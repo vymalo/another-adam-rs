@@ -1,11 +1,7 @@
 [workspace]
 resolver = "3"
-members = [
-    "crates/adam-core",
-    "crates/adam-store-testkit",
-    "crates/adam-store-postgres",
-    "crates/adam-store-mongodb",
-]
+# Glob, so crates added in parallel PRs never conflict on this list.
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
