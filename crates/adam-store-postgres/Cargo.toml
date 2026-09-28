@@ -1,0 +1,25 @@
+[package]
+name = "adam-store-postgres"
+description = "PostgreSQL store for adam-rs durable agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["tls-rustls"]
+tls-rustls = ["sqlx/tls-rustls"]
+tls-native-tls = ["sqlx/tls-native-tls"]
+
+[dependencies]
+adam-core.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "json", "chrono", "uuid"] }
+uuid.workspace = true
+
+[dev-dependencies]
+adam-store-testkit.workspace = true
+tokio.workspace = true

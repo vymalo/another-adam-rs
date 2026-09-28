@@ -1,0 +1,21 @@
+[package]
+name = "adam-store-mongodb"
+description = "MongoDB store for adam-rs durable agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-core.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+mongodb = "3.9"
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+adam-store-testkit.workspace = true
+tokio.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "adam-core"
+description = "Core traits and types for adam-rs, a Rust framework for durable AI agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+uuid.workspace = true

@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  conformance:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest and newest supported servers.
+        include:
+          - { postgres: "12", mongodb: "5.0" }
+          - { postgres: "17", mongodb: "8.0" }
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: adam_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+      mongodb:
+        image: mongo:${{ matrix.mongodb }}
+        ports: ["27017:27017"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Conformance (memory, Postgres, MongoDB)
+        env:
+          ADAM_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/adam_test
+          ADAM_TEST_MONGODB_URI: mongodb://localhost:27017
+        # Run twice: the second pass exercises migrate() on an existing schema.
+        run: |
+          cargo test --workspace
+          cargo test --workspace
