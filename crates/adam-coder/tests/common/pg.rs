@@ -22,10 +22,9 @@ const PREFIX: &str = "coder_test_";
 const STALE_AFTER_SECS: u64 = 3600;
 
 /// The server URL from the environment, if the Postgres tests are enabled.
+/// Unset with `ADAM_TEST_REQUIRE_DB=1` panics (see `adam_core::testing`).
 pub fn server_url() -> Option<String> {
-    std::env::var("ADAM_TEST_POSTGRES_URL")
-        .ok()
-        .filter(|u| !u.trim().is_empty())
+    adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL")
 }
 
 fn now_secs() -> u64 {
@@ -50,16 +49,9 @@ pub struct TestDb {
 impl TestDb {
     /// Create a migrated database, or `None` when Postgres tests are not
     /// enabled (`ADAM_TEST_POSTGRES_URL` unset). With
-    /// `ADAM_TEST_REQUIRE_DBS=1` a missing URL is a failure instead.
+    /// `ADAM_TEST_REQUIRE_DB=1` a missing URL is a failure instead.
     pub async fn create() -> Option<Self> {
-        let Some(server) = server_url() else {
-            assert!(
-                std::env::var("ADAM_TEST_REQUIRE_DBS").is_err(),
-                "ADAM_TEST_REQUIRE_DBS is set but ADAM_TEST_POSTGRES_URL is not"
-            );
-            eprintln!("skipped: ADAM_TEST_POSTGRES_URL is not set");
-            return None;
-        };
+        let server = server_url()?;
         let mut admin = PgConnection::connect(&server)
             .await
             .expect("connect to the test Postgres");
