@@ -70,6 +70,11 @@ pub struct RunNotes {
     /// The pull request, once opened.
     #[serde(default)]
     pub pull_request: Option<PullRequestNote>,
+    /// Why the run cannot deliver whatever the model does: the credentials
+    /// were rejected. A run that ends with this set and no pull request fails
+    /// (see `CoderAgent`) instead of completing.
+    #[serde(default)]
+    pub blocker: Option<String>,
 }
 
 impl RunNotes {

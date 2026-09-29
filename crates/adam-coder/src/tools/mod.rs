@@ -112,6 +112,29 @@ impl ToolEnv {
         }
     }
 
+    /// [`workspace_error`], and when the credentials were rejected also a note
+    /// that the run cannot deliver. The model sees the error either way, but a
+    /// bad token is not something it can fix, so a run that ends without a
+    /// pull request after this must fail rather than complete.
+    pub(crate) async fn delivery_error(&self, ctx: &ToolCtx, e: &WorkspaceError) -> ToolError {
+        if matches!(e, WorkspaceError::Auth(_)) {
+            let run = ctx.run_id().to_string();
+            let recorded = async {
+                let mut notes = self.notes.load(&run).await?;
+                notes.blocker = Some(format!(
+                    "the credentials were rejected ({e}); check that GITHUB_TOKEN is valid and \
+                     may push and open pull requests for the repository"
+                ));
+                self.notes.save(&run, &notes).await
+            }
+            .await;
+            if let Err(err) = recorded {
+                tracing::warn!(error = %err, "cannot record the credential failure in the run notes");
+            }
+        }
+        workspace_error(e)
+    }
+
     /// The worktree of the run `ctx` belongs to, or the message to give the
     /// model when there is none yet.
     pub(crate) async fn worktree(&self, ctx: &ToolCtx) -> Result<Worktree, Outcome> {

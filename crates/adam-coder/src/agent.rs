@@ -33,6 +33,10 @@ pub fn coder_limits() -> Limits {
 /// request has not delivered: it fails, with the findings as the error. That is
 /// what "at most N check/fix cycles, then report the findings and stop" turns
 /// into: the model reports, the run is `failed`, and nothing was opened.
+///
+/// The same goes for a run whose credentials were rejected (GitHub or git
+/// answered 401/403): the model cannot fix a bad token, so ending without a
+/// pull request is a failure that names the token, not a completed task.
 pub struct CoderAgent {
     inner: LlmAgent,
     env: Arc<ToolEnv>,
@@ -68,7 +72,13 @@ impl CoderAgent {
 
     /// Why the run must fail instead of completing, if it must.
     fn verdict(&self, notes: &RunNotes) -> Option<String> {
-        if !notes.last_check_failed() || notes.pull_request.is_some() {
+        if notes.pull_request.is_some() {
+            return None;
+        }
+        if let Some(blocker) = &notes.blocker {
+            return Some(format!("no pull request was opened: {blocker}"));
+        }
+        if !notes.last_check_failed() {
             return None;
         }
         let last = notes.checks.last.as_ref()?;

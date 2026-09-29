@@ -97,7 +97,9 @@ impl Tool for CommitAndPush {
             &sha[..sha.len().min(10)]
         ))
         .await;
-        wt.push().await.map_err(|e| workspace_error(&e))?;
+        if let Err(e) = wt.push().await {
+            return Err(self.env.delivery_error(ctx, &e).await);
+        }
 
         notes.pushed_sha = Some(sha.clone());
         self.env
@@ -250,7 +252,7 @@ impl Tool for OpenPullRequest {
         }
         ctx.emit_progress(format!("opening a pull request from {}", wt.branch()))
             .await;
-        let pr = self
+        let opened = self
             .env
             .code_host
             .open_pull_request(NewPullRequest {
@@ -260,8 +262,11 @@ impl Tool for OpenPullRequest {
                 body,
                 draft: self.env.settings.draft_pull_requests,
             })
-            .await
-            .map_err(|e| workspace_error(&e))?;
+            .await;
+        let pr = match opened {
+            Ok(pr) => pr,
+            Err(e) => return Err(self.env.delivery_error(ctx, &e).await),
+        };
 
         notes.pull_request = Some(PullRequestNote {
             url: pr.url.clone(),

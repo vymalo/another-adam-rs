@@ -8,7 +8,7 @@ use adam_workspace::RepoRef;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Outcome, ToolEnv, str_arg, workspace_error};
+use super::{Outcome, ToolEnv, str_arg};
 
 /// Branch used when the model leaves `base_branch` out.
 const DEFAULT_BASE_BRANCH: &str = "main";
@@ -74,7 +74,7 @@ impl Tool for PrepareWorkspace {
                 // The model gave a bad repository or branch: tell it, do not fail.
                 return Ok(ToolOutput::error(e.to_string()));
             }
-            Err(e) => return Err(workspace_error(&e)),
+            Err(e) => return Err(self.env.delivery_error(ctx, &e).await),
         };
         Ok(ToolOutput::text(format!(
             "Worktree ready.\nrepository: {url}\nbase branch: {base}\nbranch: {}\npath: {}",
