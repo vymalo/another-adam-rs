@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[{"index":0,"delta":{"content":"Created hello.txt "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[{"index":0,"delta":{"content":"with the line hello."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[],"usage":{"prompt_tokens":40,"completion_tokens":9,"total_tokens":49}}
+
+data: [DONE]
+

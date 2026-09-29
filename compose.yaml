@@ -91,8 +91,16 @@ services:
   # remote = git-server (use http://git-server:8080/local/sandbox.git as the
   # repository in a task). Needs the workspace base image of
   # docker/coder/Dockerfile to be pullable.
+  #
+  # The models are scripted (dev/wiremock/mock-openai/mappings/coder-script.json
+  # and opencode-script.json): the coder's model `mock-coder` prepares the
+  # workspace, delegates to OpenCode (model `mock-opencode`), runs the checks,
+  # commits, pushes and opens a pull request, so a task ends in one. CI runs
+  # exactly that with dev/coder-e2e.sh, on an image it has already built:
+  # CODER_IMAGE names it (`--no-build` then uses it as it is).
   coder:
     profiles: ["app"]
+    image: ${CODER_IMAGE:-adam-rs/coder:dev}
     build:
       context: .
       dockerfile: docker/coder/Dockerfile
@@ -110,7 +118,10 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/adam_test
       MODEL_BASE_URL: http://mock-openai:8080/v1
       MODEL_API_KEY: mock-api-key # dummy: the mock accepts anything
-      MODEL: mock-model
+      # Scripted models (see above). CODER_MODEL=mock-model gives the canned
+      # answers of the other mocks back: text, no tool call, no pull request.
+      MODEL: ${CODER_MODEL:-mock-coder}
+      OPENCODE_MODEL: ${CODER_OPENCODE_MODEL:-mock-opencode}
       GITHUB_API_URL: http://mock-github:8080
       # Dummy. Set MOCK_GITHUB_TOKEN=bad-token to make mock-github answer 401.
       GITHUB_TOKEN: ${MOCK_GITHUB_TOKEN:-dev-github-token}

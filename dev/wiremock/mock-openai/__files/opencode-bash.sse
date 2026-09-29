@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"oc-call-1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"echo hello > "}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"hello.txt\",\"description\":\"Create hello.txt\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-oc-script","object":"chat.completion.chunk","created":1700000000,"model":"mock-opencode","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}}
+
+data: [DONE]
+

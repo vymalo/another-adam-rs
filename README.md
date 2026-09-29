@@ -123,7 +123,7 @@ docker compose down -v             # stop and forget all state (volumes included
 |---|---|---|
 | `postgres` | `127.0.0.1:5432` | PostgreSQL 16, database `adam_test`, user and password `postgres` |
 | `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone |
-| `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`) |
+| `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder` and `mock-opencode` are scripted (see "Scripted models") |
 | `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) |
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git`; no authentication |
 | `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token` |
@@ -166,8 +166,10 @@ mappings are in `dev/wiremock/mock-openai/`.
 | `unauthorized` | `401` `invalid_api_key` |
 | `context-length` | `400` `context_length_exceeded` |
 
-The error scenarios apply to streaming and non-streaming requests alike and
-persist as long as the header or keyword is sent.
+The scenarios above apply to every model except `mock-coder` and `mock-opencode`,
+which follow their scripts (see "Scripted models" below). The error scenarios
+apply to streaming and non-streaming requests alike and persist as long as the
+header or keyword is sent.
 
 ### `mock-github` scenarios
 
@@ -208,14 +210,61 @@ curl -N http://127.0.0.1:8080/ \
         "In http://git-server:8080/local/sandbox.git (base branch main), add hello.txt containing hello."}]}}}'
 ```
 
-This exercises the A2A endpoint, authentication, the store and the agent loop
-against the mock model. The mock model is canned: it answers in text, or calls
-the first declared tool with `{}`, so it cannot drive OpenCode through a real
-change and the run does not end in a pull request. A complete run needs a model
-that can call tools (see the live smoke test in `crates/adam-coder/README.md`);
-the git remote and the pull request API of that run can still be `git-server`
-and `mock-github`. (The `app` profile was validated with `docker compose config`
-only when this was written: no container runtime was available.)
+This exercises the A2A endpoint, authentication, the store, the agent loop,
+OpenCode and the pull request path, and **the run ends in a pull request**: the
+coder's models are scripted (see "Scripted models" below), so the same task
+always takes the same steps. `dev/coder-e2e.sh` runs that task and checks the
+result; CI runs it on the image it has just built (`.github/workflows/coder.yml`,
+step "Compose e2e"):
+
+```sh
+docker compose --profile app up -d --build --wait postgres mock-openai mock-github git-server coder
+sh dev/coder-e2e.sh                 # OpenCode makes the change
+NO_OPENCODE=1 sh dev/coder-e2e.sh   # the check command makes it, OpenCode is not started
+```
+
+The script sends the task with `SendStreamingMessage`, waits for
+`TASK_STATE_COMPLETED`, and checks that the `branch` and `pull_request`
+artifacts are there, that `mock-github` saw exactly one
+`POST /repos/local/sandbox/pulls` (head = the branch, base = `main`), and that
+`git-server` has the branch with `hello.txt` containing `hello`. `TIMEOUT`,
+`CODER_URL`, `CODER_TOKEN`, `MOCK_GITHUB_URL` and `GIT_SERVER_URL` override the
+defaults (see the script's header).
+
+To run a prebuilt image instead of building one, set `CODER_IMAGE` (default
+`adam-rs/coder:dev`) and pass `--no-build`. `CODER_MODEL=mock-model` brings back
+the canned answers: text only, no tool call, so no pull request.
+
+### Scripted models
+
+The coder's model is `mock-coder` and OpenCode's is `mock-opencode` (`MODEL` and
+`OPENCODE_MODEL` in `compose.yaml`, moved with `CODER_MODEL` and
+`CODER_OPENCODE_MODEL`). Both are in `mock-openai`, selected by the `model` of the
+request, and both are **stateless**: the answer is chosen by which scripted
+tool-call ids the request's history already holds, so a retried or replayed
+request gets the same answer and the script cannot drift out of step.
+
+| Model | Mapping | Script |
+|---|---|---|
+| `mock-coder` | `mappings/coder-script.json` | `prepare_workspace` (`http://git-server:8080/local/sandbox.git`, `main`, id `coder-call-1`), `delegate_to_opencode` (create `hello.txt` containing `hello`, `coder-call-2`), `run_checks` (`sh ./check.sh`, `coder-call-3`), `commit_and_push` (`coder-call-4`), `open_pull_request` (`coder-call-5`), then a final text (`stop`). Not streamed. |
+| `mock-coder`, task text contains `[mock:no-opencode]` | same file | `prepare_workspace` (`nc-call-1`), `run_checks` with `echo hello > hello.txt && sh ./check.sh` (the check command makes the change, `nc-call-2`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started: deterministic where OpenCode's own behaviour is not the subject. |
+| `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |
+
+The steps mirror the reference script of `crates/adam-coder/tests/binary.rs`.
+A request of `mock-coder` that is not on the script (an id out of order, a
+history the script does not know) is answered with **404** `off_script` on
+purpose, so a run that leaves the script fails loudly instead of wandering on
+the canned answers. The task text only has to name the repository and base
+branch; the script does not read it, apart from the `[mock:no-opencode]` switch.
+
+OpenCode's tool name and argument (`bash`, `command`) are *verified 2026-09-29*:
+the published `opencode-ai` 1.18.33 binary (the version pinned in
+`vymalo/another-agentic-images`' workspace image at the time) ran through the
+real `adam-coder` against these mappings, and all three stubs matched (the
+title-generation fallback, the `bash` call, the final text). Which OpenCode
+version a given coder image ships is *unverified*; a newer one that renames the
+tool needs the mapping updated, and `NO_OPENCODE=1` is the variant that does not
+depend on it.
 
 ## Errors
 

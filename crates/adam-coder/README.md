@@ -301,7 +301,9 @@ then `TASK_STATE_COMPLETED`. Verify:
 
 For a run without a real gateway or GitHub, `compose.yaml` provides a mock
 model, a mock GitHub API and a local git remote; see "Local development" in the
-repository README (the mock model is canned, so it cannot complete a change).
+repository README. The models are scripted: a task ends in a branch on the git
+remote and one pull request on the mock GitHub, and `dev/coder-e2e.sh` (run by
+`.github/workflows/coder.yml` on the image it builds) checks exactly that.
 
 Record the pull request URL and the log excerpts in the pull request that lands
 this change. (Not run by the author of this crate: no gateway or GitHub access
