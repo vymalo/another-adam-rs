@@ -1,6 +1,7 @@
 //! Deterministic ids: the same input always gives the same id, so a status or
 //! a retried submission is recognised by whoever keys on the id.
 
+use adam_core::RunId;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -32,21 +33,47 @@ pub(crate) fn status_message_id(task_id: &str, state: &str, text: &str) -> Strin
     .to_string()
 }
 
+/// The task (run) id that a new task started by message `message_id` gets.
+///
+/// `RuntimeTaskBackend` starts a task from a message with this id, so a client
+/// that repeats the request (same `messageId`, same `contextId`, same caller)
+/// reaches the task the first attempt made instead of starting another or
+/// feeding the input in twice. Use it to look up "the task this message
+/// started" without a side table.
+///
+/// The inputs are the caller's `subject` (two callers never share a task), the
+/// `context_id` the request carried (`None` when it carried none; that is not
+/// the same as an empty one), and the `message_id`. Different contexts give
+/// different tasks even for the same message id.
+pub fn task_id_for(subject: &str, context_id: Option<&str>, message_id: &str) -> RunId {
+    let (present, context) = match context_id {
+        Some(c) => (b"1".as_slice(), c.as_bytes()),
+        None => (b"0".as_slice(), b"".as_slice()),
+    };
+    RunId(derived(
+        "adam-a2a-runtime/task/v1",
+        &[subject.as_bytes(), present, context, message_id.as_bytes()],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn ids_are_stable_and_distinguish_every_input() {
-        let a = status_message_id("t", "s", "x");
-        assert_eq!(a, status_message_id("t", "s", "x"));
-        assert_ne!(a, status_message_id("u", "s", "x"));
-        assert_ne!(a, status_message_id("t", "r", "x"));
+        let a = task_id_for("s", Some("c"), "m");
+        assert_eq!(a, task_id_for("s", Some("c"), "m"));
+        assert_ne!(a, task_id_for("t", Some("c"), "m"));
+        assert_ne!(a, task_id_for("s", Some("d"), "m"));
+        assert_ne!(a, task_id_for("s", Some("c"), "n"));
+        assert_ne!(task_id_for("s", None, "m"), task_id_for("s", Some(""), "m"));
         // Field boundaries matter.
         assert_ne!(
-            status_message_id("ab", "c", "x"),
-            status_message_id("a", "bc", "x")
+            task_id_for("ab", Some("c"), "m"),
+            task_id_for("a", Some("bc"), "m")
         );
+        // Status ids and task ids never coincide for the same fields.
         assert_ne!(
             status_message_id("t", "s", "x"),
             status_message_id("t", "s", "y")
@@ -55,9 +82,8 @@ mod tests {
 
     #[test]
     fn derived_ids_are_valid_uuids() {
-        let id = status_message_id("t", "s", "x");
-        let parsed = Uuid::parse_str(&id).unwrap();
-        assert_eq!(parsed.get_version_num(), 8);
-        assert_eq!(parsed.to_string(), id);
+        let id = task_id_for("s", None, "m").0;
+        assert_eq!(id.get_version_num(), 8);
+        assert_eq!(Uuid::parse_str(&id.to_string()).unwrap(), id);
     }
 }

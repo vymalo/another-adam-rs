@@ -18,6 +18,7 @@ agent; [`adam-coder`](../adam-coder/README.md) uses it.
 | `.with_poll_interval(..)`, `DEFAULT_POLL_INTERVAL` | how often a subscription re-reads the durable run |
 | `.with_prompt(..)`, `.with_inbound(..)` | override how the `input-required` question is derived (`PromptFn`) and how an A2A message becomes an `Inbound` (`InboundFn`) |
 | `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings |
+| `task_id_for(subject, context_id, message_id)` | the task id a new task started by that message gets (see *Stable ids*) |
 
 ```rust
 use std::sync::Arc;
@@ -40,7 +41,7 @@ credentials, while workers with the full agent run in another process over the
 same store. Nothing steps a task in the front itself.
 
 Mapping (full table in `src/backend.rs`): a task is a run (`task_id` is the run
-id); a new `SendMessage` is `Runtime::start`; a message with `taskId` is
+id); a new `SendMessage` is `Runtime::start_with_id` (delivering to the context's open task if it has one); a message with `taskId` is
 `Runtime::deliver`, only while the task is `input-required`; `CancelTask` is
 `Runtime::cancel`. Ownership is encoded in the run's durable conversation id
 (`<subject>:<context id>`), so it survives restarts with no side table, and a
@@ -58,15 +59,27 @@ the next poll. `adam-coder` wires it in for every role (`Coder::new_with`,
 
 ## Stable ids
 
-The message id of a status is derived, not drawn at random per read, so a
-consumer that keys on it sees each status once (a SHA-256 of length-prefixed
-fields, laid out as a UUID of version 8):
+Ids are derived, never drawn at random per read, so a consumer that keys on
+them sees each thing once (a SHA-256 of length-prefixed fields, laid out as a
+UUID of version 8):
 
 * **Status messages.** The `message_id` of a task's status message is a
   function of the task id, the state and the message text. The stream event and
   every `tasks/get` snapshot of the same status carry the same id; another
   state or text gives another id. (Progress messages, which exist only in the
   live stream, keep a fresh id.)
+* **Submission is idempotent by `messageId`.** A new task's id is
+  `task_id_for(subject, contextId, messageId)` and it is started with
+  `Runtime::start_with_id`, so a client that repeats `SendMessage` /
+  `SendStreamingMessage` (an outbox retry after a crash) gets the task its
+  first attempt made, with the agent reading the input once. A repeat without
+  a `contextId` finds the context the first attempt generated. A message with
+  an empty `messageId` is not recognised as a repeat. The caller is part of
+  the id, so two callers never share a task.
+  Not covered: a message delivered into an already open task of its context,
+  and a follow-up to a `taskId`, are not recognised on a repeat (the runtime
+  keeps no record of consumed inbound ids); a repeated follow-up is refused
+  because the task is no longer `input-required`.
 
 ## Errors
 
@@ -104,7 +117,7 @@ that is `-32602` and not `-32603`
 `an_init_rejection_is_a_32602_over_http`), and a
 `a_starter_only_front_accepts_a_task_a_separate_worker_completes_it`, and a
 restart scenario in which a second backend (a second replica) rebuilds a
-subscription from the store. Unit tests in `src/backend.rs`
+subscription from the store, and the repeated-`messageId` cases. Unit tests in `src/backend.rs`
 (`runtime_errors_map_by_class`,
 `what_a_client_is_told_carries_no_cause_and_no_conversation_id`) and
 `src/convert.rs`.

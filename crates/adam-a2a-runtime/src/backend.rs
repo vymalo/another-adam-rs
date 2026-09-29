@@ -16,6 +16,7 @@ use crate::convert::{
     InboundFn, PromptFn, decode_conversation, default_inbound, default_prompt, encode_conversation,
     task_from_view,
 };
+use crate::ids::task_id_for;
 use crate::subscribe;
 
 /// Default interval at which a subscription re-reads the durable run.
@@ -24,6 +25,10 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Reason recorded on a run cancelled through A2A.
 const CANCEL_REASON: &str = "canceled by client";
 
+/// How often a submission retries when the conversation's open task finishes
+/// under it.
+const MAX_JOIN_ATTEMPTS: usize = 5;
+
 /// A task is a run: `task_id` is the run id, `context_id` the conversation
 /// (namespaced by the caller, see below).
 ///
@@ -31,13 +36,25 @@ const CANCEL_REASON: &str = "canceled by client";
 ///
 /// | A2A | Runtime |
 /// |---|---|
-/// | `SendMessage` (new) | `Runtime::start`, conversation `<subject>:<context id>` |
+/// | `SendMessage` (new) | `Runtime::start_with_id` with [`task_id_for`], conversation `<subject>:<context id>` |
 /// | `SendMessage` with `taskId` | `Runtime::deliver` (only while `input-required`) |
 /// | `input-required` | run parked with no timer (`RunView::waiting`); the question comes from [`PromptFn`] |
 /// | `completed` | `Done`; `output.text` is the status message, `RunView::artifacts` are the task artifacts |
 /// | `failed` | `Failed`; the error is the status message |
 /// | `canceled` | `Failed` with `cancelled: ...` (what `Runtime::cancel` writes) |
 /// | `CancelTask` | `Runtime::cancel` |
+///
+/// # Idempotent submission
+///
+/// A new task's id is derived from the caller, the `contextId` and the
+/// message's `messageId` ([`task_id_for`]), so a client that repeats a
+/// `SendMessage` (a retry after a crash or a timeout) gets the task the first
+/// attempt made, and the agent reads the input once. This holds for a request
+/// that started a task; a message that was delivered to an already open task
+/// (below) and a follow-up to a `taskId` are not recognised on a repeat: the
+/// follow-up is refused as the task is no longer `input-required`, the
+/// delivery to an open task is delivered again (the runtime keeps no record of
+/// consumed inbound ids).
 ///
 /// A message that carries a `contextId` but no `taskId` while that context
 /// still has an open task is delivered to that task (the runtime allows one
@@ -162,6 +179,72 @@ impl RuntimeTaskBackend {
         (subject == caller.subject).then_some((view, context))
     }
 
+    /// A new-task submission: `(run id, context id)` of the task that took the
+    /// message.
+    ///
+    /// The run id is [`task_id_for`], so a repeat of the same request (same
+    /// caller, `contextId` and `messageId`) finds the run its first attempt
+    /// created and starts nothing. If the conversation already has an open task
+    /// the message is delivered to it, as `Runtime::start` does.
+    async fn start_or_join(
+        &self,
+        caller: &Caller,
+        message: &Message,
+        inbound: adam_runtime::Inbound,
+        context_id: Option<String>,
+    ) -> Result<(RunId, String), BackendError> {
+        // Without a message id there is nothing to recognise a repeat by.
+        if message.message_id.is_empty() {
+            let context = context_id.unwrap_or_else(a2a::new_context_id);
+            let conversation = encode_conversation(&caller.subject, &context);
+            let run = self
+                .runtime
+                .start(&self.agent, inbound, Some(&conversation))
+                .await
+                .map_err(map_err)?;
+            return Ok((run, context));
+        }
+        let run = task_id_for(&caller.subject, context_id.as_deref(), &message.message_id);
+        let context = context_id.clone().unwrap_or_else(a2a::new_context_id);
+        let conversation = encode_conversation(&caller.subject, &context);
+        for _ in 0..MAX_JOIN_ATTEMPTS {
+            match self
+                .runtime
+                .start_with_id(run, &self.agent, inbound.clone(), Some(&conversation))
+                .await
+            {
+                Ok(true) => return Ok((run, context)),
+                Ok(false) => {
+                    // A repeat: the task exists, and its context is the one it
+                    // was created with (a request without `contextId` got a
+                    // generated one the first time).
+                    let (_, _, context) =
+                        self.owned(caller, &run.to_string()).await?.ok_or_else(|| {
+                            BackendError::internal("a repeated submission found a foreign task")
+                        })?;
+                    return Ok((run, context));
+                }
+                Err(RuntimeError::ConversationBusy { .. }) => {
+                    let open = self
+                        .runtime
+                        .store()
+                        .open_run_for_conversation(&self.agent, &conversation)
+                        .await
+                        .map_err(|e| map_err(e.into()))?;
+                    let Some(open) = open else { continue };
+                    match self.runtime.deliver(open.id, inbound.clone()).await {
+                        Ok(()) => return Ok((open.id, context)),
+                        // It finished meanwhile: the context takes a new task.
+                        Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => {}
+                        Err(e) => return Err(map_err(e)),
+                    }
+                }
+                Err(e) => return Err(map_err(e)),
+            }
+        }
+        Err(BackendError::unavailable("the conversation is contended"))
+    }
+
     async fn view_of(&self, run: RunId) -> Result<RunView, BackendError> {
         self.runtime
             .view(run)
@@ -227,13 +310,9 @@ impl TaskBackend for RuntimeTaskBackend {
         let inbound = (self.inbound)(&message).map_err(BackendError::InvalidParams)?;
 
         let Some(task_id) = task_id else {
-            let context = context_id.unwrap_or_else(a2a::new_context_id);
-            let conversation = encode_conversation(&caller.subject, &context);
-            let run = self
-                .runtime
-                .start(&self.agent, inbound, Some(&conversation))
-                .await
-                .map_err(map_err)?;
+            let (run, context) = self
+                .start_or_join(&caller, &message, inbound, context_id)
+                .await?;
             let view = self.view_of(run).await?;
             let mut task = task_from_view(&view, &context, &self.prompt);
             let mut first = message;

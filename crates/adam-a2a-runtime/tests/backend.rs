@@ -953,3 +953,115 @@ async fn a_starter_only_front_accepts_a_task_a_separate_worker_completes_it() {
         "the front still enforces ownership"
     );
 }
+
+/// Messages delivered to the task's run on top of its start input.
+async fn pending(rig: &Rig, task: &Task) -> usize {
+    let run = adam_core::RunId(task.id.parse().unwrap());
+    rig.runtime.view(run).await.unwrap().unwrap().pending_inbox
+}
+
+fn user_with_id(text: &str, id: &str) -> Message {
+    let mut m = user(text);
+    m.message_id = id.into();
+    m
+}
+
+#[tokio::test]
+async fn repeating_a_message_returns_the_task_and_delivers_the_input_once() {
+    let rig = Rig::new();
+    let first = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    // The retry after a crash, while the task is still open (no worker runs).
+    let retry = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    assert_eq!(retry.id, first.id);
+    assert_eq!(retry.context_id, "c1");
+    assert_eq!(
+        adam_a2a_runtime::task_id_for("token-0", Some("c1"), "m-1").to_string(),
+        first.id
+    );
+    // The start message is the run's input; nothing was delivered on top.
+    assert_eq!(pending(&rig, &first).await, 0);
+
+    // ... and after the task finished the repeat still finds it, not a new one.
+    let worker = rig.worker();
+    wait_state(&rig, &alice(), &first.id, TaskState::Completed).await;
+    let late = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    assert_eq!(late.id, first.id);
+    assert_eq!(late.status.state, TaskState::Completed);
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn a_repeat_without_a_context_id_finds_the_context_the_first_attempt_made() {
+    let rig = Rig::new();
+    let first = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, None)
+        .await
+        .unwrap();
+    let retry = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(retry.id, first.id);
+    assert_eq!(retry.context_id, first.context_id);
+    assert_eq!(pending(&rig, &first).await, 0);
+}
+
+#[tokio::test]
+async fn different_messages_contexts_and_callers_are_different_tasks() {
+    let rig = Rig::new();
+    let submit = |who: Caller, id: &'static str, ctx: Option<&'static str>| {
+        let backend = rig.backend.clone();
+        async move {
+            backend
+                .submit(who, user_with_id("go", id), None, ctx.map(str::to_owned))
+                .await
+                .unwrap()
+                .id
+        }
+    };
+    let base = submit(alice(), "m-1", Some("c1")).await;
+    assert_ne!(base, submit(alice(), "m-2", None).await, "other message");
+    assert_ne!(
+        base,
+        submit(alice(), "m-1", Some("c2")).await,
+        "other context"
+    );
+    assert_ne!(base, submit(bob(), "m-1", Some("c1")).await, "other caller");
+    assert_eq!(base, submit(alice(), "m-1", Some("c1")).await);
+}
+
+#[tokio::test]
+async fn a_new_message_in_an_open_context_is_still_delivered_to_its_task() {
+    let rig = Rig::new();
+    let first = rig
+        .backend
+        .submit(alice(), user_with_id("go", "m-1"), None, Some("c1".into()))
+        .await
+        .unwrap();
+    let second = rig
+        .backend
+        .submit(
+            alice(),
+            user_with_id("more", "m-2"),
+            None,
+            Some("c1".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.id, first.id);
+    assert_eq!(pending(&rig, &first).await, 1);
+}
