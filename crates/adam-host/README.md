@@ -1,7 +1,7 @@
 # adam-host
 
-The contract between adam-rs and a host app: the process `Role` enum, and a small role-aware
-supervisor.
+The contract between adam-rs and a host app: the process `Role` enum, the workspace `Placement`
+enum, and a small role-aware supervisor.
 
 ## Where it sits
 
@@ -28,6 +28,11 @@ environment: the host owns the name of the variable (`ROLE`, `ORCH_ROLE`) or the
 | `Role::from_optional(Option<&str>)` | `None` or blank gives `All`; anything else must be a name |
 | `FromStr`, `Display` | `FromStr` trims and ignores ASCII case; exact names only, no aliases. `Display` equals `as_str()` and round-trips |
 | `ParseRoleError { input }` | the message lists the accepted values; `Classify` gives `Invalid` |
+| `Placement` | `Shared` (default), `Affinity`, `Isolated`, `A2aOnly`. Closed: no `#[non_exhaustive]` |
+| `Placement::VALUES`, `as_str()` | every placement, and its name: `shared`, `affinity`, `isolated`, `a2a-only` |
+| `pins_runs()`, `needs_workspace()` | `Affinity` and `Isolated` pin runs to a worker; every placement but `A2aOnly` needs a workspace |
+| `Placement::from_optional(Option<&str>)` | `None` or blank gives `Shared`; anything else must be a name |
+| `ParsePlacementError { input }` | the message lists the accepted values; `Classify` gives `Invalid` |
 | `Host` (feature `supervisor`) | `Host::new(role).control_plane(name, f).worker(name, f).control_plane_drain(..).worker_grace(..).run(shutdown)` |
 | `Health` (feature `supervisor`) | `host.health()`: `ready()` and `shutting_down()`. Data only |
 | `HostError` (feature `supervisor`) | `Stopped`, `Panicked`, `EndedEarly`, `NothingToRun`. `#[non_exhaustive]`; `Classify` gives `Internal` |
@@ -38,6 +43,25 @@ A new role must be a compile error in every host that matches on it. Then each h
 what the new role runs, and none of them runs it by accident. A host that only asks
 `runs_control_plane()` and `runs_workers()` needs no change. See
 [ADR 0001](../../docs/decisions/0001-library-first-host-roles.md).
+
+### Placement
+
+Where the files of a run live, and whether a run stays on one worker. The deployer chooses; the
+host reads the choice from its own variable (`adam-coder`: `WORKSPACE_PLACEMENT`) and passes it to
+`Placement::from_optional`, like `Role`. `FromStr` trims and ignores ASCII case, and `Display`
+equals `as_str()`. Like `Role`, it is closed on purpose.
+
+| Placement | Meaning | `pins_runs()` | `needs_workspace()` |
+|---|---|---|---|
+| `shared` (default) | one volume that every worker mounts; any worker may resume any run | no | yes |
+| `affinity` | a run is stepped only by the worker that first claimed it; each worker owns a folder under the root | yes | yes |
+| `isolated` | as `affinity`, and the worker's root is a volume of its own | yes | yes |
+| `a2a-only` | no workspace; the host's agents only call remote agents | no | no |
+
+This crate does not touch the store. A host maps `pins_runs()` to `ClaimScope::Pinned`
+([`adam-core`](../adam-core/README.md)) and `needs_workspace()` to "build a workspace root or
+not". A pinning worker needs a stable worker id. See
+[ADR 0002](../../docs/decisions/0002-workspace-placement.md).
 
 ## The supervisor
 
@@ -131,8 +155,8 @@ With clap, the role is a flag: `#[arg(long, env = "ROLE", value_enum, default_va
 | Feature | Default | Adds |
 |---|---|---|
 | `supervisor` | yes | `Host`, `Health`, `HostError`. Brings `tokio` (`rt`, `sync`, `time`), `tokio-util` and `tracing` |
-| `clap` | no | `Role` implements `clap::ValueEnum` (`--role control-plane`) |
-| `serde` | no | `Role` implements `Serialize` and `Deserialize` as `"control-plane"` |
+| `clap` | no | `Role` and `Placement` implement `clap::ValueEnum` (`--role control-plane`, `--placement a2a-only`) |
+| `serde` | no | `Role` and `Placement` implement `Serialize` and `Deserialize` as `"control-plane"`, `"a2a-only"` |
 
 Future work: a `runtime` feature with the `adam-runtime` worker as a ready-made worker
 component.
@@ -141,7 +165,7 @@ component.
 
 Both enums follow the repo rules ([`adam-error`](../adam-error/README.md)): `HostError` is
 `#[non_exhaustive]` with a `Classify` impl. Every variant is `Internal`: a failed component is
-a bug or a lost dependency, and the process should exit and be restarted. `ParseRoleError` is
+a bug or a lost dependency, and the process should exit and be restarted. `ParseRoleError` and `ParsePlacementError` are
 `Invalid`: it is bad configuration, and it never succeeds. Print a `HostError` with
 `adam_error::report`, which adds the cause (`component `dispatcher` stopped: connection reset`).
 
@@ -158,4 +182,8 @@ tests run on tokio's paused clock, so the drain and grace bounds are exact and i
   failure wins, and `Health` flips.
 * The class table of `HostError` and `ParseRoleError`, as an exhaustive `match`.
 
-`cargo test -p adam-host --no-default-features` runs the `Role` tests alone.
+* `Placement`: the same set as `Role` (round-trip, trimmed and case-insensitive input, exact
+  names only, `from_optional`, the clap names and flag, kebab-case serde), and the truth table of
+  `pins_runs` and `needs_workspace`.
+
+`cargo test -p adam-host --no-default-features` runs the `Role` and `Placement` tests alone.

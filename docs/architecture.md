@@ -146,17 +146,20 @@ The layers, from the bottom:
     the axum server that exposes any backend as an A2A 1.0 agent. It knows
     nothing about the runtime.
   * [`adam-host`](../crates/adam-host/README.md): the closed process `Role`
-    (`all`, `control-plane`, `worker`) and `Host`, a small supervisor that runs
-    only the components a role asks for and stops them in a fixed order. A
-    host app such as `adam-coder` reads the role from its own variable.
+    (`all`, `control-plane`, `worker`), the closed workspace `Placement`
+    (`shared`, `affinity`, `isolated`, `a2a-only`) and `Host`, a small
+    supervisor that runs only the components a role asks for and stops them in a
+    fixed order. A host app such as `adam-coder` reads the role and the
+    placement from its own variables.
 * **Implementations.** Each one is a separate crate, so a binary links only what
   it uses.
   * `adam-store-postgres` and `adam-store-mongodb` implement `Store`.
   * `adam-model-openai` implements `ModelClient` for any OpenAI-compatible
     chat-completions endpoint.
-  * `adam-workspace` runs `git` for mirrors, worktrees, commit and push. It
-    also owns two small ports of its own, `GitCredentials` and `CodeHost`
-    (GitHub).
+  * `adam-workspace` runs `git` for mirrors, worktrees, commit and push, under
+    an in-process lock and a file lock on each mirror, so several processes can
+    share a root. It also owns two small ports of its own, `GitCredentials` and
+    `CodeHost` (GitHub).
   * `adam-acp` is a client for the Agent Client Protocol: it drives a coding
     agent (OpenCode) over stdio.
   * `adam-notify-postgres` implements two ports of the runtime, `EventSink`
@@ -517,6 +520,67 @@ bound, so they finish and commit the steps they are in. If a component stops on
 its own the others are stopped in the same order and the process exits with the
 component named in the error (`HostError`, exit code 70).
 
+### Where a run's files live: workspace placement
+
+A run moves between workers at every step: a `Continue` is committed, the lease is released, and
+the next claim may go to any worker (`crates/adam-runtime/src/worker.rs`, `run_worker`). The
+coder keeps a worktree per run under a local root, so with two workers on two disks a run can land
+on a worker that has no worktree for it. Nothing fails: `prepare_workspace` clones again, the
+branch `agent/<short>` is taken, a longer one is picked, the run notes are gone, and a second pull
+request is opened. The deployer therefore chooses a **placement**
+([ADR 0002](decisions/0002-workspace-placement.md)), the closed enum `adam_host::Placement`, read
+by `adam-coder` from `WORKSPACE_PLACEMENT`:
+
+| `WORKSPACE_PLACEMENT` | Worker root | Claims | Needs `WORKER_ID` |
+|---|---|---|---|
+| `shared` (default) | `WORKSPACE_ROOT`, one volume for all workers | `ClaimScope::Any` | no |
+| `affinity` | `WORKSPACE_ROOT/<WORKER_ID>` | `ClaimScope::Pinned` | yes |
+| `isolated` | `WORKSPACE_ROOT`, a volume of this worker only | `ClaimScope::Pinned` | yes |
+| `a2a-only` | none | `Any` | refused by `adam-coder` (its tools need a workspace) |
+
+`serve` maps `Placement::pins_runs()` to `RuntimeOptions::claim_scope`
+(`crates/adam-coder/src/serve.rs`), and `RuntimeBuilder::claim_scope` to the claim. The store keeps
+the **owner** of a run beside its lease (`runs.owner` in Postgres, `owner` in MongoDB), set by the
+first pinned claim and never cleared by a release or a commit:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W1 as worker w1 (Pinned)
+    participant DB as Store
+    participant W2 as worker w2 (Pinned)
+
+    W1->>DB: claim_due(agents, w1, Pinned, now, ttl, limit)
+    DB-->>W1: lease on run R, owner of R was unset and is now w1
+    W1->>DB: commit_run(R, version, next state)
+    W1->>DB: release_lease(R, w1)
+    W2->>DB: claim_due(agents, w2, Pinned, now, ttl, limit)
+    DB-->>W2: no lease: R is owned by w1
+    W1->>DB: claim_due(agents, w1, Pinned, now, ttl, limit)
+    DB-->>W1: lease on run R again
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unowned: create_run
+    Unowned --> Unowned: claim_due with Any (owner ignored)
+    Unowned --> Owned: first claim_due with Pinned, owner = that worker
+    Owned --> Owned: claim_due by the owner, or with Any
+    Owned --> Owned: commit_run, release_lease (owner kept)
+    Unowned --> [*]: purge_finished
+    Owned --> [*]: purge_finished
+```
+
+* **A pinned run whose owner is gone is stranded.** A claim cannot tell "the owner is busy" from
+  "the owner is gone", so nothing adopts the run and nothing reports it. Adoption is future work;
+  until then a deployment that pins keeps worker ids stable and does not scale workers in.
+* **`shared` needs the mirror lock.** Several worker processes on one volume would otherwise
+  fail in git with "could not lock". `adam-workspace` holds an exclusive `flock` on
+  `<mirror>.lock` under its in-process lock (`crates/adam-workspace/src/workspace.rs`,
+  `lock_mirror`). *Unverified:* `flock` on NFS and Longhorn RWX volumes.
+* **`a2a-only`** is for hosts whose agents only call remote agents, such as the
+  `another-agentic-system` orchestrator; the enum is shared so both speak the same vocabulary.
+
 ## The path of a task
 
 A task is a **run**. Its id is the A2A `task_id`, and its A2A `context_id` is
@@ -635,8 +699,8 @@ sequenceDiagram
     participant K as EventSink
 
     loop until shutdown
-        W->>DB: claim_due(agents, worker id, now, lease ttl, free slots)
-        DB-->>W: leases: due runs with no live lease, earliest first
+        W->>DB: claim_due(agents, worker id, claim scope, now, lease ttl, free slots)
+        DB-->>W: leases: due runs with no live lease (and, if pinned, not owned by another worker), earliest first
         W->>T: spawn advance(lease), at most concurrency at once
         T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every poll interval)
         T->>T: decode the Envelope, build a Ctx<br/>with seq, inbox and attempt
@@ -850,7 +914,7 @@ stateDiagram-v2
     Leased --> Unleased: release_lease after the commit, or after a rejected commit
     Leased --> Expired: worker died or hung, or renewal kept failing
     Leased --> Expired: store trouble while stepping, lease kept and not released
-    Expired --> Leased: claim_due by any worker
+    Expired --> Leased: claim_due by any worker (a pinned claim: only by the run's owner)
     Unleased --> [*]: run reached Done or Failed
 ```
 
@@ -1329,12 +1393,18 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   tokens; the worker holds the model and GitHub secrets and the volume. Deploy-only: no
   binary changed. Verified 2026-09-29: `crates/adam-coder/src/config.rs` requires
   `A2A_BEARER_TOKENS` and `PUBLIC_URL` only for the roles that serve A2A.
-* **One worker.** Runs move between workers at every step (`adam-runtime`'s worker), while
-  the worktrees live on a ReadWriteOnce volume. A second worker without a shared `/work`
-  would continue a run on a checkout that is not there, and fork it into a second pull
-  request. The chart therefore refuses `replicaCount > 1` in both topologies; scaling
-  workers needs workspace placement (decision 10 of ADR 0001, planned). The front scales
-  freely: it is stateless.
+* **More than one worker needs a placement.** Runs move between workers at every step
+  (`adam-runtime`'s worker), while a worktree lives in one worker's `/work`. A second worker
+  that does not have a run's worktree would continue it on a checkout that is not there, and
+  fork it into a second pull request. The chart therefore refuses `replicaCount > 1` for the
+  roles that run workers until `workspace.placement` is set
+  ([ADR 0002](decisions/0002-workspace-placement.md)), and passes it to the binary as
+  `WORKSPACE_PLACEMENT` (with `WORKER_ID` from the pod name, the downward API, for the
+  placements that pin runs): `isolated` keeps a PVC per pod, `affinity` mounts one
+  ReadWriteMany claim and the coder keeps a folder per worker in it, `shared` mounts the same
+  claim and lets any worker step any run (guarded by the mirror lock). `a2a-only` is refused.
+  See *Where a run's files live: workspace placement*. The front scales freely: it is
+  stateless.
 * **Probes** hit `/healthz`. Graceful shutdown gets 120 seconds: on SIGTERM the
   workers finish the steps they are in. A step cut short by SIGKILL is taken
   over by the next start once its lease expires.
@@ -1347,8 +1417,8 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   creates. With `config.role=control-plane` the chart renders neither
   `MODEL_API_KEY` nor `GITHUB_TOKEN` (nor the model, GitHub and workspace
   settings): the control plane holds none of them. `all` and `worker` need both.
-* **Known risks** (stated in the chart README): no database backups, and one
-  replica.
+* **Known risks** (stated in the chart README): no database backups, a pinned run whose
+  worker never returns is stranded, and `flock` on NFS or Longhorn RWX is unverified.
 
 How a change reaches the chart (`.github/workflows/coder.yml`):
 

@@ -75,6 +75,7 @@ impl Server {
 fn options() -> RuntimeOptions {
     RuntimeOptions {
         worker_id: None,
+        claim_scope: adam_core::ClaimScope::Any,
         concurrency: 2,
         lease_ttl: Duration::from_secs(30),
         poll_interval: Duration::from_millis(20),

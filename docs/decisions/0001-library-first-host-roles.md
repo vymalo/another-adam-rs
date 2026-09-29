@@ -2,7 +2,7 @@
 
 Status: **Accepted** (2026-09-29). The owner answered the open questions the same day. Two
 questions stayed open: cross-process events (*resolved 2026-09-29, see below*), and the exact
-workspace placement enum.
+workspace placement enum (*resolved 2026-09-29: decided in [ADR 0002](0002-workspace-placement.md)*).
 
 ## Context
 
@@ -109,6 +109,11 @@ role. The rename is outside this repo.
     run-to-worker affinity today:** any worker may lease any run. Until affinity exists, a coder
     deployment runs one worker, or uses a shared volume.
 
+    *Amended 2026-09-29:* [ADR 0002](0002-workspace-placement.md) closes this. The enum is
+    `Placement { Shared, Affinity, Isolated, A2aOnly }` in `adam-host`, and affinity is a
+    store-level claim scope (`ClaimScope::Pinned`) over a run owner. The table above is the
+    candidate list; ADR 0002 has the final one.
+
 ## Consequences
 
 * A host is a short composition: read the role, register components, call `run`. The stop
@@ -124,6 +129,8 @@ role. The rename is outside this repo.
   *Amended 2026-09-29: the `coder` Helm chart can deploy the two halves separately
   (`topology: split`, a front Deployment and a worker StatefulSet). It stays at one worker until
   workspace placement exists; deploy-only, no binary changed.*
+  *Amended 2026-09-29: the chart now sets the placement (`workspace.placement`, ADR 0002) and
+  allows `replicaCount` above 1 when it is set.*
 * Hosting agents in-process (decision 8) is only safe as far as the host limits it. An agent that
   runs builds can starve the process it lives in. The host must give it its own pods and
   limits. adam-rs does not sandbox the host.

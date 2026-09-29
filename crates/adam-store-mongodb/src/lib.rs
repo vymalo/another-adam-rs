@@ -22,6 +22,10 @@
 //!   due/lease conditions re-checked in the filter and a fresh `lease_token`,
 //!   then read back what carries that token. MongoDB re-evaluates the filter
 //!   per document under its write lock, so two workers can't both lease a run.
+//! * Owner: a pinned claim (`ClaimScope::Pinned`) adds `owner: null or worker` to the same
+//!   filter and `$set`s `owner` in the same `updateMany`. `{ owner: null }` matches a missing
+//!   field, so runs written before schema version 2 need no migration. Releasing a lease
+//!   leaves `owner` alone.
 //! * One open run per conversation: every run has an `open_key` with a plain
 //!   unique index. Open runs with a conversation use
 //!   `open_conversation_key(agent, conversation)`; every other run uses
@@ -34,8 +38,8 @@ use std::time::Duration;
 
 use adam_core::store::{add_ttl, now, open_conversation_key, sched_at, truncate_ms};
 use adam_core::{
-    JournalEntry, Lease, NewRun, RunId, RunRecord, RunStatus, RunUpdate, Store, StoreError,
-    StoreResult,
+    ClaimScope, JournalEntry, Lease, NewRun, RunId, RunRecord, RunStatus, RunUpdate, Store,
+    StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -52,7 +56,11 @@ use uuid::Uuid;
 use codec::{bson_to_json, json_to_bson};
 
 /// Current schema version written to the `<prefix>meta` collection.
-pub const SCHEMA_VERSION: i32 = 1;
+///
+/// * 1: the first schema.
+/// * 2: `owner` on runs (see [`ClaimScope`]). A missing field reads as no owner, so nothing
+///   is rewritten; the number only says which release last migrated.
+pub const SCHEMA_VERSION: i32 = 2;
 
 const DUPLICATE_KEY: i32 = 11000;
 const OPEN_CONVERSATION_INDEX: &str = "adam_open_conversation";
@@ -360,6 +368,15 @@ impl Store for MongoStore {
             .upsert(true)
             .await
             .map_err(classify)?;
+        // Raise an older version; never lower a newer one.
+        self.db
+            .collection::<Document>(&format!("{}meta", self.prefix))
+            .update_one(
+                doc! { "_id": "schema_version", "value": { "$lt": SCHEMA_VERSION } },
+                doc! { "$set": { "value": SCHEMA_VERSION } },
+            )
+            .await
+            .map_err(classify)?;
         Ok(())
     }
 
@@ -380,6 +397,7 @@ impl Store for MongoStore {
             "lease_owner": Bson::Null,
             "lease_until": Bson::Null,
             "lease_token": Bson::Null,
+            "owner": Bson::Null,
             "created_at": date(t),
             "updated_at": date(t),
         };
@@ -551,6 +569,7 @@ impl Store for MongoStore {
         &self,
         agents: &[String],
         worker: &str,
+        scope: ClaimScope,
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,
@@ -560,12 +579,28 @@ impl Store for MongoStore {
         }
         let now = truncate_ms(now);
         let until = add_ttl(now, ttl);
-        let claimable = doc! {
+        let mut claimable = doc! {
             "agent": { "$in": agents },
             "sched_at": { "$lte": date(now) },
             "$or": [ { "lease_until": Bson::Null }, { "lease_until": { "$lte": date(now) } } ],
         };
         let token = Uuid::now_v7().to_string();
+        let mut set = doc! {
+            "lease_owner": worker,
+            "lease_until": date(until),
+            "lease_token": &token,
+        };
+        match scope {
+            ClaimScope::Any => {}
+            ClaimScope::Pinned => {
+                // A second `$or` needs `$and`. `{ owner: null }` also matches a missing field.
+                claimable.insert(
+                    "$and",
+                    vec![doc! { "$or": [ { "owner": Bson::Null }, { "owner": worker } ] }],
+                );
+                set.insert("owner", worker);
+            }
+        }
         let mut claimed = 0_usize;
         let mut tried: Vec<Bson> = Vec::new();
         // A few rounds, because candidates read in step 1 can be taken by
@@ -595,14 +630,7 @@ impl Store for MongoStore {
             tried.extend(candidates.iter().cloned());
             let updated = self
                 .runs
-                .update_many(
-                    filter,
-                    doc! { "$set": {
-                        "lease_owner": worker,
-                        "lease_until": date(until),
-                        "lease_token": &token,
-                    } },
-                )
+                .update_many(filter, doc! { "$set": &set })
                 .await
                 .map_err(classify)?;
             claimed += usize::try_from(updated.modified_count).unwrap_or(usize::MAX);

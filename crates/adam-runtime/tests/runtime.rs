@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use adam_core::{DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
+use adam_core::{ClaimScope, DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
 use adam_runtime::{
     Agent, AgentError, AgentStarter, BroadcastSink, Classify, Clock, CollectingSink, Ctx, Inbound,
     LocalNotifier, MAX_RETRY_AFTER, ManualClock, RetryPolicy, RunEvent, RunView, Runtime,
@@ -1351,6 +1351,7 @@ mod cases {
             .claim_due(
                 std::slice::from_ref(&name),
                 "someone-else",
+                adam_core::ClaimScope::Any,
                 adam_core::store::now(),
                 Duration::from_secs(30),
                 10,
@@ -2774,6 +2775,196 @@ mod cases {
             RunStatus::Failed
         );
     }
+
+    const PLACEMENT_WORKERS: [&str; 3] = ["pin-a", "pin-b", "pin-c"];
+    const PLACEMENT_STEPS: u64 = 6;
+
+    /// Three runtimes (one worker id each) over one store, and what they stepped.
+    struct Placement {
+        runtimes: Vec<Runtime>,
+        name: String,
+        /// Per run, the workers that stepped it, in order.
+        seen: Arc<Mutex<HashMap<RunId, Vec<String>>>>,
+        /// The runs seeded by `seed_placement`, one per seeded worker, in `PLACEMENT_WORKERS` order.
+        seeded: Vec<RunId>,
+    }
+
+    impl Placement {
+        async fn start(&self) -> RunId {
+            self.runtimes[0]
+                .start(&self.name, Inbound::new("start", json!({"n": 0})), None)
+                .await
+                .expect("start")
+        }
+
+        fn steps(&self, run: RunId) -> Vec<String> {
+            self.seen
+                .lock()
+                .expect("lock")
+                .get(&run)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    /// Builds the three runtimes and seeds one run for each of the first `seeds` workers: the
+    /// worker runs alone, takes its run for exactly one step (which fixes the run's first
+    /// claimant, and so its owner under `Pinned`), and is stopped again with the run unfinished.
+    /// Which worker first claims a run is otherwise a race that any one worker can win (they all
+    /// poll the same store), so leaving it to the scheduler makes "more than one worker took
+    /// part" flaky under load. (With `Any` a later seed would also step the earlier runs, so
+    /// seed only as many workers as the case needs.)
+    async fn seed_placement(store: DynStore, scope: ClaimScope, seeds: usize) -> Placement {
+        let name = uniq("placement");
+        let seen = Arc::new(Mutex::new(HashMap::<RunId, Vec<String>>::new()));
+        // While set, the first step of a run waits, so the seeding worker cannot get past it
+        // before it is told to stop.
+        let hold = Arc::new(AtomicBool::new(true));
+        let runtimes: Vec<Runtime> = PLACEMENT_WORKERS
+            .into_iter()
+            .map(|worker| {
+                // One agent per runtime, so a step knows which worker runs it.
+                let agent = fn_agent(
+                    &name,
+                    step_fn({
+                        let seen = seen.clone();
+                        let hold = hold.clone();
+                        move |ctx, state| {
+                            let seen = seen.clone();
+                            let hold = hold.clone();
+                            async move {
+                                let n = state.get("n").and_then(Value::as_u64).unwrap_or(0);
+                                seen.lock()
+                                    .expect("lock")
+                                    .entry(ctx.run_id())
+                                    .or_default()
+                                    .push(worker.to_owned());
+                                let deadline = Instant::now() + Duration::from_secs(30);
+                                while n == 0 && hold.load(SeqCst) && Instant::now() < deadline {
+                                    tokio::time::sleep(Duration::from_millis(2)).await;
+                                }
+                                tokio::time::sleep(Duration::from_millis(8)).await;
+                                Ok(if n + 1 >= PLACEMENT_STEPS {
+                                    Transition::Done {
+                                        state,
+                                        output: json!(n),
+                                    }
+                                } else {
+                                    Transition::Continue(json!({ "n": n + 1 }))
+                                })
+                            }
+                            .boxed()
+                        }
+                    }),
+                );
+                builder(&store, worker, &agent)
+                    .claim_scope(scope)
+                    .concurrency(2)
+                    .build()
+            })
+            .collect();
+        assert!(runtimes.iter().all(|rt| rt.claim_scope() == scope));
+        let mut placement = Placement {
+            runtimes,
+            name,
+            seen,
+            seeded: Vec::new(),
+        };
+        for (i, worker) in PLACEMENT_WORKERS.into_iter().enumerate().take(seeds) {
+            hold.store(true, SeqCst);
+            let run = placement.start().await;
+            let running = spawn_worker(&placement.runtimes[i]);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while placement.steps(run).is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {worker} to take its run"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            // Stop first, then let the step go: the worker finishes and commits it, and (as it
+            // was told to stop before) claims nothing more.
+            let _ = running.stop.send(());
+            hold.store(false, SeqCst);
+            tokio::time::timeout(Duration::from_secs(10), running.handle)
+                .await
+                .expect("worker stops in time")
+                .expect("worker task")
+                .expect("worker result");
+            assert_eq!(
+                placement.steps(run),
+                vec![worker.to_owned()],
+                "the seed step ran on {worker} alone"
+            );
+            let view = placement.runtimes[0]
+                .view(run)
+                .await
+                .expect("view")
+                .expect("run");
+            assert_ne!(view.status, RunStatus::Done, "the seeded run is unfinished");
+            placement.seeded.push(run);
+        }
+        hold.store(false, SeqCst);
+        placement
+    }
+
+    /// With `Pinned`, a multi-step run always steps on the worker that first claimed it, while
+    /// the runs are shared out between the workers.
+    ///
+    /// Each worker owns one unfinished run before the others start, so all three necessarily take
+    /// part; then all three run together over those runs and nine new ones, and no run may
+    /// change hands, however the scheduler orders them.
+    pub async fn pinned_workers_step_a_run_only_on_its_owner(store: DynStore) {
+        let placement = seed_placement(store, ClaimScope::Pinned, PLACEMENT_WORKERS.len()).await;
+        let mut runs = placement.seeded.clone();
+        for _ in 0..9 {
+            runs.push(placement.start().await);
+        }
+        let workers: Vec<Worker> = placement.runtimes.iter().map(spawn_worker).collect();
+        for run in &runs {
+            wait_done(&placement.runtimes[0], *run).await;
+        }
+        for w in workers {
+            w.stop().await;
+        }
+        let mut took_part = HashSet::new();
+        for (i, run) in runs.iter().enumerate() {
+            let steps = placement.steps(*run);
+            assert_eq!(steps.len(), PLACEMENT_STEPS as usize, "every step ran once");
+            let owner = &steps[0];
+            assert!(
+                steps.iter().all(|w| w == owner),
+                "run {i} moved between workers: {steps:?}"
+            );
+            if let Some(seed) = PLACEMENT_WORKERS.get(i) {
+                assert_eq!(owner, seed, "a seeded run stays with its seeding worker");
+            }
+            took_part.insert(owner.clone());
+        }
+        assert_eq!(
+            took_part.len(),
+            PLACEMENT_WORKERS.len(),
+            "the work should be shared, only {took_part:?} took part"
+        );
+    }
+
+    /// The control: with `Any`, a run one worker started can be finished by another, which is
+    /// what pinning prevents (and what forked coder runs on separate disks). Here `pin-a`'s
+    /// seeded run is finished by `pin-b` alone, so it must move.
+    pub async fn any_workers_let_a_run_move_between_workers(store: DynStore) {
+        let placement = seed_placement(store, ClaimScope::Any, 1).await;
+        let run = placement.seeded[0];
+        let only_b = spawn_worker(&placement.runtimes[1]);
+        wait_done(&placement.runtimes[0], run).await;
+        only_b.stop().await;
+        let steps = placement.steps(run);
+        assert_eq!(steps.len(), PLACEMENT_STEPS as usize, "every step ran once");
+        assert_eq!(steps[0], "pin-a");
+        assert!(
+            steps[1..].iter().all(|w| w == "pin-b"),
+            "the run should have moved to pin-b: {steps:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2831,6 +3022,8 @@ macro_rules! runtime_suite {
                 cancel_only_signals_its_own_run,
                 notifier_wakes_a_worker_of_another_runtime,
                 notifier_carries_a_cancel_to_another_runtime,
+                pinned_workers_step_a_run_only_on_its_owner,
+                any_workers_let_a_run_move_between_workers,
             );
         }
     };

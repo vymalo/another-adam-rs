@@ -6,7 +6,9 @@
 //!
 //! * `adam_runs`: one row per run. `state` is `JSONB`, so runs are queryable
 //!   from SQL for dashboards and debugging. `sched_at` is the precomputed "due
-//!   at" time; claiming is a range scan on a partial index over it.
+//!   at" time; claiming is a range scan on a partial index over it. `owner`
+//!   (schema version 2) is the worker a pinned claim tied the run to; it is
+//!   never cleared, and `NULL` for a run no pinned claim has taken.
 //! * `adam_journal`: one row per recorded step, primary key `(run_id, seq)`,
 //!   deleted with its run through `ON DELETE CASCADE`.
 //!
@@ -14,7 +16,8 @@
 //!
 //! * Commits are a single `UPDATE .. WHERE version = $expected`.
 //! * Claiming uses `FOR UPDATE SKIP LOCKED`, so concurrent workers split the due
-//!   runs between them instead of queueing on the same rows.
+//!   runs between them instead of queueing on the same rows. A pinned claim adds
+//!   `owner IS NULL OR owner = $worker` and sets `owner` in the same statement.
 //! * "One open run per conversation" is a partial unique index, so it holds
 //!   even across processes.
 //! * Journal writes are `INSERT .. ON CONFLICT DO NOTHING`, then a read of the
@@ -28,8 +31,8 @@ use std::time::Duration;
 
 use adam_core::store::{add_ttl, now, sched_at, truncate_ms};
 use adam_core::{
-    JournalEntry, Lease, NewRun, RunId, RunRecord, RunStatus, RunUpdate, Store, StoreError,
-    StoreResult,
+    ClaimScope, JournalEntry, Lease, NewRun, RunId, RunRecord, RunStatus, RunUpdate, Store,
+    StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -41,7 +44,10 @@ use sqlx::{AssertSqlSafe, Executor, Row};
 use uuid::Uuid;
 
 /// Current schema version written to the `<prefix>meta` table.
-pub const SCHEMA_VERSION: i32 = 1;
+///
+/// * 1: the first schema.
+/// * 2: `runs.owner`, the worker a pinned claim ties a run to (see [`ClaimScope`]).
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Purge deletes in batches of this many runs (plus their journals).
 const PURGE_BATCH: i64 = 500;
@@ -188,7 +194,8 @@ struct Sql {
     journal_get: Arc<str>,
     journal_insert: Arc<str>,
     journal_list: Arc<str>,
-    claim_due: Arc<str>,
+    claim_due_any: Arc<str>,
+    claim_due_pinned: Arc<str>,
     renew_lease: Arc<str>,
     release_lease: Arc<str>,
     purge: Arc<str>,
@@ -222,11 +229,14 @@ impl Sql {
                     version         BIGINT      NOT NULL CHECK (version > 0),
                     lease_owner     TEXT,
                     lease_until     TIMESTAMPTZ,
+                    owner           TEXT,
                     created_at      TIMESTAMPTZ NOT NULL,
                     updated_at      TIMESTAMPTZ NOT NULL,
                     CONSTRAINT {runs_pkey} PRIMARY KEY (id)
                 )"
             ),
+            // Schema version 1 -> 2: tables made by version 1 have no owner column.
+            format!("ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS owner TEXT"),
             // Claiming: due runs per agent, earliest first.
             format!(
                 "CREATE INDEX IF NOT EXISTS {p}runs_due ON {runs} (agent, sched_at, id)
@@ -255,9 +265,12 @@ impl Sql {
                     PRIMARY KEY (run_id, seq)
                 )"
             ),
+            // Record the version, and raise it from an older one. Never lower it: a process
+            // running an older release must not undo a newer one's migration.
             format!(
                 "INSERT INTO {meta} (key, value) VALUES ('schema_version', '{SCHEMA_VERSION}')
-                 ON CONFLICT (key) DO NOTHING"
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                  WHERE {meta}.value::INT < EXCLUDED.value::INT"
             ),
         ]
         .into_iter()
@@ -296,23 +309,8 @@ impl Sql {
             journal_list: Arc::from(format!(
                 "SELECT seq, name, ok, payload, recorded_at FROM {journal} WHERE run_id = $1 ORDER BY seq"
             )),
-            claim_due: Arc::from(format!(
-                "WITH due AS (
-                    SELECT id FROM {runs}
-                     WHERE agent = ANY($1)
-                       AND sched_at <= $2
-                       AND (lease_until IS NULL OR lease_until <= $2)
-                     ORDER BY sched_at, id
-                     LIMIT $3
-                     FOR UPDATE SKIP LOCKED
-                 )
-                 UPDATE {runs} r
-                    SET lease_owner = $4, lease_until = $5
-                   FROM due
-                  WHERE r.id = due.id
-                 RETURNING r.id, r.agent, r.conversation_id, r.parent_id, r.status, r.state, r.wake_at,
-                           r.version, r.created_at, r.updated_at, r.sched_at"
-            )),
+            claim_due_any: Arc::from(claim_due_sql(&runs, ClaimScope::Any)),
+            claim_due_pinned: Arc::from(claim_due_sql(&runs, ClaimScope::Pinned)),
             renew_lease: Arc::from(format!(
                 "UPDATE {runs} SET lease_until = $4
                   WHERE id = $1 AND lease_owner = $2 AND lease_until > $3"
@@ -336,6 +334,36 @@ impl Sql {
             open_conversation_index,
         }
     }
+}
+
+/// The claiming statement. `$1` agents, `$2` now, `$3` limit, `$4` worker, `$5` lease end.
+/// The pinned form filters on `owner` and sets it (`COALESCE` keeps an existing owner).
+fn claim_due_sql(runs: &str, scope: ClaimScope) -> String {
+    let (filter, set_owner) = match scope {
+        ClaimScope::Any => ("", ""),
+        ClaimScope::Pinned => (
+            "AND (owner IS NULL OR owner = $4)",
+            ", owner = COALESCE(r.owner, $4)",
+        ),
+    };
+    format!(
+        "WITH due AS (
+            SELECT id FROM {runs}
+             WHERE agent = ANY($1)
+               AND sched_at <= $2
+               AND (lease_until IS NULL OR lease_until <= $2)
+               {filter}
+             ORDER BY sched_at, id
+             LIMIT $3
+             FOR UPDATE SKIP LOCKED
+         )
+         UPDATE {runs} r
+            SET lease_owner = $4, lease_until = $5{set_owner}
+           FROM due
+          WHERE r.id = due.id
+         RETURNING r.id, r.agent, r.conversation_id, r.parent_id, r.status, r.state, r.wake_at,
+                   r.version, r.created_at, r.updated_at, r.sched_at"
+    )
 }
 
 /// Every statement is built once in [`Sql::new`] from constant text plus the
@@ -554,6 +582,7 @@ impl Store for PgStore {
         &self,
         agents: &[String],
         worker: &str,
+        scope: ClaimScope,
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,
@@ -563,7 +592,11 @@ impl Store for PgStore {
         }
         let now = truncate_ms(now);
         let until = add_ttl(now, ttl);
-        let rows = sqlx::query(safe(&self.sql.claim_due))
+        let statement = match scope {
+            ClaimScope::Any => &self.sql.claim_due_any,
+            ClaimScope::Pinned => &self.sql.claim_due_pinned,
+        };
+        let rows = sqlx::query(safe(statement))
             .bind(agents)
             .bind(now)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))

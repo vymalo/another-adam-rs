@@ -15,7 +15,7 @@ time (for example [`adam-coder`](../adam-coder/README.md)).
 * `PgStore::from_pool(pool)`: reuse your application's `PgPool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION`.
+* `PgStore::pool()`, `SCHEMA_VERSION` (2).
 * The `Store` implementation: call `migrate()` once at boot (idempotent, safe
   from every replica).
 
@@ -34,6 +34,19 @@ Tables are `<prefix>runs` (state as `JSONB`), `<prefix>journal` (primary key
 index. No transaction is held open while agent code runs. `JSONB` cannot hold
 `\u0000`: such state is rejected with `StoreError::InvalidInput`. The guarantee
 table is in the [root README](../../README.md#how-each-adapter-guarantees-the-contract).
+
+## Schema version and the owner column
+
+`SCHEMA_VERSION` is 2. Version 2 adds `<prefix>runs.owner TEXT`, the worker a pinned claim
+(`ClaimScope::Pinned`, see [`adam-core`](../adam-core/README.md#claim-scope-and-the-run-owner))
+tied the run to. `migrate()` runs `ALTER TABLE .. ADD COLUMN IF NOT EXISTS owner TEXT`, so a
+database made by version 1 upgrades in place and keeps its runs (they have no owner), then raises
+the `schema_version` row to 2. It never lowers it: a process of an older release that migrates
+against a newer database leaves the number alone. The pinned claim adds
+`AND (owner IS NULL OR owner = $worker)` to the claiming statement and
+`owner = COALESCE(owner, $worker)` to its `UPDATE`; `release_lease` does not touch `owner`. The
+`Any` claim is the old statement, unchanged. There is no index on `owner`: the `runs_due` partial
+index does the range scan and the owner is a filter on those rows.
 
 ## Errors
 
@@ -69,6 +82,9 @@ PostgreSQL manual's error-code appendix, recalled from memory, not re-checked.
 `tests/conformance.rs` runs the shared suite against a real server.
 `tests/errors.rs` checks the classes: an undecodable row is `Corrupt` and not
 retryable (needs the server), and an unreachable server is `Transient` (offline).
+`tests/migrate.rs` builds a version 1 schema by hand with a legacy run, migrates it and checks the
+column, the version row, that the run survived and that pinning works on it; it also checks that an
+older release does not lower the version.
 Unit tests in `src/lib.rs` cover the driver-error table, and one of them
 (`sqlstates_are_classified_against_a_real_server`) provokes real SQLSTATEs
 when the server variable is set.

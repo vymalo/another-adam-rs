@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig, SkillConfig};
 use adam_a2a_runtime::RuntimeTaskBackend;
-use adam_core::DynStore;
+use adam_core::{ClaimScope, DynStore};
 use adam_runtime::{
     BroadcastSink, DynEventSink, DynNotifier, Runtime, RuntimeBuilder, RuntimeError,
 };
@@ -18,8 +18,12 @@ use crate::agent::{AGENT_NAME, CoderAgent, CoderStarter};
 /// How the runtime that advances runs is set up.
 #[derive(Debug, Clone)]
 pub struct RuntimeOptions {
-    /// Lease identity; unique per process. `None`: random.
+    /// Lease identity; unique per process. `None`: random. With
+    /// [`ClaimScope::Pinned`] it is also the run owner, so it must be stable across restarts.
     pub worker_id: Option<String>,
+    /// Whose runs the worker claims: any run (default), or only its own
+    /// ([`ClaimScope::Pinned`], for the `affinity` and `isolated` placements).
+    pub claim_scope: ClaimScope,
     /// Runs advanced at the same time by this process.
     pub concurrency: usize,
     /// How long a claimed run stays leased without renewal.
@@ -33,6 +37,7 @@ impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
             worker_id: None,
+            claim_scope: ClaimScope::Any,
             concurrency: 4,
             lease_ttl: Duration::from_secs(30),
             poll_interval: Duration::from_millis(250),
@@ -140,6 +145,7 @@ impl Coder {
         } = live;
         let mut builder = builder
             .event_sink(sink)
+            .claim_scope(options.claim_scope)
             .concurrency(options.concurrency)
             .lease_ttl(options.lease_ttl)
             .poll_interval(options.poll_interval);

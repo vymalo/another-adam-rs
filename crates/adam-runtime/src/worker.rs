@@ -33,7 +33,8 @@ impl Runtime {
     ///
     /// Up to `concurrency` runs are advanced at the same time, at most one
     /// step per run. A run that `Continue`s is committed, released and picked
-    /// up again by the next claim (by any worker), which keeps scheduling fair.
+    /// up again by the next claim (by any worker, unless the runtime claims with
+    /// [`ClaimScope::Pinned`](adam_core::ClaimScope::Pinned): then only by the run's owner), which keeps scheduling fair.
     ///
     /// On shutdown no new runs are claimed, in-flight transitions finish and
     /// commit, and their leases are released before this returns. To stop
@@ -88,6 +89,7 @@ impl Runtime {
                     .claim_due(
                         &agents,
                         &inner.cfg.worker_id,
+                        inner.cfg.claim_scope,
                         inner.clock.now(),
                         inner.cfg.lease_ttl,
                         free,

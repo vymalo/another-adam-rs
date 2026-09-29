@@ -23,7 +23,7 @@ over A2A).
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::cancelled` / `CancelToken` observe a cancel |
-| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name) |
+| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`) |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
@@ -110,6 +110,27 @@ is front and worker in one). Across processes use an adapter:
 port, `EventSink` (`PgEventSink` carries them); a `Notifier` carries only the two
 signals above.
 
+## Pinning runs to a worker
+
+By default a run moves between workers at every step: a `Continue` is committed, the lease is
+released, and the next claim (by any worker) takes it. That is right when every worker sees the
+same files. It is wrong when a run's files live on one worker's disk, because a step that lands
+elsewhere finds no files (for the coder, a second clone, a second branch and a second pull request;
+see [ADR 0002](../../docs/decisions/0002-workspace-placement.md)).
+
+`RuntimeBuilder::claim_scope(ClaimScope::Pinned)` makes the worker claim with
+`adam_core::ClaimScope::Pinned`: it takes only runs without an owner or owned by its
+`worker_id`, and the first claim makes it the owner. Then a run always steps on one worker.
+
+* **Set a stable `worker_id`.** The default id is random per process, so after a restart the
+  worker would not recognise its own runs. Use a name that survives restarts (a StatefulSet pod
+  name).
+* **A run whose owner never comes back is stranded.** Nothing adopts it and nothing reports it.
+  Adoption is future work (ADR 0002).
+* The scope is the runtime's choice; `adam-runtime` does not depend on `adam-host`. A host maps
+  `Placement::pins_runs()` to `ClaimScope::Pinned`. `adam-coder` does it from `WORKSPACE_PLACEMENT`.
+* `start`, `deliver`, `cancel` and `view` are unaffected: they never claim.
+
 ## Errors
 
 `AgentError` and `RuntimeError` implement `adam_error::Classify`; the worker
@@ -150,7 +171,11 @@ No Cargo features, no environment variables at runtime.
 ## Tests
 
 `tests/runtime.rs` is one behavioural suite (including
-`a_starter_only_runtime_starts_and_a_full_runtime_steps`, and the two
+`a_starter_only_runtime_starts_and_a_full_runtime_steps`, the pair
+`pinned_workers_step_a_run_only_on_its_owner` (three workers, each first seeded alone with one
+unfinished run so all three own something, then twelve six-step runs stepped together: each run
+steps on one worker only) and its control
+`any_workers_let_a_run_move_between_workers` (a run seeded by one worker is finished by another), and the two
 `notifier_*` cases: two runtimes over one store and one `LocalNotifier`, a 30 s poll, a 5 s deadline) run against `MemoryStore` always,
 against PostgreSQL and against MongoDB when their variables are set. Unit
 tests sit in `src/cancel.rs`, `ctx.rs`, `events.rs`, `notify.rs` and `retry.rs`, and the

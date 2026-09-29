@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 
-use adam_core::{DynStore, NewRun, RunId, RunRecord, RunStatus, RunUpdate, StoreError};
+use adam_core::{ClaimScope, DynStore, NewRun, RunId, RunRecord, RunStatus, RunUpdate, StoreError};
 use adam_error::{BoxError, Classify, ErrorClass};
 
 use crate::agent::{Agent, AgentError, AgentStarter, Inbound};
@@ -163,6 +163,7 @@ impl RunView {
 
 pub(crate) struct Config {
     pub worker_id: String,
+    pub claim_scope: ClaimScope,
     pub lease_ttl: Duration,
     pub poll_interval: Duration,
     pub retry: RetryPolicy,
@@ -354,8 +355,26 @@ impl RuntimeBuilder {
 
     /// Identity written into leases. Must be unique per worker process (or
     /// per `Runtime` when several share a store). Default: random.
+    ///
+    /// With [`claim_scope(ClaimScope::Pinned)`](Self::claim_scope) it is also the
+    /// run *owner*, so it must be **stable across restarts** (a StatefulSet pod
+    /// name, not a random id), or the runs it owns are never claimed again.
     pub fn worker_id(mut self, id: impl Into<String>) -> Self {
         self.cfg.worker_id = id.into();
+        self
+    }
+
+    /// Whose runs [`Runtime::run_worker`] may claim. Default: [`ClaimScope::Any`],
+    /// where any worker takes any due run.
+    ///
+    /// With [`ClaimScope::Pinned`] a run stays on the worker that first claimed
+    /// it: no other worker steps it, not even after the owner's lease expired.
+    /// Use it when a run's files live on one worker (workspace placements
+    /// `affinity` and `isolated`). A run whose owner never returns is stranded;
+    /// see [ADR 0002](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0002-workspace-placement.md).
+    /// Set a stable [`worker_id`](Self::worker_id) with it.
+    pub fn claim_scope(mut self, scope: ClaimScope) -> Self {
+        self.cfg.claim_scope = scope;
         self
     }
 
@@ -439,6 +458,7 @@ impl Runtime {
             notifier: None,
             cfg: Config {
                 worker_id: format!("worker-{}", uuid::Uuid::new_v4()),
+                claim_scope: ClaimScope::Any,
                 lease_ttl: Duration::from_secs(30),
                 poll_interval: Duration::from_millis(250),
                 retry: RetryPolicy::default(),
@@ -456,6 +476,11 @@ impl Runtime {
     /// This runtime's lease identity.
     pub fn worker_id(&self) -> &str {
         &self.inner.cfg.worker_id
+    }
+
+    /// Whose runs this runtime's worker claims.
+    pub fn claim_scope(&self) -> ClaimScope {
+        self.inner.cfg.claim_scope
     }
 
     /// Names of every registration, agents and starters alike, sorted.

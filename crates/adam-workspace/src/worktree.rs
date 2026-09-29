@@ -278,8 +278,7 @@ impl Worktree {
         // Equivalent of `--set-upstream`. Done by hand and under the repo lock
         // because the branch config lives in the mirror's shared config file,
         // which concurrent pushes of different runs would otherwise race on.
-        let lock = self.ws.lock_for(&self.mirror);
-        let _guard = lock.lock().await;
+        let _guard = self.ws.lock_mirror(&self.mirror).await?;
         let key = |k: &str| format!("branch.{}.{k}", self.branch);
         self.ws
             .mirror_git(&self.mirror)

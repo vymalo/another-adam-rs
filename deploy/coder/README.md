@@ -6,7 +6,8 @@ own CloudNativePG database, for the `netcup-k8s` cluster.
 
 | Object | What |
 |---|---|
-| `StatefulSet` | 1 replica (MVP; the worker with `topology: split`), PVC `work` at `/work` on `longhorn` (mirrors and worktrees persist), `fsGroupChangePolicy: OnRootMismatch`, uid/gid 10001, probes on `/healthz` |
+| `StatefulSet` | `replicaCount` replicas (1 by default; the worker with `topology: split`), `work` at `/work`: a PVC per pod on `longhorn` by default (mirrors and worktrees persist), or one shared claim, see [Workspace placement](#workspace-placement); `fsGroupChangePolicy: OnRootMismatch`, uid/gid 10001, probes on `/healthz` |
+| `PersistentVolumeClaim` | `workspace.placement` `shared` or `affinity` without `workspace.sharedVolume.existingClaim` only: `<release>-coder-work`, ReadWriteMany, kept on `helm uninstall` |
 | `Deployment` | `topology: split` only: the front (`<release>-coder-front`), `ROLE=control-plane`, no volume, `front.replicas` replicas |
 | `PodDisruptionBudget` | `topology: split` with `front.replicas` above 1: `minAvailable: 1` for the front |
 | `Service` | ClusterIP only. **No Ingress**: the orchestrator reaches it in-cluster over A2A with a bearer token |
@@ -92,11 +93,49 @@ rollout):
 
 * `topology` must be `combined` or `split`.
 * `config.role` must be empty with `split` (the chart sets `ROLE` itself).
-* `replicaCount` above 1 is refused in both topologies. **Behaviour change:** before this
-  guard, `replicaCount: 2` rendered. It was never safe: runs move between workers at every
-  step, so a second worker without a shared `/work` continues a run on a checkout that is not
-  there and forks it into a second pull request. It will be allowed once workspace placement
-  exists (planned).
+* `workspace.placement` must be empty, `shared`, `affinity` or `isolated`. `a2a-only` is
+  refused: every tool of the coder needs a workspace.
+* `replicaCount` above 1 needs a `workspace.placement` (for a role that runs workers, which is
+  every `topology: split` worker). Before this chart version it was refused outright; it was
+  never safe without a placement, because runs move between workers at every step (see below).
+* `shared` and `affinity` need `workspace.sharedVolume.storageClass` or
+  `workspace.sharedVolume.existingClaim`: there is no default class, because most storage
+  classes cannot serve ReadWriteMany and the claim would stay `Pending`.
+
+## Workspace placement
+
+A run moves between workers at every step, and the coder keeps its worktree in one worker's
+`/work`. With more than one worker and no plan, a run that lands on a worker without its
+worktree silently forks into a second pull request. `workspace.placement` is the plan
+([ADR 0002](../../docs/decisions/0002-workspace-placement.md)); the chart passes it to the
+binary as `WORKSPACE_PLACEMENT` (`crates/adam-coder/README.md`, "Workspace placement").
+
+| `workspace.placement` | `/work` | Env on the roles that run workers | Runs |
+|---|---|---|---|
+| empty (default) | a PVC per pod (`volumeClaimTemplates`, `persistence.*`) | none: the binary defaults to `shared`, which for one worker is the same thing | any worker; `replicaCount` above 1 refused |
+| `isolated` | a PVC per pod, as above | `WORKSPACE_PLACEMENT=isolated`, `WORKER_ID` = pod name | pinned to the worker that first claimed them |
+| `affinity` | one ReadWriteMany claim for all pods (`workspace.sharedVolume.*`); each worker uses `/work/<pod name>` | `WORKSPACE_PLACEMENT=affinity`, `WORKER_ID` = pod name | pinned |
+| `shared` | the same one claim, used as it is by every worker | `WORKSPACE_PLACEMENT=shared` | any worker may step any run |
+| `a2a-only` | refused | | |
+
+* `WORKER_ID` comes from the downward API (`metadata.name`): the pod name of a StatefulSet
+  is stable across restarts, which is what makes a pinned run find its worker again. It is set
+  only for `affinity` and `isolated`, the placements that pin runs (the binary exits 78 without
+  it); `shared` lets the process pick its own lease identity.
+* With `config.role=control-plane` (a `combined` pod that runs no workers) neither variable is
+  rendered, and a placement is not required for `replicaCount` above 1.
+* `workspace.sharedVolume` (`existingClaim`, `storageClass`, `size`, `accessModes`, default
+  `ReadWriteMany`) is used by `shared` and `affinity` only. With `existingClaim` the chart
+  creates no claim. The claim it does create is annotated `helm.sh/resource-policy: keep`.
+  The volume must be writable by uid/gid 10001: the chart sets `fsGroup: 10001`, which some
+  network file systems ignore, so check the mount if a worker cannot create its folder.
+* **Switching placement changes the volumes.** `volumeClaimTemplates` are immutable: going
+  between the per-pod volume (empty, `isolated`) and the shared one (`shared`, `affinity`)
+  needs `kubectl delete statefulset <release>-coder --cascade=orphan` before `helm upgrade`. The
+  old per-pod PVCs stay, and their worktrees are not visible on the shared volume. Moving
+  between `isolated` and empty, or `shared` and `affinity`, only adds or removes the env.
+* Moving a running release from empty to a pinning placement is safe for runs in flight: a
+  run with no owner is claimed, and so owned, by the first worker that steps it.
 
 ## Role
 
@@ -132,11 +171,21 @@ exposed by the chart.
 
 * **No database backups.** Losing the CNPG volume loses the run ledger (what
   is running, what finished), not the pushed branches or pull requests.
-* **One worker.** Runs move between workers at every step (`adam-runtime`'s worker), and
-  worktrees live on a ReadWriteOnce volume, so a second worker without a shared `/work` forks a
-  run into a second pull request. The chart refuses `replicaCount` above 1 until workspace
-  placement exists (planned). The front (`topology: split`) is stateless and scales with
-  `front.replicas`.
+* **A pinned run whose worker never returns is stranded.** With `affinity` or `isolated` a
+  run is stepped only by the worker that first claimed it. If that pod is scaled in, or its
+  volume is deleted (always the case for `isolated` when the PVC is lost), no other worker
+  claims the run and nothing reports it. Adoption is future work (ADR 0002, Consequences). Keep
+  `replicaCount` from going down and keep the volumes; do not use `isolated` for storage you
+  cannot afford to lose.
+* **`flock` on network volumes is unverified.** `shared` relies on the cross-process mirror
+  lock, which uses `flock(2)` on the volume. *Unverified 2026-09-29* for NFS and for Longhorn
+  RWX (which is NFS behind a share manager). Before relying on `shared` on such a volume, run
+  two workers against one repository. `affinity` gives each worker its own folder, so two
+  workers never share a mirror; it still needs the ReadWriteMany volume but not a working
+  `flock`.
+* **The chart has not been applied with more than one worker.** The renders are checked
+  (`tests/render-check.sh`, kubeconform); a live two-worker rollout is not. The front
+  (`topology: split`) is stateless and scales with `front.replicas`.
 * The `NetworkPolicy` depends on the cluster's CNI enforcing policies (it is
   otherwise inert) and on the namespace label `kubernetes.io/metadata.name`
   (set automatically by Kubernetes 1.21+).

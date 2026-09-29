@@ -60,6 +60,31 @@ operator named. The token reaches `git` only through the environment of one
 invocation: never in a remote URL, `.git/config`, logs or error messages.
 URLs with embedded credentials and ssh/scp forms are refused.
 
+## Sharing a root between processes
+
+Several worker processes may use one root (the `shared` placement of
+[ADR 0002](../../docs/decisions/0002-workspace-placement.md): one RWX volume mounted by every
+worker). `prepare`, `remove` and `Worktree::push` change a mirror (`fetch`, `worktree add` and
+`remove`, config writes), and git's own lock files make a second process fail with "could not
+lock". So each of them takes two locks on the mirror, in this order:
+
+1. the in-process async lock of the mirror (as before), then
+2. an exclusive advisory file lock on `<mirror>.lock`, with `std::fs::File::lock` (`flock(2)` on
+   Linux), taken on a blocking thread. The file is a sibling of the mirror directory
+   (`git/<host>/<owner>/<name>.git.lock`), never inside it. The lock ends with the file handle, so
+   a crashed process frees it.
+
+*Verified 2026-09-29:* `File::lock` and `File::unlock` are stable since Rust 1.89 (the MSRV is
+1.94), and a second handle on the same file gets `WouldBlock` from `try_lock` until the first one
+unlocks (a test program built with 1.94.1). *Unverified:* that `flock` is honoured on **NFS and
+Longhorn RWX** volumes. A volume that refuses the lock fails the operation with
+`WorkspaceError::Io` ("cannot lock the mirror") instead of running unlocked. Test two workers
+against one repository on your volume before relying on it. The lock covers the mirror only:
+two processes still must not prepare the *same run* at once (a run has one lease holder).
+
+A root that belongs to one worker (the `affinity` and `isolated` placements) pays for one
+uncontended `flock` per operation and gains nothing.
+
 ## Errors
 
 `WorkspaceError` implements `adam_error::Classify` (see
@@ -100,7 +125,12 @@ Offline. The `git` CLI must be on `PATH`.
 
 * `tests/workspace.rs`: worktrees against local bare repositories, the host
   allowlist, local-path policy, scoped tokens, and a `wiremock` "evil" git
-  host that must never be contacted.
+  host that must never be contacted. Two cases cover the file lock:
+  `two_workspaces_on_one_root_do_not_trip_over_each_others_git_locks` (two `Workspaces` on one
+  root, which share no in-process lock, run 16 prepare/commit/push/remove tasks; without the file
+  lock it fails with "could not lock" in 5 of 5 runs) and
+  `a_mirror_locked_by_another_process_makes_prepare_wait` (a lock held on the lock file blocks
+  `prepare` until it is released).
 * `tests/github.rs`: the `GitHub` code host against a `wiremock` server,
   including error classes, `Retry-After` and transport source chains.
 * Unit tests in `src/error.rs` (`class_table` and the source-chain checks) and

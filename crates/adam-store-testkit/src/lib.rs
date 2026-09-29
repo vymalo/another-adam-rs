@@ -28,7 +28,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use adam_core::store::{now, truncate_ms};
-use adam_core::{DynStore, JournalEntry, NewRun, RunId, RunStatus, RunUpdate, StoreError};
+use adam_core::{
+    ClaimScope, DynStore, JournalEntry, NewRun, RunId, RunStatus, RunUpdate, StoreError,
+};
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use serde_json::json;
@@ -50,7 +52,12 @@ macro_rules! store_conformance {
             journal_detects_nondeterminism, journal_requires_run,
             claim_respects_due_rules, claim_filters_agents_and_limit,
             claim_is_exclusive_under_concurrency, lease_expiry_allows_takeover,
-            renew_and_release_lease, conversation_single_open_run,
+            renew_and_release_lease,
+            pinned_claim_never_gives_a_run_to_another_worker,
+            pinned_claim_sets_the_owner_on_first_claim,
+            any_claim_ignores_and_never_sets_the_owner,
+            pinned_claims_are_exclusive_and_stable_under_concurrency,
+            conversation_single_open_run,
             conversation_race_single_winner, purge_finished_runs,
         );
     };
@@ -527,7 +534,7 @@ pub mod cases {
         let now = now() + chrono::Duration::seconds(1);
         let ttl = Duration::from_secs(60);
         let leases = store
-            .claim_due(std::slice::from_ref(&a), "w", now, ttl, 3)
+            .claim_due(std::slice::from_ref(&a), "w", ClaimScope::Any, now, ttl, 3)
             .await
             .unwrap();
         assert_eq!(leases.len(), 3, "limit is honoured");
@@ -540,20 +547,20 @@ pub mod cases {
         assert_eq!(first_three, a_ids[..3].to_vec(), "earliest sched_at first");
 
         let rest = store
-            .claim_due(&[a.clone(), b.clone()], "w", now, ttl, 100)
+            .claim_due(&[a.clone(), b.clone()], "w", ClaimScope::Any, now, ttl, 100)
             .await
             .unwrap();
         assert_eq!(rest.len(), 2 + 5);
         assert!(
             store
-                .claim_due(&[], "w", now, ttl, 100)
+                .claim_due(&[], "w", ClaimScope::Any, now, ttl, 100)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
-                .claim_due(std::slice::from_ref(&a), "w", now, ttl, 0)
+                .claim_due(std::slice::from_ref(&a), "w", ClaimScope::Any, now, ttl, 0)
                 .await
                 .unwrap()
                 .is_empty()
@@ -580,6 +587,7 @@ pub mod cases {
                         .claim_due(
                             std::slice::from_ref(&agent),
                             &format!("w{w}"),
+                            ClaimScope::Any,
                             now,
                             Duration::from_secs(60),
                             4,
@@ -708,6 +716,205 @@ pub mod cases {
                 .unwrap()
         );
         store.release_lease(RunId::new(), "w1").await.unwrap();
+    }
+
+    /// Once a run has an owner, a pinned claim by another worker never gets it: not while it
+    /// is released, not after the owner's lease expired, not after a commit.
+    pub async fn pinned_claim_never_gives_a_run_to_another_worker(store: DynStore) {
+        let agent = agent();
+        let mut mine = Vec::new();
+        for i in 0..3 {
+            mine.push(
+                store
+                    .create_run(NewRun::new(&agent, json!(i)))
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        mine.sort();
+        let t = now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(30);
+        let pinned = ClaimScope::Pinned;
+
+        // Order is not the point here (a commit moves a run to the back), membership is.
+        let claim = |worker: &'static str, at: DateTime<Utc>| {
+            let (store, agent) = (store.clone(), agent.clone());
+            async move {
+                let mut ids = claim_ids_as(&store, pinned, &agent, worker, at, ttl, 10).await;
+                ids.sort();
+                ids
+            }
+        };
+
+        assert_eq!(claim("w1", t).await, mine, "w1 takes every unowned run");
+        for id in &mine {
+            store.release_lease(*id, "w1").await.unwrap();
+        }
+        assert!(
+            claim("w2", t).await.is_empty(),
+            "w2 must not take w1's runs"
+        );
+        // A step commits in between; the owner survives a commit.
+        let record = store.load_run(mine[0]).await.unwrap().unwrap();
+        store
+            .commit_run(
+                record.id,
+                record.version,
+                RunUpdate::new(RunStatus::Runnable, json!("stepped")),
+            )
+            .await
+            .unwrap();
+        assert!(
+            claim("w2", t).await.is_empty(),
+            "a commit does not free the owner"
+        );
+        assert_eq!(claim("w1", t).await, mine, "w1 gets them all back");
+        // The owner's lease runs out (a crashed worker): the run is stranded, not adopted.
+        let after = t + chrono::Duration::seconds(31);
+        assert!(
+            claim("w2", after).await.is_empty(),
+            "an expired lease does not hand a pinned run to another worker"
+        );
+        assert_eq!(
+            claim("w1", after).await,
+            mine,
+            "the owner can take its runs after the lease expired"
+        );
+        for id in &mine {
+            store.release_lease(*id, "w1").await.unwrap();
+        }
+        // A run created later has no owner yet: the first pinned claimant gets it for good.
+        let late = store
+            .create_run(NewRun::new(&agent, json!("late")))
+            .await
+            .unwrap();
+        let later = after + chrono::Duration::seconds(1);
+        assert_eq!(claim("w2", later).await, vec![late.id]);
+        store.release_lease(late.id, "w2").await.unwrap();
+        assert!(
+            !claim("w1", later).await.contains(&late.id),
+            "w1 must not take w2's run"
+        );
+        assert_eq!(claim("w2", later).await, vec![late.id]);
+    }
+
+    /// The first pinned claim sets the owner; release, commit and unpinned claims leave it.
+    pub async fn pinned_claim_sets_the_owner_on_first_claim(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let t = now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(30);
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+        store.release_lease(run.id, "w1").await.unwrap();
+        // An unpinned claim still takes the run (the owner is ignored) ...
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Any, &agent, "w2", t, ttl, 1).await,
+            vec![run.id]
+        );
+        store.release_lease(run.id, "w2").await.unwrap();
+        // ... and it did not change the owner.
+        assert!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w2", t, ttl, 1)
+                .await
+                .is_empty(),
+            "w1 is still the owner"
+        );
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+    }
+
+    /// `ClaimScope::Any` behaves as before owners existed: it never sets an owner.
+    pub async fn any_claim_ignores_and_never_sets_the_owner(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let t = now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(30);
+        for worker in ["w1", "w2", "w1", "w3"] {
+            assert_eq!(
+                claim_ids_as(&store, ClaimScope::Any, &agent, worker, t, ttl, 1).await,
+                vec![run.id],
+                "{worker} takes the run"
+            );
+            store.release_lease(run.id, worker).await.unwrap();
+        }
+        // No owner was set, so the first pinned claimant wins it.
+        assert_eq!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w4", t, ttl, 1).await,
+            vec![run.id]
+        );
+        store.release_lease(run.id, "w4").await.unwrap();
+        assert!(
+            claim_ids_as(&store, ClaimScope::Pinned, &agent, "w1", t, ttl, 1)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// Workers racing on pinned claims split the runs exactly once, and each worker then gets
+    /// back exactly the runs it first took.
+    pub async fn pinned_claims_are_exclusive_and_stable_under_concurrency(store: DynStore) {
+        let agent = agent();
+        let total = 48;
+        for i in 0..total {
+            store
+                .create_run(NewRun::new(&agent, json!(i)))
+                .await
+                .unwrap();
+        }
+        let t = now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(60);
+        let workers = (0..4).map(|w| {
+            let store = store.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                let name = format!("w{w}");
+                let mut mine = Vec::new();
+                loop {
+                    let got =
+                        claim_ids_as(&store, ClaimScope::Pinned, &agent, &name, t, ttl, 3).await;
+                    if got.is_empty() {
+                        return (name, mine);
+                    }
+                    mine.extend(got);
+                }
+            })
+        });
+        let split: Vec<(String, Vec<RunId>)> = join_all(workers)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        let all: Vec<RunId> = split.iter().flat_map(|(_, ids)| ids.clone()).collect();
+        let unique: HashSet<_> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len(), "a run was claimed twice");
+        assert_eq!(unique.len(), total, "every run is claimed exactly once");
+
+        for (name, ids) in &split {
+            for id in ids {
+                store.release_lease(*id, name).await.unwrap();
+            }
+        }
+        // A second round: each worker sees exactly its own runs, in any amount.
+        for (name, ids) in &split {
+            let mut again =
+                claim_ids_as(&store, ClaimScope::Pinned, &agent, name, t, ttl, 100).await;
+            let mut want = ids.clone();
+            again.sort();
+            want.sort();
+            assert_eq!(again, want, "{name} gets back its own runs and no others");
+        }
     }
 
     pub async fn conversation_single_open_run(store: DynStore) {
@@ -893,8 +1100,20 @@ pub mod cases {
         ttl: Duration,
         limit: usize,
     ) -> Vec<RunId> {
+        claim_ids_as(store, ClaimScope::Any, agent, worker, now, ttl, limit).await
+    }
+
+    async fn claim_ids_as(
+        store: &DynStore,
+        scope: ClaimScope,
+        agent: &str,
+        worker: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> Vec<RunId> {
         store
-            .claim_due(&[agent.to_owned()], worker, now, ttl, limit)
+            .claim_due(&[agent.to_owned()], worker, scope, now, ttl, limit)
             .await
             .unwrap()
             .into_iter()

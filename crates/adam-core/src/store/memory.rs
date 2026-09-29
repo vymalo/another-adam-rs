@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use super::{
-    JournalEntry, Lease, NewRun, RunId, RunRecord, RunUpdate, Store, StoreError, StoreResult,
-    add_ttl, now, truncate_ms,
+    ClaimScope, JournalEntry, Lease, NewRun, RunId, RunRecord, RunUpdate, Store, StoreError,
+    StoreResult, add_ttl, now, truncate_ms,
 };
 
 #[derive(Default)]
@@ -27,6 +27,8 @@ struct Inner {
 struct Slot {
     run: RunRecord,
     lease: Option<(String, DateTime<Utc>)>,
+    /// Set by the first [`ClaimScope::Pinned`] claim; never cleared.
+    owner: Option<String>,
 }
 
 impl MemoryStore {
@@ -88,6 +90,7 @@ impl Store for MemoryStore {
             Slot {
                 run: run.clone(),
                 lease: None,
+                owner: None,
             },
         );
         Ok(run)
@@ -185,6 +188,7 @@ impl Store for MemoryStore {
         &self,
         agents: &[String],
         worker: &str,
+        scope: ClaimScope,
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,
@@ -198,6 +202,10 @@ impl Store for MemoryStore {
             .filter(|s| agents.contains(&s.run.agent))
             .filter(|s| s.run.sched_at().is_some_and(|at| at <= now))
             .filter(|s| s.lease.as_ref().is_none_or(|(_, u)| *u <= now))
+            .filter(|s| match scope {
+                ClaimScope::Any => true,
+                ClaimScope::Pinned => s.owner.as_deref().is_none_or(|owner| owner == worker),
+            })
             .map(|s| (s.run.sched_at(), s.run.id))
             .collect();
         due.sort();
@@ -211,6 +219,12 @@ impl Store for MemoryStore {
                 )]
                 let slot = inner.runs.get_mut(&id).expect("just listed");
                 slot.lease = Some((worker.to_owned(), until));
+                match scope {
+                    ClaimScope::Any => {}
+                    ClaimScope::Pinned => {
+                        slot.owner.get_or_insert_with(|| worker.to_owned());
+                    }
+                }
                 Lease {
                     run: slot.run.clone(),
                     worker: worker.to_owned(),
