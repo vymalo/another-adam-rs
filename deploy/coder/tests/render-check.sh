@@ -52,6 +52,7 @@ check "the agent card URL is the in-cluster Service" has 'http://coder.coder-ns.
 check "repositories are restricted to github.com by default" has 'name: ALLOWED_REPO_HOSTS'
 check "the default allowlist is exactly github.com" has 'value: "github.com"'
 check "local repositories are never enabled by the chart" lacks 'ALLOW_LOCAL_REPOS'
+check "the GitHub API is api.github.com by default" has 'value: "https://api.github.com"'
 
 # Overrides take effect (values-driven, not hard-coded).
 helm template coder "$chart" --namespace coder-ns \
@@ -63,7 +64,9 @@ check "the allowed namespace is values-driven" has 'kubernetes.io/metadata.name:
 check "the storage class is values-driven" has 'storageClassName: "fast"'
 
 helm template coder "$chart" --namespace coder-ns \
-  --set 'config.allowedRepoHosts={github.com,ghe.example.com:8443}' > "$out"
+  --set 'config.allowedRepoHosts={github.com,ghe.example.com:8443}' \
+  --set config.githubApiUrl=https://ghe.example.com/api/v3 > "$out"
 check "the repository allowlist is values-driven and comma-joined" has 'value: "github.com,ghe.example.com:8443"'
+check "the GitHub API URL is values-driven" has 'value: "https://ghe.example.com/api/v3"'
 
 [ "$fail" -eq 0 ] && echo "render checks passed" || { echo "render checks FAILED"; exit 1; }

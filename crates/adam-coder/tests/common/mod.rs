@@ -510,16 +510,20 @@ pub async fn try_raw(
 }
 
 /// The official A2A client for the server at `addr`, authenticating with
-/// `token`. The agent card's `url` decides where requests go, so the server's
-/// `PUBLIC_URL` must be reachable at `addr`.
+/// `token`. The card says where requests go (the server's `PUBLIC_URL`, which
+/// in a test is not where it listens), so the card's URLs are pointed at
+/// `addr` first.
 pub async fn a2a_client(
     addr: std::net::SocketAddr,
     token: &str,
 ) -> a2a_client::A2AClient<Box<dyn a2a_client::Transport>> {
-    let card = a2a_client::agent_card::AgentCardResolver::new(None)
+    let mut card = a2a_client::agent_card::AgentCardResolver::new(None)
         .resolve(&format!("http://{addr}"))
         .await
         .expect("the agent card");
+    for interface in &mut card.supported_interfaces {
+        interface.url = format!("http://{addr}/");
+    }
     a2a_client::A2AClientFactory::builder()
         .with_interceptor(Arc::new(a2a_client::auth::AuthInterceptor::bearer(token)))
         .build()

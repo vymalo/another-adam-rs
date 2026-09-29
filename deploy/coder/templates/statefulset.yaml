@@ -64,6 +64,8 @@ spec:
               value: {{ .Values.config.checkTimeoutSecs | quote }}
             - name: ALLOWED_REPO_HOSTS
               value: {{ join "," .Values.config.allowedRepoHosts | quote }}
+            - name: GITHUB_API_URL
+              value: {{ .Values.config.githubApiUrl | quote }}
             - name: PR_DRAFT
               value: {{ .Values.config.prDraft | quote }}
             - name: GIT_AUTHOR_NAME

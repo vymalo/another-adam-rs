@@ -36,9 +36,9 @@ environment variable it reads it from).
 `config.allowedRepoHosts` (default `github.com`; env `ALLOWED_REPO_HOSTS`) lists
 the hosts a task may name a repository on. `GITHUB_TOKEN` is only ever sent to
 those hosts: any other host, a local path or a URL with embedded credentials is
-refused before git runs. For GitHub Enterprise add its host (and set
-`config.extraEnv.GITHUB_API_URL` to `https://<host>/api/v3` once the coder
-supports it). `ALLOW_LOCAL_REPOS` is for development and tests and is not
+refused before git runs. For GitHub Enterprise add its host and set
+`config.githubApiUrl` (env `GITHUB_API_URL`, default `https://api.github.com`) to
+`https://<host>/api/v3`. `ALLOW_LOCAL_REPOS` is for development and tests and is not
 exposed by the chart.
 
 ## Known risks

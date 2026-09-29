@@ -10,6 +10,7 @@
 //! | `GITHUB_TOKEN` | git push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required |
 //! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them | `github.com` |
 //! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
+//! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
 //! | `WORKSPACE_ROOT` | mirrors and worktrees (persistent storage) | `/work` |
 //! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required, non-empty (fail closed) |
 //! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required |
@@ -60,6 +61,8 @@ pub struct Config {
     pub allowed_repo_hosts: Vec<String>,
     /// `ALLOW_LOCAL_REPOS`.
     pub allow_local_repos: bool,
+    /// `GITHUB_API_URL`.
+    pub github_api_url: Url,
     /// `WORKSPACE_ROOT`.
     pub workspace_root: PathBuf,
     /// `A2A_BEARER_TOKENS`.
@@ -95,6 +98,7 @@ impl std::fmt::Debug for Config {
             .field("opencode_model", &self.opencode_model)
             .field("allowed_repo_hosts", &self.allowed_repo_hosts)
             .field("allow_local_repos", &self.allow_local_repos)
+            .field("github_api_url", &self.github_api_url.as_str())
             .field("workspace_root", &self.workspace_root)
             .field("a2a_bearer_tokens", &self.a2a_bearer_tokens.len())
             .field("public_url", &self.public_url.as_str())
@@ -229,13 +233,27 @@ impl Config {
                 hosts
             }
         };
+        let github_api_url = match get("GITHUB_API_URL") {
+            None => Url::parse(DEFAULT_GITHUB_API_URL).ok(),
+            Some(raw) => match Url::parse(raw.trim()) {
+                Ok(u) if matches!(u.scheme(), "http" | "https") && u.host().is_some() => Some(u),
+                Ok(_) => {
+                    problems.push("GITHUB_API_URL must be an http(s) URL".into());
+                    None
+                }
+                Err(e) => {
+                    problems.push(format!("GITHUB_API_URL is not a URL: {e}"));
+                    None
+                }
+            },
+        };
         let opencode_command: Vec<String> = get("OPENCODE_COMMAND")
             .unwrap_or_else(|| "opencode acp".to_owned())
             .split_whitespace()
             .map(str::to_owned)
             .collect();
 
-        let Some(public_url) = public_url else {
+        let (Some(public_url), Some(github_api_url)) = (public_url, github_api_url) else {
             return Err(ConfigError { problems });
         };
         if !problems.is_empty() {
@@ -250,6 +268,7 @@ impl Config {
             github_token: SecretString::from(github_token),
             allowed_repo_hosts,
             allow_local_repos,
+            github_api_url,
             workspace_root,
             a2a_bearer_tokens,
             public_url,
@@ -269,6 +288,8 @@ impl Config {
 
 /// Repository host used when `ALLOWED_REPO_HOSTS` is unset.
 const DEFAULT_REPO_HOST: &str = "github.com";
+/// API root used when `GITHUB_API_URL` is unset.
+const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
 
 /// `name` or `name:port`: letters, digits, dots and dashes, nothing that could
 /// smuggle a scheme, path, userinfo or wildcard into an allowlist.
@@ -338,6 +359,7 @@ mod tests {
         assert_eq!(c.opencode_command, ["opencode", "acp"]);
         assert_eq!(c.allowed_repo_hosts, ["github.com"]);
         assert!(!c.allow_local_repos, "local repositories are opt-in");
+        assert_eq!(c.github_api_url.as_str(), "https://api.github.com/");
         let tokens: Vec<_> = c
             .a2a_bearer_tokens
             .iter()
@@ -431,5 +453,30 @@ mod tests {
                 err.problems
             );
         }
+    }
+
+    #[test]
+    fn github_api_url_and_local_repos_are_configurable_and_checked() {
+        let mut vars = full();
+        vars.insert("GITHUB_API_URL", "http://127.0.0.1:9999/api/v3");
+        vars.insert("ALLOW_LOCAL_REPOS", "true");
+        let c = parse(&vars).expect("valid");
+        assert_eq!(c.github_api_url.as_str(), "http://127.0.0.1:9999/api/v3");
+        assert!(c.allow_local_repos);
+
+        let mut vars = full();
+        vars.insert("GITHUB_API_URL", "ftp://api.example");
+        vars.insert("ALLOW_LOCAL_REPOS", "yes please");
+        let err = parse(&vars).unwrap_err();
+        for name in ["GITHUB_API_URL", "ALLOW_LOCAL_REPOS"] {
+            assert!(
+                err.problems.iter().any(|p| p.starts_with(name)),
+                "{name} missing from {:?}",
+                err.problems
+            );
+        }
+        let mut vars = full();
+        vars.insert("GITHUB_API_URL", "not a url");
+        assert!(parse(&vars).is_err());
     }
 }

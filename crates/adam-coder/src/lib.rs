@@ -25,6 +25,7 @@
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
 //! | [`app`] | [`Coder`]: runtime + A2A backend + router |
 //! | [`config`] | the binary's environment variables |
+//! | [`serve()`] | the whole process: store, model, GitHub, A2A server and workers, until a shutdown future resolves |
 //!
 //! # Composition
 //!
@@ -48,8 +49,8 @@
 //!
 //! Every infrastructure piece is a trait object handed in from outside: the
 //! store, the model, the code host and the git credentials. The binary
-//! (`adam-coder`) is only a composition of the Postgres store, the
-//! OpenAI-compatible model and GitHub.
+//! (`adam-coder`) is only [`serve`] over [`Config::from_env`]: a composition
+//! of the Postgres store, the OpenAI-compatible model and GitHub.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -61,6 +62,7 @@ pub mod instructions;
 pub mod opencode;
 pub mod redact;
 mod repos;
+mod serve;
 pub mod tools;
 
 pub use agent::{AGENT_NAME, CoderAgent, coder_limits};
@@ -69,4 +71,5 @@ pub use config::{Config, ConfigError};
 pub use instructions::instructions;
 pub use redact::Redactor;
 pub use repos::workspaces_for;
+pub use serve::serve;
 pub use tools::{CoderSettings, ToolEnv, coder_tools};

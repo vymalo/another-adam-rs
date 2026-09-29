@@ -93,6 +93,7 @@ reported at once at startup):
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
 | `GITHUB_TOKEN` | push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them | `github.com` |
+| `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, worktrees, run notes | `/work` |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required |
@@ -171,6 +172,17 @@ database of its own, so the role needs `CREATEDB`):
   (run fails after the retry budget, with the child's stderr) and once
   (retried, completes); two concurrent tasks on one repository (two branches,
   two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`).
+* `tests/binary.rs`: the `adam-coder` binary as a process. All problems of a
+  bad configuration reported together with a non-zero exit; Postgres
+  unreachable at boot (clear "connecting to Postgres" error, exit 1, no
+  password, no panic; sqlx retries the connection for its 30 s acquire timeout
+  first); with Postgres: the card and `/healthz`, a clean exit 0 on SIGTERM, and
+  SIGTERM in the middle of OpenCode's turn (the process waits for the step,
+  commits it, exits 0; a second process over the same database and workspace
+  finishes the run with one commit, one push and one pull request). The last
+  one runs the whole binary against a wiremock model (`/chat/completions`) and
+  a wiremock GitHub reached through `GITHUB_API_URL`, under the production
+  repository policy.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy.
 * `adam-workspace/tests/workspace.rs`: the host allowlist, local paths, scoped

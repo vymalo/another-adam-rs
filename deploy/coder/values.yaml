@@ -40,6 +40,9 @@ config:
   # is refused before git runs. GitHub Enterprise: add its host.
   allowedRepoHosts:
     - github.com
+  # GitHub REST API root. GitHub Enterprise: https://<host>/api/v3 (and add the
+  # host to allowedRepoHosts).
+  githubApiUrl: "https://api.github.com"
   # Open pull requests as drafts.
   prDraft: false
   gitAuthorName: "adam-coder"
