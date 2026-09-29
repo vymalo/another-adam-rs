@@ -3,7 +3,7 @@
 Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
 facade), S3 (`adam-coder` tools through `#[tool]`), S4 (`adam-agent-fs`, the parser and validator of
 agent directories), S5 (the `build.rs` codegen and `adam::include_agent!()`), S6 (`adam-assembly`,
-which binds a manifest to `LlmAgent`s), S7 (skills at run time), S8 (durable child runs in the runtime) and S9 (subagents as tools) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+which binds a manifest to `LlmAgent`s), S6b (the coder's prompt and card from `agent/`), S7 (skills at run time), S8 (durable child runs in the runtime) and S9 (subagents as tools) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
 the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
@@ -692,7 +692,8 @@ stateDiagram-v2
   `BoundDef::build` hands to `LlmAgent` are already final and `AgentInfo::tools` is what the model is
   offered. The tools of S9b and S11 join them at `bind` too.
 * **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
-  `adam_a2a::AgentCardConfig`; the public URL and the version belong to the deployment.
+  `adam_a2a::AgentCardConfig`; the public URL and the version belong to the deployment. `AgentDef::card`
+  gives the same card before anything is bound, for a process with no model (a control plane).
 
 Deviations from the plan's sketch, on purpose: `AGENT` is already a reference, so the call is
 `from_manifest(AGENT)` and not `&AGENT`; the runtime has no `agents(..)` method, so `Assembly::register`
@@ -794,6 +795,44 @@ type already sets the pattern).
 * An `evals/` directory; an OpenAPI connection; subagent continuation (`task_id`) and a built-in
   root-copy `agent` tool; exporting a Rust tool as an MCP server; following SEP-2633 to ratification.
 
+## Dogfood: `adam-coder` (S3 and S6b)
+
+`adam-coder` is written with the layer it documents, in two steps, neither of which changed what the
+agent does.
+
+**S3, tools.** The six tools are `#[tool]` functions reading `State<ToolEnv>`; `coder_tools(&env)` is
+`tools![..]` wrapped in the `Redacting` layer. `tests/tool_specs.rs` pins each `ToolSpec` against the JSON
+of the hand-written tools.
+
+**S6b, prompt, limits and card.** They are one file,
+[`crates/adam-coder/agent/instructions.md`](../crates/adam-coder/agent/instructions.md): the frontmatter has the
+`name`, `description`, `limits`, `vars.max_check_cycles` (default 3) and the `card:` (name `adam-coder`, one
+skill `coding-task`); the body is the system prompt with `{{max_check_cycles}}`. `build.rs` embeds it
+(`adam_agent_fs::build("agent").emit()`), the crate includes it (`adam::include_agent!()`), and
+`CoderAgent::try_with_tools` is the whole wiring:
+
+```rust
+AgentDef::from_manifest(AGENT)?
+    .var("max_check_cycles", env.settings.max_check_cycles)   // the process's setting wins over the default
+    .bind(tools)?                                             // the six tools, in the order they are offered
+    .state(env)                                               // what the tools read with State<ToolEnv>
+    .model(model, alias)?                                     // one client, the gateway alias
+```
+
+`CoderAgent` wraps the root `LlmAgent` of that assembly and adds the completion policy (a run with red
+checks and no pull request fails). That is the escape hatch in practice: **files for the common case, a Rust
+wrapper around the assembled agent for policy**. The A2A card comes from the same file: `Assembly::card` for a
+process that has the assembly, `AgentDef::card` (added for this slice) for a control plane, which has no
+model or tools and serves the same card.
+
+The proof is in `crates/adam-coder/tests/agent_files.rs` and `src/app.rs`, against goldens captured from the Rust
+code before it was deleted (`tests/fixtures/agent/prompt.txt`, `card.json`): the assembled prompt equals the old
+prompt for any limit (but for its final newline, which every loaded body loses); the card equals the old
+literal; the limits, the tool order, the model request (system prompt, tools, `max_output_tokens`) and the
+journal's step names (`model:0`, `tool:<call id>`) are the old ones, so a run journaled by the previous
+version replays. The optional next step, moving "discover the repository's real checks" into a skill, changes
+what the model does and needs a comparison with a live model; it is not a slice.
+
 ## Delivery order
 
 | Slice | What | State |
@@ -805,6 +844,7 @@ type already sets the pattern).
 | S4 | `adam-agent-fs`: parse and validate agent directories | built |
 | S5 | `build.rs` codegen and `adam::include_agent!()` | built |
 | S6 | `adam-assembly`: `AgentDef`, templating, tool binding, models, the card | built |
+| S6b | `adam-coder`: prompt, limits and card from `crates/adam-coder/agent/instructions.md`, no behaviour change (see [Dogfood](#dogfood-adam-coder-s3-and-s6b)) | built |
 | S7 | skills at run time: the catalog, `load_skill`, `read_skill_file`, `preload_skills` | built |
 | S8 | child runs in the runtime: `start_child`, the finished message, `Ctx::child_status`, `ToolError::AwaitRun`, `pending_wait` | built |
 | S9 | subagents: `SubagentTool`, its binding, name-clash and asks-user checks, `ToolCtx::start_child` | built |

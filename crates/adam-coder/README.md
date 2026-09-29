@@ -62,8 +62,9 @@ as a tool result, `invalid arguments for `run_checks`: ...`; an empty or blank r
 
 ### The rules, in code
 
-The system prompt (`src/instructions.md`, templated with `MAX_CHECK_CYCLES`)
-tells the model the rules. The tools make them hold:
+The system prompt (`agent/instructions.md`, with `{{max_check_cycles}}`; see
+[Where the prompt and the card live](#where-the-prompt-and-the-card-live)) tells the model the rules. The tools
+make them hold:
 
 * **Cycle limit.** Every failed `run_checks` costs a cycle, counted per tool call
   id (a replay never counts twice). At `MAX_CHECK_CYCLES` the tool tells the
@@ -84,6 +85,47 @@ tells the model the rules. The tools make them hold:
 
 Per-run bookkeeping (cycles, last check, pushed sha, pull request) lives in
 `<WORKSPACE_ROOT>/coder/<run>.json` next to the worktree, written atomically.
+
+### Where the prompt and the card live
+
+One file, [`agent/instructions.md`](agent/instructions.md), holds what describes the agent, in the format of
+[`docs/authoring.md`](../../docs/authoring.md): the frontmatter has `name` (`coder`, which must equal
+`AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 8192 output tokens, 100000 tokens of history),
+`vars.max_check_cycles` (the default, 3) and `card:` (the A2A card: name `adam-coder`, the `coding-task` skill
+with its tags and example); the body is the system prompt.
+
+```mermaid
+sequenceDiagram
+  participant B as build.rs
+  participant C as adam-coder (lib)
+  participant D as AgentDef
+  participant A as CoderAgent
+  B->>C: adam_agent_fs::build("agent").emit(): validates the file, writes OUT_DIR/adam_agent.rs
+  C->>D: from_manifest(AGENT) (adam::include_agent!)
+  A->>D: var("max_check_cycles", settings), bind(coder_tools), state(ToolEnv), model(client, alias)
+  D-->>A: Assembly: the root LlmAgent, its prompt, limits, tools
+  Note over A: the LlmAgent steps the run, CoderAgent adds the completion policy
+  C->>D: card(public_url, CARGO_PKG_VERSION) for the A2A router
+```
+
+To change what the model is told or what the card advertises, edit that file and run the tests: the
+build fails with the file and line if the frontmatter is wrong, and binding fails at startup (not in the
+middle of a run) for a `{{placeholder}}` the frontmatter does not declare, a var it declares and the body never
+uses, or a `tools:` name the coder does not register. Then review `tests/fixtures/agent/prompt.txt` and
+`card.json`: they are the prompt and the card as they were when they were Rust, and a difference from them is a
+change of behaviour to decide on, not a refactor (see [Tests](#tests)). The limit in the prompt follows
+`MAX_CHECK_CYCLES`: the process passes `CoderSettings::max_check_cycles` as the var, so the file's default only
+applies to a caller that does not.
+
+What stays in Rust is what a file cannot say: the tools, the completion policy (`CoderAgent`
+wraps the assembled `LlmAgent` and fails a run that ends on red checks without a pull request), and the
+redaction. `CoderAgent::new` and `with_tools` panic if the agent cannot be assembled, which only a model alias that
+is empty or has whitespace can cause; `try_new` and `try_with_tools` return the error, and the binary uses those,
+so a bad `MODEL` is a startup error. A control plane has no model, so it takes the card from the file with
+`AgentDef::card` (`agent_card(url)`), and `CoderAgent::assembly().card(url, version)` gives the same card.
+
+The Docker build context must contain `agent/`: `docker/coder/Dockerfile.dockerignore` excludes `**/*.md` and
+re-includes `crates/adam-coder/agent/**`, and `build.rs` fails the build without the file.
 
 ### Retry safety
 
@@ -367,6 +409,15 @@ database of its own, so the role needs `CREATEDB`):
   `completed`, and a `working` update carrying the text of the worker's `Progress` event
   (`preparing a worktree of ...`), which exists only as a live event and so proves events
   crossed the two processes over `NOTIFY`. Both processes log `listening for notifications`.
+* `tests/agent_files.rs`: the prompt, limits and card in `agent/instructions.md` against the Rust they replaced.
+  `the_prompt_carries_the_rules_the_code_relies_on` runs on the assembled prompt; the prompt equals
+  `tests/fixtures/agent/prompt.txt` (the old constant, captured before it was deleted) for several limits, but for its
+  final newline, which the loader drops from every body; the limits, the tool order and the model alias are the
+  old ones; a run through a runtime on a `MockModel` sends the old system prompt, tools and `max_output_tokens` and
+  journals the old step names (`model:0`, `tool:<call id>`, so a run journaled before replays); the assembly's
+  card equals `agent_card`. A model alias the assembly refuses (empty, whitespace) is an error from `try_new`.
+  The card is also pinned by a unit test in `src/app.rs` against `tests/fixtures/agent/card.json`, the card as the
+  Rust literal built it.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, and malformed arguments.
 * `tests/tool_specs.rs`: each tool's `ToolSpec` equals `tests/fixtures/tool-specs/<tool>.json`, the JSON of

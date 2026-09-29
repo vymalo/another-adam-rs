@@ -4,7 +4,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig, SkillConfig};
+use adam::AgentDef;
+use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig};
 use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::{ClaimScope, DynStore};
 use adam_runtime::{
@@ -13,7 +14,7 @@ use adam_runtime::{
 use axum::Router;
 use url::Url;
 
-use crate::agent::{AGENT_NAME, CoderAgent, CoderStarter};
+use crate::agent::{AGENT, AGENT_NAME, CoderAgent, CoderStarter};
 
 /// How the runtime that advances runs is set up.
 #[derive(Debug, Clone)]
@@ -181,26 +182,24 @@ impl Coder {
 
 /// The agent card the coder serves. `public_url` is where clients POST
 /// JSON-RPC.
+///
+/// The card is declared in `agent/instructions.md` (the `card:` frontmatter) and read from the
+/// embedded agent, so a control plane, which has no model, tools or credentials, serves the same
+/// card as `Assembly::card` gives for the assembled agent.
+///
+/// # Panics
+///
+/// Never for the embedded files, which a unit test reads; the `expect` guards a mismatch between
+/// this crate and `adam-agent-fs`, which the build would already have refused.
+#[allow(clippy::expect_used)] // see `# Panics`
 pub fn agent_card(public_url: &Url) -> AgentCardConfig {
-    let mut skill = SkillConfig::new(
-        "coding-task",
-        "Coding task to pull request",
-        "Given a repository and a task, makes the change in a private worktree with OpenCode, \
-         runs the project's own checks, and opens a pull request. Reports the pull request as an \
-         artifact and asks the caller when it needs an answer.",
-    );
-    skill.tags = vec!["code".into(), "git".into(), "pull-request".into()];
-    skill.examples = vec![
-        "In https://github.com/acme/widgets (base branch main), add a hello.txt containing hi."
-            .into(),
-    ];
-    AgentCardConfig::new(
-        "adam-coder",
-        "Coder agent: turns a coding task into a verified pull request.",
-        public_url.clone(),
-        env!("CARGO_PKG_VERSION"),
-    )
-    .with_skill(skill)
+    AgentDef::from_manifest(AGENT)
+        .map_err(Box::new)
+        .and_then(|def| {
+            def.card(public_url.clone(), env!("CARGO_PKG_VERSION"))
+                .map_err(Box::new)
+        })
+        .expect("the coder's embedded agent declares a card")
 }
 
 #[cfg(test)]
@@ -208,6 +207,42 @@ mod tests {
     use super::*;
     use adam_core::RunId;
     use adam_runtime::{EventSink as _, RunEvent};
+    use serde_json::{Value, json};
+
+    /// The card as JSON, everything it holds, in the shape of `tests/fixtures/agent/card.json`.
+    fn render(card: &AgentCardConfig) -> Value {
+        json!({
+            "name": card.name,
+            "description": card.description,
+            "url": card.url.as_str(),
+            "version": card.version,
+            "skills": card.skills.iter().map(|s| json!({
+                "id": s.id,
+                "name": s.name,
+                "description": s.description,
+                "tags": s.tags,
+                "examples": s.examples,
+            })).collect::<Vec<_>>(),
+            "extensions": card.extensions.iter().map(|e| json!({
+                "uri": e.uri,
+                "description": e.description,
+                "required": e.required,
+                "params": e.params,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// The card is the one the Rust literal used to build. The golden file was captured from that
+    /// literal before it was deleted; only the version follows the crate's.
+    #[test]
+    fn the_card_from_the_agent_file_equals_the_old_literal() {
+        let mut golden: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/agent/card.json"))
+                .expect("the golden card is JSON");
+        golden["version"] = json!(env!("CARGO_PKG_VERSION"));
+        let url: Url = "https://agents.example.com/coder/".parse().expect("a URL");
+        assert_eq!(render(&agent_card(&url)), golden);
+    }
 
     #[tokio::test]
     async fn local_signals_deliver_events_to_the_broadcast_and_have_no_notifier() {

@@ -423,7 +423,8 @@ Each box is a crate (underscores stand for hyphens). The six coder tools are
 `prepare_workspace`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
 `open_pull_request` and `ask_user`. A seventh type, `Redacting`, wraps each of
 them to scrub secrets (`crates/adam-coder/src/tools/mod.rs`). `CoderAgent`
-wraps an `LlmAgent` and adds its completion rule. `FnTool` is a tool made from a closure. A tool
+wraps the `LlmAgent` that `adam-assembly` builds from `crates/adam-coder/agent/instructions.md` (the prompt, the
+limits and the A2A card are that file) and adds its completion rule. `FnTool` is a tool made from a closure. A tool
 reads shared dependencies with `ToolCtx::state::<T>()` (given to the agent with
 `LlmAgentBuilder::state`), declares them in `Tool::required_state`, and
 `LlmAgentBuilder::try_build` fails at startup when one is missing; `parse_args`,
@@ -1455,6 +1456,10 @@ What the diagrams cannot say (`crates/adam-coder/src/`):
 
 * **The tools** (`tools/`): `prepare_workspace`, `delegate_to_opencode`,
   `run_checks`, `commit_and_push`, `open_pull_request` and `ask_user`.
+* **The prompt and the card** (`agent/instructions.md`, embedded by `build.rs`): the system prompt with its
+  `{{max_check_cycles}}`, the loop's limits and the A2A card are a file, not Rust; `CoderAgent::new` puts
+  the file, the tools, the `ToolEnv` state and the model together with `AgentDef`, and keeps only the
+  completion policy in Rust.
 * **Rules in code.**
   * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`
     refuses to run. `commit_and_push` and `open_pull_request` refuse too.
@@ -1482,7 +1487,7 @@ What the diagrams cannot say (`crates/adam-coder/src/`):
     `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child.
   * A `Redactor` scrubs the process's own secrets from every tool result, event
     and failure text.
-* **Limits** (`coder_limits()`): 200 model turns, 400 tool calls, 8192 output
+* **Limits** (`limits:` in `agent/instructions.md`): 200 model turns, 400 tool calls, 8192 output
   tokens per call, 100,000 tokens of history sent to the model. A limit that
   trips fails the run.
 * **Cancel.** When a run is cancelled while OpenCode works, the tool sends ACP

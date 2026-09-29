@@ -196,7 +196,8 @@ and so do a `{{placeholder}}` that `vars` does not declare, a var that is never 
 value. The stages, the rules for tools, vars, models, state and skills, and the seams left for
 subagents are in the [`adam-assembly` README](../adam-assembly/README.md). `Assembly::info()` describes
 each agent made (name, alias, rendered prompt, tools, skills, limits); with the `a2a` feature,
-`Assembly::card(url, version)` is the root's `AgentCardConfig`.
+`Assembly::card(url, version)` is the root's `AgentCardConfig` (`AgentDef::card` gives it before
+anything is bound).
 
 An agent's `skills/` need no code: the prompt gets a catalog (name and description of each skill) and the
 agent gets a `load_skill` tool (the body of `SKILL.md`) and a `read_skill_file` tool (a bundled text file),

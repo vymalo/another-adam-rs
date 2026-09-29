@@ -49,7 +49,7 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 
 | Item | What |
 |---|---|
-| `AgentDef` | `from_manifest(impl IntoManifest)`, `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `name()`, `manifest()`, `bind(ToolSet)` |
+| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `name()`, `manifest()`, `bind(ToolSet)` |
 | `IntoManifest` | `AgentManifest`, `&AgentManifest`, `EmbeddedAgent` and `&EmbeddedAgent` (what `include_agent!` gives; these bring the bytes of the skills' files) |
 | `SkillFiles` | the bytes of the files skills bundle (opaque: made by `IntoManifest` and `resources_from`) |
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
@@ -148,7 +148,9 @@ the agents with `try_build`, so a tool whose `required_state` nobody gave is
 **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
 `adam_a2a::AgentCardConfig`: `card.name` (default: the agent's), `card.description` (default: the
 frontmatter `description`, else `Error::MissingCardDescription`) and `card.skills`. The public URL and the
-version are the deployment's, so they are arguments. A2A card skills are not Agent Skills.
+version are the deployment's, so they are arguments. A2A card skills are not Agent Skills. The card is a fact
+about the files, so `AgentDef::card(url, version)` gives the same card before any tool, state or model is
+bound: a process that only serves A2A (a control plane, with no model) needs it, and the coder uses it.
 
 ## Skills
 
@@ -321,7 +323,8 @@ stay in `Assembly::manifest()`. The seams for the next slices are in code, in on
   enum, "already loaded", files still readable), a subagent with its own selection, and the embedded
   fixture against the same files read from disk giving equal `AgentInfo`s and equal tool results.
 * `tests/card.rs` (feature `a2a`): the card of the fixture against `tests/golden/card.json`
-  (regenerate with `ADAM_UPDATE_GOLDEN=1`), the fallbacks and the missing description.
+  (regenerate with `ADAM_UPDATE_GOLDEN=1`), the fallbacks and the missing description, and
+  `AgentDef::card` equal to `Assembly::card`.
 * Unit tests next to the code: the template scanner (with proptest), the suggestions, the error texts,
   glob matching, the limits, the path checks and the tool results of `skills.rs`.
 

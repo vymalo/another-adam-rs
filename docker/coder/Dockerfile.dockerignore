@@ -8,6 +8,7 @@ docs
 compose.yaml
 dev
 **/*.md
-!crates/adam-coder/src/**/*.md
+# The coder's prompt and A2A card, embedded by crates/adam-coder/build.rs (`agent/instructions.md`).
+!crates/adam-coder/agent/**
 # Crate READMEs are compiled in as rustdoc (`#![doc = include_str!("../README.md")]`).
 !crates/*/README.md
