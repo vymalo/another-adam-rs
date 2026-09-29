@@ -125,6 +125,38 @@ pub enum ToolError {
     },
 }
 
+impl ToolError {
+    /// Turn a classified error into a tool error: a retryable one
+    /// ([`ErrorClass::is_retryable`]) becomes [`Transient`](Self::Transient),
+    /// anything else [`Permanent`](Self::Permanent). The message is the error
+    /// and its whole source chain ([`adam_error::report`]), because a
+    /// `ToolError` is journaled as text.
+    ///
+    /// ```
+    /// use adam_error::{Classify, ErrorClass};
+    /// use adam_llm_agent::ToolError;
+    ///
+    /// #[derive(Debug, thiserror::Error)]
+    /// #[error("backend busy")]
+    /// struct Busy;
+    /// impl Classify for Busy {
+    ///     fn class(&self) -> ErrorClass {
+    ///         ErrorClass::Transient
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(ToolError::from_classified(&Busy), ToolError::Transient("backend busy".into()));
+    /// ```
+    pub fn from_classified<E: Classify + 'static>(err: &E) -> Self {
+        let message = adam_error::report(err);
+        if err.is_retryable() {
+            Self::Transient(message)
+        } else {
+            Self::Permanent(message)
+        }
+    }
+}
+
 impl Classify for ToolError {
     fn class(&self) -> ErrorClass {
         match self {
@@ -297,5 +329,52 @@ impl ToolCtx {
                 message: message.into(),
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use adam_error::{Classify, ErrorClass};
+
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("outer")]
+    struct Classed(ErrorClass, #[source] Inner);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("inner")]
+    struct Inner;
+
+    impl Classify for Classed {
+        fn class(&self) -> ErrorClass {
+            self.0
+        }
+    }
+
+    #[test]
+    fn from_classified_splits_on_retryability_and_keeps_the_chain() {
+        for class in [
+            ErrorClass::Transient,
+            ErrorClass::RateLimited,
+            ErrorClass::Conflict,
+        ] {
+            assert_eq!(
+                ToolError::from_classified(&Classed(class, Inner)),
+                ToolError::Transient("outer: inner".into()),
+                "{class:?}"
+            );
+        }
+        for class in [
+            ErrorClass::Invalid,
+            ErrorClass::NotFound,
+            ErrorClass::Internal,
+        ] {
+            assert_eq!(
+                ToolError::from_classified(&Classed(class, Inner)),
+                ToolError::Permanent("outer: inner".into()),
+                "{class:?}"
+            );
+        }
     }
 }

@@ -68,6 +68,23 @@ jobs:
       - run: cargo check --workspace --all-targets --locked
       - run: cargo check --workspace --all-targets --locked --features adam-llm-agent/schema
 
+  # The compile tests of `#[tool]` (crates/adam/tests/ui), on the toolchain their
+  # rustc-produced snapshots were written with. The errors the macro produces
+  # itself run everywhere (nextest, stable); the ones rustc words itself change
+  # between toolchains, so they run here only (ADAM_TRYBUILD=1). Keep this in
+  # step with `rust-version`: after a bump, regenerate the snapshots with
+  # `ADAM_TRYBUILD=1 TRYBUILD=overwrite cargo test -p adam --test ui`.
+  ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p adam --test ui --locked
+        env:
+          ADAM_TRYBUILD: "1"
+
   # Licenses, advisories, banned and unknown sources: see deny.toml.
   deny:
     runs-on: ubuntu-latest

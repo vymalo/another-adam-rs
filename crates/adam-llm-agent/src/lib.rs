@@ -56,7 +56,8 @@
 //! [`ToolCtx::state`], declare them in [`Tool::required_state`], and
 //! [`LlmAgentBuilder::try_build`] fails at startup when one is missing.
 //! [`ToolSet`] / [`tools!`] group tools and [`FnTool`] makes one from a
-//! closure. The `#[tool]` macro generates all of this from a function.
+//! closure. The `#[tool]` macro (crate `adam-macros`, through the `adam` facade)
+//! generates all of this from a function.
 //!
 //! ```
 //! use std::sync::Arc;
@@ -120,6 +121,10 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "schema")]
+#[doc(hidden)]
+#[path = "private.rs"]
+pub mod __private;
 mod agent;
 mod conversation;
 mod fn_tool;

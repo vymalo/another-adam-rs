@@ -1,0 +1,5 @@
+error: `strict` is given twice in `#[tool]`
+ --> tests/ui/fail/duplicate_option.rs:4:16
+  |
+4 | #[tool(strict, strict)]
+  |                ^^^^^^

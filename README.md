@@ -28,6 +28,8 @@ trait, a shared conformance suite, and two production adapters.
 | [`adam-a2a`](crates/adam-a2a/README.md) | Expose an agent as an A2A 1.0 server (axum): `TaskBackend` seam, bearer auth (fail closed), `InMemoryBackend` under feature `test-util` |
 | [`adam-acp`](crates/adam-acp/README.md) | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
 | [`adam-llm-agent`](crates/adam-llm-agent/README.md) | `LlmAgent`: the durable model/tool-calling loop (`Tool` trait and typed tool helpers, `NeedsInput` parking, limits, history truncation) on top of `adam-runtime` |
+| [`adam-macros`](crates/adam-macros/README.md) | The `#[tool]` attribute macro: an `async fn` becomes a `Tool` (name, description and argument schema from the function and its doc comments; `State<T>` and `&ToolCtx` parameters). A proc-macro crate over `syn`; the expansion is a pure, unit-tested function |
+| [`adam`](crates/adam/README.md) | The facade for writing an agent: `use adam::prelude::*` gives `#[tool]`, `tools!`, `Tool`, `State`, `LlmAgent`, ... (feature `macros`, on by default), and re-exports the model, runtime, core and error crates |
 | [`adam-a2a-runtime`](crates/adam-a2a-runtime/README.md) | `RuntimeTaskBackend`: the A2A `TaskBackend` over `adam-runtime` (task = run, ownership per caller, `input-required` from parked runs); subscriptions are rebuilt from the store, so they survive restarts. Reusable by any agent |
 | [`adam-coder`](crates/adam-coder/README.md) | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary, which runs the A2A server, the workers or both (`ROLE`); image in `docker/coder`, chart in `deploy/coder` |
 
@@ -350,6 +352,11 @@ CI runs the tests with [cargo-nextest](https://nexte.st) (`cargo nextest run
 --workspace`, profile `ci` in `.config/nextest.toml`) plus `cargo test --doc`,
 and gates line coverage (`cargo llvm-cov nextest --workspace`).
 
+The compile tests of `#[tool]` (`cargo test -p adam --test ui`, trybuild) split in two: the
+errors the macro produces itself always run, and the ones rustc words itself run only with
+`ADAM_TRYBUILD=1`, in the CI job `ui` pinned to one toolchain (see the
+[`adam` README](crates/adam/README.md#tests)).
+
 The suite (22 cases) covers: exact JSON roundtrip (unicode, i64 bounds,
 floats, special keys), CAS conflicts, 16-way concurrent commits with a single
 winner, journal ordering, first-writer-wins and 16-way races,
@@ -386,7 +393,7 @@ node tools/docs-check/check-docs.mjs
 
 1. ~~Store trait and adapters~~ (this repo)
 2. ~~Run state machine and `ctx.step` journaling~~ (`adam-runtime`)
-3. `#[tool]` macro (schemars), designed in [`docs/authoring.md`](docs/authoring.md)
+3. ~~`#[tool]` macro (schemars)~~ (`adam-macros`, through the `adam` facade; [`docs/authoring.md`](docs/authoring.md))
 4. `build.rs` discovery of `agent/` (instructions, skills, subagents, `mcp.json`), designed in [`docs/authoring.md`](docs/authoring.md)
 5. Parking, approvals, schedules
 6. Dev TUI (`cargo adam dev`)

@@ -31,6 +31,8 @@ instructions + a model + a toolset. It is served over A2A by
 | `parse_args`, `IntoToolOutput`, `IntoToolResult`, `Json<T>` | read the model's arguments into a struct (a mistake is a `ToolOutput::error` for the model, never a panic; `null` reads as `{}`); return a `String`, `&'static str`, `Value`, `Json<T>` (compact JSON) or a `Result` of one with an error that is `Into<ToolError>` |
 | `FnTool` | a tool from a closure: `FnTool::raw(name, description, schema, \|ctx, args\| async ..)`; with feature `schema`, `FnTool::builder(name).description(..).args::<A>().handler(..)` |
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
+| `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
+| `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
 | `Conversation`, `PendingQuestion`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
 | `TRUNCATION_MARKER_PREFIX` | prefix of the marker left where history truncation shortened a tool output |
@@ -54,8 +56,9 @@ steps the runs (see *Starting without stepping* in
 [`adam-runtime`](../adam-runtime/README.md)).
 
 A complete `Tool` implementation, and one using the typed helpers, are in the crate docs
-(`src/lib.rs`). The `#[tool]` macro that generates such a tool from a function is the next step of
-[the authoring layer](../../docs/authoring.md).
+(`src/lib.rs`). The `#[tool]` macro that generates such a tool from a function is in
+[`adam-macros`](../adam-macros/README.md), used through the [`adam`](../adam/README.md) facade (part of
+[the authoring layer](../../docs/authoring.md)).
 
 ### Shared state
 
@@ -76,7 +79,9 @@ stable, so a static slice cannot be built. It is only called when the agent is b
 With the `schema` feature, `spec_for::<Args>("name", "description")` derives `parameters` from
 `schemars::JsonSchema` (schemars 1.x): draft 2020-12, subschemas inlined, no `$schema`, no `title`
 (a property that is *called* `title` stays), and an object schema always has `properties`. Doc comments
-become descriptions and `Option<T>` fields are not required.
+become descriptions and `Option<T>` fields are not required. The feature also enables schemars' `derive`, so
+`#[derive(JsonSchema)]` works for whoever depends on it, and it is what `#[tool(crate = ::adam_llm_agent)]`
+needs from a crate that does not use the `adam` facade.
 
 ## Errors
 

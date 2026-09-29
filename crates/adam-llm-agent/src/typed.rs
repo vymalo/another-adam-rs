@@ -5,7 +5,7 @@
 //! [`Json`] value or a `Result` of either instead of building a
 //! [`ToolOutput`] by hand; [`parse_args`] reads the model's argument object
 //! and turns a mistake into a [`ToolOutput::error`] the model can act on.
-//! The `#[tool]` macro (a later slice) generates calls to these; they are
+//! The `#[tool]` macro of the `adam` crate generates calls to these; they are
 //! useful by hand too.
 
 use std::borrow::Cow;

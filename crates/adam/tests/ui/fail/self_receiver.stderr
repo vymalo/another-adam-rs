@@ -1,0 +1,5 @@
+error: `#[tool]` works on free functions; put shared state in `State<T>`
+ --> tests/ui/fail/self_receiver.rs:5:12
+  |
+5 | async fn f(&self) -> String { String::new() }
+  |            ^

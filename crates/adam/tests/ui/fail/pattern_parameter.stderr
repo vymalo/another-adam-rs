@@ -1,0 +1,5 @@
+error: `#[tool]` parameters must be plain names (`name: Type`): the name is the field the model fills in
+ --> tests/ui/fail/pattern_parameter.rs:5:12
+  |
+5 | async fn f((a, b): (u8, u8)) -> String { format!("{a}{b}") }
+  |            ^^^^^^

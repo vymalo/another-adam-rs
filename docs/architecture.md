@@ -1,6 +1,6 @@
 # Architecture
 
-adam-rs is a Rust workspace of 16 crates for **durable AI agents**. An agent is
+adam-rs is a Rust workspace of 19 crates for **durable AI agents**. An agent is
 a state machine. The runtime saves its state after every step, so a worker that
 dies loses nothing: another worker resumes from the last saved step. Every piece
 of infrastructure (database, model, code host, A2A backend) sits behind a trait,
@@ -32,11 +32,15 @@ Contents:
 Arrows point from a crate to a crate it depends on. Solid arrows come from
 `[dependencies]` in the `Cargo.toml` files. Dotted arrows are
 `[dev-dependencies]` that are not also normal dependencies (tests only). Grey
-arrows go to `adam-error`: every crate except the two test kits depends on
-it.
+arrows go to `adam-error`: every crate except the two test kits and
+`adam-macros` depends on it.
 
 ```mermaid
 flowchart TB
+    subgraph authoring["Authoring"]
+        adam["adam"]
+        macros["adam-macros"]
+    end
     subgraph agents["Agents"]
         coder["adam-coder"]
         llm["adam-llm-agent"]
@@ -76,6 +80,7 @@ flowchart TB
     coder --> pg
     coder --> ws
     coder --> host
+    coder --> pgn
     a2art --> a2a
     a2art --> core
     a2art --> rt
@@ -91,6 +96,11 @@ flowchart TB
     pgn --> rt
     nk --> core
     nk --> rt
+    adam --> core
+    adam --> llm
+    adam --> macros
+    adam --> model
+    adam --> rt
 
     rt -.-> mongo
     rt -.-> pg
@@ -102,6 +112,7 @@ flowchart TB
     pgn -.-> pg
 
     a2a --> err
+    adam --> err
     a2art --> err
     acp --> err
     coder --> err
@@ -116,7 +127,7 @@ flowchart TB
     host --> err
     pgn --> err
 
-    linkStyle 34,35,36,37,38,39,40,41,42,43,44,45,46,47 stroke:#999,stroke-width:1px
+    linkStyle 40,41,42,43,44,45,46,47,48,49,50,51,52,53,54 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -160,6 +171,14 @@ The layers, from the bottom:
     `adam_runtime::Agent`.
   * `adam-coder` is the coder agent and the only binary. It is a composition
     root: it wires the pieces below it.
+* **Authoring.**
+  * `adam-macros` is the `#[tool]` attribute macro: a proc-macro crate whose
+    expansion is a pure function over token streams. It depends on `syn`,
+    `quote` and `proc-macro2` only.
+  * `adam` is the facade a user writes agents against: `prelude`, the
+    re-exported `adam-llm-agent` API, and the `#[tool]` macro behind the
+    default feature `macros`. Generated code refers to `adam::__private`.
+    See [`docs/authoring.md`](authoring.md).
 * **Test kits.** `adam-store-testkit` is the conformance suite every store must
   pass, and `adam-notify-testkit` the one every `Notifier` (and its event
   transport) must pass. It is a crate of its own because `adam-runtime` cannot
@@ -1412,6 +1431,8 @@ flowchart LR
 | `adam-a2a-runtime` | runtime | [crates/adam-a2a-runtime](../crates/adam-a2a-runtime/README.md) |
 | `adam-llm-agent` | agent | [crates/adam-llm-agent](../crates/adam-llm-agent/README.md) |
 | `adam-coder` | agent, binary | [crates/adam-coder](../crates/adam-coder/README.md) |
+| `adam-macros` | authoring, proc-macro | [crates/adam-macros](../crates/adam-macros/README.md) |
+| `adam` | authoring, facade | [crates/adam](../crates/adam/README.md) |
 | `adam-store-testkit` | test kit | [crates/adam-store-testkit](../crates/adam-store-testkit/README.md) |
 | `adam-notify-testkit` | test kit | [crates/adam-notify-testkit](../crates/adam-notify-testkit/README.md) |
 

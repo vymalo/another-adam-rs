@@ -1,0 +1,5 @@
+error: `#[tool]` goes on an `async fn`
+ --> tests/ui/fail/on_a_struct.rs:4:1
+  |
+4 | struct NotAFunction;
+  | ^^^^^^

@@ -1,7 +1,8 @@
 # The authoring layer
 
-Status: **design; only slice S1 (the typed tool helpers in `adam-llm-agent`) is built**, the rest is
-planned (see [Delivery order](#delivery-order)). Accepted by the owner on 2026-09-29 (decisions D1 to D6 below).
+Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`) and S2 (`#[tool]` and the `adam`
+facade) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by the owner on
+2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
 
@@ -186,7 +187,12 @@ match `^[a-z][a-z0-9_]{0,63}$`.
 
 ## The `#[tool]` contract
 
+Built (slice S2): [`adam-macros`](../crates/adam-macros/README.md) is the macro, and
+[`adam`](../crates/adam/README.md) is the facade you depend on.
+
 ```rust
+use adam::prelude::*;
+
 /// Ask the person who gave you the task a question and wait for the answer.
 #[tool]
 pub async fn ask_user(
@@ -198,28 +204,72 @@ let tools = tools![AskUser, RunChecks];
 let agent = LlmAgent::builder("coder", model, alias).state(env.clone()).tools(tools).try_build()?;
 ```
 
-`#[tool]` keeps the function, and generates a unit struct (`AskUser`) that implements the `Tool` trait
+`#[tool]` keeps the function (so a unit test can call it), and generates a unit struct (`AskUser`,
+the function name in `UpperCamelCase`, with the function's visibility) that implements the `Tool` trait
 of `adam-llm-agent`.
 
-* **Description and schema:** the doc comment of the function is the tool description; the doc comment
-  of each parameter is the property description. The arguments become one struct that derives
-  `Deserialize` and `JsonSchema` (schemars 1.x, draft 2020-12, subschemas inlined, no `$schema`, no
-  `title`).
-* **Parameter kinds:** `&ToolCtx` (at most one); `State<T>` (shared state, resolved from the agent's
-  extension map); every other parameter is a field of the arguments struct. `#[args] a: MyArgs` uses an
-  existing struct.
+* **Description and schema:** the doc comment of the function is the tool description (required: a
+  tool without one does not compile); the doc comment of each parameter is the property description.
+  Lines of one paragraph are joined with a space and a blank line keeps a paragraph break, so the
+  hard wrapping of a doc comment does not reach the model; list items, headings, quotes, table rows
+  and fenced code keep their lines. The arguments become one struct that derives `Deserialize` and
+  `JsonSchema` (schemars 1.x, draft 2020-12, subschemas inlined, no `$schema`, no `title`); the spec
+  is computed once per tool (`OnceLock`).
+* **Parameter kinds:** `&ToolCtx` (at most one, any position); `State<T>` (shared state, resolved
+  with `ToolCtx::require_state`); every other parameter is a field of the arguments struct, and its
+  `#[serde(..)]` and `#[schemars(..)]` attributes are copied to the field. `#[args] a: MyArgs` uses an
+  existing struct as the whole argument object and must be the only model argument.
 * **Return:** `Result<T, E>` or a bare `T`, with `T: IntoToolOutput` and `E: Into<ToolError>`.
+* **Options:** `name = "..."`, `type = Ident`, `strict` (`deny_unknown_fields`, which also closes the
+  schema), `classify` (the error is `adam_error::Classify`: retryable becomes `ToolError::Transient`,
+  the rest `Permanent`) and `crate = path` (default `::adam`; `::adam_llm_agent` for a crate that does
+  not use the facade). Reserved for later: `approval` (roadmap 5) and `subagents = false`.
 * **Bad model input is the model's problem:** a deserialization failure becomes `ToolOutput::error`
-  (as `Tool::call` already documents), so the model can correct itself.
+  (as `Tool::call` already documents), so the model can correct itself; the function never sees it.
 * **State is checked at build:** `Tool::required_state` names the `State<T>` types a tool needs, and
   `LlmAgentBuilder::try_build` fails at startup when one is missing.
 * **Journaling is unchanged:** the call runs inside `LlmAgent`'s `tool:CALL_ID` step, so the retry
-  rules of the `Tool` docs still apply.
+  rules of the `Tool` docs still apply, and the macro adds nothing non-deterministic.
 * **No distributed slices** (`inventory`, `linkme`): `tools![...]` is an explicit list that the
   compiler checks; the agent files name tools, and binding fails at startup on an unknown name.
+* **Compile errors** the macro produces itself, each pointing at the offending token: no doc comment,
+  not `async`, generic or `impl Trait`, a `self` receiver, a borrowed argument (`&str`), two
+  `&ToolCtx`, `#[args]` next to another model argument, a bad tool name, an unknown option, a parameter
+  pattern that is not a plain name, and `#[tool]` on something that is not a function. All the mistakes
+  of one function are reported in one compile. rustc reports the rest (an argument type without
+  `Deserialize` or `JsonSchema`, a return type that is not a tool result) with messages from
+  `#[diagnostic::on_unimplemented]`.
 
-`FnTool` builds a tool at run time (an MCP tool is one). The typed helpers it and the macro rely on
-(`spec_for`, `IntoToolOutput`, `parse_args`, `State<T>`, `ToolSet`) are slice S1, built, and live in [`adam-llm-agent`](../crates/adam-llm-agent/README.md).
+What runs when the model calls a generated tool (the code between the journal and your function is
+what the macro writes):
+
+```mermaid
+sequenceDiagram
+  participant A as LlmAgent
+  participant J as Journal step tool:CALL_ID
+  participant T as Generated Tool::call
+  participant F as Your async fn
+  A->>J: run the call
+  J->>T: call with ToolCtx and the model JSON
+  T->>T: parse_args into the arguments struct
+  alt the JSON does not fit
+    T-->>J: ToolOutput error, the model reads it
+  else it fits
+    T->>T: ctx.require_state for each State parameter
+    T->>F: arguments, state and ctx by position
+    F-->>T: T or Result of T and E
+    T->>T: IntoToolResult, or the classifier with classify
+    T-->>J: ToolOutput, or ToolError
+  end
+  J-->>A: recorded result, never recomputed
+```
+
+`FnTool` builds a tool at run time (an MCP tool is one). The typed helpers the macro relies on
+(`spec_for`, `IntoToolOutput`, `parse_args`, `State<T>`, `ToolSet`) are slice S1 and live in
+[`adam-llm-agent`](../crates/adam-llm-agent/README.md); the paths the generated code uses are
+re-exported there as `#[doc(hidden)] __private` (feature `schema`) and again by the facade, so that a
+crate using `#[tool]` needs no dependency of its own on `serde`, `schemars` or `async-trait` for the
+generated code.
 
 ## Skills and subagents at run time (planned)
 
@@ -307,22 +357,27 @@ never mid-step; an invalid edit keeps the last good version and logs the diagnos
 need a rebuild. Runs are durable in the store, so a restart resumes them (use the Compose Postgres, not
 the in-memory store).
 
-## Crate layout (planned)
+## Crate layout
+
+Only `adam-macros` and `adam` exist so far; the others are planned.
 
 | Crate | Kind | Contents |
 |---|---|---|
-| `adam-macros` | proc-macro | `#[tool]`; a thin shim over a pure, unit-tested `expand` function |
+| `adam-macros` | proc-macro | **built (S2)**: `#[tool]`; a thin shim over a pure, unit-tested `expand` function |
 | `adam-agent-fs` | lib | frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` (embedded and directory), the `build.rs` codegen behind a feature. No async, no runtime dependency |
 | `adam-assembly` | lib | `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s; `{{var}}` templating; skills; `SubagentTool`; the A2A card |
 | `adam-mcp` | lib | MCP client (the official Rust SDK): MCP tools as `Tool`s, `${VAR}` expansion, fail closed |
-| `adam` | facade | `prelude`, the macro, `include_agent!`, features `macros` (default), `a2a`, `mcp`, `dev` |
+| `adam` | facade | **built (S2)**: `prelude`, the macro, feature `macros` (default). Planned: `include_agent!`, features `a2a`, `mcp`, `dev` |
 | `cargo-adam` | bin | `new`, `check`, `dev` (roadmap 6) |
 
 `ManifestSource` is the seam between where the files come from and what they mean, so that a backend can be swapped
 without touching the other: its signature has only manifest types and diagnostics. `Tool` stays
 the only tool seam; MCP and `FnTool` implement it. Third-party crates the plan needs (`schemars`, `syn`,
 `serde-saphyr`, `rmcp`, `notify`, `trybuild`) are checked against `cargo deny` in the slice that adds
-each; `schemars` 1.2.2 is already in `Cargo.lock`.
+each; `schemars` 1.2.2 is already in `Cargo.lock`. S2 added `syn` 3, `quote` and `proc-macro2` (all
+already locked, through `async-trait`) to `adam-macros`, and `trybuild` 1.0.121 as a dev-dependency of
+`adam` (it brings `toml`, `winnow`, `glob`, `termcolor`, `target-tuple`; *verified 2026-09-29*:
+`cargo deny check` passes).
 
 ## Mapping: eve to adam-rs to standard
 
@@ -384,7 +439,7 @@ type already sets the pattern).
 |---|---|---|
 | S0 | this document | this change |
 | S1 | typed tool helpers in `adam-llm-agent` (feature `schema` for the schema part) | built |
-| S2 | `#[tool]` and the `adam` facade | planned |
+| S2 | `#[tool]` and the `adam` facade | built |
 | S3 | `adam-coder` tools through `#[tool]`, no behaviour change | planned |
 | S4 to S6 | `adam-agent-fs` (parse, validate), `build.rs` codegen, `adam-assembly` | planned |
 | S7 | skills | planned |

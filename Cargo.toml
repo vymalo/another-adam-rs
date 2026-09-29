@@ -17,6 +17,8 @@ expect_used = "warn"
 [workspace.dependencies]
 adam-core = { path = "crates/adam-core", version = "0.1.0" }
 adam-error = { path = "crates/adam-error", version = "0.1.0" }
+adam-llm-agent = { path = "crates/adam-llm-agent", version = "0.1.0" }
+adam-macros = { path = "crates/adam-macros", version = "0.1.0" }
 adam-model = { path = "crates/adam-model", version = "0.1.0" }
 adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.1.0" }
 adam-runtime = { path = "crates/adam-runtime", version = "0.1.0" }
@@ -35,7 +37,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
 futures = "0.3"
 httpdate = "1"
+proc-macro2 = "1"
 proptest = "1"
+quote = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream", "json", "query"] }
 schemars = { version = "1.2", default-features = false, features = ["std"] }
 secrecy = "0.10"
@@ -43,11 +47,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 subtle = "2"
+syn = { version = "3", default-features = false, features = ["full", "parsing", "printing", "proc-macro", "clone-impls"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["compat"] }
+trybuild = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter"] }
 url = "2"
