@@ -12,6 +12,10 @@ rust-version.workspace = true
 default = []
 # `Assembly::card`: the root agent's `card:` frontmatter as an `adam_a2a::AgentCardConfig`.
 a2a = ["dep:adam-a2a"]
+# Dev reload: read the agent directory at run time and swap the agents when a file changes
+# (`LiveAssembly`, `AgentDef::from_dir`). Off by default, so a release build cannot read prompts
+# from disk unless it opts in. The only feature that brings `notify`.
+dev = ["dep:notify", "dep:adam-core"]
 
 [dependencies]
 # The A2A client behind remote subagents (`a2a:`): part of every build, so a manifest with a remote
@@ -20,11 +24,13 @@ a2a-client-lf.workspace = true
 a2a-lf.workspace = true
 adam-a2a = { path = "../adam-a2a", version = "0.1.0", optional = true }
 adam-agent-fs.workspace = true
+adam-core = { workspace = true, optional = true }
 adam-error.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
+notify = { workspace = true, optional = true }
 reqwest.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
