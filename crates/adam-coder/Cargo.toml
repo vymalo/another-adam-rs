@@ -1,0 +1,47 @@
+[package]
+name = "adam-coder"
+description = "Coder agent over A2A: takes a coding task to a verified pull request (worktree, OpenCode over ACP, checks, push, PR)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "adam_coder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adam-coder"
+path = "src/main.rs"
+
+[dependencies]
+adam-a2a = { path = "../adam-a2a", version = "0.1.0" }
+adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0" }
+adam-acp = { path = "../adam-acp", version = "0.1.0" }
+adam-core.workspace = true
+adam-llm-agent = { path = "../adam-llm-agent", version = "0.1.0" }
+adam-model.workspace = true
+adam-model-openai = { path = "../adam-model-openai", version = "0.1.0" }
+adam-runtime.workspace = true
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
+adam-workspace.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+futures.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+a2a-client-lf.workspace = true
+a2a-lf.workspace = true
+adam-workspace = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true
+wiremock.workspace = true

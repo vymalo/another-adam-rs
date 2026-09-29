@@ -21,6 +21,7 @@ trait, a shared conformance suite, and two production adapters.
 | `adam-acp` | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
 | `adam-llm-agent` | `LlmAgent`: the durable model/tool-calling loop (`Tool` trait, `NeedsInput` parking, limits, history truncation) on top of `adam-runtime` |
 | `adam-a2a-runtime` | `RuntimeTaskBackend`: the A2A `TaskBackend` over `adam-runtime` (task = run, ownership per caller, `input-required` from parked runs); subscriptions are rebuilt from the store, so they survive restarts. Reusable by any agent |
+| `adam-coder` | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary; image in `docker/coder`, chart in `deploy/coder` |
 
 ## The model
 
