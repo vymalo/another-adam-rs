@@ -1,0 +1,10 @@
+# Keep the build context small; the build needs only Cargo.toml, Cargo.lock and crates/.
+**/target
+.git
+.github
+.claude
+deploy
+docs
+docker-compose.yml
+**/*.md
+!crates/adam-coder/src/**/*.md

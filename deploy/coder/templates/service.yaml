@@ -1,0 +1,17 @@
+# ClusterIP only, never exposed: the orchestrator reaches it in-cluster over A2A
+# with a bearer token. This is also the StatefulSet's governing service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "coder.fullname" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "coder.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP

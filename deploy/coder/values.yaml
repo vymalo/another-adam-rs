@@ -1,0 +1,132 @@
+# The coder agent. Reachable only inside the cluster: the orchestrator
+# (namespace `another-agentic-system`) talks A2A to the Service with a bearer
+# token. There is deliberately no Ingress here.
+
+image:
+  repository: ghcr.io/vymalo/another-adam-rs/coder
+  # Bumped on every green build of main by .github/workflows/coder.yml
+  # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
+  # sha-0000000 is the placeholder that exists before the first build.
+  tag: sha-0000000
+  pullPolicy: IfNotPresent
+
+# The image package may be private; name a pull secret here if so.
+imagePullSecrets: []
+
+# One replica for the MVP: the worktrees live on a ReadWriteOnce volume, and
+# the workspace layer assumes one process per workspace root. Runs are leased
+# in Postgres, so a second replica would work only with a shared /work.
+replicaCount: 1
+
+# Environment of the binary (see crates/adam-coder/src/config.rs). Secrets are
+# not here: they come from the ExternalSecret below.
+config:
+  # OpenAI-compatible gateway, with its /v1 prefix.
+  modelBaseUrl: "https://gateway.example.invalid/v1"
+  # Model alias of the agent, and the one OpenCode uses through the same gateway.
+  model: "coder"
+  opencodeModel: "coder"
+  # URL clients reach the JSON-RPC endpoint at (goes into the agent card).
+  # Empty: the in-cluster Service URL.
+  publicUrl: ""
+  # Runs advanced at the same time.
+  workers: 4
+  # Failed run_checks after which the agent must stop and report.
+  maxCheckCycles: 3
+  # Time limit of one run_checks command, in seconds.
+  checkTimeoutSecs: 900
+  # Hosts repositories may live on (a name for any port, or name:port). The
+  # GitHub token is only ever sent to these; a repository URL on any other host
+  # is refused before git runs. GitHub Enterprise: add its host.
+  allowedRepoHosts:
+    - github.com
+  # GitHub REST API root. GitHub Enterprise: https://<host>/api/v3 (and add the
+  # host to allowedRepoHosts).
+  githubApiUrl: "https://api.github.com"
+  # Open pull requests as drafts.
+  prDraft: false
+  gitAuthorName: "adam-coder"
+  gitAuthorEmail: "adam-coder@users.noreply.github.com"
+  # Extra environment variables, as a name -> value map.
+  extraEnv: {}
+
+service:
+  port: 8080
+
+# Mirrors and worktrees. They persist across restarts: git is the durable
+# artifact, and a restarted run finds its worktree again.
+persistence:
+  size: 20Gi
+  storageClass: longhorn
+  accessModes:
+    - ReadWriteOnce
+
+# The coder's own Postgres, created by CloudNativePG.
+database:
+  enabled: true
+  name: adam
+  owner: adam
+  instances: 1
+  storage:
+    size: 5Gi
+    storageClass: longhorn
+  # Backups are out of scope for the MVP: losing this database loses the run
+  # ledger (running and finished runs), not the pushed branches or the pull
+  # requests. Known risk.
+
+# Secret values come from AWS Secrets Manager through External Secrets.
+externalSecrets:
+  enabled: true
+  apiVersion: external-secrets.io/v1
+  refreshInterval: 1h
+  secretStoreRef:
+    name: ssegning-aws
+    kind: ClusterSecretStore
+  # The AWS secret, and the JSON property of each value inside it.
+  key: prod/meta/test-app
+  properties:
+    modelApiKey: adam_coder_model_api_key
+    githubToken: adam_coder_github_token
+    # Comma-separated bearer tokens the A2A server accepts.
+    a2aBearerTokens: adam_coder_a2a_bearer_tokens
+  # Name of the Kubernetes Secret it creates. Empty: <release>-coder.
+  targetSecretName: ""
+
+# Only the orchestrator's namespace may reach the pod. Egress is left open (git
+# hosts, the model gateway, package registries).
+networkPolicy:
+  enabled: true
+  allowedNamespace: another-agentic-system
+
+# uid/gid 10001 is the runtime user of the workspace image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  # Do not chown the whole volume (mirrors, worktrees) on every mount.
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+# Workers finish the steps they are in on SIGTERM; a step cut short by SIGKILL
+# is taken over by the next start once its lease expires.
+terminationGracePeriodSeconds: 120
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 6Gi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

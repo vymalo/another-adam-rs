@@ -1,0 +1,194 @@
+name: coder
+
+# The coder agent (crates/adam-coder + crates/adam-a2a-runtime): checks on pull
+# requests, an image on main, and a tag bump in the deploy chart.
+#
+# The bump follows the pattern of vymalo/another-agentic-system#11 (deploy-bump):
+# set the image tag in the chart's values.yaml to `sha-<first 7 of the commit>`
+# and push `chore(deploy): bump coder to sha-xxxxxxx` to main as github-actions.
+# It is a no-op when the tag is already current and it cannot loop: the push is
+# made with GITHUB_TOKEN (which does not trigger workflows), and pushes that only
+# touch values.yaml are ignored by the `paths-ignore` below anyway. Pull requests
+# get a dry run that shows the edit the bump would make.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - deploy/coder/values.yaml
+  pull_request:
+    paths:
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+      - deploy/coder/**
+      - docker/coder/**
+      - .github/workflows/coder.yml
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/vymalo/another-adam-rs/coder
+  HELM_VERSION: v3.19.0
+
+concurrency:
+  group: coder-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -p adam-coder -p adam-a2a-runtime --check
+      - run: cargo clippy -p adam-coder -p adam-a2a-runtime --all-targets -- -D warnings
+      # The tests are offline: a local bare git remote, a scripted model, the
+      # adam-acp fake agent (built by the tests) and a mock GitHub.
+      - run: cargo test -p adam-coder -p adam-a2a-runtime
+
+  helm:
+    name: helm lint and template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - run: helm lint deploy/coder
+      - run: helm template coder deploy/coder --namespace another-agentic-system > /dev/null
+      - name: Rendered chart keeps its guarantees
+        run: sh deploy/coder/tests/render-check.sh
+
+  dockerfile:
+    name: lint Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/coder/Dockerfile
+
+  bump-dry-run:
+    name: show the tag bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: What the bump would change on main
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          tag="sha-$(printf '%s' "$SHA" | cut -c1-7)"
+          sh deploy/coder/bump-tag.sh deploy/coder/values.yaml "$tag"
+          {
+            echo "### Tag bump dry run"
+            echo
+            echo "On main this pull request would set \`image.tag\` to \`$tag\`:"
+            echo
+            echo '```diff'
+            git diff --unified=1 -- deploy/coder/values.yaml
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  image:
+    name: build and push the image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [rust, helm, dockerfile]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      pushed: ${{ steps.guard.outputs.ready }}
+    steps:
+      - uses: actions/checkout@v4
+      # docker/coder/Dockerfile pins the workspace base image by tag. If it is
+      # ever set back to a placeholder (…-PENDING) that does not exist, say so
+      # instead of failing every push to main.
+      - name: Is the base image tag real?
+        id: guard
+        run: |
+          if grep -Eq '^ARG WORKSPACE_TAG=.*PENDING' docker/coder/Dockerfile; then
+            echo "::warning file=docker/coder/Dockerfile::WORKSPACE_TAG is a placeholder (…-PENDING); not building the image. Set it to a published <toolchain>-<sha7> tag of the workspace image."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.guard.outputs.ready == 'true'
+      - uses: docker/login-action@v3
+        if: steps.guard.outputs.ready == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag
+        id: tag
+        run: echo "tag=sha-$(printf '%s' "$GITHUB_SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        if: steps.guard.outputs.ready == 'true'
+        with:
+          context: .
+          file: docker/coder/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  bump:
+    name: bump the tag in the chart
+    needs: image
+    if: needs.image.outputs.pushed == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: coder-bump
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Set image.tag and push
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          tag="sha-$(printf '%s' "$SHA" | cut -c1-7)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            # A newer commit on main builds and bumps for itself; do not put
+            # its tag back to this older one (image jobs can finish out of order).
+            newer="$(git log --format=%s "$SHA..origin/main" | grep -v '^chore(deploy): bump coder to ' || true)"
+            if [ -n "$newer" ]; then
+              echo "main has moved on since $SHA; the newer build will bump"
+              exit 0
+            fi
+            result="$(sh deploy/coder/bump-tag.sh deploy/coder/values.yaml "$tag")"
+            echo "$result"
+            case "$result" in
+              unchanged*) exit 0 ;;
+            esac
+            git add deploy/coder/values.yaml
+            git commit -m "chore(deploy): bump coder to $tag"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "push raced with another commit (attempt $attempt); retrying"
+            sleep $((attempt * 3))
+          done
+          echo "could not push the bump" >&2
+          exit 1

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: coder
+description: "The adam-rs coder agent (A2A): coding task to verified pull request. One StatefulSet, its own CNPG Postgres, cluster-internal only."
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+sources:
+  - https://github.com/vymalo/another-adam-rs

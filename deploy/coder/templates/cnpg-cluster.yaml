@@ -1,0 +1,19 @@
+{{- if .Values.database.enabled }}
+# The coder's own Postgres. CloudNativePG creates the database, its owner and
+# the Secret `<name>-app` (key `uri` is the connection string the pod uses).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "coder.dbName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+spec:
+  instances: {{ .Values.database.instances }}
+  storage:
+    size: {{ .Values.database.storage.size | quote }}
+    storageClass: {{ .Values.database.storage.storageClass | quote }}
+  bootstrap:
+    initdb:
+      database: {{ .Values.database.name }}
+      owner: {{ .Values.database.owner }}
+{{- end }}
