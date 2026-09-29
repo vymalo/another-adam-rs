@@ -15,15 +15,17 @@ use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, Transport};
 use adam_a2a::{AuthConfig, BackendError, Caller, TaskBackend, TaskEvent};
-use adam_coder::{Coder, CoderAgent, RuntimeOptions, ToolEnv, coder_tools};
+use adam_a2a_runtime::RuntimeTaskBackend;
+use adam_coder::opencode::OpenCodeLaunch;
+use adam_coder::{AGENT_NAME, Coder, CoderAgent, RuntimeOptions, ToolEnv, coder_tools};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{Conversation, DynTool, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::{
     DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolSpec,
 };
-use adam_runtime::RunView;
+use adam_runtime::{BroadcastSink, RetryPolicy, RunView, Runtime};
 use async_trait::async_trait;
-use common::{Fixture, PR_URL, call, happy_script};
+use common::{Fixture, PR_URL, call, happy_script, pg};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use secrecy::SecretString;
@@ -207,18 +209,49 @@ fn run_id(task_id: &str) -> RunId {
     RunId(task_id.parse().expect("task id is a run id"))
 }
 
-fn store() -> DynStore {
-    Arc::new(MemoryStore::new())
+/// A store for one test, and what it takes to throw it away.
+struct Backing {
+    store: DynStore,
+    db: Option<pg::TestDb>,
+}
+
+impl Backing {
+    fn store(&self) -> DynStore {
+        self.store.clone()
+    }
+
+    async fn finish(self) {
+        drop(self.store);
+        if let Some(db) = self.db {
+            db.finish().await;
+        }
+    }
+}
+
+async fn memory_backing() -> Option<Backing> {
+    Some(Backing {
+        store: Arc::new(MemoryStore::new()),
+        db: None,
+    })
+}
+
+/// A database of its own: the coder's runs are claimed by agent name, so
+/// tests must not share tables.
+async fn postgres_backing() -> Option<Backing> {
+    let db = pg::TestDb::create().await?;
+    Some(Backing {
+        store: db.store(),
+        db: Some(db),
+    })
 }
 
 // ------------------------------------------------------------------- happy path
 
-#[tokio::test]
-async fn add_hello_txt_streams_working_progress_checks_artifact_completed() {
+async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store: DynStore) {
     let fx = Fixture::new("hello\n").await;
     let mock = Arc::new(MockModel::new());
     happy_script(&mock, &fx.remote_url());
-    let server = Server::start(coder_with(&fx, &mock, store())).await;
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
 
     let mut stream = server
         .client
@@ -376,8 +409,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed() {
 
 // ------------------------------------------------------------------ input-required
 
-#[tokio::test]
-async fn ask_user_parks_and_an_a2a_follow_up_resumes() {
+async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
     let fx = Fixture::new("hello\n").await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
@@ -386,7 +418,7 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes() {
         json!({"question": "Which base branch should I use?"}),
     )])
     .push_text("Understood: main.");
-    let server = Server::start(coder_with(&fx, &mock, store())).await;
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
     let worker = spawn_worker(&server.coder);
 
     let mut stream = server
@@ -445,8 +477,7 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes() {
 /// Failing checks `MAX_CHECK_CYCLES` times end the run `failed`, with the
 /// findings, and no pull request; the tools hold the line even when the model
 /// keeps going.
-#[tokio::test]
-async fn red_checks_n_times_fail_the_run_with_the_findings_and_no_pr() {
+async fn red_checks_n_times_fail_the_run_with_the_findings_and_no_pr(store: DynStore) {
     let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 2).await;
     let mock = Arc::new(MockModel::new());
     let failing = "echo 'assertion failed: hello.txt is not enough'; exit 1";
@@ -482,7 +513,7 @@ async fn red_checks_n_times_fail_the_run_with_the_findings_and_no_pr() {
         ),
     ])
     .push_text("I could not get the checks to pass.");
-    let server = Server::start(coder_with(&fx, &mock, store())).await;
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
     let worker = spawn_worker(&server.coder);
 
     let mut stream = server
@@ -574,8 +605,7 @@ fn tool_results(messages: &[adam_model::Message]) -> Vec<(String, String, bool)>
 
 /// The explicit-acceptance path: a red check does not block a pull request the
 /// user accepted, and the pull request says so.
-#[tokio::test]
-async fn a_pull_request_with_red_checks_needs_explicit_acceptance() {
+async fn a_pull_request_with_red_checks_needs_explicit_acceptance(store: DynStore) {
     let fx = Fixture::new("hello\n").await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
@@ -614,7 +644,7 @@ async fn a_pull_request_with_red_checks_needs_explicit_acceptance() {
         json!({"title": "feat: hello", "body": "b", "accept_red_checks": true}),
     )])
     .push_text("Opened it, as you accepted red checks.");
-    let server = Server::start(coder_with(&fx, &mock, store())).await;
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
     let worker = spawn_worker(&server.coder);
 
     let mut stream = server
@@ -726,6 +756,9 @@ enum CrashPoint {
     AfterCommitAndPush,
     /// After `open_pull_request` created the PR, before its result was journaled.
     InsideOpenPullRequest,
+    /// After OpenCode finished and edited files, before `delegate_to_opencode`'s
+    /// result was journaled (so the whole call runs again on takeover).
+    InsideDelegate,
 }
 
 fn short_lease() -> RuntimeOptions {
@@ -738,17 +771,28 @@ fn short_lease() -> RuntimeOptions {
 /// Two workers (two runtimes over one store) drive one run; the first dies at
 /// `point`; the second takes over and the run completes with exactly one
 /// commit, one branch update and one pull request.
-async fn crash_at(point: CrashPoint) {
-    let fx = Fixture::new("hello\n").await;
+async fn crash_at(point: CrashPoint, store: DynStore) {
+    // OpenCode is launched through a script that logs every launch, so the
+    // delegate case can tell a rerun from a replay.
+    let agent_dir = tempfile::tempdir().unwrap();
+    let (scripted, launch_log) = common::scripted_agent(
+        agent_dir.path(),
+        "exec \"$AGENT\"",
+        OpenCodeLaunch::program("unused")
+            .env("FAKE_ACP_SCENARIO", "write-file")
+            .env("FAKE_ACP_WRITE_PATH", "hello.txt")
+            .env("FAKE_ACP_WRITE_CONTENT", "hello\n"),
+    );
+    let fx = Fixture::with("hello\n", |s| s.opencode = scripted).await;
     let mock = Arc::new(MockModel::new());
     happy_script(&mock, &fx.remote_url());
-    let store = store();
     let reached = Arc::new(Notify::new());
     let armed = Arc::new(AtomicBool::new(true));
 
     let (model, wrap): (DynModel, Option<&'static str>) = match point {
         CrashPoint::InsideCommitAndPush => (mock.clone(), Some("commit_and_push")),
         CrashPoint::InsideOpenPullRequest => (mock.clone(), Some("open_pull_request")),
+        CrashPoint::InsideDelegate => (mock.clone(), Some("delegate_to_opencode")),
         CrashPoint::AfterCommitAndPush => (
             Arc::new(HangingModel {
                 inner: mock.clone(),
@@ -804,6 +848,19 @@ async fn crash_at(point: CrashPoint) {
     assert!(a.handle.await.expect_err("aborted").is_cancelled());
     let view = doomed.runtime.view(run).await.unwrap().unwrap();
     assert_eq!(view.status, RunStatus::Runnable, "not finished: {view:#?}");
+    if matches!(point, CrashPoint::InsideDelegate) {
+        // OpenCode ran once and the run's worktree holds what it did; add an
+        // edit of "an earlier attempt" that only survives if the takeover
+        // reuses the same worktree instead of starting over.
+        assert_eq!(common::launches(&launch_log), 1);
+        let worktree = fx.root.join("worktrees").join(&task.id);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("hello.txt")).unwrap(),
+            "hello\n",
+            "OpenCode's edit is in the worktree before the takeover"
+        );
+        std::fs::write(worktree.join("wip.txt"), "earlier edit\n").unwrap();
+    }
 
     // A subscription on the survivor's replica follows the run to the end.
     let mut events = survivor.backend.subscribe(&owner, &task.id);
@@ -839,6 +896,18 @@ async fn crash_at(point: CrashPoint) {
         "no duplicate pull request"
     );
     assert_eq!(fx.file_on(&branches[0], "hello.txt"), "hello");
+    if matches!(point, CrashPoint::InsideDelegate) {
+        assert_eq!(
+            common::launches(&launch_log),
+            2,
+            "the interrupted call ran again, once"
+        );
+        assert_eq!(
+            fx.file_on(&branches[0], "wip.txt"),
+            "earlier edit",
+            "the takeover kept working in the same worktree"
+        );
+    }
 
     // The durable record has both artifacts and the URL.
     let task = survivor
@@ -864,25 +933,454 @@ async fn crash_at(point: CrashPoint) {
     );
 }
 
-#[tokio::test]
-async fn crash_after_commit_and_push_was_journaled_repeats_nothing() {
-    crash_at(CrashPoint::AfterCommitAndPush).await;
+async fn crash_after_commit_and_push_was_journaled_repeats_nothing(store: DynStore) {
+    crash_at(CrashPoint::AfterCommitAndPush, store).await;
 }
 
-#[tokio::test]
-async fn crash_inside_commit_and_push_before_the_journal_is_idempotent() {
-    crash_at(CrashPoint::InsideCommitAndPush).await;
+async fn crash_inside_commit_and_push_before_the_journal_is_idempotent(store: DynStore) {
+    crash_at(CrashPoint::InsideCommitAndPush, store).await;
 }
 
-#[tokio::test]
-async fn crash_inside_open_pull_request_before_the_journal_is_idempotent() {
-    crash_at(CrashPoint::InsideOpenPullRequest).await;
+async fn crash_inside_open_pull_request_before_the_journal_is_idempotent(store: DynStore) {
+    crash_at(CrashPoint::InsideOpenPullRequest, store).await;
+}
+
+/// The crash the plan calls E6: the worker dies while OpenCode's turn is
+/// done but not journaled. The takeover reruns `delegate_to_opencode` in the
+/// same worktree (earlier edits kept), and the run still delivers one commit,
+/// one push and one pull request.
+async fn crash_during_delegate_to_opencode_reruns_on_the_same_worktree(store: DynStore) {
+    crash_at(CrashPoint::InsideDelegate, store).await;
+}
+
+// ------------------------------------------------------------ OpenCode failures
+
+/// A coder whose runtime retries transient failures quickly (the default
+/// backoff is 1, 2, 4, 8 seconds).
+fn coder_retrying(fx: &Fixture, model: DynModel, store: DynStore, max_attempts: u32) -> Coder {
+    let events = BroadcastSink::default();
+    let opts = options();
+    let runtime = Runtime::builder(store)
+        .agent(CoderAgent::new(model, "test-model", fx.env.clone()))
+        .event_sink(events.clone())
+        .concurrency(opts.concurrency)
+        .lease_ttl(opts.lease_ttl)
+        .poll_interval(opts.poll_interval)
+        .retry(RetryPolicy {
+            max_attempts,
+            initial_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(100),
+            multiplier: 2.0,
+        })
+        .build();
+    let backend = RuntimeTaskBackend::new(runtime.clone(), events, AGENT_NAME)
+        .with_poll_interval(opts.poll_interval);
+    Coder { runtime, backend }
+}
+
+/// Send `text` and follow the stream until the task stops.
+async fn run_to_end(server: &Server, text: &str) -> Seen {
+    let mut stream = server
+        .client
+        .send_streaming_message(&request(user(text)))
+        .await
+        .unwrap();
+    let mut seen = Seen::default();
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(60), stream.next())
+        .await
+        .expect("the stream ends")
+    {
+        seen.record(item.unwrap());
+    }
+    seen
+}
+
+fn prepare_and_delegate(mock: &MockModel, fx: &Fixture, delegate_ids: &[&str]) {
+    mock.push_tool_calls(vec![call(
+        "c1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )]);
+    for id in delegate_ids {
+        mock.push_tool_calls(vec![call(
+            id,
+            "delegate_to_opencode",
+            json!({"instructions": "add hello.txt containing hello"}),
+        )]);
+    }
+}
+
+/// OpenCode dies on every launch: the tool error is transient, the runtime
+/// retries within its budget and then fails the run with what happened,
+/// including the child's stderr. Nothing is pushed or opened.
+async fn opencode_crashing_every_time_fails_the_run_with_its_stderr(store: DynStore) {
+    let fx = Fixture::with("hello\n", |s| {
+        s.opencode =
+            OpenCodeLaunch::program(common::fake_agent()).env("FAKE_ACP_SCENARIO", "crash");
+    })
+    .await;
+    let mock = Arc::new(MockModel::new());
+    // The retried turn asks the model again: one delegate call per attempt.
+    prepare_and_delegate(&mock, &fx, &["c2", "c2b"]);
+    let coder = coder_retrying(&fx, mock.clone(), store, 2);
+    let server = Server::start(coder).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "add hello.txt").await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:?}",
+        seen.labels
+    );
+    let transient = |seen: &Seen| {
+        seen.messages
+            .iter()
+            .filter(|m| m.contains("delegate_to_opencode") && m.contains("transient_error"))
+            .count()
+    };
+    assert_eq!(
+        transient(&seen),
+        2,
+        "the client sees both attempts fail: {:#?}",
+        seen.messages
+    );
+    let error = seen
+        .messages
+        .iter()
+        .find(|m| m.contains("gave up after 2 attempts"))
+        .unwrap_or_else(|| panic!("no failure message in {:#?}", seen.messages));
+    assert!(error.contains("OpenCode: ACP agent exited"), "{error}");
+    assert!(
+        error.contains("simulated crash"),
+        "the child's stderr explains it: {error}"
+    );
+    assert!(fx.agent_branches().is_empty(), "nothing was pushed");
+    assert!(fx.created_pulls().await.is_empty(), "no pull request");
+    assert_eq!(
+        mock.requests().len(),
+        3,
+        "prepare, then one turn per attempt"
+    );
+}
+
+/// OpenCode dies once: the retry launches it again in the same worktree and
+/// the run delivers as if nothing had happened.
+async fn opencode_crashing_once_is_retried_and_completes(store: DynStore) {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let marker = agent_dir.path().join("crashed-once");
+    let (launch, log) = common::scripted_agent(
+        agent_dir.path(),
+        "if [ ! -e \"$MARKER\" ]; then : > \"$MARKER\"; FAKE_ACP_SCENARIO=crash exec \"$AGENT\"; fi\nexec \"$AGENT\"",
+        OpenCodeLaunch::program("unused")
+            .env("FAKE_ACP_SCENARIO", "write-file")
+            .env("FAKE_ACP_WRITE_PATH", "hello.txt")
+            .env("FAKE_ACP_WRITE_CONTENT", "hello\n")
+            .env("MARKER", marker.to_string_lossy()),
+    );
+    let fx = Fixture::with("hello\n", |s| s.opencode = launch).await;
+    let mock = Arc::new(MockModel::new());
+    prepare_and_delegate(&mock, &fx, &["c2", "c2b"]);
+    mock.push_tool_calls(vec![call(
+        "c3",
+        "run_checks",
+        json!({"command": "test -f hello.txt && cat hello.txt"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c4",
+        "commit_and_push",
+        json!({"message": "feat: add hello.txt"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c5",
+        "open_pull_request",
+        json!({"title": "feat: add hello.txt", "body": "Adds hello.txt.\n\n## Verification\n- `test -f hello.txt`: passed"}),
+    )])
+    .push_text("Opened the pull request.");
+    let server = Server::start(coder_retrying(&fx, mock.clone(), store, 2)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "add hello.txt").await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?} {:#?}",
+        seen.labels,
+        seen.messages
+    );
+    assert_eq!(
+        seen.messages
+            .iter()
+            .filter(|m| m.contains("delegate_to_opencode") && m.contains("transient_error"))
+            .count(),
+        1,
+        "the client sees the first attempt fail: {:#?}",
+        seen.messages
+    );
+    assert_eq!(common::launches(&log), 2, "one crash, one good launch");
+    let branches = fx.agent_branches();
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    assert_eq!(fx.file_on(&branches[0], "hello.txt"), "hello");
+    assert_eq!(fx.commits_ahead(&branches[0]), 1);
+    assert_eq!(fx.created_pulls().await.len(), 1);
+    assert!(seen.artifacts.iter().any(|(n, _)| n == "pull_request"));
+}
+
+// ------------------------------------------------------- concurrent tasks
+
+/// One scripted model per task, chosen by a marker in the task's text: two
+/// runs interleave their model calls, so a single shared script cannot serve
+/// both.
+struct PerTaskModel {
+    scripts: Vec<(&'static str, Arc<MockModel>)>,
+}
+
+impl PerTaskModel {
+    fn pick(&self, req: &ModelRequest) -> &Arc<MockModel> {
+        let text = format!("{:?}", req.messages);
+        self.scripts
+            .iter()
+            .find(|(marker, _)| text.contains(marker))
+            .map(|(_, model)| model)
+            .expect("the conversation carries a task marker")
+    }
+}
+
+#[async_trait]
+impl ModelClient for PerTaskModel {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.pick(&req).complete(req).await
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        self.pick(&req).stream(req).await
+    }
+}
+
+/// Two tasks on the same repository, advanced by one worker at the same time
+/// (concurrency 2): each gets its own worktree and branch, and its own pull
+/// request; the shared mirror serves both.
+async fn two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let (alpha, beta) = (Arc::new(MockModel::new()), Arc::new(MockModel::new()));
+    common::happy_script_titled(&alpha, &fx.remote_url(), "feat: alpha");
+    common::happy_script_titled(&beta, &fx.remote_url(), "feat: beta");
+    let model: DynModel = Arc::new(PerTaskModel {
+        scripts: vec![("task-alpha", alpha.clone()), ("task-beta", beta.clone())],
+    });
+    let coder = Coder::new(
+        store,
+        CoderAgent::new(model, "test-model", fx.env.clone()),
+        &options(),
+    );
+    let owner = Caller::new("token-0");
+    let a = coder
+        .backend
+        .submit(owner.clone(), user("task-alpha: add hello.txt"), None, None)
+        .await
+        .unwrap();
+    let b = coder
+        .backend
+        .submit(owner.clone(), user("task-beta: add hello.txt"), None, None)
+        .await
+        .unwrap();
+    assert_ne!(a.id, b.id);
+    let worker = spawn_worker(&coder);
+    for task in [&a, &b] {
+        let view = wait_for(&coder.runtime, run_id(&task.id), "the run to finish", |v| {
+            v.status.is_terminal()
+        })
+        .await;
+        assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    }
+    worker.stop().await;
+
+    let branches = fx.agent_branches();
+    assert_eq!(branches.len(), 2, "{branches:?}");
+    for branch in &branches {
+        assert_eq!(fx.commits_ahead(branch), 1, "{branch}");
+        assert_eq!(fx.ref_updates(branch), 1, "{branch}");
+        assert_eq!(fx.file_on(branch, "hello.txt"), "hello");
+    }
+    let mut heads: Vec<String> = fx
+        .created_pulls()
+        .await
+        .iter()
+        .map(|p| p["head"].as_str().unwrap().to_owned())
+        .collect();
+    heads.sort();
+    assert_eq!(heads, branches, "one pull request per branch");
+    let titles: std::collections::BTreeSet<String> = fx
+        .created_pulls()
+        .await
+        .iter()
+        .map(|p| p["title"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        titles,
+        ["feat: alpha", "feat: beta"].map(String::from).into()
+    );
+
+    // Each task reports its own pull request.
+    let mut urls = Vec::new();
+    for (task, title) in [(&a, "feat: alpha"), (&b, "feat: beta")] {
+        let task = coder.backend.get(&owner, &task.id).await.unwrap().unwrap();
+        assert_eq!(task.status.state, TaskState::Completed, "{title}");
+        let pr = task
+            .artifacts
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name.as_deref() == Some("pull_request"))
+            .unwrap_or_else(|| panic!("{title} has no pull_request artifact"));
+        let a2a::PartContent::Data(data) = &pr.parts[0].content else {
+            panic!("data part expected")
+        };
+        urls.push(data["url"].as_str().unwrap().to_owned());
+    }
+    urls.sort();
+    assert_eq!(urls, [PR_URL.to_owned(), common::pull_url(8)]);
+    // Two worktrees, on two different branches.
+    let worktrees: Vec<_> = std::fs::read_dir(fx.root.join("worktrees"))
+        .unwrap()
+        .collect();
+    assert_eq!(worktrees.len(), 2);
+}
+
+// ----------------------------------------------------------------- GitHub 401
+
+/// GitHub rejects the token when the coder opens the pull request. The model
+/// cannot fix a bad credential, so the run must not "complete" without a pull
+/// request: it fails, and the error says what to look at.
+async fn a_github_401_fails_the_run_with_a_clear_message(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    common::github_fails_with(&fx.github, 401, "Bad credentials").await;
+    let mock = Arc::new(MockModel::new());
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "add hello.txt").await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:?} {:#?}",
+        seen.labels,
+        seen.messages
+    );
+    let error = seen
+        .messages
+        .iter()
+        .find(|m| m.contains("Bad credentials"))
+        .unwrap_or_else(|| panic!("the GitHub message is reported: {:#?}", seen.messages));
+    assert!(
+        error.contains("authentication failed") && error.contains("GITHUB_TOKEN"),
+        "{error}"
+    );
+    assert!(
+        !error.contains(common::GITHUB_TOKEN),
+        "the token never appears in a message: {error}"
+    );
+    assert!(
+        !seen.labels.iter().any(|l| l == "artifact:pull_request"),
+        "{:?}",
+        seen.labels
+    );
+    // The branch was pushed (git is the durable artifact) but no PR exists.
+    assert_eq!(fx.agent_branches().len(), 1);
+    assert!(fx.created_pulls().await.is_empty());
+}
+
+// ------------------------------------------------------------- the A2A front
+
+/// One raw HTTP/1.1 request; `(status, body)`.
+async fn raw(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"nope"}}"#;
+    let auth = bearer.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+    let payload = if method == "POST" {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n{auth}\r\n{body}",
+            body.len()
+        )
+    } else {
+        format!("{auth}\r\n")
+    };
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{payload}")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("a status line");
+    (status, response)
+}
+
+/// The coder's own router (not just `adam-a2a`'s) refuses a missing or wrong
+/// token with 401 and never runs anything, while the agent card and
+/// `/healthz` stay open.
+async fn wrong_token_on_the_coder_router_is_401(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    let coder = coder_with(&fx, &mock, store);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = coder.router(
+        &format!("http://{addr}/").parse().unwrap(),
+        AuthConfig::BearerTokens(vec![SecretString::from(TOKEN)]),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    for bearer in [None, Some("wrong"), Some(""), Some("coder-test-toke")] {
+        let (status, response) = raw(addr, "POST", "/", bearer).await;
+        assert_eq!(status, 401, "{bearer:?}: {response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("www-authenticate: bearer"),
+            "{response}"
+        );
+        assert!(!response.contains(TOKEN), "{response}");
+    }
+    // The right token gets past authentication (the task does not exist).
+    let (status, response) = raw(addr, "POST", "/", Some(TOKEN)).await;
+    assert_ne!(status, 401, "{response}");
+
+    let (status, card) = raw(addr, "GET", "/.well-known/agent-card.json", None).await;
+    assert_eq!(status, 200, "{card}");
+    assert!(card.contains("adam-coder") && card.contains(&format!("http://{addr}/")));
+    let (status, _) = raw(addr, "GET", "/healthz", None).await;
+    assert_eq!(status, 200);
+
+    assert!(mock.requests().is_empty(), "no run was started");
 }
 
 // -------------------------------------------------------------------- ownership
 
-#[tokio::test]
-async fn another_caller_cannot_see_or_resume_the_task() {
+async fn another_caller_cannot_see_or_resume_the_task(store: DynStore) {
     let fx = Fixture::new("hello\n").await;
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![call(
@@ -890,7 +1388,7 @@ async fn another_caller_cannot_see_or_resume_the_task() {
         "ask_user",
         json!({"question": "Which repo?"}),
     )]);
-    let coder = coder_with(&fx, &mock, store());
+    let coder = coder_with(&fx, &mock, store);
     let worker = spawn_worker(&coder);
     let alice = Caller::new("token-0");
     let task = coder
@@ -917,3 +1415,46 @@ async fn another_caller_cannot_see_or_resume_the_task() {
     let seen: Task = coder.backend.get(&alice, &task.id).await.unwrap().unwrap();
     assert_eq!(seen.status.state, TaskState::InputRequired);
 }
+
+// ------------------------------------------------------- one suite per store
+
+/// Every case runs once per store: in memory always, and on PostgreSQL when
+/// `ADAM_TEST_POSTGRES_URL` is set (each case gets a private database).
+macro_rules! coder_suite {
+    ($module:ident, $make:path) => {
+        mod $module {
+            coder_suite!(@cases $make;
+                add_hello_txt_streams_working_progress_checks_artifact_completed,
+                ask_user_parks_and_an_a2a_follow_up_resumes,
+                red_checks_n_times_fail_the_run_with_the_findings_and_no_pr,
+                a_pull_request_with_red_checks_needs_explicit_acceptance,
+                crash_after_commit_and_push_was_journaled_repeats_nothing,
+                crash_inside_commit_and_push_before_the_journal_is_idempotent,
+                crash_inside_open_pull_request_before_the_journal_is_idempotent,
+                crash_during_delegate_to_opencode_reruns_on_the_same_worktree,
+                opencode_crashing_every_time_fails_the_run_with_its_stderr,
+                opencode_crashing_once_is_retried_and_completes,
+                two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs,
+                a_github_401_fails_the_run_with_a_clear_message,
+                wrong_token_on_the_coder_router_is_401,
+                another_caller_cannot_see_or_resume_the_task,
+            );
+        }
+    };
+    (@cases $make:path; $($case:ident),+ $(,)?) => {
+        $(
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn $case() {
+                let Some(backing) = $make().await else {
+                    eprintln!("skipped: store not configured");
+                    return;
+                };
+                super::$case(backing.store()).await;
+                backing.finish().await;
+            }
+        )+
+    };
+}
+
+coder_suite!(memory, super::memory_backing);
+coder_suite!(postgres, super::postgres_backing);

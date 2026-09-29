@@ -43,5 +43,7 @@ url.workspace = true
 a2a-client-lf.workspace = true
 a2a-lf.workspace = true
 adam-workspace = { workspace = true, features = ["test-util"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile.workspace = true
+uuid.workspace = true
 wiremock.workspace = true

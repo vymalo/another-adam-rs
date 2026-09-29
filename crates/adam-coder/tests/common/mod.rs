@@ -21,6 +21,8 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+pub mod pg;
+
 /// The first pull request the mock GitHub creates.
 pub const PR_URL: &str = "https://github.com/octo/widgets/pull/7";
 
@@ -384,6 +386,11 @@ pub fn call(id: &str, name: &str, args: Value) -> ToolCall {
 /// The model script of the happy path: prepare, delegate, check, commit and
 /// push, open the PR, then answer.
 pub fn happy_script(mock: &adam_model::MockModel, remote_url: &str) {
+    happy_script_titled(mock, remote_url, "feat: add hello.txt");
+}
+
+/// [`happy_script`] with the pull request title `title`.
+pub fn happy_script_titled(mock: &adam_model::MockModel, remote_url: &str, title: &str) {
     mock.push_tool_calls(vec![call(
         "c1",
         "prepare_workspace",
@@ -402,12 +409,12 @@ pub fn happy_script(mock: &adam_model::MockModel, remote_url: &str) {
     .push_tool_calls(vec![call(
         "c4",
         "commit_and_push",
-        json!({"message": "feat: add hello.txt"}),
+        json!({"message": title}),
     )])
     .push_tool_calls(vec![call(
         "c5",
         "open_pull_request",
-        json!({"title": "feat: add hello.txt", "body": "Adds hello.txt.\n\n## Verification\n- `test -f hello.txt`: passed"}),
+        json!({"title": title, "body": "Adds hello.txt.\n\n## Verification\n- `test -f hello.txt`: passed"}),
     )])
     .push_text("Opened the pull request.");
 }

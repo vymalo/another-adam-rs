@@ -64,7 +64,9 @@ tells the model the rules. The tools make them hold:
   request opened that way says so in its body. It never overrides an exhausted
   cycle budget (a deliberate hardening: after the limit the run must stop).
 * **Completion policy.** A run that ends with red checks and no pull request
-  fails instead of completing, whatever the model says.
+  fails instead of completing, whatever the model says. So does a run that ends
+  without a pull request because GitHub or git rejected the credentials (the
+  model cannot fix a bad token): the error names `GITHUB_TOKEN`.
 
 Per-run bookkeeping (cycles, last check, pushed sha, pull request) lives in
 `<WORKSPACE_ROOT>/coder/<run>.json` next to the worktree, written atomically.
@@ -138,17 +140,28 @@ Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
 
 ## Tests
 
-Everything is offline (`cargo test -p adam-coder`):
+Everything is offline (`cargo test -p adam-coder`; with
+`ADAM_TEST_POSTGRES_URL` set the Postgres variants run too, each case in a
+database of its own, so the role needs `CREATEDB`):
 
 * `tests/e2e.rs`: a real A2A client and server, the scripted `MockModel`, a
   local bare git repository as the remote, the `adam-acp` fake agent as OpenCode
-  and a wiremock GitHub. Covers the happy path (working, progress, checks,
-  artifacts, completed, branch on the remote, PR request at the mock), the
-  `input-required` round trip, red checks N times (failed, findings, no PR),
-  the explicit-acceptance path, ownership, and three crash points (inside
-  `commit_and_push`, after it was journaled, inside `open_pull_request`) with a
-  second worker taking over: one commit, one push, one pull request.
-* `tests/tools.rs`: each tool against real worktrees.
+  and a wiremock GitHub. **Every case runs once per store** (`memory::*`, and
+  `postgres::*` when the variable is set): the happy path (working, progress,
+  checks, artifacts, completed, branch on the remote, PR request at the mock),
+  the `input-required` round trip, red checks N times (failed, findings, no PR),
+  the explicit-acceptance path, ownership, the wrong bearer token (401 at the
+  coder's own router; card and `/healthz` open), four crash points (inside
+  `commit_and_push`, after it was journaled, inside `open_pull_request`, inside
+  `delegate_to_opencode`) with a second worker taking over: one commit, one
+  push, one pull request, the same worktree; OpenCode crashing on every attempt
+  (run fails after the retry budget, with the child's stderr) and once
+  (retried, completes); two concurrent tasks on one repository (two branches,
+  two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`).
+* `tests/tools.rs`: each tool against real worktrees, including the hostile
+  `repo_url` shapes against the production repository policy.
+* `adam-workspace/tests/workspace.rs`: the host allowlist, local paths, scoped
+  tokens, and a wiremock "evil" git host that must never be contacted.
 * unit tests: configuration, prompt, OpenCode config, shell execution (timeout
   kills the process group, output tail, cwd confinement, hidden secrets), run
   notes.
