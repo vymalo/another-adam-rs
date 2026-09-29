@@ -38,6 +38,17 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- printf "%s-db" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/*
+Whether this pod runs workers: every role but `control-plane` (an empty role is
+`all`). The role is trimmed and lower-cased first, as the binary parses it, so
+" Control-Plane " is a control plane here too. Renders "true" or nothing, so
+`{{ if include "coder.runsWorkers" . }}` works. Only workers need the model, GitHub and workspace settings; a control
+plane starts runs without them (see docs/architecture.md, "Roles").
+*/}}
+{{- define "coder.runsWorkers" -}}
+{{- if ne (default "" .Values.config.role | trim | lower) "control-plane" -}}true{{- end -}}
+{{- end -}}
+
 {{/* The URL clients use for the JSON-RPC endpoint (the agent card advertises it). */}}
 {{- define "coder.publicUrl" -}}
 {{- if .Values.config.publicUrl -}}

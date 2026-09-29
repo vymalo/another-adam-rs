@@ -25,8 +25,12 @@ config:
   # unset, and the binary runs `all`: the A2A server and the workers in one
   # process. This chart still deploys one StatefulSet; a role other than `all`
   # only changes what that pod runs, it does not split the deployment.
+  # `control-plane` renders none of the model, GitHub and workspace settings
+  # below (modelBaseUrl through gitAuthorEmail) and none of the two secrets
+  # they need (properties.modelApiKey, properties.githubToken): it only starts,
+  # delivers to, cancels and views runs. `all` and `worker` need all of them.
   role: ""
-  # OpenAI-compatible gateway, with its /v1 prefix.
+  # OpenAI-compatible gateway, with its /v1 prefix. Roles that run workers only.
   modelBaseUrl: "https://gateway.example.invalid/v1"
   # Model alias of the agent, and the one OpenCode uses through the same gateway.
   model: "coder"
@@ -90,6 +94,9 @@ externalSecrets:
   # The AWS secret, and the JSON property of each value inside it.
   key: prod/meta/test-app
   properties:
+    # modelApiKey and githubToken are read by the roles that run workers (all,
+    # worker); with config.role=control-plane they are neither rendered nor
+    # required, and may be set to null.
     modelApiKey: adam_coder_model_api_key
     githubToken: adam_coder_github_token
     # Comma-separated bearer tokens the A2A server accepts.

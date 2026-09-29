@@ -18,12 +18,12 @@
 //!
 //! | Module | What |
 //! |---|---|
-//! | [`agent`] | [`CoderAgent`]: `LlmAgent` + the completion policy (red checks and no PR = failed) |
+//! | [`agent`] | [`CoderAgent`]: `LlmAgent` + the completion policy (red checks and no PR = failed); [`CoderStarter`]: its start-only half |
 //! | [`tools`] | the six tools, [`ToolEnv`] and [`CoderSettings`] |
 //! | [`instructions`] | the system prompt |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
-//! | [`app`] | [`Coder`]: runtime + A2A backend + router |
+//! | [`app`] | [`Coder`]: runtime + A2A backend + router; [`Coder::control_plane`] for a process that only starts runs |
 //! | [`config`] | the binary's environment variables |
 //! | [`serve()`] | the whole process: store, model, GitHub, and the A2A server and workers its `ROLE` runs (through `adam_host::Host`), until a shutdown future resolves |
 //!
@@ -47,12 +47,25 @@
 //! # }
 //! ```
 //!
+//! A process that only serves A2A needs no model, credentials or workspaces:
+//! starting a run needs only the agent's name and its `init`, which
+//! [`CoderStarter`] provides.
+//!
+//! ```no_run
+//! # use adam_coder::*;
+//! # fn demo(store: adam_core::DynStore) {
+//! let front = Coder::control_plane(store, &RuntimeOptions::default());
+//! # let _ = front;
+//! # }
+//! ```
+//!
 //! Every infrastructure piece is a trait object handed in from outside: the
 //! store, the model, the code host and the git credentials. The binary
 //! (`adam-coder`) is only [`serve`] over [`Config::from_env`]: a composition
-//! of the Postgres store, the OpenAI-compatible model and GitHub. Which halves
-//! it runs (`all`, `control-plane` or `worker`) is the `ROLE` variable, an
-//! [`adam_host::Role`]; see [`config`].
+//! of the Postgres store and, for the roles that run workers, the
+//! OpenAI-compatible model and GitHub. Which halves it runs (`all`,
+//! `control-plane` or `worker`) is the `ROLE` variable, an [`adam_host::Role`];
+//! see [`config`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -68,9 +81,9 @@ mod repos;
 mod serve;
 pub mod tools;
 
-pub use agent::{AGENT_NAME, CoderAgent, coder_limits};
+pub use agent::{AGENT_NAME, CoderAgent, CoderStarter, coder_limits};
 pub use app::{Coder, RuntimeOptions, agent_card};
-pub use config::{Config, ConfigError};
+pub use config::{Config, ConfigError, WorkerConfig};
 pub use exit::exit_code;
 pub use instructions::instructions;
 pub use redact::Redactor;

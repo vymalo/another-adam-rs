@@ -73,13 +73,15 @@ impl Redactor {
         Self { needles }
     }
 
-    /// The secrets the process holds: the model key, the GitHub token, every
-    /// accepted A2A bearer token, and the password of `DATABASE_URL`.
+    /// The secrets the process holds: every accepted A2A bearer token, the password of
+    /// `DATABASE_URL`, and, for a role that runs workers, the model key and the GitHub token (a
+    /// control plane holds neither).
     pub fn from_config(config: &Config) -> Self {
-        let mut secrets: Vec<String> = vec![
-            config.model_api_key.expose_secret().to_owned(),
-            config.github_token.expose_secret().to_owned(),
-        ];
+        let mut secrets: Vec<String> = Vec::new();
+        if let Some(worker) = &config.worker {
+            secrets.push(worker.model_api_key.expose_secret().to_owned());
+            secrets.push(worker.github_token.expose_secret().to_owned());
+        }
         secrets.extend(
             config
                 .a2a_bearer_tokens
@@ -241,6 +243,7 @@ mod tests {
             ("PUBLIC_URL", "http://coder:8080/"),
         ]);
         let config = Config::from_lookup(|k| vars.get(k).map(|v| (*v).to_owned())).unwrap();
+        assert!(config.worker.is_some());
         let r = Redactor::from_config(&config);
         for leaked in [
             "p%40ss%2Fw0rd",
@@ -256,5 +259,21 @@ mod tests {
             r.scrub("postgres://u:[redacted]@db/adam"),
             "postgres://u:[redacted]@db/adam"
         );
+    }
+
+    #[test]
+    fn a_control_plane_redacts_what_it_holds_and_needs_no_worker_secrets() {
+        let vars = std::collections::HashMap::from([
+            ("ROLE", "control-plane"),
+            ("DATABASE_URL", "postgres://u:db-password-1@db/adam"),
+            ("A2A_BEARER_TOKENS", "tok-one-1"),
+            ("PUBLIC_URL", "http://coder:8080/"),
+        ]);
+        let config = Config::from_lookup(|k| vars.get(k).map(|v| (*v).to_owned())).unwrap();
+        assert!(config.worker.is_none());
+        let r = Redactor::from_config(&config);
+        for leaked in ["db-password-1", "tok-one-1"] {
+            assert_eq!(r.scrub(&format!("<{leaked}>")), "<[redacted]>", "{leaked}");
+        }
     }
 }

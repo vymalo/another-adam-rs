@@ -7,11 +7,11 @@ use std::time::Duration;
 use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig, SkillConfig};
 use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::DynStore;
-use adam_runtime::{BroadcastSink, Runtime, RuntimeError};
+use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder, RuntimeError};
 use axum::Router;
 use url::Url;
 
-use crate::agent::{AGENT_NAME, CoderAgent};
+use crate::agent::{AGENT_NAME, CoderAgent, CoderStarter};
 
 /// How the runtime that advances runs is set up.
 #[derive(Debug, Clone)]
@@ -42,9 +42,10 @@ impl Default for RuntimeOptions {
 ///
 /// By default one process serves A2A *and* runs workers; replicas over the same
 /// database scale horizontally through leases. With `ROLE` the two halves run in
-/// separate processes: a control plane uses [`Coder::router`] and never calls
-/// [`Coder::run_worker`], a worker does the opposite. The halves meet only in the
-/// store, and the backend of a control plane learns what a worker did by polling.
+/// separate processes: a control plane ([`Coder::control_plane`]) uses [`Coder::router`] and
+/// never calls [`Coder::run_worker`], a worker ([`Coder::new`]) does the opposite. The halves
+/// meet only in the store, and the backend of a control plane learns what a worker did by
+/// polling.
 pub struct Coder {
     /// The runtime; call [`Coder::run_worker`] to advance runs.
     pub runtime: Runtime,
@@ -53,11 +54,24 @@ pub struct Coder {
 }
 
 impl Coder {
-    /// Compose `agent` over `store`.
+    /// Compose `agent` over `store`: the A2A backend and workers that step runs.
     pub fn new(store: DynStore, agent: CoderAgent, options: &RuntimeOptions) -> Self {
+        Self::compose(Runtime::builder(store).agent(agent), options)
+    }
+
+    /// Compose the control plane over `store`: the A2A backend, with the agent registered as a
+    /// [`CoderStarter`] only. It starts, delivers to, cancels and views runs, and needs no model,
+    /// GitHub client or workspaces; nothing in it steps a run, so a
+    /// [`run_worker`](Self::run_worker) here claims nothing. A process built with
+    /// [`Coder::new`] over the same store does the stepping.
+    pub fn control_plane(store: DynStore, options: &RuntimeOptions) -> Self {
+        Self::compose(Runtime::builder(store).starter(CoderStarter), options)
+    }
+
+    /// The runtime settings and the A2A backend, common to both compositions.
+    fn compose(builder: RuntimeBuilder, options: &RuntimeOptions) -> Self {
         let events = BroadcastSink::default();
-        let mut builder = Runtime::builder(store)
-            .agent(agent)
+        let mut builder = builder
             .event_sink(events.clone())
             .concurrency(options.concurrency)
             .lease_ttl(options.lease_ttl)
