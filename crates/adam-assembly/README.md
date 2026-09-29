@@ -485,7 +485,8 @@ let assembly = AgentDef::from_manifest(AGENT)?
   gets none, its own MCP tools included (decision D3).
 * **Fail closed.** An agent whose `mcp.json` lists servers must have been connected (or given tools with
   `AgentDef::mcp_tools`, for a client of your own or a test): `Error::McpNotConnected { origin, servers }`
-  otherwise, and the message says what to call. `connect_mcp` itself fails at startup (`Error::Mcp { origin,
+  otherwise, and the message says what to call. An empty set given for such an agent (by hand, or servers that
+  offer no tool it can use) binds, with a `warn` naming the agent and its servers. `connect_mcp` itself fails at startup (`Error::Mcp { origin,
   class, source }`, the agent and the `mcp.json` in `origin`) for anything `adam-mcp` refuses: an unset variable,
   `type: sse`, a stdio server the policy does not allow, a server that is down, an allow-listed tool the server
   lacks.
@@ -547,6 +548,7 @@ stateDiagram-v2
 | Mistake | Error |
 |---|---|
 | `mcp.json` lists servers and nothing was connected or supplied | `McpNotConnected { origin, servers }`, at `bind` |
+| `mcp.json` lists servers and an empty tool set was connected or supplied | no error: a `warn` naming the agent and its servers |
 | a server cannot be connected (variable, policy, network, allow-list) | `Mcp { origin, class, source }`, at `connect_mcp` (feature `mcp`; the variant itself is always there) |
 | the connected `mcp.json` is not the agent's current one (dev reload) | `McpChanged { origin }` |
 | a tool not named after a server of the agent's own `mcp.json` | `McpForeignTool { origin, tool, servers }` |

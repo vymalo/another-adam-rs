@@ -275,28 +275,32 @@ async fn mcp_tool_named_like_registered_is_clash() {
 #[tokio::test]
 async fn subagent_named_like_mcp_tool_is_clash() {
     let server = TestHttpServer::start(Some(TOKEN)).await;
-    let root = uniq("root");
-    let mut files = root_files(
-        &root,
-        "tools: ['linear__*']",
-        &mcp_json(&server.url(), "LINEAR_TOKEN", ""),
-    );
-    files.push((
-        "agent/subagents/linear__echo.md".into(),
-        instructions("description: Echoes.", "Echo."),
-    ));
-    let error = def_of(&files)
-        .env("LINEAR_TOKEN", TOKEN)
-        .connect_mcp(&policy())
-        .await
-        .unwrap()
-        .bind(ToolSet::new())
-        .unwrap_err();
-    assert!(
-        matches!(&error, Error::SubagentToolClash { tool, clash, .. }
-            if tool == "linear__echo" && clash == &ToolClash::McpTool { server: "linear".into() }),
-        "{error}"
-    );
+    // By pattern, and with no `tools:` at all (a root then gets every tool, its MCP tools
+    // included): the clash is named as the MCP tool's either way, never as a skill's.
+    for frontmatter in ["tools: ['linear__*']", ""] {
+        let root = uniq("root");
+        let mut files = root_files(
+            &root,
+            frontmatter,
+            &mcp_json(&server.url(), "LINEAR_TOKEN", ""),
+        );
+        files.push((
+            "agent/subagents/linear__echo.md".into(),
+            instructions("description: Echoes.", "Echo."),
+        ));
+        let error = def_of(&files)
+            .env("LINEAR_TOKEN", TOKEN)
+            .connect_mcp(&policy())
+            .await
+            .unwrap()
+            .bind(ToolSet::new())
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::SubagentToolClash { tool, clash, .. }
+                if tool == "linear__echo" && clash == &ToolClash::McpTool { server: "linear".into() }),
+            "{frontmatter:?}: {error}"
+        );
+    }
 }
 
 #[tokio::test]

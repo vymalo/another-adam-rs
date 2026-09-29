@@ -467,6 +467,33 @@ fn info_of(def: AgentDef, registered: &[&str]) -> Vec<(String, Vec<String>)> {
 }
 
 #[test]
+fn an_empty_mcp_tool_set_for_declared_servers_binds_with_a_warning() {
+    let logs = adam_mcp_testkit::LogCapture::start();
+    let bound = info_of(
+        with_mcp("name: coder", "description: Researches.")
+            .mcp_tools("coder", mcp(&["linear__list"]))
+            .mcp_tools("coder/researcher", adam_llm_agent::ToolSet::new()),
+        &[],
+    );
+    assert_eq!(bound[1], ("coder/researcher".to_owned(), vec![]));
+    let text = logs.text();
+    let warning = text
+        .lines()
+        .find(|l| l.contains("lists servers, and it has no MCP tool"))
+        .unwrap_or_else(|| panic!("no warning in: {text}"));
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(warning.contains("coder/researcher"), "{warning}");
+    assert!(warning.contains("search"), "{warning}");
+    // The root got its tool: no warning names it.
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("has no MCP tool") && l.contains("agent=coder ")),
+        "{text}"
+    );
+}
+
+#[test]
 fn mcp_json_without_connections_fails_closed() {
     let error = with_mcp("name: coder", "description: Researches.")
         .bind(tools(&["ask_user"]))

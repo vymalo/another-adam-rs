@@ -333,7 +333,8 @@ impl AgentDef {
     /// catalog `tools:` selects from, next to the registered tools (`tools: ['linear__*']`
     /// selects a server's tools; a subagent that lists none gets none). An agent whose `mcp.json`
     /// lists servers must have been given tools ([`connect_mcp`](Self::connect_mcp) or
-    /// [`mcp_tools`](Self::mcp_tools)): [`Error::McpNotConnected`] otherwise (fail closed). The
+    /// [`mcp_tools`](Self::mcp_tools)): [`Error::McpNotConnected`] otherwise (fail closed). An
+    /// empty set given for such an agent binds, with a warning naming the agent and its servers. The
     /// tools must come from the same `mcp.json` ([`Error::McpChanged`]), be named after its
     /// servers ([`Error::McpForeignTool`]) and not share a name with a registered tool
     /// ([`Error::McpToolClash`]).
@@ -575,6 +576,15 @@ impl Walk<'_> {
                 });
             }
             entries.push((tool_name, Arc::clone(tool)));
+        }
+        if entries.is_empty() && !servers.is_empty() {
+            // Not refused: an empty set can be meant (supplied by hand, or servers that offer no
+            // tool this agent can use). But it is never silent.
+            tracing::warn!(
+                agent = %name,
+                servers = ?servers,
+                "the agent's mcp.json lists servers, and it has no MCP tool"
+            );
         }
         Ok(entries)
     }
