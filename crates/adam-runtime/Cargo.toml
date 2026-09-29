@@ -1,0 +1,23 @@
+[package]
+name = "adam-runtime"
+description = "Durable agent-loop runtime for adam-rs: run state machine, journaled steps, workers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-core.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }

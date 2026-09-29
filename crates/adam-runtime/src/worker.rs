@@ -1,0 +1,499 @@
+//! The worker loop: claim due runs, advance them one transition, commit with
+//! CAS, renew leases while stepping, release.
+
+use std::collections::HashSet;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use futures::FutureExt;
+use serde_json::Value;
+use tokio::task::{JoinHandle, JoinSet};
+
+use adam_core::{Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError, StoreResult};
+
+use crate::agent::{AgentError, Transition};
+use crate::ctx::{Ctx, CtxOutcome, CtxParts};
+use crate::envelope::Envelope;
+use crate::events::Artifact;
+use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
+
+type InFlight = Arc<Mutex<HashSet<RunId>>>;
+
+impl Runtime {
+    /// Worker loop until `shutdown` resolves: claim due runs, advance each by
+    /// one transition, commit it (compare-and-swap), renew the lease while
+    /// stepping, release it.
+    ///
+    /// Up to `concurrency` runs are advanced at the same time, at most one
+    /// step per run. A run that `Continue`s is committed, released and picked
+    /// up again by the next claim (by any worker), which keeps scheduling fair.
+    ///
+    /// On shutdown no new runs are claimed, in-flight transitions finish and
+    /// commit, and their leases are released before this returns. To stop
+    /// harder, drop the future: in-flight steps are aborted and their runs are
+    /// picked up by another worker once the leases expire.
+    #[tracing::instrument(skip_all, fields(worker = %self.inner.cfg.worker_id))]
+    pub async fn run_worker(
+        &self,
+        shutdown: impl Future<Output = ()> + Send,
+    ) -> Result<(), RuntimeError> {
+        let inner = &self.inner;
+        tokio::pin!(shutdown);
+        let mut wake = inner.wake.subscribe();
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        let in_flight: InFlight = Arc::default();
+        let agents: Vec<String> = inner.agents.keys().cloned().collect();
+
+        loop {
+            if shutdown.as_mut().now_or_never().is_some() {
+                break;
+            }
+            while let Some(joined) = tasks.try_join_next() {
+                log_join(joined);
+            }
+            // Mark local wake-ups seen *before* claiming, so one arriving
+            // during the claim still ends the wait below.
+            wake.borrow_and_update();
+
+            let free = inner.cfg.concurrency.saturating_sub(tasks.len());
+            if free > 0 && !agents.is_empty() {
+                let claimed = inner
+                    .store
+                    .claim_due(
+                        &agents,
+                        &inner.cfg.worker_id,
+                        inner.clock.now(),
+                        inner.cfg.lease_ttl,
+                        free,
+                    )
+                    .await;
+                match claimed {
+                    Ok(leases) => {
+                        for lease in leases {
+                            let run = lease.run.id;
+                            if !in_flight
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .insert(run)
+                            {
+                                // Our lease on it expired while we are still
+                                // stepping it (renewal off or failing). Do
+                                // not start a second step, and do not quietly
+                                // extend the lease by claiming it again:
+                                // hand it back so another worker may take
+                                // over. The version CAS settles who wins.
+                                tracing::warn!(%run, "re-claimed a run that is still in flight, releasing it");
+                                if let Err(e) =
+                                    inner.store.release_lease(run, &inner.cfg.worker_id).await
+                                {
+                                    tracing::warn!(%run, error = %e, "releasing the lease failed");
+                                }
+                                continue;
+                            }
+                            let guard = InFlightGuard {
+                                set: in_flight.clone(),
+                                run,
+                            };
+                            tasks.spawn(advance(inner.clone(), lease, guard));
+                        }
+                    }
+                    Err(e) => tracing::error!(error = %e, "claiming due runs failed"),
+                }
+            }
+
+            let has_capacity = inner.cfg.concurrency > tasks.len();
+            let joined = async {
+                if tasks.is_empty() {
+                    std::future::pending().await
+                } else {
+                    tasks.join_next().await
+                }
+            };
+            tokio::select! {
+                biased;
+                () = &mut shutdown => break,
+                Some(res) = joined => log_join(res),
+                _ = wake.changed(), if has_capacity => {}
+                () = tokio::time::sleep(inner.cfg.poll_interval), if has_capacity => {}
+            }
+        }
+
+        // Graceful: let in-flight transitions finish, commit and release.
+        while let Some(joined) = tasks.join_next().await {
+            log_join(joined);
+        }
+        Ok(())
+    }
+}
+
+fn log_join(res: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = res
+        && e.is_panic()
+    {
+        tracing::error!("run task panicked: {e}");
+    }
+}
+
+/// Removes the run from the worker's in-flight set, even on unwind.
+struct InFlightGuard {
+    set: InFlight,
+    run: RunId,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.run);
+    }
+}
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn spawn_renewer(inner: Arc<Inner>, run: RunId) -> AbortOnDrop {
+    let every = (inner.cfg.lease_ttl / 3).max(Duration::from_millis(1));
+    AbortOnDrop(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            match inner
+                .store
+                .renew_lease(
+                    run,
+                    &inner.cfg.worker_id,
+                    inner.clock.now(),
+                    inner.cfg.lease_ttl,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(%run, "lease lost while stepping; the commit will be rejected if another worker advanced the run");
+                    return;
+                }
+                Err(e) => tracing::warn!(%run, error = %e, "lease renewal failed"),
+            }
+        }
+    }))
+}
+
+/// One claimed run: step it, commit, release.
+#[tracing::instrument(skip_all, fields(run = %lease.run.id, agent = %lease.run.agent))]
+async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
+    let run = lease.run.id;
+    let renewer = inner
+        .cfg
+        .lease_renewal
+        .then(|| spawn_renewer(inner.clone(), run));
+    let release = transition(&inner, lease.run).await;
+    drop(renewer);
+    drop(guard);
+    if release && let Err(e) = inner.store.release_lease(run, &inner.cfg.worker_id).await {
+        tracing::warn!(%run, error = %e, "releasing the lease failed; it will expire");
+    }
+}
+
+/// What to commit after a transition.
+struct Next {
+    status: RunStatus,
+    wake_at: Option<DateTime<Utc>>,
+    /// The agent's state to store.
+    agent: Value,
+    output: Value,
+    error: Option<String>,
+    attempt: u32,
+    seq: u64,
+    /// How many inbox messages this transition consumed (a prefix).
+    consumed: usize,
+    artifacts: Vec<Artifact>,
+    /// Set on a scheduled retry; shown in the status event.
+    retry_detail: Option<String>,
+}
+
+enum Plan {
+    Commit(Box<Next>),
+    /// Infrastructure trouble: commit nothing and keep the lease, so the run
+    /// is retried when it expires instead of being hammered.
+    Leave,
+}
+
+/// Returns whether the lease should be released.
+async fn transition(inner: &Arc<Inner>, rec: RunRecord) -> bool {
+    let run = rec.id;
+    let env = match Envelope::decode(run, &rec.state) {
+        Ok(env) => env,
+        Err(e) => {
+            tracing::error!(error = %e, "failing run with unreadable state");
+            let update = RunUpdate::new(RunStatus::Failed, rec.state.clone());
+            if inner
+                .store
+                .commit_run(run, rec.version, update)
+                .await
+                .is_ok()
+            {
+                inner
+                    .emit_status(run, &rec.agent, RunStatus::Failed, Some(e.to_string()))
+                    .await;
+            }
+            return true;
+        }
+    };
+    let Some(agent) = inner.agents.get(&rec.agent).cloned() else {
+        tracing::error!(agent = %rec.agent, "claimed a run of an unregistered agent");
+        return true;
+    };
+
+    let mut ctx = Ctx::new(CtxParts {
+        run,
+        agent: rec.agent.clone(),
+        conversation_id: rec.conversation_id.clone(),
+        attempt: env.attempt,
+        seq: env.seq,
+        inbox: env.inbox.clone(),
+        store: inner.store.clone(),
+        sink: inner.sink.clone(),
+        clock: inner.clock.clone(),
+    });
+    let stepped = AssertUnwindSafe(agent.step(&mut ctx, env.agent.clone()))
+        .catch_unwind()
+        .await;
+    let result = stepped.unwrap_or_else(|panic| {
+        Err(AgentError::Transient(format!(
+            "agent panicked: {}",
+            panic_message(&panic)
+        )))
+    });
+    let outcome = ctx.into_outcome();
+
+    let plan = plan(inner, &env, outcome, result);
+    let Plan::Commit(next) = plan else {
+        return false;
+    };
+    match commit(inner, &rec, &env, &next).await {
+        Ok(Some(committed)) => {
+            announce(inner, &committed, &next).await;
+            true
+        }
+        Ok(None) => {
+            tracing::info!(
+                "commit rejected (run advanced or cancelled elsewhere); dropping result"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "commit failed; the run will be retried when its lease expires");
+            false
+        }
+    }
+}
+
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_owned())
+}
+
+/// Decide what the transition's result means for the run.
+fn plan(
+    inner: &Inner,
+    base: &Envelope,
+    out: CtxOutcome,
+    result: Result<Transition<Value>, AgentError>,
+) -> Plan {
+    let CtxOutcome {
+        seq,
+        consumed,
+        artifacts,
+    } = out;
+    // Starting point for a transition that made progress.
+    let progressed = |status, wake_at, agent, output, error| Next {
+        status,
+        wake_at,
+        agent,
+        output,
+        error,
+        attempt: 0,
+        seq,
+        consumed,
+        artifacts: artifacts.clone(),
+        retry_detail: None,
+    };
+    // Starting point for a failure that ends the run: state untouched.
+    let failed = |error: String| Next {
+        status: RunStatus::Failed,
+        wake_at: None,
+        agent: base.agent.clone(),
+        output: Value::Null,
+        error: Some(error),
+        attempt: base.attempt,
+        seq,
+        consumed: 0,
+        artifacts: artifacts.clone(),
+        retry_detail: None,
+    };
+
+    let next = match result {
+        Ok(Transition::Continue(s)) => progressed(RunStatus::Runnable, None, s, Value::Null, None),
+        Ok(Transition::Park { state, wake_at }) => {
+            progressed(RunStatus::Parked, wake_at, state, Value::Null, None)
+        }
+        Ok(Transition::Done { state, output }) => {
+            progressed(RunStatus::Done, None, state, output, None)
+        }
+        Ok(Transition::Fail { state, error }) => {
+            progressed(RunStatus::Failed, None, state, Value::Null, Some(error))
+        }
+        Err(AgentError::Transient(msg)) => {
+            let failures = base.attempt.saturating_add(1);
+            let policy = &inner.cfg.retry;
+            if failures >= policy.max_attempts {
+                Next {
+                    attempt: failures,
+                    ..failed(format!("gave up after {failures} attempts: {msg}"))
+                }
+            } else {
+                let delay = policy.backoff(failures);
+                let wake_at = inner.clock.now()
+                    + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX);
+                Next {
+                    status: RunStatus::Runnable,
+                    wake_at: Some(wake_at),
+                    agent: base.agent.clone(),
+                    output: Value::Null,
+                    error: None,
+                    attempt: failures,
+                    // Abandon this try's journal entries so the retry runs
+                    // its steps afresh (see `Ctx::step`).
+                    seq,
+                    consumed: 0,
+                    artifacts: Vec::new(),
+                    retry_detail: Some(format!(
+                        "attempt {failures} of {} failed, retrying in {delay:?}: {msg}",
+                        policy.max_attempts
+                    )),
+                }
+            }
+        }
+        Err(AgentError::Permanent(msg)) => failed(msg),
+        Err(AgentError::NonDeterminism(msg)) => failed(format!("non-deterministic replay: {msg}")),
+        Err(AgentError::Store(e @ StoreError::InvalidData(_))) => failed(e.to_string()),
+        Err(AgentError::Store(e @ StoreError::NonDeterminism { .. })) => {
+            failed(format!("non-deterministic replay: {e}"))
+        }
+        Err(AgentError::Store(e)) => {
+            tracing::error!(error = %e, "store error while stepping; leaving the run leased");
+            return Plan::Leave;
+        }
+    };
+    Plan::Commit(Box::new(next))
+}
+
+/// The record to write, built on the freshest envelope.
+fn build_update(
+    next: &Next,
+    cur: &Envelope,
+    base_inbox_len: usize,
+    base_rev: u64,
+) -> StoreResult<RunUpdate> {
+    // Messages that arrived while stepping sit after the ones we started
+    // with. A parked agent must not sleep through them.
+    let arrived = cur.inbox.len() > base_inbox_len;
+    let (status, wake_at) = if next.status == RunStatus::Parked && arrived {
+        (RunStatus::Runnable, None)
+    } else {
+        (next.status, next.wake_at)
+    };
+    let mut artifacts = cur.artifacts.clone();
+    artifacts.extend(next.artifacts.iter().cloned());
+    let env = Envelope {
+        v: cur.v,
+        agent: next.agent.clone(),
+        inbox: cur.inbox.iter().skip(next.consumed).cloned().collect(),
+        seq: next.seq,
+        attempt: next.attempt,
+        rev: base_rev + 1,
+        output: next.output.clone(),
+        error: next.error.clone(),
+        artifacts,
+    };
+    let mut update = RunUpdate::new(status, env.encode()?);
+    update.wake_at = wake_at;
+    Ok(update)
+}
+
+/// Commit with CAS. A conflict caused only by messages delivered while we
+/// were stepping is merged (the messages are kept); any other conflict means
+/// someone else advanced or cancelled the run, and the result is dropped
+/// (`Ok(None)`).
+async fn commit(
+    inner: &Inner,
+    claimed: &RunRecord,
+    base: &Envelope,
+    next: &Next,
+) -> StoreResult<Option<RunRecord>> {
+    let run = claimed.id;
+    let mut cur_rec = claimed.clone();
+    let mut cur_env = base.clone();
+    for attempt in 0..MAX_COMMIT_RETRIES {
+        if attempt > 0 {
+            let Some(rec) = inner.store.load_run(run).await? else {
+                return Ok(None);
+            };
+            let env = match Envelope::decode(run, &rec.state) {
+                Ok(env) => env,
+                Err(_) => return Ok(None),
+            };
+            // `deliver` never bumps `rev` and never changes a runnable run's
+            // status; everything else that commits does.
+            if rec.status != RunStatus::Runnable
+                || env.rev != base.rev
+                || env.inbox.len() < base.inbox.len()
+            {
+                return Ok(None);
+            }
+            cur_rec = rec;
+            cur_env = env;
+        }
+        let update = build_update(next, &cur_env, base.inbox.len(), base.rev)?;
+        match inner.store.commit_run(run, cur_rec.version, update).await {
+            Ok(rec) => return Ok(Some(rec)),
+            Err(StoreError::Conflict { .. }) => {}
+            Err(StoreError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+    tracing::warn!(%run, "gave up merging a commit after repeated conflicts");
+    Ok(None)
+}
+
+/// Emit the status event for a committed transition.
+async fn announce(inner: &Inner, committed: &RunRecord, next: &Next) {
+    let (status, detail) = match committed.status {
+        RunStatus::Parked => (RunStatus::Parked, None),
+        RunStatus::Done => (RunStatus::Done, None),
+        RunStatus::Failed => (RunStatus::Failed, next.error.clone()),
+        RunStatus::Runnable => match (&next.retry_detail, next.status) {
+            (Some(detail), _) => (RunStatus::Runnable, Some(detail.clone())),
+            (None, RunStatus::Parked) => (
+                RunStatus::Runnable,
+                Some("woken by inbound message".to_owned()),
+            ),
+            // A plain `Continue`: not worth an event per transition.
+            (None, _) => return,
+        },
+    };
+    inner
+        .emit_status(committed.id, &committed.agent, status, detail)
+        .await;
+}

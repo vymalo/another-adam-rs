@@ -16,6 +16,7 @@ trait, a shared conformance suite, and two production adapters.
 | `adam-model` | `ModelClient` trait (`complete` + streaming, tool calling), request/response types, `MockModel` test double |
 | `adam-model-openai` | `OpenAiCompatible`: any OpenAI-compatible chat-completions endpoint (gateway or provider) via `reqwest` + rustls |
 | `adam-workspace` | Per-run git worktrees over a shared mirror, commit and push, and pull requests (`CodeHost`, GitHub). The token is passed per `git` invocation and never stored |
+| `adam-runtime` | Durable agent loop: `Agent` trait, run state machine, `ctx.step` journaling, workers, retries, event sinks |
 
 ## The model
 
@@ -123,7 +124,7 @@ one line: `adam_store_testkit::store_conformance!(make_store);`.
 ## Roadmap
 
 1. ~~Store trait and adapters~~ (this repo)
-2. Run state machine and `ctx.step` journaling
+2. ~~Run state machine and `ctx.step` journaling~~ (`adam-runtime`)
 3. `#[tool]` macro (schemars)
 4. `build.rs` discovery of `agent/` (instructions, tools, skills, subagents)
 5. Parking, approvals, schedules
