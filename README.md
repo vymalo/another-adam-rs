@@ -4,6 +4,10 @@ A Rust framework for durable AI agents, in the spirit of [eve](https://eve.dev):
 filesystem-first authoring, macros where eve uses file conventions, and every
 piece of infrastructure behind a trait so each developer picks their own.
 
+**Docs:** [`docs/`](docs/README.md), starting with the
+[architecture](docs/architecture.md) (crate map, ports, the path of a task, the
+run lifecycle, the error tree, the coder agent), with Mermaid diagrams.
+
 This repository currently contains the **durable-state layer**: the `Store`
 trait, a shared conformance suite, and two production adapters.
 
@@ -310,6 +314,15 @@ change as any change to the crate's public API, environment variables or
 tests. CI (the `lint` job) fails when a `crates/*/Cargo.toml` has no sibling
 `README.md`; it cannot check that the README is still accurate, so review
 does. The crate table above links each README.
+
+Docs live in [`docs/`](docs/README.md). Every process there is a Mermaid
+diagram, and CI (the `docs` job) parses each diagram and resolves each relative
+link and `#heading` in the repository's Markdown:
+
+```sh
+npm --prefix tools/docs-check ci          # once per clone
+node tools/docs-check/check-docs.mjs
+```
 
 ## Roadmap
 
