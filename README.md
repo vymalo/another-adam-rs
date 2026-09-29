@@ -18,6 +18,7 @@ trait, a shared conformance suite, and two production adapters.
 | `adam-workspace` | Per-run git worktrees over a shared mirror, commit and push, and pull requests (`CodeHost`, GitHub). The token is passed per `git` invocation and never stored |
 | `adam-runtime` | Durable agent loop: `Agent` trait, run state machine, `ctx.step` journaling, workers, retries, event sinks |
 | `adam-a2a` | Expose an agent as an A2A 1.0 server (axum): `TaskBackend` seam, bearer auth (fail closed), `InMemoryBackend` under feature `test-util` |
+| `adam-acp` | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
 
 ## The model
 
