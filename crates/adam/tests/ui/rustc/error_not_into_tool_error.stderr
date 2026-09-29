@@ -1,0 +1,15 @@
+error[E0277]: `Result<std::string::String, MyErr>` cannot be returned from a tool
+ --> tests/ui/rustc/error_not_into_tool_error.rs:7:17
+  |
+6 | #[tool]
+  | ------- required by a bound introduced by this call
+7 | async fn f() -> Result<String, MyErr> {
+  |                 ^^^^^^ not a tool result
+  |
+  = help: the trait `IntoToolResult` is not implemented for `Result<std::string::String, MyErr>`
+  = note: return `Result<T, E>` where `T: IntoToolOutput` and `E: Into<ToolError>`, or a bare `T: IntoToolOutput`
+help: the trait `IntoToolResult` is implemented for `Result<T, E>`
+ --> $WORKSPACE/crates/adam-llm-agent/src/typed.rs
+  |
+  | impl<T: IntoToolOutput, E: Into<ToolError>> IntoToolResult for Result<T, E> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

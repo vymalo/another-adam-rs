@@ -19,7 +19,7 @@
 //! | Module | What |
 //! |---|---|
 //! | [`agent`] | [`CoderAgent`]: `LlmAgent` + the completion policy (red checks and no PR = failed); [`CoderStarter`]: its start-only half |
-//! | [`tools`] | the six tools, [`ToolEnv`] and [`CoderSettings`] |
+//! | [`tools`] | the six tools (`#[tool]` functions reading [`ToolEnv`] from the agent's state) and [`CoderSettings`] |
 //! | [`instructions`] | the system prompt |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |

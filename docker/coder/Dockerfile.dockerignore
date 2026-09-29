@@ -9,3 +9,5 @@ compose.yaml
 dev
 **/*.md
 !crates/adam-coder/src/**/*.md
+# Crate READMEs are compiled in as rustdoc (`#![doc = include_str!("../README.md")]`).
+!crates/*/README.md

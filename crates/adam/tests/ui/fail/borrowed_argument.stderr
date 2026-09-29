@@ -1,0 +1,5 @@
+error: model arguments must be owned (`String`, not `&str`): they are deserialized from JSON
+ --> tests/ui/fail/borrowed_argument.rs:5:15
+  |
+5 | async fn f(a: &str) -> String { a.to_owned() }
+  |               ^

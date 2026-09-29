@@ -1,6 +1,6 @@
 # Architecture
 
-adam-rs is a Rust workspace of 16 crates for **durable AI agents**. An agent is
+adam-rs is a Rust workspace of 19 crates for **durable AI agents**. An agent is
 a state machine. The runtime saves its state after every step, so a worker that
 dies loses nothing: another worker resumes from the last saved step. Every piece
 of infrastructure (database, model, code host, A2A backend) sits behind a trait,
@@ -32,11 +32,15 @@ Contents:
 Arrows point from a crate to a crate it depends on. Solid arrows come from
 `[dependencies]` in the `Cargo.toml` files. Dotted arrows are
 `[dev-dependencies]` that are not also normal dependencies (tests only). Grey
-arrows go to `adam-error`: every crate except the two test kits depends on
-it.
+arrows go to `adam-error`: every crate except the two test kits and
+`adam-macros` depends on it.
 
 ```mermaid
 flowchart TB
+    subgraph authoring["Authoring"]
+        adam["adam"]
+        macros["adam-macros"]
+    end
     subgraph agents["Agents"]
         coder["adam-coder"]
         llm["adam-llm-agent"]
@@ -66,6 +70,7 @@ flowchart TB
     end
 
     coder --> a2a
+    coder --> adam
     coder --> a2art
     coder --> acp
     coder --> core
@@ -76,6 +81,7 @@ flowchart TB
     coder --> pg
     coder --> ws
     coder --> host
+    coder --> pgn
     a2art --> a2a
     a2art --> core
     a2art --> rt
@@ -91,6 +97,11 @@ flowchart TB
     pgn --> rt
     nk --> core
     nk --> rt
+    adam --> core
+    adam --> llm
+    adam --> macros
+    adam --> model
+    adam --> rt
 
     rt -.-> mongo
     rt -.-> pg
@@ -102,6 +113,7 @@ flowchart TB
     pgn -.-> pg
 
     a2a --> err
+    adam --> err
     a2art --> err
     acp --> err
     coder --> err
@@ -116,7 +128,7 @@ flowchart TB
     host --> err
     pgn --> err
 
-    linkStyle 34,35,36,37,38,39,40,41,42,43,44,45,46,47 stroke:#999,stroke-width:1px
+    linkStyle 41,42,43,44,45,46,47,48,49,50,51,52,53,54,55 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -160,6 +172,14 @@ The layers, from the bottom:
     `adam_runtime::Agent`.
   * `adam-coder` is the coder agent and the only binary. It is a composition
     root: it wires the pieces below it.
+* **Authoring.**
+  * `adam-macros` is the `#[tool]` attribute macro: a proc-macro crate whose
+    expansion is a pure function over token streams. It depends on `syn`,
+    `quote` and `proc-macro2` only.
+  * `adam` is the facade a user writes agents against: `prelude`, the
+    re-exported `adam-llm-agent` API, and the `#[tool]` macro behind the
+    default feature `macros`. Generated code refers to `adam::__private`.
+    See [`docs/authoring.md`](authoring.md).
 * **Test kits.** `adam-store-testkit` is the conformance suite every store must
   pass, and `adam-notify-testkit` the one every `Notifier` (and its event
   transport) must pass. It is a crate of its own because `adam-runtime` cannot
@@ -320,7 +340,9 @@ classDiagram
             <<interface>>
             spec()
             call()
+            required_state()
         }
+        class FnTool
         class LlmAgent
         class LlmStarter
     }
@@ -334,6 +356,7 @@ classDiagram
         class OpenPullRequest
         class AskUser
     }
+    Tool <|.. FnTool
     Agent <|.. LlmAgent
     Agent <|.. CoderAgent
     AgentStarter <|.. LlmStarter
@@ -359,7 +382,12 @@ Each box is a crate (underscores stand for hyphens). The six coder tools are
 `prepare_workspace`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
 `open_pull_request` and `ask_user`. A seventh type, `Redacting`, wraps each of
 them to scrub secrets (`crates/adam-coder/src/tools/mod.rs`). `CoderAgent`
-wraps an `LlmAgent` and adds its completion rule. `AgentStarter` is the start-only half
+wraps an `LlmAgent` and adds its completion rule. `FnTool` is a tool made from a closure. A tool
+reads shared dependencies with `ToolCtx::state::<T>()` (given to the agent with
+`LlmAgentBuilder::state`), declares them in `Tool::required_state`, and
+`LlmAgentBuilder::try_build` fails at startup when one is missing; `parse_args`,
+`IntoToolOutput`, `ToolSet` and, with the `schema` feature, `spec_for` remove the boilerplate
+(see the [crate README](../crates/adam-llm-agent/README.md)). `AgentStarter` is the start-only half
 of `Agent` (`name` and `init`, no `step`): a process that only accepts requests registers
 a starter (`LlmStarter`, `CoderStarter`) and never holds the agent's model or credentials.
 
@@ -374,7 +402,7 @@ The boundaries, by what they swap:
 | `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `StaticToken` (one token, any host) | none needed |
 | `Agent` | `adam-runtime` | `LlmAgent`, `CoderAgent` | test agents |
 | `AgentStarter` | `adam-runtime` | `LlmStarter`, `CoderStarter` | test starters |
-| `Tool` | `adam-llm-agent` | the coder tools | test tools |
+| `Tool` | `adam-llm-agent` | the coder tools, `FnTool` | test tools |
 | `EventSink` | `adam-runtime` | `BroadcastSink` (in-process), `PgEventSink` (`adam-notify-postgres`: local first, then `NOTIFY` to other processes) | `NoopSink` (default), `CollectingSink` |
 | `Notifier` | `adam-runtime` | `PgNotifier` (`adam-notify-postgres`) | `LocalNotifier` (in-process; also the fan-out inside `PgNotify`) |
 | `Clock` | `adam-runtime` | `SystemClock` | `ManualClock` |
@@ -1141,6 +1169,13 @@ sequenceDiagram
     A-->>C: completed, with the pull request as an artifact
 ```
 
+The `pull_request` artifact has two parts: a data part with the JSON
+(`url`, `number` as a string, `branch`, `repository`) and, after it, an A2A
+`url` part (`Part.url`, A2A v1) with the pull request's URL, so a chat surface
+shows a link. The mapping is `adam_a2a_runtime::artifact_of`, which does this
+for any artifact whose data is an object with an absolute `http(s)` `url`; the
+`branch` artifact has no such field and stays a single data part.
+
 The same flow as states, from the point of view of the run notes and the
 tools' guards:
 
@@ -1404,6 +1439,8 @@ flowchart LR
 | `adam-a2a-runtime` | runtime | [crates/adam-a2a-runtime](../crates/adam-a2a-runtime/README.md) |
 | `adam-llm-agent` | agent | [crates/adam-llm-agent](../crates/adam-llm-agent/README.md) |
 | `adam-coder` | agent, binary | [crates/adam-coder](../crates/adam-coder/README.md) |
+| `adam-macros` | authoring, proc-macro | [crates/adam-macros](../crates/adam-macros/README.md) |
+| `adam` | authoring, facade | [crates/adam](../crates/adam/README.md) |
 | `adam-store-testkit` | test kit | [crates/adam-store-testkit](../crates/adam-store-testkit/README.md) |
 | `adam-notify-testkit` | test kit | [crates/adam-notify-testkit](../crates/adam-notify-testkit/README.md) |
 

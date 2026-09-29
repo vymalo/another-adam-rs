@@ -176,6 +176,13 @@ pub(crate) fn task_from_view(view: &RunView, context_id: &str, prompt: &PromptFn
 /// rides on the part. The artifact id is derived from the content, so the
 /// live event and the durable copy of the same artifact carry the same id and
 /// a subscriber sees it once.
+///
+/// **A link is offered as a link.** When the data is a JSON object whose `url`
+/// is an absolute `http(s)` URL (a pull request, a report), the artifact gets
+/// a second part after the data part: an A2A `url` part (`Part.url` of the
+/// A2A v1 `a2a.proto`: "a `url` pointing to the file's content") carrying that
+/// URL, so a client shows a link where it would otherwise show JSON. The data
+/// part is unchanged, and the artifact id does not depend on the extra part.
 pub fn artifact_of(artifact: &adam_runtime::Artifact) -> Artifact {
     let part = match &artifact.data {
         Value::String(s) => Part::text(s.clone()),
@@ -185,14 +192,27 @@ pub fn artifact_of(artifact: &adam_runtime::Artifact) -> Artifact {
         Some(mime) => part.with_media_type(mime.clone()),
         None => part,
     };
+    let mut parts = vec![part];
+    if let Some(url) = link_of(&artifact.data) {
+        parts.push(Part::url(url));
+    }
     Artifact {
         artifact_id: artifact_id(artifact),
         name: Some(artifact.name.clone()),
         description: None,
-        parts: vec![part],
+        parts,
         metadata: None,
         extensions: None,
     }
+}
+
+/// The `url` of an object-shaped artifact, when it is an absolute `http(s)` URL.
+fn link_of(data: &Value) -> Option<&str> {
+    let url = data.get("url")?.as_str()?;
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    (!rest.is_empty() && !url.chars().any(char::is_whitespace)).then_some(url)
 }
 
 /// Content-derived artifact id: `<name>-<12 hex digits>`.
@@ -364,6 +384,65 @@ mod tests {
             a2a::PartContent::Data(_)
         ));
         assert_ne!(artifact_id(&data), artifact_id(&text));
+    }
+
+    #[test]
+    fn a_link_in_the_data_is_also_a_url_part_after_the_data_part() {
+        let pr = RunArtifact {
+            name: "pull_request".into(),
+            mime_type: Some("application/json".into()),
+            data: json!({"url": "https://github.com/octo/widgets/pull/7", "number": "7"}),
+        };
+        let a = artifact_of(&pr);
+        assert_eq!(a.parts.len(), 2);
+        assert_eq!(
+            a.parts[0].content,
+            a2a::PartContent::Data(
+                json!({"url": "https://github.com/octo/widgets/pull/7", "number": "7"})
+            ),
+            "the data part is unchanged"
+        );
+        assert_eq!(a.parts[0].media_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            a.parts[1].content,
+            a2a::PartContent::Url("https://github.com/octo/widgets/pull/7".into())
+        );
+        assert_eq!(
+            serde_json::to_value(&a.parts[1]).unwrap(),
+            json!({"url": "https://github.com/octo/widgets/pull/7"}),
+            "and it is a `url` part on the wire"
+        );
+        // The id is a function of name, media type and data only: the extra part changes nothing.
+        assert_eq!(a.artifact_id, artifact_id(&pr));
+    }
+
+    #[test]
+    fn only_an_absolute_http_url_in_an_object_is_a_link() {
+        let parts = |data: Value| {
+            artifact_of(&RunArtifact {
+                name: "x".into(),
+                mime_type: None,
+                data,
+            })
+            .parts
+            .len()
+        };
+        assert_eq!(parts(json!({"url": "http://example.com/a"})), 2);
+        for not_a_link in [
+            json!({"url": "ftp://example.com/a"}),
+            json!({"url": "javascript:alert(1)"}),
+            json!({"url": "/relative"}),
+            json!({"url": "https://"}),
+            json!({"url": "https://example.com/a b"}),
+            json!({"url": 7}),
+            json!({"link": "https://example.com/a"}),
+            json!({"nested": {"url": "https://example.com/a"}}),
+            json!("https://example.com/a"),
+            json!(["https://example.com/a"]),
+            Value::Null,
+        ] {
+            assert_eq!(parts(not_a_link.clone()), 1, "{not_a_link}");
+        }
     }
 
     #[test]

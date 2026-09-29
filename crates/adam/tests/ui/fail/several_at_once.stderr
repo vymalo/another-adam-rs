@@ -1,0 +1,29 @@
+error: `#[tool]` functions must be `async`
+ --> tests/ui/fail/several_at_once.rs:4:1
+  |
+4 | fn f<T>(&self, a: &str) -> String { String::new() }
+  | ^^
+
+error: `#[tool]` functions cannot be generic; model arguments are deserialized into concrete types
+ --> tests/ui/fail/several_at_once.rs:4:5
+  |
+4 | fn f<T>(&self, a: &str) -> String { String::new() }
+  |     ^
+
+error: `#[tool]` needs a doc comment: it is the description the model reads
+ --> tests/ui/fail/several_at_once.rs:4:4
+  |
+4 | fn f<T>(&self, a: &str) -> String { String::new() }
+  |    ^
+
+error: `#[tool]` works on free functions; put shared state in `State<T>`
+ --> tests/ui/fail/several_at_once.rs:4:9
+  |
+4 | fn f<T>(&self, a: &str) -> String { String::new() }
+  |         ^
+
+error: model arguments must be owned (`String`, not `&str`): they are deserialized from JSON
+ --> tests/ui/fail/several_at_once.rs:4:19
+  |
+4 | fn f<T>(&self, a: &str) -> String { String::new() }
+  |                   ^

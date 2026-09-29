@@ -1,0 +1,5 @@
+error: unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, crate
+ --> tests/ui/fail/unknown_option.rs:4:8
+  |
+4 | #[tool(aproval = "always")]
+  |        ^^^^^^^

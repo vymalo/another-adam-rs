@@ -17,7 +17,7 @@ agent; [`adam-coder`](../adam-coder/README.md) uses it.
 | `RuntimeTaskBackend::new(runtime, events, agent)` | `events` must be the `BroadcastSink` the runtime was built with; `agent` is the registered name, as an agent (`.agent`) or as a start-only starter (`.starter`) |
 | `.with_poll_interval(..)`, `DEFAULT_POLL_INTERVAL` | how often a subscription re-reads the durable run |
 | `.with_prompt(..)`, `.with_inbound(..)` | override how the `input-required` question is derived (`PromptFn`) and how an A2A message becomes an `Inbound` (`InboundFn`) |
-| `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings |
+| `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings. `artifact_of`: string data is a text part, anything else a data part; an object whose `url` is an absolute `http(s)` URL also gets a `url` part after the data part (A2A v1 `Part.url`), so a client can show a link |
 | `task_id_for(agent, subject, context_id, message_id)` | the task id a new task of `agent` started by that message gets (see *Stable ids*) |
 
 ```rust

@@ -1,0 +1,20 @@
+{
+  "name": "run_checks",
+  "description": "Run a shell command in your worktree (a project check such as `cargo test`, `pnpm test` or `just ci`) and get its exit code and the tail of its output. Only exit code 0 counts as passing. Every failed run uses up one of your limited check cycles.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "Shell command, run with `sh -lc` in the worktree"
+      },
+      "cwd": {
+        "type": "string",
+        "description": "Optional sub-directory of the worktree to run in (relative, inside the worktree)"
+      }
+    },
+    "required": [
+      "command"
+    ]
+  }
+}

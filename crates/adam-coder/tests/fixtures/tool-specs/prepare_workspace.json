@@ -1,0 +1,21 @@
+{
+  "name": "prepare_workspace",
+  "description": "Check the repository out into your private worktree, on a fresh branch created from origin/<base_branch>. Call it once, first. Calling it again for the same repository is harmless and keeps your changes.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo_url": {
+        "type": "string",
+        "description": "https://github.com/<owner>/<repo>"
+      },
+      "base_branch": {
+        "type": "string",
+        "description": "Branch to start from and to open the pull request against, e.g. main"
+      }
+    },
+    "required": [
+      "repo_url",
+      "base_branch"
+    ]
+  }
+}

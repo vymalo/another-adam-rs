@@ -1,0 +1,16 @@
+{
+  "name": "ask_user",
+  "description": "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "question": {
+        "type": "string",
+        "description": "What you need to know"
+      }
+    },
+    "required": [
+      "question"
+    ]
+  }
+}

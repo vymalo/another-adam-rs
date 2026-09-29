@@ -80,11 +80,12 @@ impl CoderAgent {
         model: DynModel,
         model_alias: impl Into<String>,
         env: Arc<ToolEnv>,
-        tools: Vec<DynTool>,
+        tools: impl IntoIterator<Item = DynTool>,
     ) -> Self {
         let mut builder = LlmAgent::builder(AGENT_NAME, model, model_alias)
             .instructions(instructions(env.settings.max_check_cycles))
-            .limits(coder_limits());
+            .limits(coder_limits())
+            .state(env.clone());
         for tool in tools {
             builder = builder.dyn_tool(tool);
         }

@@ -1,0 +1,5 @@
+error: `#[tool]` needs a doc comment: it is the description the model reads
+ --> tests/ui/fail/no_doc.rs:4:10
+  |
+4 | async fn f() -> String { String::new() }
+  |          ^

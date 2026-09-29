@@ -1,0 +1,5 @@
+error: `#[tool]` functions cannot be generic; model arguments are deserialized into concrete types
+ --> tests/ui/fail/generic.rs:5:11
+  |
+5 | async fn f<T: Send>(a: String) -> String { a }
+  |           ^

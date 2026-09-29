@@ -1,0 +1,5 @@
+error: `#[args]` must be the only model argument
+ --> tests/ui/fail/args_with_others.rs:5:10
+  |
+5 | async fn f(#[args] a: String, b: String) -> String { b }
+  |          ^

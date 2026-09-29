@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::state::{Extensions, State, StateKey};
+
 /// A capability the model may call.
 ///
 /// The agent runs every call inside a journaled step: once a call has
@@ -32,6 +34,18 @@ pub trait Tool: Send + Sync + 'static {
     /// Runs inside a journaled step; must be safe to retry if it fails before
     /// being recorded.
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError>;
+
+    /// The shared state this tool reads with [`ToolCtx::state`], by type.
+    ///
+    /// [`LlmAgentBuilder::try_build`](crate::LlmAgentBuilder::try_build)
+    /// checks that the agent was given each one (with
+    /// [`LlmAgentBuilder::state`](crate::LlmAgentBuilder::state)), so a
+    /// missing dependency fails at startup and not in the middle of a run.
+    /// The default is none, which is what a tool written before this method
+    /// existed declares.
+    fn required_state(&self) -> Vec<StateKey> {
+        Vec::new()
+    }
 }
 
 /// A shared, type-erased [`Tool`].
@@ -111,6 +125,38 @@ pub enum ToolError {
     },
 }
 
+impl ToolError {
+    /// Turn a classified error into a tool error: a retryable one
+    /// ([`ErrorClass::is_retryable`]) becomes [`Transient`](Self::Transient),
+    /// anything else [`Permanent`](Self::Permanent). The message is the error
+    /// and its whole source chain ([`adam_error::report`]), because a
+    /// `ToolError` is journaled as text.
+    ///
+    /// ```
+    /// use adam_error::{Classify, ErrorClass};
+    /// use adam_llm_agent::ToolError;
+    ///
+    /// #[derive(Debug, thiserror::Error)]
+    /// #[error("backend busy")]
+    /// struct Busy;
+    /// impl Classify for Busy {
+    ///     fn class(&self) -> ErrorClass {
+    ///         ErrorClass::Transient
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(ToolError::from_classified(&Busy), ToolError::Transient("backend busy".into()));
+    /// ```
+    pub fn from_classified<E: Classify + 'static>(err: &E) -> Self {
+        let message = adam_error::report(err);
+        if err.is_retryable() {
+            Self::Transient(message)
+        } else {
+            Self::Permanent(message)
+        }
+    }
+}
+
 impl Classify for ToolError {
     fn class(&self) -> ErrorClass {
         match self {
@@ -134,6 +180,7 @@ pub struct ToolCtx {
     tool_name: String,
     emitter: Emitter,
     cancel: CancelToken,
+    extensions: Arc<Extensions>,
 }
 
 impl ToolCtx {
@@ -144,6 +191,7 @@ impl ToolCtx {
         tool_name: String,
         emitter: Emitter,
         cancel: CancelToken,
+        extensions: Arc<Extensions>,
     ) -> Self {
         Self {
             run_id: emitter.run_id(),
@@ -153,6 +201,7 @@ impl ToolCtx {
             tool_name,
             emitter,
             cancel,
+            extensions,
         }
     }
 
@@ -172,7 +221,17 @@ impl ToolCtx {
             tool_name,
             emitter,
             CancelToken::new(),
+            Arc::default(),
         )
+    }
+
+    /// Make `value` available to the tool under test through
+    /// [`state`](Self::state), as
+    /// [`LlmAgentBuilder::state`](crate::LlmAgentBuilder::state) does for a
+    /// real run.
+    pub fn with_state<T: Send + Sync + 'static>(mut self, value: Arc<T>) -> Self {
+        Arc::make_mut(&mut self.extensions).insert(value);
+        self
     }
 
     /// Replace the cancellation token, so a test can fire it
@@ -203,6 +262,26 @@ impl ToolCtx {
     /// retries and replays, so usable as an idempotency key.
     pub fn call_id(&self) -> &str {
         &self.call_id
+    }
+
+    /// The shared value of type `T` the agent was given, if any.
+    pub fn state<T: Send + Sync + 'static>(&self) -> Option<State<T>> {
+        self.extensions.get::<T>().map(State::from)
+    }
+
+    /// Like [`state`](Self::state), but a missing value is a
+    /// [`ToolError::Permanent`] naming the type, for a tool that cannot go on
+    /// without it. A tool that lists the type in
+    /// [`Tool::required_state`] can only see this error when the agent was
+    /// built with [`build`](crate::LlmAgentBuilder::build) instead of
+    /// [`try_build`](crate::LlmAgentBuilder::try_build).
+    pub fn require_state<T: Send + Sync + 'static>(&self) -> Result<State<T>, ToolError> {
+        self.state::<T>().ok_or_else(|| {
+            ToolError::Permanent(format!(
+                "missing shared state `{}`: register it with LlmAgentBuilder::state",
+                StateKey::of::<T>()
+            ))
+        })
     }
 
     /// The name this tool was called by.
@@ -250,5 +329,52 @@ impl ToolCtx {
                 message: message.into(),
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use adam_error::{Classify, ErrorClass};
+
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("outer")]
+    struct Classed(ErrorClass, #[source] Inner);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("inner")]
+    struct Inner;
+
+    impl Classify for Classed {
+        fn class(&self) -> ErrorClass {
+            self.0
+        }
+    }
+
+    #[test]
+    fn from_classified_splits_on_retryability_and_keeps_the_chain() {
+        for class in [
+            ErrorClass::Transient,
+            ErrorClass::RateLimited,
+            ErrorClass::Conflict,
+        ] {
+            assert_eq!(
+                ToolError::from_classified(&Classed(class, Inner)),
+                ToolError::Transient("outer: inner".into()),
+                "{class:?}"
+            );
+        }
+        for class in [
+            ErrorClass::Invalid,
+            ErrorClass::NotFound,
+            ErrorClass::Internal,
+        ] {
+            assert_eq!(
+                ToolError::from_classified(&Classed(class, Inner)),
+                ToolError::Permanent("outer: inner".into()),
+                "{class:?}"
+            );
+        }
     }
 }

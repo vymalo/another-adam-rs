@@ -1,0 +1,5 @@
+error: `#[tool]` functions cannot be generic; model arguments are deserialized into concrete types
+ --> tests/ui/fail/impl_trait.rs:5:15
+  |
+5 | async fn f(a: impl Into<String>) -> String { a.into() }
+  |               ^^^^

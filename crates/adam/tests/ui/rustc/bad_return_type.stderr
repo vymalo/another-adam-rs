@@ -1,0 +1,17 @@
+error[E0277]: `u8` cannot be returned from a tool
+ --> tests/ui/rustc/bad_return_type.rs:5:17
+  |
+4 | #[tool]
+  | ------- required by a bound introduced by this call
+5 | async fn f() -> u8 {
+  |                 ^^ not a tool result
+  |
+  = help: the trait `IntoToolOutput` is not implemented for `u8`
+  = note: return `Result<T, E>` where `T: IntoToolOutput` and `E: Into<ToolError>`, or a bare `T: IntoToolOutput`
+  = help: the following other types implement trait `IntoToolOutput`:
+            &'static str
+            Cow<'static, str>
+            Json<T>
+            ToolOutput
+            std::string::String
+  = note: required for `u8` to implement `IntoToolResult`

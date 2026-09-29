@@ -1,0 +1,25 @@
+{
+  "name": "open_pull_request",
+  "description": "Open the pull request for the pushed branch. Requires that everything is pushed with commit_and_push and that the last check run passed on exactly this code (re-run the checks after your last change). The body must have a summary and a verification section listing the commands you ran and their results.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "title": {
+        "type": "string",
+        "description": "Conventional Commit style title"
+      },
+      "body": {
+        "type": "string",
+        "description": "Markdown: summary, then verification"
+      },
+      "accept_red_checks": {
+        "type": "boolean",
+        "description": "Set true ONLY when the user explicitly said, in this conversation, that a pull request with failing (or no) checks is acceptable. Never set it on your own judgement."
+      }
+    },
+    "required": [
+      "title",
+      "body"
+    ]
+  }
+}

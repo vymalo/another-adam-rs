@@ -1,0 +1,33 @@
+[package]
+name = "adam"
+description = "The adam-rs facade: one dependency for writing agents, with the #[tool] macro and a prelude"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["macros"]
+# `#[tool]` (and the paths it generates code against, which are always there).
+macros = ["dep:adam-macros"]
+
+[dependencies]
+adam-core.workspace = true
+adam-error.workspace = true
+adam-llm-agent = { workspace = true, features = ["schema"] }
+adam-macros = { workspace = true, optional = true }
+adam-model.workspace = true
+adam-runtime.workspace = true
+
+[dev-dependencies]
+schemars = { workspace = true, features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+trybuild.workspace = true
+
+[lints]
+workspace = true
