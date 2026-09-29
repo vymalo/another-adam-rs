@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use adam_core::{DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
+use adam_core::{ClaimScope, DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
 use adam_runtime::{
     Agent, AgentError, AgentStarter, BroadcastSink, Classify, Clock, CollectingSink, Ctx, Inbound,
     LocalNotifier, MAX_RETRY_AFTER, ManualClock, RetryPolicy, RunEvent, RunView, Runtime,
@@ -2775,6 +2775,107 @@ mod cases {
             RunStatus::Failed
         );
     }
+
+    /// Three workers over twelve multi-step runs. Returns, per run, the workers that stepped it
+    /// in order, and how many distinct workers took part.
+    async fn steps_per_worker(
+        store: DynStore,
+        scope: ClaimScope,
+    ) -> (Vec<Vec<String>>, HashSet<String>) {
+        const RUNS: usize = 12;
+        const STEPS: u64 = 6;
+        let name = uniq("placement");
+        let seen = Arc::new(Mutex::new(HashMap::<RunId, Vec<String>>::new()));
+        let runtimes: Vec<Runtime> = ["pin-a", "pin-b", "pin-c"]
+            .into_iter()
+            .map(|worker| {
+                // One agent per runtime, so a step knows which worker runs it.
+                let agent = fn_agent(
+                    &name,
+                    step_fn({
+                        let seen = seen.clone();
+                        move |ctx, state| {
+                            let seen = seen.clone();
+                            async move {
+                                let n = state.get("n").and_then(Value::as_u64).unwrap_or(0);
+                                seen.lock()
+                                    .expect("lock")
+                                    .entry(ctx.run_id())
+                                    .or_default()
+                                    .push(worker.to_owned());
+                                tokio::time::sleep(Duration::from_millis(8)).await;
+                                Ok(if n + 1 >= STEPS {
+                                    Transition::Done {
+                                        state,
+                                        output: json!(n),
+                                    }
+                                } else {
+                                    Transition::Continue(json!({ "n": n + 1 }))
+                                })
+                            }
+                            .boxed()
+                        }
+                    }),
+                );
+                builder(&store, worker, &agent)
+                    .claim_scope(scope)
+                    .concurrency(2)
+                    .build()
+            })
+            .collect();
+        assert!(runtimes.iter().all(|rt| rt.claim_scope() == scope));
+        let mut runs = Vec::new();
+        for _ in 0..RUNS {
+            runs.push(
+                runtimes[0]
+                    .start(&name, Inbound::new("start", json!({"n": 0})), None)
+                    .await
+                    .expect("start"),
+            );
+        }
+        let workers: Vec<Worker> = runtimes.iter().map(spawn_worker).collect();
+        for run in &runs {
+            wait_done(&runtimes[0], *run).await;
+        }
+        for w in workers {
+            w.stop().await;
+        }
+        let seen = seen.lock().expect("lock");
+        let per_run: Vec<Vec<String>> = runs.iter().map(|run| seen[run].clone()).collect();
+        for steps in &per_run {
+            assert_eq!(steps.len(), STEPS as usize, "every step ran once");
+        }
+        let took_part = per_run.iter().flatten().cloned().collect();
+        (per_run, took_part)
+    }
+
+    /// With `Pinned`, a multi-step run always steps on the worker that first claimed it, while
+    /// the runs are shared out between the workers.
+    pub async fn pinned_workers_step_a_run_only_on_its_owner(store: DynStore) {
+        let (per_run, took_part) = steps_per_worker(store, ClaimScope::Pinned).await;
+        for (i, steps) in per_run.iter().enumerate() {
+            let owner = &steps[0];
+            assert!(
+                steps.iter().all(|w| w == owner),
+                "run {i} moved between workers: {steps:?}"
+            );
+        }
+        assert!(
+            took_part.len() >= 2,
+            "the work should be shared, only {took_part:?} took part"
+        );
+    }
+
+    /// The control: with `Any`, the same setup moves runs between workers, which is what pinning
+    /// prevents (and what forked coder runs on separate disks).
+    pub async fn any_workers_let_a_run_move_between_workers(store: DynStore) {
+        let (per_run, _) = steps_per_worker(store, ClaimScope::Any).await;
+        let moved = per_run
+            .iter()
+            .filter(|steps| steps.iter().any(|w| w != &steps[0]))
+            .count();
+        assert!(moved >= 1, "no run moved: {per_run:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2832,6 +2933,8 @@ macro_rules! runtime_suite {
                 cancel_only_signals_its_own_run,
                 notifier_wakes_a_worker_of_another_runtime,
                 notifier_carries_a_cancel_to_another_runtime,
+                pinned_workers_step_a_run_only_on_its_owner,
+                any_workers_let_a_run_move_between_workers,
             );
         }
     };
