@@ -23,6 +23,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
 a2a-client-lf.workspace = true
 async-trait.workspace = true

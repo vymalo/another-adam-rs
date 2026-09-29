@@ -344,4 +344,37 @@ mod tests {
         let raw = Message::new(Role::User, vec![Part::raw(vec![1])]);
         assert!(default_inbound(&raw).is_err());
     }
+
+    mod prop {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            /// Any subject and any context id (colons, percents and the
+            /// escape sequences themselves included) come back unchanged, and
+            /// the subject cannot smuggle a separator: two callers never map
+            /// to the same conversation.
+            #[test]
+            fn prop_conversation_id_roundtrip(subject in any::<String>(), context in any::<String>()) {
+                let enc = encode_conversation(&subject, &context);
+                prop_assert_eq!(decode_conversation(&enc), Some((subject.clone(), context.clone())));
+            }
+
+            #[test]
+            fn prop_conversation_ids_are_injective(
+                s1 in "[%:a-zA-Z0-9]{0,6}", c1 in "[%:a-zA-Z0-9]{0,6}",
+                s2 in "[%:a-zA-Z0-9]{0,6}", c2 in "[%:a-zA-Z0-9]{0,6}",
+            ) {
+                prop_assume!((&s1, &c1) != (&s2, &c2));
+                prop_assert_ne!(encode_conversation(&s1, &c1), encode_conversation(&s2, &c2));
+            }
+
+            /// Decoding arbitrary text never panics.
+            #[test]
+            fn prop_decode_conversation_never_panics(text in any::<String>()) {
+                let _ = decode_conversation(&text);
+            }
+        }
+    }
 }
