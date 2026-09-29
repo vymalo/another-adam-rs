@@ -9,6 +9,7 @@ trait, a shared conformance suite, and two production adapters.
 
 | Crate | What it is |
 |---|---|
+| [`adam-error`](crates/adam-error/README.md) | The error model every crate shares: `ErrorClass`, the `Classify` trait, `BoxError` and `report()`. Pure: no I/O, no async |
 | [`adam-core`](crates/adam-core/README.md) | `Store` trait, run/journal/lease types, in-memory reference store |
 | [`adam-store-testkit`](crates/adam-store-testkit/README.md) | Conformance suite every store must pass (`store_conformance!`) |
 | [`adam-store-postgres`](crates/adam-store-postgres/README.md) | PostgreSQL 12+ via `sqlx` 0.9 |
@@ -94,9 +95,9 @@ let run = store.commit_run(run.id, run.version, RunUpdate::new(RunStatus::Parked
   prefix plus percent-encoding of `%`, `.`, `$`, NUL); ordinary keys are stored
   as-is so `state.messages.role` still works in queries. See
   `adam-store-mongodb/src/codec.rs`.
-* **MongoDB integers** above `i64::MAX` are rejected with `InvalidData`.
+* **MongoDB integers** above `i64::MAX` are rejected with `InvalidInput`.
 * **PostgreSQL NUL.** `JSONB` cannot hold `\u0000`; such state is rejected with
-  `InvalidData` instead of a raw driver error.
+  `InvalidInput` instead of a raw driver error.
 * **Time** is truncated to milliseconds in every store (BSON dates are
   millisecond precision), so all backends compare timestamps identically.
   Lease expiry uses the `now` the caller passes in; keep worker clocks in sync
@@ -211,6 +212,56 @@ that can call tools (see the live smoke test in `crates/adam-coder/README.md`);
 the git remote and the pull request API of that run can still be `git-server`
 and `mock-github`. (The `app` profile was validated with `docker compose config`
 only when this was written: no container runtime was available.)
+
+## Errors
+
+Every library error enum implements `adam_error::Classify`: a variant says
+**what happened**, its `ErrorClass` says **what to do**. Retry loops, the A2A
+error a client sees and the process exit code all decide from the class, never
+from a variant, so a new variant only needs a class decision.
+
+| Class | Meaning | Retry | Alert | A2A error (`adam-a2a`) | Exit code (`adam-coder`) |
+|---|---|---|---|---|---|
+| `Transient` | may succeed later: network, 5xx, timeout, pool, crashed child | yes, with backoff | no | `-32603` "backend temporarily unavailable" | 69 |
+| `RateLimited` | slow down; honour `retry_after()` | yes, after `max(backoff, retry_after)` | no | `-32603` "backend temporarily unavailable" | 69 |
+| `Conflict` | lost an optimistic-concurrency race | yes, at once (bounded) | no | `-32603` "backend temporarily unavailable" | 69 |
+| `Invalid` | the input is wrong; it never succeeds | no | no | `-32602` invalid params | 78 |
+| `NotFound` | absent, or invisible to this caller | no | no | `-32001` task not found | 1 |
+| `Rejected` | valid, but the target's state forbids it (finished, busy, exists) | no | no | `-32602` invalid params (`-32002` for a cancel) | 1 |
+| `Unauthenticated` | credentials missing or refused | no | no | `-32603` "internal error" | 1 |
+| `Unsupported` | the peer does not offer this | no | no | `-32603` "internal error" | 1 |
+| `Corrupt` | stored or received data breaks an invariant | no | **yes** | `-32603` "internal error" | 70 |
+| `Internal` | a bug, or unclassified | no | **yes** | `-32603` "internal error" | 70 |
+
+The A2A server answers every JSON-RPC error with HTTP 200 and an error object,
+so there is no HTTP status to map; a body that is not a request gets `-32700`
+(not JSON) or `-32600` (JSON, but not a request), with a null id.
+
+**Retry.** The runtime retries a step that fails with a `Transient` or
+`RateLimited` `AgentError` with exponential backoff (`RetryPolicy`), waiting
+at least the error's `retry_after()` when it has one (a provider's
+`Retry-After`, capped at 24 hours). Any other class fails the run. A store
+error while stepping is decided by class: `Corrupt` and `Invalid` fail the run
+(a row that can never be read must not be re-leased for ever); everything else
+leaves the run to its lease and is logged with its class.
+
+**Exit codes** of `adam-coder` (sysexits.h values, *unverified*: from memory)
+are found by walking the `anyhow` chain from the outside in: 78 configuration
+(`ConfigError`, `OpenAiConfigError`, or any `Invalid` error), 69 a dependency
+that is unreachable at boot (Postgres), 71 an OS error (a port that cannot
+bind), 70 a half of the process that stopped, a panic or an internal error,
+1 anything else, 0 after a clean SIGTERM. The failure is one structured JSON
+log line, `adam-coder failed`, with the whole cause chain and none of the
+process's secrets.
+
+**Rules for an error enum** (details in `crates/adam-error/README.md`):
+`thiserror` in libraries and `anyhow` only in binaries, `#[non_exhaustive]`,
+an `impl Classify` with an exhaustive `match` in its test, a `#[source]` for
+every wrapped error (`BoxError` for a driver or SDK type, so none appears in a
+trait signature), and a message that describes its own layer only. Nothing
+interpolates its source: `adam_error::report(&e)` prints the chain
+(`a: b: c`) once, and is used only where an error is flattened, at a trust or
+persistence boundary: the journal, a response to a client, a log line.
 
 ## Testing
 
