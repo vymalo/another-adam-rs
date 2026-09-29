@@ -1,0 +1,22 @@
+[package]
+name = "adam-llm-agent"
+description = "Durable LLM tool-calling agent for adam-rs: the model/tool loop on top of adam-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-core.workspace = true
+adam-model.workspace = true
+adam-runtime.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+tokio.workspace = true

@@ -1,7 +1,7 @@
 //! [`Ctx`]: what an [`Agent`](crate::Agent) sees while it steps.
 
 use std::future::Future;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -27,16 +27,84 @@ const NOW_STEP: &str = "ctx.now";
 /// recorded result instead of running again.
 pub struct Ctx {
     run: RunId,
-    agent: String,
     conversation_id: Option<String>,
     attempt: u32,
     seq: u64,
     inbox: Vec<Inbound>,
     consumed: usize,
     store: DynStore,
-    sink: DynEventSink,
     clock: DynClock,
-    artifacts: Mutex<Vec<Artifact>>,
+    emitter: Emitter,
+}
+
+/// A cloneable, owned handle for emitting [`RunEvent`]s of one run.
+///
+/// [`Ctx::emit`] borrows the `Ctx`, which cannot be held across a
+/// [`Ctx::step`] (that takes `&mut self`) or moved into a spawned task. Take an
+/// `Emitter` with [`Ctx::emitter`] before the step and move it in instead. It
+/// behaves exactly like [`Ctx::emit`], including [`RunEvent::Artifact`] being
+/// recorded with the transition's commit, and is `'static`.
+#[derive(Clone)]
+pub struct Emitter {
+    run: RunId,
+    agent: Arc<str>,
+    sink: DynEventSink,
+    artifacts: Arc<Mutex<Vec<Artifact>>>,
+}
+
+impl std::fmt::Debug for Emitter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Emitter")
+            .field("run", &self.run)
+            .field("agent", &self.agent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Emitter {
+    /// An emitter detached from any [`Ctx`], for tests and for code that runs
+    /// outside a transition. Events go to `sink`; artifacts are forwarded but
+    /// recorded nowhere, since no transition commits them.
+    pub fn new(run: RunId, agent: impl Into<String>, sink: DynEventSink) -> Self {
+        Self {
+            run,
+            agent: Arc::from(agent.into()),
+            sink,
+            artifacts: Arc::default(),
+        }
+    }
+
+    /// The run the events belong to.
+    pub fn run_id(&self) -> RunId {
+        self.run
+    }
+
+    /// Name of the agent the events are attributed to.
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    /// Same contract as [`Ctx::emit`]: best effort, not durable, except that
+    /// [`RunEvent::Artifact`] is also recorded with the transition's commit
+    /// (dropped again if the transition is retried).
+    pub async fn emit(&self, event: RunEvent) {
+        if let RunEvent::Artifact {
+            name,
+            mime_type,
+            data,
+        } = &event
+        {
+            self.artifacts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Artifact {
+                    name: name.clone(),
+                    mime_type: mime_type.clone(),
+                    data: data.clone(),
+                });
+        }
+        self.sink.emit(self.run, &self.agent, event).await;
+    }
 }
 
 /// What the runtime needs back from a [`Ctx`] after the transition.
@@ -62,16 +130,19 @@ impl Ctx {
     pub(crate) fn new(p: CtxParts) -> Self {
         Self {
             run: p.run,
-            agent: p.agent,
             conversation_id: p.conversation_id,
             attempt: p.attempt,
             seq: p.seq,
             inbox: p.inbox,
             consumed: 0,
             store: p.store,
-            sink: p.sink,
             clock: p.clock,
-            artifacts: Mutex::new(Vec::new()),
+            emitter: Emitter {
+                run: p.run,
+                agent: Arc::from(p.agent),
+                sink: p.sink,
+                artifacts: Arc::default(),
+            },
         }
     }
 
@@ -79,10 +150,13 @@ impl Ctx {
         CtxOutcome {
             seq: self.seq,
             consumed: self.consumed,
-            artifacts: self
-                .artifacts
-                .into_inner()
-                .unwrap_or_else(PoisonError::into_inner),
+            artifacts: std::mem::take(
+                &mut *self
+                    .emitter
+                    .artifacts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            ),
         }
     }
 
@@ -93,7 +167,7 @@ impl Ctx {
 
     /// Name of the agent running this transition.
     pub fn agent(&self) -> &str {
-        &self.agent
+        &self.emitter.agent
     }
 
     /// The conversation this run belongs to, if any.
@@ -228,22 +302,14 @@ impl Ctx {
     /// transition's commit (see `RunView::artifacts`), and dropped again if
     /// the transition is retried.
     pub async fn emit(&self, event: RunEvent) {
-        if let RunEvent::Artifact {
-            name,
-            mime_type,
-            data,
-        } = &event
-        {
-            self.artifacts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(Artifact {
-                    name: name.clone(),
-                    mime_type: mime_type.clone(),
-                    data: data.clone(),
-                });
-        }
-        self.sink.emit(self.run, &self.agent, event).await;
+        self.emitter.emit(event).await;
+    }
+
+    /// An owned handle that emits like [`Ctx::emit`] but does not borrow the
+    /// `Ctx`, so it can be moved into a [`Ctx::step`] closure or a spawned
+    /// task. See [`Emitter`].
+    pub fn emitter(&self) -> Emitter {
+        self.emitter.clone()
     }
 }
 
@@ -261,5 +327,87 @@ fn decode<T: DeserializeOwned, E: DeserializeOwned>(
         serde_json::from_value(entry.payload.clone()).map(Ok)
     } else {
         serde_json::from_value(entry.payload.clone()).map(Err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use adam_core::MemoryStore;
+
+    use super::*;
+    use crate::clock::SystemClock;
+    use crate::events::CollectingSink;
+
+    async fn ctx(sink: &CollectingSink) -> Ctx {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let run = store
+            .create_run(adam_core::NewRun::new("a", serde_json::json!({})))
+            .await
+            .expect("create run");
+        Ctx::new(CtxParts {
+            run: run.id,
+            agent: "a".into(),
+            conversation_id: None,
+            attempt: 0,
+            seq: 0,
+            inbox: Vec::new(),
+            store,
+            sink: Arc::new(sink.clone()),
+            clock: Arc::new(SystemClock),
+        })
+    }
+
+    #[tokio::test]
+    async fn emitter_outlives_borrows_and_records_artifacts_like_ctx_emit() {
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        let emitter = ctx.emitter();
+        assert_eq!(emitter.run_id(), ctx.run_id());
+        assert_eq!(emitter.agent(), "a");
+
+        // Usable from another task while the Ctx is borrowed mutably.
+        let task = tokio::spawn(async move {
+            emitter
+                .emit(RunEvent::Progress {
+                    message: "working".into(),
+                })
+                .await;
+            emitter
+                .emit(RunEvent::Artifact {
+                    name: "report".into(),
+                    mime_type: None,
+                    data: serde_json::json!(1),
+                })
+                .await;
+        });
+        let step: Result<Result<u8, String>, AgentError> =
+            ctx.step("noop", || async { Ok(1) }).await;
+        assert_eq!(step.expect("step").expect("inner"), 1);
+        task.await.expect("emitter task");
+        ctx.emit(RunEvent::Progress {
+            message: "from ctx".into(),
+        })
+        .await;
+
+        let events = sink.events_for(ctx.run_id());
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[2], RunEvent::Progress { message } if message == "from ctx"));
+        let outcome = ctx.into_outcome();
+        assert_eq!(outcome.artifacts.len(), 1);
+        assert_eq!(outcome.artifacts[0].name, "report");
+    }
+
+    #[tokio::test]
+    async fn detached_emitter_forwards_to_its_sink() {
+        let sink = CollectingSink::new();
+        let run = RunId::new();
+        let emitter = Emitter::new(run, "x", Arc::new(sink.clone()));
+        emitter
+            .emit(RunEvent::Progress {
+                message: "hi".into(),
+            })
+            .await;
+        assert_eq!(sink.events()[0].agent, "x");
+        assert_eq!(sink.events_for(run).len(), 1);
     }
 }
