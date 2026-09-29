@@ -1,7 +1,7 @@
 # 0001. Library first: host roles in `adam-host`
 
-Status: **Proposed** (2026-09-29). The owner decided the direction. The open questions at the
-end are still pending.
+Status: **Accepted** (2026-09-29). The owner answered the open questions the same day. Two
+questions stay open: cross-process events, and the exact workspace placement enum.
 
 ## Context
 
@@ -25,8 +25,9 @@ front stops first, the worker stops second, and a bound decides when to give up 
 orchestrator bounds both halves, `adam-coder` only the front). *Verified 2026-09-29: read
 `crates/adam-coder/src/serve.rs` and `boot.rs`.*
 
-The name "control plane" also names the Next.js chat UI in `another-agentic-system`. That
-clash is outside this repo. It is tracked there.
+The name "control plane" also names the Next.js chat UI in `another-agentic-system`. The owner
+decided that the UI is renamed "web chat surface" there, and that "control plane" means the
+role. The rename is outside this repo.
 
 ## Decision
 
@@ -58,6 +59,33 @@ clash is outside this repo. It is tracked there.
    per role.
 7. **The seam stays the store.** The two roles talk only through the Postgres store: the run
    record with its version compare-and-swap, and leases. No new protocol between them.
+8. **Hosts may run adam agents in-process, tools and sandboxes included.** The owner decided
+   this for the `another-agentic-system` orchestrator: a worker there may host an adam agent
+   in its own process, behind its own agent port and behind a Cargo feature of its own. That
+   includes agents that run tools and sandboxes. It is the host's decision and the host's
+   risk. For adam-rs it means the agent, runtime and store crates stay usable as libraries in
+   another process. The host, not adam-rs, adds the adapter. Plain A2A stays the way to reach
+   an agent in another process.
+9. **Hosts consume adam-rs by git rev.** The repository is public. A host pins a full commit
+   sha and bumps it by pull request. adam-rs does not publish to crates.io for this. It keeps
+   the workspace `repository` field and the pinned dependency versions correct, so a host can
+   build from the sha alone.
+10. **Workspace placement is chosen by the deployer** (decided in principle). An agent with a
+    filesystem, such as the coder, needs a workspace per run. The owner said every strategy
+    must be possible: "A worker can do the work, it can own a folder, it can have an isolated
+    pvc, it can use only a2a." adam-rs will offer a closed, deployer-selected placement policy.
+    Candidate names:
+
+    | Policy | Meaning |
+    |---|---|
+    | `Shared` | an RWX volume; any worker may resume any run |
+    | `Affinity` | a run is leased only by the worker that owns its folder |
+    | `Isolated` | a PVC per worker; implies affinity |
+    | none | A2A-only deployments need no workspace |
+
+    The exact enum and the mechanism are follow-up design work. **The runtime has no
+    run-to-worker affinity today:** any worker may lease any run. Until affinity exists, a coder
+    deployment runs one worker, or uses a shared volume.
 
 ## Consequences
 
@@ -68,6 +96,10 @@ clash is outside this repo. It is tracked there.
 * `Role` is a public, closed enum. Adding a role is a breaking change for hosts that match on
   it. That is the point, and it costs a major version.
 * `adam-coder` is not refactored here. Until it is, it keeps its own hand-written stop logic.
+* Hosting agents in-process (decision 8) is only safe as far as the host limits it. An agent that
+  runs builds can starve the process it lives in. The host must give it its own pods and
+  limits. adam-rs does not sandbox the host.
+* Placement (decision 10) will add a second closed enum that deployments depend on.
 * When the halves are separate processes, some things degrade until they are built: live
   events only reach subscribers in the same process, the worker wakes by polling instead of a
   wake signal, and a cancel reaches the worker by polling. Each has a planned fix (Postgres
@@ -93,15 +125,20 @@ clash is outside this repo. It is tracked there.
 * **A `runtime` feature in `adam-host` now.** A ready-made worker component over
   `adam-runtime`. Useful, but not needed to fix the contract. Left as future work.
 
+## Resolved questions
+
+* **Local, in-process agents in hosts.** Resolved 2026-09-29: yes, including agents that run
+  tools and sandboxes, behind the host's agent port and a Cargo feature (decision 8).
+* **Where `Role` lives, and whether it is closed.** Resolved: `adam-host`, closed (decisions 2
+  and 3).
+* **How hosts depend on adam-rs.** Resolved: git rev, public repository (decision 9).
+
 ## Open questions
 
-* **Local, in-process agents in hosts.** May the orchestrator run an adam agent in its own
-  process, behind its agent port? Options: later and feature-gated (only agents with no
-  sandbox), never (A2A only), or yes including tools. The coder, workspace and ACP crates
-  would not be linked in.
 * **Cross-process events.** Live events and worker wake-up between a control plane and a
   worker in other processes. Proposed: an event sink and listener over Postgres `NOTIFY`
   (payload limit 8000 bytes, *unverified*: from memory), with polling as the fallback.
-* **Coder scale-out with worktrees on per-replica volumes.** A run needs the git worktree it
-  started with. N workers with a volume each means a run must return to the same worker.
-  Options: N fronts and one worker, a shared read-write-many volume, or lease affinity.
+* **The exact placement enum and mechanism** (decision 10). Are `Shared`, `Affinity` and
+  `Isolated` the right names and the right set? How does a worker own a folder and claim only
+  its runs (a lease with a worker id, or a routing key)? What happens to a run when its worker
+  is gone for good under `Affinity` or `Isolated`? Needs its own design and ADR.
