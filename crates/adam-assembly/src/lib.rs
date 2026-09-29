@@ -81,9 +81,18 @@
 //! | 2 | [`BoundDef`] | tools resolved, prompts rendered ([`bind`](AgentDef::bind)) | unknown tool, unknown, unused or unset var, bad `{{` |
 //! | 3 | [`Assembly`] | state and model ([`state`](BoundDef::state), [`model`](BoundDef::model)) | bad model alias, missing state |
 //!
-//! Not here yet: skills (slice S7), the tool that runs a subagent as a durable child run (S8 and
-//! S9), remote subagents (S9b), `mcp.json` tools (S11) and reloading from disk (S10). The
-//! manifest keeps their files, and [`BoundDef::model`] is where they plug in.
+//! # Skills
+//!
+//! An agent with skills gets a catalog (name and description of each) after its instructions and
+//! two tools: [`LOAD_SKILL`] returns the body of a skill, and [`READ_SKILL_FILE`] returns one of the
+//! text files it bundles. `preload_skills:` puts a body in the prompt instead. The bytes of the
+//! bundled files come with an embedded agent, or are read once by [`AgentDef::from_source`] and
+//! [`AgentDef::resources_from`]; a refusal is a [`SkillError`] shown to the model. See the README
+//! for the exact format.
+//!
+//! Not here yet: the tool that runs a subagent as a durable child run (S8 and S9), remote
+//! subagents (S9b), `mcp.json` tools (S11) and reloading from disk (S10). The manifest keeps their
+//! files, and [`BoundDef::model`] is where they plug in.
 
 #![warn(missing_docs)]
 
@@ -92,12 +101,14 @@ mod assembly;
 mod card;
 mod def;
 mod error;
+mod skills;
 mod suggest;
 mod template;
 
 pub use assembly::{AgentInfo, Assembly, BoundDef, RemoteInfo};
 pub use def::{AgentDef, IntoManifest};
-pub use error::{AliasProblem, Error, Origin};
+pub use error::{AliasProblem, Error, Origin, SkillField};
+pub use skills::{LOAD_SKILL, READ_SKILL_FILE, SkillError, SkillFiles};
 pub use template::TemplateProblem;
 
 /// The URL type of [`Assembly::card`], so a caller needs no `url` dependency of its own.

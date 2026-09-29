@@ -25,13 +25,13 @@ Directory walking uses `std::fs`, so there is no `walkdir` dependency either.
 
 | Item | What |
 |---|---|
-| `ManifestSource` (trait), `Dir` | `load() -> Result<Report, Error>`. `Dir::new(root)` reads `root/agent/` (one agent) or `root/agents/<name>/` (several); `.optional()` accepts neither, `.default_name(n)` names a root agent whose frontmatter has no `name` (a build script passes `CARGO_PKG_NAME`) |
+| `ManifestSource` (trait), `Dir` | `load() -> Result<Report, Error>` and `read_resource(&Skill, name) -> Result<Cow<'static, [u8]>, Error>` (the bytes of a file a skill bundles; it refuses a name the skill does not list, so `..` cannot leave its directory). `Dir::new(root)` reads `root/agent/` (one agent) or `root/agents/<name>/` (several); `.optional()` accepts neither, `.default_name(n)` names a root agent whose frontmatter has no `name` (a build script passes `CARGO_PKG_NAME`) |
 | `Report`, `Package`, `Layout` | `report.package.agents`, `report.diagnostics`, `errors()`, `warnings()`, `is_ok()`, `into_package(Strictness)` |
 | `Diagnostic`, `Severity` | `{ severity: Error \| Warning, path, line: Option<u32>, message }`; `Display` is `path:line: severity: message` |
 | `Strictness` | `Lenient` (only errors fail) or `Strict` (warnings fail too) |
 | `AgentManifest` | `name`, `path`, `frontmatter`, `instructions` (`body`, `parts`, `prompt()`), `skills`, `subagents`, `mcp`, `schedules` |
 | `Subagent` | `Local(Box<AgentManifest>)` or `Remote(RemoteAgent)` (`a2a:` URL, `RemoteAuth::Bearer { env }`) |
-| `Skill`, `SkillLayout` | `name`, `description`, `license`, `compatibility`, `metadata`, `allowed_tools`, `body`, `resources` (paths, not contents) |
+| `Skill`, `SkillLayout`, `SKILL_RESOURCE_LIMIT` | `name`, `description`, `license`, `compatibility`, `metadata`, `allowed_tools`, `body`, `resources` (paths, not contents; `SKILL_RESOURCE_LIMIT` is the 1 MiB one skill may bundle) |
 | `Schedule` | `name` (`a/b` from the path), `cron`, `timezone`, `agent`, `prompt` |
 | `AgentFrontmatter`, `Limits`, `Card`, `ToolList`, `ModelRef`, `SkillSelection` | the shared agent and subagent schema; unknown keys are kept in `extra` |
 | `SkillFrontmatter`, `ScheduleFrontmatter` | the other two YAML schemas |
@@ -41,7 +41,7 @@ Directory walking uses `std::fs`, so there is no `walkdir` dependency either.
 | `is_agent_name`, `is_skill_name`, `is_tool_name`, `is_env_name` | the name patterns |
 | `Error` | `Io { path, source }` (the source could not be read), `Invalid { diagnostics }` (`into_package` refused) and `Codec { action, what, source }` (a manifest could not be encoded or decoded); implements `adam_error::Classify` (`NotFound`, `Internal`, `Invalid`) |
 | `Digest`, `digest_with`, `Dir::digest` | `sha256:...` of a normalised manifest and its skill resources: the same for a directory and for the embedded copy of it |
-| `EmbeddedPackage`, `EmbeddedAgent`, `EmbeddedSkill`, `EmbeddedSubagent`, ... | the `'static` form of a package, built by generated code; `EmbeddedPackage` is a `ManifestSource`, `EmbeddedAgent::{to_manifest, frontmatter, recompute_digest, verify}` |
+| `EmbeddedPackage`, `EmbeddedAgent`, `EmbeddedSkill`, `EmbeddedSubagent`, ... | the `'static` form of a package, built by generated code; `EmbeddedPackage` is a `ManifestSource`, `EmbeddedAgent::{to_manifest, frontmatter, recompute_digest, verify, resource}` |
 | `build(dir)`, `Build`, `BuildError`, `Emitted`, `Generated` (feature `build`) | the code generator for `build.rs` |
 
 ```rust
@@ -115,7 +115,7 @@ What is in the generated file:
 * The frontmatter is JSON, read back by `EmbeddedAgent::frontmatter()` into the same
   `AgentFrontmatter` the directory path uses, so there is no second schema.
 * `mcp.json` is `include_str!` of the file (placeholders unexpanded, no secret can be in the build).
-* Skill resources are `include_bytes!` of the file, up to 1 MiB per skill; over that is a build error.
+* Skill resources are `include_bytes!` of the file, up to 1 MiB per skill (`SKILL_RESOURCE_LIMIT`); over that is a build error. `ManifestSource::read_resource` serves their bytes from either source (`adam-assembly` reads them for `read_skill_file`).
 * Every agent, at every depth of subagents, carries its `digest`.
 
 The generated code is plain `'static` data, so it is const-evaluated and costs nothing at startup.

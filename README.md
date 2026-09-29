@@ -403,7 +403,7 @@ node tools/docs-check/check-docs.mjs
 1. ~~Store trait and adapters~~ (this repo)
 2. ~~Run state machine and `ctx.step` journaling~~ (`adam-runtime`)
 3. ~~`#[tool]` macro (schemars)~~ (`adam-macros`, through the `adam` facade; [`docs/authoring.md`](docs/authoring.md))
-4. ~~`build.rs` discovery of `agent/` (instructions, skills, subagents, `mcp.json`)~~ (`adam-agent-fs` parses and validates, `build("agent").emit()` embeds, `adam::include_agent!()` includes; [`docs/authoring.md`](docs/authoring.md)). `adam-assembly` binds it to `LlmAgent`s (templating, tool binding, models, the A2A card); skills and subagents as child runs are next
+4. ~~`build.rs` discovery of `agent/` (instructions, skills, subagents, `mcp.json`)~~ (`adam-agent-fs` parses and validates, `build("agent").emit()` embeds, `adam::include_agent!()` includes; [`docs/authoring.md`](docs/authoring.md)). `adam-assembly` binds it to `LlmAgent`s (templating, tool binding, models, the skills catalog with `load_skill` and `read_skill_file`, the A2A card); subagents as child runs are next
 5. Parking, approvals, schedules
 6. Dev TUI (`cargo adam dev`)
 7. Host adapters (axum/tower), channels, sandboxes

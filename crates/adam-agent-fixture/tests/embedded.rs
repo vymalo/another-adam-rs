@@ -123,3 +123,34 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+#[test]
+fn a_resource_reads_the_same_bytes_from_the_directory_and_from_the_binary() {
+    let dir = dir();
+    let from_dir = dir.load().unwrap().package;
+    let mut checked = 0;
+    for skill in &from_dir.agents[0].skills {
+        for resource in &skill.resources {
+            let on_disk = dir.read_resource(skill, resource).unwrap();
+            let embedded = PACKAGE.read_resource(skill, resource).unwrap();
+            assert_eq!(on_disk, embedded, "{resource}");
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked, 2,
+        "release-notes has references/style.md and scripts/run.sh"
+    );
+
+    // Only what a skill lists is readable: a path out of its directory is refused, not read.
+    let skill = &from_dir.agents[0].skills[0];
+    for source in [&dir as &dyn ManifestSource, &PACKAGE as &dyn ManifestSource] {
+        assert!(
+            source
+                .read_resource(skill, "../../instructions.md")
+                .is_err()
+        );
+        assert!(source.read_resource(skill, "nope.md").is_err());
+    }
+    assert_eq!(adam::agent_fs::SKILL_RESOURCE_LIMIT, 1024 * 1024);
+}

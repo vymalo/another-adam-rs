@@ -2,8 +2,8 @@
 
 Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
 facade), S3 (`adam-coder` tools through `#[tool]`), S4 (`adam-agent-fs`, the parser and validator of
-agent directories), S5 (the `build.rs` codegen and `adam::include_agent!()`) and S6 (`adam-assembly`,
-which binds a manifest to `LlmAgent`s) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+agent directories), S5 (the `build.rs` codegen and `adam::include_agent!()`), S6 (`adam-assembly`,
+which binds a manifest to `LlmAgent`s) and S7 (skills at run time) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
 the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
@@ -153,7 +153,8 @@ directory is a warning (the directory wins); a missing `description` or unparsea
 skill and is a **build error**, because these files are our own source and not a third-party install.
 A flat `skills/<name>.md` is an eve convenience and may omit frontmatter (the description is then the
 first non-empty line, with a warning). `allowed-tools` is parsed and ignored in v1. Resources are
-embedded up to 1 MiB per skill.
+embedded up to 1 MiB per skill. What the model sees of a skill at run time is
+[described below](#skills-at-run-time-built-s7-adam-assembly).
 
 The repository's own `.agents/skills/` is a corpus of 75 vendored `SKILL.md` files. The parser must read
 all of them with no error; that is a conformance test since S4.
@@ -330,7 +331,9 @@ stateDiagram-v2
   `body_offset` (a body's line in its file, for bind-time messages) is not there: slice S6 reports lines
   within the body instead (`prompt line N` of the file it names).
 * **Two sources, one type.** `ManifestSource::load()` is implemented by `Dir` and by
-  `EmbeddedPackage`, both giving a `Report` and a `Package`. `adam::agent_fs` is the whole crate
+  `EmbeddedPackage`, both giving a `Report` and a `Package`; `ManifestSource::read_resource(skill, name)`
+  gives the bytes of a bundled file, which a manifest lists without reading (slice S7; it refuses a name the
+  skill does not list, so a `..` cannot leave the skill's directory). `adam::agent_fs` is the whole crate
   re-exported by the facade, and generated code refers to it as `::adam::agent_fs` (change it with
   `.crate_path(..)` for a crate that depends on `adam-agent-fs` directly).
 * **Versions must match.** The generated code fills the public fields of the `Embedded*` types, so
@@ -430,13 +433,94 @@ re-exported there as `#[doc(hidden)] __private` (feature `schema`) and again by 
 crate using `#[tool]` needs no dependency of its own on `serde`, `schemars` or `async-trait` for the
 generated code.
 
-## Skills and subagents at run time (planned)
+## Skills at run time (built: S7, `adam-assembly`)
 
-**Skills** use progressive disclosure. The catalog (`name`, `description`) is appended to the system
-prompt; the tool `load_skill { name }` (an enum of the agent's skills) returns the body wrapped in
-`<skill_content>`; `read_skill_file { skill, path }` reads an embedded resource and rejects `..` and
-absolute paths. `load_skill` is a normal tool, so its result is journaled: a replay returns the body the
-model first saw, even if the skill changed in between. No skills means no tool and no catalog.
+Skills use progressive disclosure, the three tiers of the Agent Skills client guide (*verified 2026-09-29*,
+<https://agentskills.io/client-implementation/adding-skills-support.md>, which recommends a catalog in
+the prompt with a behaviour note, a dedicated activation tool whose `name` is an enum, `<skill_content>`
+wrapping with the bundled files listed and not read, and no catalog and no tool when there are no
+skills). Each agent has its own skills: the ones under its own `skills/`, narrowed by `skills:` (`all`,
+the default, or a list in the order it gives) and never inherited from its parent. `bind` builds all of
+it, so a mistake is a startup error, and `AgentInfo::prompt`, `tools` and `skills` show what was built.
+
+| Tier | The model sees | Cost |
+|---|---|---|
+| 1. Catalog | `name` and `description` of each selected skill, in the prompt after the instructions | about 50 to 100 tokens per skill, on every request |
+| 2. `load_skill { name }` | the body of `SKILL.md`, frontmatter stripped, in `<skill_content name="...">`, with the bundled files listed in `<skill_resources>` | once, in the tool result; it stays in the conversation |
+| 3. `read_skill_file { skill, path }` | one bundled file as text | once per file read |
+
+The catalog is part of the crate's contract and is pinned by a golden file
+(`crates/adam-assembly/tests/golden/coder-prompt.txt`): a two-line behaviour note, then an
+`<available_skills>` block with one `<skill><name>..</name><description>..</description></skill>` per
+skill. A description is collapsed to one line and XML-escaped (`&`, `<`, `>`), so it cannot close a tag;
+the body of a skill is not escaped (it is Markdown). `load_skill` has a `name` parameter that is a JSON
+Schema **enum** of the skills left to load; `read_skill_file` has a `skill` enum of the skills that
+bundle a file. A name outside the enum, an unselected skill and a made-up one get the same refusal, which
+lists the available names and suggests the closest.
+
+**`read_skill_file` is a lookup, not a file read.** The path is normalised (a leading `./` is dropped),
+refused when it is empty, absolute (`/`, `\`, a drive letter), has a `..` component, a backslash or a
+control character, and then looked up **by exact match** in the skill's list of bundled files: there is
+no file system access at run time, so a path that is not in the list cannot reach anything. The file must
+be UTF-8 without a NUL byte and is returned as it is (an empty file as `(the file is empty)`); a binary
+file is refused with its size, because an image or a compiled asset is not something the model can read
+as text (scripts and assets are for a sandbox to run, roadmap 7). The bytes come from the binary (an
+embedded agent) or were read from the directory once at startup (`AgentDef::from_source`,
+`AgentDef::resources_from`), and a skill may bundle at most 1 MiB (`SKILL_RESOURCE_LIMIT`, enforced by the
+build script and again when the bytes are loaded), so the bytes a file returns are bounded by that cap.
+
+**`preload_skills:`** puts the whole `<skill_content>` of a skill into the prompt, after the catalog and
+under a one-line note, instead of leaving it to `load_skill`. A preloaded skill must be one of the agent's
+selected skills. It is out of the catalog and out of the `load_skill` enum, and asking for it anyway says
+it is already in the instructions; its files remain readable. When every selected skill is preloaded
+there is no `load_skill`, and there is no `read_skill_file` when no selected skill bundles a file. An
+agent with no selected skill has neither tool and no catalog.
+
+A registered tool with the name `load_skill` or `read_skill_file` on an agent that has skills is
+`Error::ReservedToolName`; `tools:` does not filter the skill tools, `skills: []` turns them off. Both
+tools are ordinary `Tool`s, so their results are journaled with the step that ran them: a replay after a
+crash returns what the model first saw, even if the skill changed in between.
+
+```mermaid
+sequenceDiagram
+  participant M as Model
+  participant A as LlmAgent
+  participant L as load_skill
+  participant R as read_skill_file
+  A->>M: prompt with the catalog, tools load_skill and read_skill_file
+  M->>A: call load_skill(name: release-notes)
+  A->>L: journaled step tool:CALL_ID
+  L-->>A: skill_content: the body and skill_resources
+  A->>M: the body is a tool result in the conversation
+  M->>A: call read_skill_file(skill, path: references/style.md)
+  A->>R: journaled step tool:CALL_ID
+  alt the path is relative, has no .., and is a bundled text file
+    R-->>A: the file's text
+  else refused
+    R-->>A: is_error result: what is wrong and what is available
+  end
+  A->>M: the result, and the model carries on
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Cataloged: bind, the skill is selected
+  Cataloged --> Loaded: load_skill, the body is in the conversation
+  Cataloged --> Cataloged: load_skill refused, unknown or unselected name
+  [*] --> Preloaded: bind, the skill is in preload_skills
+  Preloaded --> Preloaded: load_skill answers already loaded
+  Loaded --> Loaded: read_skill_file, a bundled text file
+  Preloaded --> Preloaded: read_skill_file, a bundled text file
+  Loaded --> [*]: the run ends
+  Preloaded --> [*]: the run ends
+```
+
+Known limit: an old tool result may be truncated to fit `limits.max_history_tokens`, and a loaded skill
+is a tool result like any other (the client guide asks for skill content to be exempt from pruning).
+Preloading is the way to keep a skill for the whole run until the loop's history fitting learns to
+protect it.
+
+## Subagents at run time (planned)
 
 **Subagents** are child runs. Each local subagent is its own `LlmAgent` registered on the same
 `Runtime` as `<root>/<sub>`. The parent sees one tool per subagent (decision D5), with input
@@ -545,8 +629,10 @@ stateDiagram-v2
 * **Subagents are defined, not yet callable.** Each local subagent becomes an `LlmAgent` named
   `<parent>/<name>` with its own prompt, tools, alias and limits, and `Assembly::register` registers all of
   them on the runtime. The tool that starts one as a durable child run is S8/S9; remote subagents are data
-  (`Assembly::remotes()`) until S9b. Skills and `mcp.json` stay in the manifest for S7 and S11. Each of
-  these plugs into `BoundDef::build`, the one function that makes an `LlmAgent` from a bound agent.
+  (`Assembly::remotes()`) until S9b. `mcp.json` stays in the manifest for S11. Skills are bound (S7, see
+  the section above): the catalog and the two tools are added while `bind` resolves an agent, so the
+  prompt and the tool list `BoundDef::build` hands to `LlmAgent` are already final. The tools of S9 and
+  S11 plug into `BoundDef::build`, the one function that makes an `LlmAgent` from a bound agent.
 * **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
   `adam_a2a::AgentCardConfig`; the public URL and the version belong to the deployment.
 
@@ -580,7 +666,7 @@ the in-memory store).
 |---|---|---|
 | `adam-macros` | proc-macro | **built (S2)**: `#[tool]`; a thin shim over a pure, unit-tested `expand` function |
 | `adam-agent-fs` | lib | **built (S4, S5)**: frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` with the `Dir` and `EmbeddedPackage` implementations, the digest of a manifest, and the `build.rs` codegen behind the feature `build`. No async, no runtime dependency |
-| `adam-assembly` | lib | **built (S6)**: `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s (root and local subagents); `{{var}}` templating; the A2A card behind feature `a2a`. Planned: skills, `SubagentTool`, dev reload |
+| `adam-assembly` | lib | **built (S6, S7)**: `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s (root and local subagents); `{{var}}` templating; the skills catalog with `load_skill` and `read_skill_file`; the A2A card behind feature `a2a`. Planned: `SubagentTool`, dev reload |
 | `adam-mcp` | lib | MCP client (the official Rust SDK): MCP tools as `Tool`s, `${VAR}` expansion, fail closed |
 | `adam` | facade | **built (S2, S5, S6)**: `prelude`, the macro, feature `macros` (default), `include_agent!`, `adam::agent_fs`, `AgentDef` and its stages, `adam::assembly`, feature `a2a`. Planned: features `mcp`, `dev` |
 | `adam-agent-fixture` | test fixture | **built (S5)**, not published: a `build.rs` plus `include_agent!()` over the `adam-agent-fs` test fixture, and the tests that compare embedded and directory |
@@ -661,6 +747,6 @@ type already sets the pattern).
 | S4 | `adam-agent-fs`: parse and validate agent directories | built |
 | S5 | `build.rs` codegen and `adam::include_agent!()` | built |
 | S6 | `adam-assembly`: `AgentDef`, templating, tool binding, models, the card | built |
-| S7 | skills | planned |
+| S7 | skills at run time: the catalog, `load_skill`, `read_skill_file`, `preload_skills` | built |
 | S8, S9 | child runs and subagents | planned; S8 needs a review of the design above first |
 | S10, S11 | dev reload; `mcp.json` tools | planned |

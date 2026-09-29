@@ -63,6 +63,20 @@ impl ManifestSource for EmbeddedPackage {
             diagnostics: Vec::new(),
         })
     }
+
+    fn read_resource(&self, skill: &Skill, name: &str) -> Result<Cow<'static, [u8]>, Error> {
+        let path = skill.path.to_string_lossy().replace('\\', "/");
+        self.agents
+            .iter()
+            .find_map(|agent| agent.resource(&path, name))
+            .map(Cow::Borrowed)
+            .ok_or_else(|| {
+                Error::io(
+                    format!("{path}/{name}"),
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "not embedded"),
+                )
+            })
+    }
 }
 
 /// One agent with everything that belongs to it.
@@ -181,7 +195,10 @@ impl EmbeddedAgent {
             })
     }
 
-    fn resource(&self, skill_path: &str, name: &str) -> Option<&'static [u8]> {
+    /// The bytes of a resource of a skill of this agent or of one of its subagents, found by the
+    /// skill's file (`agent/skills/release-notes/SKILL.md`) and the resource's path
+    /// (`references/style.md`).
+    pub fn resource(&self, skill_path: &str, name: &str) -> Option<&'static [u8]> {
         let own = self
             .skills
             .iter()
@@ -490,6 +507,38 @@ mod tests {
         assert!(report.diagnostics.is_empty());
         assert_eq!(report.package.layout, Layout::Single);
         assert_eq!(report.package.agents[0].name, "a");
+    }
+
+    #[test]
+    fn a_package_serves_the_resources_of_any_depth_and_nothing_else() {
+        static AGENTS: [EmbeddedAgent; 1] = [WITH_SKILL];
+        let package = EmbeddedPackage {
+            layout: Layout::Single,
+            agents: &AGENTS,
+        };
+        let manifest = package.load().unwrap().package.agents.remove(0);
+        let own = &manifest.skills[0];
+        assert_eq!(
+            &*package.read_resource(own, "scripts/run.sh").unwrap(),
+            b"echo hi"
+        );
+        let Subagent::Local(kid) = &manifest.subagents[0] else {
+            panic!("a local subagent");
+        };
+        assert_eq!(
+            &*package
+                .read_resource(&kid.skills[0], "assets/x.bin")
+                .unwrap(),
+            &[0, 1, 2]
+        );
+        // Not a resource of that skill, even if another skill has it.
+        let err = package.read_resource(own, "assets/x.bin").unwrap_err();
+        assert!(matches!(err, Error::Io { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("agent/skills/s/SKILL.md/assets/x.bin"),
+            "{err}"
+        );
     }
 
     #[test]
