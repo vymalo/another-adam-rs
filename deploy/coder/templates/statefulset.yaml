@@ -50,6 +50,17 @@ spec:
             {{- if include "coder.runsWorkers" . }}
             - name: WORKSPACE_ROOT
               value: /work
+            {{- with include "coder.placement" . }}
+            - name: WORKSPACE_PLACEMENT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if include "coder.pinsRuns" . }}
+            {{- /* A pinned run stays with the worker of that name: the pod name is stable per StatefulSet ordinal. */}}
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
             {{- end }}
             {{- /* topology=split: this StatefulSet is the worker; the front is its own Deployment. */}}
             {{- with (ternary "worker" .Values.config.role $split) }}
@@ -141,6 +152,12 @@ spec:
           volumeMounts:
             - name: work
               mountPath: /work
+      {{- if include "coder.sharedWork" . }}
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: {{ include "coder.workClaim" . }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -153,6 +170,7 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- if not (include "coder.sharedWork" .) }}
   volumeClaimTemplates:
     - metadata:
         name: work
@@ -165,3 +183,4 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.size | quote }}
+{{- end }}

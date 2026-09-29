@@ -1393,15 +1393,18 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   tokens; the worker holds the model and GitHub secrets and the volume. Deploy-only: no
   binary changed. Verified 2026-09-29: `crates/adam-coder/src/config.rs` requires
   `A2A_BEARER_TOKENS` and `PUBLIC_URL` only for the roles that serve A2A.
-* **One worker.** Runs move between workers at every step (`adam-runtime`'s worker), while
-  the worktrees live on a ReadWriteOnce volume. A second worker without a shared `/work`
-  would continue a run on a checkout that is not there, and fork it into a second pull
-  request. The chart therefore refuses `replicaCount > 1` in both topologies until it
-  learns to set a placement. The binary already has one (`WORKSPACE_PLACEMENT` and
-  `WORKER_ID`, ADR 0002): more workers need `shared` (a ReadWriteMany `/work`, guarded by
-  the mirror lock), or `affinity`/`isolated` with a stable `WORKER_ID` per pod (see *Where a
-  run's files live: workspace placement*). Without one, a run that lands on a worker without
-  its worktree silently forks. The front scales freely: it is stateless.
+* **More than one worker needs a placement.** Runs move between workers at every step
+  (`adam-runtime`'s worker), while a worktree lives in one worker's `/work`. A second worker
+  that does not have a run's worktree would continue it on a checkout that is not there, and
+  fork it into a second pull request. The chart therefore refuses `replicaCount > 1` for the
+  roles that run workers until `workspace.placement` is set
+  ([ADR 0002](decisions/0002-workspace-placement.md)), and passes it to the binary as
+  `WORKSPACE_PLACEMENT` (with `WORKER_ID` from the pod name, the downward API, for the
+  placements that pin runs): `isolated` keeps a PVC per pod, `affinity` mounts one
+  ReadWriteMany claim and the coder keeps a folder per worker in it, `shared` mounts the same
+  claim and lets any worker step any run (guarded by the mirror lock). `a2a-only` is refused.
+  See *Where a run's files live: workspace placement*. The front scales freely: it is
+  stateless.
 * **Probes** hit `/healthz`. Graceful shutdown gets 120 seconds: on SIGTERM the
   workers finish the steps they are in. A step cut short by SIGKILL is taken
   over by the next start once its lease expires.
@@ -1414,8 +1417,8 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   creates. With `config.role=control-plane` the chart renders neither
   `MODEL_API_KEY` nor `GITHUB_TOKEN` (nor the model, GitHub and workspace
   settings): the control plane holds none of them. `all` and `worker` need both.
-* **Known risks** (stated in the chart README): no database backups, and one
-  replica.
+* **Known risks** (stated in the chart README): no database backups, a pinned run whose
+  worker never returns is stranded, and `flock` on NFS or Longhorn RWX is unverified.
 
 How a change reaches the chart (`.github/workflows/coder.yml`):
 

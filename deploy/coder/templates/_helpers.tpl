@@ -80,3 +80,27 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end -}}
+
+{{/*
+The workspace placement, trimmed and lower-cased as the binary parses it. Empty
+means "not set": the chart sets no WORKSPACE_PLACEMENT and each pod has a volume
+of its own, which is today's single-worker render.
+*/}}
+{{- define "coder.placement" -}}
+{{- default "" .Values.workspace.placement | toString | trim | lower -}}
+{{- end -}}
+
+{{/* Whether the placement pins runs to a worker (affinity, isolated): renders "true" or nothing. */}}
+{{- define "coder.pinsRuns" -}}
+{{- if has (include "coder.placement" .) (list "affinity" "isolated") -}}true{{- end -}}
+{{- end -}}
+
+{{/* Whether /work is one ReadWriteMany volume for all workers (shared, affinity): "true" or nothing. */}}
+{{- define "coder.sharedWork" -}}
+{{- if has (include "coder.placement" .) (list "affinity" "shared") -}}true{{- end -}}
+{{- end -}}
+
+{{/* Name of the claim behind /work when it is shared: the existing claim, or the one the chart creates. */}}
+{{- define "coder.workClaim" -}}
+{{- default (printf "%s-work" (include "coder.fullname" .) | trunc 63 | trimSuffix "-") .Values.workspace.sharedVolume.existingClaim -}}
+{{- end -}}

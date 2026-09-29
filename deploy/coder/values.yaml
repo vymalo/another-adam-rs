@@ -33,11 +33,11 @@ front:
     limits:
       memory: 512Mi
 
-# The workers: the StatefulSet's replicas. Keep 1: runs move between workers at
-# every step, and the worktrees live on a ReadWriteOnce volume, so a second
-# worker without a shared /work would fork a run into a second pull request.
-# The chart refuses to render with more than 1 until it can set a workspace placement (the
-# binary has one: WORKSPACE_PLACEMENT and WORKER_ID, ADR 0002).
+# The workers: the StatefulSet's replicas. Runs move between workers at every step, and a
+# worktree lives in one worker's /work, so more than 1 needs a workspace.placement (below);
+# the chart refuses replicaCount > 1 while it is empty, or a run that lands on a worker
+# without its worktree would fork into a second pull request. With a pinning placement
+# (affinity, isolated) never scale the workers in: a run owned by a removed pod is stranded.
 replicaCount: 1
 
 # Environment of the binary (see crates/adam-coder/src/config.rs). Secrets are
@@ -85,8 +85,43 @@ config:
 service:
   port: 8080
 
+# Where a run's files live (ADR 0002). The chart sets WORKSPACE_PLACEMENT from this on the
+# roles that run workers, and, for the placements that pin runs, WORKER_ID from the pod name
+# (downward API; stable per StatefulSet pod).
+workspace:
+  # One of:
+  #   ""        (default) not set: no WORKSPACE_PLACEMENT, no WORKER_ID, and each pod has a
+  #             volume of its own from persistence (below). This is the single-worker render
+  #             this chart always had; the binary reads it as `shared`, which is the same
+  #             thing for one worker. replicaCount > 1 is refused until you choose one.
+  #   shared    one ReadWriteMany volume (sharedVolume below) mounted by every worker; any
+  #             worker may step any run. Safe across processes through the mirror lock, which
+  #             relies on flock(2) being honoured by the volume (unverified for NFS and
+  #             Longhorn RWX: test two workers against one repository first).
+  #   affinity  the same one ReadWriteMany volume, but a run is stepped only by the worker
+  #             that first claimed it, and each worker keeps its files in /work/<pod name>.
+  #   isolated  a volume per worker (persistence below, one PVC per pod), used as it is; a
+  #             run is stepped only by the worker that first claimed it. Losing a volume
+  #             loses the workspace of its runs.
+  # a2a-only is refused: every tool of the coder needs a workspace.
+  # Changing between the per-pod volume (empty, isolated) and the shared one (shared,
+  # affinity) changes the StatefulSet's volumeClaimTemplates, which Kubernetes does not let
+  # you edit: delete the StatefulSet with --cascade=orphan first, then upgrade.
+  placement: ""
+  # The volume behind shared and affinity (ignored by "" and isolated). Set storageClass to a
+  # class that supports ReadWriteMany, or existingClaim to use a claim you manage (then the
+  # chart creates none, and size, storageClass and accessModes are unused).
+  sharedVolume:
+    existingClaim: ""
+    storageClass: ""
+    size: 50Gi
+    accessModes:
+      - ReadWriteMany
+
 # Mirrors and worktrees. They persist across restarts: git is the durable
-# artifact, and a restarted run finds its worktree again.
+# artifact, and a restarted run finds its worktree again. This is the per-pod volume
+# (StatefulSet volumeClaimTemplates) used with workspace.placement "" and isolated; shared and
+# affinity use workspace.sharedVolume instead.
 persistence:
   size: 20Gi
   storageClass: longhorn

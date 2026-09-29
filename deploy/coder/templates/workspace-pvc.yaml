@@ -1,0 +1,20 @@
+{{- if and (include "coder.sharedWork" .) (not .Values.workspace.sharedVolume.existingClaim) }}
+# workspace.placement=shared or affinity: one ReadWriteMany claim mounted at /work by every
+# worker. Kept on `helm uninstall`, as the StatefulSet's own claims are: it holds the mirrors,
+# the worktrees and the run notes.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "coder.workClaim" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.workspace.sharedVolume.accessModes | nindent 4 }}
+  storageClassName: {{ .Values.workspace.sharedVolume.storageClass | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.workspace.sharedVolume.size | quote }}
+{{- end }}

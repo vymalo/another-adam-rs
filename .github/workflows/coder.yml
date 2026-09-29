@@ -82,20 +82,31 @@ jobs:
           tar -xzf "$RUNNER_TEMP/kubeconform.tgz" -C "$RUNNER_TEMP" kubeconform
           # The default render (role all), the control plane's, which drops the model, GitHub
           # and workspace settings and the two secrets they need, and topology=split (a front
-          # Deployment, a PodDisruptionBudget and the worker StatefulSet).
+          # Deployment, a PodDisruptionBudget and the worker StatefulSet), and the three
+          # workspace placements at three workers (isolated: a claim per pod; affinity and
+          # shared: one ReadWriteMany PersistentVolumeClaim).
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             > "$RUNNER_TEMP/rendered.yaml"
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set config.role=control-plane > "$RUNNER_TEMP/rendered-control-plane.yaml"
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set topology=split --set front.replicas=2 > "$RUNNER_TEMP/rendered-split.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set workspace.placement=isolated --set replicaCount=3 > "$RUNNER_TEMP/rendered-isolated.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set workspace.placement=affinity --set workspace.sharedVolume.storageClass=longhorn \
+            --set replicaCount=3 > "$RUNNER_TEMP/rendered-affinity.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set workspace.placement=shared --set workspace.sharedVolume.storageClass=longhorn \
+            --set topology=split --set replicaCount=3 > "$RUNNER_TEMP/rendered-shared-split.yaml"
           for attempt in 1 2 3; do
             status=0
             "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
                 -schema-location default \
                 -schema-location 'deploy/coder/tests/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
                 "$RUNNER_TEMP/rendered.yaml" "$RUNNER_TEMP/rendered-control-plane.yaml" \
-                "$RUNNER_TEMP/rendered-split.yaml" \
+                "$RUNNER_TEMP/rendered-split.yaml" "$RUNNER_TEMP/rendered-isolated.yaml" \
+                "$RUNNER_TEMP/rendered-affinity.yaml" "$RUNNER_TEMP/rendered-shared-split.yaml" \
                 > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
             cat "$RUNNER_TEMP/kubeconform.out"
             if [ "$status" -eq 0 ]; then exit 0; fi

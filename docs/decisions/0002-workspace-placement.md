@@ -4,6 +4,11 @@ Status: **Accepted** (2026-09-29). Closes the open question of
 [ADR 0001](0001-library-first-host-roles.md), decision 10. Adoption of the runs of a lost worker is
 not part of this decision (see *Consequences*).
 
+*Status note 2026-09-29: the `coder` Helm chart (0.2.0) sets the placement. `workspace.placement`
+(`shared`, `affinity`, `isolated`; `a2a-only` is refused) is passed as `WORKSPACE_PLACEMENT`, and
+`WORKER_ID` is the pod name for the pinning placements. `replicaCount` above 1 is allowed once a
+placement is set. The decision itself is unchanged.*
+
 ## Context
 
 The owner's words, 2026-09-29: "A worker can do the work, it can own a folder, it can have an

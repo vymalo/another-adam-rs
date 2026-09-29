@@ -193,11 +193,135 @@ check "split with config.role=worker fails to render" \
   fails helm template coder "$chart" --namespace coder-ns --set topology=split --set config.role=worker
 check "split with config.role=control-plane fails to render" \
   fails helm template coder "$chart" --namespace coder-ns --set topology=split --set config.role=control-plane
-check "split with replicaCount=2 fails to render" \
+check "split with replicaCount=2 fails to render without a workspace.placement" \
   fails helm template coder "$chart" --namespace coder-ns --set topology=split --set replicaCount=2
-check "combined with replicaCount=2 fails to render" \
+check "combined with replicaCount=2 fails to render without a workspace.placement" \
   fails helm template coder "$chart" --namespace coder-ns --set replicaCount=2
 check "split needs the worker secrets" \
   fails helm template coder "$chart" --namespace coder-ns --set topology=split --set externalSecrets.properties.githubToken=null
+
+# workspace.placement: where /work lives and whether runs are pinned to a worker (ADR 0002).
+placement_env='name: (WORKSPACE_PLACEMENT|WORKER_ID)$'
+rwx_class=longhorn-rwx
+says() { printf '%s\n' "$1" | grep -q -- "$2"; } # says <output> <pattern>
+
+helm template coder "$chart" --namespace coder-ns > "$out"
+check "default: no placement env (the golden is the per-pod volume)" lacks "$placement_env"
+check "default: a volumeClaimTemplates volume" count '^  volumeClaimTemplates:$' 1
+check "default: no PersistentVolumeClaim object" lacks '^kind: PersistentVolumeClaim$'
+check "default: no pod-level volumes" lacks '^      volumes:$'
+
+for p in isolated affinity shared; do
+  for n in 1 3; do
+    helm template coder "$chart" --namespace coder-ns --set workspace.placement=$p \
+      --set workspace.sharedVolume.storageClass=$rwx_class --set replicaCount=$n > "$out"
+    check "$p x$n: renders the replicas" has "^  replicas: $n$"
+    check "$p x$n: WORKSPACE_PLACEMENT=$p" dhas StatefulSet "^              value: \"$p\"$"
+    check "$p x$n: exactly one WORKSPACE_PLACEMENT" dcount StatefulSet 'name: WORKSPACE_PLACEMENT$' 1
+    check "$p x$n: /work is still the workspace root and mount" dhas StatefulSet 'mountPath: /work'
+    check "$p x$n: the workspace and check settings are unchanged" dcount StatefulSet "$workspace_and_checks" 9
+    check "$p x$n: still never exposed" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$|type: (LoadBalancer|NodePort)'
+  done
+done
+
+# WORKER_ID: the pod name (downward API), only where runs are pinned.
+for p in isolated affinity; do
+  helm template coder "$chart" --namespace coder-ns --set workspace.placement=$p \
+    --set workspace.sharedVolume.storageClass=$rwx_class --set replicaCount=3 > "$out"
+  check "$p: WORKER_ID is set" dhas StatefulSet '^            - name: WORKER_ID$'
+  check "$p: WORKER_ID reads metadata.name (the stable pod name)" dhas StatefulSet 'fieldPath: metadata.name'
+  check "$p: exactly one WORKER_ID" dcount StatefulSet 'name: WORKER_ID$' 1
+done
+helm template coder "$chart" --namespace coder-ns --set workspace.placement=shared \
+  --set workspace.sharedVolume.storageClass=$rwx_class --set replicaCount=3 > "$out"
+check "shared: no WORKER_ID (runs are not pinned)" dlacks StatefulSet 'name: WORKER_ID$'
+
+# Volumes: isolated is a claim per pod; affinity and shared are one ReadWriteMany claim.
+helm template coder "$chart" --namespace coder-ns --set workspace.placement=isolated --set replicaCount=3 > "$out"
+check "isolated: per-pod volumeClaimTemplates on the persistence class" dhas StatefulSet 'storageClassName: "longhorn"'
+check "isolated: one claim template, ReadWriteOnce" dcount StatefulSet '^          - ReadWriteOnce$' 1
+check "isolated: no shared claim object" lacks '^kind: PersistentVolumeClaim$'
+check "isolated: no pod-level volumes" dlacks StatefulSet '^      volumes:$'
+
+for p in affinity shared; do
+  helm template coder "$chart" --namespace coder-ns --set workspace.placement=$p \
+    --set workspace.sharedVolume.storageClass=$rwx_class --set replicaCount=3 > "$out"
+  check "$p: exactly one PersistentVolumeClaim" count '^kind: PersistentVolumeClaim$' 1
+  check "$p: the claim is ReadWriteMany" dhas PersistentVolumeClaim '^    - ReadWriteMany$'
+  check "$p: the claim uses workspace.sharedVolume.storageClass" dhas PersistentVolumeClaim "storageClassName: \"$rwx_class\""
+  check "$p: the claim is named <release>-work" dhas PersistentVolumeClaim '^  name: coder-work$'
+  check "$p: the claim is kept on helm uninstall" dhas PersistentVolumeClaim 'helm.sh/resource-policy: keep'
+  check "$p: the StatefulSet mounts that claim as work" dhas StatefulSet '^            claimName: coder-work$'
+  check "$p: no per-pod volumeClaimTemplates" dlacks StatefulSet 'volumeClaimTemplates:'
+  check "$p: the default shared claim size is 50Gi" dhas PersistentVolumeClaim 'storage: "50Gi"'
+done
+
+# An existing claim is used as it is: the chart creates none.
+for p in affinity shared; do
+  helm template coder "$chart" --namespace coder-ns --set workspace.placement=$p \
+    --set workspace.sharedVolume.existingClaim=my-rwx --set replicaCount=2 > "$out"
+  check "$p: existingClaim creates no PersistentVolumeClaim" lacks '^kind: PersistentVolumeClaim$'
+  check "$p: existingClaim is the claim mounted" dhas StatefulSet '^            claimName: my-rwx$'
+done
+helm template coder "$chart" --namespace coder-ns --set workspace.placement=shared \
+  --set workspace.sharedVolume.storageClass=$rwx_class --set workspace.sharedVolume.size=200Gi \
+  --set 'workspace.sharedVolume.accessModes={ReadWriteMany,ReadWriteOnce}' > "$out"
+check "shared: the claim size is values-driven" dhas PersistentVolumeClaim 'storage: "200Gi"'
+check "shared: the access modes are values-driven" dcount PersistentVolumeClaim '^    - (ReadWriteMany|ReadWriteOnce)$' 2
+check "isolated ignores workspace.sharedVolume (nothing to set)" \
+  helm template coder "$chart" --namespace coder-ns --set workspace.placement=isolated --set replicaCount=2
+
+# The placement is trimmed and case-folded, as the binary parses it.
+helm template coder "$chart" --namespace coder-ns --set-string 'workspace.placement= Isolated ' > "$out"
+check "a padded, mixed-case placement is normalised" dhas StatefulSet '^              value: "isolated"$'
+
+# A combined pod that runs no workers reads neither variable, and needs no placement to scale.
+helm template coder "$chart" --namespace coder-ns --set config.role=control-plane \
+  --set workspace.placement=isolated --set replicaCount=3 \
+  --set externalSecrets.properties.modelApiKey=null --set externalSecrets.properties.githubToken=null > "$out"
+check "a control plane gets no placement env" lacks "$placement_env"
+check "a control plane with replicaCount=3 needs no placement" \
+  helm template coder "$chart" --namespace coder-ns --set config.role=control-plane --set replicaCount=3 \
+    --set externalSecrets.properties.modelApiKey=null --set externalSecrets.properties.githubToken=null
+
+# topology=split: the placement goes to the worker StatefulSet only; the front has no volume or env.
+for p in isolated affinity shared; do
+  helm template coder "$chart" --namespace coder-ns --set topology=split --set front.replicas=2 \
+    --set workspace.placement=$p --set workspace.sharedVolume.storageClass=$rwx_class --set replicaCount=3 > "$out"
+  check "split + $p: the worker has the placement" dhas StatefulSet "^              value: \"$p\"$"
+  check "split + $p: the worker runs 3 replicas" dhas StatefulSet '^  replicas: 3$'
+  check "split + $p: the worker is still ROLE=worker" dhas StatefulSet 'value: "worker"'
+  check "split + $p: the front has no placement env, volume or claim" dlacks Deployment "$placement_env|volumes:|claimName|volumeMounts:"
+  check "split + $p: the front is still a control plane" dhas Deployment 'value: "control-plane"'
+done
+helm template coder "$chart" --namespace coder-ns --set topology=split \
+  --set workspace.placement=isolated --set replicaCount=3 > "$out"
+check "split + isolated: the StatefulSet identity equals the combined one (the PVCs are reused)" \
+  [ "$(sts_identity "$out")" = "$(sts_identity "$golden")" ]
+
+# Guards.
+message=$(helm template coder "$chart" --namespace coder-ns --set replicaCount=3 2>&1 || true)
+check "replicaCount=3 with an empty placement fails" fails helm template coder "$chart" --namespace coder-ns --set replicaCount=3
+check "the replicaCount error names workspace.placement" says "$message" 'needs workspace.placement'
+check "split with replicaCount=3 and an empty placement fails" \
+  fails helm template coder "$chart" --namespace coder-ns --set topology=split --set replicaCount=3
+message=$(helm template coder "$chart" --namespace coder-ns --set workspace.placement=bogus 2>&1 || true)
+check "an unknown placement fails" fails helm template coder "$chart" --namespace coder-ns --set workspace.placement=bogus
+check "the unknown-placement error lists the accepted values and the value" \
+  says "$message" 'must be one of shared, affinity or isolated.*"bogus"'
+message=$(helm template coder "$chart" --namespace coder-ns --set workspace.placement=a2a-only 2>&1 || true)
+check "a2a-only fails for the coder" fails helm template coder "$chart" --namespace coder-ns --set workspace.placement=a2a-only
+check "the a2a-only error says the coder refuses it" says "$message" 'a2a-only is refused for the coder'
+check "a2a-only fails even with one replica and a shared class" \
+  fails helm template coder "$chart" --namespace coder-ns --set workspace.placement=a2a-only \
+    --set workspace.sharedVolume.storageClass=$rwx_class
+for p in affinity shared; do
+  message=$(helm template coder "$chart" --namespace coder-ns --set workspace.placement=$p 2>&1 || true)
+  check "$p without a storage class or an existing claim fails" \
+    fails helm template coder "$chart" --namespace coder-ns --set workspace.placement=$p
+  check "$p: the error names workspace.sharedVolume" says "$message" 'workspace.sharedVolume.storageClass'
+done
+check "an empty placement string is the unset default" \
+  helm template coder "$chart" --namespace coder-ns --set workspace.placement=
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi
