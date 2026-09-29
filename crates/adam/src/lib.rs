@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
+pub use adam_agent_fs as agent_fs;
 pub use adam_core as core;
 pub use adam_error as error;
 pub use adam_llm_agent::*;
@@ -14,6 +15,20 @@ pub use adam_llm_agent::__private;
 /// `#[tool]`: an `async fn` becomes a [`Tool`]. See the [crate docs](crate).
 #[cfg(feature = "macros")]
 pub use adam_macros::tool;
+
+/// Include the agent that `build.rs` embedded: `adam::include_agent!();` at module level.
+///
+/// `build.rs` calls `adam_agent_fs::build("agent").emit()`, which writes `OUT_DIR/adam_agent.rs`;
+/// this macro includes it. The module then has `AGENTS` (a slice of
+/// [`EmbeddedAgent`](agent_fs::EmbeddedAgent)), `AGENT` (the agent of an `agent/` package) and
+/// `PACKAGE` (an [`EmbeddedPackage`](agent_fs::EmbeddedPackage), which is a
+/// [`ManifestSource`](agent_fs::ManifestSource)). See the [crate docs](crate).
+#[macro_export]
+macro_rules! include_agent {
+    () => {
+        ::core::include!(::core::concat!(::core::env!("OUT_DIR"), "/adam_agent.rs"));
+    };
+}
 
 /// What an agent's source file usually wants: `use adam::prelude::*;`.
 pub mod prelude {
