@@ -172,9 +172,10 @@ No Cargo features, no environment variables at runtime.
 
 `tests/runtime.rs` is one behavioural suite (including
 `a_starter_only_runtime_starts_and_a_full_runtime_steps`, the pair
-`pinned_workers_step_a_run_only_on_its_owner` (three workers, twelve six-step runs: each run steps
-on one worker only, and the work is shared) and its control
-`any_workers_let_a_run_move_between_workers`, and the two
+`pinned_workers_step_a_run_only_on_its_owner` (three workers, each first seeded alone with one
+unfinished run so all three own something, then twelve six-step runs stepped together: each run
+steps on one worker only) and its control
+`any_workers_let_a_run_move_between_workers` (a run seeded by one worker is finished by another), and the two
 `notifier_*` cases: two runtimes over one store and one `LocalNotifier`, a 30 s poll, a 5 s deadline) run against `MemoryStore` always,
 against PostgreSQL and against MongoDB when their variables are set. Unit
 tests sit in `src/cancel.rs`, `ctx.rs`, `events.rs`, `notify.rs` and `retry.rs`, and the
