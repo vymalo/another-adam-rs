@@ -13,19 +13,17 @@
 # Verified 2026-09-29: HEAD on registry-1.docker.io/v2/library/rust/manifests/1.94-trixie
 # (OCI index accept header) returned this docker-content-digest; the tag
 # 1.94.1-trixie has the same digest. The workspace's rust-version is 1.94.
-ARG RUST_IMAGE=rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c
+# Written inline in FROM (not through an ARG) so hadolint can see the tag.
 
 # Tag of the runtime base image, of the form <rust toolchain>-<sha7>: immutable,
 # published by vymalo/another-agentic-images (merged in #7 as bc97d51). Deployments
 # pin an immutable tag, never `latest`. Bump it when that image changes (the tag
 # of its newest build on main), together with anything here that depends on it.
-# Not yet checked for anonymous pull: the registry token request returned no
-# token when this was written (2026-09-29), i.e. the package was not visible
-# anonymously yet; check it before the first deployment, as that repo's
-# CLAUDE.md describes.
+# Anonymous pull verified 2026-09-29: the manifest request for this tag with an
+# anonymous ghcr.io token returned 200.
 ARG WORKSPACE_TAG=1.98.1-bc97d51
 
-FROM ${RUST_IMAGE} AS build
+FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS build
 WORKDIR /src
 # The workspace is `crates/*`, so every member's manifest is needed to resolve
 # the lockfile even though only adam-coder is built. Only a C compiler is needed
