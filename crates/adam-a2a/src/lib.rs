@@ -1,8 +1,8 @@
 //! Expose an adam-rs agent as an [A2A](https://a2a-protocol.org) server.
 //!
 //! The crate defines its own backend seam, [`TaskBackend`], so it is
-//! independent of the agent runtime; the durable runtime implements it in a
-//! later wave. [`A2aServer::router`] turns a backend into an [`axum::Router`]
+//! independent of the agent runtime; `adam-a2a-runtime` implements it over the
+//! durable runtime. [`A2aServer::router`] turns a backend into an [`axum::Router`]
 //! that the orchestrator (or any A2A client) can talk to with no adam-specific
 //! code.
 //!

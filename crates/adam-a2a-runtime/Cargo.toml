@@ -1,6 +1,7 @@
 [package]
 name = "adam-a2a-runtime"
 description = "A2A TaskBackend over the adam-rs durable runtime: tasks are runs, subscriptions are replayable from the store"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,0 +1,66 @@
+# adam-store-mongodb
+
+`adam_core::Store` on MongoDB 5.0+ through the official driver.
+
+## Where it sits
+
+An **adapter** of the store port in [`adam-core`](../adam-core/README.md),
+checked by [`adam-store-testkit`](../adam-store-testkit/README.md). It is the
+alternative to [`adam-store-postgres`](../adam-store-postgres/README.md); a
+binary picks one at composition time.
+
+## API at a glance
+
+* `MongoStore::connect(uri, db)`: connect and use database `db`.
+* `MongoStore::new(database)`: reuse your application's `Database` handle.
+* `MongoStore::with_collection_prefix(prefix)`: collection-name prefix
+  (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
+* `MongoStore::database()`, `SCHEMA_VERSION`.
+* `codec::{json_to_bson, bson_to_json, encode_key, decode_key}`: the reversible key escaping
+  (`$ref`, dotted, empty keys, NUL) applied to run state. Ordinary keys are
+  stored verbatim, so `state.messages.0.role` is still a valid query path.
+* The `Store` implementation: call `migrate()` once at boot.
+
+```rust
+use std::sync::Arc;
+use adam_core::{DynStore, Store};
+
+let store = adam_store_mongodb::MongoStore::connect(&uri, "myapp").await?;
+store.migrate().await?;
+let store: DynStore = Arc::new(store);
+```
+
+Every operation is a single-document atomic write, so a standalone `mongod`
+is enough (no multi-document transactions). Integers above `i64::MAX` are
+rejected with `StoreError::InvalidData`. Time is truncated to milliseconds.
+The guarantee table is in the [root README](../../README.md#how-each-adapter-guarantees-the-contract).
+
+*Unverified:* the "MongoDB 5.0+" floor is the oldest server CI runs against
+(`conformance` job), not a documented driver guarantee. The `mongodb` driver
+requirement is `3.9` (verified 2026-09-29, `Cargo.toml`).
+
+## Features
+
+None.
+
+## Tests
+
+`tests/conformance.rs` runs the shared suite; `src/codec.rs` has property
+tests of the key escaping.
+
+| Variable | Meaning |
+|---|---|
+| `ADAM_TEST_MONGODB_URI` | server to test against; unset means the suite is skipped |
+| `ADAM_TEST_MONGODB_DB` | database name (default `adam_test`) |
+| `ADAM_TEST_REQUIRE_DB` | `1`: an unset URI fails instead of skipping (CI sets it) |
+
+```sh
+docker compose up -d   # from the repository root
+ADAM_TEST_MONGODB_URI=mongodb://localhost:27017 cargo test -p adam-store-mongodb
+```
+
+CI runs it against MongoDB 5.0 and 8.0.
+
+## See also
+
+[`adam-store-postgres`](../adam-store-postgres/README.md), the other adapter.

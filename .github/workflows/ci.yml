@@ -34,6 +34,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # Every crate documents itself: update its README in the same change as
+      # any change to its public API, environment variables or tests.
+      - name: Every crate has a README
+        run: |
+          missing=0
+          for manifest in crates/*/Cargo.toml; do
+            dir=$(dirname "$manifest")
+            if [ ! -f "$dir/README.md" ]; then
+              echo "::error file=$manifest::$dir has no README.md"
+              missing=1
+            fi
+          done
+          exit "$missing"
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
