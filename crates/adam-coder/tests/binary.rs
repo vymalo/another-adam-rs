@@ -1,4 +1,4 @@
-//! The `adam-coder` binary as a process: configuration errors, an unreachable
+//! The `adam-coder` binary as a process: configuration errors, the roles, an unreachable
 //! Postgres, serving and SIGTERM. Offline, except that the cases which need a
 //! database use `ADAM_TEST_POSTGRES_URL` (and skip without it).
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
@@ -6,12 +6,12 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse};
+use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse, TaskState};
 use adam_core::{RunId, RunStatus};
 use common::pg::TestDb;
 use common::{text_reply, tool_reply};
@@ -53,6 +53,17 @@ fn valid_env(database_url: &str, workspace: &Path) -> Vec<(String, String)> {
         env("LISTEN_ADDR", "127.0.0.1:0".to_owned()),
         env("WORKSPACE_ROOT", workspace.to_string_lossy().into_owned()),
     ]
+}
+
+/// `valid_env` for `role`: without the front's variables when the role serves no A2A, so a test
+/// proves that the process starts without them.
+fn role_env(role: &str, database_url: &str, workspace: &Path) -> Vec<(String, String)> {
+    let mut env = valid_env(database_url, workspace);
+    env.push(("ROLE".to_owned(), role.to_owned()));
+    if role == "worker" {
+        env.retain(|(k, _)| k != "A2A_BEARER_TOKENS" && k != "PUBLIC_URL");
+    }
+    env
 }
 
 impl Proc {
@@ -257,6 +268,65 @@ async fn missing_and_bad_variables_are_reported_together_and_exit_78() {
     assert!(!err.contains(GITHUB_TOKEN), "{err}");
 }
 
+/// `ROLE` is one of `all`, `control-plane` and `worker`. Anything else is a configuration
+/// error (exit 78) that names the variable and the accepted values, and nothing is started.
+#[tokio::test]
+async fn an_unknown_role_is_a_configuration_error_naming_the_accepted_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut env = valid_env("postgres://u:p@127.0.0.1:1/x", tmp.path());
+    env.push(("ROLE".into(), "boss".into()));
+    let mut p = Proc::spawn(&env);
+    let status = p.exit_within(Duration::from_secs(30)).await;
+    assert_eq!(status.code(), Some(78), "{}", p.logs());
+    let fields = failure(&p);
+    assert_eq!(fields["code"], 78);
+    let err = fields["error"].as_str().unwrap().to_owned();
+    assert!(err.contains("ROLE"), "{err}");
+    assert!(err.contains("\"boss\""), "{err}");
+    for accepted in ["all", "control-plane", "worker"] {
+        assert!(err.contains(accepted), "{accepted} missing from:\n{err}");
+    }
+    assert!(
+        !err.contains("connecting to Postgres"),
+        "a bad role must stop before anything connects:\n{err}"
+    );
+}
+
+/// What each role requires. A control plane still needs the model and GitHub variables, because
+/// `Runtime::start` needs the complete agent (see `adam_coder::config`), so a missing one is a
+/// configuration error for it too. A missing front variable is one only for the roles that serve
+/// A2A. (That a worker *starts* without them is `a_worker_serves_only_healthz_...`.)
+#[tokio::test]
+async fn each_role_reports_the_variables_it_is_missing_and_exits_78() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (role, remove, reported) in [
+        ("control-plane", "GITHUB_TOKEN", "GITHUB_TOKEN"),
+        ("control-plane", "MODEL", "MODEL"),
+        ("control-plane", "A2A_BEARER_TOKENS", "A2A_BEARER_TOKENS"),
+        ("control-plane", "PUBLIC_URL", "PUBLIC_URL"),
+        ("all", "A2A_BEARER_TOKENS", "A2A_BEARER_TOKENS"),
+        ("worker", "GITHUB_TOKEN", "GITHUB_TOKEN"),
+        ("worker", "MODEL_API_KEY", "MODEL_API_KEY"),
+    ] {
+        let mut env = role_env(role, "postgres://u:p@127.0.0.1:1/x", tmp.path());
+        env.retain(|(k, _)| k != remove);
+        let mut p = Proc::spawn(&env);
+        let status = p.exit_within(Duration::from_secs(30)).await;
+        assert_eq!(
+            status.code(),
+            Some(78),
+            "{role} without {remove}\n{}",
+            p.logs()
+        );
+        let err = failure(&p)["error"].as_str().unwrap().to_owned();
+        assert!(
+            err.contains(reported),
+            "{role}: {reported} missing from:\n{err}"
+        );
+        assert!(!err.contains("connecting to Postgres"), "{role}: {err}");
+    }
+}
+
 /// Postgres unreachable at boot: a clear error, exit code 69 (`EX_UNAVAILABLE`, so
 /// a supervisor retries later), no panic, no password in the output, and no
 /// waiting around.
@@ -336,6 +406,75 @@ async fn serves_card_and_healthz_then_stops_cleanly_on_sigterm() {
     db.finish().await;
 }
 
+/// A worker serves no A2A: its listener answers `/healthz` (so probes work) and nothing else, it
+/// starts without `A2A_BEARER_TOKENS` and `PUBLIC_URL`, it creates its workspace root, and it
+/// stops on SIGTERM with exit code 0.
+#[tokio::test]
+async fn a_worker_serves_only_healthz_needs_no_front_variables_and_stops_on_sigterm() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("work");
+    let mut p = Proc::spawn(&role_env("worker", &db.url(), &workspace));
+    let addr = p.ready().await;
+
+    for (method, path) in [
+        ("GET", "/.well-known/agent-card.json"),
+        ("POST", "/"),
+        ("GET", "/"),
+    ] {
+        let (status, body) = common::raw(addr, method, path, None).await;
+        assert_eq!(status, 404, "a worker has no A2A: {method} {path}: {body}");
+    }
+    assert!(workspace.is_dir(), "a worker creates its workspace root");
+    let out = p.stdout();
+    assert!(
+        out.contains("\"role\":\"worker\"") || out.contains("role=worker"),
+        "the role is logged:\n{out}"
+    );
+
+    p.sigterm().await;
+    let status = p.exit_within(Duration::from_secs(15)).await;
+    assert_eq!(status.code(), Some(0), "{}", p.logs());
+    let out = p.stdout();
+    assert!(
+        out.contains("shutdown requested") && out.contains("stopped"),
+        "{out}"
+    );
+    assert!(!p.stderr().contains("panicked"), "{}", p.logs());
+    db.finish().await;
+}
+
+/// A control plane serves A2A (card, `/healthz`, 401 without a token) and never touches the
+/// workspace root: it is not created, because no run is stepped here.
+#[tokio::test]
+async fn a_control_plane_serves_a2a_and_does_not_create_the_workspace_root() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("never-created");
+    let mut p = Proc::spawn(&role_env("control-plane", &db.url(), &workspace));
+    let addr = p.ready().await;
+
+    let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
+    assert_eq!(status, 200, "{card}");
+    assert!(card.contains(PUBLIC_URL), "{card}");
+    let (status, _) = common::raw(addr, "POST", "/", None).await;
+    assert_eq!(status, 401, "an unauthenticated call is refused");
+    assert!(
+        !workspace.exists(),
+        "a control plane must not create the workspace root"
+    );
+
+    p.sigterm().await;
+    let status = p.exit_within(Duration::from_secs(15)).await;
+    assert_eq!(status.code(), Some(0), "{}", p.logs());
+    assert!(!workspace.exists(), "still not created after the stop");
+    db.finish().await;
+}
+
 /// Answers `POST /chat/completions` by *turn*: the reply is the one after as
 /// many tool results as the conversation already holds. A model that is asked
 /// the same question twice (a retried request, a replayed step) gets the same
@@ -366,25 +505,10 @@ fn turns(asked: &Mutex<Vec<usize>>) -> usize {
     asked.lock().unwrap().iter().max().map_or(0, |t| t + 1)
 }
 
-/// SIGTERM while OpenCode is working: the process does not abandon the step. It
-/// waits for OpenCode, commits the step (the run is not lost, not failed and
-/// not repeated), and exits 0. A second process over the same database and
-/// workspace finishes the run: one commit, one push, one pull request.
-///
-/// Also the wiring test of the whole binary: the model is a wiremock
-/// `/chat/completions`, GitHub is a wiremock reached through `GITHUB_API_URL`,
-/// and the repository is `https://github.com/octo/widgets` under the
-/// **production** policy (`ALLOW_LOCAL_REPOS` unset): git's `insteadOf`
-/// (in a private `$HOME`) points that URL at a local bare repository.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sigterm_mid_run_commits_the_in_flight_step() {
-    let Some(db) = TestDb::create().await else {
-        return;
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
-
-    // The remote, and the private git config that makes github.com point at it.
+/// A bare `remote.git` seeded with `main`, and a private `$HOME` whose git config points
+/// `https://github.com/octo/widgets.git` at it (so the production repository policy applies while
+/// the bytes stay local). Returns `(remote, home)`.
+fn seed_remote(dir: &Path) -> (PathBuf, PathBuf) {
     let remote = dir.join("remote.git");
     let seed = dir.join("seed");
     std::fs::create_dir_all(&remote).unwrap();
@@ -413,24 +537,12 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
         ),
     )
     .unwrap();
+    (remote, home)
+}
 
-    // OpenCode: a script that reports it started and waits for `go`.
-    let (started, go, launches) = (
-        dir.join("started"),
-        dir.join("go"),
-        dir.join("launches.log"),
-    );
-    let script = dir.join("opencode.sh");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\necho launched >> \"$LAUNCHES\"\n: > \"$STARTED\"\ni=0\n\
-         while [ ! -e \"$GO\" ]; do i=$((i+1)); [ $i -gt 1200 ] && exit 9; sleep 0.05; done\n\
-         exec \"$AGENT\"\n",
-    )
-    .unwrap();
-
-    // The model: prepare, delegate, checks, commit and push, PR, done.
-    let model = MockServer::start().await;
+/// Mount the happy-path model on `model`: prepare, delegate, checks, commit and push, pull
+/// request, done. Returns the turn of every request, in arrival order.
+async fn mount_happy_model(model: &MockServer) -> Arc<Mutex<Vec<usize>>> {
     let asked = Arc::new(Mutex::new(Vec::new()));
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -461,8 +573,50 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
             ],
             asked: asked.clone(),
         })
-        .mount(&model)
+        .mount(model)
         .await;
+    asked
+}
+
+/// SIGTERM while OpenCode is working: the process does not abandon the step. It
+/// waits for OpenCode, commits the step (the run is not lost, not failed and
+/// not repeated), and exits 0. A second process over the same database and
+/// workspace finishes the run: one commit, one push, one pull request.
+///
+/// Also the wiring test of the whole binary: the model is a wiremock
+/// `/chat/completions`, GitHub is a wiremock reached through `GITHUB_API_URL`,
+/// and the repository is `https://github.com/octo/widgets` under the
+/// **production** policy (`ALLOW_LOCAL_REPOS` unset): git's `insteadOf`
+/// (in a private `$HOME`) points that URL at a local bare repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sigterm_mid_run_commits_the_in_flight_step() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // The remote, and the private git config that makes github.com point at it.
+    let (remote, home) = seed_remote(dir);
+
+    // OpenCode: a script that reports it started and waits for `go`.
+    let (started, go, launches) = (
+        dir.join("started"),
+        dir.join("go"),
+        dir.join("launches.log"),
+    );
+    let script = dir.join("opencode.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho launched >> \"$LAUNCHES\"\n: > \"$STARTED\"\ni=0\n\
+         while [ ! -e \"$GO\" ]; do i=$((i+1)); [ $i -gt 1200 ] && exit 9; sleep 0.05; done\n\
+         exec \"$AGENT\"\n",
+    )
+    .unwrap();
+
+    // The model: prepare, delegate, checks, commit and push, PR, done.
+    let model = MockServer::start().await;
+    let asked = mount_happy_model(&model).await;
     let github = common::mock_github().await;
 
     let workspace = dir.join("work");
@@ -674,6 +828,199 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
     assert!(
         !all_logs.contains(GITHUB_TOKEN),
         "the token is never logged"
+    );
+    db.finish().await;
+}
+
+/// The two halves as two processes over one database: a control plane (A2A, no `run_worker`) and
+/// a worker (`run_worker`, `/healthz` only). The task is sent to the control plane **before** the
+/// worker exists and waits, unclaimed. Then the worker starts, steps the run to a pull request,
+/// and the control plane's stream reports it.
+///
+/// The control plane learns what the worker did by polling the run in the store: the live event
+/// sink is in-process, so nothing is pushed across the two processes. That is expected (ADR 0001,
+/// "Consequences"); the stream still carries every state and artifact, a poll interval late.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (remote, home) = seed_remote(dir);
+    let model = MockServer::start().await;
+    let asked = mount_happy_model(&model).await;
+    let github = common::mock_github().await;
+
+    let front_workspace = dir.join("front-work");
+    let worker_workspace = dir.join("worker-work");
+    let with_backends = |mut env: Vec<(String, String)>| {
+        env.extend([
+            ("MODEL_BASE_URL".to_owned(), model.uri()),
+            ("GITHUB_API_URL".to_owned(), github.uri()),
+            ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+            (
+                "OPENCODE_COMMAND".to_owned(),
+                common::fake_agent().to_string_lossy().into_owned(),
+            ),
+            ("FAKE_ACP_SCENARIO".to_owned(), "write-file".to_owned()),
+            ("FAKE_ACP_WRITE_PATH".to_owned(), "hello.txt".to_owned()),
+            ("FAKE_ACP_WRITE_CONTENT".to_owned(), "hello\n".to_owned()),
+        ]);
+        env
+    };
+
+    // The control plane alone takes the task.
+    let mut front = Proc::spawn(&with_backends(role_env(
+        "control-plane",
+        &db.url(),
+        &front_workspace,
+    )));
+    let front_addr = front.ready().await;
+    let client = common::a2a_client(front_addr, A2A_TOKEN).await;
+    let mut stream = client
+        .send_streaming_message(&SendMessageRequest {
+            message: Message::new(
+                Role::User,
+                vec![Part::text(
+                    "In https://github.com/octo/widgets (base main) add hello.txt containing hello",
+                )],
+            ),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    let Some(Ok(StreamResponse::Task(task))) = stream.next().await else {
+        panic!("the first event is the task\n{}", front.logs());
+    };
+    let run = RunId(task.id.parse().expect("task id is a run id"));
+
+    // Nobody steps it: the control plane runs no worker.
+    let store = db.store();
+    let waiting = store.load_run(run).await.unwrap().expect("the run exists");
+    assert_eq!(waiting.status, RunStatus::Runnable);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let still = store.load_run(run).await.unwrap().unwrap();
+    assert_eq!(
+        (still.status, still.version),
+        (RunStatus::Runnable, waiting.version),
+        "a control plane must not step runs: {still:?}\n{}",
+        front.logs()
+    );
+    assert_eq!(turns(&asked), 0, "the model was not asked");
+
+    // A worker joins, on its own workspace, without the front's variables.
+    let mut worker = Proc::spawn(&with_backends(role_env(
+        "worker",
+        &db.url(),
+        &worker_workspace,
+    )));
+    let worker_addr = worker.ready().await;
+    let (status, _) = common::raw(worker_addr, "GET", "/healthz", None).await;
+    assert_eq!(status, 200);
+
+    // The control plane's stream reports what the worker did.
+    let mut labels: Vec<String> = Vec::new();
+    let mut artifacts: Vec<String> = Vec::new();
+    let mut last = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !last.as_ref().is_some_and(TaskState::is_terminal) {
+        let item = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(item))) => item,
+            Ok(other) => panic!(
+                "the stream ended before the task did: {other:?}, seen {labels:?}\n{}\n{}",
+                front.logs(),
+                worker.logs()
+            ),
+            Err(_) => panic!(
+                "the task did not finish, seen {labels:?}\n{}\n{}",
+                front.logs(),
+                worker.logs()
+            ),
+        };
+        match item {
+            StreamResponse::StatusUpdate(u) => {
+                labels.push(format!("status:{:?}", u.status.state));
+                last = Some(u.status.state);
+            }
+            StreamResponse::ArtifactUpdate(u) => {
+                let name = u.artifact.name.unwrap_or_default();
+                labels.push(format!("artifact:{name}"));
+                artifacts.push(name);
+            }
+            StreamResponse::Task(t) => last = Some(t.status.state),
+            StreamResponse::Message(_) => {}
+        }
+    }
+    assert_eq!(last, Some(TaskState::Completed), "{labels:?}");
+    for name in ["branch", "pull_request"] {
+        assert!(
+            artifacts.iter().any(|a| a == name),
+            "{name} missing from {labels:?}"
+        );
+    }
+    drop(stream);
+    drop(client);
+
+    // The durable result, and who did the work.
+    let done = store.load_run(run).await.unwrap().unwrap();
+    assert_eq!(done.status, RunStatus::Done, "{done:?}");
+    assert_eq!(turns(&asked), 6, "{:?}", asked.lock().unwrap());
+    assert!(
+        worker_workspace
+            .join("worktrees")
+            .join(run.to_string())
+            .join("hello.txt")
+            .is_file(),
+        "the worker's workspace holds the worktree"
+    );
+    assert!(
+        !front_workspace.exists(),
+        "the control plane never created a workspace root"
+    );
+    let branches: Vec<String> = common::git(
+        &remote,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/agent",
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    assert_eq!(
+        common::git(&remote, &["show", &format!("{}:hello.txt", branches[0])]),
+        "hello"
+    );
+    let pulls = github
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .count();
+    assert_eq!(pulls, 1, "exactly one pull request");
+
+    // Both stop cleanly on SIGTERM.
+    front.sigterm().await;
+    worker.sigterm().await;
+    for (name, proc) in [("control plane", &mut front), ("worker", &mut worker)] {
+        let status = proc.exit_within(Duration::from_secs(30)).await;
+        assert_eq!(status.code(), Some(0), "{name}\n{}", proc.logs());
+        assert!(proc.stdout().contains("shutdown requested"), "{name}");
+    }
+    let all_logs = format!("{}{}", front.logs(), worker.logs());
+    assert!(
+        !all_logs.contains(GITHUB_TOKEN),
+        "the token is never logged"
+    );
+    assert!(
+        !all_logs.contains(A2A_TOKEN),
+        "the bearer token is never logged"
     );
     db.finish().await;
 }

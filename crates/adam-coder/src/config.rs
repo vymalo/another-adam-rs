@@ -2,6 +2,7 @@
 //!
 //! | Variable | Meaning | Default |
 //! |---|---|---|
+//! | `ROLE` | what this process runs: `all`, `control-plane` or `worker` ([`adam_host::Role`]) | `all` |
 //! | `DATABASE_URL` | Postgres for the run store (`adam-store-postgres`) | required |
 //! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix | required |
 //! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required |
@@ -12,9 +13,9 @@
 //! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
 //! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
 //! | `WORKSPACE_ROOT` | mirrors and worktrees (persistent storage) | `/work` |
-//! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required, non-empty (fail closed) |
-//! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required |
-//! | `LISTEN_ADDR` | bind address | `0.0.0.0:8080` |
+//! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required for `all` and `control-plane`, non-empty (fail closed) |
+//! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required for `all` and `control-plane` |
+//! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
 //! | `CHECK_TIMEOUT_SECS` | time limit of one `run_checks` command | `900` |
@@ -22,6 +23,17 @@
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 //! | `PR_DRAFT` | open pull requests as drafts (`true`/`false`) | `false` |
 //! | `OPENCODE_COMMAND` | program that speaks ACP on stdio (arguments follow, whitespace-separated) | `opencode acp` |
+//!
+//! # Roles
+//!
+//! `ROLE` picks the halves this process runs. The variables of a half are required only by the
+//! roles that run it: `A2A_BEARER_TOKENS` and `PUBLIC_URL` by the roles that run the control
+//! plane (`all`, `control-plane`), and nothing else is role-specific. In particular the model and
+//! GitHub variables (`MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `GITHUB_TOKEN`) are required by
+//! **every** role: [`Runtime::start`](adam_runtime::Runtime::start) looks the agent up by name and
+//! calls its `init`, so the control plane registers the complete [`CoderAgent`](crate::CoderAgent)
+//! even though it never steps it. Agent starters, a later change, are meant to remove that
+//! requirement for `control-plane`.
 //!
 //! Every problem is reported at once, so a misconfigured deployment is fixed
 //! in one round trip. Secrets are wrapped in [`SecretString`] and never appear
@@ -32,6 +44,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use adam_error::{Classify, ErrorClass};
+use adam_host::Role;
 use secrecy::SecretString;
 use url::Url;
 
@@ -56,6 +69,8 @@ impl Classify for ConfigError {
 /// The binary's configuration.
 #[derive(Clone)]
 pub struct Config {
+    /// `ROLE`: which halves this process runs.
+    pub role: Role,
     /// `DATABASE_URL`.
     pub database_url: SecretString,
     /// `MODEL_BASE_URL`.
@@ -76,11 +91,11 @@ pub struct Config {
     pub github_api_url: Url,
     /// `WORKSPACE_ROOT`.
     pub workspace_root: PathBuf,
-    /// `A2A_BEARER_TOKENS`.
+    /// `A2A_BEARER_TOKENS`. Empty unless [`Role::runs_control_plane`].
     pub a2a_bearer_tokens: Vec<SecretString>,
-    /// `PUBLIC_URL`.
-    pub public_url: Url,
-    /// `LISTEN_ADDR`.
+    /// `PUBLIC_URL`. `Some` exactly when [`Role::runs_control_plane`].
+    pub public_url: Option<Url>,
+    /// `LISTEN_ADDR`: the A2A server, or the `/healthz` listener of a worker.
     pub listen_addr: SocketAddr,
     /// `WORKERS`.
     pub workers: usize,
@@ -103,6 +118,7 @@ pub struct Config {
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
+            .field("role", &self.role)
             .field("database_url", &"[REDACTED]")
             .field("model_base_url", &self.model_base_url)
             .field("model", &self.model)
@@ -112,7 +128,7 @@ impl std::fmt::Debug for Config {
             .field("github_api_url", &self.github_api_url.as_str())
             .field("workspace_root", &self.workspace_root)
             .field("a2a_bearer_tokens", &self.a2a_bearer_tokens.len())
-            .field("public_url", &self.public_url.as_str())
+            .field("public_url", &self.public_url.as_ref().map(Url::as_str))
             .field("listen_addr", &self.listen_addr)
             .field("workers", &self.workers)
             .field("max_check_cycles", &self.max_check_cycles)
@@ -143,6 +159,14 @@ impl Config {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let mut problems = Vec::new();
         let get = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
+        let role = match Role::from_optional(lookup("ROLE").as_deref()) {
+            Ok(role) => role,
+            Err(e) => {
+                problems.push(format!("ROLE is invalid: {e}"));
+                Role::default()
+            }
+        };
+
         let mut required = |name: &str| {
             let value = get(name);
             if value.is_none() {
@@ -155,8 +179,18 @@ impl Config {
         let model_base_url = required("MODEL_BASE_URL");
         let model = required("MODEL");
         let github_token = required("GITHUB_TOKEN");
-        let public_url_raw = required("PUBLIC_URL");
-        let tokens_raw = required("A2A_BEARER_TOKENS");
+        // The front's variables: only a role that serves A2A needs them.
+        let front = role.runs_control_plane();
+        let public_url_raw = if front {
+            required("PUBLIC_URL")
+        } else {
+            String::new()
+        };
+        let tokens_raw = if front {
+            required("A2A_BEARER_TOKENS")
+        } else {
+            String::new()
+        };
         let model_api_key = match lookup("MODEL_API_KEY") {
             Some(v) => v,
             None => {
@@ -171,17 +205,21 @@ impl Config {
         let workspace_root =
             PathBuf::from(get("WORKSPACE_ROOT").unwrap_or_else(|| "/work".to_owned()));
 
-        let public_url = match Url::parse(&public_url_raw) {
-            Ok(u) if matches!(u.scheme(), "http" | "https") => Some(u),
-            Ok(_) => {
-                problems.push("PUBLIC_URL must be an http(s) URL".into());
-                None
+        let public_url = if front {
+            match Url::parse(&public_url_raw) {
+                Ok(u) if matches!(u.scheme(), "http" | "https") => Some(u),
+                Ok(_) => {
+                    problems.push("PUBLIC_URL must be an http(s) URL".into());
+                    None
+                }
+                Err(e) if !public_url_raw.is_empty() => {
+                    problems.push(format!("PUBLIC_URL is not a URL: {e}"));
+                    None
+                }
+                Err(_) => None,
             }
-            Err(e) if !public_url_raw.is_empty() => {
-                problems.push(format!("PUBLIC_URL is not a URL: {e}"));
-                None
-            }
-            Err(_) => None,
+        } else {
+            None
         };
 
         let a2a_bearer_tokens: Vec<SecretString> = tokens_raw
@@ -264,13 +302,15 @@ impl Config {
             .map(str::to_owned)
             .collect();
 
-        let (Some(public_url), Some(github_api_url)) = (public_url, github_api_url) else {
+        // `github_api_url` is `None` only after a problem was recorded above.
+        let Some(github_api_url) = github_api_url else {
             return Err(ConfigError { problems });
         };
         if !problems.is_empty() {
             return Err(ConfigError { problems });
         }
         Ok(Self {
+            role,
             database_url: SecretString::from(database_url),
             model_base_url,
             model_api_key: SecretString::from(model_api_key),
@@ -489,5 +529,108 @@ mod tests {
         let mut vars = full();
         vars.insert("GITHUB_API_URL", "not a url");
         assert!(parse(&vars).is_err());
+    }
+
+    fn with_role(role: &'static str) -> HashMap<&'static str, &'static str> {
+        let mut vars = full();
+        vars.insert("ROLE", role);
+        vars
+    }
+
+    #[test]
+    fn the_role_defaults_to_all_and_each_value_parses() {
+        assert_eq!(parse(&full()).unwrap().role, Role::All);
+        // Blank counts as unset, like every other variable.
+        assert_eq!(parse(&with_role("  ")).unwrap().role, Role::All);
+        for role in Role::VALUES {
+            assert_eq!(parse(&with_role(role.as_str())).unwrap().role, role);
+        }
+        // `adam_host` trims and ignores ASCII case.
+        assert_eq!(
+            parse(&with_role(" Control-Plane ")).unwrap().role,
+            Role::ControlPlane
+        );
+    }
+
+    #[test]
+    fn an_unknown_role_names_the_variable_and_the_accepted_values() {
+        for bad in ["boss", "controlplane", "workers", "front"] {
+            let err = parse(&with_role(bad)).unwrap_err();
+            let problem = err
+                .problems
+                .iter()
+                .find(|p| p.starts_with("ROLE"))
+                .unwrap_or_else(|| panic!("{bad:?} accepted or misreported: {:?}", err.problems));
+            assert!(problem.contains(&format!("{bad:?}")), "{problem}");
+            for accepted in ["all", "control-plane", "worker"] {
+                assert!(problem.contains(accepted), "{problem}");
+            }
+            assert_eq!(err.class(), ErrorClass::Invalid);
+        }
+    }
+
+    #[test]
+    fn a_worker_needs_no_front_variables() {
+        let mut vars = with_role("worker");
+        vars.remove("A2A_BEARER_TOKENS");
+        vars.remove("PUBLIC_URL");
+        let c = parse(&vars).expect("a worker serves no A2A");
+        assert_eq!(c.role, Role::Worker);
+        assert!(c.a2a_bearer_tokens.is_empty());
+        assert!(c.public_url.is_none());
+
+        // What a worker does not use is not validated either: a chart may set it for all roles.
+        vars.insert("PUBLIC_URL", "ftp://not-used");
+        vars.insert("A2A_BEARER_TOKENS", " , ");
+        assert!(parse(&vars).is_ok());
+    }
+
+    #[test]
+    fn the_roles_that_run_the_control_plane_need_the_front_variables() {
+        for role in ["all", "control-plane"] {
+            let mut vars = with_role(role);
+            vars.remove("A2A_BEARER_TOKENS");
+            vars.remove("PUBLIC_URL");
+            let err = parse(&vars).unwrap_err();
+            for name in ["A2A_BEARER_TOKENS", "PUBLIC_URL"] {
+                assert!(
+                    err.problems.iter().any(|p| p.starts_with(name)),
+                    "{role}: {name} missing from {:?}",
+                    err.problems
+                );
+            }
+            // Fail closed: a blank list is no list.
+            let mut vars = with_role(role);
+            vars.insert("A2A_BEARER_TOKENS", " , ");
+            assert!(parse(&vars).is_err(), "{role}");
+            let c = parse(&with_role(role)).unwrap();
+            assert_eq!(c.a2a_bearer_tokens.len(), 2);
+            assert_eq!(c.public_url.unwrap().as_str(), "http://coder.svc:8080/");
+        }
+    }
+
+    /// Every role still needs the model and GitHub variables: `Runtime::start` needs the complete
+    /// agent, so the control plane registers it too (see the module docs). This test pins that
+    /// down; the change that lets a control plane start without them changes it on purpose.
+    #[test]
+    fn every_role_still_needs_the_model_and_github_variables() {
+        for role in Role::VALUES {
+            for name in ["MODEL_BASE_URL", "MODEL_API_KEY", "MODEL", "GITHUB_TOKEN"] {
+                let mut vars = with_role(role.as_str());
+                vars.remove(name);
+                let err = parse(&vars).unwrap_err();
+                assert!(
+                    err.problems.iter().any(|p| p.starts_with(name)),
+                    "{role}: {name} missing from {:?}",
+                    err.problems
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_role_is_shown_in_debug_output() {
+        let c = parse(&with_role("worker")).unwrap();
+        assert!(format!("{c:?}").contains("role: Worker"));
     }
 }

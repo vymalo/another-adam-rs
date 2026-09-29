@@ -57,6 +57,15 @@ role. The rename is outside this repo.
 
    The front then needs no model or GitHub secrets. The worker needs them. Config is checked
    per role.
+
+   *Amended 2026-09-29 (implemented in `adam-coder`):* config is checked per role, but the
+   control plane still needs the model and GitHub settings. `Runtime::start` looks the agent up
+   by name and calls its `init`, so the control plane registers the complete `CoderAgent`
+   (its model client, workspaces and GitHub client are built, never called, and the workspace
+   root is not created). Only `A2A_BEARER_TOKENS` and `PUBLIC_URL` are role-specific, and the
+   worker does not need them. Removing the requirement needs agent starters (a control plane
+   that can start a run without holding the agent), which is a later change. *Verified
+   2026-09-29: read `Runtime::start` and `new_run` in `crates/adam-runtime/src/runtime.rs`.*
 7. **The seam stays the store.** The two roles talk only through the Postgres store: the run
    record with its version compare-and-swap, and leases. No new protocol between them.
 8. **Hosts may run adam agents in-process, tools and sandboxes included.** The owner decided
@@ -96,6 +105,9 @@ role. The rename is outside this repo.
 * `Role` is a public, closed enum. Adding a role is a breaking change for hosts that match on
   it. That is the point, and it costs a major version.
 * `adam-coder` is not refactored here. Until it is, it keeps its own hand-written stop logic.
+  *Amended 2026-09-29: `adam-coder` now reads `ROLE` and runs its components through `Host`;
+  its hand-written stop logic and `StoppedUnexpectedly` are gone, and a component that ends
+  early is a `HostError` (exit code 70).*
 * Hosting agents in-process (decision 8) is only safe as far as the host limits it. An agent that
   runs builds can starve the process it lives in. The host must give it its own pods and
   limits. adam-rs does not sandbox the host.

@@ -12,8 +12,9 @@ Given "in repo X, do Y" it
 
 It is durable (every model and tool step is journaled by `adam-runtime`, so a
 restarted worker replays instead of repeating a side effect) and addressable
-(an A2A 1.0 server from `adam-a2a`, backed by `adam-a2a-runtime`). One process
-serves A2A and runs the workers; replicas share one Postgres.
+(an A2A 1.0 server from `adam-a2a`, backed by `adam-a2a-runtime`). By default one
+process serves A2A and runs the workers; replicas share one Postgres. `ROLE` splits
+the two halves into separate processes (see [Roles](#roles)).
 
 ```mermaid
 sequenceDiagram
@@ -102,6 +103,7 @@ reported at once at startup):
 
 | Variable | Meaning | Default |
 |---|---|---|
+| `ROLE` | what this process runs: `all`, `control-plane` or `worker` (see [Roles](#roles)) | `all` |
 | `DATABASE_URL` | Postgres for the run store | required |
 | `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required (key may be empty) |
 | `MODEL` | model alias of the agent | required |
@@ -111,9 +113,9 @@ reported at once at startup):
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, worktrees, run notes | `/work` |
-| `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required |
-| `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required |
-| `LISTEN_ADDR` | bind address | `0.0.0.0:8080` |
+| `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
+| `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
+| `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` | `900`, `16384` |
@@ -128,6 +130,53 @@ never inlined) together with `OPENCODE_DISABLE_AUTOUPDATE=1`; see
 `src/opencode.rs` for what was verified against the OpenCode sources. The
 OpenCode child does not see `GITHUB_TOKEN`, `DATABASE_URL` or
 `A2A_BEARER_TOKENS`, and the checks do not see those or `MODEL_API_KEY`.
+
+### Roles
+
+`ROLE` is parsed with `adam_host::Role` (`all`, `control-plane`, `worker`; case-insensitive;
+unset or blank means `all`). Anything else is a configuration error (exit 78) that names
+`ROLE` and the accepted values. The process registers its parts as components of an
+`adam_host::Host`, which starts only those the role runs.
+
+| Role | Starts | Listener | Workspace root |
+|---|---|---|---|
+| `all` (default) | the A2A server and the workers, in one process: today's behaviour | A2A and `/healthz` on `LISTEN_ADDR` | created |
+| `control-plane` | the A2A server over a `Runtime` used only to start, deliver to, cancel and view runs; `run_worker` is never called | A2A and `/healthz` on `LISTEN_ADDR` | **not** created |
+| `worker` | `Runtime::run_worker`, and a listener that answers `GET /healthz` (`200 ok`, the route the A2A router serves) and nothing else | `/healthz` only on `LISTEN_ADDR` | created |
+
+The roles meet only in the Postgres store (the run record's version compare-and-swap, and
+leases), so any number of each can share one database. Two things follow until a
+cross-process event path exists (see ADR 0001, "Open questions"):
+
+* The control plane learns what a worker did by **polling** the run, so its A2A stream is a
+  poll interval (250 ms) late. Every state and artifact still arrives.
+* A cancel reaches the worker on its next poll of the run, not at once.
+
+A worker's runs have no affinity today: any worker may lease any run. A deployment keeps
+one worker per workspace root, or gives the workers a shared volume (ADR 0001, decision 10).
+
+**Required variables by role**
+
+| Variable | `all` | `control-plane` | `worker` |
+|---|---|---|---|
+| `DATABASE_URL` | yes | yes | yes |
+| `A2A_BEARER_TOKENS`, `PUBLIC_URL` | yes | yes | not read |
+| `GITHUB_TOKEN` | yes | yes | yes |
+| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL` | yes | yes | yes |
+
+A missing required value is a configuration error (exit 78) listed with every other problem.
+A worker does not read `A2A_BEARER_TOKENS` or `PUBLIC_URL`, so it does not validate them either.
+
+**The control plane still needs the model and GitHub settings.** `Runtime::start` looks the
+agent up by name and calls its `init`, so a control plane must register the complete
+`CoderAgent`, which is built from the model client, the workspaces and the GitHub client. Those
+clients are only constructed there: nothing calls the model or GitHub, and the workspace root is
+not created. A later change ("agent starters") is meant to let a control plane start runs
+without them; until then the variables stay required, and `config.rs` has a test that says so.
+
+`SIGTERM` stops the control plane first (open connections get 10 seconds), then the workers,
+without a bound, so they finish and commit the steps they are in. A component that stops on its
+own stops the others and ends the process with a `HostError`, exit 70.
 
 ### Which repositories, and where the token goes
 
@@ -166,9 +215,10 @@ survives; the `source` does not. It is exact-value replacement, not a detector: 
 was transformed (hashed, split) is not found, and values shorter than 4
 characters are not registered.
 
-SIGTERM stops accepting connections and lets in-flight steps finish and commit;
-a step cut short by a hard kill is taken over by the next start when its lease
-expires. Logs are JSON on stdout (`RUST_LOG` filters).
+SIGTERM stops accepting connections and lets in-flight steps finish and commit
+(see [Roles](#roles) for what stops in which order); a step cut short by a hard kill
+is taken over by the next start when its lease expires. Logs are JSON on stdout
+(`RUST_LOG` filters).
 
 Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
 
@@ -177,8 +227,9 @@ Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
 The library errors it composes are classified (see
 [`adam-error`](../adam-error/README.md)); this crate adds `ConfigError`
 (`Invalid`: the same environment never works; it lists every problem and never
-a secret) and `StoppedUnexpectedly` (`Internal`: the server or the workers
-stopped while still needed).
+a secret). A component of the process that stops while still needed (the server
+or the workers) is an `adam_host::HostError`, which names the component and is
+`Internal`.
 
 A failure ends the process with one structured log line, `adam-coder failed`
 (JSON on stdout, fields `error`, the whole scrubbed cause chain, and `code`),
@@ -191,11 +242,11 @@ walking the `anyhow` chain from the outside in and taking the first match:
 | 78 (`EX_CONFIG`) | configuration; do not restart | `ConfigError`, or an `Invalid` `StoreError`, `OpenAiConfigError`, `WorkspaceError` or `RuntimeError` |
 | 69 (`EX_UNAVAILABLE`) | a dependency is unreachable; restart later | a `Transient`, `RateLimited` or `Conflict` one of those, such as Postgres at boot |
 | 71 (`EX_OSERR`) | the OS refused something | an `io::Error` with no typed error above it: a listener that cannot bind |
-| 70 (`EX_SOFTWARE`) | internal | `StoppedUnexpectedly`, a panicked task, or a `Corrupt` or `Internal` typed error (including `OpenAiConfigError::Client`) |
+| 70 (`EX_SOFTWARE`) | internal | `HostError` (a component stopped, panicked or ended before shutdown, whatever its own cause), a panicked task, or a `Corrupt` or `Internal` typed error (including `OpenAiConfigError::Client`) |
 | 1 | anything else | for example `NotFound`, `Rejected`, `Unauthenticated` (a bad `GITHUB_TOKEN`) or an untyped error |
 
 The typed errors it looks for are `StoreError`, `OpenAiConfigError`,
-`WorkspaceError`, `RuntimeError` and `StoppedUnexpectedly`. Because the walk goes
+`WorkspaceError`, `RuntimeError` and `HostError`. Because the walk goes
 outside in, an unreachable Postgres is 69 although an `io::Error` is at the
 bottom of its chain. The values are BSD `sysexits.h`'s, *unverified* (from
 memory).
@@ -236,12 +287,21 @@ database of its own, so the role needs `CREATEDB`):
   finishes the run with one commit, one push and one pull request). The last
   one runs the whole binary against a wiremock model (`/chat/completions`) and
   a wiremock GitHub reached through `GITHUB_API_URL`, under the production
-  repository policy.
+  repository policy. Roles: an unknown `ROLE` (exit 78, names the variable and the accepted
+  values); the variables each role is missing (exit 78); a `worker` that starts without
+  `A2A_BEARER_TOKENS` and `PUBLIC_URL`, answers `/healthz` and 404 to everything A2A, and
+  creates its workspace root; a `control-plane` that serves A2A and never creates the
+  workspace root; and **a control plane and a worker as two processes over one database**:
+  the task is sent to the control plane before the worker exists and waits unclaimed (the
+  model is not asked, the run's version does not move), then the worker starts, steps it to a
+  branch and a pull request, and the control plane's stream (by polling) reports the artifacts
+  and `completed`.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy.
 * `adam-workspace/tests/workspace.rs`: the host allowlist, local paths, scoped
   tokens, and a wiremock "evil" git host that must never be contacted.
-* unit tests: configuration, prompt, OpenCode config, shell execution (timeout
+* unit tests: configuration (including `ROLE`: the default, each value, an unknown one, and the
+  variables each role requires), prompt, OpenCode config, shell execution (timeout
   kills the process group, output tail, cwd confinement, hidden secrets), run
   notes, the exit code of each root cause (`src/exit.rs`), and the scrubbing
   and bounding of failure text (`src/agent.rs`, `src/redact.rs`).

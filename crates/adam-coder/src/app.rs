@@ -40,8 +40,11 @@ impl Default for RuntimeOptions {
 
 /// The coder, composed: runtime (workers) and A2A backend over one store.
 ///
-/// One process serves A2A *and* runs workers; replicas over the same database
-/// scale horizontally through leases.
+/// By default one process serves A2A *and* runs workers; replicas over the same
+/// database scale horizontally through leases. With `ROLE` the two halves run in
+/// separate processes: a control plane uses [`Coder::router`] and never calls
+/// [`Coder::run_worker`], a worker does the opposite. The halves meet only in the
+/// store, and the backend of a control plane learns what a worker did by polling.
 pub struct Coder {
     /// The runtime; call [`Coder::run_worker`] to advance runs.
     pub runtime: Runtime,

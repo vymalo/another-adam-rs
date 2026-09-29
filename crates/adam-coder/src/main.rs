@@ -1,4 +1,4 @@
-//! `adam-coder`: the coder agent as one process: A2A server and workers.
+//! `adam-coder`: the coder agent as one process: the A2A server, the workers, or both (`ROLE`).
 //!
 //! Configuration is read from the environment, see [`adam_coder::config`].
 //! SIGTERM (and Ctrl-C) stop accepting connections and let the workers finish

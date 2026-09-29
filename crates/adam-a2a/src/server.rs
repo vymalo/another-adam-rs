@@ -77,6 +77,13 @@ impl A2aServer {
         Self::router_with_options(card, backend, auth, ServerOptions::default())
     }
 
+    /// A router with `GET /healthz` alone: the same liveness route [`router`](Self::router)
+    /// serves (200, body `ok`, no credential), for a process that has no A2A endpoint but must
+    /// still answer probes, such as a worker that runs no front.
+    pub fn health_router() -> Router {
+        Router::new().route("/healthz", get(healthz))
+    }
+
     /// [`router`](Self::router) with [`ServerOptions`].
     pub fn router_with_options(
         card: AgentCardConfig,
@@ -98,7 +105,7 @@ impl A2aServer {
             .merge(agent_card_router(Arc::new(StaticAgentCard::new(
                 agent_card,
             ))))
-            .route("/healthz", get(healthz))
+            .merge(Self::health_router())
             // Outermost, and over everything (including the fallback), so a
             // route added later is protected unless `auth::is_public` says so.
             .layer(middleware::from_fn_with_state(

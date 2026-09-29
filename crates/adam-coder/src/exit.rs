@@ -11,7 +11,7 @@
 //! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, or any error whose class is `Invalid` |
 //! | 69 | `EX_UNAVAILABLE` | a dependency is unreachable: a `Transient`, `RateLimited` or `Conflict` error, such as Postgres |
 //! | 71 | `EX_OSERR` | an [`std::io::Error`]: a listener that cannot bind, a directory that cannot be created |
-//! | 70 | `EX_SOFTWARE` | [`StoppedUnexpectedly`], a panicked task, or a `Corrupt` or `Internal` error |
+//! | 70 | `EX_SOFTWARE` | [`HostError`] (a component of the process stopped, panicked or ended while still needed), a panicked task, or a `Corrupt` or `Internal` error |
 //! | 1 | | anything else |
 //!
 //! The values are those of BSD `sysexits.h`, *unverified* (from memory; the header is not part of
@@ -21,6 +21,7 @@ use std::error::Error;
 
 use adam_core::StoreError;
 use adam_error::{Classify, ErrorClass};
+use adam_host::HostError;
 use adam_model_openai::OpenAiConfigError;
 use adam_runtime::RuntimeError;
 use adam_workspace::WorkspaceError;
@@ -33,27 +34,15 @@ pub const EX_CONFIG: u8 = 78;
 pub const EX_UNAVAILABLE: u8 = 69;
 /// `EX_OSERR`: the operating system refused something (a port, a directory).
 pub const EX_OSERR: u8 = 71;
-/// `EX_SOFTWARE`: an internal error: a bug, or a half of the process that stopped.
+/// `EX_SOFTWARE`: an internal error: a bug, or a component of the process that stopped.
 pub const EX_SOFTWARE: u8 = 70;
 /// Anything else.
 pub const EX_GENERAL: u8 = 1;
 
-/// A half of the process (the server or the workers) stopped while it was still needed.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-#[error("{0} stopped unexpectedly")]
-pub struct StoppedUnexpectedly(pub &'static str);
-
-impl Classify for StoppedUnexpectedly {
-    fn class(&self) -> ErrorClass {
-        ErrorClass::Internal
-    }
-}
-
 /// The exit code for `err`, found by walking its chain from the outside in. See the module docs.
 pub fn exit_code(err: &anyhow::Error) -> u8 {
     // A context layer is not part of `chain()`'s downcastable items, so ask for it directly.
-    if err.downcast_ref::<StoppedUnexpectedly>().is_some() {
+    if err.downcast_ref::<HostError>().is_some() {
         return EX_SOFTWARE;
     }
     for cause in err.chain() {
@@ -94,9 +83,7 @@ fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
     if let Some(e) = cause.downcast_ref::<RuntimeError>() {
         return Some(e.class());
     }
-    cause
-        .downcast_ref::<StoppedUnexpectedly>()
-        .map(Classify::class)
+    cause.downcast_ref::<HostError>().map(Classify::class)
 }
 
 #[cfg(test)]
@@ -160,11 +147,35 @@ mod tests {
     }
 
     #[test]
-    fn a_half_that_stopped_or_a_bug_is_70() {
-        assert_eq!(coded(StoppedUnexpectedly("server")), 70);
-        // As a context layer over any cause, including an io::Error from the server.
-        let e = anyhow::Error::from(std::io::Error::other("accept failed"))
-            .context(StoppedUnexpectedly("server"));
+    fn a_component_that_stopped_or_a_bug_is_70() {
+        let ended = || HostError::EndedEarly {
+            component: "a2a-server".into(),
+        };
+        assert_eq!(coded(ended()), 70);
+        assert_eq!(coded(HostError::NothingToRun), 70);
+        assert_eq!(
+            coded(HostError::Panicked {
+                component: "worker".into(),
+                source: "boom".into(),
+            }),
+            70
+        );
+        // Whatever the component failed with, the outermost layer decides: an `io::Error` from
+        // the server is not a 71, and a `Transient` store error from a worker is not a 69.
+        let stopped = HostError::Stopped {
+            component: "a2a-server".into(),
+            source: Box::new(std::io::Error::other("accept failed")),
+        };
+        assert_eq!(coded(stopped), 70);
+        let stopped = HostError::Stopped {
+            component: "worker".into(),
+            source: Box::new(StoreError::unavailable(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
+        };
+        assert_eq!(coded(stopped), 70);
+        // Under a context layer too.
+        let e = Err::<(), _>(ended()).context("running").unwrap_err();
         assert_eq!(exit_code(&e), 70);
         assert_eq!(
             coded(StoreError::internal(std::io::Error::other("syntax error"))),
