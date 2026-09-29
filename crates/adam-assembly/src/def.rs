@@ -12,8 +12,9 @@ use adam_agent_fs::{
 use adam_llm_agent::{DynTool, Limits, ToolSet};
 
 use crate::assembly::BoundDef;
-use crate::error::{Error, Origin};
+use crate::error::{Error, Origin, ToolClash};
 use crate::skills::{self, SkillFiles};
+use crate::subagent::SubagentTool;
 use crate::suggest::closest;
 use crate::template::{self, Piece};
 
@@ -202,8 +203,16 @@ impl AgentDef {
     /// * a value supplied for an agent the definition does not contain.
     ///
     /// The root agent gets every registered tool when it has no `tools:`; a subagent gets none
-    /// (decision D3 of `docs/authoring.md`). Nothing is built yet: the model and the state come
-    /// next ([`BoundDef`]).
+    /// (decision D3 of `docs/authoring.md`), whatever its parent has. Each agent then gets a
+    /// tool per local subagent, named after it ([`SubagentTool`]), after its own tools and its
+    /// skills' tools. Two more things are refused here:
+    ///
+    /// * a subagent tool whose name is already a tool of the parent, or another subagent's
+    ///   ([`Error::SubagentToolClash`]);
+    /// * a subagent with a tool that asks the user ([`Error::SubagentAsksUser`]): nobody would
+    ///   answer it.
+    ///
+    /// Nothing is built yet: the model and the state come next ([`BoundDef`]).
     ///
     /// # Errors
     ///
@@ -311,9 +320,16 @@ impl Walk<'_> {
             parent.is_none(),
             self.catalog,
         )?;
+        if parent.is_some() {
+            refuse_asking_tools(&origin, &tools)?;
+        }
         let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
+        let registered = tools.len();
         let (skills, preloaded) =
             add_skills(&origin, manifest, self.files, &mut prompt, &mut tools)?;
+        // The tools `add_skills` appended, so a clash can say whose tool it hit.
+        let skill_tools: Vec<String> = tools[registered..].iter().map(|(n, _)| n.clone()).collect();
+        add_subagent_tools(&origin, manifest, &skill_tools, &mut tools)?;
         let index = self.nodes.len();
         self.nodes.push(Node {
             name: name.clone(),
@@ -377,6 +393,70 @@ fn add_skills(
     prompt.push_str("\n\n");
     prompt.push_str(&section);
     Ok((set.names(), set.preloaded()))
+}
+
+/// A subagent runs as a child of another run: there is nobody to answer a question, and a run
+/// that asks parks until someone does. Refuse the tools that say they ask.
+fn refuse_asking_tools(origin: &Origin, tools: &[(String, DynTool)]) -> Result<(), Error> {
+    match tools.iter().find(|(_, tool)| tool.asks_user()) {
+        Some((name, _)) => Err(Error::SubagentAsksUser {
+            origin: origin.clone(),
+            tool: name.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Give the agent a tool for each of its local subagents, named after the subagent and placed
+/// after the agent's own tools and its skills' tools, in the order of the manifest. The name must
+/// not be one the agent's model already sees.
+fn add_subagent_tools(
+    origin: &Origin,
+    manifest: &AgentManifest,
+    skill_tools: &[String],
+    tools: &mut Vec<(String, DynTool)>,
+) -> Result<(), Error> {
+    // The subagent tools added so far, by name, with the file of the subagent that owns each.
+    let mut subagents: Vec<(&str, &std::path::Path)> = Vec::new();
+    for sub in &manifest.subagents {
+        let Subagent::Local(child) = sub else {
+            continue;
+        };
+        let clash = if let Some((_, file)) = subagents.iter().find(|(n, _)| *n == child.name) {
+            Some(ToolClash::Subagent {
+                file: file.to_path_buf(),
+            })
+        } else if tools.iter().any(|(n, _)| *n == child.name) {
+            // Whose tool it is depends on what `add_skills` added, not on the name: without
+            // skills, a registered tool may be called `load_skill`.
+            Some(if skill_tools.contains(&child.name) {
+                ToolClash::SkillTool
+            } else {
+                ToolClash::Tool
+            })
+        } else {
+            None
+        };
+        if let Some(clash) = clash {
+            return Err(Error::SubagentToolClash {
+                origin: Origin::new(
+                    format!("{}/{}", origin.agent, child.name),
+                    child.path.clone(),
+                ),
+                parent: origin.agent.clone(),
+                tool: child.name.clone(),
+                clash,
+            });
+        }
+        let tool = SubagentTool::new(
+            child.name.clone(),
+            format!("{}/{}", origin.agent, child.name),
+            child.frontmatter.description.as_deref().unwrap_or_default(),
+        );
+        subagents.push((&child.name, &child.path));
+        tools.push((child.name.clone(), Arc::new(tool)));
+    }
+    Ok(())
 }
 
 /// The loop's limits: what the frontmatter sets, the loop's default for the rest.

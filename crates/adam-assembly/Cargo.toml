@@ -30,6 +30,7 @@ url = { workspace = true, optional = true }
 # depends on `adam`, which depends on this crate: a dev-dependency cycle, which cargo allows.
 adam-agent-fixture = { path = "../adam-agent-fixture" }
 adam-core.workspace = true
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
 proptest.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

@@ -55,11 +55,12 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
 | `SkillError` | why `load_skill` or `read_skill_file` refused a call: closed enum, its `Display` is the tool result the model reads |
 | `BoundDef` | `state(Arc<T>)`, `model_aliases(..)`, `model(DynModel, alias)` |
+| `SubagentTool` | the tool that runs a subagent as a child run: `new(tool_name, agent, description)`, `agent()`. `bind` adds one per local subagent, so a user never builds one |
 | `Assembly` | `agents()`, `root()`, `register(RuntimeBuilder)`, `info()`, `remotes()`, `manifest()`, `card(url, version)` (feature `a2a`) |
-| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog), `tools` (with the skill tools), `skills`, `preloaded`, `limits`: what an `LlmAgent` was made from, comparable |
+| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog), `tools` (own, skill tools, then one per subagent: what the model is offered), `skills`, `preloaded`, `limits`: what an `LlmAgent` was made from, comparable |
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data |
 | `Error`, `Origin` | the closed error enum, and the agent and file every file-related variant carries |
-| `AliasProblem`, `TemplateProblem`, `SkillField` | closed enums inside `Error::ModelAlias`, `Error::Template` and `Error::UnknownSkill` |
+| `AliasProblem`, `TemplateProblem`, `SkillField`, `ToolClash` | closed enums inside `Error::ModelAlias`, `Error::Template`, `Error::UnknownSkill` and `Error::SubagentToolClash` |
 
 ## The stages
 
@@ -239,19 +240,53 @@ content.
 never succeeds) except `Manifest`, which keeps its source's class. `bind` and `model` return the first
 problem found, in the order of the tables above.
 
-## Subagents and the seams left
+## Subagents
 
 A subagent that is a local file becomes an `LlmAgent` of its own, registered as `<parent>/<name>`
 (`coder/reviewer`, `coder/researcher/summarizer`), with its own prompt, tools, skills, model and limits.
-It is *defined*, not yet callable: nothing gives the parent a tool that starts it. A remote subagent
-(`a2a:`) is data in `Assembly::remotes()`. `mcp.json` and schedules stay in `Assembly::manifest()`.
-The seams are in code, in one place each:
+It inherits **nothing** from its parent: its tools are the ones its own `tools:` lists and none when it
+lists none (a tool only the parent has is unknown to the child), its skills are the ones under its own
+`skills/`, and its history starts with the message it is called with.
+
+Its parent gets a `SubagentTool`, one per subagent, named after it, added by `bind` after the parent's own
+tools and its skills' tools, in the order of the manifest (`AgentInfo::tools` lists them):
+
+* input `{ "message": string }` (required); description: the subagent's `description`, then "The agent does
+  not see this conversation; put everything it needs in `message`.";
+* a call starts the subagent as a child run of the parent's run and parks the parent until it is done
+  (`ToolCtx::start_child` and `ToolError::AwaitRun`, see "Child runs" in `docs/architecture.md`). The
+  child's final **text** is the tool result; an error result if the child failed, and the parent goes on. A
+  blank or missing `message` is an error result and starts nothing;
+* the child's own `limits:` apply to the child (its turns and tool calls are not the parent's);
+* **the runtime handle is not something you attach.** The tool starts the child on the runtime that steps
+  the parent, through the `ToolCtx` of the call, so there is nothing to forget. What it needs is the child
+  registered on that runtime: `Assembly::register` registers every agent. A process that steps the parent
+  without the child (only `assembly.root()` registered) refuses the call for good, with the agent's name, as
+  an error result; in a split deployment register the subagents as starters where the parent runs;
+* what does not travel back: artifacts (they stay on the child's run). What does not happen: two subagent
+  calls of one model turn run one after the other, not side by side, and cancelling the parent does not
+  cancel the child.
+
+| Mistake | Error, at `bind` |
+|---|---|
+| a subagent named like a tool its parent has (registered and selected, or `load_skill` / `read_skill_file` when the parent has skills), or like another subagent of the parent | `SubagentToolClash { origin, parent, tool, clash: ToolClash }` (origin is the subagent) |
+| a subagent with a tool that asks the user (`Tool::asks_user()`), by name, by `*` or by a pattern | `SubagentAsksUser { origin, tool }` |
+
+A registered tool the parent does not select is not a clash. **Why a subagent may not have an asking
+tool:** a subagent runs as a child of another run with nobody to answer, and a run that asks parks until
+someone does, so the parent would wait for ever. The tool declares it (`#[tool(asks_user)]`,
+`FnTool::asking_user()`, or `fn asks_user(&self) -> bool` on a hand-written `Tool`) and `bind` refuses it
+(a deadline on the child would only make "waits for ever" into "fails late"). It is a declaration: a tool
+that returns `NeedsInput` without saying so would still park its child.
+
+A remote subagent (`a2a:`) is data in `Assembly::remotes()` (its tool is S9b). `mcp.json` and schedules
+stay in `Assembly::manifest()`. The seams for the next slices are in code, in one place each:
 
 | Slice | What plugs in | Where |
 |---|---|---|
 | S7 skills (built) | the catalog appended to the prompt, `load_skill` and `read_skill_file` added to the tools | `add_skills` in `def.rs`, called while `bind` resolves an agent, so `Node::prompt` and `Node::tools` are final when `BoundDef::build` hands them to `LlmAgent`; the logic is `skills.rs` |
-| S9 subagents (the runtime side, S8, is built) | a tool per child that calls `Runtime::start_child` under `ToolCtx::child_run_id()` and returns `ToolError::AwaitRun`; least-privilege tools are already resolved | `BoundDef::build`: the children of a node are the nodes whose `parent` is its index, and `AgentInfo::description` is the tool description; a tool with a name `load_skill` or `read_skill_file` is already refused by `add_skills`, and a subagent tool will need the same check |
-| S9b remote subagents | a tool per `RemoteInfo` | `BoundDef::build`, with `remotes` |
+| S9 subagents (built) | a `SubagentTool` per local child, the name checks, the asks-user refusal | `add_subagent_tools` and `refuse_asking_tools` in `def.rs`, in the same walk; the tool is `subagent.rs` |
+| S9b remote subagents | a tool per `RemoteInfo`; its name joins the checks of `add_subagent_tools` | `Walk::agent` in `def.rs`, which already sees `remotes` |
 | S10 dev reload | `from_source` + `bind` + `model` again on a changed directory, swapped at a step boundary | a caller of this crate; `AgentDef` and `BoundDef` are plain values |
 | S11 MCP tools | the discovered tools go into the `ToolSet` given to `bind`; `linear__*` patterns already match them | `AgentDef::bind` |
 
@@ -269,6 +304,14 @@ The seams are in code, in one place each:
   directory of `adam-agent-fs`), embedded and read from disk, binds to equal `AgentInfo`s; each agent is
   bound as its files say; the root and a subagent run to the end on a `MockModel` through a `Runtime` on
   the in-memory store.
+* `tests/subagents.rs`: a parent calls a subagent which calls its own (root, researcher, summarizer) on a
+  `MockModel` through a `Runtime`, on the memory store and on PostgreSQL when `ADAM_TEST_POSTGRES_URL` is
+  set: each model request's prompt, tool list and history asserted, the answers coming back as tool results,
+  the runs recorded under their parents; the fixture's reviewer; a tool only the parent has is not offered
+  to the child and is refused when the child calls it; limits apply per child (a child over its `max_turns`
+  fails and the parent is told; a child's turns are not the parent's); a call without a `message`; a runtime
+  that does not know the child; a parent whose process goes away while it waits and is stepped by a new
+  runtime that gets the child's answer; every name clash and the asks-user refusal.
 * `tests/skills.rs`: the catalog against `tests/golden/coder-prompt.txt` (the fixture; regenerate with
   `ADAM_UPDATE_GOLDEN=1`) and against a hand-written text with escaping; no skill, no tool; `skills:`
   selection and order; unknown, unselected and unsupplied skills, an over-size skill and a reserved tool

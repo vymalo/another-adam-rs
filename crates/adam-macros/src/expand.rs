@@ -42,10 +42,11 @@ struct Options {
     type_name: Option<Ident>,
     strict: Option<Span>,
     classify: bool,
+    asks_user: bool,
     krate: Option<Path>,
 }
 
-const OPTIONS: &str = "name, type, strict, classify, crate";
+const OPTIONS: &str = "name, type, strict, classify, asks_user, crate";
 
 impl Parse for Options {
     fn parse(input: ParseStream) -> Result<Self> {
@@ -68,6 +69,7 @@ impl Parse for Options {
                 }
                 "strict" => opts.strict.replace(key.span()).is_some(),
                 "classify" => std::mem::replace(&mut opts.classify, true),
+                "asks_user" => std::mem::replace(&mut opts.asks_user, true),
                 other => {
                     return Err(Error::new(
                         key.span(),
@@ -149,6 +151,7 @@ struct Analysis {
     params: Vec<Param>,
     strict: bool,
     classify: bool,
+    asks_user: bool,
     return_span: Span,
 }
 
@@ -254,6 +257,7 @@ fn analyse(func: &ItemFn, opts: Options) -> Result<Analysis> {
         params,
         strict: opts.strict.is_some(),
         classify: opts.classify,
+        asks_user: opts.asks_user,
         return_span,
     })
 }
@@ -598,6 +602,14 @@ impl Analysis {
             }
         });
 
+        let asks_user = self.asks_user.then(|| {
+            quote! {
+                fn asks_user(&self) -> bool {
+                    true
+                }
+            }
+        });
+
         // Read the arguments, resolve the state, call the function: one call
         // argument per parameter, in the function's order.
         let mut lets = Vec::new();
@@ -659,6 +671,8 @@ impl Analysis {
                 }
 
                 #required_state
+
+                #asks_user
 
                 async fn call(
                     &self,
@@ -971,6 +985,27 @@ mod tests {
     }
 
     #[test]
+    fn asks_user_declares_that_the_tool_asks() {
+        let out = ok(
+            quote!(asks_user),
+            quote! {
+                /// Ask.
+                async fn ask(question: String) -> Result<ToolOutput, ToolError> { todo!() }
+            },
+        );
+        has(&out, "fnasks_user(&self)->bool{true}");
+        // Without the option the trait's default (`false`) stands.
+        let out = ok(
+            quote!(),
+            quote! {
+                /// Ask.
+                async fn ask(question: String) -> String { question }
+            },
+        );
+        lacks(&out, "asks_user");
+    }
+
+    #[test]
     fn lint_attributes_stay_on_the_kept_parameter_only() {
         let out = ok(
             quote!(),
@@ -1274,12 +1309,13 @@ mod tests {
         );
         assert_eq!(
             msg,
-            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, crate"
+            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, crate"
         );
         for repeated in [
             quote!(name = "a", name = "b"),
             quote!(strict, strict),
             quote!(classify, classify),
+            quote!(asks_user, asks_user),
             quote!(type = A, type = B),
             quote!(crate = a, crate = b),
         ] {

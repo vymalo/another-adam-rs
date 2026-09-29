@@ -90,9 +90,17 @@
 //! [`AgentDef::resources_from`]; a refusal is a [`SkillError`] shown to the model. See the README
 //! for the exact format.
 //!
-//! Not here yet: the tool that runs a subagent as a durable child run (S8 and S9), remote
-//! subagents (S9b), `mcp.json` tools (S11) and reloading from disk (S10). The manifest keeps their
-//! files, and [`BoundDef::model`] is where they plug in.
+//! # Subagents
+//!
+//! Each local subagent is an agent of its own, `<parent>/<name>`, that inherits nothing, and its
+//! parent gets a [`SubagentTool`] named after it: a call runs the subagent as a durable child run
+//! of the parent's run and the child's final text is the result. A subagent cannot have a tool that
+//! asks the user ([`Tool::asks_user`](adam_llm_agent::Tool::asks_user)), and its name may not clash
+//! with a tool of its parent: both are errors at [`AgentDef::bind`]. The tool needs no runtime
+//! handle: [`Assembly::register`] registers every agent, and that is all it needs.
+//!
+//! Not here yet: remote subagents (S9b), `mcp.json` tools (S11) and reloading from disk (S10). The
+//! manifest keeps their files, and [`AgentDef::bind`] is where they plug in.
 
 #![warn(missing_docs)]
 
@@ -102,13 +110,15 @@ mod card;
 mod def;
 mod error;
 mod skills;
+mod subagent;
 mod suggest;
 mod template;
 
 pub use assembly::{AgentInfo, Assembly, BoundDef, RemoteInfo};
 pub use def::{AgentDef, IntoManifest};
-pub use error::{AliasProblem, Error, Origin, SkillField};
+pub use error::{AliasProblem, Error, Origin, SkillField, ToolClash};
 pub use skills::{LOAD_SKILL, READ_SKILL_FILE, SkillError, SkillFiles};
+pub use subagent::SubagentTool;
 pub use template::TemplateProblem;
 
 /// The URL type of [`Assembly::card`], so a caller needs no `url` dependency of its own.

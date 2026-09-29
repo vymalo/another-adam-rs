@@ -92,7 +92,7 @@ mod worker;
 pub use adam_error::{Classify, ErrorClass};
 pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
 pub use cancel::CancelToken;
-pub use child::{ChildStatus, RUN_FINISHED_KIND, child_run_id};
+pub use child::{ChildStarter, ChildStatus, RUN_FINISHED_KIND, child_run_id};
 pub use clock::{Clock, DynClock, ManualClock, SystemClock};
 pub use ctx::{Ctx, Emitter};
 pub use events::{

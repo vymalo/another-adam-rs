@@ -5,11 +5,12 @@ use std::sync::Arc;
 use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
 use adam_model::ToolSpec;
-use adam_runtime::{Artifact, CancelToken, DynEventSink, Emitter, RunEvent};
+use adam_runtime::{Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, RunEvent};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::conversation::user_message;
 use crate::state::{Extensions, State, StateKey};
 
 /// A capability the model may call.
@@ -45,6 +46,24 @@ pub trait Tool: Send + Sync + 'static {
     /// existed declares.
     fn required_state(&self) -> Vec<StateKey> {
         Vec::new()
+    }
+
+    /// Whether this tool can end a call with [`ToolError::NeedsInput`]: it asks the person who
+    /// started the run a question, and the run parks until someone answers.
+    ///
+    /// Declare it (`true`) on every tool that can. A run nobody can answer would wait forever, and
+    /// the composition layer uses the declaration to keep such a tool away from those runs:
+    /// `adam-assembly` refuses to bind a subagent, which runs as a child of another run and has no
+    /// user to ask, with a tool that says `true`. The default is `false`, which is what a tool
+    /// written before this method existed declares. `#[tool(asks_user)]` and
+    /// [`FnTool::asking_user`](crate::FnTool::asking_user) set it.
+    ///
+    /// It is a declaration, not a guard: nothing stops a tool that says `false` from returning
+    /// `NeedsInput` anyway, and the run would park. A tool that wraps another (see
+    /// [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it, as it forwards
+    /// [`required_state`](Self::required_state).
+    fn asks_user(&self) -> bool {
+        false
     }
 }
 
@@ -199,9 +218,11 @@ pub struct ToolCtx {
     emitter: Emitter,
     cancel: CancelToken,
     extensions: Arc<Extensions>,
+    children: Option<ChildStarter>,
 }
 
 impl ToolCtx {
+    #[allow(clippy::too_many_arguments)] // built in one place, from the pieces of a `Ctx`
     pub(crate) fn new(
         conversation_id: Option<String>,
         attempt: u32,
@@ -210,6 +231,7 @@ impl ToolCtx {
         emitter: Emitter,
         cancel: CancelToken,
         extensions: Arc<Extensions>,
+        children: Option<ChildStarter>,
     ) -> Self {
         Self {
             run_id: emitter.run_id(),
@@ -220,6 +242,7 @@ impl ToolCtx {
             emitter,
             cancel,
             extensions,
+            children,
         }
     }
 
@@ -240,6 +263,7 @@ impl ToolCtx {
             emitter,
             CancelToken::new(),
             Arc::default(),
+            None,
         )
     }
 
@@ -287,6 +311,33 @@ impl ToolCtx {
     /// `Runtime::start_child` and to [`ToolError::AwaitRun`].
     pub fn child_run_id(&self) -> RunId {
         adam_runtime::child_run_id(self.run_id, &self.call_id)
+    }
+
+    /// Start `agent` as a child run of this run, with `message` as its first user message, under
+    /// [`child_run_id`](Self::child_run_id), and return that id: what to put in
+    /// [`ToolError::AwaitRun`]. The child starts on the runtime that steps this run, so the agent
+    /// must be registered on it (as an agent or a starter).
+    ///
+    /// Idempotent: a call that runs again (a replay, a retry) finds the child it started. One child
+    /// per call: starting a second one from the same call would find the first.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::Permanent`] for an agent the runtime does not know, and for a context made by
+    /// [`detached`](Self::detached), which belongs to no runtime; [`ToolError::Transient`] for a
+    /// store failure worth retrying.
+    pub async fn start_child(&self, agent: &str, message: &str) -> Result<RunId, ToolError> {
+        let Some(children) = &self.children else {
+            return Err(ToolError::Permanent(
+                "this tool context belongs to no runtime, so it cannot start a child run".into(),
+            ));
+        };
+        let child = self.child_run_id();
+        children
+            .start(child, agent, user_message(message))
+            .await
+            .map_err(|e| ToolError::from_classified(&e))?;
+        Ok(child)
     }
 
     /// The shared value of type `T` the agent was given, if any.
@@ -438,6 +489,17 @@ mod tests {
         );
         let other = ToolCtx::detached("t", "call_2", sink);
         assert_ne!(ctx.child_run_id(), other.child_run_id());
+    }
+
+    #[tokio::test]
+    async fn a_detached_context_cannot_start_a_child() {
+        use adam_runtime::NoopSink;
+        let ctx = ToolCtx::detached("t", "call_1", Arc::new(NoopSink));
+        let error = ctx.start_child("child", "go").await.unwrap_err();
+        assert!(
+            matches!(&error, ToolError::Permanent(m) if m.contains("belongs to no runtime")),
+            "{error:?}"
+        );
     }
 
     #[test]

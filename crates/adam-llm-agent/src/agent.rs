@@ -702,6 +702,7 @@ impl LlmAgent {
             ctx.emitter(),
             ctx.cancel_token(),
             Arc::clone(&self.extensions),
+            Some(ctx.child_starter()),
         );
         let args = call.arguments.clone();
         let outcome: Result<ToolOutput, ToolError> = ctx

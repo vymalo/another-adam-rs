@@ -16,6 +16,7 @@ use adam_core::{RunId, RunRecord, RunStatus};
 
 use crate::agent::Inbound;
 use crate::envelope::Envelope;
+use crate::runtime::{Runtime, RuntimeError};
 
 /// [`Inbound::kind`] of the message a finished child sends its parent.
 ///
@@ -54,6 +55,58 @@ pub fn child_run_id(parent: RunId, key: &str) -> RunId {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     RunId(uuid::Builder::from_custom_bytes(bytes).into_uuid())
+}
+
+/// The right of one run to start its own children, as an owned, cloneable handle.
+///
+/// [`Ctx::child_starter`](crate::Ctx::child_starter) makes one from the runtime that is stepping the
+/// run, so code that runs inside a step (a tool of an `LlmAgent`, which cannot hold the `Ctx`) starts
+/// children on that very runtime without being given one. It can only start children *of that run*:
+/// [`start`](Self::start) is [`Runtime::start_child`] with the parent fixed.
+///
+/// It is transient: a step gets a new one, and holding on to it past the step keeps the runtime alive.
+#[derive(Clone)]
+pub struct ChildStarter {
+    runtime: Runtime,
+    parent: RunId,
+}
+
+impl std::fmt::Debug for ChildStarter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildStarter")
+            .field("parent", &self.parent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChildStarter {
+    pub(crate) fn new(runtime: Runtime, parent: RunId) -> Self {
+        Self { runtime, parent }
+    }
+
+    /// The run whose children this starts.
+    pub fn parent(&self) -> RunId {
+        self.parent
+    }
+
+    /// Start a run of `agent` as a child of [`parent`](Self::parent) under `id`: exactly
+    /// [`Runtime::start_child`], so it is idempotent (`false` when the id exists) and the agent must
+    /// be registered on this runtime, as an agent or as a starter.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::UnknownAgent`] for an agent this runtime does not know, and the store's
+    /// errors.
+    pub async fn start(
+        &self,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+    ) -> Result<bool, RuntimeError> {
+        self.runtime
+            .start_child(self.parent, id, agent, input)
+            .await
+    }
 }
 
 /// Where a child run stands, as far as its parent needs to know.

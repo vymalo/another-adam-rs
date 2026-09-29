@@ -1119,11 +1119,13 @@ What the design refuses to do, and why:
 * **No parallel fan-out yet.** An `LlmAgent` runs the calls of one model turn in order, and the first
   `AwaitRun` parks the run, so three subagent calls in one turn run one after the other. Starting all the
   children first and waiting for all of them needs `pending_wait` to hold several runs.
-* **No timeout on a child.** A parent waits as long as its child is open. A child that parks with no timer, for
-  instance because one of its tools asked the user something, waits for an answer nobody is placed to give
-  (`Limits` bound a running child, not a parked one). Give a child that a parent starts tools that do not
-  ask, or cancel it: the parent then gets the error result. A deadline for the wait belongs to the tool that
-  starts the child, and is a seam for the subagent slice.
+* **No timeout on a child, and no asking tools in a subagent.** A parent waits as long as its child is open. A
+  child that parks with no timer, for instance because one of its tools asked the user something, waits for
+  an answer nobody is placed to give (`Limits` bound a running child, not a parked one). The subagent binding
+  (`adam-assembly`) closes this at startup instead of at run time: a tool that can ask says so
+  (`Tool::asks_user()`), and `bind` refuses a subagent that has one, so the situation cannot arise from an
+  agent directory. A tool that returns `NeedsInput` without declaring it still parks its child, and a child
+  can still be cancelled by id: the parent then gets the error result.
 * **The output travels whole.** The child's output is the payload of the message, then the text of the tool
   result in the parent's history. Long histories are shortened for the model by `max_history_tokens` as for any
   tool output, but the stored conversation keeps it.
@@ -1134,6 +1136,13 @@ What the design refuses to do, and why:
   that predates them (it would fail the run as non-deterministic on replay). Roll the workers before the
   tools that start children are enabled. The other direction is safe: journals and states written before
   (`ToolError` without `AwaitRun`, `Conversation` with `pending_question`) load and replay in the new build.
+
+Code that runs inside a step but cannot hold the `Ctx`, such as a tool of an `LlmAgent`, starts a child through
+`Ctx::child_starter()`: an owned `ChildStarter` for the runtime that is stepping the run, which can start only
+children of that run (`start` is `start_child` with the parent fixed). `LlmAgent` hands it to every tool as
+`ToolCtx::start_child(agent, message)` (under `ToolCtx::child_run_id()`), so a tool needs no `Runtime` handle,
+and the child starts on the runtime that steps the parent, whichever process that is. The subagent tool of
+`adam-assembly` is exactly this call followed by `AwaitRun`; see [subagents](authoring.md#the-subagent-tool-s9).
 
 A hand-written `Agent` can wait for children too: start them with `start_child`, `Park` with a timer, and on
 the next step read `take_inbox()` for messages of kind `adam.run.finished` (`ChildStatus::from_notice`) and

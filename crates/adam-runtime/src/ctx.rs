@@ -11,9 +11,10 @@ use adam_core::{DynStore, JournalEntry, RunId, StoreError};
 
 use crate::agent::{AgentError, Inbound};
 use crate::cancel::CancelToken;
-use crate::child::ChildStatus;
+use crate::child::{ChildStarter, ChildStatus};
 use crate::clock::DynClock;
 use crate::events::{Artifact, DynEventSink, RunEvent};
+use crate::runtime::Runtime;
 
 /// Journal name of [`Ctx::now_journaled`].
 const NOW_STEP: &str = "ctx.now";
@@ -38,6 +39,7 @@ pub struct Ctx {
     clock: DynClock,
     cancel: CancelToken,
     emitter: Emitter,
+    runtime: Runtime,
 }
 
 /// A cloneable, owned handle for emitting [`RunEvent`]s of one run.
@@ -128,6 +130,8 @@ pub(crate) struct CtxParts {
     pub sink: DynEventSink,
     pub clock: DynClock,
     pub cancel: CancelToken,
+    /// The runtime that steps the run.
+    pub runtime: Runtime,
 }
 
 impl Ctx {
@@ -142,6 +146,7 @@ impl Ctx {
             store: p.store,
             clock: p.clock,
             cancel: p.cancel,
+            runtime: p.runtime,
             emitter: Emitter {
                 run: p.run,
                 agent: Arc::from(p.agent),
@@ -330,6 +335,12 @@ impl Ctx {
         Ok(Some(ChildStatus::from_record(&rec)))
     }
 
+    /// A handle for starting children of this run on the runtime that steps it: owned and cloneable,
+    /// so it can be moved into a [`Ctx::step`] closure (see [`ChildStarter`]).
+    pub fn child_starter(&self) -> ChildStarter {
+        ChildStarter::new(self.runtime.clone(), self.run)
+    }
+
     /// A handle on this transition's cancellation signal, cloneable and
     /// `'static`, so it can be moved into a [`Ctx::step`] closure or a spawned
     /// task (this `Ctx` cannot: `step` borrows it mutably). See [`CancelToken`].
@@ -395,6 +406,7 @@ mod tests {
 
     async fn ctx(sink: &CollectingSink) -> Ctx {
         let store: DynStore = Arc::new(MemoryStore::new());
+        let runtime = Runtime::builder(store.clone()).build();
         let run = store
             .create_run(adam_core::NewRun::new("a", serde_json::json!({})))
             .await
@@ -410,7 +422,29 @@ mod tests {
             sink: Arc::new(sink.clone()),
             clock: Arc::new(SystemClock),
             cancel: CancelToken::new(),
+            runtime,
         })
+    }
+
+    #[tokio::test]
+    async fn the_child_starter_starts_children_of_this_run_only() {
+        let sink = CollectingSink::new();
+        let ctx = ctx(&sink).await;
+        let starter = ctx.child_starter();
+        assert_eq!(starter.parent(), ctx.run_id());
+        assert!(format!("{starter:?}").contains("ChildStarter"));
+        // The runtime behind it knows no agent, and says so (a registered one is covered by the
+        // runtime and `adam-llm-agent` integration tests).
+        let refused = starter
+            .clone()
+            .start(
+                RunId::new(),
+                "nobody",
+                Inbound::new("message", serde_json::json!({})),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, crate::RuntimeError::UnknownAgent(name) if name == "nobody"));
     }
 
     #[tokio::test]

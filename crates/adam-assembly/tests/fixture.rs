@@ -121,7 +121,11 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
             "ask_user",
             "linear__list_issues",
             "load_skill",
-            "read_skill_file"
+            "read_skill_file",
+            // One tool per subagent, named after it, after everything else.
+            "legacy",
+            "researcher",
+            "reviewer"
         ]
     );
     assert_eq!(coder.skills, ["release-notes", "triage"]);
@@ -163,7 +167,10 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
     // A subagent that lists no tools has none, and one that nests keeps its own.
     assert!(info("coder/legacy").tools.is_empty());
     // A subagent has its own skills (`web-search`, no files) and inherits none of the parent's.
-    assert_eq!(info("coder/researcher").tools, ["fetch_page", "load_skill"]);
+    assert_eq!(
+        info("coder/researcher").tools,
+        ["fetch_page", "load_skill", "summarizer"]
+    );
     assert_eq!(info("coder/researcher").skills, ["web-search"]);
     assert!(info("coder/reviewer").skills.is_empty());
     assert!(info("coder/researcher/summarizer").tools.is_empty());
@@ -231,7 +238,10 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
             "ask_user",
             "linear__list_issues",
             "load_skill",
-            "read_skill_file"
+            "read_skill_file",
+            "legacy",
+            "researcher",
+            "reviewer"
         ]
     );
     // The tool ran and its output went back to the model.

@@ -212,6 +212,7 @@ dependencies = [
  "adam-llm-agent",
  "adam-model",
  "adam-runtime",
+ "adam-store-postgres",
  "async-trait",
  "proptest",
  "serde_json",

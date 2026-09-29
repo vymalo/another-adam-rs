@@ -3,7 +3,7 @@
 Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
 facade), S3 (`adam-coder` tools through `#[tool]`), S4 (`adam-agent-fs`, the parser and validator of
 agent directories), S5 (the `build.rs` codegen and `adam::include_agent!()`), S6 (`adam-assembly`,
-which binds a manifest to `LlmAgent`s), S7 (skills at run time) and S8 (durable child runs in the runtime) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+which binds a manifest to `LlmAgent`s), S7 (skills at run time), S8 (durable child runs in the runtime) and S9 (subagents as tools) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
 the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
@@ -384,8 +384,10 @@ of `adam-llm-agent`.
 * **Return:** `Result<T, E>` or a bare `T`, with `T: IntoToolOutput` and `E: Into<ToolError>`.
 * **Options:** `name = "..."`, `type = Ident`, `strict` (`deny_unknown_fields`, which also closes the
   schema), `classify` (the error is `adam_error::Classify`: retryable becomes `ToolError::Transient`,
-  the rest `Permanent`) and `crate = path` (default `::adam`; `::adam_llm_agent` for a crate that does
-  not use the facade). Reserved for later: `approval` (roadmap 5) and `subagents = false`.
+  the rest `Permanent`), `asks_user` (the tool can end a call with `ToolError::NeedsInput`: the
+  generated `Tool::asks_user` says `true`, and `bind` refuses it on a subagent, added in S9) and
+  `crate = path` (default `::adam`; `::adam_llm_agent` for a crate that does not use the facade).
+  Reserved for later: `approval` (roadmap 5).
 * **Bad model input is the model's problem:** a deserialization failure becomes `ToolOutput::error`
   (as `Tool::call` already documents), so the model can correct itself; the function never sees it.
 * **State is checked at build:** `Tool::required_state` names the `State<T>` types a tool needs, and
@@ -520,16 +522,16 @@ is a tool result like any other (the client guide asks for skill content to be e
 Preloading is the way to keep a skill for the whole run until the loop's history fitting learns to
 protect it.
 
-## Subagents at run time (S8 built, S9 planned)
+## Subagents at run time (S8 and S9 built)
 
 **Subagents** are child runs. Each local subagent is its own `LlmAgent` registered on the same
 `Runtime` as `<root>/<sub>`. The parent sees one tool per subagent (decision D5), with input
 `{ message }`. The child never sees the parent's history.
 
-Slice S8, the child runs in the runtime and in `LlmAgent`, is **built**; the tool that hands the model a
-subagent (`SubagentTool`, slice S9) is not. The diagram below is what S8 implements and its tests exercise with a
-stand-in tool; the full design, the failure interleavings and their tests are in
-[Child runs](architecture.md#child-runs) in the architecture.
+Slice S8 is the child runs in the runtime and in `LlmAgent`; slice S9 is the tool that hands the model a
+subagent (`SubagentTool`) and the binding that adds it. The diagrams below are the whole path; the full design
+of the runtime half, the failure interleavings and their tests are in [Child runs](architecture.md#child-runs)
+in the architecture.
 
 ```mermaid
 sequenceDiagram
@@ -537,8 +539,8 @@ sequenceDiagram
   participant J as Journal step tool:CALL_ID
   participant R as Runtime
   participant C as Child run coder/reviewer
-  P->>J: subagent tool called
-  J->>R: start_child with id from parent run and call id
+  P->>J: subagent tool called with message
+  J->>R: ToolCtx::start_child, id from parent run and call id
   J-->>P: AwaitRun, journaled
   P->>R: Park with a timer as fallback
   R->>C: claim, step until Done or Fail
@@ -576,10 +578,50 @@ idempotent, so the only side effects of the call are that creation and reads. Wh
 The id is a UUID version 8 from a SHA-256 (as the A2A adapter derives task ids), not the UUIDv5 the first
 sketch named: no new dependency, and one derivation convention in the workspace.
 
-Cancelling a parent does not cancel its children in v1; they finish within their own limits and their message
-to the finished parent is dropped (a cascade needs `Store::children`, see the architecture). A model that
-calls several subagents in one turn gets them one after the other. For S9: `SubagentTool` holds a `Runtime`
-handle, calls `start_child(ctx.run_id(), ctx.child_run_id(), "<root>/<sub>", ..)` and returns `AwaitRun`.
+### The subagent tool (S9)
+
+`AgentDef::bind` gives each agent one [`SubagentTool`](../crates/adam-assembly/README.md#subagents) per local
+subagent, after its own tools and its skills' tools, in the order of the manifest. The contract:
+
+* **Name and shape.** The tool is named after the subagent (a name that is already a valid tool name:
+  `a-z`, `0-9`, `-`, `_`). Its input is `{ "message": string }`, required, no other property. Its description
+  is the subagent's `description` followed by "The agent does not see this conversation; put everything it
+  needs in `message`."
+* **A call** starts the subagent as a child run of the parent's run, with `message` as its first user message,
+  and returns `AwaitRun`. The parent parks; the child's final **text** is the tool result, or an error result
+  (`the run failed: ...`) when the child failed, and the parent goes on either way. A missing, non-string or
+  blank `message` is an error result and starts nothing.
+* **How the tool reaches the runtime.** It does not hold one. `Ctx::child_starter()` gives the step a
+  `ChildStarter` (the runtime that steps the run, and the run as the only possible parent), `LlmAgent` puts it
+  in each `ToolCtx`, and the tool calls `ToolCtx::start_child(agent, message)`. So there is no handle to attach
+  and none to forget, and the child starts on the runtime that steps the parent, in a split deployment too. What
+  the runtime needs is the child's agent, registered under `<root>/<sub>` (`Assembly::register` does it; a
+  process that steps the parent without knowing the child gets a permanent error result naming the agent).
+* **Least privilege.** A subagent's tools are the ones its own `tools:` lists, from the same registered set, and
+  none when it lists none. It gets nothing of its parent's, including the parent's subagent tools. A tool the
+  parent has and the child does not list is unknown to the child (its model is not offered it, and a call to it
+  is answered `unknown tool`).
+* **Limits per child.** The child's own `limits:` apply to the child's run: its turns and tool calls are its
+  own and do not count against the parent, and a child that goes over fails, which the parent sees as an error
+  result.
+* **Name clashes are build errors** (`Error::SubagentToolClash`, with the subagent's `Origin`): a subagent
+  named like a tool of its parent (registered and selected, or `load_skill`/`read_skill_file` when the parent
+  has skills), or like another subagent of the parent. A registered tool the parent does not select is no clash.
+* **No asking tools in a subagent.** A subagent runs as a child of another run, so nobody could answer a
+  question, and a run that asks parks until someone does. The parent would wait for ever, polling. A tool
+  declares that it can ask with `Tool::asks_user()` (`#[tool(asks_user)]`, `FnTool::asking_user()`), and `bind`
+  refuses a subagent whose resolved tools include one (`Error::SubagentAsksUser`), also when it got the tool
+  through `*` or a pattern. A bind-time refusal was chosen over a deadline on the child because it costs
+  nothing at run time, cannot fire in the middle of a run, and tells the author what to change; a deadline
+  would only turn "waits for ever" into "fails late". It is a declaration: a tool that returns `NeedsInput`
+  without saying so would still park its child, so mark every tool that can.
+* **Limits of the design.** The calls of one model turn run one after another, so two subagents called in the
+  same turn run one after the other (fan-out needs several pending runs at once and is out of scope). Only the
+  child's text travels back: its artifacts stay on the child's run. The child starts with an empty history and
+  cannot be continued (a `task_id` is a later question). Cancelling the parent does not cancel the child (a cascade needs
+  `Store::children`, see the architecture).
+
+Remote subagents (`a2a:`, S9b) will use the same tool shape and join the same name check.
 
 Remote subagents (`a2a:`) use the same tool shape: a journaled A2A `SendMessage`, then a park on the
 remote task id and a poll on the timer.
@@ -642,13 +684,13 @@ stateDiagram-v2
 * **State and limits.** `state(Arc<T>)` reaches every agent's tools; a tool whose `required_state` is
   missing fails `model(..)` with the agent's name. The frontmatter `limits` replace the loop's defaults
   key by key.
-* **Subagents are defined, not yet callable.** Each local subagent becomes an `LlmAgent` named
-  `<parent>/<name>` with its own prompt, tools, alias and limits, and `Assembly::register` registers all of
-  them on the runtime. The runtime side of a durable child run is built (S8); the tool that starts one is S9; remote subagents are data
-  (`Assembly::remotes()`) until S9b. `mcp.json` stays in the manifest for S11. Skills are bound (S7, see
-  the section above): the catalog and the two tools are added while `bind` resolves an agent, so the
-  prompt and the tool list `BoundDef::build` hands to `LlmAgent` are already final. The tools of S9 and
-  S11 plug into `BoundDef::build`, the one function that makes an `LlmAgent` from a bound agent.
+* **Subagents.** Each local subagent becomes an `LlmAgent` named `<parent>/<name>` with its own prompt,
+  tools, alias and limits, and `Assembly::register` registers all of them on the runtime. Its parent gets a
+  `SubagentTool` (S9, see [Subagents at run time](#subagents-at-run-time-s8-and-s9-built)); remote subagents
+  are data (`Assembly::remotes()`) until S9b. `mcp.json` stays in the manifest for S11. Skills (S7) and
+  subagent tools (S9) are added while `bind` resolves an agent, so the prompt and the tool list
+  `BoundDef::build` hands to `LlmAgent` are already final and `AgentInfo::tools` is what the model is
+  offered. The tools of S9b and S11 join them at `bind` too.
 * **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
   `adam_a2a::AgentCardConfig`; the public URL and the version belong to the deployment.
 
@@ -682,7 +724,7 @@ the in-memory store).
 |---|---|---|
 | `adam-macros` | proc-macro | **built (S2)**: `#[tool]`; a thin shim over a pure, unit-tested `expand` function |
 | `adam-agent-fs` | lib | **built (S4, S5)**: frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` with the `Dir` and `EmbeddedPackage` implementations, the digest of a manifest, and the `build.rs` codegen behind the feature `build`. No async, no runtime dependency |
-| `adam-assembly` | lib | **built (S6, S7)**: `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s (root and local subagents); `{{var}}` templating; the skills catalog with `load_skill` and `read_skill_file`; the A2A card behind feature `a2a`. Planned: `SubagentTool`, dev reload |
+| `adam-assembly` | lib | **built (S6, S7, S9)**: `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s (root and local subagents); `{{var}}` templating; the skills catalog with `load_skill` and `read_skill_file`; `SubagentTool`, one per subagent; the A2A card behind feature `a2a`. Planned: remote subagents, dev reload |
 | `adam-mcp` | lib | MCP client (the official Rust SDK): MCP tools as `Tool`s, `${VAR}` expansion, fail closed |
 | `adam` | facade | **built (S2, S5, S6)**: `prelude`, the macro, feature `macros` (default), `include_agent!`, `adam::agent_fs`, `AgentDef` and its stages, `adam::assembly`, feature `a2a`. Planned: features `mcp`, `dev` |
 | `adam-agent-fixture` | test fixture | **built (S5)**, not published: a `build.rs` plus `include_agent!()` over the `adam-agent-fs` test fixture, and the tests that compare embedded and directory |
@@ -765,5 +807,5 @@ type already sets the pattern).
 | S6 | `adam-assembly`: `AgentDef`, templating, tool binding, models, the card | built |
 | S7 | skills at run time: the catalog, `load_skill`, `read_skill_file`, `preload_skills` | built |
 | S8 | child runs in the runtime: `start_child`, the finished message, `Ctx::child_status`, `ToolError::AwaitRun`, `pending_wait` | built |
-| S9 | subagents: `SubagentTool` and its binding | planned |
+| S9 | subagents: `SubagentTool`, its binding, name-clash and asks-user checks, `ToolCtx::start_child` | built |
 | S10, S11 | dev reload; `mcp.json` tools | planned |

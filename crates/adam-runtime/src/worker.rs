@@ -362,6 +362,9 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
         sink: inner.sink.clone(),
         clock: inner.clock.clone(),
         cancel,
+        runtime: Runtime {
+            inner: Arc::clone(inner),
+        },
     });
     let stepped = AssertUnwindSafe(agent.step(&mut ctx, env.agent.clone()))
         .catch_unwind()

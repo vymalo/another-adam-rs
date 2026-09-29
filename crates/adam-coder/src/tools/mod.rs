@@ -226,6 +226,10 @@ impl Tool for Redacting {
         self.inner.required_state()
     }
 
+    fn asks_user(&self) -> bool {
+        self.inner.asks_user()
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         let r = &self.redactor;
         match self.inner.call(ctx, args).await {
