@@ -386,8 +386,8 @@ node tools/docs-check/check-docs.mjs
 
 1. ~~Store trait and adapters~~ (this repo)
 2. ~~Run state machine and `ctx.step` journaling~~ (`adam-runtime`)
-3. `#[tool]` macro (schemars)
-4. `build.rs` discovery of `agent/` (instructions, tools, skills, subagents)
+3. `#[tool]` macro (schemars), designed in [`docs/authoring.md`](docs/authoring.md)
+4. `build.rs` discovery of `agent/` (instructions, skills, subagents, `mcp.json`), designed in [`docs/authoring.md`](docs/authoring.md)
 5. Parking, approvals, schedules
 6. Dev TUI (`cargo adam dev`)
 7. Host adapters (axum/tower), channels, sandboxes
