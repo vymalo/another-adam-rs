@@ -707,6 +707,37 @@ async fn card_and_healthz_stay_open() {
     );
 }
 
+/// `A2aServer::health_router` is the probe route alone: `/healthz` answers, and nothing of A2A is
+/// there (a worker with no front still answers its probes).
+#[tokio::test]
+async fn health_router_serves_healthz_and_nothing_else() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, A2aServer::health_router())
+            .await
+            .unwrap();
+    });
+    let health = raw(addr, "GET", "/healthz", &[], "").await;
+    assert_eq!(health.status, 200);
+    assert_eq!(
+        health.body.trim_end_matches('\n').lines().last(),
+        Some("ok")
+    );
+    for (method, path) in [
+        ("GET", "/.well-known/agent-card.json"),
+        ("POST", "/"),
+        ("POST", "/healthz"),
+    ] {
+        let response = raw(addr, method, path, &[], "{}").await;
+        assert!(
+            response.status == 404 || response.status == 405,
+            "{method} {path}: {}",
+            response.status
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_client_gets_a_typed_error_on_a_bad_token() {
     let server = TestServer::start(TestServer::bearer()).await;

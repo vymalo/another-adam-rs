@@ -46,6 +46,8 @@ Protocol notes (details in the crate docs, `src/lib.rs`):
   `GetTask`, `CancelTask`, `SubscribeToTask`; task states on the wire are
   `TASK_STATE_*`. `ListTasks` is unsupported and push-notification methods
   return `PushNotificationNotSupported`.
+* `A2aServer::health_router()` is the `/healthz` route alone (200, `ok`), for a process that
+  answers probes but serves no A2A, such as a worker.
 * Every route except the agent card and `/healthz` answers 401 without a valid
   token. The middleware strips any client-sent identity header and injects the
   trusted `Caller`.
