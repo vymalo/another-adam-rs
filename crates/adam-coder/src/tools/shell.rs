@@ -293,15 +293,17 @@ mod tests {
     async fn a_timeout_kills_the_process_group_and_reports_it() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("survivor");
+        // The timeout leaves a login shell on a loaded machine time to start and
+        // print (400 ms did not, once, in CI); the grandchild outlives it by far.
+        let timeout = Duration::from_secs(2);
+        let grandchild_delay = 4;
         // A background grandchild that would create a file if it survived.
         let script = format!(
-            "(sleep 3; touch {}) & echo started; sleep 60",
+            "(sleep {grandchild_delay}; touch {}) & echo started; sleep 60",
             marker.display()
         );
         let started = std::time::Instant::now();
-        let out = run_shell(dir.path(), &script, Duration::from_millis(400), 1024)
-            .await
-            .unwrap();
+        let out = run_shell(dir.path(), &script, timeout, 1024).await.unwrap();
         assert!(out.timed_out, "{out:?}");
         assert!(!out.passed());
         assert!(out.tail.contains("started"), "{:?}", out.tail);
@@ -309,7 +311,10 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "returned promptly, not after the sleeps"
         );
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        // The grandchild started before the timeout, so a survivor would have
+        // touched the marker by timeout + its delay; wait past that.
+        let deadline = started + timeout + Duration::from_secs(grandchild_delay + 1);
+        tokio::time::sleep_until(deadline.into()).await;
         assert!(!marker.exists(), "the grandchild was killed with the group");
     }
 
