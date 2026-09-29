@@ -31,6 +31,15 @@ main (`deploy/coder/bump-tag.sh`, also run as a dry run on pull requests).
 The orchestrator holds one of the bearer tokens (its agent list names the
 environment variable it reads it from).
 
+## Role
+
+`config.role` (env `ROLE`) is empty by default: the chart does not render `ROLE`, and the
+binary runs `all`, the A2A server and the workers in one pod. Set it to `control-plane` or
+`worker` to make the pod run only that half (a worker answers `/healthz` on the same port,
+so the probes keep working, and serves no A2A). The chart still deploys **one**
+StatefulSet: it does not split the deployment into a front and a worker workload. See the
+crate README (`crates/adam-coder/README.md`, "Roles") for what each role starts and needs.
+
 ## Repositories
 
 `config.allowedRepoHosts` (default `github.com`; env `ALLOWED_REPO_HOSTS`) lists

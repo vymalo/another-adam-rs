@@ -51,6 +51,7 @@ check "the ExternalSecret key is prod/meta/test-app" has 'key: prod/meta/test-ap
 check "no Secret object is rendered (no plaintext secrets)" lacks '^kind: Secret$'
 check "no token-looking value in the render" lacks '(ghp_|github_pat_|sk-[A-Za-z0-9]{8})'
 check "the image tag comes from values" has 'image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"'
+check "ROLE is not rendered by default (the binary runs all)" lacks 'name: ROLE'
 check "the agent card URL is the in-cluster Service" has 'http://coder.coder-ns.svc.cluster.local:8080/'
 
 check "repositories are restricted to github.com by default" has 'name: ALLOWED_REPO_HOSTS'
@@ -72,5 +73,10 @@ helm template coder "$chart" --namespace coder-ns \
   --set config.githubApiUrl=https://ghe.example.com/api/v3 > "$out"
 check "the repository allowlist is values-driven and comma-joined" has 'value: "github.com,ghe.example.com:8443"'
 check "the GitHub API URL is values-driven" has 'value: "https://ghe.example.com/api/v3"'
+
+helm template coder "$chart" --namespace coder-ns --set config.role=worker > "$out"
+check "ROLE is rendered when config.role is set" has 'name: ROLE'
+check "ROLE carries the value" has 'value: "worker"'
+check "the probes still use /healthz for a worker" count 'path: /healthz' 3
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

@@ -21,6 +21,11 @@ replicaCount: 1
 # Environment of the binary (see crates/adam-coder/src/config.rs). Secrets are
 # not here: they come from the ExternalSecret below.
 config:
+  # What the process runs: all, control-plane or worker (ROLE). Empty leaves ROLE
+  # unset, and the binary runs `all`: the A2A server and the workers in one
+  # process. This chart still deploys one StatefulSet; a role other than `all`
+  # only changes what that pod runs, it does not split the deployment.
+  role: ""
   # OpenAI-compatible gateway, with its /v1 prefix.
   modelBaseUrl: "https://gateway.example.invalid/v1"
   # Model alias of the agent, and the one OpenCode uses through the same gateway.

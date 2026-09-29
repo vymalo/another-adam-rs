@@ -48,6 +48,10 @@ spec:
               value: "0.0.0.0:8080"
             - name: WORKSPACE_ROOT
               value: /work
+            {{- with .Values.config.role }}
+            - name: ROLE
+              value: {{ . | quote }}
+            {{- end }}
             - name: PUBLIC_URL
               value: {{ include "coder.publicUrl" . | quote }}
             - name: MODEL_BASE_URL
