@@ -19,6 +19,7 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.build()` |
+| `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection) |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec` and `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` |
 | `ToolOutput` | `text`, `error`, `with_artifact` |
@@ -40,6 +41,11 @@ let agent = LlmAgent::builder("assistant", Arc::new(MockModel::new()), "my-model
 // register it: Runtime::builder(store).agent(agent).build()
 // start a run: runtime.start("assistant", user_message("hello"), None)
 ```
+
+A process that only accepts requests registers `LlmStarter::new("assistant")`
+with `RuntimeBuilder::starter` instead, and a worker with the `LlmAgent`
+steps the runs (see *Starting without stepping* in
+[`adam-runtime`](../adam-runtime/README.md)).
 
 A complete `Tool` implementation is in the crate docs (`src/lib.rs`).
 
@@ -75,7 +81,7 @@ None.
 ## Tests
 
 `tests/llm_agent.rs` is a behavioural suite over a scripted `MockModel` and
-`MemoryStore` (tool loop, retries and rate limits, limits, replay after a
+`MemoryStore` (`a_starter_inits_exactly_like_the_agent`, tool loop, retries and rate limits, limits, replay after a
 crash, `NeedsInput` parking, cancellation, history truncation). Property tests
 of the truncation are in `src/history.rs`; the journal record of a model
 failure is tested in `src/agent.rs`

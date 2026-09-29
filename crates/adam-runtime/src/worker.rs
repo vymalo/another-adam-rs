@@ -47,7 +47,17 @@ impl Runtime {
         let mut wake = inner.wake.subscribe();
         let mut tasks: JoinSet<()> = JoinSet::new();
         let in_flight: InFlight = Arc::default();
-        let agents: Vec<String> = inner.agents.keys().cloned().collect();
+        // Only full agents are claimed: a starter-only registration can start
+        // a run but has no `step`, so its runs are left to a worker that has.
+        let agents: Vec<String> = inner
+            .agents
+            .iter()
+            .filter(|(_, r)| r.agent().is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if agents.is_empty() {
+            tracing::warn!("no agent to step is registered, this worker claims nothing");
+        }
 
         loop {
             if shutdown.as_mut().now_or_never().is_some() {
@@ -274,7 +284,11 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
             return true;
         }
     };
-    let Some(agent) = inner.agents.get(&rec.agent).cloned() else {
+    let Some(agent) = inner
+        .agents
+        .get(&rec.agent)
+        .and_then(|r| r.agent().cloned())
+    else {
         tracing::error!(agent = %rec.agent, "claimed a run of an unregistered agent");
         return true;
     };

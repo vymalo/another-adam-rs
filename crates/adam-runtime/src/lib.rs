@@ -6,6 +6,14 @@
 //! after every transition, compare-and-swap on the run's version, so a worker
 //! that dies loses nothing: another worker resumes from the last commit.
 //!
+//! # Starting without stepping
+//!
+//! Starting a run needs only a name and the initial state
+//! ([`AgentStarter`]); stepping it needs the whole [`Agent`]. A process that
+//! only accepts requests registers a starter with [`RuntimeBuilder::starter`]
+//! and holds none of the agent's dependencies; workers register the agent
+//! under the same name and step what the front started.
+//!
 //! # Side effects and replay
 //!
 //! `step` may run again after a crash, a lost lease or a retry. Side effects
@@ -67,7 +75,7 @@ mod runtime;
 mod worker;
 
 pub use adam_error::{Classify, ErrorClass};
-pub use agent::{Agent, AgentError, Inbound, Transition};
+pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
 pub use cancel::CancelToken;
 pub use clock::{Clock, DynClock, ManualClock, SystemClock};
 pub use ctx::{Ctx, Emitter};

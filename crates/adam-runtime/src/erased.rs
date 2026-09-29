@@ -5,13 +5,18 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::agent::{Agent, AgentError, Inbound, Transition};
+use crate::agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
 use crate::ctx::Ctx;
 
-#[async_trait]
-pub(crate) trait ErasedAgent: Send + Sync {
+/// What starting a run needs: a name and the initial state.
+pub(crate) trait ErasedStarter: Send + Sync {
     fn name(&self) -> &str;
     fn init(&self, input: Inbound) -> Result<Value, AgentError>;
+}
+
+/// What stepping a run needs on top of starting it.
+#[async_trait]
+pub(crate) trait ErasedAgent: ErasedStarter {
     async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError>;
 }
 
@@ -22,8 +27,7 @@ fn encode<S: serde::Serialize>(state: &S) -> Result<Value, AgentError> {
         .map_err(|e| AgentError::permanent("agent state is not serializable").with_source(e))
 }
 
-#[async_trait]
-impl<A: Agent> ErasedAgent for Erased<A> {
+impl<A: Agent> ErasedStarter for Erased<A> {
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -31,7 +35,23 @@ impl<A: Agent> ErasedAgent for Erased<A> {
     fn init(&self, input: Inbound) -> Result<Value, AgentError> {
         encode(&self.0.init(input)?)
     }
+}
 
+/// A start-only registration: no `step`.
+pub(crate) struct StarterOnly<S>(pub S);
+
+impl<S: AgentStarter> ErasedStarter for StarterOnly<S> {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn init(&self, input: Inbound) -> Result<Value, AgentError> {
+        encode(&self.0.init(input)?)
+    }
+}
+
+#[async_trait]
+impl<A: Agent> ErasedAgent for Erased<A> {
     async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError> {
         let state: A::State = serde_json::from_value(state).map_err(|e| {
             AgentError::permanent("stored agent state does not decode").with_source(e)

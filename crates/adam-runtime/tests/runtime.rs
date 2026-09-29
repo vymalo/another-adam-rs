@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
 use adam_runtime::{
-    Agent, AgentError, BroadcastSink, Classify, Clock, CollectingSink, Ctx, Inbound,
+    Agent, AgentError, AgentStarter, BroadcastSink, Classify, Clock, CollectingSink, Ctx, Inbound,
     MAX_RETRY_AFTER, ManualClock, RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder,
     RuntimeError, Transition,
 };
@@ -120,6 +120,22 @@ impl Agent for FnAgent {
 
     async fn step(&self, ctx: &mut Ctx, state: Value) -> StepResult {
         (self.step)(ctx, state).await
+    }
+}
+
+/// A start-only registration whose state is the start payload, like
+/// [`FnAgent`].
+struct JsonStarter(String);
+
+impl AgentStarter for JsonStarter {
+    type State = Value;
+
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn init(&self, input: Inbound) -> Result<Value, AgentError> {
+        Ok(input.payload)
     }
 }
 
@@ -1440,6 +1456,93 @@ mod cases {
         assert_eq!(rt.agent_names(), vec![name]);
     }
 
+    /// A start-only runtime (`RuntimeBuilder::starter`) creates runs but never
+    /// steps them; a runtime with the full agent over the same store does.
+    pub async fn a_starter_only_runtime_starts_and_a_full_runtime_steps(store: DynStore) {
+        let name = uniq("starter");
+        let agent = fn_agent(
+            &name,
+            step_fn(|_ctx, state| {
+                async move {
+                    Ok(Transition::Done {
+                        state,
+                        output: json!("stepped"),
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let front = Runtime::builder(store.clone())
+            .starter(JsonStarter(name.clone()))
+            .worker_id(uniq("front"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        assert_eq!(front.agent_names(), vec![name.clone()]);
+        assert!(matches!(
+            front.start("nobody", inbound(), None).await,
+            Err(RuntimeError::UnknownAgent(n)) if n == "nobody"
+        ));
+
+        // The front starts a run and keeps it Runnable however long its worker
+        // loop polls: it has nothing to step it with.
+        let run = front
+            .start(&name, Inbound::new("start", json!({"k": 1})), None)
+            .await
+            .unwrap();
+        let idle = spawn_worker(&front);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let view = front.view(run).await.unwrap().unwrap();
+        idle.stop().await;
+        assert_eq!(view.status, RunStatus::Runnable);
+        assert_eq!(view.agent, name);
+        assert_eq!(view.state, json!({"k": 1}));
+        let version = view.version;
+
+        // A conversation start and an idempotent start work the same way.
+        let by_id = RunId::new();
+        assert!(
+            front
+                .start_with_id(by_id, &name, inbound(), Some(&uniq("conv")))
+                .await
+                .unwrap()
+        );
+
+        // A second runtime with the full agent, over the same store, steps it.
+        let worker = runtime(&store, &agent);
+        let stepping = spawn_worker(&worker);
+        let done = wait_done(&worker, run).await;
+        wait_done(&worker, by_id).await;
+        stepping.stop().await;
+        assert_eq!(done.output, Some(json!("stepped")));
+        assert!(done.version > version);
+        assert_eq!(done.state, json!({"k": 1}));
+
+        // The last registration of a name wins, whichever kind it is.
+        let agent_last = Runtime::builder(store.clone())
+            .starter(JsonStarter(name.clone()))
+            .agent(agent.clone())
+            .worker_id(uniq("agent-last"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let run = agent_last.start(&name, inbound(), None).await.unwrap();
+        let w = spawn_worker(&agent_last);
+        wait_done(&agent_last, run).await;
+        w.stop().await;
+
+        let starter_last = Runtime::builder(store.clone())
+            .agent(agent)
+            .starter(JsonStarter(name.clone()))
+            .worker_id(uniq("starter-last"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let run = starter_last.start(&name, inbound(), None).await.unwrap();
+        let w = spawn_worker(&starter_last);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let view = starter_last.view(run).await.unwrap().unwrap();
+        w.stop().await;
+        assert_eq!(view.status, RunStatus::Runnable);
+    }
+
     /// Events, durable artifacts, and reconstruction after a restart.
     pub async fn events_and_durable_artifacts(store: DynStore) {
         let name = uniq("events");
@@ -2526,6 +2629,7 @@ macro_rules! runtime_suite {
                 conversation_delivers_to_the_open_run,
                 start_with_id_is_idempotent,
                 api_errors,
+                a_starter_only_runtime_starts_and_a_full_runtime_steps,
                 events_and_durable_artifacts,
                 broadcast_sink_streams_a_run,
                 panic_is_a_transient_failure,

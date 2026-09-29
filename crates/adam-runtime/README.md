@@ -19,10 +19,11 @@ over A2A).
 | Item | What |
 |---|---|
 | `Agent` (trait) | `name`, `init(Inbound) -> State`, `async step(&mut Ctx, State) -> Transition<State>` |
+| `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, no `step`; `State` is only `Serialize`. See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::cancelled` / `CancelToken` observe a cancel |
-| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `start`, `start_with_id`, `deliver`, `cancel`, `view`, `run_worker(shutdown)` |
+| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name) |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`) |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
@@ -46,6 +47,34 @@ A recorded step outcome is never re-executed, but a side effect is
 at-least-once (a crash between the effect and its journal write runs it
 again): keep effects idempotent. The lifecycle and guarantees are in the crate
 docs (`src/lib.rs`) and the [root README](../../README.md#the-model).
+
+## Starting without stepping
+
+Starting a run needs only a name and the initial state; stepping it needs the
+whole agent, which usually holds a model, credentials and a sandbox. A process
+that only accepts requests (an A2A front) registers an `AgentStarter` with
+`RuntimeBuilder::starter` and holds none of those. A worker registers the
+`Agent` under the same name and steps what the front started, over the same
+store.
+
+* `start` and `start_with_id` work for both kinds of registration, and an
+  unknown name is still `UnknownAgent`.
+* `run_worker` claims only the names registered with `.agent(..)`. A runtime
+  with starters only warns once and claims nothing, so a run of a
+  starter-only name stays `Runnable` until a worker with the agent takes it.
+* The last registration of a name wins, whichever kind it is, with a warning.
+* `starter.init` must return the state the agent of that name decodes; the
+  runtime stores it as JSON and cannot check the types agree.
+  `adam_llm_agent::LlmStarter` and `adam_coder::CoderStarter` are the two in
+  this workspace.
+
+```rust
+let runtime = Runtime::builder(store)   // store: adam_core::DynStore
+    .starter(MyStarter)                 // MyStarter: impl AgentStarter
+    .build();
+let run = runtime.start("my-agent", inbound, None).await?;
+// a worker process: Runtime::builder(store).agent(MyAgent)...run_worker(..)
+```
 
 ## Errors
 
@@ -86,7 +115,8 @@ No Cargo features, no environment variables at runtime.
 
 ## Tests
 
-`tests/runtime.rs` is one behavioural suite run against `MemoryStore` always,
+`tests/runtime.rs` is one behavioural suite (including
+`a_starter_only_runtime_starts_and_a_full_runtime_steps`) run against `MemoryStore` always,
 against PostgreSQL and against MongoDB when their variables are set. Unit
 tests sit in `src/cancel.rs`, `ctx.rs`, `events.rs` and `retry.rs`, and the
 class tables of `AgentError` and `RuntimeError` in `src/agent.rs`

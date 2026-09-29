@@ -12,7 +12,9 @@ use adam_a2a::{
 };
 use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::{DynStore, MemoryStore};
-use adam_runtime::{Agent, AgentError, BroadcastSink, Ctx, Inbound, RunEvent, Runtime, Transition};
+use adam_runtime::{
+    Agent, AgentError, AgentStarter, BroadcastSink, Ctx, Inbound, RunEvent, Runtime, Transition,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -28,6 +30,34 @@ use tokio::sync::oneshot;
 /// * `[reject]`: `init` refuses the start message, like an agent that cannot read it.
 struct Scripted;
 
+/// The start-only half of [`Scripted`], for a front that never steps a run.
+struct ScriptedStarter;
+
+impl AgentStarter for ScriptedStarter {
+    type State = Value;
+
+    fn name(&self) -> &str {
+        "scripted"
+    }
+
+    fn init(&self, input: Inbound) -> Result<Value, AgentError> {
+        scripted_init(input)
+    }
+}
+
+fn scripted_init(input: Inbound) -> Result<Value, AgentError> {
+    let text = input.payload["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    if text.contains("[reject]") {
+        return Err(AgentError::permanent(
+            "unusable start message: it asks for something this agent cannot do",
+        ));
+    }
+    Ok(json!({"text": text, "phase": 0}))
+}
+
 #[async_trait]
 impl Agent for Scripted {
     type State = Value;
@@ -37,16 +67,7 @@ impl Agent for Scripted {
     }
 
     fn init(&self, input: Inbound) -> Result<Value, AgentError> {
-        let text = input.payload["text"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        if text.contains("[reject]") {
-            return Err(AgentError::permanent(
-                "unusable start message: it asks for something this agent cannot do",
-            ));
-        }
-        Ok(json!({"text": text, "phase": 0}))
+        scripted_init(input)
     }
 
     async fn step(&self, ctx: &mut Ctx, mut state: Value) -> Result<Transition<Value>, AgentError> {
@@ -138,6 +159,24 @@ impl Rig {
         let events = BroadcastSink::default();
         let runtime = Runtime::builder(store.clone())
             .agent(Scripted)
+            .event_sink(events.clone())
+            .poll_interval(Duration::from_millis(10))
+            .build();
+        let backend = RuntimeTaskBackend::new(runtime.clone(), events, "scripted")
+            .with_poll_interval(Duration::from_millis(10));
+        Self {
+            store,
+            runtime,
+            backend,
+        }
+    }
+
+    /// A front that only accepts tasks: its runtime registers the start-only
+    /// half of the agent, so it can start runs but never steps them.
+    fn front_only(store: DynStore) -> Self {
+        let events = BroadcastSink::default();
+        let runtime = Runtime::builder(store.clone())
+            .starter(ScriptedStarter)
             .event_sink(events.clone())
             .poll_interval(Duration::from_millis(10))
             .build();
@@ -864,4 +903,40 @@ async fn an_init_rejection_is_a_32602_over_http() {
     assert!(text.contains("-32602"), "{text}");
     assert!(text.contains("unusable start message"), "{text}");
     assert!(!text.contains("-32603"), "{text}");
+}
+
+#[tokio::test]
+async fn a_starter_only_front_accepts_a_task_a_separate_worker_completes_it() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let front = Rig::front_only(store.clone());
+    let task = front
+        .backend
+        .submit(alice(), user("do it"), None, Some("ctx-1".into()))
+        .await
+        .expect("submit");
+    assert_eq!(task.status.state, TaskState::Submitted);
+
+    // The front's own worker loop has nothing to step the run with.
+    let idle = front.worker();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let still = front
+        .backend
+        .get(&alice(), &task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    idle.stop().await;
+    assert_eq!(still.status.state, TaskState::Submitted);
+
+    // A separate process with the full agent, over the same store, finishes it
+    // and the front reads the result from the durable record.
+    let back = Rig::over(store);
+    let worker = back.worker();
+    let done = wait_state(&front, &alice(), &task.id, TaskState::Completed).await;
+    worker.stop().await;
+    assert_eq!(done.id, task.id);
+    assert!(
+        front.backend.get(&bob(), &task.id).await.unwrap().is_none(),
+        "the front still enforces ownership"
+    );
 }
