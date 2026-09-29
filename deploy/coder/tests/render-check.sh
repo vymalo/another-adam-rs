@@ -49,6 +49,10 @@ check "no token-looking value in the render" lacks '(ghp_|github_pat_|sk-[A-Za-z
 check "the image tag comes from values" has 'image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"'
 check "the agent card URL is the in-cluster Service" has 'http://coder.coder-ns.svc.cluster.local:8080/'
 
+check "repositories are restricted to github.com by default" has 'name: ALLOWED_REPO_HOSTS'
+check "the default allowlist is exactly github.com" has 'value: "github.com"'
+check "local repositories are never enabled by the chart" lacks 'ALLOW_LOCAL_REPOS'
+
 # Overrides take effect (values-driven, not hard-coded).
 helm template coder "$chart" --namespace coder-ns \
   --set externalSecrets.properties.githubToken=my_prop \
@@ -57,5 +61,9 @@ helm template coder "$chart" --namespace coder-ns \
 check "ExternalSecret property names are values-driven" has 'property: my_prop'
 check "the allowed namespace is values-driven" has 'kubernetes.io/metadata.name: orchestrator'
 check "the storage class is values-driven" has 'storageClassName: "fast"'
+
+helm template coder "$chart" --namespace coder-ns \
+  --set 'config.allowedRepoHosts={github.com,ghe.example.com:8443}' > "$out"
+check "the repository allowlist is values-driven and comma-joined" has 'value: "github.com,ghe.example.com:8443"'
 
 [ "$fail" -eq 0 ] && echo "render checks passed" || { echo "render checks FAILED"; exit 1; }

@@ -7,7 +7,9 @@
 //! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required |
 //! | `MODEL` | model alias of the agent itself | required |
 //! | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
-//! | `GITHUB_TOKEN` | git push and pull request token | required |
+//! | `GITHUB_TOKEN` | git push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required |
+//! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them | `github.com` |
+//! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
 //! | `WORKSPACE_ROOT` | mirrors and worktrees (persistent storage) | `/work` |
 //! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required, non-empty (fail closed) |
 //! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required |
@@ -54,6 +56,10 @@ pub struct Config {
     pub opencode_model: String,
     /// `GITHUB_TOKEN`.
     pub github_token: SecretString,
+    /// `ALLOWED_REPO_HOSTS`, lowercased.
+    pub allowed_repo_hosts: Vec<String>,
+    /// `ALLOW_LOCAL_REPOS`.
+    pub allow_local_repos: bool,
     /// `WORKSPACE_ROOT`.
     pub workspace_root: PathBuf,
     /// `A2A_BEARER_TOKENS`.
@@ -87,6 +93,8 @@ impl std::fmt::Debug for Config {
             .field("model_base_url", &self.model_base_url)
             .field("model", &self.model)
             .field("opencode_model", &self.opencode_model)
+            .field("allowed_repo_hosts", &self.allowed_repo_hosts)
+            .field("allow_local_repos", &self.allow_local_repos)
             .field("workspace_root", &self.workspace_root)
             .field("a2a_bearer_tokens", &self.a2a_bearer_tokens.len())
             .field("public_url", &self.public_url.as_str())
@@ -189,13 +197,36 @@ impl Config {
             Duration::from_secs(parse_or(&get, "CHECK_TIMEOUT_SECS", 900u64, &mut problems).max(1));
         let check_output_tail =
             parse_or(&get, "CHECK_OUTPUT_TAIL_BYTES", 16_384usize, &mut problems).max(256);
-        let pr_draft = match get("PR_DRAFT").as_deref() {
+        let mut flag = |name: &str| match get(name).as_deref() {
             None => false,
             Some(v) if v.eq_ignore_ascii_case("true") || v == "1" => true,
             Some(v) if v.eq_ignore_ascii_case("false") || v == "0" => false,
             Some(v) => {
-                problems.push(format!("PR_DRAFT must be true or false, got {v:?}"));
+                problems.push(format!("{name} must be true or false, got {v:?}"));
                 false
+            }
+        };
+        let pr_draft = flag("PR_DRAFT");
+        let allow_local_repos = flag("ALLOW_LOCAL_REPOS");
+        let allowed_repo_hosts = match get("ALLOWED_REPO_HOSTS") {
+            None => vec![DEFAULT_REPO_HOST.to_owned()],
+            Some(raw) => {
+                let hosts: Vec<String> = raw
+                    .split(',')
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect();
+                if hosts.is_empty() {
+                    problems.push("ALLOWED_REPO_HOSTS has no usable host".into());
+                }
+                for host in &hosts {
+                    if !is_host_entry(host) {
+                        problems.push(format!(
+                            "ALLOWED_REPO_HOSTS entry {host:?} is not a host name (use `github.com` or `host:port`, no scheme or path)"
+                        ));
+                    }
+                }
+                hosts
             }
         };
         let opencode_command: Vec<String> = get("OPENCODE_COMMAND")
@@ -204,10 +235,12 @@ impl Config {
             .map(str::to_owned)
             .collect();
 
-        let public_url = match public_url {
-            Some(url) if problems.is_empty() => url,
-            _ => return Err(ConfigError { problems }),
+        let Some(public_url) = public_url else {
+            return Err(ConfigError { problems });
         };
+        if !problems.is_empty() {
+            return Err(ConfigError { problems });
+        }
         Ok(Self {
             database_url: SecretString::from(database_url),
             model_base_url,
@@ -215,6 +248,8 @@ impl Config {
             model,
             opencode_model,
             github_token: SecretString::from(github_token),
+            allowed_repo_hosts,
+            allow_local_repos,
             workspace_root,
             a2a_bearer_tokens,
             public_url,
@@ -230,6 +265,24 @@ impl Config {
             opencode_command,
         })
     }
+}
+
+/// Repository host used when `ALLOWED_REPO_HOSTS` is unset.
+const DEFAULT_REPO_HOST: &str = "github.com";
+
+/// `name` or `name:port`: letters, digits, dots and dashes, nothing that could
+/// smuggle a scheme, path, userinfo or wildcard into an allowlist.
+fn is_host_entry(entry: &str) -> bool {
+    let (name, port) = match entry.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (entry, None),
+    };
+    !name.is_empty()
+        && !name.starts_with(['.', '-'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        && port.is_none_or(|p| !p.is_empty() && p.parse::<u16>().is_ok())
 }
 
 fn parse_or<T: std::str::FromStr>(
@@ -283,6 +336,8 @@ mod tests {
         assert_eq!(c.max_check_cycles, 3);
         assert_eq!(c.opencode_model, "coder-large");
         assert_eq!(c.opencode_command, ["opencode", "acp"]);
+        assert_eq!(c.allowed_repo_hosts, ["github.com"]);
+        assert!(!c.allow_local_repos, "local repositories are opt-in");
         let tokens: Vec<_> = c
             .a2a_bearer_tokens
             .iter()
@@ -345,6 +400,36 @@ mod tests {
         let text = format!("{c:?}");
         for secret in ["hunter2", "sk-secret", "ghp_secret", "one", "two"] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn repository_hosts_are_normalised_and_validated() {
+        let mut vars = full();
+        vars.insert("ALLOWED_REPO_HOSTS", " GitHub.com, ghe.example.com:8443 ,,");
+        let c = parse(&vars).expect("valid");
+        assert_eq!(c.allowed_repo_hosts, ["github.com", "ghe.example.com:8443"]);
+
+        for bad in [
+            "https://github.com",
+            "github.com/o/r",
+            "*.github.com",
+            "user@github.com",
+            "github.com:",
+            "github.com:notaport",
+            "-x.com",
+            " , ",
+        ] {
+            let mut vars = full();
+            vars.insert("ALLOWED_REPO_HOSTS", bad);
+            let err = parse(&vars).unwrap_err();
+            assert!(
+                err.problems
+                    .iter()
+                    .any(|p| p.starts_with("ALLOWED_REPO_HOSTS")),
+                "{bad:?} accepted or misreported: {:?}",
+                err.problems
+            );
         }
     }
 }

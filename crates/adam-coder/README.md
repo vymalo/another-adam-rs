@@ -89,7 +89,9 @@ reported at once at startup):
 | `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required (key may be empty) |
 | `MODEL` | model alias of the agent | required |
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
-| `GITHUB_TOKEN` | push and pull request token | required |
+| `GITHUB_TOKEN` | push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required |
+| `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them | `github.com` |
+| `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, worktrees, run notes | `/work` |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required |
@@ -108,6 +110,25 @@ never inlined) together with `OPENCODE_DISABLE_AUTOUPDATE=1`; see
 `src/opencode.rs` for what was verified against the OpenCode sources. The
 OpenCode child does not see `GITHUB_TOKEN`, `DATABASE_URL` or
 `A2A_BEARER_TOKENS`, and the checks do not see those or `MODEL_API_KEY`.
+
+### Which repositories, and where the token goes
+
+The repository URL comes from the model, which took it from the user, so it
+is treated as hostile input. `GITHUB_TOKEN` is bound to `ALLOWED_REPO_HOSTS`
+twice over:
+
+1. `Workspaces::allow_hosts` refuses any other host before a process is
+   spawned, a request is made or a credential is asked for (the model gets the
+   reason as a tool error). URLs with embedded credentials, ssh/scp forms, and
+   anything that is not `https://<host>/<owner>/<repo>` are refused by the
+   parser, and git is handed the URL rebuilt from the parsed parts, never the
+   raw string.
+2. The credentials are a `ScopedToken` for the same hosts, which refuses
+   every other host even if a caller forgot the check.
+
+Local paths, `file://` and plain `http://` are refused unless
+`ALLOW_LOCAL_REPOS=true`, which exists for development and tests; local
+remotes never receive the token.
 
 SIGTERM stops accepting connections and lets in-flight steps finish and commit;
 a step cut short by a hard kill is taken over by the next start when its lease

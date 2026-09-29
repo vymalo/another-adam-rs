@@ -179,8 +179,8 @@ impl GitCmd {
         self
     }
 
-    pub(crate) fn auth(mut self, auth: Auth) -> Self {
-        self.auth = Some(auth);
+    pub(crate) fn maybe_auth(mut self, auth: Option<Auth>) -> Self {
+        self.auth = auth;
         self
     }
 

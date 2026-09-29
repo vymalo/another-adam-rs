@@ -6,7 +6,10 @@
 //!   committed ([`Worktree::commit_all`]) and pushed ([`Worktree::push`]).
 //! * A [`CodeHost`] ([`GitHub`]) turns the pushed branch into a pull request,
 //!   idempotently.
-//! * [`GitCredentials`] supplies the token ([`StaticToken`] in the MVP). The
+//! * [`GitCredentials`] supplies the token ([`ScopedToken`] for one host,
+//!   [`StaticToken`] for any). [`Workspaces::allow_hosts`] and
+//!   [`Workspaces::allow_local`] decide which repository URLs are accepted at
+//!   all, so a token only ever goes to a host the operator named. The
 //!   token reaches `git` only through the environment of a single invocation:
 //!   never in a remote URL, `.git/config`, logs or error messages.
 //!
@@ -66,7 +69,7 @@ mod worktree;
 #[cfg(feature = "test-util")]
 pub use code_host::MemoryCodeHost;
 pub use code_host::{CodeHost, DynCodeHost, NewPullRequest, PullRequest};
-pub use credentials::{DynGitCredentials, GitCredentials, StaticToken};
+pub use credentials::{DynGitCredentials, GitCredentials, ScopedToken, StaticToken};
 pub use error::{WorkspaceError, WorkspaceResult};
 #[cfg(feature = "github")]
 pub use github::GitHub;

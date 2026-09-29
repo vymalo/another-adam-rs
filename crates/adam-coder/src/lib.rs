@@ -58,10 +58,12 @@ pub mod app;
 pub mod config;
 pub mod instructions;
 pub mod opencode;
+mod repos;
 pub mod tools;
 
 pub use agent::{AGENT_NAME, CoderAgent, coder_limits};
 pub use app::{Coder, RuntimeOptions, agent_card};
 pub use config::{Config, ConfigError};
 pub use instructions::instructions;
+pub use repos::workspaces_for;
 pub use tools::{CoderSettings, ToolEnv, coder_tools};

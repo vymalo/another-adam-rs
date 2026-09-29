@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{WorkspaceError, WorkspaceResult};
-use crate::git::{Auth, GitCmd};
+use crate::git::GitCmd;
 use crate::repo::RepoRef;
 use crate::workspace::{Inner, REMOTE_TRACKING_PREFIX};
 
@@ -20,7 +20,6 @@ pub struct Worktree {
     ws: Arc<Inner>,
     run: String,
     repo: RepoRef,
-    http_scope: Option<String>,
     path: PathBuf,
     branch: String,
     mirror: PathBuf,
@@ -102,7 +101,6 @@ impl Worktree {
         ws: Arc<Inner>,
         run: String,
         repo: RepoRef,
-        http_scope: Option<String>,
         path: PathBuf,
         branch: String,
         mirror: PathBuf,
@@ -111,7 +109,6 @@ impl Worktree {
             ws,
             run,
             repo,
-            http_scope,
             path,
             branch,
             mirror,
@@ -269,12 +266,12 @@ impl Worktree {
     /// [`WorkspaceError::Invalid`].
     #[tracing::instrument(skip(self), fields(run = %self.run, branch = %self.branch))]
     pub async fn push(&self) -> WorkspaceResult<()> {
-        let token = self.ws.creds.token_for(&self.repo).await?;
-        let auth = Auth::new(token, self.http_scope.as_deref());
+        let loc = self.repo.locate()?;
+        let auth = self.ws.authorize(&self.repo, &loc).await?;
         self.git()
             .args(["push", "--quiet", "origin"])
             .arg(format!("refs/heads/{0}:refs/heads/{0}", self.branch))
-            .auth(auth)
+            .maybe_auth(auth)
             .run()
             .await?;
 

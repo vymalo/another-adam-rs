@@ -11,14 +11,14 @@ use std::time::Duration;
 
 use adam_a2a::AuthConfig;
 use adam_coder::opencode::OpenCodeLaunch;
-use adam_coder::{Coder, CoderAgent, CoderSettings, Config, RuntimeOptions, ToolEnv};
+use adam_coder::{
+    Coder, CoderAgent, CoderSettings, Config, RuntimeOptions, ToolEnv, workspaces_for,
+};
 use adam_core::DynStore;
 use adam_model::DynModel;
 use adam_model_openai::{OpenAiCompatible, OpenAiConfig};
 use adam_store_postgres::PgStore;
-use adam_workspace::{
-    DynCodeHost, DynGitCredentials, GitHub, GitIdentity, StaticToken, Workspaces,
-};
+use adam_workspace::{DynCodeHost, GitHub, GitIdentity};
 use anyhow::Context as _;
 use secrecy::ExposeSecret as _;
 use tokio::sync::watch;
@@ -64,10 +64,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.workspace_root)
         .await
         .with_context(|| format!("creating {}", config.workspace_root.display()))?;
-    let creds: DynGitCredentials = Arc::new(StaticToken::new(
-        config.github_token.expose_secret().to_owned(),
-    ));
-    let workspaces = Workspaces::new(config.workspace_root.clone(), creds.clone());
+    let (workspaces, creds) = workspaces_for(&config);
     let code_host: DynCodeHost =
         Arc::new(GitHub::new(creds).context("building the GitHub client")?);
 

@@ -31,6 +31,16 @@ main (`deploy/coder/bump-tag.sh`, also run as a dry run on pull requests).
 The orchestrator holds one of the bearer tokens (its agent list names the
 environment variable it reads it from).
 
+## Repositories
+
+`config.allowedRepoHosts` (default `github.com`; env `ALLOWED_REPO_HOSTS`) lists
+the hosts a task may name a repository on. `GITHUB_TOKEN` is only ever sent to
+those hosts: any other host, a local path or a URL with embedded credentials is
+refused before git runs. For GitHub Enterprise add its host (and set
+`config.extraEnv.GITHUB_API_URL` to `https://<host>/api/v3` once the coder
+supports it). `ALLOW_LOCAL_REPOS` is for development and tests and is not
+exposed by the chart.
+
 ## Known risks
 
 * **No database backups.** Losing the CNPG volume loses the run ledger (what

@@ -5,7 +5,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use adam_workspace::{
-    FileStatus, GitCredentials, GitIdentity, RepoRef, StaticToken, WorkspaceError, Workspaces,
+    FileStatus, GitCredentials, GitIdentity, RepoRef, ScopedToken, StaticToken, WorkspaceError,
+    Workspaces,
 };
 use base64::Engine as _;
 use tempfile::TempDir;
@@ -701,8 +702,281 @@ async fn credentials_errors_propagate() {
             Err(WorkspaceError::Auth("broker unavailable".to_owned()))
         }
     }
-    let env = Env::new();
-    let ws = Workspaces::new(env.root.join("other-root"), Arc::new(Broken));
-    let err = ws.prepare(&env.repo, "run-cred-0001").await.unwrap_err();
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(tmp.path().join("root"), Arc::new(Broken));
+    // Credentials are only requested for http(s) remotes (a local remote
+    // needs none); nothing listens on port 1, but the broker fails first.
+    let repo = RepoRef::new("http://127.0.0.1:1/o/r.git", "main");
+    let err = ws.prepare(&repo, "run-cred-0001").await.unwrap_err();
     assert!(matches!(err, WorkspaceError::Auth(_)), "{err:?}");
+}
+
+// --------------------------------------------------- repository host allowlist
+
+/// Counts how often the token is requested, and for whom.
+#[derive(Default)]
+struct Spy {
+    asked: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl GitCredentials for Spy {
+    async fn token_for(&self, repo: &RepoRef) -> Result<secrecy::SecretString, WorkspaceError> {
+        self.asked.lock().unwrap().push(repo.url.clone());
+        Ok(secrecy::SecretString::from(TOKEN.to_owned()))
+    }
+}
+
+/// An "evil" git server: answers 404 to everything and remembers what it saw.
+async fn evil_server() -> wiremock::MockServer {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn saw_authorization(requests: &[wiremock::Request]) -> bool {
+    requests
+        .iter()
+        .any(|r| r.headers.contains_key("authorization"))
+}
+
+/// The point of the allowlist: whoever picks the repository URL must not be
+/// able to make the token travel to a host of their choosing.
+#[tokio::test]
+async fn token_is_never_sent_to_a_host_outside_the_allowlist() {
+    let evil = evil_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let spy = Arc::new(Spy::default());
+    let ws = Workspaces::new(root.clone(), spy.clone())
+        .allow_hosts(["github.com"])
+        .allow_local(true);
+
+    let evil_url = format!("{}/octo/widgets.git", evil.uri());
+    let mut hostile = vec![
+        evil_url.clone(),
+        // Look-alikes and tricks around the allowed name.
+        "https://github.com.evil.example/octo/widgets.git".to_owned(),
+        "https://evilgithub.com/octo/widgets.git".to_owned(),
+        "https://evil.example/github.com/widgets.git".to_owned(),
+        "https://github.com.:443/octo/widgets.git".to_owned(),
+        "https://GITHUB.COM.evil.example/octo/widgets".to_owned(),
+        "https://github.com:8443.evil.example/octo/widgets".to_owned(),
+        "https://evil.example\\@github.com/octo/widgets.git".to_owned(),
+    ];
+    // Plain http to the allowed name is refused too when local is off (below).
+    hostile.push(format!("http://127.0.0.1:{}/octo/widgets.git", 1));
+    for (i, url) in hostile.iter().enumerate() {
+        let err = ws
+            .prepare(
+                &RepoRef::new(url.clone(), "main"),
+                &format!("run-evil-{i:04}"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::Invalid(_)), "{url}: {err:?}");
+        assert!(!err.to_string().contains(TOKEN), "{err}");
+    }
+
+    assert!(
+        evil.received_requests().await.unwrap().is_empty(),
+        "the evil host must not be contacted at all"
+    );
+    assert!(
+        spy.asked.lock().unwrap().is_empty(),
+        "the token must not even be requested for a refused host: {:?}",
+        spy.asked.lock().unwrap()
+    );
+    assert!(
+        !root.join("git").exists(),
+        "no mirror is created for a refused repository"
+    );
+}
+
+#[tokio::test]
+async fn an_allowed_host_still_gets_the_token_and_only_it() {
+    use base64::Engine as _;
+    let server = evil_server().await;
+    let port = server.address().port();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = RepoRef::new(format!("{}/octo/widgets.git", server.uri()), "main");
+    let want = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{TOKEN}"))
+    );
+
+    // `host` and `host:port` entries both allow it (http needs allow_local).
+    for (i, entry) in ["127.0.0.1".to_owned(), format!("127.0.0.1:{port}")]
+        .into_iter()
+        .enumerate()
+    {
+        let ws = Workspaces::new(
+            tmp.path().join(format!("root-{i}")),
+            Arc::new(StaticToken::new(TOKEN)),
+        )
+        .allow_hosts([entry.clone()])
+        .allow_local(true);
+        let err = ws
+            .prepare(&repo, &format!("run-ok-{i:04}"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::NotFound(_)),
+            "{entry}: {err:?}"
+        );
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty(), "git never reached the allowed host");
+    for r in &requests {
+        assert_eq!(
+            r.headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some(want.as_str())
+        );
+    }
+
+    // The same host on another port is a different server.
+    let before = requests.len();
+    let ws = Workspaces::new(
+        tmp.path().join("root-port"),
+        Arc::new(StaticToken::new(TOKEN)),
+    )
+    .allow_hosts([format!("127.0.0.1:{}", port.wrapping_add(1))])
+    .allow_local(true);
+    let err = ws.prepare(&repo, "run-port-0001").await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+
+    // An empty allowlist accepts nothing.
+    let ws = Workspaces::new(
+        tmp.path().join("root-none"),
+        Arc::new(StaticToken::new(TOKEN)),
+    )
+    .allow_hosts(Vec::<String>::new());
+    let err = ws.prepare(&repo, "run-none-0001").await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert!(err.to_string().contains("(none)"), "{err}");
+}
+
+#[tokio::test]
+async fn local_paths_are_refused_unless_allowed() {
+    let env = Env::new();
+    let file_url = format!("file://{}", env.remote.display());
+    let root = env.root.join("strict");
+    let strict = Workspaces::new(root.clone(), Arc::new(Spy::default()))
+        .allow_hosts(["github.com"])
+        .allow_local(false);
+    for (i, url) in [env.repo.url.clone(), file_url.clone()].iter().enumerate() {
+        let err = strict
+            .prepare(
+                &RepoRef::new(url.clone(), "main"),
+                &format!("run-loc-{i:04}"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::Invalid(_)), "{url}: {err:?}");
+        assert!(err.to_string().contains("local"), "{err}");
+    }
+    // Even with no host allowlist at all.
+    let no_hosts = Workspaces::new(root.clone(), Arc::new(Spy::default())).allow_local(false);
+    let err = no_hosts
+        .prepare(&env.repo, "run-loc-0009")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert!(!root.join("git").exists(), "nothing was created");
+
+    // Plain http is dev-only as well, whatever the host allowlist says.
+    let server = evil_server().await;
+    let http = Workspaces::new(root.clone(), Arc::new(Spy::default()))
+        .allow_hosts(["127.0.0.1"])
+        .allow_local(false);
+    let repo = RepoRef::new(format!("{}/o/r.git", server.uri()), "main");
+    let err = http.prepare(&repo, "run-loc-0010").await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert!(err.to_string().contains("https"), "{err}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    // Allowed: both spellings of a local remote work, and no token is asked for.
+    let spy = Arc::new(Spy::default());
+    let lax = Workspaces::new(env.root.join("lax"), spy.clone())
+        .allow_hosts(["github.com"])
+        .allow_local(true);
+    lax.prepare(&env.repo, "run-loc-0020").await.unwrap();
+    lax.prepare(&RepoRef::new(file_url, "main"), "run-loc-0021")
+        .await
+        .unwrap();
+    assert!(
+        spy.asked.lock().unwrap().is_empty(),
+        "local remotes get no credentials"
+    );
+}
+
+/// A token bound to `github.com` protects even a `Workspaces` that was never
+/// given an allowlist.
+#[tokio::test]
+async fn a_scoped_token_alone_keeps_the_token_from_a_foreign_host() {
+    let evil = evil_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = Workspaces::new(
+        tmp.path().join("root"),
+        Arc::new(ScopedToken::new("github.com", TOKEN)),
+    );
+    let repo = RepoRef::new(format!("{}/octo/widgets.git", evil.uri()), "main");
+    let err = ws.prepare(&repo, "run-scope-001").await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert!(!err.to_string().contains(TOKEN), "{err}");
+    assert!(
+        !saw_authorization(&evil.received_requests().await.unwrap()),
+        "no Authorization header may reach the foreign host"
+    );
+}
+
+/// The policy is checked again where credentials are used: a worktree that
+/// was made under a laxer configuration cannot push under a stricter one.
+#[tokio::test]
+async fn push_applies_the_current_policy() {
+    let env = Env::new();
+    let wt = env.ws.prepare(&env.repo, "run-push-pol-1").await.unwrap();
+    std::fs::write(wt.path().join("p.txt"), "p\n").unwrap();
+    wt.commit_all("p", &me()).await.unwrap().unwrap();
+
+    let strict = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)))
+        .allow_hosts(["github.com"])
+        .allow_local(false);
+    let same = strict
+        .open_existing("run-push-pol-1")
+        .await
+        .unwrap()
+        .unwrap();
+    let err = same.push().await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert!(
+        git(&env.remote, &["branch", "--list", "agent/*"]).is_empty(),
+        "nothing was pushed"
+    );
+    // The original, permissive handle still pushes.
+    wt.push().await.unwrap();
+}
+
+#[tokio::test]
+async fn git_is_given_the_canonical_url_of_an_http_remote() {
+    let server = evil_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let ws = Workspaces::new(root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let raw = format!(
+        "{}/Octo/Widgets/",
+        server.uri().replace("http://", "HTTP://")
+    );
+    let repo = RepoRef::new(raw, "main");
+    let _ = ws.prepare(&repo, "run-canon-001").await.unwrap_err();
+    let loc = repo.locate().unwrap();
+    let config = std::fs::read_to_string(root.join(loc.mirror_relative()).join("config")).unwrap();
+    let want = format!("url = {}/Octo/Widgets.git", server.uri());
+    assert!(config.contains(&want), "{config}");
 }

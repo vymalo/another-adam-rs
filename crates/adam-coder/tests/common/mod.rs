@@ -3,16 +3,16 @@
 //! to script the model. Everything is offline.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::{CoderSettings, ToolEnv};
 use adam_model::ToolCall;
 use adam_workspace::{
-    CodeHost, DynCodeHost, GitHub, NewPullRequest, PullRequest, RepoRef, StaticToken,
+    CodeHost, DynCodeHost, GitHub, NewPullRequest, PullRequest, RepoRef, ScopedToken,
     WorkspaceError, Workspaces,
 };
 use async_trait::async_trait;
@@ -21,7 +21,16 @@ use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+/// The first pull request the mock GitHub creates.
 pub const PR_URL: &str = "https://github.com/octo/widgets/pull/7";
+
+/// Token of the fixture; every test can assert it never leaks.
+pub const GITHUB_TOKEN: &str = "ghp_FAKEtoken0123456789abcdefghijklmnop";
+
+/// URL of pull request `number` of the mock repository.
+pub fn pull_url(number: u64) -> String {
+    format!("https://github.com/octo/widgets/pull/{number}")
+}
 
 /// Hermetic git for setting up and inspecting the remote; panics on failure.
 pub fn git(dir: &Path, args: &[&str]) -> String {
@@ -99,51 +108,102 @@ pub fn fake_agent() -> &'static Path {
     })
 }
 
-/// GitHub's REST API, faked: lists open pull requests for a head (none until
-/// one was created) and creates them.
-struct ListPulls {
-    created: Arc<AtomicBool>,
+/// The pull requests the mock GitHub has, by head branch: `number` starts at 7
+/// and grows per new head. Creating a pull request for a head that has one
+/// returns it again (GitHub would answer 422; the client resolves both the
+/// same way).
+#[derive(Default)]
+struct Pulls {
+    by_head: Mutex<BTreeMap<String, u64>>,
+}
+
+impl Pulls {
+    fn create(&self, head: &str) -> u64 {
+        let mut heads = self.by_head.lock().unwrap();
+        let next = 7 + heads.len() as u64;
+        *heads.entry(head.to_owned()).or_insert(next)
+    }
+
+    fn get(&self, head: &str) -> Option<u64> {
+        self.by_head.lock().unwrap().get(head).copied()
+    }
 }
 
 fn branch_of(head: &str) -> &str {
     head.split_once(':').map_or(head, |(_, b)| b)
 }
 
-fn api_pull(branch: &str) -> Value {
+fn api_pull(number: u64, branch: &str) -> Value {
     json!({
-        "number": 7,
-        "html_url": PR_URL,
+        "number": number,
+        "html_url": pull_url(number),
         "head": {"ref": branch},
         "state": "open",
     })
 }
 
+struct ListPulls {
+    pulls: Arc<Pulls>,
+}
+
 impl Respond for ListPulls {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        if !self.created.load(Ordering::SeqCst) {
-            return ResponseTemplate::new(200).set_body_json(json!([]));
-        }
         let head = request
             .url
             .query_pairs()
             .find(|(k, _)| k == "head")
             .map(|(_, v)| v.into_owned())
             .unwrap_or_default();
-        ResponseTemplate::new(200).set_body_json(json!([api_pull(branch_of(&head))]))
+        let branch = branch_of(&head);
+        let open: Vec<Value> = self
+            .pulls
+            .get(branch)
+            .map(|n| api_pull(n, branch))
+            .into_iter()
+            .collect();
+        ResponseTemplate::new(200).set_body_json(open)
     }
 }
 
 struct CreatePull {
-    created: Arc<AtomicBool>,
+    pulls: Arc<Pulls>,
 }
 
 impl Respond for CreatePull {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.created.store(true, Ordering::SeqCst);
         let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
         let head = body["head"].as_str().unwrap_or_default();
-        ResponseTemplate::new(201).set_body_json(api_pull(head))
+        let number = self.pulls.create(head);
+        ResponseTemplate::new(201).set_body_json(api_pull(number, head))
     }
+}
+
+/// A mock GitHub for `octo/widgets`: lists and creates pull requests.
+pub async fn mock_github() -> MockServer {
+    let github = MockServer::start().await;
+    let pulls = Arc::new(Pulls::default());
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/widgets/pulls"))
+        .respond_with(ListPulls {
+            pulls: pulls.clone(),
+        })
+        .mount(&github)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octo/widgets/pulls"))
+        .respond_with(CreatePull { pulls })
+        .mount(&github)
+        .await;
+    github
+}
+
+/// Make the mock GitHub answer every API call with `status` from now on.
+pub async fn github_fails_with(github: &MockServer, status: u16, message: &str) {
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(status).set_body_json(json!({"message": message})))
+        .with_priority(1)
+        .mount(github)
+        .await;
 }
 
 /// The real [`GitHub`] client pointed at the mock, but answering for a
@@ -212,24 +272,15 @@ impl Fixture {
         );
         git(&seed, &["push", "--quiet", "origin", "main"]);
 
-        let github = MockServer::start().await;
-        let created = Arc::new(AtomicBool::new(false));
-        Mock::given(method("GET"))
-            .and(path("/repos/octo/widgets/pulls"))
-            .respond_with(ListPulls {
-                created: created.clone(),
-            })
-            .mount(&github)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/repos/octo/widgets/pulls"))
-            .respond_with(CreatePull { created })
-            .mount(&github)
-            .await;
+        let github = mock_github().await;
 
         let root = tmp.path().join("work");
-        let creds = Arc::new(StaticToken::new("ghp_FAKEtoken0123456789abcdefghijklmnop"));
-        let workspaces = Workspaces::new(root.clone(), creds.clone());
+        let creds = Arc::new(ScopedToken::new("github.com", GITHUB_TOKEN));
+        // What the binary does, with `ALLOW_LOCAL_REPOS=true` (the remote here
+        // is a local bare repository).
+        let workspaces = Workspaces::new(root.clone(), creds.clone())
+            .allow_hosts(["github.com"])
+            .allow_local(true);
         let code_host: DynCodeHost = Arc::new(GithubBehindMock {
             inner: GitHub::new(creds)
                 .expect("client")
@@ -251,6 +302,21 @@ impl Fixture {
             github,
             env,
         }
+    }
+
+    /// The same tools as `env` but with the production repository policy:
+    /// only `github.com`, no local paths (`ALLOW_LOCAL_REPOS` unset), in a
+    /// workspace root of its own.
+    pub fn production_env(&self) -> Arc<ToolEnv> {
+        let creds = Arc::new(ScopedToken::new("github.com", GITHUB_TOKEN));
+        let workspaces = Workspaces::new(self.tmp.path().join("production-work"), creds)
+            .allow_hosts(["github.com"])
+            .allow_local(false);
+        Arc::new(ToolEnv::new(
+            workspaces,
+            self.env.code_host.clone(),
+            self.env.settings.clone(),
+        ))
     }
 
     pub fn remote_url(&self) -> String {
@@ -344,4 +410,33 @@ pub fn happy_script(mock: &adam_model::MockModel, remote_url: &str) {
         json!({"title": "feat: add hello.txt", "body": "Adds hello.txt.\n\n## Verification\n- `test -f hello.txt`: passed"}),
     )])
     .push_text("Opened the pull request.");
+}
+
+/// An ACP "OpenCode" that is a shell script around the fake agent, so tests
+/// can script what the real one would do across launches. The script runs with
+/// `$AGENT` set to the fake agent (which reads the `FAKE_ACP_*` variables of
+/// `base`) and `$LAUNCHES`, a file it appends one line to per launch.
+///
+/// Returns the launcher and the path of the launch log.
+pub fn scripted_agent(dir: &Path, script: &str, base: OpenCodeLaunch) -> (OpenCodeLaunch, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let launches = dir.join("launches.log");
+    let file = dir.join("opencode.sh");
+    std::fs::write(
+        &file,
+        format!("#!/bin/sh\necho launched >> \"$LAUNCHES\"\n{script}\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut launch = OpenCodeLaunch::program("/bin/sh")
+        .env("AGENT", fake_agent().to_string_lossy())
+        .env("LAUNCHES", launches.to_string_lossy());
+    launch.args = vec![file.to_string_lossy().into_owned()];
+    launch.env.extend(base.env);
+    (launch, launches)
+}
+
+/// How often the launch log says the agent was started.
+pub fn launches(log: &Path) -> usize {
+    std::fs::read_to_string(log).map_or(0, |t| t.lines().count())
 }

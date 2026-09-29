@@ -59,6 +59,12 @@ enum Remote {
     /// `http(s)://host[:port]/`; the scope for the auth header.
     Http {
         scope: String,
+        /// Lowercased host name as parsed by the URL parser.
+        hostname: String,
+        port: Option<u16>,
+        secure: bool,
+        /// `<scope><owner>/<name>.git`, rebuilt from the parsed parts.
+        canonical: String,
     },
     Local,
 }
@@ -106,11 +112,20 @@ impl RepoLocation {
                     ),
                     None => (host.clone(), format!("{}://{host}/", url.scheme())),
                 };
+                let owner = path_component(owner)?;
+                let name = path_component(name)?;
+                let canonical = format!("{scope}{owner}/{name}.git");
                 Ok(Self {
                     host: path_component(&host_dir)?,
-                    owner: path_component(owner)?,
-                    name: path_component(name)?,
-                    remote: Remote::Http { scope },
+                    owner,
+                    name,
+                    remote: Remote::Http {
+                        scope,
+                        hostname: host,
+                        port: url.port(),
+                        secure: url.scheme() == "https",
+                        canonical,
+                    },
                 })
             }
             "file" => {
@@ -163,9 +178,38 @@ impl RepoLocation {
     /// http(s) remotes.
     pub(crate) fn http_scope(&self) -> Option<&str> {
         match &self.remote {
-            Remote::Http { scope } => Some(scope),
+            Remote::Http { scope, .. } => Some(scope),
             Remote::Local => None,
         }
+    }
+
+    /// The URL git is given for an http(s) remote: rebuilt from the parsed
+    /// parts (`scheme://host[:port]/owner/name.git`), never the caller's raw
+    /// string, so what git connects to is exactly what was checked against the
+    /// host allowlist (no parser differential).
+    pub(crate) fn canonical_http_url(&self) -> Option<&str> {
+        match &self.remote {
+            Remote::Http { canonical, .. } => Some(canonical),
+            Remote::Local => None,
+        }
+    }
+
+    /// Whether an http(s) remote is reached over TLS.
+    pub(crate) fn is_secure(&self) -> bool {
+        matches!(&self.remote, Remote::Http { secure: true, .. })
+    }
+
+    /// Whether `entry` (`host` for any port, or `host:port`, case-insensitive)
+    /// names this remote's server. Filesystem remotes never match.
+    pub(crate) fn matches_host(&self, entry: &str) -> bool {
+        let Remote::Http { hostname, port, .. } = &self.remote else {
+            return false;
+        };
+        let entry = entry.trim().to_ascii_lowercase();
+        if entry == *hostname {
+            return true;
+        }
+        matches!(port, Some(p) if entry == format!("{hostname}:{p}"))
     }
 }
 
@@ -274,6 +318,36 @@ mod tests {
                 "{url} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn host_entries_match_by_name_or_name_and_port() {
+        let l = loc("https://GitHub.com/o/r.git").unwrap();
+        assert!(l.matches_host("github.com"));
+        assert!(l.matches_host(" GITHUB.com "));
+        assert!(!l.matches_host("github.com:8443"));
+        assert!(!l.matches_host("evil.com"));
+        assert!(!l.matches_host("hub.com"));
+        assert!(!l.matches_host("github.com.evil.com"));
+        let p = loc("http://127.0.0.1:8080/o/r.git").unwrap();
+        assert!(p.matches_host("127.0.0.1"));
+        assert!(p.matches_host("127.0.0.1:8080"));
+        assert!(!p.matches_host("127.0.0.1:8081"));
+        assert!(!loc("/tmp/a/remote.git").unwrap().matches_host("local"));
+    }
+
+    #[test]
+    fn git_is_given_the_rebuilt_url_not_the_raw_string() {
+        let l = loc("https://GitHub.com/vymalo/adam/").unwrap();
+        assert_eq!(
+            l.canonical_http_url(),
+            Some("https://github.com/vymalo/adam.git")
+        );
+        // A backslash is a path separator to the URL parser but not to every
+        // other parser; such a URL must not survive parsing at all.
+        assert!(loc("https://evil.com\\@github.com/o/r").is_err());
+        assert!(loc("https://github.com/o/r.git").unwrap().is_secure());
+        assert!(!loc("http://127.0.0.1:1/o/r").unwrap().is_secure());
     }
 
     #[test]

@@ -114,6 +114,82 @@ async fn prepare_workspace_reports_a_bad_repository_to_the_model() {
     );
 }
 
+/// The production policy (only `github.com`, no local paths): a hostile or
+/// careless `repo_url` is reported to the model before any git call, and the
+/// GitHub token never leaves for the host the model named.
+#[tokio::test]
+async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production() {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let rig = Rig::new().await;
+    let evil = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&evil)
+        .await;
+    let env = rig.fx.production_env();
+    let hostile = [
+        // Another host, the honest way and with look-alike names.
+        format!("{}/octo/widgets.git", evil.uri()),
+        "https://evil.example/octo/widgets.git".to_owned(),
+        "https://github.com.evil.example/octo/widgets.git".to_owned(),
+        "https://evil.example/github.com/octo/widgets.git".to_owned(),
+        // Local paths, in both spellings, including the fixture's real remote.
+        rig.fx.remote_url(),
+        format!("file://{}", rig.fx.remote.display()),
+        "/etc".to_owned(),
+        // Credentials in the URL, to the allowed host and to another.
+        "https://x-access-token:s3cr3t@github.com/octo/widgets.git".to_owned(),
+        "https://user:s3cr3t@evil.example/octo/widgets.git".to_owned(),
+        // Not URLs at all.
+        "git@github.com:octo/widgets.git".to_owned(),
+        "ssh://git@github.com/octo/widgets.git".to_owned(),
+        "ext::sh -c 'touch /tmp/pwned'".to_owned(),
+        "--upload-pack=touch /tmp/pwned".to_owned(),
+    ];
+    for url in &hostile {
+        let out = PrepareWorkspace::new(env.clone())
+            .call(&rig.ctx, json!({"repo_url": url, "base_branch": "main"}))
+            .await;
+        assert!(
+            is_error(&out),
+            "{url} must be reported to the model as an error, got {out:?}"
+        );
+        let message = text(out);
+        assert!(!message.contains("s3cr3t"), "{url}: {message}");
+        assert!(!message.contains(common::GITHUB_TOKEN), "{url}: {message}");
+    }
+
+    let seen = evil.received_requests().await.unwrap();
+    assert!(seen.is_empty(), "the foreign host was contacted: {seen:?}");
+    let root = rig.fx.tmp.path().join("production-work");
+    assert!(
+        !root.join("git").exists() && !root.join("worktrees").exists(),
+        "nothing was created for a refused repository"
+    );
+
+    // Whatever the reason, the model gets the reason as text to act on.
+    let out = PrepareWorkspace::new(env.clone())
+        .call(
+            &rig.ctx,
+            json!({"repo_url": "https://evil.example/o/r.git", "base_branch": "main"}),
+        )
+        .await;
+    let message = text(out);
+    assert!(
+        message.contains("not allowed") && message.contains("github.com"),
+        "{message}"
+    );
+    let out = PrepareWorkspace::new(env)
+        .call(
+            &rig.ctx,
+            json!({"repo_url": rig.fx.remote_url(), "base_branch": "main"}),
+        )
+        .await;
+    assert!(text(out).contains("local"), "the reason names local paths");
+}
+
 #[tokio::test]
 async fn tools_that_need_a_workspace_say_so() {
     let rig = Rig::new().await;

@@ -68,7 +68,61 @@ pub struct Workspaces {
 pub(crate) struct Inner {
     root: PathBuf,
     pub(crate) creds: DynGitCredentials,
+    policy: Policy,
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// Which repositories a [`Workspaces`] accepts. The default accepts
+/// everything (the library predates the policy); see
+/// [`Workspaces::allow_hosts`].
+#[derive(Clone, Debug)]
+struct Policy {
+    /// `None`: any host. `Some`: only these (`host` or `host:port`).
+    hosts: Option<Vec<String>>,
+    /// Filesystem remotes and plain `http` (dev and test setups).
+    allow_local: bool,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            hosts: None,
+            allow_local: true,
+        }
+    }
+}
+
+impl Policy {
+    fn check(&self, loc: &RepoLocation) -> WorkspaceResult<()> {
+        if loc.is_local() {
+            return if self.allow_local {
+                Ok(())
+            } else {
+                Err(WorkspaceError::Invalid(
+                    "local repository paths and file:// URLs are not allowed".to_owned(),
+                ))
+            };
+        }
+        if !loc.is_secure() && !self.allow_local {
+            return Err(WorkspaceError::Invalid(
+                "repositories must be reached over https, not plain http".to_owned(),
+            ));
+        }
+        match &self.hosts {
+            Some(hosts) if !hosts.iter().any(|h| loc.matches_host(h)) => {
+                Err(WorkspaceError::Invalid(format!(
+                    "repository host {} is not allowed; allowed hosts: {}",
+                    loc.host.replace('_', ":"),
+                    if hosts.is_empty() {
+                        "(none)".to_owned()
+                    } else {
+                        hosts.join(", ")
+                    }
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 impl fmt::Debug for Workspaces {
@@ -100,6 +154,60 @@ impl Workspaces {
             inner: Arc::new(Inner {
                 root,
                 creds,
+                policy: Policy::default(),
+                locks: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Accept only repositories on these hosts. An entry is a host name (any
+    /// port) or `host:port`, compared case-insensitively; the list replaces an
+    /// earlier one, and an empty list accepts nothing.
+    ///
+    /// **Call this whenever the repository URL comes from somebody else** (a
+    /// model, a user, a webhook). The URL decides where `git` connects, and
+    /// that is where the credentials are sent; without an allowlist, any host
+    /// a caller names receives the token. A refused repository is
+    /// [`WorkspaceError::Invalid`], reported before any process is spawned or
+    /// any credential is requested. Pair it with a
+    /// [`ScopedToken`](crate::ScopedToken) for defence in depth.
+    ///
+    /// Configure the value right after [`Workspaces::new`]; the per-mirror
+    /// locks of an earlier handle are not shared with the returned one.
+    #[must_use]
+    pub fn allow_hosts<I, S>(self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let hosts = hosts
+            .into_iter()
+            .map(|h| h.as_ref().trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        self.with_policy(|p| p.hosts = Some(hosts))
+    }
+
+    /// Whether filesystem remotes (an absolute path or a `file://` URL) and
+    /// plain `http://` remotes are accepted. Default: `true`, for
+    /// backwards compatibility; production setups that take URLs from others
+    /// pass `false`. Local remotes never receive credentials.
+    ///
+    /// Configure the value right after [`Workspaces::new`], like
+    /// [`Workspaces::allow_hosts`].
+    #[must_use]
+    pub fn allow_local(self, allow: bool) -> Self {
+        self.with_policy(|p| p.allow_local = allow)
+    }
+
+    fn with_policy(self, change: impl FnOnce(&mut Policy)) -> Self {
+        let mut policy = self.inner.policy.clone();
+        change(&mut policy);
+        Self {
+            inner: Arc::new(Inner {
+                root: self.inner.root.clone(),
+                creds: self.inner.creds.clone(),
+                policy,
                 locks: Mutex::new(HashMap::new()),
             }),
         }
@@ -140,8 +248,11 @@ impl Workspaces {
     #[tracing::instrument(skip(self, repo), fields(repo = %repo.url, run = %run))]
     pub async fn prepare(&self, repo: &RepoRef, run: &str) -> WorkspaceResult<Worktree> {
         validate_run(run)?;
-        self.inner.validate_base(&repo.base_branch).await?;
+        // The URL is checked before anything else runs: a refused repository
+        // costs no process, no request and no credential.
         let loc = repo.locate()?;
+        self.inner.policy.check(&loc)?;
+        self.inner.validate_base(&repo.base_branch).await?;
         let mirror = self.inner.root.join(loc.mirror_relative());
 
         let lock = self.inner.lock_for(&mirror);
@@ -157,7 +268,7 @@ impl Workspaces {
                 )));
             }
             if self.inner.is_valid_worktree(&path, &mirror).await {
-                return Ok(self.inner.worktree(&loc, m, path, mirror));
+                return Ok(self.inner.worktree(m, path, mirror));
             }
         }
         if exists(&path).await? {
@@ -168,12 +279,12 @@ impl Workspaces {
             )));
         }
 
-        self.inner.ensure_mirror(repo, &mirror).await?;
-        let auth = self.inner.auth(repo, &loc).await?;
+        self.inner.ensure_mirror(repo, &loc, &mirror).await?;
+        let auth = self.inner.authorize(repo, &loc).await?;
         self.inner
             .mirror_git(&mirror)
             .args(["fetch", "--prune", "--quiet", "origin"])
-            .auth(auth)
+            .maybe_auth(auth)
             .run()
             .await?;
 
@@ -229,7 +340,7 @@ impl Workspaces {
             }
             return Err(e);
         }
-        Ok(self.inner.worktree(&loc, &meta, path, mirror))
+        Ok(self.inner.worktree(&meta, path, mirror))
     }
 
     /// The worktree of `run`, if it exists on disk: how a restarted process
@@ -252,7 +363,7 @@ impl Workspaces {
         let mirror = self.inner.root.join(loc.mirror_relative());
         let path = self.inner.worktree_path(run);
         if self.inner.is_valid_worktree(&path, &mirror).await {
-            Ok(Some(self.inner.worktree(&loc, &meta, path, mirror)))
+            Ok(Some(self.inner.worktree(&meta, path, mirror)))
         } else {
             Ok(None)
         }
@@ -337,23 +448,28 @@ impl Inner {
         self.git().git_dir(mirror)
     }
 
-    async fn auth(&self, repo: &RepoRef, loc: &RepoLocation) -> WorkspaceResult<Auth> {
+    /// The credentials for talking to `repo`'s remote, after the policy said
+    /// the remote is acceptable. The only place a token is requested: nothing
+    /// is asked of [`GitCredentials`](crate::GitCredentials) for a refused
+    /// host, and filesystem remotes need (and get) none.
+    pub(crate) async fn authorize(
+        &self,
+        repo: &RepoRef,
+        loc: &RepoLocation,
+    ) -> WorkspaceResult<Option<Auth>> {
+        self.policy.check(loc)?;
+        let Some(scope) = loc.http_scope() else {
+            return Ok(None);
+        };
         let token = self.creds.token_for(repo).await?;
-        Ok(Auth::new(token, loc.http_scope()))
+        Ok(Some(Auth::new(token, Some(scope))))
     }
 
-    fn worktree(
-        self: &Arc<Self>,
-        loc: &RepoLocation,
-        meta: &Meta,
-        path: PathBuf,
-        mirror: PathBuf,
-    ) -> Worktree {
+    fn worktree(self: &Arc<Self>, meta: &Meta, path: PathBuf, mirror: PathBuf) -> Worktree {
         Worktree::new(
             Arc::clone(self),
             meta.run.clone(),
             RepoRef::new(&meta.url, &meta.base_branch),
-            loc.http_scope().map(str::to_owned),
             path,
             meta.branch.clone(),
             mirror,
@@ -380,7 +496,12 @@ impl Inner {
     }
 
     /// Create the bare mirror if needed and (re)write its remote config.
-    async fn ensure_mirror(&self, repo: &RepoRef, mirror: &Path) -> WorkspaceResult<()> {
+    async fn ensure_mirror(
+        &self,
+        repo: &RepoRef,
+        loc: &RepoLocation,
+        mirror: &Path,
+    ) -> WorkspaceResult<()> {
         if !exists(&mirror.join("HEAD")).await? {
             if let Some(parent) = mirror.parent() {
                 tokio::fs::create_dir_all(parent)
@@ -394,7 +515,10 @@ impl Inner {
                 .await?;
         }
         let git = || self.mirror_git(mirror).arg("config");
-        git().args(["remote.origin.url", &repo.url]).run().await?;
+        // For http(s), the URL rebuilt from the parsed parts: git connects to
+        // exactly the host the policy approved, however the raw string parses.
+        let url = loc.canonical_http_url().unwrap_or(&repo.url);
+        git().args(["remote.origin.url", url]).run().await?;
         git()
             .args([
                 "remote.origin.fetch",
