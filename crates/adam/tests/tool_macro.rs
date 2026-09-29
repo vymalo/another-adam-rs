@@ -10,7 +10,7 @@ use adam::error::{Classify, ErrorClass};
 use adam::model::{DynModel, Message, MockModel, ToolCall};
 use adam::prelude::*;
 use adam::runtime::{CollectingSink, RunView, Runtime};
-use adam::{BuildError, Conversation, StateKey, user_message};
+use adam::{BuildError, Conversation, PendingWait, StateKey, user_message};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -409,7 +409,7 @@ async fn run_until_settled(agent: &LlmAgent) -> RunView {
     let view = loop {
         let view = rt.view(run).await.unwrap().unwrap();
         let conversation: Conversation = serde_json::from_value(view.state.clone()).unwrap();
-        let parked = conversation.pending_question.is_some();
+        let parked = conversation.pending_wait.is_some();
         if matches!(view.status, RunStatus::Done | RunStatus::Failed) || parked {
             break view;
         }
@@ -483,9 +483,12 @@ async fn a_tool_that_needs_input_parks_the_run_with_the_question() {
     let agent = builder(&mock).tools(tools![AskUser]).try_build().unwrap();
     let view = run_until_settled(&agent).await;
     let pending = conversation(&view)
-        .pending_question
+        .pending_wait
         .expect("parked on the question");
-    assert_eq!(pending.question, "Which branch?");
+    assert!(
+        matches!(&pending, PendingWait::Question(q) if q.question == "Which branch?"),
+        "{pending:?}"
+    );
 }
 
 #[test]

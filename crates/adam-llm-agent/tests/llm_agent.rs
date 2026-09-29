@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter, PendingQuestion,
-    TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
+    PendingWait, TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
     DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest,
@@ -304,7 +304,7 @@ async fn model_calls_tool_a_then_b_then_answers() {
     let state = conversation(&view);
     assert_eq!(state.messages, expected);
     assert_eq!((state.turns, state.tool_calls), (3, 2));
-    assert!(state.pending_calls.is_empty() && state.pending_question.is_none());
+    assert!(state.pending_calls.is_empty() && state.pending_wait.is_none());
 
     // What the model saw: history grows, tools and settings ride along.
     let requests = h.mock.requests();
@@ -1015,12 +1015,12 @@ async fn needs_input_parks_and_the_answer_becomes_the_tool_result() {
     assert_eq!(parked.status, RunStatus::Parked);
     assert!(parked.waiting);
     assert_eq!(
-        conversation(&parked).pending_question,
-        Some(PendingQuestion {
+        conversation(&parked).pending_wait,
+        Some(PendingWait::Question(PendingQuestion {
             call_id: "c1".into(),
             tool: "ask".into(),
             question: "which environment?".into(),
-        })
+        }))
     );
     assert_eq!(
         echo_calls.load(SeqCst),
@@ -1040,7 +1040,7 @@ async fn needs_input_parks_and_the_answer_becomes_the_tool_result() {
 
     assert_eq!(echo_calls.load(SeqCst), 1);
     let state = conversation(&view);
-    assert!(state.pending_question.is_none() && state.pending_calls.is_empty());
+    assert!(state.pending_wait.is_none() && state.pending_calls.is_empty());
     assert_eq!(state.messages[2], Message::tool_result("c1", "prod"));
     assert_eq!(state.messages[3], Message::tool_result("c2", "echo-out"));
     // The model's second call saw the answer as the tool result.
@@ -1117,7 +1117,7 @@ async fn an_unreadable_message_does_not_answer_the_question() {
     .await;
     assert!(
         conversation(&rt.view(run).await.unwrap().unwrap())
-            .pending_question
+            .pending_wait
             .is_some()
     );
 

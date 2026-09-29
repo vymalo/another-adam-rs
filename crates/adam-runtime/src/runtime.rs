@@ -14,6 +14,7 @@ use adam_error::{BoxError, Classify, ErrorClass};
 
 use crate::agent::{Agent, AgentError, AgentStarter, Inbound};
 use crate::cancel::CancelToken;
+use crate::child::ChildStatus;
 use crate::clock::{Clock, DynClock, SystemClock};
 use crate::envelope::Envelope;
 use crate::erased::{Erased, ErasedAgent, ErasedStarter, StarterOnly};
@@ -262,6 +263,77 @@ impl Inner {
     pub async fn announce_finished(&self, run: RunId) {
         if let Some(notifier) = &self.notifier {
             notifier.publish(Signal::Finished { run }).await;
+        }
+    }
+
+    /// Append `inbound` to the inbox of `run`; see [`Runtime::deliver`].
+    pub async fn deliver(&self, run: RunId, inbound: Inbound) -> Result<(), RuntimeError> {
+        for _ in 0..MAX_COMMIT_RETRIES {
+            let rec = self
+                .store
+                .load_run(run)
+                .await?
+                .ok_or(RuntimeError::NotFound(run))?;
+            if rec.status.is_terminal() {
+                return Err(RuntimeError::Finished {
+                    run,
+                    status: rec.status,
+                });
+            }
+            let mut env = Envelope::decode(run, &rec.state)?;
+            env.inbox.push(inbound.clone());
+            let woke = rec.status == RunStatus::Parked;
+            let (status, wake_at) = if woke {
+                (RunStatus::Runnable, None)
+            } else {
+                (rec.status, rec.wake_at)
+            };
+            let mut update = RunUpdate::new(status, env.encode()?);
+            update.wake_at = wake_at;
+            match self.store.commit_run(run, rec.version, update).await {
+                Ok(_) => {
+                    self.announce_runnable(run, &rec.agent).await;
+                    if woke {
+                        self.emit_status(
+                            run,
+                            &rec.agent,
+                            RunStatus::Runnable,
+                            Some("woken by inbound message".into()),
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
+                Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(RuntimeError::Contended(format!("run {run}")))
+    }
+
+    /// `child` just reached a terminal state: if it has a parent, tell it
+    /// ([`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND)).
+    ///
+    /// Best effort by design, and never an error for the child: this runs after the child's own
+    /// commit, so a crash or a store error here loses the message and nothing else. The parent
+    /// keeps a timer and reads the child when it fires (`Ctx::child_status`), which is what makes
+    /// the whole exchange at-least-once. A parent that is finished or gone has nobody to tell.
+    pub async fn notify_parent(&self, child: &RunRecord) {
+        let Some(parent) = child.parent_id else {
+            return;
+        };
+        if child.status.is_open() {
+            return;
+        }
+        let notice = ChildStatus::from_record(child).notice(child.id);
+        match self.deliver(parent, notice).await {
+            Ok(()) => {}
+            Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => {
+                tracing::debug!(child = %child.id, %parent, "the parent is finished or gone; nobody to tell");
+            }
+            Err(e) => {
+                tracing::warn!(child = %child.id, %parent, error = %adam_error::report(&e), "telling the parent failed; it learns of the result when its timer fires");
+            }
         }
     }
 
@@ -571,6 +643,46 @@ impl Runtime {
         }
     }
 
+    /// Start a run of `agent` as a child of `parent`, under a caller-chosen id.
+    ///
+    /// The child records `parent` (`RunRecord::parent_id`), and when it reaches a terminal state the
+    /// runtime delivers a [`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND) message to the parent
+    /// (payload: [`ChildStatus`], message id: the child's run id). The message is a hint sent after
+    /// the child's commit, so it can be lost; the parent reads the child with
+    /// [`Ctx::child_status`](crate::Ctx::child_status) on a timer to be sure.
+    ///
+    /// Idempotent like [`start_with_id`](Self::start_with_id): returns `true` if this call created
+    /// the child and `false` if a run with that id already existed (then `input` is ignored). Derive
+    /// the id from the parent and something stable, such as a tool call id, with
+    /// [`child_run_id`](crate::child_run_id), and a step that runs again finds the child it started
+    /// instead of starting another.
+    ///
+    /// The child is an ordinary run: it has no conversation, and cancelling the parent does not
+    /// cancel it (it finishes within its own limits and its message to the finished parent is
+    /// dropped). `parent` is not checked, so a child started for a parent that does not exist runs
+    /// and its message finds nobody.
+    #[tracing::instrument(skip(self, input))]
+    pub async fn start_child(
+        &self,
+        parent: RunId,
+        id: RunId,
+        agent: &str,
+        input: Inbound,
+    ) -> Result<bool, RuntimeError> {
+        let registered = self.registered(agent)?;
+        let new = self
+            .new_run(registered.starter(), input, Some(id), None)?
+            .parent(parent);
+        match self.inner.store.create_run(new).await {
+            Ok(rec) => {
+                self.started(&rec).await;
+                Ok(true)
+            }
+            Err(StoreError::AlreadyExists(_)) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn new_run(
         &self,
         agent: &dyn ErasedStarter,
@@ -622,49 +734,7 @@ impl Runtime {
     /// Fails with [`RuntimeError::Finished`] if the run is done or failed.
     #[tracing::instrument(skip(self, inbound), fields(inbound = %inbound.id))]
     pub async fn deliver(&self, run: RunId, inbound: Inbound) -> Result<(), RuntimeError> {
-        for _ in 0..MAX_COMMIT_RETRIES {
-            let rec = self
-                .inner
-                .store
-                .load_run(run)
-                .await?
-                .ok_or(RuntimeError::NotFound(run))?;
-            if rec.status.is_terminal() {
-                return Err(RuntimeError::Finished {
-                    run,
-                    status: rec.status,
-                });
-            }
-            let mut env = Envelope::decode(run, &rec.state)?;
-            env.inbox.push(inbound.clone());
-            let woke = rec.status == RunStatus::Parked;
-            let (status, wake_at) = if woke {
-                (RunStatus::Runnable, None)
-            } else {
-                (rec.status, rec.wake_at)
-            };
-            let mut update = RunUpdate::new(status, env.encode()?);
-            update.wake_at = wake_at;
-            match self.inner.store.commit_run(run, rec.version, update).await {
-                Ok(_) => {
-                    self.inner.announce_runnable(run, &rec.agent).await;
-                    if woke {
-                        self.inner
-                            .emit_status(
-                                run,
-                                &rec.agent,
-                                RunStatus::Runnable,
-                                Some("woken by inbound message".into()),
-                            )
-                            .await;
-                    }
-                    return Ok(());
-                }
-                Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(RuntimeError::Contended(format!("run {run}")))
+        self.inner.deliver(run, inbound).await
     }
 
     /// Cancel a run: a parked or runnable run becomes `Failed` with
@@ -701,12 +771,13 @@ impl Runtime {
             env.inbox.clear();
             let update = RunUpdate::new(RunStatus::Failed, env.encode()?);
             match self.inner.store.commit_run(run, rec.version, update).await {
-                Ok(_) => {
+                Ok(committed) => {
                     self.inner.fire_cancel(run);
                     self.inner.announce_finished(run).await;
                     self.inner
                         .emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
                         .await;
+                    self.inner.notify_parent(&committed).await;
                     return Ok(());
                 }
                 Err(StoreError::Conflict { .. }) => tokio::task::yield_now().await,

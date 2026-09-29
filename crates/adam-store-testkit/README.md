@@ -22,7 +22,9 @@ dependency.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.
 * `fault::FaultyStore`: wraps a `DynStore` and fails scripted calls
-  (`fail`, `fail_always`, `fail_after_apply`, `heal`, `calls`, `injected`), with
+  (`fail`, `fail_always`, `fail_after_apply`, `heal`, `calls`, `injected`; and `fail_run` /
+  `fail_run_after_apply`, which strike only the calls about one run, to break one link of a chain such as
+  the message a finished child sends its parent), with
   `fault::Method` and `fault::Mode` selecting the method and whether the
   operation is applied before the error is returned. `fault::is_injected`
   tells an injected error from a real one.

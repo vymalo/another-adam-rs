@@ -86,6 +86,9 @@ struct Rule {
 #[derive(Default)]
 struct Plan {
     rules: HashMap<Method, Rule>,
+    /// Faults that only strike calls about one run (see `FaultyStore::fail_run`). They are tried
+    /// before the rule of the method.
+    run_rules: HashMap<(Method, RunId), Rule>,
     calls: HashMap<Method, u64>,
     injected: HashMap<Method, u64>,
 }
@@ -154,14 +157,40 @@ impl FaultyStore {
         self.plan().rules.insert(method, Rule { remaining, mode });
     }
 
-    /// Stop failing `method`.
-    pub fn heal(&self, method: Method) {
-        self.plan().rules.remove(&method);
+    /// Fail the next `n` calls of `method` that are about `run` (the ones that take a run id:
+    /// `load_run`, `commit_run`, the journal methods and the lease methods), before they reach the
+    /// store. Calls about other runs pass through, so a test can break one link of a chain, such as
+    /// the message a finished child sends its parent, while everything else works. Replaces any
+    /// earlier run-scoped script for that method and run.
+    pub fn fail_run(&self, method: Method, run: RunId, n: u64) {
+        self.script_run(method, run, Some(n), Mode::Before);
     }
 
-    /// Stop failing every method. Counters are kept.
+    /// Like [`fail_run`](Self::fail_run), but the call *is* performed and then reported as failed
+    /// ([`Mode::After`]): a write whose acknowledgement was lost.
+    pub fn fail_run_after_apply(&self, method: Method, run: RunId, n: u64) {
+        self.script_run(method, run, Some(n), Mode::After);
+    }
+
+    fn script_run(&self, method: Method, run: RunId, remaining: Option<u64>, mode: Mode) {
+        self.plan()
+            .run_rules
+            .insert((method, run), Rule { remaining, mode });
+    }
+
+    /// Stop failing `method`: its method-scoped script and every run-scoped script for it
+    /// ([`fail_run`](Self::fail_run)). Other methods' scripts and the counters are kept.
+    pub fn heal(&self, method: Method) {
+        let mut plan = self.plan();
+        plan.rules.remove(&method);
+        plan.run_rules.retain(|(m, _), _| *m != method);
+    }
+
+    /// Stop failing every method, run-scoped faults included. Counters are kept.
     pub fn heal_all(&self) {
-        self.plan().rules.clear();
+        let mut plan = self.plan();
+        plan.rules.clear();
+        plan.run_rules.clear();
     }
 
     /// How many calls of `method` have been made (failed ones included).
@@ -174,31 +203,42 @@ impl FaultyStore {
         self.plan().injected.get(&method).copied().unwrap_or(0)
     }
 
-    /// Count the call and decide whether it fails, and how.
-    fn strike(&self, method: Method) -> Option<Mode> {
+    /// Count the call and decide whether it fails, and how. A call about a run meets the rule
+    /// scoped to that run first, and the rule of the method after it.
+    fn strike(&self, method: Method, run: Option<RunId>) -> Option<Mode> {
         let mut plan = self.plan();
         *plan.calls.entry(method).or_default() += 1;
-        let rule = plan.rules.get_mut(&method)?;
+        let mode = run
+            .and_then(|run| Self::spend(&mut plan.run_rules, (method, run)))
+            .or_else(|| Self::spend(&mut plan.rules, method))?;
+        *plan.injected.entry(method).or_default() += 1;
+        Some(mode)
+    }
+
+    /// Use one fault of the rule under `key`, dropping the rule when none is left.
+    fn spend<K: std::hash::Hash + Eq + Copy>(rules: &mut HashMap<K, Rule>, key: K) -> Option<Mode> {
+        let rule = rules.get_mut(&key)?;
         let mode = rule.mode;
         match &mut rule.remaining {
             Some(0) => {
-                plan.rules.remove(&method);
+                rules.remove(&key);
                 return None;
             }
             Some(n) => *n -= 1,
             None => {}
         }
-        *plan.injected.entry(method).or_default() += 1;
         Some(mode)
     }
 
-    /// Run `op` on the inner store under the script for `method`.
+    /// Run `op` on the inner store under the script for `method` (and, for a call about a run,
+    /// the one for `run`).
     async fn run<T>(
         &self,
         method: Method,
+        run: Option<RunId>,
         op: impl std::future::Future<Output = StoreResult<T>>,
     ) -> StoreResult<T> {
-        match self.strike(method) {
+        match self.strike(method, run) {
             None => op.await,
             Some(Mode::Before) => Err(StoreError::unavailable(Injected(method))),
             Some(Mode::After) => {
@@ -222,12 +262,13 @@ impl Store for FaultyStore {
     }
 
     async fn create_run(&self, run: NewRun) -> StoreResult<RunRecord> {
-        self.run(Method::CreateRun, self.inner.create_run(run))
+        self.run(Method::CreateRun, None, self.inner.create_run(run))
             .await
     }
 
     async fn load_run(&self, id: RunId) -> StoreResult<Option<RunRecord>> {
-        self.run(Method::LoadRun, self.inner.load_run(id)).await
+        self.run(Method::LoadRun, Some(id), self.inner.load_run(id))
+            .await
     }
 
     async fn commit_run(
@@ -238,6 +279,7 @@ impl Store for FaultyStore {
     ) -> StoreResult<RunRecord> {
         self.run(
             Method::CommitRun,
+            Some(id),
             self.inner.commit_run(id, expected_version, update),
         )
         .await
@@ -250,23 +292,32 @@ impl Store for FaultyStore {
     ) -> StoreResult<Option<RunRecord>> {
         self.run(
             Method::OpenRunForConversation,
+            None,
             self.inner.open_run_for_conversation(agent, conversation_id),
         )
         .await
     }
 
     async fn journal_get(&self, run: RunId, seq: u64) -> StoreResult<Option<JournalEntry>> {
-        self.run(Method::JournalGet, self.inner.journal_get(run, seq))
-            .await
+        self.run(
+            Method::JournalGet,
+            Some(run),
+            self.inner.journal_get(run, seq),
+        )
+        .await
     }
 
     async fn journal_put(&self, run: RunId, entry: JournalEntry) -> StoreResult<JournalEntry> {
-        self.run(Method::JournalPut, self.inner.journal_put(run, entry))
-            .await
+        self.run(
+            Method::JournalPut,
+            Some(run),
+            self.inner.journal_put(run, entry),
+        )
+        .await
     }
 
     async fn journal_list(&self, run: RunId) -> StoreResult<Vec<JournalEntry>> {
-        self.run(Method::JournalList, self.inner.journal_list(run))
+        self.run(Method::JournalList, Some(run), self.inner.journal_list(run))
             .await
     }
 
@@ -281,6 +332,7 @@ impl Store for FaultyStore {
     ) -> StoreResult<Vec<Lease>> {
         self.run(
             Method::ClaimDue,
+            None,
             self.inner.claim_due(agents, worker, scope, now, ttl, limit),
         )
         .await
@@ -295,19 +347,25 @@ impl Store for FaultyStore {
     ) -> StoreResult<bool> {
         self.run(
             Method::RenewLease,
+            Some(id),
             self.inner.renew_lease(id, worker, now, ttl),
         )
         .await
     }
 
     async fn release_lease(&self, id: RunId, worker: &str) -> StoreResult<()> {
-        self.run(Method::ReleaseLease, self.inner.release_lease(id, worker))
-            .await
+        self.run(
+            Method::ReleaseLease,
+            Some(id),
+            self.inner.release_lease(id, worker),
+        )
+        .await
     }
 
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
         self.run(
             Method::PurgeFinished,
+            None,
             self.inner.purge_finished(agent, before),
         )
         .await
@@ -393,6 +451,62 @@ mod tests {
             store.commit_run(run.id, 1, update).await,
             Err(StoreError::Conflict { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_run_scoped_fault_only_strikes_calls_about_that_run() {
+        let store = faulty();
+        let (a, b) = (
+            create(&store).await.expect("a"),
+            create(&store).await.expect("b"),
+        );
+        store.fail_run(Method::CommitRun, a.id, 1);
+        let update = RunUpdate::new(RunStatus::Done, json!({"n": 1}));
+        // Another run's commit passes and does not spend the fault.
+        store
+            .commit_run(b.id, 1, update.clone())
+            .await
+            .expect("b is untouched");
+        assert_eq!(store.injected(Method::CommitRun), 0);
+        // The scoped run's commit fails exactly once, and is not applied.
+        let err = store
+            .commit_run(a.id, 1, update.clone())
+            .await
+            .expect_err("scripted");
+        assert!(is_injected(&err));
+        assert_eq!(store.load_run(a.id).await.unwrap().unwrap().version, 1);
+        store.commit_run(a.id, 1, update).await.expect("spent");
+        assert_eq!(store.injected(Method::CommitRun), 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_scoped_fault_can_apply_the_call_and_lose_the_acknowledgement() {
+        let store = faulty();
+        let run = create(&store).await.expect("create");
+        store.fail_run_after_apply(Method::CommitRun, run.id, 1);
+        let update = RunUpdate::new(RunStatus::Done, json!({"n": 1}));
+        assert!(store.commit_run(run.id, 1, update).await.is_err());
+        let loaded = store.load_run(run.id).await.unwrap().unwrap();
+        assert_eq!((loaded.version, loaded.status), (2, RunStatus::Done));
+        store.heal_all();
+    }
+
+    #[tokio::test]
+    async fn heal_clears_the_run_scoped_scripts_of_that_method_only() {
+        let store = faulty();
+        let run = create(&store).await.expect("create");
+        store.fail_run(Method::LoadRun, run.id, 5);
+        store.fail_run(Method::CommitRun, run.id, 5);
+        assert!(store.load_run(run.id).await.is_err());
+        store.heal(Method::LoadRun);
+        assert!(store.load_run(run.id).await.expect("healed").is_some());
+        let update = RunUpdate::new(RunStatus::Done, json!({"n": 1}));
+        let err = store
+            .commit_run(run.id, 1, update)
+            .await
+            .expect_err("another method's run-scoped script is kept");
+        assert!(is_injected(&err));
+        assert_eq!(store.injected(Method::LoadRun), 1);
     }
 
     #[tokio::test]

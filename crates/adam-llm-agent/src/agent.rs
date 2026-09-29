@@ -4,17 +4,24 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use adam_core::{RunId, RunStatus};
 use adam_error::report;
 use adam_model::{
     Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse, ToolCall,
     ToolSpec,
 };
-use adam_runtime::{Agent, AgentError, AgentStarter, Ctx, Inbound, RunEvent, Transition};
+use adam_runtime::{
+    Agent, AgentError, AgentStarter, ChildStatus, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent,
+    Transition,
+};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::conversation::{ArtifactRef, Conversation, PendingQuestion, parse_user_text};
+use crate::conversation::{
+    ArtifactRef, Conversation, PendingQuestion, PendingRun, PendingWait, parse_user_text,
+};
 use crate::history::fit_history;
 use crate::state::Extensions;
 use crate::tool::{DynTool, Tool, ToolCtx, ToolError, ToolOutput};
@@ -92,7 +99,12 @@ pub struct LlmAgentBuilder {
     tools: Vec<DynTool>,
     limits: Limits,
     extensions: Extensions,
+    wait_poll: Duration,
 }
+
+/// How long a run waiting for a child run sleeps before it looks at the child itself, unless
+/// [`LlmAgentBuilder::wait_poll`] says otherwise.
+pub const DEFAULT_WAIT_POLL: Duration = Duration::from_secs(60);
 
 /// Why [`LlmAgentBuilder::try_build`] refused to build an agent.
 ///
@@ -159,6 +171,19 @@ impl LlmAgentBuilder {
     /// Replace the [`Limits`] (default: [`Limits::default`]).
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// How long a run that waits for a child run (a tool returned [`ToolError::AwaitRun`]) sleeps
+    /// before it reads the child itself (default [`DEFAULT_WAIT_POLL`], 60 s).
+    ///
+    /// The child normally tells the parent when it finishes, and the parent wakes at once. The
+    /// timer is the fallback for a message that never arrived (the child's process died between
+    /// its commit and the message), so it bounds how late the parent can be, not how often it
+    /// runs: each wake without the message is one store read. A zero interval is raised to one
+    /// millisecond.
+    pub fn wait_poll(mut self, every: Duration) -> Self {
+        self.wait_poll = every.max(Duration::from_millis(1));
         self
     }
 
@@ -248,6 +273,7 @@ impl LlmAgentBuilder {
             specs,
             limits: self.limits,
             extensions: Arc::new(self.extensions),
+            wait_poll: self.wait_poll,
         }
     }
 }
@@ -261,7 +287,8 @@ impl LlmAgentBuilder {
 /// # One step is one model turn
 ///
 /// 1. Inbox messages are appended to the history (or, when the run was parked
-///    on a question, the first one answers it).
+///    on a question, the first one answers it). A run parked on a child run
+///    looks at the child instead (see "Child runs" below).
 /// 2. The model is called in a journaled step `model:<turn>` with the history
 ///    and tool specs.
 /// 3. Each requested tool runs as its own journaled step `tool:<call id>` and
@@ -282,7 +309,27 @@ impl LlmAgentBuilder {
 ///   `ok`, `error`, `needs_input` or `transient_error`;
 /// * `Progress` from [`ToolCtx::emit_progress`];
 /// * `Artifact` for each artifact a tool returns (also durable);
-/// * `Custom { kind: "input_required", payload: {question, call_id} }` before parking.
+/// * `Custom { kind: "input_required", payload: {question, call_id} }` before parking;
+/// * `Custom { kind: "awaiting_run", payload: {call_id, run} }` before parking on a child run,
+///   followed by a `tool_end` with status `waiting` (not final), and later by the final
+///   `tool_end` with `ok` or `error` when the child's outcome becomes the result.
+///
+/// # Child runs
+///
+/// A tool that returns [`ToolError::AwaitRun`] has started a child run (with
+/// `Runtime::start_child`, under [`ToolCtx::child_run_id`]) whose outcome is
+/// the answer. The run parks with a timer ([`LlmAgentBuilder::wait_poll`],
+/// 60 s by default) and records the wait in [`Conversation::pending_wait`].
+/// When the child finishes, the runtime delivers an `adam.run.finished`
+/// message and the parent wakes at once; if that message is lost, the timer
+/// wakes it and it reads the child (`Ctx::child_status`), so a lost message
+/// costs at most one interval. The outcome becomes the tool result: the
+/// child's `text` (or its output as JSON), or, for a child that failed or was
+/// cancelled, an error result saying so. The message is matched to the wait by
+/// the child's run id, and one that matches nothing (a copy of a message
+/// already used, or a stray one) is dropped. User messages that arrive
+/// meanwhile queue behind the owed result. Cancelling the parent does not
+/// cancel the child.
 ///
 /// # Failure handling
 ///
@@ -294,7 +341,8 @@ impl LlmAgentBuilder {
 ///   (the runtime's backoff still applies when it is longer).
 /// * Other model error: the run fails (`model call failed: ...`).
 /// * [`ToolError::Permanent`], `ToolOutput { is_error: true }` and unknown
-///   tool names: an error tool result for the model; the run goes on.
+///   tool names: an error tool result for the model; the run goes on. So does
+///   a child run that failed, was cancelled or no longer exists.
 /// * A tripped [`Limits`] entry: the run fails.
 #[derive(Clone)]
 pub struct LlmAgent {
@@ -307,6 +355,7 @@ pub struct LlmAgent {
     specs: Vec<ToolSpec>,
     limits: Limits,
     extensions: Arc<Extensions>,
+    wait_poll: Duration,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -333,6 +382,8 @@ enum Flow {
     Next,
     /// Wait for the user (a tool asked a question).
     Park,
+    /// Wait for a child run, with a timer.
+    Wait,
     /// The model finished.
     Done(Value),
     /// Fail the run.
@@ -355,6 +406,7 @@ impl LlmAgent {
             tools: Vec::new(),
             limits: Limits::default(),
             extensions: Extensions::new(),
+            wait_poll: DEFAULT_WAIT_POLL,
         }
     }
 
@@ -368,7 +420,10 @@ impl LlmAgent {
     }
 
     /// Move inbound messages into the state; the first one answers a pending
-    /// question. Returns `false` when the run must keep waiting.
+    /// question. Returns `false` when the run must keep waiting for that answer.
+    ///
+    /// A wait on a child run is not touched here: user messages queue behind
+    /// the owed tool result like any other.
     fn absorb_inbox(&self, state: &mut Conversation, inbox: Vec<Inbound>) -> bool {
         let mut texts = Vec::new();
         for inbound in inbox {
@@ -380,19 +435,16 @@ impl LlmAgent {
             }
         }
         let mut texts = texts.into_iter();
-        if let Some(q) = state.pending_question.take() {
+        if let Some(PendingWait::Question(q)) = &state.pending_wait {
             let Some(answer) = texts.next() else {
-                state.pending_question = Some(q);
                 return false;
             };
-            if state
-                .pending_calls
-                .first()
-                .is_some_and(|c| c.id == q.call_id)
-            {
+            let call_id = q.call_id.clone();
+            state.pending_wait = None;
+            if state.pending_calls.first().is_some_and(|c| c.id == call_id) {
                 state.pending_calls.remove(0);
             }
-            state.messages.push(Message::tool_result(q.call_id, answer));
+            state.messages.push(Message::tool_result(call_id, answer));
         }
         for text in texts {
             let message = Message::user_text(text);
@@ -403,6 +455,66 @@ impl LlmAgent {
             }
         }
         true
+    }
+
+    /// When a run that waits for a child looks at it next.
+    fn next_poll(&self, ctx: &Ctx) -> DateTime<Utc> {
+        let every = chrono::Duration::from_std(self.wait_poll).unwrap_or(chrono::Duration::MAX);
+        ctx.now()
+            .checked_add_signed(every)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    }
+
+    /// The child's outcome as the result of the call that waited for it. Returns the status word
+    /// the `tool_end` event carries.
+    fn answer_run(
+        state: &mut Conversation,
+        wait: &PendingRun,
+        child: &ChildStatus,
+    ) -> &'static str {
+        let (message, status) = match (&child.status, &child.error) {
+            (RunStatus::Done, _) => (
+                Message::tool_result(wait.call_id.clone(), render_output(child.output.as_ref())),
+                "ok",
+            ),
+            (_, error) => (
+                Message::tool_error(
+                    wait.call_id.clone(),
+                    format!(
+                        "the run failed: {}",
+                        error.as_deref().unwrap_or("no reason given")
+                    ),
+                ),
+                "error",
+            ),
+        };
+        state.messages.push(message);
+        if state
+            .pending_calls
+            .first()
+            .is_some_and(|c| c.id == wait.call_id)
+        {
+            state.pending_calls.remove(0);
+        }
+        state.pending_wait = None;
+        status
+    }
+
+    /// Where the child a run waits for stands: what its message said, or, without one, what the
+    /// store says. `None`: still working.
+    async fn settle(
+        ctx: &Ctx,
+        wait: &PendingRun,
+        notices: &[(RunId, ChildStatus)],
+    ) -> Result<Option<ChildStatus>, AgentError> {
+        if let Some((_, status)) = notices.iter().find(|(run, _)| *run == wait.run) {
+            return Ok(Some(status.clone()));
+        }
+        Ok(match ctx.child_status(wait.run).await? {
+            Some(status) if status.is_finished() => Some(status),
+            Some(_) => None,
+            None => Some(ChildStatus::vanished()),
+        })
     }
 
     /// One journaled model call, then the assistant message into the state.
@@ -500,10 +612,14 @@ impl LlmAgent {
     }
 
     /// Run the owed tool calls in order, each as its own journaled step.
+    ///
+    /// `notices` are the finished-child messages this transition received: a call that starts a
+    /// child which already finished (its message got here first) is answered at once.
     async fn run_pending(
         &self,
         ctx: &mut Ctx,
         state: &mut Conversation,
+        notices: &[(RunId, ChildStatus)],
     ) -> Result<Flow, AgentError> {
         while let Some(call) = state.pending_calls.first().cloned() {
             let (message, artifacts) = match self.run_tool(ctx, &call).await? {
@@ -514,12 +630,32 @@ impl LlmAgent {
                         payload: json!({ "question": question, "call_id": call.id }),
                     })
                     .await;
-                    state.pending_question = Some(PendingQuestion {
+                    state.pending_wait = Some(PendingWait::Question(PendingQuestion {
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
                         question,
-                    });
+                    }));
                     return Ok(Flow::Park);
+                }
+                ToolResult::AwaitRun(run) => {
+                    let wait = PendingRun {
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        run,
+                    };
+                    let Some((_, child)) = notices.iter().find(|(r, _)| *r == run) else {
+                        ctx.emit(RunEvent::Custom {
+                            kind: "awaiting_run".into(),
+                            payload: json!({ "call_id": call.id, "run": run }),
+                        })
+                        .await;
+                        ctx.emit(tool_end(&call.name, &call.id, "waiting")).await;
+                        state.pending_wait = Some(PendingWait::Run(wait));
+                        return Ok(Flow::Wait);
+                    };
+                    let status = Self::answer_run(state, &wait, child);
+                    ctx.emit(tool_end(&call.name, &call.id, status)).await;
+                    continue;
                 }
             };
             state.messages.push(message);
@@ -535,10 +671,7 @@ impl LlmAgent {
             kind: "tool_start".into(),
             payload: json!({ "name": call.name, "call_id": call.id, "status": status }),
         };
-        let end = |status: &'static str| RunEvent::Custom {
-            kind: "tool_end".into(),
-            payload: json!({ "name": call.name, "call_id": call.id, "status": status }),
-        };
+        let end = |status: &'static str| tool_end(&call.name, &call.id, status);
         ctx.emit(start("running")).await;
 
         let Some(tool) = self.tool(&call.name).cloned() else {
@@ -619,6 +752,9 @@ impl LlmAgent {
                 ctx.emit(end("needs_input")).await;
                 Ok(ToolResult::NeedsInput(question))
             }
+            // No end event yet: `run_pending` says "waiting", or the final status when the
+            // child's message is already here.
+            Err(ToolError::AwaitRun { run }) => Ok(ToolResult::AwaitRun(run)),
         }
     }
 }
@@ -669,6 +805,35 @@ enum ToolResult {
         artifacts: Vec<ArtifactRef>,
     },
     NeedsInput(String),
+    AwaitRun(RunId),
+}
+
+fn tool_end(name: &str, call_id: &str, status: &'static str) -> RunEvent {
+    RunEvent::Custom {
+        kind: "tool_end".into(),
+        payload: json!({ "name": name, "call_id": call_id, "status": status }),
+    }
+}
+
+/// A child's output as the text of the tool result. An `LlmAgent` child finishes with
+/// `{"text": ..., "artifacts": [...]}` and the parent's model gets the text (the same reading the
+/// A2A adapter has of an output); another string is passed as it is, and anything else as JSON.
+fn render_output(output: Option<&Value>) -> String {
+    let text = match output {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Object(o)) if matches!(o.get("text"), Some(Value::String(_))) => o
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Some(other) => other.to_string(),
+    };
+    if text.trim().is_empty() {
+        "(the run finished without output)".to_owned()
+    } else {
+        text
+    }
 }
 
 #[async_trait]
@@ -692,13 +857,43 @@ impl Agent for LlmAgent {
         ctx: &mut Ctx,
         mut state: Conversation,
     ) -> Result<Transition<Conversation>, AgentError> {
-        let inbox = ctx.take_inbox();
+        let (finished, inbox): (Vec<_>, Vec<_>) = ctx
+            .take_inbox()
+            .into_iter()
+            .partition(|i| i.kind == RUN_FINISHED_KIND);
+        let notices: Vec<(RunId, ChildStatus)> = finished
+            .iter()
+            .filter_map(|i| {
+                let notice = ChildStatus::from_notice(i);
+                if notice.is_none() {
+                    tracing::warn!(inbound = %i.id, "ignoring an unreadable run.finished message");
+                }
+                notice
+            })
+            .collect();
         if !self.absorb_inbox(&mut state, inbox) {
             // Woken without an answer (nothing usable arrived): keep waiting.
             return Ok(Transition::Park {
                 state,
                 wake_at: None,
             });
+        }
+
+        // A wait on a child ends with the child's message or, when woken without one (the timer,
+        // or a user message), with what the store says. A message that matches no wait (a
+        // duplicate of one already used, or one for a call the run is not on) is dropped here:
+        // the wait it was for has been settled, or will be, from the store.
+        if let Some(PendingWait::Run(wait)) = state.pending_wait.clone() {
+            match Self::settle(ctx, &wait, &notices).await? {
+                Some(child) => {
+                    let status = Self::answer_run(&mut state, &wait, &child);
+                    ctx.emit(tool_end(&wait.tool, &wait.call_id, status)).await;
+                }
+                None => {
+                    let wake_at = Some(self.next_poll(ctx));
+                    return Ok(Transition::Park { state, wake_at });
+                }
+            }
         }
 
         // Owed tool results (the run was parked on a question) come first;
@@ -709,7 +904,7 @@ impl Agent for LlmAgent {
             flow = self.model_turn(ctx, &mut state).await?;
         }
         if matches!(flow, Flow::Next) {
-            flow = self.run_pending(ctx, &mut state).await?;
+            flow = self.run_pending(ctx, &mut state, &notices).await?;
         }
         Ok(match flow {
             Flow::Next => {
@@ -722,9 +917,46 @@ impl Agent for LlmAgent {
                 state,
                 wake_at: None,
             },
+            Flow::Wait => Transition::Park {
+                wake_at: Some(self.next_poll(ctx)),
+                state,
+            },
             Flow::Done(output) => Transition::Done { state, output },
             Flow::Fail(error) => Transition::Fail { state, error },
         })
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+
+    #[test]
+    fn a_child_answers_with_its_text() {
+        assert_eq!(
+            render_output(Some(&json!({"text": "approved", "artifacts": []}))),
+            "approved"
+        );
+        assert_eq!(render_output(Some(&json!("plain"))), "plain");
+        // Anything else is the model's to read as it is: its JSON.
+        let other = json!({"verdict": "ok", "n": 2});
+        let rendered = render_output(Some(&other));
+        assert_eq!(serde_json::from_str::<Value>(&rendered).unwrap(), other);
+        assert_eq!(render_output(Some(&json!([1, 2]))), "[1,2]");
+        // A `text` that is not a string is not a text.
+        assert_eq!(render_output(Some(&json!({"text": 3}))), r#"{"text":3}"#);
+    }
+
+    #[test]
+    fn no_output_is_said_not_left_empty() {
+        for none in [
+            None,
+            Some(&Value::Null),
+            Some(&json!("")),
+            Some(&json!({"text": "  "})),
+        ] {
+            assert_eq!(render_output(none), "(the run finished without output)");
+        }
     }
 }
 

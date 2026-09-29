@@ -23,13 +23,17 @@ pub type PromptFn = Arc<dyn Fn(&RunView) -> Option<String> + Send + Sync>;
 /// follow-ups alike). An `Err` becomes `invalid params` for the client.
 pub type InboundFn = Arc<dyn Fn(&Message) -> Result<Inbound, String> + Send + Sync>;
 
-/// The default [`PromptFn`]: `state.pending_question.question` (what
-/// `adam_llm_agent::Conversation` stores while it waits) or, failing that, a
-/// string at `state.question`.
+/// The default [`PromptFn`]: `state.pending_wait.question` (what
+/// `adam_llm_agent::Conversation` stores while it waits for the user), or
+/// `state.pending_question.question` (what it stored before it could also wait
+/// for a child run, so runs parked by an older build keep their prompt) or,
+/// failing both, a string at `state.question`. A run that waits for a child run
+/// has no question and is `working`, not `input-required`.
 pub fn default_prompt(view: &RunView) -> Option<String> {
     let state = &view.state;
     state
-        .pointer("/pending_question/question")
+        .pointer("/pending_wait/question")
+        .or_else(|| state.pointer("/pending_question/question"))
         .or_else(|| state.get("question"))
         .and_then(Value::as_str)
         .map(str::to_owned)
@@ -303,10 +307,20 @@ mod tests {
 
     #[test]
     fn status_messages_carry_the_question_output_and_error() {
+        // The field is `pending_wait` now; a run parked by an older build stored `pending_question`.
+        for state in [
+            json!({"pending_wait": {"call_id": "c1", "tool": "ask", "question": "which branch?"}}),
+            json!({"pending_question": {"question": "which branch?"}}),
+        ] {
+            let mut v = view(RunStatus::Parked);
+            v.state = state;
+            let s = status_of(&v, &prompt());
+            assert_eq!(s.message.unwrap().text(), Some("which branch?"));
+        }
+        // A wait on a child run asks nobody anything.
         let mut v = view(RunStatus::Parked);
-        v.state = json!({"pending_question": {"question": "which branch?"}});
-        let s = status_of(&v, &prompt());
-        assert_eq!(s.message.unwrap().text(), Some("which branch?"));
+        v.state = json!({"pending_wait": {"call_id": "c1", "tool": "sub", "run": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"}});
+        assert_eq!(default_prompt(&v), None);
 
         let mut v = view(RunStatus::Done);
         v.output = Some(json!({"text": "all done", "artifacts": []}));

@@ -333,15 +333,11 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
         Err(e) => {
             tracing::error!(error = %e, "failing run with unreadable state");
             let update = RunUpdate::new(RunStatus::Failed, rec.state.clone());
-            if inner
-                .store
-                .commit_run(run, rec.version, update)
-                .await
-                .is_ok()
-            {
+            if let Ok(committed) = inner.store.commit_run(run, rec.version, update).await {
                 inner
                     .emit_status(run, &rec.agent, RunStatus::Failed, Some(e.to_string()))
                     .await;
+                inner.notify_parent(&committed).await;
             }
             return true;
         }
@@ -385,6 +381,8 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
     match commit(inner, &rec, &env, &next).await {
         Ok(Some(committed)) => {
             announce(inner, &committed, &next).await;
+            // After the commit, never before: the parent's timer is the fallback for a crash here.
+            inner.notify_parent(&committed).await;
             true
         }
         Ok(None) => {

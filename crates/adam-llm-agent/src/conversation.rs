@@ -1,5 +1,6 @@
 //! The agent's durable state and the inbound message format.
 
+use adam_core::RunId;
 use adam_model::{Message, ToolCall, Usage};
 use adam_runtime::Inbound;
 use serde::{Deserialize, Serialize};
@@ -34,8 +35,9 @@ pub(crate) fn parse_user_text(payload: &Value) -> Result<String, String> {
 
 /// A tool call that asked the user a question and waits for the answer.
 ///
-/// Stored in [`Conversation::pending_question`], so it is visible in the
-/// durable run view (`RunView::state`) while the run is parked.
+/// One kind of [`PendingWait`], stored in [`Conversation::pending_wait`], so it
+/// is visible in the durable run view (`RunView::state`) while the run is
+/// parked.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingQuestion {
     /// The tool call the answer will be returned for.
@@ -44,6 +46,46 @@ pub struct PendingQuestion {
     pub tool: String,
     /// The question.
     pub question: String,
+}
+
+/// A tool call that waits for a child run to finish.
+///
+/// One kind of [`PendingWait`]. The run is parked with a timer, and the call is
+/// answered by the child's `adam.run.finished` message, or, when the timer fires
+/// first, by reading the child.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingRun {
+    /// The tool call the child's result will be returned for.
+    pub call_id: String,
+    /// The tool that started the child.
+    pub tool: String,
+    /// The child run.
+    pub run: RunId,
+}
+
+/// What a parked run is waiting for, so that one result can complete the call
+/// that owes it.
+///
+/// Serialized without a tag, by its fields: `{call_id, tool, question}` for a
+/// [`Question`](Self::Question) (the shape the field had when it could only hold
+/// a question) and `{call_id, tool, run}` for a [`Run`](Self::Run).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PendingWait {
+    /// The tool started a child run; its outcome is the tool result.
+    Run(PendingRun),
+    /// The tool needs the user's answer; the next message is the tool result.
+    Question(PendingQuestion),
+}
+
+impl PendingWait {
+    /// The tool call the wait is for.
+    pub fn call_id(&self) -> &str {
+        match self {
+            Self::Run(w) => &w.call_id,
+            Self::Question(w) => &w.call_id,
+        }
+    }
 }
 
 /// Name and media type of an artifact a tool produced (the content itself
@@ -79,12 +121,14 @@ pub struct Conversation {
     pub usage: Usage,
     /// Calls of the last assistant message that have no result yet, in order.
     /// Only non-empty while a step is in flight or the run is parked on
-    /// [`pending_question`](Self::pending_question).
+    /// [`pending_wait`](Self::pending_wait).
     #[serde(default)]
     pub pending_calls: Vec<ToolCall>,
-    /// Set while the run is parked waiting for the user's answer.
-    #[serde(default)]
-    pub pending_question: Option<PendingQuestion>,
+    /// Set while the run is parked waiting for the user's answer or for a child
+    /// run. Before child runs existed this field was `pending_question` and held
+    /// only a question; state stored under that name still loads.
+    #[serde(default, alias = "pending_question")]
+    pub pending_wait: Option<PendingWait>,
     /// User messages that arrived while tool results were still owed. They are
     /// appended once the last owed result is in (a user message between an
     /// assistant tool call and its result would break the protocol).
@@ -128,6 +172,69 @@ mod tests {
         assert_eq!(m.kind, MESSAGE_KIND);
         assert_eq!(m.payload, json!({"text": "hello"}));
         assert_eq!(parse_user_text(&m.payload).unwrap(), "hello");
+    }
+
+    /// A `Conversation` as an older version stored it: the field is still called
+    /// `pending_question`. Written by hand, not by the current serializer.
+    const OLD_PARKED_ON_A_QUESTION: &str = r#"{
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "deploy"}]}
+        ],
+        "turns": 1,
+        "tool_calls": 1,
+        "pending_calls": [{"id": "c1", "name": "ask", "arguments": {}}],
+        "pending_question": {"call_id": "c1", "tool": "ask", "question": "which environment?"}
+    }"#;
+
+    #[test]
+    fn a_state_stored_as_pending_question_still_loads() {
+        let c: Conversation = serde_json::from_str(OLD_PARKED_ON_A_QUESTION).unwrap();
+        assert_eq!(
+            c.pending_wait,
+            Some(PendingWait::Question(PendingQuestion {
+                call_id: "c1".into(),
+                tool: "ask".into(),
+                question: "which environment?".into(),
+            }))
+        );
+        assert_eq!(c.pending_calls.len(), 1);
+        assert_eq!(c.turns, 1);
+        // Stored again, it is written under the new name and reads back the same.
+        let stored = serde_json::to_value(&c).unwrap();
+        assert!(stored.get("pending_question").is_none());
+        assert_eq!(
+            stored["pending_wait"],
+            json!({"call_id": "c1", "tool": "ask", "question": "which environment?"})
+        );
+        assert_eq!(serde_json::from_value::<Conversation>(stored).unwrap(), c);
+    }
+
+    #[test]
+    fn a_wait_on_a_child_run_keeps_its_own_shape() {
+        let run = RunId::new();
+        let literal = json!({
+            "pending_wait": {"call_id": "c1", "tool": "reviewer", "run": run.to_string()}
+        });
+        let c: Conversation = serde_json::from_value(literal.clone()).unwrap();
+        assert_eq!(
+            c.pending_wait,
+            Some(PendingWait::Run(PendingRun {
+                call_id: "c1".into(),
+                tool: "reviewer".into(),
+                run,
+            }))
+        );
+        assert_eq!(
+            c.pending_wait.as_ref().map(PendingWait::call_id),
+            Some("c1")
+        );
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["pending_wait"],
+            literal["pending_wait"]
+        );
+        // A null field, as `Conversation::default` serializes, is no wait at all.
+        let none: Conversation = serde_json::from_value(json!({"pending_question": null})).unwrap();
+        assert_eq!(none.pending_wait, None);
     }
 
     #[test]

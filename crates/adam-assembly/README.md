@@ -250,7 +250,7 @@ The seams are in code, in one place each:
 | Slice | What plugs in | Where |
 |---|---|---|
 | S7 skills (built) | the catalog appended to the prompt, `load_skill` and `read_skill_file` added to the tools | `add_skills` in `def.rs`, called while `bind` resolves an agent, so `Node::prompt` and `Node::tools` are final when `BoundDef::build` hands them to `LlmAgent`; the logic is `skills.rs` |
-| S8, S9 subagents | a tool per child that starts a durable child run; least-privilege tools are already resolved | `BoundDef::build`: the children of a node are the nodes whose `parent` is its index, and `AgentInfo::description` is the tool description; a tool with a name `load_skill` or `read_skill_file` is already refused by `add_skills`, and a subagent tool will need the same check |
+| S9 subagents (the runtime side, S8, is built) | a tool per child that calls `Runtime::start_child` under `ToolCtx::child_run_id()` and returns `ToolError::AwaitRun`; least-privilege tools are already resolved | `BoundDef::build`: the children of a node are the nodes whose `parent` is its index, and `AgentInfo::description` is the tool description; a tool with a name `load_skill` or `read_skill_file` is already refused by `add_skills`, and a subagent tool will need the same check |
 | S9b remote subagents | a tool per `RemoteInfo` | `BoundDef::build`, with `remotes` |
 | S10 dev reload | `from_source` + `bind` + `model` again on a changed directory, swapped at a step boundary | a caller of this crate; `AgentDef` and `BoundDef` are plain values |
 | S11 MCP tools | the discovered tools go into the `ToolSet` given to `bind`; `linear__*` patterns already match them | `AgentDef::bind` |

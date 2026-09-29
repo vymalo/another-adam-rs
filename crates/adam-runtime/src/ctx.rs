@@ -11,6 +11,7 @@ use adam_core::{DynStore, JournalEntry, RunId, StoreError};
 
 use crate::agent::{AgentError, Inbound};
 use crate::cancel::CancelToken;
+use crate::child::ChildStatus;
 use crate::clock::DynClock;
 use crate::events::{Artifact, DynEventSink, RunEvent};
 
@@ -301,6 +302,32 @@ impl Ctx {
         let taken = std::mem::take(&mut self.inbox);
         self.consumed += taken.len();
         taken
+    }
+
+    /// Where the child run `run` stands now, read from the store.
+    ///
+    /// This is the fallback of the [`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND) message: a parent
+    /// that waits for a child parks with a timer, and when it wakes without the message it asks
+    /// here. **Not journaled**: it is a live read, and a replay must see the child as it is then.
+    ///
+    /// `Ok(None)` when the run does not exist (a child purged after it finished).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Permanent`] when `run` is not a child of this run: a run reads its own
+    /// children and no others, so an agent cannot probe the results of unrelated runs. A store
+    /// failure is [`AgentError::Store`].
+    pub async fn child_status(&self, run: RunId) -> Result<Option<ChildStatus>, AgentError> {
+        let Some(rec) = self.store.load_run(run).await.map_err(store_error)? else {
+            return Ok(None);
+        };
+        if rec.parent_id != Some(self.run) {
+            return Err(AgentError::permanent(format!(
+                "run {run} is not a child of run {}",
+                self.run
+            )));
+        }
+        Ok(Some(ChildStatus::from_record(&rec)))
     }
 
     /// A handle on this transition's cancellation signal, cloneable and

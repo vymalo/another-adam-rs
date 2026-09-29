@@ -3,7 +3,7 @@
 Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
 facade), S3 (`adam-coder` tools through `#[tool]`), S4 (`adam-agent-fs`, the parser and validator of
 agent directories), S5 (the `build.rs` codegen and `adam::include_agent!()`), S6 (`adam-assembly`,
-which binds a manifest to `LlmAgent`s) and S7 (skills at run time) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+which binds a manifest to `LlmAgent`s), S7 (skills at run time) and S8 (durable child runs in the runtime) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
 the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
@@ -520,14 +520,16 @@ is a tool result like any other (the client guide asks for skill content to be e
 Preloading is the way to keep a skill for the whole run until the loop's history fitting learns to
 protect it.
 
-## Subagents at run time (planned)
+## Subagents at run time (S8 built, S9 planned)
 
 **Subagents** are child runs. Each local subagent is its own `LlmAgent` registered on the same
 `Runtime` as `<root>/<sub>`. The parent sees one tool per subagent (decision D5), with input
 `{ message }`. The child never sees the parent's history.
 
-Planned: this describes slice S8/S9. Nothing in the diagram exists yet; `NewRun::parent` exists in
-`adam-core` and the runtime never sets it.
+Slice S8, the child runs in the runtime and in `LlmAgent`, is **built**; the tool that hands the model a
+subagent (`SubagentTool`, slice S9) is not. The diagram below is what S8 implements and its tests exercise with a
+stand-in tool; the full design, the failure interleavings and their tests are in
+[Child runs](architecture.md#child-runs) in the architecture.
 
 ```mermaid
 sequenceDiagram
@@ -554,16 +556,30 @@ stateDiagram-v2
   Waiting --> Answered: run.finished inbound, or timer wake finds the child terminal
   Waiting --> Failed: parent cancelled
   Answered --> [*]: tool result is the child output, or an error result
-  Failed --> [*]
+  Failed --> [*]: the child is not cancelled
 ```
 
-The deterministic child id (`uuidv5(parent run, call id)`) with `start_with_id` makes the start
-idempotent, so the only side effects of the call are that creation and reads. Runtime changes:
-`Runtime::start_child`, a notification on the terminal commit of a run that has a parent
-(at-least-once, deduplicated by `Inbound::id`), `Ctx::child_status` as the fallback read, a new
-`ToolError::AwaitRun` variant (old journals still decode), and `LlmAgent` generalising
-`pending_question` to a wait with a serde default so stored conversations still load. Cancelling a
-parent does not cancel its children in v1; they finish within their own limits.
+The deterministic child id (`child_run_id(parent run, call id)`) with `start_child` makes the start
+idempotent, so the only side effects of the call are that creation and reads. What S8 added:
+
+* `Runtime::start_child(parent, id, agent, input)`: `start_with_id` that records the parent.
+* On the terminal commit of a run that has a parent (a step, a cancel, or an unreadable state), the runtime
+  delivers `adam.run.finished` (at-least-once; payload `{status, output | error}`; `Inbound::id` is the
+  child's run id, so the parent deduplicates). It is sent after the commit, so it can be lost, and the parent
+  always waits with a timer.
+* `Ctx::child_status(run)`: the fallback read, for the caller's own children only.
+* `ToolError::AwaitRun { run }`, a new variant (old journals still decode), and `ToolCtx::child_run_id()`.
+* `LlmAgent` records `Conversation::pending_wait` (a `Question` or a `Run`; the field was `pending_question` and
+  state stored under that name still loads), parks with `wait_poll` (60 s by default), and turns the child's
+  outcome into the tool result: its `output.text`, or an error result if it failed.
+
+The id is a UUID version 8 from a SHA-256 (as the A2A adapter derives task ids), not the UUIDv5 the first
+sketch named: no new dependency, and one derivation convention in the workspace.
+
+Cancelling a parent does not cancel its children in v1; they finish within their own limits and their message
+to the finished parent is dropped (a cascade needs `Store::children`, see the architecture). A model that
+calls several subagents in one turn gets them one after the other. For S9: `SubagentTool` holds a `Runtime`
+handle, calls `start_child(ctx.run_id(), ctx.child_run_id(), "<root>/<sub>", ..)` and returns `AwaitRun`.
 
 Remote subagents (`a2a:`) use the same tool shape: a journaled A2A `SendMessage`, then a park on the
 remote task id and a poll on the timer.
@@ -628,7 +644,7 @@ stateDiagram-v2
   key by key.
 * **Subagents are defined, not yet callable.** Each local subagent becomes an `LlmAgent` named
   `<parent>/<name>` with its own prompt, tools, alias and limits, and `Assembly::register` registers all of
-  them on the runtime. The tool that starts one as a durable child run is S8/S9; remote subagents are data
+  them on the runtime. The runtime side of a durable child run is built (S8); the tool that starts one is S9; remote subagents are data
   (`Assembly::remotes()`) until S9b. `mcp.json` stays in the manifest for S11. Skills are bound (S7, see
   the section above): the catalog and the two tools are added while `bind` resolves an agent, so the
   prompt and the tool list `BoundDef::build` hands to `LlmAgent` are already final. The tools of S9 and
@@ -748,5 +764,6 @@ type already sets the pattern).
 | S5 | `build.rs` codegen and `adam::include_agent!()` | built |
 | S6 | `adam-assembly`: `AgentDef`, templating, tool binding, models, the card | built |
 | S7 | skills at run time: the catalog, `load_skill`, `read_skill_file`, `preload_skills` | built |
-| S8, S9 | child runs and subagents | planned; S8 needs a review of the design above first |
+| S8 | child runs in the runtime: `start_child`, the finished message, `Ctx::child_status`, `ToolError::AwaitRun`, `pending_wait` | built |
+| S9 | subagents: `SubagentTool` and its binding | planned |
 | S10, S11 | dev reload; `mcp.json` tools | planned |
