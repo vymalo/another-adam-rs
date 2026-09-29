@@ -7,13 +7,18 @@
 //! done by [`adam_coder::serve`].
 
 use std::future::Future;
+use std::process::ExitCode;
 
-use adam_coder::Config;
+use adam_coder::{Config, Redactor, exit_code};
 use anyhow::Context as _;
 use tracing_subscriber::EnvFilter;
 
+/// Exit code 0 after a clean shutdown; otherwise the sysexits-style code of the error's root cause
+/// ([`adam_coder::exit`]: 78 configuration, 69 dependency unreachable, 71 OS error, 70 internal, 1
+/// anything else). The failure is one structured log line, with the whole cause chain and none of
+/// the process's secrets, written by the same logger as everything else.
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -21,9 +26,26 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = Config::from_env().context("reading the configuration")?;
+    // Nothing is known to be secret until the configuration is read; its errors name variables,
+    // never their values.
+    let config = match Config::from_env().context("reading the configuration") {
+        Ok(config) => config,
+        Err(e) => return fail(&e, &Redactor::default()),
+    };
+    let redactor = Redactor::from_config(&config);
     tracing::info!(config = ?config, "starting adam-coder");
-    adam_coder::serve(config, shutdown_signal()).await
+    match adam_coder::serve(config, shutdown_signal()).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e, &redactor),
+    }
+}
+
+/// Log `e` once, chain included, and turn it into the process's exit code.
+fn fail(e: &anyhow::Error, redactor: &Redactor) -> ExitCode {
+    let code = exit_code(e);
+    let chain = redactor.scrub_string(format!("{e:#}"));
+    tracing::error!(error = %chain, code, "adam-coder failed");
+    ExitCode::from(code)
 }
 
 /// Resolves on SIGTERM or Ctrl-C.

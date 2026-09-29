@@ -31,15 +31,26 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use adam_error::{Classify, ErrorClass};
 use secrecy::SecretString;
 use url::Url;
 
 /// One or more environment variables are missing or unusable.
+///
+/// Classified as [`ErrorClass::Invalid`]: the same environment never works. It lists every
+/// problem at once and never a secret's value.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 #[error("invalid configuration:\n  - {}", problems.join("\n  - "))]
 pub struct ConfigError {
     /// One line per problem.
     pub problems: Vec<String>,
+}
+
+impl Classify for ConfigError {
+    fn class(&self) -> ErrorClass {
+        ErrorClass::Invalid
+    }
 }
 
 /// The binary's configuration.

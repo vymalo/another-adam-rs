@@ -58,6 +58,7 @@
 pub mod agent;
 pub mod app;
 pub mod config;
+pub mod exit;
 pub mod instructions;
 pub mod opencode;
 pub mod redact;
@@ -68,6 +69,7 @@ pub mod tools;
 pub use agent::{AGENT_NAME, CoderAgent, coder_limits};
 pub use app::{Coder, RuntimeOptions, agent_card};
 pub use config::{Config, ConfigError};
+pub use exit::{StoppedUnexpectedly, exit_code};
 pub use instructions::instructions;
 pub use redact::Redactor;
 pub use repos::workspaces_for;
