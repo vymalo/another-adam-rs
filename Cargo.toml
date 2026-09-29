@@ -13,6 +13,7 @@ rust-version = "1.94"
 [workspace.dependencies]
 adam-core = { path = "crates/adam-core", version = "0.1.0" }
 adam-model = { path = "crates/adam-model", version = "0.1.0" }
+adam-runtime = { path = "crates/adam-runtime", version = "0.1.0" }
 adam-store-testkit = { path = "crates/adam-store-testkit", version = "0.1.0" }
 adam-workspace = { path = "crates/adam-workspace", version = "0.1.0" }
 

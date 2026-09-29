@@ -19,6 +19,7 @@ trait, a shared conformance suite, and two production adapters.
 | `adam-runtime` | Durable agent loop: `Agent` trait, run state machine, `ctx.step` journaling, workers, retries, event sinks |
 | `adam-a2a` | Expose an agent as an A2A 1.0 server (axum): `TaskBackend` seam, bearer auth (fail closed), `InMemoryBackend` under feature `test-util` |
 | `adam-acp` | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
+| `adam-llm-agent` | `LlmAgent`: the durable model/tool-calling loop (`Tool` trait, `NeedsInput` parking, limits, history truncation) on top of `adam-runtime` |
 
 ## The model
 

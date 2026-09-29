@@ -62,7 +62,7 @@ mod worker;
 
 pub use agent::{Agent, AgentError, Inbound, Transition};
 pub use clock::{Clock, DynClock, ManualClock, SystemClock};
-pub use ctx::Ctx;
+pub use ctx::{Ctx, Emitter};
 pub use events::{
     Artifact, BroadcastSink, CollectingSink, DynEventSink, EventSink, NoopSink, RunEvent,
     RunSubscription, SinkEvent,
