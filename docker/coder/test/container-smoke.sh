@@ -34,7 +34,7 @@ cleanup() {
     docker logs "$name" 2>&1 | tail -n 80 || true
   fi
   docker rm -f "$name" >/dev/null 2>&1 || true
-  [ -n "$model_pid" ] && kill "$model_pid" 2>/dev/null || true
+  if [ -n "$model_pid" ]; then kill "$model_pid" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 
