@@ -31,6 +31,7 @@ use adam_core::{
     JournalEntry, Lease, NewRun, RunId, RunRecord, RunStatus, RunUpdate, Store, StoreError,
     StoreResult,
 };
+use adam_error::ErrorClass;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -62,7 +63,7 @@ impl PgStore {
             .max_connections(16)
             .connect(url)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         Ok(Self::from_pool(pool))
     }
 
@@ -128,7 +129,48 @@ impl PgStore {
                 );
             }
         }
-        StoreError::unavailable(err)
+        classify(err)
+    }
+}
+
+/// Decide what a driver error means to the caller and box it as the source.
+///
+/// * Connection loss, pool exhaustion, restarts, deadlocks and serialization failures may
+///   succeed later: `Transient` (a retry by the runtime).
+/// * A row that cannot be decoded is stored data that breaks an invariant: `Corrupt`. It
+///   must not be retried forever (a poisoned row would be re-leased for ever).
+/// * A rejected statement or a bad connection string is a bug or a mistake that repeating
+///   cannot cure: `Internal` and `Invalid`.
+///
+/// SQLSTATE classes are from the PostgreSQL manual, Appendix A (unverified from memory:
+/// `08` connection exception, `40001` serialization failure, `40P01` deadlock, `53`
+/// insufficient resources, `57P01`..`57P03` shutdown and start-up).
+pub(crate) fn classify(err: sqlx::Error) -> StoreError {
+    use sqlx::Error as E;
+    let class = match &err {
+        E::Io(_)
+        | E::Tls(_)
+        | E::PoolTimedOut
+        | E::PoolClosed
+        | E::WorkerCrashed
+        | E::Protocol(_) => ErrorClass::Transient,
+        E::Database(db) => match db.code().as_deref() {
+            Some(code)
+                if code.starts_with("08")
+                    || code.starts_with("53")
+                    || matches!(code, "40001" | "40P01" | "57P01" | "57P02" | "57P03") =>
+            {
+                ErrorClass::Transient
+            }
+            _ => ErrorClass::Internal,
+        },
+        E::Decode(_) | E::ColumnDecode { .. } | E::ColumnNotFound(_) => ErrorClass::Corrupt,
+        E::Configuration(_) => ErrorClass::Invalid,
+        _ => ErrorClass::Internal,
+    };
+    StoreError::Backend {
+        class,
+        source: Box::new(err),
     }
 }
 
@@ -308,64 +350,55 @@ fn to_i64(n: u64, what: &str) -> StoreResult<i64> {
 }
 
 fn run_from_row(row: &PgRow) -> StoreResult<RunRecord> {
-    let status: String = row.try_get("status").map_err(StoreError::unavailable)?;
-    let version: i64 = row.try_get("version").map_err(StoreError::unavailable)?;
-    let Json(state): Json<Value> = row.try_get("state").map_err(StoreError::unavailable)?;
+    let status: String = row.try_get("status").map_err(classify)?;
+    let version: i64 = row.try_get("version").map_err(classify)?;
+    let Json(state): Json<Value> = row.try_get("state").map_err(classify)?;
     Ok(RunRecord {
-        id: RunId(
-            row.try_get::<Uuid, _>("id")
-                .map_err(StoreError::unavailable)?,
-        ),
-        agent: row.try_get("agent").map_err(StoreError::unavailable)?,
-        conversation_id: row
-            .try_get("conversation_id")
-            .map_err(StoreError::unavailable)?,
+        id: RunId(row.try_get::<Uuid, _>("id").map_err(classify)?),
+        agent: row.try_get("agent").map_err(classify)?,
+        conversation_id: row.try_get("conversation_id").map_err(classify)?,
         parent_id: row
             .try_get::<Option<Uuid>, _>("parent_id")
-            .map_err(StoreError::unavailable)?
+            .map_err(classify)?
             .map(RunId),
         status: RunStatus::parse(&status)
             .ok_or_else(|| StoreError::Corrupt(format!("unknown run status {status:?}")))?,
         state,
-        wake_at: row.try_get("wake_at").map_err(StoreError::unavailable)?,
+        wake_at: row.try_get("wake_at").map_err(classify)?,
         version: u64::try_from(version)
             .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
-        created_at: row.try_get("created_at").map_err(StoreError::unavailable)?,
-        updated_at: row.try_get("updated_at").map_err(StoreError::unavailable)?,
+        created_at: row.try_get("created_at").map_err(classify)?,
+        updated_at: row.try_get("updated_at").map_err(classify)?,
     })
 }
 
 fn entry_from_row(row: &PgRow) -> StoreResult<JournalEntry> {
-    let seq: i64 = row.try_get("seq").map_err(StoreError::unavailable)?;
-    let Json(payload): Json<Value> = row.try_get("payload").map_err(StoreError::unavailable)?;
+    let seq: i64 = row.try_get("seq").map_err(classify)?;
+    let Json(payload): Json<Value> = row.try_get("payload").map_err(classify)?;
     Ok(JournalEntry {
         seq: u64::try_from(seq).map_err(|_| StoreError::Corrupt(format!("negative seq {seq}")))?,
-        name: row.try_get("name").map_err(StoreError::unavailable)?,
-        ok: row.try_get("ok").map_err(StoreError::unavailable)?,
+        name: row.try_get("name").map_err(classify)?,
+        ok: row.try_get("ok").map_err(classify)?,
         payload,
-        recorded_at: row
-            .try_get("recorded_at")
-            .map_err(StoreError::unavailable)?,
+        recorded_at: row.try_get("recorded_at").map_err(classify)?,
     })
 }
 
 #[async_trait]
 impl Store for PgStore {
     async fn migrate(&self) -> StoreResult<()> {
-        let mut tx = self.pool.begin().await.map_err(StoreError::unavailable)?;
+        let mut tx = self.pool.begin().await.map_err(classify)?;
         // Serialize concurrent migrations; CREATE .. IF NOT EXISTS alone can
         // still race on the catalog.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
             .bind(format!("adam-rs:migrate:{}", self.prefix))
             .execute(&mut *tx)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         for stmt in &self.sql.migrate {
-            tx.execute(safe(stmt))
-                .await
-                .map_err(StoreError::unavailable)?;
+            tx.execute(safe(stmt)).await.map_err(classify)?;
         }
-        tx.commit().await.map_err(StoreError::unavailable)
+        tx.commit().await.map_err(classify)
     }
 
     async fn create_run(&self, new: NewRun) -> StoreResult<RunRecord> {
@@ -394,7 +427,7 @@ impl Store for PgStore {
             .bind(id.0)
             .fetch_optional(&self.pool)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         row.as_ref().map(run_from_row).transpose()
     }
 
@@ -440,7 +473,7 @@ impl Store for PgStore {
             .bind(id.0)
             .fetch_optional(&self.pool)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         match actual {
             None => Err(StoreError::NotFound(id)),
             Some(actual) => Err(StoreError::Conflict {
@@ -461,7 +494,7 @@ impl Store for PgStore {
             .bind(conversation_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         row.as_ref().map(run_from_row).transpose()
     }
 
@@ -474,7 +507,7 @@ impl Store for PgStore {
             .bind(seq)
             .fetch_optional(&self.pool)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         row.as_ref().map(entry_from_row).transpose()
     }
 
@@ -513,7 +546,7 @@ impl Store for PgStore {
             .bind(run.0)
             .fetch_all(&self.pool)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         rows.iter().map(entry_from_row).collect()
     }
 
@@ -538,13 +571,12 @@ impl Store for PgStore {
             .bind(until)
             .fetch_all(&self.pool)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         // RETURNING order is unspecified; restore the claim order.
         let mut claimed = rows
             .iter()
             .map(|row| {
-                let sched: DateTime<Utc> =
-                    row.try_get("sched_at").map_err(StoreError::unavailable)?;
+                let sched: DateTime<Utc> = row.try_get("sched_at").map_err(classify)?;
                 Ok((sched, run_from_row(row)?))
             })
             .collect::<StoreResult<Vec<_>>>()?;
@@ -574,7 +606,7 @@ impl Store for PgStore {
             .bind(add_ttl(now, ttl))
             .execute(&self.pool)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         Ok(done.rows_affected() == 1)
     }
 
@@ -584,7 +616,7 @@ impl Store for PgStore {
             .bind(worker)
             .execute(&self.pool)
             .await
-            .map_err(StoreError::unavailable)?;
+            .map_err(classify)?;
         Ok(())
     }
 
@@ -597,11 +629,112 @@ impl Store for PgStore {
                 .bind(PURGE_BATCH)
                 .execute(&self.pool)
                 .await
-                .map_err(StoreError::unavailable)?;
+                .map_err(classify)?;
             total += done.rows_affected();
             if done.rows_affected() < PURGE_BATCH as u64 {
                 return Ok(total);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adam_error::Classify;
+    use sqlx::error::BoxDynError;
+
+    fn boxed(msg: &'static str) -> BoxDynError {
+        msg.into()
+    }
+
+    fn class_of(err: sqlx::Error) -> ErrorClass {
+        classify(err).class()
+    }
+
+    #[test]
+    fn driver_errors_are_classified_by_what_they_mean() {
+        let io = || std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        // Exhaustive over the variants we decide on; the rest fall through to Internal.
+        let table: Vec<(sqlx::Error, ErrorClass)> = vec![
+            (sqlx::Error::Io(io()), ErrorClass::Transient),
+            (sqlx::Error::Tls(boxed("handshake")), ErrorClass::Transient),
+            (sqlx::Error::PoolTimedOut, ErrorClass::Transient),
+            (sqlx::Error::PoolClosed, ErrorClass::Transient),
+            (sqlx::Error::WorkerCrashed, ErrorClass::Transient),
+            (
+                sqlx::Error::Protocol("bad frame".into()),
+                ErrorClass::Transient,
+            ),
+            (sqlx::Error::Decode(boxed("bad utf8")), ErrorClass::Corrupt),
+            (
+                sqlx::Error::ColumnDecode {
+                    index: "version".into(),
+                    source: boxed("mismatched types"),
+                },
+                ErrorClass::Corrupt,
+            ),
+            (sqlx::Error::ColumnNotFound("x".into()), ErrorClass::Corrupt),
+            (
+                sqlx::Error::Configuration(boxed("bad url")),
+                ErrorClass::Invalid,
+            ),
+            (sqlx::Error::RowNotFound, ErrorClass::Internal),
+            (
+                sqlx::Error::Encode(boxed("bad value")),
+                ErrorClass::Internal,
+            ),
+        ];
+        for (err, want) in table {
+            let shown = err.to_string();
+            assert_eq!(class_of(err), want, "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_row_is_not_retryable() {
+        let e = classify(sqlx::Error::Decode(boxed("bad")));
+        assert!(!e.is_retryable());
+        assert!(e.class().should_alert());
+    }
+
+    /// Provoke a server-side error with a chosen SQLSTATE.
+    async fn raise(pool: &PgPool, sqlstate: &str) -> sqlx::Error {
+        let stmt =
+            format!("DO $$ BEGIN RAISE EXCEPTION 'boom' USING ERRCODE = '{sqlstate}'; END $$");
+        match sqlx::query(AssertSqlSafe(stmt)).execute(pool).await {
+            Ok(_) => panic!("statement should have failed"),
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlstates_are_classified_against_a_real_server() {
+        let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        for (state, want) in [
+            ("40001", ErrorClass::Transient), // serialization failure
+            ("40P01", ErrorClass::Transient), // deadlock
+            ("08006", ErrorClass::Transient), // connection failure
+            ("53300", ErrorClass::Transient), // too many connections
+            ("57P01", ErrorClass::Transient), // admin shutdown
+            ("42601", ErrorClass::Internal),  // syntax error
+            ("23514", ErrorClass::Internal),  // check violation
+        ] {
+            assert_eq!(
+                class_of(raise(&pool, state).await),
+                want,
+                "SQLSTATE {state}"
+            );
+        }
+        // A real syntax error on a raw query, not a raised one.
+        let err = sqlx::query("SELEC 1").execute(&pool).await.unwrap_err();
+        assert_eq!(class_of(err), ErrorClass::Internal);
     }
 }

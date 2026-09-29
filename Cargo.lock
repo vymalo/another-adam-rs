@@ -282,6 +282,7 @@ name = "adam-store-mongodb"
 version = "0.1.0"
 dependencies = [
  "adam-core",
+ "adam-error",
  "adam-store-testkit",
  "async-trait",
  "chrono",
@@ -298,6 +299,7 @@ name = "adam-store-postgres"
 version = "0.1.0"
 dependencies = [
  "adam-core",
+ "adam-error",
  "adam-store-testkit",
  "async-trait",
  "chrono",
