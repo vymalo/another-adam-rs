@@ -29,6 +29,7 @@ trait, a shared conformance suite, and two production adapters.
 | [`adam-acp`](crates/adam-acp/README.md) | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
 | [`adam-llm-agent`](crates/adam-llm-agent/README.md) | `LlmAgent`: the durable model/tool-calling loop (`Tool` trait and typed tool helpers, `NeedsInput` parking, limits, history truncation) on top of `adam-runtime` |
 | [`adam-macros`](crates/adam-macros/README.md) | The `#[tool]` attribute macro: an `async fn` becomes a `Tool` (name, description and argument schema from the function and its doc comments; `State<T>` and `&ToolCtx` parameters). A proc-macro crate over `syn`; the expansion is a pure, unit-tested function |
+| [`adam-agent-fs`](crates/adam-agent-fs/README.md) | Parses and validates agent directories (`agent/instructions.md`, skills in the Agent Skills format, subagents in the Claude Code / Copilot format, `mcp.json`, schedules) into an `AgentManifest`, with file-and-line diagnostics. A leaf: YAML through `serde-saphyr`, no async, no runtime dependency |
 | [`adam`](crates/adam/README.md) | The facade for writing an agent: `use adam::prelude::*` gives `#[tool]`, `tools!`, `Tool`, `State`, `LlmAgent`, ... (feature `macros`, on by default), and re-exports the model, runtime, core and error crates |
 | [`adam-a2a-runtime`](crates/adam-a2a-runtime/README.md) | `RuntimeTaskBackend`: the A2A `TaskBackend` over `adam-runtime` (task = run, ownership per caller, `input-required` from parked runs); subscriptions are rebuilt from the store, so they survive restarts. Reusable by any agent |
 | [`adam-coder`](crates/adam-coder/README.md) | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary, which runs the A2A server, the workers or both (`ROLE`); image in `docker/coder`, chart in `deploy/coder` |
@@ -400,7 +401,7 @@ node tools/docs-check/check-docs.mjs
 1. ~~Store trait and adapters~~ (this repo)
 2. ~~Run state machine and `ctx.step` journaling~~ (`adam-runtime`)
 3. ~~`#[tool]` macro (schemars)~~ (`adam-macros`, through the `adam` facade; [`docs/authoring.md`](docs/authoring.md))
-4. `build.rs` discovery of `agent/` (instructions, skills, subagents, `mcp.json`), designed in [`docs/authoring.md`](docs/authoring.md)
+4. `build.rs` discovery of `agent/` (instructions, skills, subagents, `mcp.json`), designed in [`docs/authoring.md`](docs/authoring.md); the parser and validator are built (`adam-agent-fs`), the codegen is next
 5. Parking, approvals, schedules
 6. Dev TUI (`cargo adam dev`)
 7. Host adapters (axum/tower), channels, sandboxes

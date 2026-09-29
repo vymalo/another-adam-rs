@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp",
+      "headers": { "Authorization": "Bearer ${LINEAR_API_TOKEN}" },
+      "tools": ["list_issues", "create_issue"]
+    },
+    "fs": {
+      "command": "mcp-server-filesystem",
+      "args": ["/work"],
+      "env": { "LOG_LEVEL": "${MCP_LOG_LEVEL:-info}" }
+    }
+  }
+}

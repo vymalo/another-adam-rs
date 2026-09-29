@@ -1,0 +1,24 @@
+[package]
+name = "adam-agent-fs"
+description = "Parse and validate agent directories for adam-rs: frontmatter, skills, subagents, mcp.json, with diagnostics"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-error.workspace = true
+serde.workspace = true
+serde-saphyr.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

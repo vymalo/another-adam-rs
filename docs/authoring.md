@@ -1,8 +1,9 @@
 # The authoring layer
 
-Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`) and S2 (`#[tool]` and the `adam`
-facade) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by the owner on
-2026-09-29 (decisions D1 to D6 below).
+Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
+facade), S3 (`adam-coder` tools through `#[tool]`) and S4 (`adam-agent-fs`, the parser and validator of
+agent directories) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
 
@@ -154,7 +155,7 @@ first non-empty line, with a warning). `allowed-tools` is parsed and ignored in 
 embedded up to 1 MiB per skill.
 
 The repository's own `.agents/skills/` is a corpus of 75 vendored `SKILL.md` files. The parser must read
-all of them with no error; that becomes a conformance test in S4.
+all of them with no error; that is a conformance test since S4.
 
 ### `mcp.json`
 
@@ -184,6 +185,81 @@ all of them with no error; that becomes a conformance test in S4.
 
 Tools are Rust (next section). The files only say **which** tools an agent gets (`tools:`). Tool names
 match `^[a-z][a-z0-9_]{0,63}$`.
+
+## Parsing and validation (built: `adam-agent-fs`)
+
+Slice S4. [`adam-agent-fs`](../crates/adam-agent-fs/README.md) reads a directory into an
+`AgentManifest` and reports every problem as a `Diagnostic { severity, path, line, message }` (severity
+is the closed enum `Error | Warning`). It is the one parser and the one validator: the `build.rs` codegen
+(S5) and the run-time `dev` loader (S10) will call it, so the two paths cannot disagree. It has no
+`build.rs` code, no async and no adam runtime dependency. Nothing in it expands `${VAR}`.
+
+```mermaid
+sequenceDiagram
+  participant C as Caller
+  participant D as Dir source
+  participant F as Splitter and YAML
+  participant V as Validation
+  C->>D: load
+  D->>D: agent or agents, both is an error, neither is an error unless optional
+  loop each instructions.md, subagent, skill, schedule, mcp.json
+    D->>F: split at the first --- and the next ---
+    F-->>D: YAML text and body, or unterminated
+    D->>F: read the YAML 1.2 into the schema
+    F-->>D: the schema, or an invalid YAML error with its line
+    D->>V: names, required keys, secrets, unknown keys, references
+    V-->>D: diagnostics, the item is kept or skipped
+  end
+  D-->>C: Report with the package and every diagnostic
+  C->>C: into_package, lenient (errors fail) or strict (warnings fail too)
+```
+
+* **Splitter.** The frontmatter exists only when the first line is `---`; the next `---` line closes
+  it. An unclosed block is an error, never "no frontmatter". A byte-order mark and CRLF line endings are
+  handled, and a file without frontmatter is all body. Bodies are kept with LF endings and trimmed.
+* **YAML.** [`serde-saphyr`](https://crates.io/crates/serde-saphyr) 1.3.0, deserialize only, with
+  `strict_booleans` so that `no` is a string (YAML 1.2). It has no dynamic value type, so keys the schema
+  does not know are read into `serde_json::Value` and become warnings. *Verified 2026-09-29*, crates.io API:
+  1.3.0 (2026-09-16), licence `MIT OR Apache-2.0`, `rust-version` 1.89; its new transitive crates
+  `granit-parser` 1.3.0 (1.81), `annotate-snippets` 0.12.16 (1.85), `arraydeque` 0.5.1, `encoding_rs_io`
+  0.1.8 and `unicode-width` 0.2.2 are all MIT or Apache-2.0, and `cargo deny check` passes with no change to
+  `deny.toml`. Directory walking is `std::fs`, so `walkdir` is not a dependency.
+* **Agent files.** `AgentFrontmatter` is the one schema for the root agent, a directory subagent and a flat
+  subagent: `name`, `description`, `tools` (a list, or a comma string; `*` is every tool), `model` (an alias,
+  or `inherit`), `skills` (`all` or a list), `preload_skills`, `limits` (Claude's `maxTurns` is folded into
+  `limits.max_turns`), `vars` (scalars, read as text), `card` (root only), `a2a` and `auth` (a remote
+  subagent), `metadata`. A subagent needs a `description`. The keys `api_key`, `apiKey`, `token`, `secret`,
+  `password` and `base_url` are errors (compared without case, `_` and `-`), and so is a `model` that is a URL.
+  Claude Code, Copilot and OpenCode keys that adam does not act on (`color`, `permissionMode`, `target`,
+  `user-invocable`, `mcp-servers`, ...) warn "ignored"; any other unknown key warns "unknown".
+* **Names.** Agents and subagents match `^[a-z0-9][a-z0-9_-]{0,63}$`. The frontmatter `name` wins when it is
+  valid; otherwise the path gives the name (the file name without `.md` or `.agent.md`, the directory, or the
+  composition root's default for the root agent) with a warning. Copilot allows capitals in file names and
+  display names in `name`, so `Code-Reviewer.agent.md` is lower-cased with a warning and
+  `name: Security Reviewer` falls back to the file name. In `agents/<name>/` the directory is the name and
+  a different `name:` is an error. Two subagents or skills with one name are an error.
+* **Skills.** The Agent Skills rules of the section above. The effective name is always the directory name
+  (the file stem of a flat skill). A missing `name` on a directory skill warns. `metadata` values that are not
+  strings are kept as their text (skills in the wild put lists there). `resources` lists the other files of a
+  skill directory without reading them; symbolic links are followed one step and never entered twice.
+* **`mcp.json`.** `mcpServers`, with `type` `stdio` (the default when there is a `command`), `http`,
+  `streamable-http` or `sse`. A `url` without `type` is an error, as in Claude Code; `ws` is not supported.
+  The server name and each allow-listed tool must fit `<server>__<tool>` in 64 characters. `${VAR}` and
+  `${VAR:-default}` stay as written, and `McpConfig::env_references()` lists the names for a build to record.
+  A literal credential in a header, an environment value or a URL is a **warning** (as in the plan; a strict
+  build refuses it); a server key such as `apiKey` is an **error**.
+* **Schedules.** `cron` (five fields, checked for shape and not evaluated), `timezone` (default `UTC`),
+  `agent:` (must be the owning agent), and a non-empty body. Schedules belong to the root agent of a
+  directory; in a subagent directory they warn "ignored".
+* **Other rules.** A prompt over 30,000 characters warns, because GitHub Copilot accepts at most that in an
+  agent file (*verified 2026-09-29*, the Copilot custom-agents configuration page cited above). An entry of an
+  agent directory that is not a slot (`tools/`, `channels/`, ...) warns and points at `#[tool]`.
+  Dotfiles, `*.test.md`, `__tests__/` and `README.md` are never read. Files that are not UTF-8 are errors.
+
+The test suite is the specification: one fixture directory per rule, each producing exactly one diagnostic;
+all 75 vendored `.agents/skills/*/SKILL.md` of this repository parse with no error and no warning; a Claude
+Code agent and two Copilot agents parse unchanged as subagents; and the splitter never panics on arbitrary
+text.
 
 ## The `#[tool]` contract
 
@@ -359,12 +435,12 @@ the in-memory store).
 
 ## Crate layout
 
-Only `adam-macros` and `adam` exist so far; the others are planned.
+`adam-macros`, `adam` and `adam-agent-fs` exist; the others are planned.
 
 | Crate | Kind | Contents |
 |---|---|---|
 | `adam-macros` | proc-macro | **built (S2)**: `#[tool]`; a thin shim over a pure, unit-tested `expand` function |
-| `adam-agent-fs` | lib | frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` (embedded and directory), the `build.rs` codegen behind a feature. No async, no runtime dependency |
+| `adam-agent-fs` | lib | **built (S4)**: frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` with the `Dir` implementation. Planned (S5): the embedded source and the `build.rs` codegen behind a feature. No async, no runtime dependency |
 | `adam-assembly` | lib | `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s; `{{var}}` templating; skills; `SubagentTool`; the A2A card |
 | `adam-mcp` | lib | MCP client (the official Rust SDK): MCP tools as `Tool`s, `${VAR}` expansion, fail closed |
 | `adam` | facade | **built (S2)**: `prelude`, the macro, feature `macros` (default). Planned: `include_agent!`, features `a2a`, `mcp`, `dev` |
@@ -377,7 +453,8 @@ the only tool seam; MCP and `FnTool` implement it. Third-party crates the plan n
 each; `schemars` 1.2.2 is already in `Cargo.lock`. S2 added `syn` 3, `quote` and `proc-macro2` (all
 already locked, through `async-trait`) to `adam-macros`, and `trybuild` 1.0.121 as a dev-dependency of
 `adam` (it brings `toml`, `winnow`, `glob`, `termcolor`, `target-tuple`; *verified 2026-09-29*:
-`cargo deny check` passes).
+`cargo deny check` passes). S4 added `serde-saphyr` 1.3.0 to `adam-agent-fs` (see [Parsing and
+validation](#parsing-and-validation-built-adam-agent-fs)).
 
 ## Mapping: eve to adam-rs to standard
 
@@ -441,7 +518,8 @@ type already sets the pattern).
 | S1 | typed tool helpers in `adam-llm-agent` (feature `schema` for the schema part) | built |
 | S2 | `#[tool]` and the `adam` facade | built |
 | S3 | `adam-coder` tools through `#[tool]`, no behaviour change | built |
-| S4 to S6 | `adam-agent-fs` (parse, validate), `build.rs` codegen, `adam-assembly` | planned |
+| S4 | `adam-agent-fs`: parse and validate agent directories | built |
+| S5, S6 | `build.rs` codegen, `adam-assembly` | planned |
 | S7 | skills | planned |
 | S8, S9 | child runs and subagents | planned; S8 needs a review of the design above first |
 | S10, S11 | dev reload; `mcp.json` tools | planned |

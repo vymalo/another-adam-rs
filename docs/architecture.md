@@ -1,6 +1,6 @@
 # Architecture
 
-adam-rs is a Rust workspace of 19 crates for **durable AI agents**. An agent is
+adam-rs is a Rust workspace of 20 crates for **durable AI agents**. An agent is
 a state machine. The runtime saves its state after every step, so a worker that
 dies loses nothing: another worker resumes from the last saved step. Every piece
 of infrastructure (database, model, code host, A2A backend) sits behind a trait,
@@ -40,6 +40,7 @@ flowchart TB
     subgraph authoring["Authoring"]
         adam["adam"]
         macros["adam-macros"]
+        agentfs["adam-agent-fs"]
     end
     subgraph agents["Agents"]
         coder["adam-coder"]
@@ -125,10 +126,11 @@ flowchart TB
     mongo --> err
     pg --> err
     ws --> err
+    agentfs --> err
     host --> err
     pgn --> err
 
-    linkStyle 41,42,43,44,45,46,47,48,49,50,51,52,53,54,55 stroke:#999,stroke-width:1px
+    linkStyle 41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -179,6 +181,12 @@ The layers, from the bottom:
   * `adam-macros` is the `#[tool]` attribute macro: a proc-macro crate whose
     expansion is a pure function over token streams. It depends on `syn`,
     `quote` and `proc-macro2` only.
+  * `adam-agent-fs` parses and validates an agent directory (`agent/instructions.md`,
+    skills, subagents, `mcp.json`, schedules) into an `AgentManifest` and reports
+    every mistake with its file and line. It is a leaf over `serde` and
+    `serde-saphyr`, with no async and no runtime dependency; the `build.rs`
+    codegen and the binding to `LlmAgent` build on it later. See
+    [`docs/authoring.md`](authoring.md).
   * `adam` is the facade a user writes agents against: `prelude`, the
     re-exported `adam-llm-agent` API, and the `#[tool]` macro behind the
     default feature `macros`. Generated code refers to `adam::__private`.
