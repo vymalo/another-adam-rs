@@ -1,3 +1,4 @@
+{{- include "coder.validate" . -}}
 # ClusterIP only, never exposed: the orchestrator reaches it in-cluster over A2A
 # with a bearer token. This is also the StatefulSet's governing service.
 apiVersion: v1
@@ -9,7 +10,12 @@ metadata:
 spec:
   type: ClusterIP
   selector:
+    {{- /* topology=split: the front Deployment's pods answer, not the worker's */}}
+    {{- if eq .Values.topology "split" }}
+    {{- include "coder.frontSelectorLabels" . | nindent 4 }}
+    {{- else }}
     {{- include "coder.selectorLabels" . | nindent 4 }}
+    {{- end }}
   ports:
     - name: http
       port: {{ .Values.service.port }}

@@ -1,0 +1,15 @@
+{{- if and (eq .Values.topology "split") (gt (int .Values.front.replicas) 1) }}
+# Keeps one front pod serving through node drains. Not rendered for one replica:
+# minAvailable 1 of 1 would block every drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "coder.frontName" . }}
+  labels:
+    {{- include "coder.frontLabels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "coder.frontSelectorLabels" . | nindent 6 }}
+{{- end }}

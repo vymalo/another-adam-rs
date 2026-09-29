@@ -121,6 +121,9 @@ role. The rename is outside this repo.
   *Amended 2026-09-29: `adam-coder` now reads `ROLE` and runs its components through `Host`;
   its hand-written stop logic and `StoppedUnexpectedly` are gone, and a component that ends
   early is a `HostError` (exit code 70).*
+  *Amended 2026-09-29: the `coder` Helm chart can deploy the two halves separately
+  (`topology: split`, a front Deployment and a worker StatefulSet). It stays at one worker until
+  workspace placement exists; deploy-only, no binary changed.*
 * Hosting agents in-process (decision 8) is only safe as far as the host limits it. An agent that
   runs builds can starve the process it lives in. The host must give it its own pods and
   limits. adam-rs does not sandbox the host.

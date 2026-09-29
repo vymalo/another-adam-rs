@@ -9,8 +9,20 @@ metadata:
     {{- include "coder.labels" . | nindent 4 }}
 spec:
   podSelector:
+    {{- if eq .Values.topology "split" }}
+    {{- /* the front and the worker pods differ in `name`; both are covered */}}
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - {{ include "coder.name" . }}
+          - {{ printf "%s-front" (include "coder.name" .) | trunc 63 | trimSuffix "-" }}
+    {{- else }}
     matchLabels:
       {{- include "coder.selectorLabels" . | nindent 6 }}
+    {{- end }}
   policyTypes:
     - Ingress
   ingress:

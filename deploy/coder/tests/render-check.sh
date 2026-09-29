@@ -24,8 +24,34 @@ has() { grep -Eq -- "$1" "$out"; }
 lacks() { ! grep -Eq -- "$1" "$out"; }
 count() { [ "$(grep -Ec -- "$1" "$out")" -eq "$2" ]; }
 fails() { ! "$@"; }
+# doc <Kind> [file]: the YAML document(s) of one kind from the render (or a file).
+doc() {
+  awk -v k="$1" '
+    function flush() { if (buf ~ ("(^|\n)kind: " k "\n")) printf "%s", buf; buf = "" }
+    /^---$/ { flush(); next }
+    { buf = buf $0 "\n" }
+    END { flush() }' "${2:-$out}"
+}
+dhas() { doc "$1" | grep -Eq -- "$2"; }
+dlacks() { ! doc "$1" | grep -Eq -- "$2"; }
+dcount() { [ "$(doc "$1" | grep -Ec -- "$2")" -eq "$3" ]; }
+# The parts of a StatefulSet that must not change between topologies: its
+# name, the immutable selector and the volume claim (so the PVC is reused).
+sts_identity() { # sts_identity <file>
+  doc StatefulSet "$1" | awk '
+    /^  name: / && !n { print; n = 1 }
+    /^  serviceName:/ { print }
+    /^  selector:/ { on = 1 } /^  template:/ { on = 0 }
+    /^  volumeClaimTemplates:/ { on = 1 }
+    on { print }'
+}
 
 helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 > "$out"
+
+golden="$chart/tests/golden/combined.yaml"
+# The default render is the pre-split chart, byte for byte (regenerate with the
+# command above, at the same --namespace and --set, only for a deliberate change).
+check "the default render equals tests/golden/combined.yaml" cmp -s "$out" "$golden"
 
 check "never exposed: no Ingress, Route or Gateway" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$'
 check "never exposed: no LoadBalancer or NodePort" lacks 'type: (LoadBalancer|NodePort)'
@@ -120,5 +146,58 @@ for role in "" all worker; do
       fails helm template coder "$chart" --namespace coder-ns "$@" --set "externalSecrets.properties.$property=null"
   done
 done
+
+# topology=split: a front Deployment (control plane, no volume) and the worker StatefulSet.
+helm template coder "$chart" --namespace coder-ns --set topology=split > "$out"
+check "split: one Deployment" count '^kind: Deployment$' 1
+check "split: one StatefulSet" count '^kind: StatefulSet$' 1
+check "split: exactly one Service" count '^kind: Service$' 1
+check "split: still never exposed" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$|type: (LoadBalancer|NodePort)'
+check "split: the Service is still named coder (the orchestrator's URL is unchanged)" dhas Service '^  name: coder$'
+check "split: the Service selects the front pods" dhas Service '^    app.kubernetes.io/name: coder-front$'
+check "split: the agent card URL is still the Service" has 'http://coder.coder-ns.svc.cluster.local:8080/'
+check "split: the Deployment is the front" dhas Deployment '^  name: coder-front$'
+check "split: the Deployment is a control plane" dhas Deployment 'value: "control-plane"'
+check "split: the Deployment has no volume" dlacks Deployment 'volumeMounts:|volumeClaimTemplates:|mountPath:'
+check "split: the Deployment has no model, GitHub or OpenCode settings" dlacks Deployment "$model_and_github"
+check "split: the Deployment has no workspace or check settings" dlacks Deployment "$workspace_and_checks"
+check "split: the Deployment keeps the A2A tokens, the database and the public URL" dcount Deployment "$front" 3
+check "split: the Deployment uses /healthz for all three probes" dcount Deployment 'path: /healthz' 3
+check "split: the Deployment runs as uid 10001, non-root" dhas Deployment 'runAsUser: 10001'
+check "split: the Deployment uses the same image" dhas Deployment 'image: "ghcr.io/vymalo/another-adam-rs/coder:'
+check "split: the StatefulSet is still named coder and is the worker" dhas StatefulSet 'value: "worker"'
+check "split: the worker mounts /work" dhas StatefulSet 'mountPath: /work'
+check "split: the worker has neither the A2A tokens nor the public URL" dlacks StatefulSet 'name: (A2A_BEARER_TOKENS|PUBLIC_URL)$'
+check "split: the worker keeps the database" dhas StatefulSet 'name: DATABASE_URL$'
+check "split: the worker gets the model, GitHub and OpenCode settings" dcount StatefulSet "$model_and_github" 5
+check "split: the worker gets the workspace and check settings" dcount StatefulSet "$workspace_and_checks" 9
+check "split: the worker keeps one replica" dhas StatefulSet '^  replicas: 1$'
+check "split: the StatefulSet identity equals the combined one (the PVC is reused)" \
+  [ "$(sts_identity "$out")" = "$(sts_identity "$golden")" ]
+check "split: the ExternalSecret carries all three keys" dcount ExternalSecret 'secretKey:' 3
+check "split: the NetworkPolicy lists the worker's name" dhas NetworkPolicy '^          - coder$'
+check "split: the NetworkPolicy lists the front's name" dhas NetworkPolicy '^          - coder-front$'
+check "split: the NetworkPolicy still restricts ingress only" lacks '^    - Egress$'
+check "split: no PodDisruptionBudget for one front replica" lacks '^kind: PodDisruptionBudget$'
+check "split: an unset config.role is not rendered as ROLE=all" lacks 'value: "all"'
+
+helm template coder "$chart" --namespace coder-ns --set topology=split --set front.replicas=2 > "$out"
+check "split: two front replicas render a PodDisruptionBudget" has '^kind: PodDisruptionBudget$'
+check "split: the PodDisruptionBudget keeps one front pod" dhas PodDisruptionBudget '^  minAvailable: 1$'
+check "split: the front replicas are values-driven" dhas Deployment '^  replicas: 2$'
+check "split: the worker stays at one replica" dhas StatefulSet '^  replicas: 1$'
+
+# Guards: a bad topology, a role set by hand in split, and more than one worker stop the render.
+check "topology=bogus fails to render" fails helm template coder "$chart" --namespace coder-ns --set topology=bogus
+check "split with config.role=worker fails to render" \
+  fails helm template coder "$chart" --namespace coder-ns --set topology=split --set config.role=worker
+check "split with config.role=control-plane fails to render" \
+  fails helm template coder "$chart" --namespace coder-ns --set topology=split --set config.role=control-plane
+check "split with replicaCount=2 fails to render" \
+  fails helm template coder "$chart" --namespace coder-ns --set topology=split --set replicaCount=2
+check "combined with replicaCount=2 fails to render" \
+  fails helm template coder "$chart" --namespace coder-ns --set replicaCount=2
+check "split needs the worker secrets" \
+  fails helm template coder "$chart" --namespace coder-ns --set topology=split --set externalSecrets.properties.githubToken=null
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi
