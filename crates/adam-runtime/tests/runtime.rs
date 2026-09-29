@@ -1126,19 +1126,26 @@ mod cases {
 
     /// Cancelling a run under a worker: the worker's commit is rejected and
     /// its result dropped.
+    ///
+    /// The step is held at a gate until the cancel has returned, so the cancel
+    /// always lands before the step can commit. (A fixed sleep in the step made
+    /// this a race: a cancel delayed past it, by a loaded database, found the
+    /// run already `Done`.)
     pub async fn cancel_running_drops_the_workers_commit(store: DynStore) {
         let name = uniq("cancel-running");
         let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
         let finished = Arc::new(AtomicUsize::new(0));
         let agent = fn_agent(
             &name,
             step_fn({
-                let (started, finished) = (started.clone(), finished.clone());
+                let (started, gate, finished) = (started.clone(), gate.clone(), finished.clone());
                 move |_ctx, state| {
-                    let (started, finished) = (started.clone(), finished.clone());
+                    let (started, gate, finished) =
+                        (started.clone(), gate.clone(), finished.clone());
                     async move {
                         started.notify_one();
-                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        notified(&gate, "the cancel to land").await;
                         finished.fetch_add(1, SeqCst);
                         Ok(Transition::Done {
                             state,
@@ -1156,7 +1163,9 @@ mod cases {
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
         notified(&started, "the step").await;
+        assert_eq!(count(&finished), 0, "the step is still held at the gate");
         rt.cancel(run, "abort").await.expect("cancel");
+        gate.notify_one(); // only now may the step return and the worker commit
         worker.stop().await; // waits for the in-flight step to finish
         assert_eq!(count(&finished), 1, "the step ran to its end");
         let view = rt.view(run).await.expect("view").expect("run");
