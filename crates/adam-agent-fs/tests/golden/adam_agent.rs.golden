@@ -5,12 +5,13 @@
 pub static AGENTS: &[::adam_agent_fs::EmbeddedAgent] = &[
     ::adam_agent_fs::EmbeddedAgent {
         name: "coder",
-        digest: "sha256:4330bb4d4c221edfd7f5da6702573c0b7f82ed9b09e20ed859ffb51eba9fbadb",
+        digest: "sha256:b0dd64c22e2ff549e7cd74da07bb2e125122e524880db0837f571bf85d822840",
         path: "agent/instructions.md",
         frontmatter_json: r#"{"name":"coder","description":"Turns a coding task into a verified pull request.","tools":["prepare_workspace","run_checks","ask_user","linear__*"],"model":"coder-large","skills":"all","limits":{"max_turns":200,"max_tool_calls":400,"max_output_tokens":8192,"max_history_tokens":100000},"vars":{"max_check_cycles":"3","strict":"true"},"card":{"name":"adam-coder","skills":[{"id":"coding-task","name":"Coding task to pull request","description":"Given a repository and a task, makes the change and opens a pull request.","tags":["code","git","pull-request"],"examples":["In https://github.com/acme/widgets, add a hello.txt containing hi."]}]},"metadata":{"owner":"platform-team","version":"1.2"}}"#,
         instructions: ::adam_agent_fs::EmbeddedInstructions {
             body: r#"You are the coder agent. You turn one coding task into a verified pull request.
-Stop after at most {{max_check_cycles}} failed check cycles."#,
+Stop after at most {{max_check_cycles}} failed check cycles.
+Strict mode is {{strict}}."#,
             parts: &[
                 ::adam_agent_fs::EmbeddedPart { file: "10-style.md", body: r#"## Style
 

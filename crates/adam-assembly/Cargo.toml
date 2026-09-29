@@ -1,0 +1,38 @@
+[package]
+name = "adam-assembly"
+description = "Bind an agent manifest to LlmAgents: templating, tool binding with did-you-mean errors, models, the A2A card"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# `Assembly::card`: the root agent's `card:` frontmatter as an `adam_a2a::AgentCardConfig`.
+a2a = ["dep:adam-a2a", "dep:url"]
+
+[dependencies]
+adam-a2a = { path = "../adam-a2a", version = "0.1.0", optional = true }
+adam-agent-fs.workspace = true
+adam-error.workspace = true
+adam-llm-agent.workspace = true
+adam-model.workspace = true
+adam-runtime.workspace = true
+thiserror.workspace = true
+url = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The embedded agent (`build.rs` + `include_agent!`) that the end-to-end tests bind. The fixture
+# depends on `adam`, which depends on this crate: a dev-dependency cycle, which cargo allows.
+adam-agent-fixture = { path = "../adam-agent-fixture" }
+adam-core.workspace = true
+async-trait.workspace = true
+proptest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

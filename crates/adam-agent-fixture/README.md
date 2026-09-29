@@ -11,3 +11,6 @@ equals the manifest that `Dir` reads from the same directory at run time (packag
 resource bytes), and `verify()` accepts the generated digests.
 
 `cargo test -p adam-agent-fixture`.
+
+[`adam-assembly`](../adam-assembly/README.md) uses it too (a dev-dependency): its tests bind the embedded agent and
+the same files read from the directory, and run the agent end to end on a `MockModel`.
