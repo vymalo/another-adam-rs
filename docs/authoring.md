@@ -2,7 +2,8 @@
 
 Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
 facade), S3 (`adam-coder` tools through `#[tool]`), S4 (`adam-agent-fs`, the parser and validator of
-agent directories) and S5 (the `build.rs` codegen and `adam::include_agent!()`) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+agent directories), S5 (the `build.rs` codegen and `adam::include_agent!()`) and S6 (`adam-assembly`,
+which binds a manifest to `LlmAgent`s) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
 the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
@@ -326,8 +327,8 @@ stateDiagram-v2
   resources are `include_bytes!`, at most 1 MiB per skill. Every agent, at every depth, carries a
   `digest`: SHA-256 over the JSON of the normalised manifest and the bytes of each resource, the same
   for a directory (`Dir::digest`) and for its embedded copy (`EmbeddedAgent::verify`). The plan's
-  `body_offset` (a body's line in its file, for bind-time messages) is not there yet; slice S6 adds
-  it if binding needs it.
+  `body_offset` (a body's line in its file, for bind-time messages) is not there: slice S6 reports lines
+  within the body instead (`prompt line N` of the file it names).
 * **Two sources, one type.** `ManifestSource::load()` is implemented by `Dir` and by
   `EmbeddedPackage`, both giving a `Report` and a `Package`. `adam::agent_fs` is the whole crate
   re-exported by the facade, and generated code refers to it as `::adam::agent_fs` (change it with
@@ -483,7 +484,13 @@ parent does not cancel its children in v1; they finish within their own limits.
 Remote subagents (`a2a:`) use the same tool shape: a journaled A2A `SendMessage`, then a park on the
 remote task id and a poll on the timer.
 
-## Binding and dev reload (planned; the build half is above)
+## Binding (built: `adam-assembly`)
+
+Slice S6. [`adam-assembly`](../crates/adam-assembly/README.md) turns a manifest into `LlmAgent`s. The
+embedded manifest (`AgentDef::from_manifest(AGENT)`, where `AGENT` is the `&'static EmbeddedAgent` of
+`adam::include_agent!()`) and one read from a directory at run time (`AgentDef::from_source(&Dir::new(..), ..)`)
+are the same `AgentManifest`, so they take one code path and the tests assert that they bind to equal
+agents.
 
 ```mermaid
 sequenceDiagram
@@ -492,15 +499,64 @@ sequenceDiagram
   participant O as OUT_DIR adam_agent.rs
   participant M as main.rs
   participant D as AgentDef
-  participant L as LlmAgent
+  participant N as BoundDef
+  participant A as Assembly
   B->>F: build("agent")
   F->>F: split frontmatter, validate, list diagnostics
   F->>O: static manifest: normalised bodies, resources with include_bytes
   M->>O: adam::include_agent!()
-  M->>D: from_manifest, then bind(tools), state(..), model(..)
-  D->>D: unknown tool, unknown var or missing state fails here
-  D->>L: one LlmAgent per agent and subagent
+  M->>D: from_manifest(AGENT), var(..)
+  M->>D: bind(tools)
+  D->>D: tools named in the files exist, prompts rendered, vars consistent
+  D-->>N: unknown tool, unknown or unused var: Err here
+  M->>N: state(env), model(client, alias)
+  N->>N: model alias of each agent, LlmAgent try_build for each
+  N-->>A: bad alias or missing state: Err here
+  A->>A: root and one LlmAgent per local subagent definition
 ```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Defined: from_manifest
+  Defined --> Bound: bind, tools and vars consistent
+  Defined --> Refused: unknown tool, unknown, unused or unset var
+  Bound --> Assembled: model, every agent built
+  Bound --> Refused: bad model alias, missing state
+  Assembled --> [*]: registered on a Runtime
+  Refused --> [*]: the process does not start
+```
+
+* **Tools.** `tools:` names are checked against the `ToolSet`. An unknown name is
+  `Error::UnknownTool` with the closest registered name ("did you mean") and the list of what is
+  registered; a `linear__*` pattern must match at least one tool. The root agent with no `tools:` gets
+  every registered tool, a subagent with none gets none (D3), `*` is all and `[]` none. Nothing is
+  inherited from the parent.
+* **Vars.** `{{name}}` is substituted into the body of `instructions.md` and every `instructions/*.md`.
+  An unknown placeholder, a var declared and never used, a used var whose default is empty and that the
+  code did not supply (`vars:` with `repo:` and nothing after it), a value supplied for an undeclared
+  var, and a `{{` that is not a placeholder are all errors at `bind`, with the file and the line of the
+  body. `{{{{` writes a literal `{{`. Values come from `AgentDef::var` (root) and `agent_var("a/b", ..)`.
+* **Model.** One `DynModel` for every agent. An agent's gateway alias is the `model:` it names, else its
+  parent's (`inherit`, the subagent default), else the alias the code passes to `model(..)`.
+  `model_aliases([..])` lists what the deployment serves and refuses the rest with a suggestion.
+* **State and limits.** `state(Arc<T>)` reaches every agent's tools; a tool whose `required_state` is
+  missing fails `model(..)` with the agent's name. The frontmatter `limits` replace the loop's defaults
+  key by key.
+* **Subagents are defined, not yet callable.** Each local subagent becomes an `LlmAgent` named
+  `<parent>/<name>` with its own prompt, tools, alias and limits, and `Assembly::register` registers all of
+  them on the runtime. The tool that starts one as a durable child run is S8/S9; remote subagents are data
+  (`Assembly::remotes()`) until S9b. Skills and `mcp.json` stay in the manifest for S7 and S11. Each of
+  these plugs into `BoundDef::build`, the one function that makes an `LlmAgent` from a bound agent.
+* **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
+  `adam_a2a::AgentCardConfig`; the public URL and the version belong to the deployment.
+
+Deviations from the plan's sketch, on purpose: `AGENT` is already a reference, so the call is
+`from_manifest(AGENT)` and not `&AGENT`; the runtime has no `agents(..)` method, so `Assembly::register`
+folds `RuntimeBuilder::agent` over the agents; a subagent's prompt lines are counted from its body, since
+the manifest keeps no `body_offset`; and `state(..)` comes before `model(..)` because `model(..)` is the
+step that builds the agents and finds a missing state.
+
+## Dev reload (planned)
 
 | | `build.rs` (default) | function-like proc macro | run-time `AgentDir::load` (dev) |
 |---|---|---|---|
@@ -509,7 +565,8 @@ sequenceDiagram
 | Cost at startup | none | none | parse |
 
 With the `dev` feature (off by default, so a release binary cannot read prompts from disk unless it
-opts in), `AgentDef::from_dir("agent")` plus `.watch()` rebuilds the same manifest at run time. Each
+opts in), `AgentDef::from_dir("agent")` plus `.watch()` (slice S10; `from_source` is the building block)
+rebuilds the same manifest at run time. Each
 `step` takes the current definition, so a running run picks up new instructions at its next step and
 never mid-step; an invalid edit keeps the last good version and logs the diagnostics. Tool code changes
 need a rebuild. Runs are durable in the store, so a restart resumes them (use the Compose Postgres, not
@@ -517,15 +574,15 @@ the in-memory store).
 
 ## Crate layout
 
-`adam-macros`, `adam` and `adam-agent-fs` exist; the others are planned.
+`adam-macros`, `adam`, `adam-agent-fs` and `adam-assembly` exist; the others are planned.
 
 | Crate | Kind | Contents |
 |---|---|---|
 | `adam-macros` | proc-macro | **built (S2)**: `#[tool]`; a thin shim over a pure, unit-tested `expand` function |
 | `adam-agent-fs` | lib | **built (S4, S5)**: frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` with the `Dir` and `EmbeddedPackage` implementations, the digest of a manifest, and the `build.rs` codegen behind the feature `build`. No async, no runtime dependency |
-| `adam-assembly` | lib | `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s; `{{var}}` templating; skills; `SubagentTool`; the A2A card |
+| `adam-assembly` | lib | **built (S6)**: `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s (root and local subagents); `{{var}}` templating; the A2A card behind feature `a2a`. Planned: skills, `SubagentTool`, dev reload |
 | `adam-mcp` | lib | MCP client (the official Rust SDK): MCP tools as `Tool`s, `${VAR}` expansion, fail closed |
-| `adam` | facade | **built (S2, S5)**: `prelude`, the macro, feature `macros` (default), `include_agent!`, `adam::agent_fs`. Planned: features `a2a`, `mcp`, `dev` |
+| `adam` | facade | **built (S2, S5, S6)**: `prelude`, the macro, feature `macros` (default), `include_agent!`, `adam::agent_fs`, `AgentDef` and its stages, `adam::assembly`, feature `a2a`. Planned: features `mcp`, `dev` |
 | `adam-agent-fixture` | test fixture | **built (S5)**, not published: a `build.rs` plus `include_agent!()` over the `adam-agent-fs` test fixture, and the tests that compare embedded and directory |
 | `cargo-adam` | bin | `new`, `check`, `dev` (roadmap 6) |
 
@@ -603,7 +660,7 @@ type already sets the pattern).
 | S3 | `adam-coder` tools through `#[tool]`, no behaviour change | built |
 | S4 | `adam-agent-fs`: parse and validate agent directories | built |
 | S5 | `build.rs` codegen and `adam::include_agent!()` | built |
-| S6 | `adam-assembly` | planned |
+| S6 | `adam-assembly`: `AgentDef`, templating, tool binding, models, the card | built |
 | S7 | skills | planned |
 | S8, S9 | child runs and subagents | planned; S8 needs a review of the design above first |
 | S10, S11 | dev reload; `mcp.json` tools | planned |

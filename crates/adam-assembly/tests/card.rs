@@ -1,0 +1,154 @@
+//! The A2A card of the root agent (feature `a2a`).
+#![cfg(feature = "a2a")]
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
+
+mod common;
+
+use std::path::Path;
+use std::sync::Arc;
+
+use adam_a2a::AgentCardConfig;
+use adam_agent_fixture::AGENT;
+use adam_assembly::{AgentDef, Error, Url};
+use adam_llm_agent::ToolSet;
+use adam_model::MockModel;
+use common::{def, instructions, tools};
+use serde_json::{Value, json};
+
+fn assembly_of(def: AgentDef, set: ToolSet) -> adam_assembly::Assembly {
+    def.bind(set)
+        .unwrap()
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap()
+}
+
+/// The config as JSON: everything the config holds, in a stable shape for the golden file.
+fn render(card: &AgentCardConfig) -> Value {
+    json!({
+        "name": card.name,
+        "description": card.description,
+        "url": card.url.as_str(),
+        "version": card.version,
+        "skills": card.skills.iter().map(|s| json!({
+            "id": s.id,
+            "name": s.name,
+            "description": s.description,
+            "tags": s.tags,
+            "examples": s.examples,
+        })).collect::<Vec<_>>(),
+        "extensions": card.extensions.iter().map(|e| json!({
+            "uri": e.uri,
+            "description": e.description,
+            "required": e.required,
+            "params": e.params,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The same JSON with every object's keys in sorted order, whether or not another crate of the
+/// build turned on serde_json's `preserve_order` (feature unification decides that, not us).
+fn sorted(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            let mut map = map;
+            Value::Object(
+                keys.into_iter()
+                    .filter_map(|k| map.remove(&k).map(|v| (k, sorted(v))))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sorted).collect()),
+        other => other,
+    }
+}
+
+fn url() -> Url {
+    "https://agents.example.com/coder/".parse().unwrap()
+}
+
+#[test]
+fn the_fixture_card_matches_the_golden_file() {
+    let fixture_tools = tools(&[
+        "prepare_workspace",
+        "run_checks",
+        "ask_user",
+        "linear__list_issues",
+        "read_diff",
+        "list_files",
+        "fetch_page",
+    ]);
+    let assembly = assembly_of(AgentDef::from_manifest(AGENT).unwrap(), fixture_tools);
+    let card = assembly.card(url(), "1.2.3").unwrap();
+    let got = serde_json::to_string_pretty(&sorted(render(&card))).unwrap() + "\n";
+
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/card.json");
+    if std::env::var_os("ADAM_UPDATE_GOLDEN").is_some() {
+        std::fs::write(&golden, &got).unwrap();
+    }
+    let want = std::fs::read_to_string(&golden).unwrap();
+    assert_eq!(got, want, "regenerate with ADAM_UPDATE_GOLDEN=1");
+}
+
+#[test]
+fn without_a_card_the_agent_describes_itself() {
+    let assembly = assembly_of(
+        def(&[(
+            "agent/instructions.md",
+            &instructions("name: helper\ndescription: Helps out.", "Hi."),
+        )]),
+        ToolSet::new(),
+    );
+    let card = assembly.card(url(), "0.1.0").unwrap();
+    assert_eq!(card.name, "helper");
+    assert_eq!(card.description, "Helps out.");
+    assert_eq!(card.version, "0.1.0");
+    assert!(card.skills.is_empty() && card.extensions.is_empty());
+}
+
+#[test]
+fn the_card_description_wins_over_the_agents() {
+    let assembly = assembly_of(
+        def(&[(
+            "agent/instructions.md",
+            &instructions(
+                "name: helper\ndescription: Internal.\ncard:\n  description: Public.",
+                "Hi.",
+            ),
+        )]),
+        ToolSet::new(),
+    );
+    assert_eq!(assembly.card(url(), "1").unwrap().description, "Public.");
+}
+
+#[test]
+fn a_card_needs_a_description() {
+    let assembly = assembly_of(
+        def(&[(
+            "agent/instructions.md",
+            &instructions("name: helper", "Hi."),
+        )]),
+        ToolSet::new(),
+    );
+    let error = assembly.card(url(), "1").unwrap_err();
+    assert!(
+        matches!(error, Error::MissingCardDescription { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().starts_with(
+            "agent `helper` (agent/instructions.md): the A2A card needs a description"
+        ),
+        "{error}"
+    );
+    // Blanks are no description either.
+    let blank = assembly_of(
+        def(&[(
+            "agent/instructions.md",
+            &instructions("name: helper\ndescription: '  '", "Hi."),
+        )]),
+        ToolSet::new(),
+    );
+    assert!(blank.card(url(), "1").is_err());
+}

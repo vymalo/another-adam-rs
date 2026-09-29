@@ -1,0 +1,22 @@
+{
+  "description": "Turns a coding task into a verified pull request.",
+  "extensions": [],
+  "name": "adam-coder",
+  "skills": [
+    {
+      "description": "Given a repository and a task, makes the change and opens a pull request.",
+      "examples": [
+        "In https://github.com/acme/widgets, add a hello.txt containing hi."
+      ],
+      "id": "coding-task",
+      "name": "Coding task to pull request",
+      "tags": [
+        "code",
+        "git",
+        "pull-request"
+      ]
+    }
+  ],
+  "url": "https://agents.example.com/coder/",
+  "version": "1.2.3"
+}

@@ -92,6 +92,7 @@ name = "adam"
 version = "0.1.0"
 dependencies = [
  "adam-agent-fs",
+ "adam-assembly",
  "adam-core",
  "adam-error",
  "adam-llm-agent",
@@ -196,6 +197,27 @@ dependencies = [
  "tempfile",
  "thiserror",
  "trybuild",
+ "url",
+]
+
+[[package]]
+name = "adam-assembly"
+version = "0.1.0"
+dependencies = [
+ "adam-a2a",
+ "adam-agent-fixture",
+ "adam-agent-fs",
+ "adam-core",
+ "adam-error",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-runtime",
+ "async-trait",
+ "proptest",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
  "url",
 ]
 

@@ -12,9 +12,12 @@ rust-version.workspace = true
 default = ["macros"]
 # `#[tool]` (and the paths it generates code against, which are always there).
 macros = ["dep:adam-macros"]
+# `Assembly::card`: the root agent's `card:` as an `adam_a2a::AgentCardConfig`.
+a2a = ["adam-assembly/a2a"]
 
 [dependencies]
 adam-agent-fs.workspace = true
+adam-assembly.workspace = true
 adam-core.workspace = true
 adam-error.workspace = true
 adam-llm-agent = { workspace = true, features = ["schema"] }

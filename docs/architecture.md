@@ -1,6 +1,6 @@
 # Architecture
 
-adam-rs is a Rust workspace of 20 crates for **durable AI agents**. An agent is
+adam-rs is a Rust workspace of 21 crates for **durable AI agents**. An agent is
 a state machine. The runtime saves its state after every step, so a worker that
 dies loses nothing: another worker resumes from the last saved step. Every piece
 of infrastructure (database, model, code host, A2A backend) sits behind a trait,
@@ -33,7 +33,10 @@ Arrows point from a crate to a crate it depends on. Solid arrows come from
 `[dependencies]` in the `Cargo.toml` files. Dotted arrows are
 `[dev-dependencies]` that are not also normal dependencies (tests only). Grey
 arrows go to `adam-error`: every crate except the two test kits,
-`adam-agent-fixture` and `adam-macros` depends on it.
+`adam-agent-fixture` and `adam-macros` depends on it. `adam-assembly` reaches
+`adam-a2a` through its optional feature `a2a`, and its dotted edge to
+`adam-agent-fixture` closes a cycle through `adam` that cargo allows because
+it is a dev-dependency.
 
 ```mermaid
 flowchart TB
@@ -41,6 +44,7 @@ flowchart TB
         adam["adam"]
         macros["adam-macros"]
         agentfs["adam-agent-fs"]
+        asm["adam-assembly"]
     end
     subgraph agents["Agents"]
         coder["adam-coder"]
@@ -101,7 +105,13 @@ flowchart TB
     nk --> rt
     fixture --> adam
     fixture --> agentfs
+    asm --> a2a
+    asm --> agentfs
+    asm --> llm
+    asm --> model
+    asm --> rt
     adam --> agentfs
+    adam --> asm
     adam --> core
     adam --> llm
     adam --> macros
@@ -116,6 +126,7 @@ flowchart TB
     pg -.-> testkit
     pgn -.-> nk
     pgn -.-> pg
+    asm -.-> fixture
 
     a2a --> err
     adam --> err
@@ -131,10 +142,11 @@ flowchart TB
     pg --> err
     ws --> err
     agentfs --> err
+    asm --> err
     host --> err
     pgn --> err
 
-    linkStyle 44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59 stroke:#999,stroke-width:1px
+    linkStyle 51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -190,12 +202,20 @@ The layers, from the bottom:
     every mistake with its file and line. It is a leaf over `serde` and
     `serde-saphyr`, with no async and no runtime dependency. Its feature `build`
     is the code generator a `build.rs` calls to embed the directory in the
-    binary as a `'static` manifest; the binding to `LlmAgent` builds on it
-    later. See [`docs/authoring.md`](authoring.md).
+    binary as a `'static` manifest. See [`docs/authoring.md`](authoring.md).
+  * `adam-assembly` binds a manifest to `LlmAgent`s: `AgentDef::from_manifest`
+    takes the embedded manifest or one read from a directory (one code path),
+    `bind` checks `tools:` against a `ToolSet` (unknown names come back with a
+    "did you mean") and renders the `{{var}}` placeholders of the prompt,
+    `model` gives every agent its gateway alias and builds the root and one
+    `LlmAgent` per local subagent definition, and, with feature `a2a`, `card`
+    turns the root's `card:` into an `AgentCardConfig`. It depends on
+    `adam-agent-fs`, `adam-llm-agent`, `adam-model` and `adam-runtime`.
   * `adam` is the facade a user writes agents against: `prelude`, the
     re-exported `adam-llm-agent` API, the `#[tool]` macro behind the
-    default feature `macros`, and `adam-agent-fs` as `adam::agent_fs` with the
-    `include_agent!` macro for the agent embedded by `build.rs`. Generated
+    default feature `macros`, `AgentDef` and its stages from `adam-assembly`
+    (feature `a2a` turns on the card), and `adam-agent-fs` as `adam::agent_fs`
+    with the `include_agent!` macro for the agent embedded by `build.rs`. Generated
     code refers to `adam::__private` and `adam::agent_fs`.
     See [`docs/authoring.md`](authoring.md).
 * **Test kits.** `adam-store-testkit` is the conformance suite every store must

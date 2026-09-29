@@ -4,7 +4,8 @@ The facade of adam-rs: one dependency for writing an agent. It re-exports
 [`adam-llm-agent`](../adam-llm-agent/README.md) (with its `schema` feature), the `#[tool]` macro of
 [`adam-macros`](../adam-macros/README.md), and the model, runtime, core and error crates as modules
 (`adam::model`, `adam::runtime`, `adam::core`, `adam::error`), [`adam-agent-fs`](../adam-agent-fs/README.md)
-as `adam::agent_fs`, and it adds a `prelude` and the `include_agent!` macro.
+as `adam::agent_fs`, [`adam-assembly`](../adam-assembly/README.md) as `adam::assembly`, and it adds a
+`prelude` and the `include_agent!` macro.
 
 ```toml
 [dependencies]
@@ -14,10 +15,12 @@ adam = "0.1"
 | Feature | Default | What |
 |---|---|---|
 | `macros` | yes | `#[tool]` (`adam::tool`, and in the prelude) |
+| `a2a` | no | `Assembly::card`: the root agent's `card:` as an `adam_a2a::AgentCardConfig` (turns on `adam-assembly/a2a`) |
 
 The authoring layer around it (agent directories, skills, subagents) is designed in
-[`docs/authoring.md`](../../docs/authoring.md). What exists: `#[tool]`, and the agent directory
-embedded at build time (`adam::include_agent!()`, below). The binding to `LlmAgent` is planned.
+[`docs/authoring.md`](../../docs/authoring.md). What exists: `#[tool]`, the agent directory
+embedded at build time (`adam::include_agent!()`, below), and `AgentDef`, which binds it to
+`LlmAgent`s ([`adam-assembly`](../adam-assembly/README.md), also `adam::assembly`).
 
 ## `#[tool]`
 
@@ -157,13 +160,42 @@ fn main() {
 }
 ```
 
-`AGENT` is an [`adam::agent_fs::EmbeddedAgent`](../adam-agent-fs/README.md#embedding-at-build-time).
+`AGENT` is a `&'static` [`adam::agent_fs::EmbeddedAgent`](../adam-agent-fs/README.md#embedding-at-build-time).
 `PACKAGE` is an `EmbeddedPackage`, a `ManifestSource` like `adam::agent_fs::Dir`, so the same
 `Package` can come from the binary or from a directory at run time and the two compared. The macro
 is `include!(concat!(env!("OUT_DIR"), "/adam_agent.rs"))` and nothing else; it needs the build
 script and a crate that depends on `adam` (the generated code names `::adam::agent_fs`; use
 `.crate_path("::adam_agent_fs")` when it depends on `adam-agent-fs` directly).
 [`adam-agent-fixture`](../adam-agent-fixture/README.md) is a complete example with tests.
+
+### Binding the agent: `AgentDef`
+
+`AgentDef` (in the prelude, from [`adam-assembly`](../adam-assembly/README.md)) turns the embedded
+agent, or one read from a directory, into `LlmAgent`s. Every mistake is found at startup, with the agent
+and the file in the message.
+
+```rust,ignore
+use std::sync::Arc;
+use adam::prelude::*;
+
+adam::include_agent!();
+
+let assembly = AgentDef::from_manifest(AGENT)?            // or an AgentManifest from a Dir
+    .var("repo", "acme/widgets")                          // a value for {{repo}} in the prompt
+    .bind(tools![PrepareWorkspace, RunChecks, AskUser])?  // `tools:` in the files must name these
+    .state(Arc::new(env))                                 // what `State<T>` parameters read
+    .model(model, "coder-large")?;                        // one client; the default gateway alias
+
+let runtime = assembly.register(Runtime::builder(store)).build(); // the root and every subagent
+```
+
+A typo in the files fails `bind`: a `tools: [run_check]` gets
+``agent `coder` (agent/instructions.md): `tools` names `run_check`, which is not a registered tool; did you mean `run_checks`?``,
+and so do a `{{placeholder}}` that `vars` does not declare, a var that is never used, and a var with no
+value. The stages, the rules for tools, vars, models and state, and the seams left for skills and
+subagents are in the [`adam-assembly` README](../adam-assembly/README.md). `Assembly::info()` describes
+each agent made (name, alias, rendered prompt, tools, limits); with the `a2a` feature,
+`Assembly::card(url, version)` is the root's `AgentCardConfig`.
 
 ### Compile errors
 

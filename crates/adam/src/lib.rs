@@ -2,6 +2,11 @@
 #![warn(missing_docs)]
 
 pub use adam_agent_fs as agent_fs;
+pub use adam_assembly as assembly;
+pub use adam_assembly::{
+    AgentDef, AgentInfo, AliasProblem, Assembly, BoundDef, Error as AssemblyError, IntoManifest,
+    Origin, RemoteInfo, TemplateProblem,
+};
 pub use adam_core as core;
 pub use adam_error as error;
 pub use adam_llm_agent::*;
@@ -35,7 +40,8 @@ pub mod prelude {
     #[cfg(feature = "macros")]
     pub use crate::tool;
     pub use crate::{
-        BuildError, FnTool, IntoToolOutput, IntoToolResult, Json, Limits, LlmAgent, State, Tool,
-        ToolCtx, ToolError, ToolOutput, ToolSet, tools,
+        AgentDef, Assembly, AssemblyError, BoundDef, BuildError, FnTool, IntoToolOutput,
+        IntoToolResult, Json, Limits, LlmAgent, State, Tool, ToolCtx, ToolError, ToolOutput,
+        ToolSet, tools,
     };
 }

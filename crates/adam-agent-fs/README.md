@@ -11,8 +11,8 @@ the line. The layout, the file formats and the reasons are in
 The **files half of the authoring layer** (slices S4 and S5). It is a leaf: `serde`, `serde_json`,
 [`serde-saphyr`](https://crates.io/crates/serde-saphyr) (YAML 1.2, deserialize only), `sha2`, `url`,
 `thiserror` and [`adam-error`](../adam-error/README.md). No async, no `tokio`, no adam runtime
-crate, and it never expands `${VAR}` or reads a secret. The binding to `LlmAgent` (S6) and the MCP
-client (S11) build on it and are not here yet.
+crate, and it never expands `${VAR}` or reads a secret. The binding to `LlmAgent` ([`adam-assembly`](../adam-assembly/README.md), S6)
+builds on it; the MCP client (S11) is not here yet.
 
 `ManifestSource` is the seam between where the files are and what they mean. `Dir` reads a
 directory; `EmbeddedPackage` (the static manifest `build.rs` generates, see
