@@ -36,7 +36,20 @@
 //!   [`ErrorClass`] ([`Classify`]); the runtime decides from the class.
 //! * [`Runtime::cancel`]: `Failed` with the reason, unless already finished.
 //!   A step that is running at that moment can observe it through
-//!   [`Ctx::cancelled`] / [`CancelToken`] and stop early.
+//!   [`Ctx::cancelled`] / [`CancelToken`] and stop early: at once when the
+//!   runtime that holds it is the one cancelling or shares a [`Notifier`],
+//!   within one poll interval otherwise.
+//!
+//! # Several processes
+//!
+//! Processes share nothing but the store, and find work by polling it
+//! (`poll_interval`). A [`Notifier`] ([`RuntimeBuilder::notifier`]) makes them
+//! react at once: `start` and `deliver` publish [`Signal::Runnable`] so a
+//! worker of another process polls now, and `cancel` publishes
+//! [`Signal::Finished`] so a step of another process sees its
+//! [`CancelToken`] fire. Signals are hints: they may be lost, and polling
+//! stays on. [`LocalNotifier`] connects runtimes inside one process; an adapter
+//! crate connects processes.
 //!
 //! # Observing runs
 //!
@@ -70,6 +83,7 @@ mod ctx;
 mod envelope;
 mod erased;
 mod events;
+mod notify;
 mod retry;
 mod runtime;
 mod worker;
@@ -83,5 +97,6 @@ pub use events::{
     Artifact, BroadcastSink, CollectingSink, DynEventSink, EventSink, NoopSink, RunEvent,
     RunSubscription, SinkEvent,
 };
+pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};

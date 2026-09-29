@@ -272,6 +272,12 @@ classDiagram
             <<interface>>
             now()
         }
+        class Notifier {
+            <<interface>>
+            publish()
+            subscribe()
+        }
+        class LocalNotifier
         class NoopSink
         class BroadcastSink
         class CollectingSink
@@ -281,6 +287,7 @@ classDiagram
     EventSink <|.. NoopSink
     EventSink <|.. BroadcastSink
     EventSink <|.. CollectingSink
+    Notifier <|.. LocalNotifier
     Clock <|.. SystemClock
     Clock <|.. ManualClock
 
@@ -345,6 +352,7 @@ The boundaries, by what they swap:
 | `AgentStarter` | `adam-runtime` | `LlmStarter`, `CoderStarter` | test starters |
 | `Tool` | `adam-llm-agent` | the coder tools | test tools |
 | `EventSink` | `adam-runtime` | `BroadcastSink` | `NoopSink` (default), `CollectingSink` |
+| `Notifier` | `adam-runtime` | none yet (a Postgres adapter is next) | `LocalNotifier` (in-process; also the fan-out inside adapters) |
 | `Clock` | `adam-runtime` | `SystemClock` | `ManualClock` |
 | `PermissionPrompt` | `adam-acp` | none in this repository (the default policy needs no prompt) | `StaticPrompt` |
 
@@ -615,6 +623,14 @@ What the diagram cannot say:
   repeat. The coder's tools are (see
   [The coder agent](#the-coder-agent)). A replay that asks for a different
   step name at a recorded `seq` fails the run with `NonDeterminism`.
+* **Waking is polling plus hints.** An idle worker sleeps at most one
+  `poll_interval` (250 ms by default), and the same `Runtime` wakes its own
+  workers at once. With a `Notifier` configured
+  (`RuntimeBuilder::notifier`), `start` and `deliver` publish
+  `Signal::Runnable` so a worker of another process polls now, and `cancel`
+  publishes `Signal::Finished` so a step of another process sees its
+  `CancelToken` fire at once (`crates/adam-runtime/src/notify.rs`, `worker.rs`).
+  A signal is a hint that may be lost; polling and the cancel watch stay on.
 * **The lease is an optimisation.** The compare-and-swap on `version` is the
   guarantee. A worker whose lease expired mid-step cannot overwrite newer state:
   its commit is rejected and it drops its result.

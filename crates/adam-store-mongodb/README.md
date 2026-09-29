@@ -9,6 +9,15 @@ checked by [`adam-store-testkit`](../adam-store-testkit/README.md). It is the
 alternative to [`adam-store-postgres`](../adam-store-postgres/README.md); a
 binary picks one at composition time.
 
+## Cross-process signals
+
+There are none. A standalone `mongod` has no change streams (they need a replica
+set), and this adapter promises to work on one, so workers of other processes
+find new runs by polling `claim_due` (`poll_interval`), and a cancel issued by
+another process reaches a running step at its next poll. Compose a `Notifier`
+from another adapter (`adam-notify-postgres` needs a Postgres, so it fits when
+that is the store, or on the side) or accept the poll latency.
+
 ## API at a glance
 
 * `MongoStore::connect(uri, db)`: connect and use database `db`.

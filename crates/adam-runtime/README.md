@@ -28,6 +28,7 @@ over A2A).
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
 | `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events |
+| `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
 | `RetryPolicy`, `MAX_RETRY_AFTER` | exponential backoff for transient errors |
 | `Clock`, `SystemClock`, `ManualClock` | injectable time |
 
@@ -78,6 +79,33 @@ let run = runtime.start("my-agent", inbound, None).await?;
 // a worker process: Runtime::builder(store).agent(MyAgent)...run_worker(..)
 ```
 
+## Several processes
+
+Processes share nothing but the store. A worker finds due runs by polling it
+(`poll_interval`, 250 ms by default), and a step learns of a cancel issued by
+another process when its worker next reads the run. Both are correct, and both
+cost up to one poll interval.
+
+A `Notifier` removes that latency. Configure one with
+`RuntimeBuilder::notifier(..)` on the front and on the workers:
+
+* `start` and `deliver` publish `Signal::Runnable { run, agent }`. A worker of
+  any process that steps `agent` polls at once.
+* `cancel` publishes `Signal::Finished { run }`. A process that is stepping the
+  run fires the step's `CancelToken` at once.
+* `Delivery::Resync` means signals may have been lost (a lagging subscriber, a
+  dropped connection): the worker polls and re-reads every run it is stepping.
+
+**A signal is a hint, never the truth.** It may be lost, duplicated or late.
+Correctness rests on the version compare-and-swap and the lease, and polling
+stays on with a notifier configured (timers and retry backoffs are found by
+polling only). Without a notifier the behaviour is exactly what it was.
+
+`LocalNotifier` connects runtimes inside one process (tests, or a process that
+is front and worker in one). Across processes use an adapter crate. Live
+*events* of a run stepped elsewhere are a separate port, `EventSink`: a
+`Notifier` carries only the two signals above.
+
 ## Errors
 
 `AgentError` and `RuntimeError` implement `adam_error::Classify`; the worker
@@ -118,9 +146,10 @@ No Cargo features, no environment variables at runtime.
 ## Tests
 
 `tests/runtime.rs` is one behavioural suite (including
-`a_starter_only_runtime_starts_and_a_full_runtime_steps`) run against `MemoryStore` always,
+`a_starter_only_runtime_starts_and_a_full_runtime_steps`, and the two
+`notifier_*` cases: two runtimes over one store and one `LocalNotifier`, a 30 s poll, a 5 s deadline) run against `MemoryStore` always,
 against PostgreSQL and against MongoDB when their variables are set. Unit
-tests sit in `src/cancel.rs`, `ctx.rs`, `events.rs` and `retry.rs`, and the
+tests sit in `src/cancel.rs`, `ctx.rs`, `events.rs`, `notify.rs` and `retry.rs`, and the
 class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
 (`class_table`, `from_classified_maps_retryable_to_transient_and_keeps_the_hint`,
 `a_message_never_repeats_its_source`) and `src/runtime.rs` (`error_tests`).

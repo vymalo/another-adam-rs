@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
 use adam_runtime::{
     Agent, AgentError, AgentStarter, BroadcastSink, Classify, Clock, CollectingSink, Ctx, Inbound,
-    MAX_RETRY_AFTER, ManualClock, RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder,
-    RuntimeError, Transition,
+    LocalNotifier, MAX_RETRY_AFTER, ManualClock, RetryPolicy, RunEvent, RunView, Runtime,
+    RuntimeBuilder, RuntimeError, Transition,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -2580,6 +2580,110 @@ mod cases {
         assert_eq!(view.error.as_deref(), Some("cancelled: from b"));
     }
 
+    /// With a shared notifier a run started, and a message delivered, by one
+    /// runtime wakes the idle worker of another at once, despite a 30 s poll.
+    pub async fn notifier_wakes_a_worker_of_another_runtime(store: DynStore) {
+        let name = uniq("notify-wake");
+        let agent = fn_agent(
+            &name,
+            step_fn(|ctx, state| {
+                async move {
+                    if phase(&state) == 0 {
+                        return Ok(Transition::Park {
+                            state: json!({"phase": 1}),
+                            wake_at: None,
+                        });
+                    }
+                    Ok(Transition::Done {
+                        state,
+                        output: json!(ctx.take_inbox().len()),
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let notifier = LocalNotifier::default();
+        let slow = |worker: &str| {
+            builder(&store, worker, &agent)
+                .poll_interval(Duration::from_secs(30))
+                .notifier(notifier.clone())
+                .build()
+        };
+        let (front, back) = (slow("notify-front"), slow("notify-back"));
+        let worker = spawn_worker(&back);
+        // Let the worker find nothing and go idle on its 30 s poll.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let run = front.start(&name, inbound(), None).await.expect("start");
+        wait_for_within(
+            &back,
+            run,
+            Duration::from_secs(5),
+            "parked despite a 30s poll",
+            |v| v.waiting,
+        )
+        .await;
+        front.deliver(run, inbound()).await.expect("deliver");
+        let done = wait_for_within(
+            &back,
+            run,
+            Duration::from_secs(5),
+            "done despite a 30s poll",
+            |v| v.status == RunStatus::Done,
+        )
+        .await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!(1)));
+    }
+
+    /// With a shared notifier a cancel issued by one runtime reaches the step
+    /// another is running at once, not after a 30 s poll.
+    pub async fn notifier_carries_a_cancel_to_another_runtime(store: DynStore) {
+        let name = uniq("notify-cancel");
+        let started = Arc::new(Notify::new());
+        let observed = Arc::new(Notify::new());
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (started, observed) = (started.clone(), observed.clone());
+                move |ctx, state| {
+                    let (started, observed) = (started.clone(), observed.clone());
+                    async move {
+                        started.notify_one();
+                        tokio::select! {
+                            () = ctx.cancelled() => {
+                                observed.notify_one();
+                                Ok(Transition::Done { state, output: json!("stopped early") })
+                            }
+                            () = tokio::time::sleep(Duration::from_secs(60)) => {
+                                Ok(Transition::Done { state, output: json!("ran to the end") })
+                            }
+                        }
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let notifier = LocalNotifier::default();
+        let slow = |worker: &str| {
+            builder(&store, worker, &agent)
+                .poll_interval(Duration::from_secs(30))
+                .notifier(notifier.clone())
+                .build()
+        };
+        let (a, b) = (slow("notify-cancel-a"), slow("notify-cancel-b"));
+        let run = a.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&a);
+        notified(&started, "the step on a").await;
+
+        b.cancel(run, "from b").await.expect("cancel on b");
+        tokio::time::timeout(Duration::from_secs(5), observed.notified())
+            .await
+            .expect("a's step sees b's cancellation despite a 30s poll");
+        worker.stop().await;
+        let view = a.view(run).await.expect("view").expect("run");
+        assert_eq!(view.error.as_deref(), Some("cancelled: from b"));
+    }
+
     /// The signal is per run: cancelling one run leaves a concurrent run's
     /// token untouched, and a fresh transition starts with a fresh token.
     pub async fn cancel_only_signals_its_own_run(store: DynStore) {
@@ -2695,6 +2799,8 @@ macro_rules! runtime_suite {
                 cancel_signals_the_step_that_is_running,
                 cancel_issued_elsewhere_signals_the_step,
                 cancel_only_signals_its_own_run,
+                notifier_wakes_a_worker_of_another_runtime,
+                notifier_carries_a_cancel_to_another_runtime,
             );
         }
     };

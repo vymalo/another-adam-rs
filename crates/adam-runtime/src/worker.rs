@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use futures::FutureExt;
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt};
 use serde_json::Value;
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -20,6 +21,7 @@ use crate::cancel::CancelToken;
 use crate::ctx::{Ctx, CtxOutcome, CtxParts};
 use crate::envelope::Envelope;
 use crate::events::Artifact;
+use crate::notify::{Delivery, Signal};
 use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
 
 type InFlight = Arc<Mutex<HashSet<RunId>>>;
@@ -58,6 +60,15 @@ impl Runtime {
         if agents.is_empty() {
             tracing::warn!("no agent to step is registered, this worker claims nothing");
         }
+        // Subscribe before the first claim, so a signal published from here
+        // on is not missed. Held until this function returns.
+        let _signals = inner.notifier.as_ref().map(|notifier| {
+            spawn_signal_consumer(
+                inner.clone(),
+                notifier.subscribe(),
+                agents.iter().cloned().collect(),
+            )
+        });
 
         loop {
             if shutdown.as_mut().now_or_never().is_some() {
@@ -196,6 +207,55 @@ fn spawn_renewer(inner: Arc<Inner>, run: RunId) -> AbortOnDrop {
             }
         }
     }))
+}
+
+/// Turns the notifier's deliveries into local effects: a run of an agent this
+/// worker steps became runnable, poll now; a run was cancelled, fire its token
+/// if we are stepping it; signals may have been lost, do both checks for
+/// everything. Only hints: whatever they miss the poll and the cancel watch
+/// find.
+fn spawn_signal_consumer(
+    inner: Arc<Inner>,
+    mut deliveries: BoxStream<'static, Delivery>,
+    agents: HashSet<String>,
+) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        while let Some(delivery) = deliveries.next().await {
+            match delivery {
+                Delivery::Signal(Signal::Runnable { agent, .. }) => {
+                    if agents.contains(&agent) {
+                        inner.notify_workers();
+                    }
+                }
+                Delivery::Signal(Signal::Finished { run }) => inner.fire_cancel(run),
+                Delivery::Resync => {
+                    inner.notify_workers();
+                    recheck_in_flight(&inner).await;
+                }
+            }
+        }
+        tracing::debug!("the notifier stream ended; polling carries on alone");
+    }))
+}
+
+/// Read every run this runtime is stepping and fire the token of those that
+/// turned terminal (or vanished), as the per-step cancel watch would at its
+/// next poll.
+async fn recheck_in_flight(inner: &Inner) {
+    let runs: Vec<RunId> = inner
+        .in_flight
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .keys()
+        .copied()
+        .collect();
+    for run in runs {
+        match inner.store.load_run(run).await {
+            Ok(Some(rec)) if rec.status.is_open() => {}
+            Ok(_) => inner.fire_cancel(run),
+            Err(e) => tracing::debug!(%run, error = %e, "resync could not read the run"),
+        }
+    }
 }
 
 /// Fires `token` once the run turns terminal (or vanishes) in the store, which
