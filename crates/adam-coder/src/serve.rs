@@ -1,5 +1,5 @@
-//! The coder as one process: [`serve`] composes the Postgres store, the model,
-//! GitHub and the workspaces from a [`Config`], and runs the halves its
+//! The coder as one process: [`serve`] composes the Postgres store from a [`Config`] and, for the
+//! roles that run workers, the model, GitHub and the workspaces, and runs the halves its
 //! [`adam_host::Role`] asks for until told to stop.
 //!
 //! The binary is `serve(Config::from_env()?, sigterm)` and nothing else; tests
@@ -10,7 +10,7 @@
 //! | Role | Components | Also |
 //! |---|---|---|
 //! | `all` (default) | `a2a-server` (control plane), `worker` | |
-//! | `control-plane` | `a2a-server` | a runtime that only starts, delivers, cancels and views runs |
+//! | `control-plane` | `a2a-server` | [`Coder::control_plane`]: a runtime with the agent's starter only, no model or GitHub configuration |
 //! | `worker` | `worker`, `health` | `/healthz` on [`Config::listen_addr`], no A2A |
 
 use std::future::Future;
@@ -31,11 +31,49 @@ use tokio::net::TcpListener;
 use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 use crate::repos::workspaces_for;
-use crate::{Coder, CoderAgent, CoderSettings, Config, RuntimeOptions, ToolEnv};
+use crate::{Coder, CoderAgent, CoderSettings, Config, RuntimeOptions, ToolEnv, WorkerConfig};
 
 /// How long open connections (SSE streams never end on their own) get to
 /// finish after the shutdown signal before the server is dropped.
 const SERVER_DRAIN: Duration = Duration::from_secs(10);
+
+/// The complete coder agent for a role that runs workers: the model client, the GitHub client and
+/// the workspaces. The clients are only constructed here; nothing calls the model or GitHub until
+/// a worker steps a run. `redactor` is built from the whole configuration, so it also knows the
+/// database password and the A2A tokens, which a step's error text must not carry either.
+async fn build_agent(worker: &WorkerConfig, redactor: Redactor) -> anyhow::Result<CoderAgent> {
+    let model: DynModel = Arc::new(
+        OpenAiCompatible::new(OpenAiConfig::new(
+            worker.model_base_url.clone(),
+            worker.model_api_key.clone(),
+        ))
+        .context("building the model client")?,
+    );
+
+    tokio::fs::create_dir_all(&worker.workspace_root)
+        .await
+        .with_context(|| format!("creating {}", worker.workspace_root.display()))?;
+    let (workspaces, creds) = workspaces_for(worker);
+    let code_host: DynCodeHost = Arc::new(
+        GitHub::new(creds)
+            .context("building the GitHub client")?
+            .with_api_base(worker.github_api_url.as_str()),
+    );
+
+    let mut settings = CoderSettings::new(OpenCodeLaunch::from_command(
+        &worker.opencode_command,
+        &worker.model_base_url,
+        &worker.opencode_model,
+    ));
+    settings.max_check_cycles = worker.max_check_cycles;
+    settings.check_timeout = worker.check_timeout;
+    settings.check_output_tail = worker.check_output_tail;
+    settings.draft_pull_requests = worker.pr_draft;
+    settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
+
+    let env = Arc::new(ToolEnv::new(workspaces, code_host, settings).with_redactor(redactor));
+    Ok(CoderAgent::new(model, worker.model.clone(), env))
+}
 
 /// Run the coder until `shutdown` resolves (SIGTERM in the binary).
 ///
@@ -67,53 +105,26 @@ pub async fn serve(
         Arc::new(store)
     };
 
-    // Every role builds the complete agent: `Runtime::start` looks it up by name and calls its
-    // `init`, so even a control plane, which never steps a run, registers it. The clients are
-    // only constructed here; nothing calls the model or GitHub until a worker steps a run.
-    let model: DynModel = Arc::new(
-        OpenAiCompatible::new(OpenAiConfig::new(
-            config.model_base_url.clone(),
-            config.model_api_key.clone(),
-        ))
-        .context("building the model client")?,
-    );
-
-    // The workspace root is the workers' business: only a role that runs them creates it.
-    if role.runs_workers() {
-        tokio::fs::create_dir_all(&config.workspace_root)
-            .await
-            .with_context(|| format!("creating {}", config.workspace_root.display()))?;
-    }
-    let (workspaces, creds) = workspaces_for(&config);
-    let code_host: DynCodeHost = Arc::new(
-        GitHub::new(creds)
-            .context("building the GitHub client")?
-            .with_api_base(config.github_api_url.as_str()),
-    );
-
-    let mut settings = CoderSettings::new(OpenCodeLaunch::from_command(
-        &config.opencode_command,
-        &config.model_base_url,
-        &config.opencode_model,
-    ));
-    settings.max_check_cycles = config.max_check_cycles;
-    settings.check_timeout = config.check_timeout;
-    settings.check_output_tail = config.check_output_tail;
-    settings.draft_pull_requests = config.pr_draft;
-    settings.identity = GitIdentity::new(&config.git_author_name, &config.git_author_email);
-
-    let env = Arc::new(
-        ToolEnv::new(workspaces, code_host, settings).with_redactor(Redactor::from_config(&config)),
-    );
-    let agent = CoderAgent::new(model, config.model.clone(), env);
-    let coder = Coder::new(
-        store,
-        agent,
-        &RuntimeOptions {
-            concurrency: config.workers,
-            ..RuntimeOptions::default()
-        },
-    );
+    // Only a role that runs workers builds the agent: model, GitHub client, workspaces. A control
+    // plane starts, delivers to, cancels and views runs, which needs the agent's name and `init`
+    // only (`CoderStarter`), so it takes no model or GitHub configuration.
+    let (coder, workers) = match &config.worker {
+        Some(worker) => (
+            Coder::new(
+                store,
+                build_agent(worker, Redactor::from_config(&config)).await?,
+                &RuntimeOptions {
+                    concurrency: worker.workers,
+                    ..RuntimeOptions::default()
+                },
+            ),
+            Some(worker.workers),
+        ),
+        None => (
+            Coder::control_plane(store, &RuntimeOptions::default()),
+            None,
+        ),
+    };
 
     // Bind before anything runs: an address that cannot be bound fails the process at once.
     let listener = TcpListener::bind(config.listen_addr)
@@ -125,7 +136,7 @@ pub async fn serve(
     tracing::info!(
         %addr,
         %role,
-        workers = role.runs_workers().then_some(config.workers),
+        workers,
         "listening"
     );
 

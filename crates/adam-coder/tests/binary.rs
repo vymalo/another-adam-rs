@@ -55,13 +55,22 @@ fn valid_env(database_url: &str, workspace: &Path) -> Vec<(String, String)> {
     ]
 }
 
-/// `valid_env` for `role`: without the front's variables when the role serves no A2A, so a test
-/// proves that the process starts without them.
+/// `valid_env` for `role`, with only the variables the role reads: without the front's variables
+/// when the role serves no A2A, and without the model, GitHub and workspace variables when it runs
+/// no workers, so a test proves that the process starts without them.
 fn role_env(role: &str, database_url: &str, workspace: &Path) -> Vec<(String, String)> {
     let mut env = valid_env(database_url, workspace);
     env.push(("ROLE".to_owned(), role.to_owned()));
     if role == "worker" {
         env.retain(|(k, _)| k != "A2A_BEARER_TOKENS" && k != "PUBLIC_URL");
+    }
+    if role == "control-plane" {
+        env.retain(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "MODEL_BASE_URL" | "MODEL_API_KEY" | "MODEL" | "GITHUB_TOKEN" | "WORKSPACE_ROOT"
+            )
+        });
     }
     env
 }
@@ -292,20 +301,21 @@ async fn an_unknown_role_is_a_configuration_error_naming_the_accepted_values() {
     );
 }
 
-/// What each role requires. A control plane still needs the model and GitHub variables, because
-/// `Runtime::start` needs the complete agent (see `adam_coder::config`), so a missing one is a
-/// configuration error for it too. A missing front variable is one only for the roles that serve
-/// A2A. (That a worker *starts* without them is `a_worker_serves_only_healthz_...`.)
+/// What each role requires. The model and GitHub variables belong to the roles that run workers
+/// (`all`, `worker`); a control plane starts without them (`a_control_plane_serves_a2a_...`). A
+/// missing front variable is one only for the roles that serve A2A. (That a worker *starts*
+/// without them is `a_worker_serves_only_healthz_...`.)
 #[tokio::test]
 async fn each_role_reports_the_variables_it_is_missing_and_exits_78() {
     let tmp = tempfile::tempdir().unwrap();
     for (role, remove, reported) in [
-        ("control-plane", "GITHUB_TOKEN", "GITHUB_TOKEN"),
-        ("control-plane", "MODEL", "MODEL"),
         ("control-plane", "A2A_BEARER_TOKENS", "A2A_BEARER_TOKENS"),
         ("control-plane", "PUBLIC_URL", "PUBLIC_URL"),
+        ("control-plane", "DATABASE_URL", "DATABASE_URL"),
         ("all", "A2A_BEARER_TOKENS", "A2A_BEARER_TOKENS"),
+        ("all", "GITHUB_TOKEN", "GITHUB_TOKEN"),
         ("worker", "GITHUB_TOKEN", "GITHUB_TOKEN"),
+        ("worker", "MODEL", "MODEL"),
         ("worker", "MODEL_API_KEY", "MODEL_API_KEY"),
     ] {
         let mut env = role_env(role, "postgres://u:p@127.0.0.1:1/x", tmp.path());
@@ -446,8 +456,9 @@ async fn a_worker_serves_only_healthz_needs_no_front_variables_and_stops_on_sigt
     db.finish().await;
 }
 
-/// A control plane serves A2A (card, `/healthz`, 401 without a token) and never touches the
-/// workspace root: it is not created, because no run is stepped here.
+/// A control plane serves A2A (card, `/healthz`, 401 without a token) with no model, GitHub or
+/// workspace configuration, and never touches the workspace root, even when one is set: it is not
+/// created, because no run is stepped here.
 #[tokio::test]
 async fn a_control_plane_serves_a2a_and_does_not_create_the_workspace_root() {
     let Some(db) = TestDb::create().await else {
@@ -455,8 +466,18 @@ async fn a_control_plane_serves_a2a_and_does_not_create_the_workspace_root() {
     };
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("never-created");
-    let mut p = Proc::spawn(&role_env("control-plane", &db.url(), &workspace));
+    let mut env = role_env("control-plane", &db.url(), &workspace);
+    env.push((
+        "WORKSPACE_ROOT".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+    ));
+    let mut p = Proc::spawn(&env);
     let addr = p.ready().await;
+    let out = p.stdout();
+    assert!(
+        out.contains("\"worker\":None") || out.contains("worker: None"),
+        "the control plane's configuration has no worker half:\n{out}"
+    );
 
     let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
     assert_eq!(status, 200, "{card}");
@@ -870,13 +891,27 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
         env
     };
 
-    // The control plane alone takes the task.
-    let mut front = Proc::spawn(&with_backends(role_env(
-        "control-plane",
-        &db.url(),
-        &front_workspace,
-    )));
+    // The control plane alone takes the task. It gets no model, GitHub or OpenCode configuration
+    // at all (and a workspace root it must leave alone): starting a run needs none of it.
+    let mut front_env = role_env("control-plane", &db.url(), &front_workspace);
+    front_env.push((
+        "WORKSPACE_ROOT".to_owned(),
+        front_workspace.to_string_lossy().into_owned(),
+    ));
+    let mut front = Proc::spawn(&front_env);
     let front_addr = front.ready().await;
+    let front_out = front.stdout();
+    for absent in [
+        "model_base_url",
+        "github_api_url",
+        &model.uri(),
+        &github.uri(),
+    ] {
+        assert!(
+            !front_out.contains(absent),
+            "the control plane logged model or GitHub configuration ({absent}):\n{front_out}"
+        );
+    }
     let client = common::a2a_client(front_addr, A2A_TOKEN).await;
     let mut stream = client
         .send_streaming_message(&SendMessageRequest {

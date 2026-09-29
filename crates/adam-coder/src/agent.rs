@@ -4,9 +4,9 @@
 use std::sync::Arc;
 
 use adam_error::report;
-use adam_llm_agent::{Conversation, DynTool, Limits, LlmAgent};
+use adam_llm_agent::{Conversation, DynTool, Limits, LlmAgent, LlmStarter};
 use adam_model::DynModel;
-use adam_runtime::{Agent, AgentError, Ctx, Inbound, Transition};
+use adam_runtime::{Agent, AgentError, AgentStarter, Ctx, Inbound, Transition};
 use async_trait::async_trait;
 
 use crate::instructions::instructions;
@@ -25,6 +25,28 @@ pub fn coder_limits() -> Limits {
         max_tool_calls: 400,
         max_output_tokens: 8192,
         max_history_tokens: 100_000,
+    }
+}
+
+/// The start-only half of the [`CoderAgent`]: its name and its `init`, with no model, tools or
+/// credentials.
+///
+/// A process that only accepts tasks registers this (`RuntimeBuilder::starter`, or
+/// [`Coder::control_plane`](crate::Coder::control_plane)) and a worker with the [`CoderAgent`]
+/// steps the runs. [`CoderAgent::init`] delegates here, so the two cannot disagree on the state a
+/// run starts with.
+#[derive(Debug, Clone, Default)]
+pub struct CoderStarter;
+
+impl AgentStarter for CoderStarter {
+    type State = Conversation;
+
+    fn name(&self) -> &str {
+        AGENT_NAME
+    }
+
+    fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
+        LlmStarter::new(AGENT_NAME).init(input)
     }
 }
 
@@ -102,7 +124,7 @@ impl Agent for CoderAgent {
     }
 
     fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
-        self.inner.init(input)
+        CoderStarter.init(input)
     }
 
     async fn step(
@@ -271,5 +293,19 @@ mod tests {
         assert!(out.is_char_boundary(out.len() - " [truncated]".len()));
         // Short text is left alone.
         assert_eq!(r.failure_text("short".into()), "short");
+    }
+
+    #[test]
+    fn the_starter_carries_the_agents_name_and_reads_the_same_start_message() {
+        use adam_llm_agent::user_message;
+
+        assert_eq!(CoderStarter.name(), AGENT_NAME);
+        let state = CoderStarter.init(user_message("fix it")).unwrap();
+        assert_eq!(state, Conversation::new("fix it"));
+        // A start message the agent would reject is rejected here, before a run exists.
+        let err = CoderStarter
+            .init(Inbound::new("message", serde_json::json!({"text": 7})))
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Permanent { .. }), "{err:?}");
     }
 }

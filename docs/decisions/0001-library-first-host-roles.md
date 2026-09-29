@@ -66,6 +66,18 @@ role. The rename is outside this repo.
    worker does not need them. Removing the requirement needs agent starters (a control plane
    that can start a run without holding the agent), which is a later change. *Verified
    2026-09-29: read `Runtime::start` and `new_run` in `crates/adam-runtime/src/runtime.rs`.*
+
+   *Amended 2026-09-29 (agent starters implemented):* the requirement above is gone. Starting
+   a run needs only the agent's name and `init`, so `adam-runtime` has `AgentStarter` (the
+   start-only half of `Agent`) and `RuntimeBuilder::starter`. The runtime keeps a closed
+   registry of agents and starters; `start`, `start_with_id` and `agent_names` cover both,
+   while `run_worker` claims only agents. `adam-coder` registers a `CoderStarter` in the
+   control plane (`Coder::control_plane`), so a control plane needs `DATABASE_URL`,
+   `A2A_BEARER_TOKENS` and `PUBLIC_URL` and **no model or GitHub variables**; only the roles that
+   run workers read them (`Config::worker`, a `WorkerConfig`, is `Some` exactly then). This is
+   a breaking change to `adam-coder`'s public `Config` and `workspaces_for`. *Verified
+   2026-09-29: `crates/adam-coder/tests/binary.rs` starts a control plane with none of the
+   model, GitHub or workspace variables, and a separate worker process completes its task.*
 7. **The seam stays the store.** The two roles talk only through the Postgres store: the run
    record with its version compare-and-swap, and leases. No new protocol between them.
 8. **Hosts may run adam agents in-process, tools and sandboxes included.** The owner decided

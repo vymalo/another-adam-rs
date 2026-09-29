@@ -259,6 +259,11 @@ classDiagram
             init()
             step()
         }
+        class AgentStarter {
+            <<interface>>
+            name()
+            init()
+        }
         class EventSink {
             <<interface>>
             emit()
@@ -286,9 +291,11 @@ classDiagram
             call()
         }
         class LlmAgent
+        class LlmStarter
     }
     namespace adam_coder {
         class CoderAgent
+        class CoderStarter
         class PrepareWorkspace
         class DelegateToOpenCode
         class RunChecks
@@ -298,6 +305,8 @@ classDiagram
     }
     Agent <|.. LlmAgent
     Agent <|.. CoderAgent
+    AgentStarter <|.. LlmStarter
+    AgentStarter <|.. CoderStarter
     Tool <|.. PrepareWorkspace
     Tool <|.. DelegateToOpenCode
     Tool <|.. RunChecks
@@ -319,7 +328,9 @@ Each box is a crate (underscores stand for hyphens). The six coder tools are
 `prepare_workspace`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
 `open_pull_request` and `ask_user`. A seventh type, `Redacting`, wraps each of
 them to scrub secrets (`crates/adam-coder/src/tools/mod.rs`). `CoderAgent`
-wraps an `LlmAgent` and adds its completion rule.
+wraps an `LlmAgent` and adds its completion rule. `AgentStarter` is the start-only half
+of `Agent` (`name` and `init`, no `step`): a process that only accepts requests registers
+a starter (`LlmStarter`, `CoderStarter`) and never holds the agent's model or credentials.
 
 The boundaries, by what they swap:
 
@@ -331,6 +342,7 @@ The boundaries, by what they swap:
 | `CodeHost` | `adam-workspace` | `GitHub` (feature `github`, on by default) | `MemoryCodeHost` (feature `test-util`) |
 | `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `StaticToken` (one token, any host) | none needed |
 | `Agent` | `adam-runtime` | `LlmAgent`, `CoderAgent` | test agents |
+| `AgentStarter` | `adam-runtime` | `LlmStarter`, `CoderStarter` | test starters |
 | `Tool` | `adam-llm-agent` | the coder tools | test tools |
 | `EventSink` | `adam-runtime` | `BroadcastSink` | `NoopSink` (default), `CollectingSink` |
 | `Clock` | `adam-runtime` | `SystemClock` | `ManualClock` |
@@ -370,13 +382,17 @@ flowchart LR
     subgraph serve["adam-coder: serve()"]
         direction LR
         pg["PgStore::connect + migrate()<br/>as DynStore"]
-        mdl["OpenAiCompatible::new<br/>as DynModel"]
-        creds["ScopedToken<br/>as DynGitCredentials"]
-        wsp["Workspaces::new<br/>allow_hosts, allow_local"]
-        gh["GitHub::new(creds)<br/>as DynCodeHost"]
-        tenv["ToolEnv<br/>workspaces + code host + settings + Redactor"]
-        agent["CoderAgent::new<br/>model + ToolEnv"]
-        coder["Coder::new(store, agent)"]
+        subgraph wcfg["roles that run workers (all, worker): Config::worker is Some, build_agent()"]
+            direction LR
+            mdl["OpenAiCompatible::new<br/>as DynModel"]
+            creds["ScopedToken<br/>as DynGitCredentials"]
+            wsp["Workspaces::new<br/>allow_hosts, allow_local"]
+            gh["GitHub::new(creds)<br/>as DynCodeHost"]
+            tenv["ToolEnv<br/>workspaces + code host + settings + Redactor"]
+            agent["CoderAgent::new<br/>model + ToolEnv"]
+        end
+        starter["CoderStarter<br/>name + init only<br/>(role control-plane: no model, no GitHub)"]
+        coder["Coder<br/>Coder::new(store, agent) or<br/>Coder::control_plane(store)"]
         rtm["Runtime<br/>BroadcastSink as EventSink"]
         bk["RuntimeTaskBackend"]
         router["A2aServer::router<br/>card + backend + AuthConfig"]
@@ -391,7 +407,8 @@ flowchart LR
         gh --> tenv
         tenv --> agent
         mdl --> agent
-        agent --> coder
+        agent -- "all, worker" --> coder
+        starter -- "control-plane" --> coder
         pg --> coder
         coder --> rtm
         coder --> bk
@@ -407,14 +424,17 @@ flowchart LR
 | `ROLE` | Components that run | Needs |
 |---|---|---|
 | `all` (default) | `a2a-server` and `worker`: one process, as before | every variable |
-| `control-plane` | `a2a-server` over a `Runtime` that only starts, delivers, cancels and views runs; `run_worker` is never called | every variable, and no workspace root is created |
+| `control-plane` | `a2a-server` over `Coder::control_plane`: a `Runtime` with the agent's `CoderStarter` only, which starts, delivers, cancels and views runs; `run_worker` is never called | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variables, and no workspace root is created |
 | `worker` | `worker` (`run_worker`) and `health` (`GET /healthz` on `LISTEN_ADDR`, no A2A) | everything except `A2A_BEARER_TOKENS` and `PUBLIC_URL` |
 
-The control plane still needs the model and GitHub variables. `Runtime::start`
-looks the agent up by name and calls its `init`, so every process registers the
-complete `CoderAgent`, and its model and GitHub clients are built (never called)
-in the control plane too. A later change, agent starters, is meant to lift that.
-The two roles meet only in the Postgres store: the run record with its version
+Only the roles that run workers hold the model, GitHub and workspace settings. Starting a run
+needs the agent's name and its `init` and nothing else, so the control plane registers a
+`CoderStarter` (an `adam_runtime::AgentStarter`, `RuntimeBuilder::starter`) instead of the
+`CoderAgent`, and `Config::worker` is `None` for it: no model client, GitHub client or
+workspaces are built, and none of their variables is read
+(`crates/adam-coder/src/serve.rs`, `config.rs`). The runtime claims only registered agents, so
+a control plane never steps a run even if `run_worker` were called. `CoderAgent::init`
+delegates to `CoderStarter`, so both start a run with the same state. The two roles meet only in the Postgres store: the run record with its version
 compare-and-swap, and leases. Until a cross-process event path exists (ADR 0001,
 *Open questions*), a control plane in another process learns what a worker did by
 polling the run, so the stream reaches the client a poll interval late, and a
@@ -465,7 +485,7 @@ sequenceDiagram
     alt the conversation has an open run
         R->>DB: load_run, then commit_run with the message in the inbox
     else no open run
-        R->>R: agent.init(input) gives the first state (an Envelope)
+        R->>R: starter or agent init(input) gives the first state (an Envelope)
         R->>DB: create_run (Runnable, version 1)
         R->>K: emit Status(Runnable, started)
     end
@@ -1060,7 +1080,7 @@ flowchart LR
         end
         pvc[("PVC at /work<br/>mirrors, worktrees, notes")]
         cnpg[("CloudNativePG cluster<br/>Postgres: runs and journal")]
-        secret["ExternalSecret to Secret<br/>MODEL_API_KEY, GITHUB_TOKEN, A2A_BEARER_TOKENS"]
+        secret["ExternalSecret to Secret<br/>MODEL_API_KEY, GITHUB_TOKEN (not for role control-plane), A2A_BEARER_TOKENS"]
     end
 
     orch -->|"A2A JSON-RPC + bearer token"| svc
@@ -1095,7 +1115,9 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   network policies.
 * **Secrets** come from an `ExternalSecret` (AWS Secrets Manager through External
   Secrets). The database URL is the `uri` key of the Secret that CloudNativePG
-  creates.
+  creates. With `config.role=control-plane` the chart renders neither
+  `MODEL_API_KEY` nor `GITHUB_TOKEN` (nor the model, GitHub and workspace
+  settings): the control plane holds none of them. `all` and `worker` need both.
 * **Known risks** (stated in the chart README): no database backups, and one
   replica.
 

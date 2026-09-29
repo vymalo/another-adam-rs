@@ -80,14 +80,19 @@ jobs:
             "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
           echo "$KUBECONFORM_SHA256  $RUNNER_TEMP/kubeconform.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/kubeconform.tgz" -C "$RUNNER_TEMP" kubeconform
+          # The default render (role all) and the control plane's, which drops the model, GitHub
+          # and workspace settings and the two secrets they need.
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             > "$RUNNER_TEMP/rendered.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set config.role=control-plane > "$RUNNER_TEMP/rendered-control-plane.yaml"
           for attempt in 1 2 3; do
             status=0
             "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
                 -schema-location default \
                 -schema-location 'deploy/coder/tests/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
-                "$RUNNER_TEMP/rendered.yaml" > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
+                "$RUNNER_TEMP/rendered.yaml" "$RUNNER_TEMP/rendered-control-plane.yaml" \
+                > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
             cat "$RUNNER_TEMP/kubeconform.out"
             if [ "$status" -eq 0 ]; then exit 0; fi
             if ! grep -q 'failed downloading schema' "$RUNNER_TEMP/kubeconform.out"; then exit "$status"; fi

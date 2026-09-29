@@ -22,11 +22,16 @@ main (`deploy/coder/bump-tag.sh`, also run as a dry run on pull requests).
 
 ## Secrets
 
-| Env | AWS property (default) |
-|---|---|
-| `MODEL_API_KEY` | `adam_coder_model_api_key` |
-| `GITHUB_TOKEN` | `adam_coder_github_token` |
-| `A2A_BEARER_TOKENS` | `adam_coder_a2a_bearer_tokens` (comma-separated) |
+| Env | AWS property (default) | Rendered for |
+|---|---|---|
+| `MODEL_API_KEY` | `adam_coder_model_api_key` | roles that run workers (`all`, `worker`) |
+| `GITHUB_TOKEN` | `adam_coder_github_token` | roles that run workers (`all`, `worker`) |
+| `A2A_BEARER_TOKENS` | `adam_coder_a2a_bearer_tokens` (comma-separated) | every role |
+
+With `config.role=control-plane` the chart renders neither `MODEL_API_KEY` nor `GITHUB_TOKEN`,
+in the pod or in the `ExternalSecret`, and `externalSecrets.properties.modelApiKey` and
+`githubToken` may be `null`. For the other roles those two properties are `required`: a render
+without them fails.
 
 The orchestrator holds one of the bearer tokens (its agent list names the
 environment variable it reads it from).
@@ -39,6 +44,19 @@ binary runs `all`, the A2A server and the workers in one pod. Set it to `control
 so the probes keep working, and serves no A2A). The chart still deploys **one**
 StatefulSet: it does not split the deployment into a front and a worker workload. See the
 crate README (`crates/adam-coder/README.md`, "Roles") for what each role starts and needs.
+
+A control plane needs no model, GitHub or workspace configuration, so with
+`config.role=control-plane` the chart leaves out `MODEL_BASE_URL`, `MODEL`, `OPENCODE_MODEL`,
+`WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
+`PR_DRAFT`, `GIT_AUTHOR_*`, `WORKSPACE_ROOT` and the two secrets above (the helper
+`coder.runsWorkers` in `templates/_helpers.tpl`). The render of `all` and `worker` is unchanged.
+`.github/workflows/coder.yml` runs kubeconform on the default render and on the control-plane
+render, and `tests/render-check.sh` asserts both.
+
+Follow-up: the `work` volume claim template and its mount stay for every role, because a
+StatefulSet's `volumeClaimTemplates` are immutable. A control plane on its own would not need
+the volume; dropping it means a new StatefulSet (or a separate workload for the front), which
+is not done here.
 
 ## Repositories
 

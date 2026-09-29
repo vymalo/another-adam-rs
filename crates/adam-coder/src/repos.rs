@@ -5,14 +5,14 @@ use std::sync::Arc;
 use adam_workspace::{DynGitCredentials, ScopedToken, Workspaces};
 use secrecy::ExposeSecret as _;
 
-use crate::Config;
+use crate::WorkerConfig;
 
 /// The workspaces the coder works in: the workspace root, restricted to the
 /// configured repository hosts, with the GitHub token scoped to the same
 /// hosts (defence in depth: the allowlist refuses a foreign host before any
 /// credential is requested, the scoped token refuses it again if a caller
 /// ever forgets the check).
-pub fn workspaces_for(config: &Config) -> (Workspaces, DynGitCredentials) {
+pub fn workspaces_for(config: &WorkerConfig) -> (Workspaces, DynGitCredentials) {
     let mut hosts = config.allowed_repo_hosts.iter();
     let first = hosts.next().map_or("github.com", String::as_str);
     let creds = hosts.fold(
@@ -36,7 +36,7 @@ mod tests {
 
     use super::*;
 
-    fn config(extra: &[(&str, &str)], root: &std::path::Path) -> Config {
+    fn config(extra: &[(&str, &str)], root: &std::path::Path) -> WorkerConfig {
         let mut vars = HashMap::from([
             ("DATABASE_URL", "postgres://u:p@db/adam".to_owned()),
             ("MODEL_BASE_URL", "https://gw.example/v1".to_owned()),
@@ -48,7 +48,8 @@ mod tests {
             ("WORKSPACE_ROOT", root.to_string_lossy().into_owned()),
         ]);
         vars.extend(extra.iter().map(|(k, v)| (*k, (*v).to_owned())));
-        Config::from_lookup(|k| vars.get(k).cloned()).unwrap()
+        let config = crate::Config::from_lookup(|k| vars.get(k).cloned()).unwrap();
+        config.worker.expect("the default role runs workers")
     }
 
     /// The configuration reaches the workspaces: by default a foreign host and

@@ -46,14 +46,17 @@ spec:
           env:
             - name: LISTEN_ADDR
               value: "0.0.0.0:8080"
+            {{- if include "coder.runsWorkers" . }}
             - name: WORKSPACE_ROOT
               value: /work
+            {{- end }}
             {{- with .Values.config.role }}
             - name: ROLE
               value: {{ . | quote }}
             {{- end }}
             - name: PUBLIC_URL
               value: {{ include "coder.publicUrl" . | quote }}
+            {{- if include "coder.runsWorkers" . }}
             - name: MODEL_BASE_URL
               value: {{ .Values.config.modelBaseUrl | quote }}
             - name: MODEL
@@ -76,6 +79,7 @@ spec:
               value: {{ .Values.config.gitAuthorName | quote }}
             - name: GIT_AUTHOR_EMAIL
               value: {{ .Values.config.gitAuthorEmail | quote }}
+            {{- end }}
             {{- range $name, $value := .Values.config.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}
@@ -89,6 +93,7 @@ spec:
                   key: uri
             {{- end }}
             {{- if .Values.externalSecrets.enabled }}
+            {{- if include "coder.runsWorkers" . }}
             - name: MODEL_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -99,6 +104,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "coder.secretName" . }}
                   key: GITHUB_TOKEN
+            {{- end }}
             - name: A2A_BEARER_TOKENS
               valueFrom:
                 secretKeyRef:

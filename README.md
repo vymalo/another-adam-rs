@@ -147,7 +147,8 @@ export MODEL_BASE_URL=http://127.0.0.1:8081/v1 MODEL_API_KEY=mock-api-key MODEL=
 export GITHUB_API_URL=http://127.0.0.1:8082 GITHUB_TOKEN=dev-github-token
 export A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/
 # optional: ROLE=control-plane or ROLE=worker instead of the default `all`. Run one of each
-# over the same DATABASE_URL (different LISTEN_ADDR) to split the halves; see the crate README.
+# over the same DATABASE_URL (different LISTEN_ADDR) to split the halves; a control plane ignores
+# the model, GitHub and workspace variables. See the crate README.
 ```
 
 OpenCode (which the coder runs) reaches the mock model through the same

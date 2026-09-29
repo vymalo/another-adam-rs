@@ -14,7 +14,8 @@ It is durable (every model and tool step is journaled by `adam-runtime`, so a
 restarted worker replays instead of repeating a side effect) and addressable
 (an A2A 1.0 server from `adam-a2a`, backed by `adam-a2a-runtime`). By default one
 process serves A2A and runs the workers; replicas share one Postgres. `ROLE` splits
-the two halves into separate processes (see [Roles](#roles)).
+the two halves into separate processes (see [Roles](#roles)); a control plane
+needs no model or GitHub configuration.
 
 ```mermaid
 sequenceDiagram
@@ -105,23 +106,27 @@ reported at once at startup):
 |---|---|---|
 | `ROLE` | what this process runs: `all`, `control-plane` or `worker` (see [Roles](#roles)) | `all` |
 | `DATABASE_URL` | Postgres for the run store | required |
-| `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required (key may be empty) |
-| `MODEL` | model alias of the agent | required |
+| `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
+| `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
+| `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
+| `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required by `all` and `worker` (key may be empty) |
+| `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
-| `GITHUB_TOKEN` | push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required |
+| `GITHUB_TOKEN` | push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required by `all` and `worker` |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, worktrees, run notes | `/work` |
-| `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
-| `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
-| `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` | `900`, `16384` |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
+
+Everything from `MODEL_BASE_URL` down is read by the roles that run workers (`all`, `worker`)
+only, and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.
+A control plane neither needs nor validates any of it (see [Roles](#roles)).
 
 OpenCode's configuration is generated at startup into
 `OPENCODE_CONFIG_CONTENT` (custom `@ai-sdk/openai-compatible` provider at
@@ -141,7 +146,7 @@ unset or blank means `all`). Anything else is a configuration error (exit 78) th
 | Role | Starts | Listener | Workspace root |
 |---|---|---|---|
 | `all` (default) | the A2A server and the workers, in one process: today's behaviour | A2A and `/healthz` on `LISTEN_ADDR` | created |
-| `control-plane` | the A2A server over a `Runtime` used only to start, deliver to, cancel and view runs; `run_worker` is never called | A2A and `/healthz` on `LISTEN_ADDR` | **not** created |
+| `control-plane` | the A2A server over `Coder::control_plane`: a `Runtime` with the agent's `CoderStarter` only, used to start, deliver to, cancel and view runs; `run_worker` is never called | A2A and `/healthz` on `LISTEN_ADDR` | **not** created |
 | `worker` | `Runtime::run_worker`, and a listener that answers `GET /healthz` (`200 ok`, the route the A2A router serves) and nothing else | `/healthz` only on `LISTEN_ADDR` | created |
 
 The roles meet only in the Postgres store (the run record's version compare-and-swap, and
@@ -161,18 +166,22 @@ one worker per workspace root, or gives the workers a shared volume (ADR 0001, d
 |---|---|---|---|
 | `DATABASE_URL` | yes | yes | yes |
 | `A2A_BEARER_TOKENS`, `PUBLIC_URL` | yes | yes | not read |
-| `GITHUB_TOKEN` | yes | yes | yes |
-| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL` | yes | yes | yes |
+| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `GITHUB_TOKEN` | yes | not read | yes |
+| the rest of the table above (`OPENCODE_*`, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
 
 A missing required value is a configuration error (exit 78) listed with every other problem.
-A worker does not read `A2A_BEARER_TOKENS` or `PUBLIC_URL`, so it does not validate them either.
+What a role does not read it does not validate either: a worker ignores `A2A_BEARER_TOKENS` and
+`PUBLIC_URL`, and a control plane ignores a malformed `GITHUB_API_URL` or `WORKERS=0`.
 
-**The control plane still needs the model and GitHub settings.** `Runtime::start` looks the
-agent up by name and calls its `init`, so a control plane must register the complete
-`CoderAgent`, which is built from the model client, the workspaces and the GitHub client. Those
-clients are only constructed there: nothing calls the model or GitHub, and the workspace root is
-not created. A later change ("agent starters") is meant to let a control plane start runs
-without them; until then the variables stay required, and `config.rs` has a test that says so.
+**A control plane needs no model or GitHub configuration.** Starting a run needs only the
+agent's name and its `init`, which `CoderStarter` provides (`CoderAgent::init` delegates to it, so
+the two cannot disagree). `serve` builds the model client, the GitHub client, the workspaces and
+the `CoderAgent` (`build_agent`, which also creates the workspace root) only when
+`Config::worker` is `Some`; otherwise it composes `Coder::control_plane`. A control plane
+never steps a run, so a `run_worker` on it would claim nothing (`adam-runtime` claims only
+registered agents, not starters). The library keeps `Coder::new(store, CoderAgent, ..)` for
+processes that step runs. See [ADR 0001](../../docs/decisions/0001-library-first-host-roles.md),
+decision 6.
 
 `SIGTERM` stops the control plane first (open connections get 10 seconds), then the workers,
 without a bound, so they finish and commit the steps they are in. A component that stops on its
@@ -202,7 +211,7 @@ remotes never receive the token.
 Text from things this process does not control (OpenCode's stderr tail in an
 "ACP agent exited" error, a check's output, a provider's error body) reaches
 clients as run errors, events and tool results. A `Redactor` built from the
-configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN`, every
+configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN` (both only where the role holds them), every
 `A2A_BEARER_TOKENS` entry and the `DATABASE_URL` password (and their Base64
 forms) with `[redacted]` in tool results and errors, in OpenCode's and the
 checks' progress lines, in the checks' findings, in the agent's final
@@ -290,18 +299,20 @@ database of its own, so the role needs `CREATEDB`):
   repository policy. Roles: an unknown `ROLE` (exit 78, names the variable and the accepted
   values); the variables each role is missing (exit 78); a `worker` that starts without
   `A2A_BEARER_TOKENS` and `PUBLIC_URL`, answers `/healthz` and 404 to everything A2A, and
-  creates its workspace root; a `control-plane` that serves A2A and never creates the
-  workspace root; and **a control plane and a worker as two processes over one database**:
-  the task is sent to the control plane before the worker exists and waits unclaimed (the
-  model is not asked, the run's version does not move), then the worker starts, steps it to a
+  creates its workspace root; a `control-plane` that starts with **no model, GitHub or
+  workspace variables**, serves A2A and never creates the workspace root; and **a control
+  plane and a worker as two processes over one database**: the control plane is given no model
+  or GitHub configuration and its log shows none; the task is sent to it before the worker
+  exists and waits unclaimed (the model is not asked, the run's version does not move), then the worker starts, steps it to a
   branch and a pull request, and the control plane's stream (by polling) reports the artifacts
   and `completed`.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy.
 * `adam-workspace/tests/workspace.rs`: the host allowlist, local paths, scoped
   tokens, and a wiremock "evil" git host that must never be contacted.
-* unit tests: configuration (including `ROLE`: the default, each value, an unknown one, and the
-  variables each role requires), prompt, OpenCode config, shell execution (timeout
+* unit tests: configuration (including `ROLE`: the default, each value, an unknown one, the
+  variables each role requires, and that `Config::worker` is `Some` exactly for the roles that
+  run workers), prompt, OpenCode config, shell execution (timeout
   kills the process group, output tail, cwd confinement, hidden secrets), run
   notes, the exit code of each root cause (`src/exit.rs`), and the scrubbing
   and bounding of failure text (`src/agent.rs`, `src/redact.rs`).

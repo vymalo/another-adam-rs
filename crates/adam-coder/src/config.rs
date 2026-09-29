@@ -4,18 +4,18 @@
 //! |---|---|---|
 //! | `ROLE` | what this process runs: `all`, `control-plane` or `worker` ([`adam_host::Role`]) | `all` |
 //! | `DATABASE_URL` | Postgres for the run store (`adam-store-postgres`) | required |
-//! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix | required |
-//! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required |
-//! | `MODEL` | model alias of the agent itself | required |
+//! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required for `all` and `control-plane`, non-empty (fail closed) |
+//! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required for `all` and `control-plane` |
+//! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
+//! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix | required for `all` and `worker` |
+//! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker` |
+//! | `MODEL` | model alias of the agent itself | required for `all` and `worker` |
 //! | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
-//! | `GITHUB_TOKEN` | git push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required |
+//! | `GITHUB_TOKEN` | git push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required for `all` and `worker` |
 //! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them | `github.com` |
 //! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
 //! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
 //! | `WORKSPACE_ROOT` | mirrors and worktrees (persistent storage) | `/work` |
-//! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required for `all` and `control-plane`, non-empty (fail closed) |
-//! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required for `all` and `control-plane` |
-//! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
 //! | `CHECK_TIMEOUT_SECS` | time limit of one `run_checks` command | `900` |
@@ -26,14 +26,20 @@
 //!
 //! # Roles
 //!
-//! `ROLE` picks the halves this process runs. The variables of a half are required only by the
-//! roles that run it: `A2A_BEARER_TOKENS` and `PUBLIC_URL` by the roles that run the control
-//! plane (`all`, `control-plane`), and nothing else is role-specific. In particular the model and
-//! GitHub variables (`MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `GITHUB_TOKEN`) are required by
-//! **every** role: [`Runtime::start`](adam_runtime::Runtime::start) looks the agent up by name and
-//! calls its `init`, so the control plane registers the complete [`CoderAgent`](crate::CoderAgent)
-//! even though it never steps it. Agent starters, a later change, are meant to remove that
-//! requirement for `control-plane`.
+//! `ROLE` picks the halves this process runs, and each half brings its own variables:
+//!
+//! * **Every role** needs `DATABASE_URL`.
+//! * **The control plane** (`all`, `control-plane`) also needs `A2A_BEARER_TOKENS` and
+//!   `PUBLIC_URL`: it serves A2A and starts, delivers to, cancels and views runs, which needs only
+//!   the agent's name and its `init` ([`CoderStarter`](crate::CoderStarter)), so it holds no model
+//!   or GitHub configuration.
+//! * **The workers** (`all`, `worker`) need everything a step uses, the `MODEL_*`, `MODEL`
+//!   and `GITHUB_TOKEN` variables, and read the rest of the table above (the workspace, the
+//!   checks, the commit identity, OpenCode). They arrive in [`Config::worker`] as a
+//!   [`WorkerConfig`], which is `Some` exactly when [`Role::runs_workers`].
+//!
+//! What a role does not use is not validated: a chart may set a variable for every role, and a
+//! malformed `GITHUB_API_URL` does not stop a control plane. `LISTEN_ADDR` is read by every role.
 //!
 //! Every problem is reported at once, so a misconfigured deployment is fixed
 //! in one round trip. Secrets are wrapped in [`SecretString`] and never appear
@@ -73,6 +79,34 @@ pub struct Config {
     pub role: Role,
     /// `DATABASE_URL`.
     pub database_url: SecretString,
+    /// `A2A_BEARER_TOKENS`. Empty unless [`Role::runs_control_plane`].
+    pub a2a_bearer_tokens: Vec<SecretString>,
+    /// `PUBLIC_URL`. `Some` exactly when [`Role::runs_control_plane`].
+    pub public_url: Option<Url>,
+    /// `LISTEN_ADDR`: the A2A server, or the `/healthz` listener of a worker.
+    pub listen_addr: SocketAddr,
+    /// What stepping a run needs: the model, GitHub, the workspaces and the checks. `Some` exactly
+    /// when [`Role::runs_workers`]; a control plane holds none of it.
+    pub worker: Option<WorkerConfig>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("role", &self.role)
+            .field("database_url", &"[REDACTED]")
+            .field("a2a_bearer_tokens", &self.a2a_bearer_tokens.len())
+            .field("public_url", &self.public_url.as_ref().map(Url::as_str))
+            .field("listen_addr", &self.listen_addr)
+            .field("worker", &self.worker)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The configuration of the roles that run workers (`all`, `worker`): everything a step of the
+/// coder uses.
+#[derive(Clone)]
+pub struct WorkerConfig {
     /// `MODEL_BASE_URL`.
     pub model_base_url: String,
     /// `MODEL_API_KEY`.
@@ -91,12 +125,6 @@ pub struct Config {
     pub github_api_url: Url,
     /// `WORKSPACE_ROOT`.
     pub workspace_root: PathBuf,
-    /// `A2A_BEARER_TOKENS`. Empty unless [`Role::runs_control_plane`].
-    pub a2a_bearer_tokens: Vec<SecretString>,
-    /// `PUBLIC_URL`. `Some` exactly when [`Role::runs_control_plane`].
-    pub public_url: Option<Url>,
-    /// `LISTEN_ADDR`: the A2A server, or the `/healthz` listener of a worker.
-    pub listen_addr: SocketAddr,
     /// `WORKERS`.
     pub workers: usize,
     /// `MAX_CHECK_CYCLES`.
@@ -115,11 +143,9 @@ pub struct Config {
     pub opencode_command: Vec<String>,
 }
 
-impl std::fmt::Debug for Config {
+impl std::fmt::Debug for WorkerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Config")
-            .field("role", &self.role)
-            .field("database_url", &"[REDACTED]")
+        f.debug_struct("WorkerConfig")
             .field("model_base_url", &self.model_base_url)
             .field("model", &self.model)
             .field("opencode_model", &self.opencode_model)
@@ -127,9 +153,6 @@ impl std::fmt::Debug for Config {
             .field("allow_local_repos", &self.allow_local_repos)
             .field("github_api_url", &self.github_api_url.as_str())
             .field("workspace_root", &self.workspace_root)
-            .field("a2a_bearer_tokens", &self.a2a_bearer_tokens.len())
-            .field("public_url", &self.public_url.as_ref().map(Url::as_str))
-            .field("listen_addr", &self.listen_addr)
             .field("workers", &self.workers)
             .field("max_check_cycles", &self.max_check_cycles)
             .field("check_timeout", &self.check_timeout)
@@ -176,9 +199,6 @@ impl Config {
         };
 
         let database_url = required("DATABASE_URL");
-        let model_base_url = required("MODEL_BASE_URL");
-        let model = required("MODEL");
-        let github_token = required("GITHUB_TOKEN");
         // The front's variables: only a role that serves A2A needs them.
         let front = role.runs_control_plane();
         let public_url_raw = if front {
@@ -191,19 +211,6 @@ impl Config {
         } else {
             String::new()
         };
-        let model_api_key = match lookup("MODEL_API_KEY") {
-            Some(v) => v,
-            None => {
-                problems.push(
-                    "MODEL_API_KEY is required (set it empty for a gateway without auth)".into(),
-                );
-                String::new()
-            }
-        };
-
-        let opencode_model = get("OPENCODE_MODEL").unwrap_or_else(|| model.clone());
-        let workspace_root =
-            PathBuf::from(get("WORKSPACE_ROOT").unwrap_or_else(|| "/work".to_owned()));
 
         let public_url = if front {
             match Url::parse(&public_url_raw) {
@@ -238,18 +245,72 @@ impl Config {
             SocketAddr::from(([0, 0, 0, 0], 8080)),
             &mut problems,
         );
-        let workers = parse_or(&get, "WORKERS", 4usize, &mut problems);
+
+        // The workers' variables: a control plane neither needs nor validates them.
+        let worker = if role.runs_workers() {
+            WorkerConfig::parse(&lookup, &get, &mut problems)
+        } else {
+            None
+        };
+
+        if !problems.is_empty() {
+            return Err(ConfigError { problems });
+        }
+        Ok(Self {
+            role,
+            database_url: SecretString::from(database_url),
+            a2a_bearer_tokens,
+            public_url,
+            listen_addr,
+            worker,
+        })
+    }
+}
+
+impl WorkerConfig {
+    /// Read the workers' variables, adding one line to `problems` per missing or malformed one.
+    /// `None` only after a problem was recorded.
+    fn parse(
+        lookup: &impl Fn(&str) -> Option<String>,
+        get: &impl Fn(&str) -> Option<String>,
+        problems: &mut Vec<String>,
+    ) -> Option<Self> {
+        let mut required = |name: &str| {
+            let value = get(name);
+            if value.is_none() {
+                problems.push(format!("{name} is required"));
+            }
+            value.unwrap_or_default()
+        };
+        let model_base_url = required("MODEL_BASE_URL");
+        let model = required("MODEL");
+        let github_token = required("GITHUB_TOKEN");
+        let model_api_key = match lookup("MODEL_API_KEY") {
+            Some(v) => v,
+            None => {
+                problems.push(
+                    "MODEL_API_KEY is required (set it empty for a gateway without auth)".into(),
+                );
+                String::new()
+            }
+        };
+
+        let opencode_model = get("OPENCODE_MODEL").unwrap_or_else(|| model.clone());
+        let workspace_root =
+            PathBuf::from(get("WORKSPACE_ROOT").unwrap_or_else(|| "/work".to_owned()));
+
+        let workers = parse_or(get, "WORKERS", 4usize, problems);
         if workers == 0 {
             problems.push("WORKERS must be at least 1".into());
         }
-        let max_check_cycles = parse_or(&get, "MAX_CHECK_CYCLES", 3u32, &mut problems);
+        let max_check_cycles = parse_or(get, "MAX_CHECK_CYCLES", 3u32, problems);
         if max_check_cycles == 0 {
             problems.push("MAX_CHECK_CYCLES must be at least 1".into());
         }
         let check_timeout =
-            Duration::from_secs(parse_or(&get, "CHECK_TIMEOUT_SECS", 900u64, &mut problems).max(1));
+            Duration::from_secs(parse_or(get, "CHECK_TIMEOUT_SECS", 900u64, problems).max(1));
         let check_output_tail =
-            parse_or(&get, "CHECK_OUTPUT_TAIL_BYTES", 16_384usize, &mut problems).max(256);
+            parse_or(get, "CHECK_OUTPUT_TAIL_BYTES", 16_384usize, problems).max(256);
         let mut flag = |name: &str| match get(name).as_deref() {
             None => false,
             Some(v) if v.eq_ignore_ascii_case("true") || v == "1" => true,
@@ -303,15 +364,8 @@ impl Config {
             .collect();
 
         // `github_api_url` is `None` only after a problem was recorded above.
-        let Some(github_api_url) = github_api_url else {
-            return Err(ConfigError { problems });
-        };
-        if !problems.is_empty() {
-            return Err(ConfigError { problems });
-        }
-        Ok(Self {
-            role,
-            database_url: SecretString::from(database_url),
+        let github_api_url = github_api_url?;
+        Some(Self {
             model_base_url,
             model_api_key: SecretString::from(model_api_key),
             model,
@@ -321,9 +375,6 @@ impl Config {
             allow_local_repos,
             github_api_url,
             workspace_root,
-            a2a_bearer_tokens,
-            public_url,
-            listen_addr,
             workers,
             max_check_cycles,
             check_timeout,
@@ -402,8 +453,15 @@ mod tests {
     #[test]
     fn defaults_apply_and_tokens_are_split() {
         let c = parse(&full()).expect("valid");
-        assert_eq!(c.workspace_root, PathBuf::from("/work"));
         assert_eq!(c.listen_addr, "0.0.0.0:8080".parse().unwrap());
+        let tokens: Vec<_> = c
+            .a2a_bearer_tokens
+            .iter()
+            .map(|t| t.expose_secret().to_owned())
+            .collect();
+        assert_eq!(tokens, ["one", "two"]);
+        let c = c.worker.expect("the default role runs workers");
+        assert_eq!(c.workspace_root, PathBuf::from("/work"));
         assert_eq!(c.workers, 4);
         assert_eq!(c.max_check_cycles, 3);
         assert_eq!(c.opencode_model, "coder-large");
@@ -411,12 +469,6 @@ mod tests {
         assert_eq!(c.allowed_repo_hosts, ["github.com"]);
         assert!(!c.allow_local_repos, "local repositories are opt-in");
         assert_eq!(c.github_api_url.as_str(), "https://api.github.com/");
-        let tokens: Vec<_> = c
-            .a2a_bearer_tokens
-            .iter()
-            .map(|t| t.expose_secret().to_owned())
-            .collect();
-        assert_eq!(tokens, ["one", "two"]);
         assert!(!c.pr_draft);
     }
 
@@ -480,7 +532,7 @@ mod tests {
     fn repository_hosts_are_normalised_and_validated() {
         let mut vars = full();
         vars.insert("ALLOWED_REPO_HOSTS", " GitHub.com, ghe.example.com:8443 ,,");
-        let c = parse(&vars).expect("valid");
+        let c = parse(&vars).expect("valid").worker.unwrap();
         assert_eq!(c.allowed_repo_hosts, ["github.com", "ghe.example.com:8443"]);
 
         for bad in [
@@ -511,7 +563,7 @@ mod tests {
         let mut vars = full();
         vars.insert("GITHUB_API_URL", "http://127.0.0.1:9999/api/v3");
         vars.insert("ALLOW_LOCAL_REPOS", "true");
-        let c = parse(&vars).expect("valid");
+        let c = parse(&vars).expect("valid").worker.unwrap();
         assert_eq!(c.github_api_url.as_str(), "http://127.0.0.1:9999/api/v3");
         assert!(c.allow_local_repos);
 
@@ -609,12 +661,9 @@ mod tests {
         }
     }
 
-    /// Every role still needs the model and GitHub variables: `Runtime::start` needs the complete
-    /// agent, so the control plane registers it too (see the module docs). This test pins that
-    /// down; the change that lets a control plane start without them changes it on purpose.
     #[test]
-    fn every_role_still_needs_the_model_and_github_variables() {
-        for role in Role::VALUES {
+    fn the_worker_roles_need_the_model_and_github_variables() {
+        for role in Role::VALUES.into_iter().filter(|r| r.runs_workers()) {
             for name in ["MODEL_BASE_URL", "MODEL_API_KEY", "MODEL", "GITHUB_TOKEN"] {
                 let mut vars = with_role(role.as_str());
                 vars.remove(name);
@@ -625,6 +674,69 @@ mod tests {
                     err.problems
                 );
             }
+            // What a worker uses is validated, every problem at once.
+            let mut vars = with_role(role.as_str());
+            vars.insert("GITHUB_API_URL", "garbage");
+            vars.insert("WORKERS", "0");
+            let err = parse(&vars).unwrap_err();
+            for name in ["GITHUB_API_URL", "WORKERS"] {
+                assert!(
+                    err.problems.iter().any(|p| p.starts_with(name)),
+                    "{role}: {name} missing from {:?}",
+                    err.problems
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_control_plane_needs_no_model_github_or_workspace_variables() {
+        let mut vars = with_role("control-plane");
+        for name in ["MODEL_BASE_URL", "MODEL_API_KEY", "MODEL", "GITHUB_TOKEN"] {
+            vars.remove(name);
+        }
+        let c = parse(&vars).expect("a control plane starts runs, it does not step them");
+        assert_eq!(c.role, Role::ControlPlane);
+        assert!(c.worker.is_none());
+        assert_eq!(c.a2a_bearer_tokens.len(), 2);
+        assert!(c.public_url.is_some());
+
+        // What only a worker uses is not validated either: a chart may set it for every role.
+        vars.insert("GITHUB_API_URL", "garbage");
+        vars.insert("WORKERS", "0");
+        vars.insert("MAX_CHECK_CYCLES", "many");
+        vars.insert("PR_DRAFT", "maybe");
+        vars.insert("ALLOWED_REPO_HOSTS", "https://x");
+        assert!(parse(&vars).unwrap().worker.is_none());
+
+        // The database and the front's own variables are still required.
+        for name in ["DATABASE_URL", "A2A_BEARER_TOKENS", "PUBLIC_URL"] {
+            let mut vars = vars.clone();
+            vars.remove(name);
+            let err = parse(&vars).unwrap_err();
+            assert!(
+                err.problems.iter().any(|p| p.starts_with(name)),
+                "{name} missing from {:?}",
+                err.problems
+            );
+        }
+    }
+
+    #[test]
+    fn worker_config_is_some_exactly_when_the_role_runs_workers() {
+        for role in Role::VALUES {
+            let c = parse(&with_role(role.as_str())).unwrap();
+            assert_eq!(c.worker.is_some(), role.runs_workers(), "{role}");
+        }
+    }
+
+    #[test]
+    fn a_worker_configs_debug_output_hides_secrets() {
+        let c = parse(&with_role("worker")).unwrap();
+        let text = format!("{:?}", c.worker.unwrap());
+        assert!(text.contains("WorkerConfig"), "{text}");
+        for secret in ["sk-secret", "ghp_secret"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
     }
 
