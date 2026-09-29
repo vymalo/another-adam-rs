@@ -647,6 +647,31 @@ fn a_subagent_named_like_a_skill_tool_is_refused() {
 }
 
 #[test]
+fn a_registered_tool_named_like_a_skill_tool_is_a_plain_tool_clash_without_skills() {
+    let mut files = with_helper("coder", "tools: [load_skill]", "");
+    files.push((
+        "agent/subagents/load_skill.md".into(),
+        instructions("description: Loads.", "You load."),
+    ));
+    let error = bind_error(&files, tools(&["load_skill"]));
+    let Error::SubagentToolClash { tool, clash, .. } = &error else {
+        panic!("wrong variant: {error}");
+    };
+    assert_eq!(tool, "load_skill");
+    assert_eq!(
+        *clash,
+        ToolClash::Tool,
+        "no skills, so the tool is a registered one"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("already has a tool with that name"),
+        "{error}"
+    );
+}
+
+#[test]
 fn two_subagents_with_one_name_are_refused() {
     let files = with_helper("coder", "tools: []", "");
     let refs: Vec<(&str, &str)> = files

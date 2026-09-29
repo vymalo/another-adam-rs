@@ -13,7 +13,7 @@ use adam_llm_agent::{DynTool, Limits, ToolSet};
 
 use crate::assembly::BoundDef;
 use crate::error::{Error, Origin, ToolClash};
-use crate::skills::{self, LOAD_SKILL, READ_SKILL_FILE, SkillFiles};
+use crate::skills::{self, SkillFiles};
 use crate::subagent::SubagentTool;
 use crate::suggest::closest;
 use crate::template::{self, Piece};
@@ -324,9 +324,12 @@ impl Walk<'_> {
             refuse_asking_tools(&origin, &tools)?;
         }
         let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
+        let registered = tools.len();
         let (skills, preloaded) =
             add_skills(&origin, manifest, self.files, &mut prompt, &mut tools)?;
-        add_subagent_tools(&origin, manifest, &mut tools)?;
+        // The tools `add_skills` appended, so a clash can say whose tool it hit.
+        let skill_tools: Vec<String> = tools[registered..].iter().map(|(n, _)| n.clone()).collect();
+        add_subagent_tools(&origin, manifest, &skill_tools, &mut tools)?;
         let index = self.nodes.len();
         self.nodes.push(Node {
             name: name.clone(),
@@ -410,6 +413,7 @@ fn refuse_asking_tools(origin: &Origin, tools: &[(String, DynTool)]) -> Result<(
 fn add_subagent_tools(
     origin: &Origin,
     manifest: &AgentManifest,
+    skill_tools: &[String],
     tools: &mut Vec<(String, DynTool)>,
 ) -> Result<(), Error> {
     // The subagent tools added so far, by name, with the file of the subagent that owns each.
@@ -423,15 +427,13 @@ fn add_subagent_tools(
                 file: file.to_path_buf(),
             })
         } else if tools.iter().any(|(n, _)| *n == child.name) {
-            // `add_skills` refused a registered tool with a skill tool's name, so a match with
-            // one of those names is the skills' own.
-            Some(
-                if child.name == LOAD_SKILL || child.name == READ_SKILL_FILE {
-                    ToolClash::SkillTool
-                } else {
-                    ToolClash::Tool
-                },
-            )
+            // Whose tool it is depends on what `add_skills` added, not on the name: without
+            // skills, a registered tool may be called `load_skill`.
+            Some(if skill_tools.contains(&child.name) {
+                ToolClash::SkillTool
+            } else {
+                ToolClash::Tool
+            })
         } else {
             None
         };
