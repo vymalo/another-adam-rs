@@ -167,6 +167,20 @@ impl Proc {
         })
     }
 
+    /// Wait until the process logged that `LISTEN` is active, so it hears other processes.
+    async fn notifying(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.stdout().contains("listening for notifications") {
+            assert!(self.still_running(), "exited early\n{}", self.logs());
+            assert!(
+                Instant::now() < deadline,
+                "never listened for notifications\n{}",
+                self.logs()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Wait until the server logged its address and `/healthz` answers 200;
     /// returns the address.
     async fn ready(&mut self) -> SocketAddr {
@@ -391,6 +405,7 @@ async fn serves_card_and_healthz_then_stops_cleanly_on_sigterm() {
     let tmp = tempfile::tempdir().unwrap();
     let mut p = Proc::spawn(&valid_env(&db.url(), tmp.path()));
     let addr = p.ready().await;
+    p.notifying().await;
 
     let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
     assert_eq!(status, 200, "{card}");
@@ -858,9 +873,10 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
 /// worker exists and waits, unclaimed. Then the worker starts, steps the run to a pull request,
 /// and the control plane's stream reports it.
 ///
-/// The control plane learns what the worker did by polling the run in the store: the live event
-/// sink is in-process, so nothing is pushed across the two processes. That is expected (ADR 0001,
-/// "Consequences"); the stream still carries every state and artifact, a poll interval late.
+/// Both processes log `listening for notifications`. The worker's progress reaches the control
+/// plane's stream **as events**, over Postgres `NOTIFY` (ADR 0001, "Cross-process events"): a
+/// `working` update carrying the text of a `Progress` event exists only as a live event, so a
+/// control plane that learned things by polling the run alone could never have streamed it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database() {
     let Some(db) = TestDb::create().await else {
@@ -900,6 +916,7 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
     ));
     let mut front = Proc::spawn(&front_env);
     let front_addr = front.ready().await;
+    front.notifying().await;
     let front_out = front.stdout();
     for absent in [
         "model_base_url",
@@ -953,12 +970,14 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
         &worker_workspace,
     )));
     let worker_addr = worker.ready().await;
+    worker.notifying().await;
     let (status, _) = common::raw(worker_addr, "GET", "/healthz", None).await;
     assert_eq!(status, 200);
 
     // The control plane's stream reports what the worker did.
     let mut labels: Vec<String> = Vec::new();
     let mut artifacts: Vec<String> = Vec::new();
+    let mut progress: Vec<String> = Vec::new();
     let mut last = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     while !last.as_ref().is_some_and(TaskState::is_terminal) {
@@ -978,6 +997,13 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
         match item {
             StreamResponse::StatusUpdate(u) => {
                 labels.push(format!("status:{:?}", u.status.state));
+                progress.extend(
+                    u.status
+                        .message
+                        .as_ref()
+                        .and_then(|m| m.text())
+                        .map(str::to_owned),
+                );
                 last = Some(u.status.state);
             }
             StreamResponse::ArtifactUpdate(u) => {
@@ -990,6 +1016,14 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
         }
     }
     assert_eq!(last, Some(TaskState::Completed), "{labels:?}");
+    assert!(
+        progress
+            .iter()
+            .any(|m| m.contains("preparing a worktree of")),
+        "the worker's progress events crossed processes: {progress:?}\n{}\n{}",
+        front.logs(),
+        worker.logs()
+    );
     for name in ["branch", "pull_request"] {
         assert!(
             artifacts.iter().any(|a| a == name),

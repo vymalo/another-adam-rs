@@ -54,7 +54,9 @@ let runtime = Runtime::builder(store)
 
 Run `notify.run(..)` in the same process as the `Runtime`, for every role. A
 worker-only process needs it to hear signals; a front needs it to hear events.
-Wiring it into `adam-coder` is a follow-up.
+[`adam-coder`](../adam-coder/README.md) does exactly this: `serve` builds one `PgNotify`
+on the store's pool and runs it as the host component `notify` in every role (see its
+*Live events and wake-up across processes*).
 
 ## Channels and payloads
 

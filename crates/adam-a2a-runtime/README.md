@@ -53,7 +53,8 @@ subscription of a task another process is stepping advances at the durable poll.
 `PgEventSink` as the runtime's sink, with this backend subscribing to the
 `BroadcastSink` it delivers into) and also wakes the worker on a start and
 delivers a `CancelTask` to the running step at once (a `Notifier`), instead of at
-the next poll. Wiring it into `adam-coder` is a follow-up.
+the next poll. `adam-coder` wires it in for every role (`Coder::new_with`,
+`Coder::control_plane_with`).
 
 ## Errors
 

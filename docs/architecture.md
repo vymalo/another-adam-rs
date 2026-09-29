@@ -424,12 +424,14 @@ flowchart LR
             agent["CoderAgent::new<br/>model + ToolEnv"]
         end
         starter["CoderStarter<br/>name + init only<br/>(role control-plane: no model, no GitHub)"]
-        coder["Coder<br/>Coder::new(store, agent) or<br/>Coder::control_plane(store)"]
-        rtm["Runtime<br/>BroadcastSink as EventSink"]
+        pgn["PgNotify::new(store pool, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier"]
+        coder["Coder<br/>Coder::new_with(store, agent, live) or<br/>Coder::control_plane_with(store, live)"]
+        rtm["Runtime<br/>PgEventSink as EventSink, PgNotifier as Notifier"]
         bk["RuntimeTaskBackend"]
         router["A2aServer::router<br/>card + backend + AuthConfig"]
         cp["control-plane component a2a-server<br/>axum::serve"]
         wrk["worker component worker<br/>Runtime::run_worker"]
+        ntf["component notify<br/>PgNotify::run<br/>(worker component in all and worker,<br/>control-plane component in control-plane)"]
         hlt["worker component health<br/>A2aServer::health_router<br/>(role worker only)"]
         host["Host::new(role)<br/>.run(shutdown)"]
 
@@ -442,6 +444,9 @@ flowchart LR
         agent -- "all, worker" --> coder
         starter -- "control-plane" --> coder
         pg --> coder
+        pg -- "pool" --> pgn
+        pgn --> coder
+        pgn --> ntf
         coder --> rtm
         coder --> bk
         bk --> router
@@ -449,15 +454,16 @@ flowchart LR
         rtm --> wrk
         cp --> host
         wrk --> host
+        ntf --> host
         hlt --> host
     end
 ```
 
 | `ROLE` | Components that run | Needs |
 |---|---|---|
-| `all` (default) | `a2a-server` and `worker`: one process, as before | every variable |
-| `control-plane` | `a2a-server` over `Coder::control_plane`: a `Runtime` with the agent's `CoderStarter` only, which starts, delivers, cancels and views runs; `run_worker` is never called | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variables, and no workspace root is created |
-| `worker` | `worker` (`run_worker`) and `health` (`GET /healthz` on `LISTEN_ADDR`, no A2A) | everything except `A2A_BEARER_TOKENS` and `PUBLIC_URL` |
+| `all` (default) | `a2a-server`, `worker` and `notify`: one process, as before | every variable |
+| `control-plane` | `a2a-server` and `notify`, over `Coder::control_plane_with`: a `Runtime` with the agent's `CoderStarter` only, which starts, delivers, cancels and views runs; `run_worker` is never called | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variables, and no workspace root is created |
+| `worker` | `worker` (`run_worker`), `notify` and `health` (`GET /healthz` on `LISTEN_ADDR`, no A2A) | everything except `A2A_BEARER_TOKENS` and `PUBLIC_URL` |
 
 Only the roles that run workers hold the model, GitHub and workspace settings. Starting a run
 needs the agent's name and its `init` and nothing else, so the control plane registers a
@@ -466,11 +472,16 @@ needs the agent's name and its `init` and nothing else, so the control plane reg
 workspaces are built, and none of their variables is read
 (`crates/adam-coder/src/serve.rs`, `config.rs`). The runtime claims only registered agents, so
 a control plane never steps a run even if `run_worker` were called. `CoderAgent::init`
-delegates to `CoderStarter`, so both start a run with the same state. The two roles meet only in the Postgres store: the run record with its version
-compare-and-swap, and leases. Until a cross-process event path exists (ADR 0001,
-*Open questions*), a control plane in another process learns what a worker did by
-polling the run, so the stream reaches the client a poll interval late, and a
-cancel reaches the worker on its next poll.
+delegates to `CoderStarter`, so both start a run with the same state. The two roles meet in the Postgres store: the run record with its version
+compare-and-swap, and leases, which is what makes them correct. They also meet in `NOTIFY`
+(see [Across processes: signals and events](#across-processes-signals-and-events)): every role
+runs the component `notify`, one `PgNotify` over the store's own pool, so a worker wakes at
+once for a run a control plane started, a cancel reaches a step in another process at once,
+and the control plane's stream carries a worker's progress events as they happen. Polling
+stays on, so without `notify` (a library user's `LiveSignals::local()`, a lost connection, a
+transaction-mode pooler) the same things happen a poll interval (250 ms) late. In `all` and
+`worker`, `notify` is a worker component that stops only after `worker` has finished, so the
+last step's events and signals are still sent; in `control-plane` it stops with the server.
 
 On SIGTERM `Host` stops the control plane first: the server stops taking
 connections and open streams get 10 seconds. It then stops the workers, with no
@@ -677,8 +688,8 @@ learns of a cancel at the next poll of its run. `adam-notify-postgres` closes
 both gaps over `LISTEN`/`NOTIFY` without changing who is right: every
 notification is a hint, the compare-and-swap and the polling stay in place, and
 a run completes with the crate removed, only later. The processes are wired by
-their composition root (`adam-coder` is a follow-up; the crate's
-`tests/two_runtimes.rs` wires a front and a worker the same way).
+their composition root. `adam-coder`'s `serve` does it for every role (done, no new
+variable); the crate's `tests/two_runtimes.rs` wires a front and a worker the same way.
 
 Each process has one `PgNotify` (`crates/adam-notify-postgres/src/lib.rs`) whose
 `run` holds a listener on two channels, `{prefix}events` and `{prefix}signals`,
@@ -695,6 +706,7 @@ sequenceDiagram
     participant WN as Worker PgNotify
     participant W as Worker<br/>run_worker + Agent.step
 
+    Note over F,W: adam-coder serve wires one PgNotify per process,<br/>the component notify, in every role
     C->>F: SendStreamingMessage
     F->>DB: create_run (Runnable)
     F-)FN: publish Signal Runnable (queued, never waits)
@@ -738,7 +750,9 @@ What the diagram cannot say:
 * **The listener holds one pooled connection** and needs a session, so no
   transaction-mode pooler in front of it.
 * **Not built here:** MongoDB has no equivalent (no change streams on a standalone
-  `mongod`), so it keeps polling; `adam-coder` does not use the crate yet.
+  `mongod`), so it keeps polling; `adam-coder` is Postgres only and uses the crate in
+  every role (`crates/adam-coder/src/serve.rs`, and its `binary.rs` test of a control plane
+  and a worker in two processes, which sees the worker's progress in the front's stream).
 
 The listener's lifecycle (`crates/adam-notify-postgres/src/lib.rs`, `listen_loop`
 and `session`):
