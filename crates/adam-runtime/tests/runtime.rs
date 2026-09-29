@@ -275,6 +275,45 @@ async fn notified(n: &Notify, what: &str) {
         .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
+/// Polls `cond` until it holds. It fails, naming `what`, after 20 s: a bound
+/// for a bug, never a duration the test relies on.
+async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// An agent that finishes at once: a probe for [`claim_pass`].
+fn probe_agent() -> FnAgent {
+    fn_agent(
+        &uniq("probe"),
+        step_fn(|_ctx, state| {
+            async move {
+                Ok(Transition::Done {
+                    state,
+                    output: json!(null),
+                })
+            }
+            .boxed()
+        }),
+    )
+}
+
+/// Returns once a worker of `rt` has claimed a run that was started *after*
+/// this call began, that is, after a whole claim pass that saw everything due
+/// at the time. It is how a test proves "a worker looked and left the run
+/// alone" without sleeping: `rt` must have `probe` registered, and a worker
+/// running.
+async fn claim_pass(rt: &Runtime, probe: &FnAgent) {
+    let run = rt
+        .start(&probe.name, inbound(), None)
+        .await
+        .expect("start the probe");
+    wait_done(rt, run).await;
+}
+
 fn phase(state: &Value) -> u64 {
     state.get("phase").and_then(Value::as_u64).unwrap_or(0)
 }
@@ -483,21 +522,28 @@ mod cases {
 
     /// A message delivered while a step is in flight neither is lost nor
     /// discards the step: it is merged into the commit.
+    ///
+    /// The step is held at a gate until the message is delivered, so it is
+    /// always delivered *during* the step (a sleep in the step let a loaded
+    /// machine deliver it after the step had committed).
     pub async fn deliver_during_step_is_merged(store: DynStore) {
         let name = uniq("merge");
         let phase0_runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
         let agent = fn_agent(
             &name,
             step_fn({
-                let (phase0_runs, started) = (phase0_runs.clone(), started.clone());
+                let (phase0_runs, started, gate) =
+                    (phase0_runs.clone(), started.clone(), gate.clone());
                 move |ctx, state| {
-                    let (phase0_runs, started) = (phase0_runs.clone(), started.clone());
+                    let (phase0_runs, started, gate) =
+                        (phase0_runs.clone(), started.clone(), gate.clone());
                     async move {
                         if phase(&state) == 0 {
                             phase0_runs.fetch_add(1, SeqCst);
                             started.notify_one();
-                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            notified(&gate, "the message to be delivered").await;
                             return Ok(Transition::Continue(json!({"phase": 1})));
                         }
                         let texts: Vec<Value> = ctx
@@ -522,6 +568,7 @@ mod cases {
         rt.deliver(run, Inbound::new("message", json!({"text": "late"})))
             .await
             .expect("deliver");
+        gate.notify_one(); // only now may the step return and commit
         let done = wait_done(&rt, run).await;
         worker.stop().await;
 
@@ -534,19 +581,21 @@ mod cases {
     }
 
     /// A message arriving during the step that parks must not be slept through.
+    /// The step is held at a gate until the message is delivered.
     pub async fn message_during_parking_step_wakes_the_run(store: DynStore) {
         let name = uniq("nosleep");
         let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
         let agent = fn_agent(
             &name,
             step_fn({
-                let started = started.clone();
+                let (started, gate) = (started.clone(), gate.clone());
                 move |ctx, state| {
-                    let started = started.clone();
+                    let (started, gate) = (started.clone(), gate.clone());
                     async move {
                         if phase(&state) == 0 {
                             started.notify_one();
-                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            notified(&gate, "the message to be delivered").await;
                             return Ok(Transition::Park {
                                 state: json!({"phase": 1}),
                                 wake_at: None,
@@ -568,12 +617,19 @@ mod cases {
         rt.deliver(run, Inbound::new("message", json!({})))
             .await
             .expect("deliver");
+        gate.notify_one(); // only now may the step park
         let done = wait_done(&rt, run).await;
         worker.stop().await;
         assert_eq!(done.output, Some(json!(1)));
     }
 
-    /// A parked run with `wake_at` is not stepped before it, and is after.
+    /// A parked run with `wake_at` is not stepped before it, and is at it.
+    ///
+    /// The clock is frozen, so the run stays parked until the test moves time
+    /// (sampling a 500 ms window for "parked" missed it on a loaded machine,
+    /// and a wall-clock sleep only made "not stepped early" hold by chance).
+    /// One millisecond short of `wake_at`, a probe run proves a claim pass
+    /// really looked at the parked run and left it alone.
     pub async fn timers(store: DynStore) {
         let name = uniq("timer");
         let steps = Arc::new(AtomicUsize::new(0));
@@ -602,7 +658,12 @@ mod cases {
                 }
             }),
         );
-        let rt = runtime(&store, &agent);
+        let probe = probe_agent();
+        let clock = FrozenClock::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .agent(probe.clone())
+            .clock(clock.clone())
+            .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
 
@@ -612,19 +673,14 @@ mod cases {
         .await;
         let wake_at = parked.wake_at.expect("timer set");
         assert!(!parked.waiting, "a timer is not 'waiting for input'");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        // Read first, then the time: if the time is still before `wake_at`,
-        // the read was too, so a second step would be a real early wake-up.
-        // (On a loaded machine the 200 ms sleep can overshoot the timer.)
-        let (steps_seen, status) = (
-            count(&steps),
-            rt.view(run).await.expect("view").expect("run").status,
-        );
-        if adam_core::store::now() < wake_at {
-            assert_eq!(steps_seen, 1, "not stepped before wake_at");
-            assert_eq!(status, RunStatus::Parked);
-        }
 
+        clock.advance(Duration::from_millis(499));
+        claim_pass(&rt, &probe).await;
+        assert_eq!(count(&steps), 1, "not stepped before wake_at");
+        let view = rt.view(run).await.expect("view").expect("run");
+        assert_eq!(view.status, RunStatus::Parked);
+
+        clock.advance(Duration::from_millis(1));
         wait_done(&rt, run).await;
         worker.stop().await;
         let stepped_at = stepped_at.lock().expect("lock");
@@ -1185,20 +1241,29 @@ mod cases {
     }
 
     /// A step longer than the lease TTL keeps its lease by renewal.
+    ///
+    /// Time is a frozen clock that the test moves, so the lease can only lapse
+    /// if a renewal really fails to extend it: nothing depends on how quickly a
+    /// loaded machine schedules the renewer or answers the store. The clock
+    /// moves 60% of a TTL at a time, four times (well past one TTL), and after
+    /// each move the test waits for renewals that began after it; without them
+    /// the second move would have expired the lease.
     pub async fn lease_renewal_keeps_the_lease(store: DynStore) {
+        let (faults, store) = faulty(store);
         let name = uniq("renew");
         let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
         let agent = fn_agent(
             &name,
             step_fn({
-                let calls = calls.clone();
+                let (calls, started, gate) = (calls.clone(), started.clone(), gate.clone());
                 move |_ctx, state| {
-                    let calls = calls.clone();
+                    let (calls, started, gate) = (calls.clone(), started.clone(), gate.clone());
                     async move {
                         calls.fetch_add(1, SeqCst);
-                        // Three lease periods: without renewal the run would be
-                        // taken over at least twice.
-                        tokio::time::sleep(Duration::from_millis(3000)).await;
+                        started.notify_one();
+                        notified(&gate, "the lease to outlive several TTLs").await;
                         Ok(Transition::Done {
                             state,
                             output: json!("slow but ours"),
@@ -1208,19 +1273,38 @@ mod cases {
                 }
             }),
         );
-        // Renewal runs every ttl/3 (~333 ms), leaving ~667 ms for a slow store
-        // round trip before the lease could lapse. A 300 ms lease left ~200 ms
-        // and flaked on loaded CI runners.
+        let probe = probe_agent();
+        let clock = FrozenClock::new();
+        let ttl = Duration::from_millis(90); // renewed every 30 ms of real time
         let short = |w: &str| {
             builder(&store, w, &agent)
-                .lease_ttl(Duration::from_millis(1000))
+                .agent(probe.clone())
+                .lease_ttl(ttl)
+                .clock(clock.clone())
                 .build()
         };
         let (a, b) = (short("renew-a"), short("renew-b"));
         let run = a.start(&name, inbound(), None).await.expect("start");
         let wa = spawn_worker(&a);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        notified(&started, "the step").await;
         let wb = spawn_worker(&b);
+
+        for _ in 0..4 {
+            clock.advance(ttl * 6 / 10);
+            // Renewal n+1 may have read the clock before the move; n+2 began
+            // after n+1 finished, so n+2 read it after, and n+3 starting means
+            // n+2 has been applied.
+            let seen = faults.calls(Method::RenewLease);
+            wait_until("renewals after the clock moved", || {
+                faults.calls(Method::RenewLease) >= seen + 3 || count(&calls) > 1
+            })
+            .await;
+            assert_eq!(count(&calls), 1, "nobody took the run over");
+        }
+        // The other worker has looked, at the final time, and left the run.
+        claim_pass(&b, &probe).await;
+        assert_eq!(count(&calls), 1, "nobody took the run over");
+        gate.notify_one();
         let done = wait_done(&a, run).await;
         wa.stop().await;
         wb.stop().await;
@@ -1230,23 +1314,38 @@ mod cases {
 
     /// Without renewal a second worker takes over, and the stale commit of the
     /// first is rejected by the version CAS.
+    ///
+    /// The first worker's step is held at a gate until the second has
+    /// finished the run, so the stale commit always comes second; the lease
+    /// lapses because the frozen clock is moved past it. (A 900 ms sleep in
+    /// the step let a stalled second worker arrive after the first had
+    /// committed, and then the "stale" commit was the valid one.)
     pub async fn stale_commit_is_rejected_without_renewal(store: DynStore) {
         let name = uniq("stale");
         let invocations = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
         let slow_finished = Arc::new(AtomicUsize::new(0));
         let agent = fn_agent(
             &name,
             step_fn({
-                let (invocations, started, slow_finished) =
-                    (invocations.clone(), started.clone(), slow_finished.clone());
+                let (invocations, started, gate, slow_finished) = (
+                    invocations.clone(),
+                    started.clone(),
+                    gate.clone(),
+                    slow_finished.clone(),
+                );
                 move |_ctx, state| {
-                    let (invocations, started, slow_finished) =
-                        (invocations.clone(), started.clone(), slow_finished.clone());
+                    let (invocations, started, gate, slow_finished) = (
+                        invocations.clone(),
+                        started.clone(),
+                        gate.clone(),
+                        slow_finished.clone(),
+                    );
                     async move {
                         if invocations.fetch_add(1, SeqCst) == 0 {
                             started.notify_one();
-                            tokio::time::sleep(Duration::from_millis(900)).await;
+                            notified(&gate, "the takeover to finish").await;
                             slow_finished.fetch_add(1, SeqCst);
                             return Ok(Transition::Done {
                                 state,
@@ -1263,30 +1362,32 @@ mod cases {
             }),
         );
         let sink = CollectingSink::new();
+        let clock = FrozenClock::new();
         let a = builder(&store, "stale-a", &agent)
             .lease_ttl(Duration::from_millis(200))
             .lease_renewal(false)
+            .clock(clock.clone())
             .event_sink(sink.clone())
             .build();
         let b = builder(&store, "stale-b", &agent)
+            .clock(clock.clone())
             .event_sink(sink.clone())
             .build();
         let run = a.start(&name, inbound(), None).await.expect("start");
         let wa = spawn_worker(&a);
         notified(&started, "the slow step").await;
+        clock.advance(Duration::from_millis(250)); // the first lease lapses
         let wb = spawn_worker(&b);
 
         let done = wait_done(&b, run).await;
         assert_eq!(done.output, Some(json!("fast")));
+        assert_eq!(count(&slow_finished), 0, "the slow step is still held");
         let committed_version = done.version;
 
-        // Wait for the slow step to finish and attempt its commit.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while count(&slow_finished) == 0 {
-            assert!(Instant::now() < deadline, "slow step never finished");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        wa.stop().await;
+        // Only now may the slow step finish and attempt its commit.
+        gate.notify_one();
+        wait_until("the slow step to finish", || count(&slow_finished) == 1).await;
+        wa.stop().await; // waits for its commit attempt
         wb.stop().await;
 
         let after = b.view(run).await.expect("view").expect("run");
@@ -2185,6 +2286,11 @@ mod cases {
 
     /// A commit that fails leaves the lease to expire; the next claim replays
     /// the journal, so the effect still ran once, and the run finishes.
+    ///
+    /// The clock is frozen, so the lease lapses only when the test says so.
+    /// Before that, a probe run proves a claim pass looked at the run and left
+    /// it (an elapsed-time bound could not tell "not yet due" from "not yet
+    /// polled").
     pub async fn commit_failure_leaves_run_to_lease_expiry(store: DynStore) {
         let (faults, store) = faulty(store);
         let name = uniq("commit-fail");
@@ -2213,13 +2319,33 @@ mod cases {
                 }
             }),
         );
+        let probe = probe_agent();
+        let clock = FrozenClock::new();
+        let ttl = Duration::from_millis(300);
         let rt = builder(&store, &uniq("w"), &agent)
-            .lease_ttl(Duration::from_millis(300))
+            .agent(probe.clone())
+            .lease_ttl(ttl)
+            .clock(clock.clone())
             .build();
         faults.fail(Method::CommitRun, 1);
-        let started = Instant::now();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
+        wait_until("the commit to fail", || {
+            faults.injected(Method::CommitRun) == 1
+        })
+        .await;
+
+        // The lease is still ours: a claim pass leaves the run alone.
+        claim_pass(&rt, &probe).await;
+        assert_eq!(
+            count(&invocations),
+            1,
+            "the run was retried before its lease expired"
+        );
+        let waiting = rt.view(run).await.expect("view").expect("run");
+        assert_eq!(waiting.status, RunStatus::Runnable);
+
+        clock.advance(ttl);
         let done = wait_done(&rt, run).await;
         worker.stop().await;
 
@@ -2230,11 +2356,6 @@ mod cases {
             count(&effects),
             1,
             "the journal kept the effect from re-running"
-        );
-        assert!(
-            started.elapsed() >= Duration::from_millis(290),
-            "the run was retried before its lease expired: {:?}",
-            started.elapsed()
         );
     }
 
@@ -2339,24 +2460,37 @@ mod cases {
     /// A lease that cannot be renewed expires under a slow step; another
     /// worker takes the run over and finishes it, and the slow worker's late
     /// commit is rejected.
+    ///
+    /// As in the test without renewal, the slow step is held at a gate until
+    /// the takeover has committed, and the lease lapses by moving a frozen
+    /// clock, after a renewal has been seen to fail.
     pub async fn renew_failure_lets_another_worker_take_over(store: DynStore) {
         let (faults, faulty_store) = faulty(store.clone());
         let name = uniq("renew-fail");
         let invocations = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
         let slow_finished = Arc::new(AtomicUsize::new(0));
         let agent = fn_agent(
             &name,
             step_fn({
-                let (invocations, started, slow_finished) =
-                    (invocations.clone(), started.clone(), slow_finished.clone());
+                let (invocations, started, gate, slow_finished) = (
+                    invocations.clone(),
+                    started.clone(),
+                    gate.clone(),
+                    slow_finished.clone(),
+                );
                 move |_ctx, state| {
-                    let (invocations, started, slow_finished) =
-                        (invocations.clone(), started.clone(), slow_finished.clone());
+                    let (invocations, started, gate, slow_finished) = (
+                        invocations.clone(),
+                        started.clone(),
+                        gate.clone(),
+                        slow_finished.clone(),
+                    );
                     async move {
                         if invocations.fetch_add(1, SeqCst) == 0 {
                             started.notify_one();
-                            tokio::time::sleep(Duration::from_millis(900)).await;
+                            notified(&gate, "the takeover to finish").await;
                             slow_finished.fetch_add(1, SeqCst);
                             return Ok(Transition::Done {
                                 state,
@@ -2373,31 +2507,35 @@ mod cases {
             }),
         );
         faults.fail_always(Method::RenewLease);
+        let clock = FrozenClock::new();
         let a = builder(&faulty_store, "renew-fail-a", &agent)
             .lease_ttl(Duration::from_millis(300))
+            .clock(clock.clone())
             .build();
-        let b = builder(&store, "renew-fail-b", &agent).build();
+        let b = builder(&store, "renew-fail-b", &agent)
+            .clock(clock.clone())
+            .build();
         let run = a.start(&name, inbound(), None).await.expect("start");
         let wa = spawn_worker(&a);
         notified(&started, "the slow step").await;
+        wait_until("a renewal to be attempted and fail", || {
+            faults.injected(Method::RenewLease) >= 1
+        })
+        .await;
+        clock.advance(Duration::from_millis(350)); // the unrenewed lease lapses
         let wb = spawn_worker(&b);
 
         let done = wait_done(&b, run).await;
         assert_eq!(done.output, Some(json!("fast")));
+        assert_eq!(count(&slow_finished), 0, "the slow step is still held");
         let committed_version = done.version;
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while count(&slow_finished) == 0 {
-            assert!(Instant::now() < deadline, "the slow step never finished");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        wa.stop().await;
+        // Only now may the slow step finish and attempt its commit.
+        gate.notify_one();
+        wait_until("the slow step to finish", || count(&slow_finished) == 1).await;
+        wa.stop().await; // waits for its commit attempt
         wb.stop().await;
 
-        assert!(
-            faults.injected(Method::RenewLease) >= 1,
-            "the renewal was attempted and failed"
-        );
         let after = b.view(run).await.expect("view").expect("run");
         assert_eq!(after.output, Some(json!("fast")), "the late commit lost");
         assert_eq!(after.version, committed_version);
