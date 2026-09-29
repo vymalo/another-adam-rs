@@ -116,6 +116,12 @@ pub enum ToolClash {
         /// The other subagent's file, relative to the source root.
         file: PathBuf,
     },
+    /// A tool of an MCP server of the parent's own `mcp.json` (`<server>__<tool>`).
+    McpTool {
+        /// The server whose tool it is. A `Box<str>` and not a `String` so that this enum stays as
+        /// small as the `PathBuf` of the other variant: [`Error`] is returned by value everywhere.
+        server: Box<str>,
+    },
 }
 
 /// Why the bearer token of a remote subagent was refused, in [`Error::RemoteAuth`]. Never carries
@@ -454,6 +460,89 @@ pub enum Error {
         /// Why.
         problem: RemoteUrlProblem,
     },
+    /// An agent's `mcp.json` lists MCP servers and nothing was connected for it: the tools of those
+    /// servers would be missing, and an agent must not start without tools its files promise (fail
+    /// closed).
+    #[error(
+        "{origin}: `mcp.json` lists the MCP servers {}, but none is connected, so their tools do \
+         not exist: {}",
+        list(.servers),
+        not_connected_how()
+    )]
+    McpNotConnected {
+        /// The agent and its `mcp.json`.
+        origin: Origin,
+        /// The servers the file lists, sorted.
+        servers: Vec<String>,
+    },
+    /// The servers were connected from an `mcp.json` that is not the one the agent has now.
+    #[error(
+        "{origin}: `mcp.json` is not the file its servers were connected with: connections are \
+         made once, when the process starts, so restart the process to use the change"
+    )]
+    McpChanged {
+        /// The agent and its `mcp.json`.
+        origin: Origin,
+    },
+    /// A tool given for an agent with [`AgentDef::mcp_tools`](crate::AgentDef::mcp_tools) is not
+    /// named after one of the servers of the agent's own `mcp.json`.
+    #[error(
+        "{origin}: the MCP tool `{tool}` does not belong to a server of this agent's `mcp.json` \
+         (its servers: {}): a tool is named `<server>__<tool>`",
+        list(.servers)
+    )]
+    McpForeignTool {
+        /// The agent and its `mcp.json`.
+        origin: Origin,
+        /// The tool's name.
+        tool: String,
+        /// The servers of the agent's `mcp.json`, sorted.
+        servers: Vec<String>,
+    },
+    /// An MCP tool has the name of a registered tool, so `tools:` could not tell them apart.
+    #[error(
+        "{origin}: the MCP tool `{tool}` has the name of a registered tool: rename the registered \
+         tool, or list the tools of the MCP server under `tools` in `mcp.json` without it"
+    )]
+    McpToolClash {
+        /// The agent and its `mcp.json`.
+        origin: Origin,
+        /// The name in conflict.
+        tool: String,
+    },
+    /// [`AgentDef::mcp_tools`](crate::AgentDef::mcp_tools) names an agent the definition does not
+    /// contain.
+    #[error(
+        "no agent `{agent}` to give MCP tools to{}; agents: {}",
+        hint(.suggestion.as_deref()),
+        list(.known)
+    )]
+    McpUnknownAgent {
+        /// The name as given to `AgentDef::mcp_tools`.
+        agent: String,
+        /// The closest agent, when one is close.
+        suggestion: Option<String>,
+        /// Every agent of the definition, root first.
+        known: Vec<String>,
+    },
+    /// The MCP servers of an agent could not be connected. Only
+    /// [`AgentDef::connect_mcp`](crate::AgentDef::connect_mcp) (feature `mcp`) makes it, but the
+    /// variant is always there, so that the feature adds no variant to this exhaustive enum and a
+    /// `match` that compiles with the feature compiles without it.
+    #[error("{origin}: {source}")]
+    Mcp {
+        /// The agent and its `mcp.json`.
+        origin: Origin,
+        /// The class of the client's error, kept here because `source` is opaque: a server that is
+        /// down is [`ErrorClass::Transient`], the rest of what the client refuses is
+        /// [`ErrorClass::Invalid`].
+        class: ErrorClass,
+        /// Why: with the feature `mcp`, an `adam_mcp::Error`, which `downcast_ref` gets back.
+        /// Boxed: the error of the client is larger than the rest of this enum, and opaque so
+        /// that this crate's public type does not name the client without the feature.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// The A2A card needs a description and the agent has none.
     #[error(
         "{origin}: the A2A card needs a description: set `description` (or `card.description`) in the frontmatter"
@@ -464,10 +553,23 @@ pub enum Error {
     },
 }
 
+#[cfg(feature = "mcp")]
+impl Error {
+    /// The error of connecting `origin`'s servers, as [`Error::Mcp`].
+    pub(crate) fn mcp(origin: Origin, source: adam_mcp::Error) -> Self {
+        Self::Mcp {
+            origin,
+            class: source.class(),
+            source: Box::new(source),
+        }
+    }
+}
+
 impl Classify for Error {
     fn class(&self) -> ErrorClass {
         match self {
             Self::Manifest(source) => source.class(),
+            Self::Mcp { class, .. } => *class,
             _ => ErrorClass::Invalid,
         }
     }
@@ -488,6 +590,22 @@ fn clash_reason(clash: &ToolClash) -> String {
             "another subagent of the parent, in {}, has the same name: rename one of them",
             portable(file)
         ),
+        ToolClash::McpTool { server } => format!(
+            "the parent's MCP server `{server}` has a tool with that name: rename the subagent, \
+             or list the server's tools under `tools` in `mcp.json` without it"
+        ),
+    }
+}
+
+/// What to do about [`Error::McpNotConnected`], which depends on whether this build has the
+/// feature `mcp`.
+fn not_connected_how() -> &'static str {
+    if cfg!(feature = "mcp") {
+        "call AgentDef::connect_mcp before bind (or AgentDef::mcp_tools to give the tools of a \
+         client of your own)"
+    } else {
+        "enable the feature `mcp` of adam-assembly and call AgentDef::connect_mcp before bind (or \
+         call AgentDef::mcp_tools to give the tools of a client of your own)"
     }
 }
 
@@ -660,6 +778,28 @@ mod tests {
                 url: "http://billing.example.com/".into(),
                 problem: RemoteUrlProblem::Insecure,
             },
+            Error::McpNotConnected {
+                origin: o.clone(),
+                servers: vec!["linear".into(), "fs".into()],
+            },
+            Error::McpChanged { origin: o.clone() },
+            Error::McpForeignTool {
+                origin: o.clone(),
+                tool: "github__list".into(),
+                servers: vec!["linear".into()],
+            },
+            Error::McpToolClash {
+                origin: o.clone(),
+                tool: "linear__list".into(),
+            },
+            Error::SubagentToolClash {
+                origin: o.clone(),
+                parent: "coder".into(),
+                tool: "linear__list".into(),
+                clash: ToolClash::McpTool {
+                    server: "linear".into(),
+                },
+            },
             Error::MissingCardDescription { origin: o },
         ];
         for error in cases {
@@ -732,6 +872,64 @@ mod tests {
             .to_string(),
             "not one of the aliases this deployment serves; allowed: none"
         );
+    }
+
+    #[test]
+    fn the_mcp_variant_exists_without_the_feature_and_keeps_its_class() {
+        // Built by hand, as a client of one's own would: no feature `mcp` is needed to name it, to
+        // match it, or to ask its class (the enum stays additive).
+        let down = Error::Mcp {
+            origin: Origin::new("coder", "agent/mcp.json"),
+            class: ErrorClass::Transient,
+            source: "connection refused".into(),
+        };
+        let Error::Mcp { origin, source, .. } = &down else {
+            panic!("{down}");
+        };
+        assert_eq!(origin.agent, "coder");
+        assert_eq!(source.to_string(), "connection refused");
+        assert_eq!(down.class(), ErrorClass::Transient);
+        assert_eq!(
+            down.to_string(),
+            "agent `coder` (agent/mcp.json): connection refused"
+        );
+        assert!(std::error::Error::source(&down).is_some());
+        let refused = Error::Mcp {
+            origin: Origin::new("coder", "agent/mcp.json"),
+            class: ErrorClass::Invalid,
+            source: "not allowed".into(),
+        };
+        assert_eq!(refused.class(), ErrorClass::Invalid);
+    }
+
+    #[test]
+    fn mcp_problems_say_what_to_do() {
+        let not_connected = Error::McpNotConnected {
+            origin: Origin::new("coder", "agent/mcp.json"),
+            servers: vec!["fs".into(), "linear".into()],
+        };
+        let text = not_connected.to_string();
+        assert!(
+            text.starts_with(
+                "agent `coder` (agent/mcp.json): `mcp.json` lists the MCP servers `fs`, `linear`"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("AgentDef::connect_mcp") && text.contains("AgentDef::mcp_tools"),
+            "{text}"
+        );
+        let unknown = Error::McpUnknownAgent {
+            agent: "coder/reserch".into(),
+            suggestion: Some("coder/research".into()),
+            known: vec!["coder".into(), "coder/research".into()],
+        };
+        assert_eq!(
+            unknown.to_string(),
+            "no agent `coder/reserch` to give MCP tools to; did you mean `coder/research`?; \
+             agents: `coder`, `coder/research`"
+        );
+        assert_eq!(unknown.class(), ErrorClass::Invalid);
     }
 
     #[test]

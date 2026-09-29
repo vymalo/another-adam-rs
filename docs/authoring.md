@@ -3,7 +3,7 @@
 Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
 facade), S3 (`adam-coder` tools through `#[tool]`), S4 (`adam-agent-fs`, the parser and validator of
 agent directories), S5 (the `build.rs` codegen and `adam::include_agent!()`), S6 (`adam-assembly`,
-which binds a manifest to `LlmAgent`s), S6b (the coder's prompt and card from `agent/`), S7 (skills at run time), S8 (durable child runs in the runtime), S9 (subagents as tools) and S9b (remote A2A subagents) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+which binds a manifest to `LlmAgent`s), S6b (the coder's prompt and card from `agent/`), S7 (skills at run time), S8 (durable child runs in the runtime), S9 (subagents as tools), S9b (remote A2A subagents), S10 (dev reload) and S11 (`mcp.json` tools) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
 the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
@@ -183,7 +183,13 @@ all of them with no error; that is a conformance test since S4.
   The model-facing name is `<server>__<tool>`.
 * `${VAR}` and `${VAR:-default}` are expanded **at startup only**. A missing variable without a default
   fails startup (fail closed). `build.rs` records the names and never the values.
-* stdio servers spawn processes: allowed only when the composition root opts in.
+* stdio servers spawn processes: allowed only when the composition root opts in (`McpPolicy::allow_stdio`).
+* At run time (S11, [below](#mcp-tools-at-run-time-built-feature-mcp)): `type: http` and `streamable-http` are the
+  streamable HTTP transport, `type: sse` is refused (the specification deprecates HTTP+SSE), a stdio server's
+  child gets a clean environment plus the file's `env`, a URL is https or local and carries no credentials and
+  no `${VAR}` (the SDK logs URLs; `McpPolicy::allow_url_secrets` is the opt-in), secrets belong in `headers`, and
+  `tools` is the allow-list that is the mitigation for a server's description text. A server name has no `__` and
+  does not end in `_`, a tool name does not start with `_` (so `<server>__<tool>` names one server).
 
 ### Tools
 
@@ -197,7 +203,8 @@ Slice S4. [`adam-agent-fs`](../crates/adam-agent-fs/README.md) reads a directory
 is the closed enum `Error | Warning`). It is the one parser and the one validator: the `build.rs` codegen
 (S5, below) and the run-time `dev` loader (S10) call it, so the two paths cannot disagree. It has no
 async and no adam runtime dependency, and the codegen is a feature (`build`) of the same crate.
-Nothing in it expands `${VAR}`.
+Nothing in it expands `${VAR}`; it only cuts a text into literals and references
+(`split_env_references`, used by `env_references()` here and by the run-time expansion of S11, so both read one grammar).
 
 ```mermaid
 sequenceDiagram
@@ -785,10 +792,11 @@ stateDiagram-v2
   tools, alias and limits, and `Assembly::register` registers all of them on the runtime. Its parent gets a
   `SubagentTool` (S9, see [Subagents at run time](#subagents-at-run-time-s8-and-s9-built)); remote subagents
   are also tools of their parent (S9b, see [Remote subagents](#remote-subagents-a2a-s9b)) and are listed as data
-  in `Assembly::remotes()`. `mcp.json` stays in the manifest for S11. Skills (S7) and
+  in `Assembly::remotes()`. Skills (S7) and
   subagent tools (S9) are added while `bind` resolves an agent, so the prompt and the tool list
   `BoundDef::build` hands to `LlmAgent` are already final and `AgentInfo::tools` is what the model is
-  offered. The tools of S11 join them at `bind` too.
+  offered. The MCP tools of S11 join the catalog `tools:` selects from at `bind` too (see
+  [MCP tools at run time](#mcp-tools-at-run-time-built-feature-mcp)).
 * **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
   `adam_a2a::AgentCardConfig`; the public URL and the version belong to the deployment. `AgentDef::card`
   gives the same card before anything is bound, for a process with no model (a control plane).
@@ -798,6 +806,97 @@ Deviations from the plan's sketch, on purpose: `AGENT` is already a reference, s
 folds `RuntimeBuilder::agent` over the agents; a subagent's prompt lines are counted from its body, since
 the manifest keeps no `body_offset`; and `state(..)` comes before `model(..)` because `model(..)` is the
 step that builds the agents and finds a missing state.
+
+## MCP tools at run time (built: feature `mcp`)
+
+Slice S11. [`adam-mcp`](../crates/adam-mcp/README.md) is the MCP client (the official Rust SDK, `rmcp`); the
+wiring is [`adam-assembly`](../crates/adam-assembly/README.md#mcp-tools-feature-mcp), behind its feature `mcp` (the
+facade's `mcp` also gives `adam::mcp`). **Off by default**: a build that does not opt in has no MCP client, cannot
+start a process because a file said so, and `bind` still refuses an agent whose `mcp.json` lists servers.
+
+```mermaid
+sequenceDiagram
+  participant M as main
+  participant D as AgentDef
+  participant C as adam-mcp
+  participant S as MCP servers
+  participant B as bind
+  participant J as LlmAgent (journaled step tool:CALL_ID)
+  M->>D: from_manifest(AGENT), env(..)
+  M->>D: connect_mcp(policy)
+  loop the root and each local subagent with an mcp.json
+    D->>C: connect(config, Env, policy)
+    C->>C: expand ${VAR}, check the policy and the URLs (no I/O)
+    C->>S: start or dial, initialize, tools/list
+    S-->>C: tools
+    C-->>D: server__tool tools, kept for this agent
+  end
+  M->>B: bind(registered tools)
+  B->>B: per agent: connected, same file, names fit its servers, no clash, tools: selects
+  Note over J,S: at run time
+  J->>S: tools/call (one call, within a timeout, dropped when the run is cancelled)
+  S-->>J: content, as text (cut at 64 KiB), isError kept
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Declared: mcp.json in the manifest
+  Declared --> Connected: connect_mcp
+  Declared --> Refused: bind without connecting or supplying tools
+  Connected --> Ready: bind
+  Ready --> Broken: the transport died during a call (an error result)
+  Broken --> Ready: the next call reconnects once, from the same recipe
+  Ready --> Closed: the Assembly is dropped
+  Refused --> [*]
+  Closed --> [*]
+```
+
+* **Per agent.** An agent's MCP tools come only from the `mcp.json` in its own directory (the root's for the
+  root, a subagent directory's for that subagent); they are not added to the shared `ToolSet`. A subagent
+  inherits none of them (D3 again), and two directories may each name a server `linear`, connected apart with
+  their own headers. `tools:` selects among the registered tools and the agent's own MCP tools (`linear__*`
+  works as it always did); a subagent that lists none has none.
+* **Fail closed, at startup.** `AgentDef::connect_mcp` finds everything that can be wrong before the first model
+  call: a `${VAR}` with no value and no default, `type: sse`, a stdio server the policy does not allow (nothing is
+  started), a URL that is plain http to another machine, carries a user name or password, or contains a `${VAR}`
+  (unless the deployment opts in), an invalid header, a
+  server that is down or refuses the credentials, an allow-list naming a tool the server lacks. `bind` refuses an
+  agent with servers and no connection (`McpNotConnected`), tools of a different `mcp.json` (`McpChanged`), a tool
+  that belongs to no server of the agent's file (`McpForeignTool`) and a name clash with a registered tool or a
+  subagent. `AgentDef::mcp_tools(agent, tools)` is the hook for a client of your own and for tests.
+* **Names and text.** Model-facing names are `<server>__<tool>`; without an allow-list, a tool whose name does not
+  fit `^[A-Za-z0-9_-]{1,64}$` is skipped with a warning; with one, exactly the listed tools in its order. The
+  description is the server's (else its title, else a default), cut at 8 KiB; the parameters are the server's
+  schema as it is. Answers are the content blocks as text, scrubbed of expanded values and then cut at 64 KiB;
+  images and blobs are described, never included; `isError` is an error result.
+* **Durability: at-least-once.** A call runs inside the agent's journaled step, so a replay of a committed call
+  returns the recorded result and does not call the server. MCP has no idempotency key, so a transition that fails
+  before it commits (a crash, a lost lease, a later tool of the same turn returning `Transient`) calls the server
+  again. For that reason **no failure of an MCP call is a `ToolError::Transient`**: a timeout, a lost connection or
+  a protocol error is an error result that says the call may or may not have run, and the model decides. The
+  tests pin both the committed case and the retried one.
+* **Secrets.** `${VAR}` reads `AgentDef::env` first and the process environment second, as
+  `auth: bearer:VAR` does. Values are `SecretString`s; every expanded value and the whole expanded text is
+  registered (and its percent-encoded, form-encoded and JSON-escaped forms) with a redactor that every message from
+  the server, the transport or the SDK, every tool result (text and `isError`) and every line of a child's stderr
+  (logged at `debug`) passes through. Nothing secret is in a journal, state, event, `Debug` or error, or in a log
+  line of this crate. **Secrets go in `headers`, not in the URL**: the SDK logs the URL it dials in its own log
+  lines, which the redactor cannot reach, so a `${VAR}` in a `url` is refused (`Error::UrlSecret`) unless
+  `McpPolicy::allow_url_secrets(true)`, and then the `rmcp` log target must be filtered. A secret in a stdio `args`
+  is visible to every process of the machine (`/proc/*/cmdline`, `ps`): use `env`. Tool descriptions and answers are text the server
+  controls and go into the model's context: the allow-list is the mitigation.
+* **Reload.** Connections are made once, at startup, and outlive dev reloads (`LiveBuilder::connect_mcp`, features
+  `dev` and `mcp`; a reload is synchronous and may run on the watcher's thread, so it never connects). An edit of
+  an `mcp.json` is refused with a message saying to restart: tools are discovered once, and a run in flight may
+  have called one.
+* **Not in S11:** MCP resources, prompts, sampling, roots and elicitation; OAuth; `type: sse`; `list_changed` and
+  re-discovery on a reload; MCP tasks; progress notifications; concurrent connects (servers connect one after the
+  other, in name order); exporting adam's tools as an MCP server.
+
+*Verified 2026-09-29* (the `rmcp` 3.5.0 crate, <https://docs.rs/rmcp/3.5.0>, <https://crates.io/api/v1/crates/rmcp>):
+`rmcp` 3.5.0 is Apache-2.0 with `rust-version` 1.88; its SSE transport was removed in 0.11.0 (its CHANGELOG, PR #562)
+and the specification calls HTTP+SSE deprecated (<https://modelcontextprotocol.io/specification/2025-03-26/basic/transports>).
+The crate README lists the facts the code relies on, with the ones found by running the tests.
 
 ## Dev reload (built: feature `dev`)
 
@@ -852,7 +951,9 @@ stateDiagram-v2
 **What a reload changes.** The prompt is not journaled and the model request is rebuilt on every turn, so a
 new prompt, limits, model alias, tool description, `{{var}}` value, wait timer, remote timeout or token apply to
 every run **at its next step**, never in the middle of one. A re-bind builds new tools, and a remote tool makes
-its HTTP client on its first call, so a rotated token or a new URL is what the next call uses.
+its HTTP client on its first call, so a rotated token or a new URL is what the next call uses. **MCP
+connections are the exception**: they are made once, by `LiveBuilder::connect_mcp`, outlive reloads, and an edit of
+an `mcp.json` is refused (`McpChanged`, "restart the process"), like an invalid edit: the last good version stays.
 
 **The replay rule.** A run's journal is keyed by step names (`model:3`, `tool:<call id>`), and a replayed
 transition (lease lost, stale commit) that finds `tool:c1` where its code now answers "unknown tool" fails with
@@ -884,15 +985,16 @@ load. The watcher is `notify` 8 (*verified 2026-09-29*, crates.io: 8.2.0 is the 
 
 ## Crate layout
 
-`adam-macros`, `adam`, `adam-agent-fs` and `adam-assembly` exist; the others are planned.
+`adam-macros`, `adam`, `adam-agent-fs`, `adam-assembly`, `adam-mcp` and `adam-mcp-testkit` exist; the others are planned.
 
 | Crate | Kind | Contents |
 |---|---|---|
 | `adam-macros` | proc-macro | **built (S2)**: `#[tool]`; a thin shim over a pure, unit-tested `expand` function |
 | `adam-agent-fs` | lib | **built (S4, S5)**: frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` with the `Dir` and `EmbeddedPackage` implementations, the digest of a manifest, and the `build.rs` codegen behind the feature `build`. No async, no runtime dependency |
-| `adam-assembly` | lib | **built (S6, S7, S9, S9b, S10)**: `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s (root and local subagents); `{{var}}` templating; the skills catalog with `load_skill` and `read_skill_file`; `SubagentTool`, one per local subagent; a tool per remote (A2A) subagent, with bearer auth from the environment; the A2A card behind feature `a2a`; dev reload behind feature `dev` (`LiveAssembly`, `notify`) |
-| `adam-mcp` | lib | MCP client (the official Rust SDK): MCP tools as `Tool`s, `${VAR}` expansion, fail closed |
-| `adam` | facade | **built (S2, S5, S6)**: `prelude`, the macro, feature `macros` (default), `include_agent!`, `adam::agent_fs`, `AgentDef` and its stages, `adam::assembly`, features `a2a` and `dev`. Planned: feature `mcp` |
+| `adam-assembly` | lib | **built (S6, S7, S9, S9b, S10, S11)**: `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s (root and local subagents); `{{var}}` templating; the skills catalog with `load_skill` and `read_skill_file`; `SubagentTool`, one per local subagent; a tool per remote (A2A) subagent, with bearer auth from the environment; the A2A card behind feature `a2a`; dev reload behind feature `dev` (`LiveAssembly`, `notify`); the tools of each agent's `mcp.json` behind feature `mcp` (`connect_mcp`, `mcp_tools`, the per-agent checks) |
+| `adam-mcp` | lib | **built (S11)**: the MCP client over `rmcp` 3.5 (streamable HTTP and stdio, no SSE): `McpServers::connect(&McpConfig, &Env, &McpPolicy)` gives `<server>__<tool>` tools; `${VAR}` expansion, allow-list, redaction, reconnect, fail closed |
+| `adam-mcp-testkit` | test kit | **built (S11)**, not published: a scriptable MCP server over stdio (the binary `adam-mcp-test-server`) and streamable HTTP (`TestHttpServer`), and the stdio tests of `adam-mcp` |
+| `adam` | facade | **built (S2, S5, S6)**: `prelude`, the macro, feature `macros` (default), `include_agent!`, `adam::agent_fs`, `AgentDef` and its stages, `adam::assembly`, features `a2a`, `dev` and `mcp` (`adam::mcp`) |
 | `adam-agent-fixture` | test fixture | **built (S5)**, not published: a `build.rs` plus `include_agent!()` over the `adam-agent-fs` test fixture, and the tests that compare embedded and directory |
 | `cargo-adam` | bin | `new`, `check`, `dev` (roadmap 6) |
 
@@ -900,7 +1002,8 @@ load. The watcher is `notify` 8 (*verified 2026-09-29*, crates.io: 8.2.0 is the 
 without touching the other: its signature has only manifest types and diagnostics. `Tool` stays
 the only tool seam; MCP and `FnTool` implement it. Third-party crates the plan needs (`schemars`, `syn`,
 `serde-saphyr`, `rmcp`, `notify`, `trybuild`) are checked against `cargo deny` in the slice that adds
-each; `schemars` 1.2.2 is already in `Cargo.lock`. S2 added `syn` 3, `quote` and `proc-macro2` (all
+each; S11 added `rmcp` 3.5.0 (Apache-2.0; client features only, `default-features = false`) with `process-wrap`,
+`sse-stream`, `pastey`, `nix` and the Windows crates it needs (*verified 2026-09-29*: `cargo deny check` passes); `schemars` 1.2.2 is already in `Cargo.lock`. S2 added `syn` 3, `quote` and `proc-macro2` (all
 already locked, through `async-trait`) to `adam-macros`, and `trybuild` 1.0.121 as a dev-dependency of
 `adam` (it brings `toml`, `winnow`, `glob`, `termcolor`, `target-tuple`; *verified 2026-09-29*:
 `cargo deny check` passes). S4 added `serde-saphyr` 1.3.0 to `adam-agent-fs` (see [Parsing and
@@ -1015,4 +1118,4 @@ what the model does and needs a comparison with a live model; it is not a slice.
 | S9 | subagents: `SubagentTool`, its binding, name-clash and asks-user checks, `ToolCtx::start_child` | built |
 | S9b | remote (A2A) subagents: `AwaitRemote`, `PendingWait::Remote`, `Tool::poll_remote`, `auth: bearer:VAR`, the journaled send and the poll on the timer | built |
 | S10 | dev reload: feature `dev`, `LiveAssembly`, `reload`, `watch`, the swap at step boundaries, the replay rule | built |
-| S11 | `mcp.json` tools | planned |
+| S11 | `mcp.json` tools: `adam-mcp`, `adam-mcp-testkit`, feature `mcp` of `adam-assembly` and `adam`, `AgentDef::connect_mcp` and `mcp_tools`, `LiveBuilder::connect_mcp` | built |

@@ -75,12 +75,14 @@ fn the_fixture_card_matches_the_golden_file() {
         "prepare_workspace",
         "run_checks",
         "ask_user",
-        "linear__list_issues",
         "read_diff",
         "list_files",
         "fetch_page",
     ]);
-    let assembly = assembly_of(AgentDef::from_manifest(AGENT).unwrap(), fixture_tools);
+    let assembly = assembly_of(
+        common::with_fixture_mcp(AgentDef::from_manifest(AGENT).unwrap()),
+        fixture_tools,
+    );
     let card = assembly.card(url(), "1.2.3").unwrap();
     let got = serde_json::to_string_pretty(&sorted(render(&card))).unwrap() + "\n";
 
@@ -162,12 +164,11 @@ fn a_definition_gives_the_card_before_it_is_bound() {
         "prepare_workspace",
         "run_checks",
         "ask_user",
-        "linear__list_issues",
         "read_diff",
         "list_files",
         "fetch_page",
     ]);
-    let def = AgentDef::from_manifest(AGENT).unwrap();
+    let def = common::with_fixture_mcp(AgentDef::from_manifest(AGENT).unwrap());
     let early = def.card(url(), "1.2.3").unwrap();
     let assembly = assembly_of(def, fixture_tools);
     let bound = assembly.card(url(), "1.2.3").unwrap();

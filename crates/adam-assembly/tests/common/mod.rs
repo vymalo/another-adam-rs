@@ -64,6 +64,15 @@ pub fn with_fixture_token(def: AgentDef) -> AgentDef {
     def.env("BILLING_AGENT_TOKEN", "fixture-token")
 }
 
+/// The MCP tools the fixture's `mcp.json` files promise, given by hand as a client of the test's
+/// own would: the root's `linear` server (allow-listed to `list_issues` and `create_issue`, of
+/// which the test supplies the first) and the researcher's `search` server (whose tools no agent
+/// selects). `fs` has no tools here: the fixture's `tools:` never selects one.
+pub fn with_fixture_mcp(def: AgentDef) -> AgentDef {
+    def.mcp_tools("coder", ToolSet::new().tool(stub("linear__list_issues")))
+        .mcp_tools("coder/researcher", ToolSet::new())
+}
+
 /// `agent/instructions.md` with this frontmatter and body.
 pub fn instructions(frontmatter: &str, body: &str) -> String {
     format!("---\n{frontmatter}\n---\n{body}\n")

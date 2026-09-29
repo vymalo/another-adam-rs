@@ -190,7 +190,7 @@ impl BoundDef {
     /// bind, not here, so that a name clash is found before a model is needed, and so that
     /// [`AgentInfo::tools`] and the agent cannot disagree. This function only hands them over.
     /// The remote subagents (slice S9b) join the same list in `bind`, where their names meet the
-    /// local ones; slice S11 adds the tools of `mcp.json` the same way.
+    /// local ones, and so do the MCP tools of `mcp.json` (slice S11), which `tools:` selects.
     fn build(
         &self,
         node: &Node,
@@ -313,7 +313,7 @@ impl Assembly {
     }
 
     /// The manifest the root agent was made from: its skills, `mcp.json` and schedules (the
-    /// skills are bound; `mcp.json` and schedules are for later slices).
+    /// skills and the MCP servers are bound; schedules are for a later slice).
     pub fn manifest(&self) -> &AgentManifest {
         &self.manifest
     }

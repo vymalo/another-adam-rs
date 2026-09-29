@@ -66,7 +66,7 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
             sink,
             format!(
                 "server name `{name}` must be letters, digits, `-` and `_` (at most 64 characters, \
-                 no `__`): the model sees its tools as `{name}__<tool>`"
+                 no `__`, not ending in `_`): the model sees its tools as `{name}__<tool>`"
             ),
         );
     }
@@ -112,6 +112,7 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
 
     for entry in raw.tools.iter().flatten() {
         let fits = !entry.is_empty()
+            && !entry.starts_with('_')
             && entry
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -121,7 +122,8 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
                 sink,
                 format!(
                     "server `{name}`: tool `{entry}` cannot be named `{name}__{entry}` for the model \
-                     (letters, digits, `-`, `_`; at most {MODEL_NAME_MAX} characters)"
+                     (letters, digits, `-`, `_`, not starting with `_`; at most {MODEL_NAME_MAX} \
+                     characters)"
                 ),
             );
         }
@@ -226,10 +228,14 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
     ok.then_some(server)
 }
 
+/// A server name the model can be shown in `<server>__<tool>`. It has no `__` and does not end in
+/// `_`: `a` with a tool `_x` and `a_` with a tool `x` would both be `a___x`, and the tools of `a_`
+/// would look like tools of `a`.
 fn server_name_ok(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MODEL_NAME_MAX
         && !name.contains("__")
+        && !name.ends_with('_')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -317,7 +323,9 @@ fn warn_literal_url(sink: &mut Sink<'_>, server: &str, url: &str) {
             None,
             format!(
                 "server `{server}`: the `url` carries what looks like a literal credential; \
-                 write `${{VAR}}` and set the variable in the environment"
+                 move it to a header (`Authorization: Bearer ${{VAR}}`) and set the variable in \
+                 the environment (a `${{VAR}}` in a URL is refused at run time unless the \
+                 deployment opts in)"
             ),
         );
     }

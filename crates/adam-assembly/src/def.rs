@@ -15,6 +15,7 @@ use secrecy::SecretString;
 
 use crate::assembly::BoundDef;
 use crate::error::{Error, Origin, ToolClash};
+use crate::mcp::{self, McpBinding};
 use crate::remote::{RemoteSettings, RemoteSubagentTool};
 use crate::skills::{self, SkillFiles};
 use crate::subagent::SubagentTool;
@@ -105,6 +106,8 @@ pub struct AgentDef {
     files: SkillFiles,
     /// What the deployment decides about remote (`a2a:`) subagents.
     remote: RemoteSettings,
+    /// The MCP tools of each agent: connected from its `mcp.json`, or supplied by hand.
+    mcp: McpBinding,
 }
 
 impl AgentDef {
@@ -121,6 +124,7 @@ impl AgentDef {
             values: BTreeMap::new(),
             files,
             remote: RemoteSettings::default(),
+            mcp: McpBinding::default(),
         })
     }
 
@@ -227,6 +231,75 @@ impl AgentDef {
         self
     }
 
+    /// Give an agent the tools of its MCP servers, made by code of your own: a client other than
+    /// `adam-mcp`, or a test double. `agent` is the name the agent is registered under (`coder`,
+    /// `coder/researcher`); each tool must be named `<server>__<tool>` after a server of **that
+    /// agent's own** `mcp.json`. An agent whose `mcp.json` lists servers must be given tools here
+    /// or by `connect_mcp` (feature `mcp`), or [`bind`](Self::bind) refuses it. Calling this again
+    /// for the same agent replaces the tools.
+    ///
+    /// Checked at [`bind`](Self::bind): [`Error::McpForeignTool`], [`Error::McpToolClash`],
+    /// [`Error::McpUnknownAgent`].
+    #[must_use]
+    pub fn mcp_tools(mut self, agent: impl Into<String>, tools: ToolSet) -> Self {
+        self.mcp.set(agent, None, tools);
+        self
+    }
+
+    /// Connect to the MCP servers of the root agent's `mcp.json` and of each local subagent's, and
+    /// keep their tools for [`bind`](Self::bind). Only with the feature `mcp`.
+    ///
+    /// Each agent gets its own connections: two directories that both name a server `linear`
+    /// connect twice, with their own headers. `${VAR}` in the files is expanded from
+    /// [`env`](Self::env) first and then from the process environment, so a token given in code
+    /// reaches a server the same way it reaches a remote subagent. Everything that can be wrong
+    /// (an unset variable, `type: sse`, a local process the policy does not allow, a server that
+    /// is down, an allow-list that names a tool the server lacks) is an error here, at startup:
+    /// see `adam_mcp::McpServers::connect`.
+    ///
+    /// The connections live as long as the tools do: as long as the [`Assembly`](crate::Assembly)
+    /// built from this definition. Call it after the [`env`](Self::env) calls it should see, and
+    /// once: it connects again each time.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Mcp`], naming the agent and its `mcp.json`, for the first server that fails.
+    #[cfg(feature = "mcp")]
+    pub async fn connect_mcp(mut self, policy: &adam_mcp::McpPolicy) -> Result<Self, Error> {
+        let env = adam_mcp::Env::from_values(Arc::clone(&self.remote.env));
+        let mut agents = Vec::new();
+        mcp::local_agents(&self.manifest, &self.manifest.name, &mut agents);
+        let mut connected = Vec::new();
+        for (name, manifest) in agents {
+            let Some(config) = mcp::declared(manifest) else {
+                continue;
+            };
+            let servers = adam_mcp::McpServers::connect(config, &env, policy)
+                .await
+                .map_err(|source| {
+                    Error::mcp(Origin::new(name.clone(), mcp::file_of(manifest)), source)
+                })?;
+            connected.push((name, config.clone(), servers.tools()));
+        }
+        for (name, config, tools) in connected {
+            self.mcp.set(name, Some(config), tools);
+        }
+        Ok(self)
+    }
+
+    /// The MCP binding, to keep across reloads (dev reload).
+    #[cfg(all(feature = "dev", feature = "mcp"))]
+    pub(crate) fn mcp_binding(&self) -> &McpBinding {
+        &self.mcp
+    }
+
+    /// Replace the MCP binding: dev reload gives a fresh definition the connections made once.
+    #[cfg(all(feature = "dev", feature = "mcp"))]
+    pub(crate) fn with_mcp_binding(mut self, binding: McpBinding) -> Self {
+        self.mcp = binding;
+        self
+    }
+
     /// Check the definition against the registered tools and render the prompts.
     ///
     /// Everything that can be wrong with the files, given these tools, is found here, at
@@ -256,6 +329,16 @@ impl AgentDef {
     /// ([`Error::RemoteAuth`]). The token is read now and kept in memory, and the network is not
     /// touched until the first call.
     ///
+    /// An agent's MCP tools (`mcp.json`) come from its own directory only, and are part of the
+    /// catalog `tools:` selects from, next to the registered tools (`tools: ['linear__*']`
+    /// selects a server's tools; a subagent that lists none gets none). An agent whose `mcp.json`
+    /// lists servers must have been given tools ([`connect_mcp`](Self::connect_mcp) or
+    /// [`mcp_tools`](Self::mcp_tools)): [`Error::McpNotConnected`] otherwise (fail closed). An
+    /// empty set given for such an agent binds, with a warning naming the agent and its servers. The
+    /// tools must come from the same `mcp.json` ([`Error::McpChanged`]), be named after its
+    /// servers ([`Error::McpForeignTool`]) and not share a name with a registered tool
+    /// ([`Error::McpToolClash`]).
+    ///
     /// Nothing is built yet: the model and the state come next ([`BoundDef`]).
     ///
     /// # Errors
@@ -263,11 +346,26 @@ impl AgentDef {
     /// The first problem found, in the order above; see [`Error`].
     pub fn bind(self, tools: ToolSet) -> Result<BoundDef, Error> {
         let catalog = Catalog::new(&tools)?;
+        // An agent given MCP tools that the definition does not contain: a typo, found before the
+        // walk, so that the message is about the name and not about a server that "is not
+        // connected".
+        let mut agents = Vec::new();
+        mcp::local_agents(&self.manifest, &self.manifest.name, &mut agents);
+        let agent_names: Vec<String> = agents.into_iter().map(|(name, _)| name).collect();
+        if let Some(agent) = self.mcp.agents().find(|a| !agent_names.contains(a)) {
+            return Err(Error::McpUnknownAgent {
+                agent: agent.clone(),
+                suggestion: closest(agent, agent_names.iter().map(String::as_str))
+                    .map(str::to_owned),
+                known: agent_names,
+            });
+        }
         let mut walk = Walk {
             catalog: &catalog,
             values: &self.values,
             files: &self.files,
             remote: &self.remote,
+            mcp: &self.mcp,
             nodes: Vec::new(),
             remotes: Vec::new(),
         };
@@ -334,6 +432,13 @@ impl Catalog {
         Ok(Self { entries })
     }
 
+    /// This catalog and `more` after it: the registered tools and one agent's own MCP tools.
+    fn with(&self, more: &[(String, DynTool)]) -> Self {
+        let mut entries = self.entries.clone();
+        entries.extend(more.iter().cloned());
+        Self { entries }
+    }
+
     fn names(&self) -> Vec<String> {
         self.entries.iter().map(|(n, _)| n.clone()).collect()
     }
@@ -349,6 +454,7 @@ struct Walk<'a> {
     values: &'a BTreeMap<String, BTreeMap<String, String>>,
     files: &'a SkillFiles,
     remote: &'a RemoteSettings,
+    mcp: &'a McpBinding,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
 }
@@ -361,11 +467,14 @@ impl Walk<'_> {
         parent: Option<usize>,
     ) -> Result<(), Error> {
         let origin = Origin::new(name.clone(), manifest.path.clone());
+        // The agent's own MCP tools, checked, then chosen from with the registered ones.
+        let own_mcp = self.mcp_tools(manifest, &name)?;
+        let catalog = self.catalog.with(&own_mcp);
         let mut tools = resolve_tools(
             &origin,
             manifest.frontmatter.tools.as_ref(),
             parent.is_none(),
-            self.catalog,
+            &catalog,
         )?;
         if parent.is_some() {
             refuse_asking_tools(&origin, &tools)?;
@@ -376,7 +485,17 @@ impl Walk<'_> {
             add_skills(&origin, manifest, self.files, &mut prompt, &mut tools)?;
         // The tools `add_skills` appended, so a clash can say whose tool it hit.
         let skill_tools: Vec<String> = tools[registered..].iter().map(|(n, _)| n.clone()).collect();
-        add_subagent_tools(&origin, manifest, &skill_tools, self.remote, &mut tools)?;
+        let mcp_names: Vec<String> = own_mcp.iter().map(|(n, _)| n.clone()).collect();
+        add_subagent_tools(
+            &origin,
+            manifest,
+            &Taken {
+                skill_tools: &skill_tools,
+                mcp_tools: &mcp_names,
+            },
+            self.remote,
+            &mut tools,
+        )?;
         let index = self.nodes.len();
         self.nodes.push(Node {
             name: name.clone(),
@@ -406,6 +525,68 @@ impl Walk<'_> {
             }
         }
         Ok(())
+    }
+}
+
+impl Walk<'_> {
+    /// The MCP tools of one agent: what was connected or supplied for it, checked against its own
+    /// `mcp.json` and the registered tools. Empty when it has no servers.
+    fn mcp_tools(
+        &self,
+        manifest: &AgentManifest,
+        name: &str,
+    ) -> Result<Vec<(String, DynTool)>, Error> {
+        let declared = mcp::declared(manifest);
+        let servers: Vec<String> = declared
+            .map(|config| config.servers.keys().cloned().collect())
+            .unwrap_or_default();
+        let origin = Origin::new(name, mcp::file_of(manifest));
+        let Some(given) = self.mcp.get(name) else {
+            return if servers.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(Error::McpNotConnected { origin, servers })
+            };
+        };
+        if given.config.as_ref().is_some_and(|c| Some(c) != declared) {
+            return Err(Error::McpChanged { origin });
+        }
+        let mut entries: Vec<(String, DynTool)> = Vec::new();
+        for tool in &given.tools {
+            let tool_name = tool.spec().name;
+            let belongs = servers.iter().any(|server| {
+                tool_name
+                    .strip_prefix(server.as_str())
+                    .is_some_and(|rest| rest.starts_with("__"))
+            });
+            if !belongs {
+                return Err(Error::McpForeignTool {
+                    origin,
+                    tool: tool_name,
+                    servers,
+                });
+            }
+            if entries.iter().any(|(n, _)| *n == tool_name) {
+                return Err(Error::DuplicateTool { tool: tool_name });
+            }
+            if self.catalog.get(&tool_name).is_some() {
+                return Err(Error::McpToolClash {
+                    origin,
+                    tool: tool_name,
+                });
+            }
+            entries.push((tool_name, Arc::clone(tool)));
+        }
+        if entries.is_empty() && !servers.is_empty() {
+            // Not refused: an empty set can be meant (supplied by hand, or servers that offer no
+            // tool this agent can use). But it is never silent.
+            tracing::warn!(
+                agent = %name,
+                servers = ?servers,
+                "the agent's mcp.json lists servers, and it has no MCP tool"
+            );
+        }
+        Ok(entries)
     }
 }
 
@@ -454,13 +635,21 @@ fn refuse_asking_tools(origin: &Origin, tools: &[(String, DynTool)]) -> Result<(
     }
 }
 
+/// Where some of an agent's tools came from, so that a name clash can say whose tool it hit.
+struct Taken<'a> {
+    /// The tools `add_skills` appended.
+    skill_tools: &'a [String],
+    /// The agent's own MCP tools (selected or not: only a selected one is in `tools`).
+    mcp_tools: &'a [String],
+}
+
 /// Give the agent a tool for each of its subagents, local and remote, named after the subagent and
 /// placed after the agent's own tools and its skills' tools, in the order of the manifest. The name
 /// must not be one the agent's model already sees.
 fn add_subagent_tools(
     origin: &Origin,
     manifest: &AgentManifest,
-    skill_tools: &[String],
+    taken: &Taken<'_>,
     remote: &RemoteSettings,
     tools: &mut Vec<(String, DynTool)>,
 ) -> Result<(), Error> {
@@ -476,10 +665,14 @@ fn add_subagent_tools(
                 file: file.to_path_buf(),
             })
         } else if tools.iter().any(|(n, _)| n == name) {
-            // Whose tool it is depends on what `add_skills` added, not on the name: without
-            // skills, a registered tool may be called `load_skill`.
-            Some(if skill_tools.iter().any(|t| t == name) {
+            // Whose tool it is depends on what `add_skills` and the MCP servers added, not on
+            // the name: without skills, a registered tool may be called `load_skill`.
+            Some(if taken.skill_tools.iter().any(|t| t == name) {
                 ToolClash::SkillTool
+            } else if taken.mcp_tools.iter().any(|t| t == name) {
+                ToolClash::McpTool {
+                    server: name.split_once("__").map_or(name, |(s, _)| s).into(),
+                }
             } else {
                 ToolClash::Tool
             })

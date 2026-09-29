@@ -211,6 +211,11 @@ The layers, from the bottom:
     `LlmAgent` per local subagent definition, and, with feature `a2a`, `card`
     turns the root's `card:` into an `AgentCardConfig`. It depends on
     `adam-agent-fs`, `adam-llm-agent`, `adam-model` and `adam-runtime`.
+  * `adam-mcp` is the MCP client behind the tools of an agent's `mcp.json`
+    (feature `mcp` of `adam-assembly`): it connects to each server at startup,
+    lists its tools and gives them back as `Tool`s, so an MCP call is an
+    ordinary journaled tool step. It depends on `adam-agent-fs`,
+    `adam-llm-agent`, `adam-model`, `adam-error` and `rmcp`.
   * `adam` is the facade a user writes agents against: `prelude`, the
     re-exported `adam-llm-agent` API, the `#[tool]` macro behind the
     default feature `macros`, `AgentDef` and its stages from `adam-assembly`

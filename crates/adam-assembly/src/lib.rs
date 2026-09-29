@@ -118,8 +118,16 @@
 //! that start later, so that durable replay never sees a tool appear or vanish. The rules are in
 //! the docs of `LiveAssembly` and in the README.
 //!
-//! Not here yet: `mcp.json` tools (S11). The manifest keeps their files, and [`AgentDef::bind`]
-//! is where they plug in.
+//! # MCP tools
+//!
+//! With the feature `mcp` (off by default), [`AgentDef::connect_mcp`] connects to the servers of each
+//! agent's own `mcp.json` (the root's, and each local subagent's) with `adam-mcp` and keeps their
+//! tools, named `<server>__<tool>`, for that agent alone: [`AgentDef::bind`] adds them to the
+//! catalog `tools:` selects from, and refuses an agent whose `mcp.json` lists servers that were not
+//! connected ([`Error::McpNotConnected`]). [`AgentDef::mcp_tools`] gives tools made by a client of your
+//! own. Secrets stay in `SecretString`s, a call is a journaled step and never a transient error (MCP has
+//! no idempotency key), and a dev reload keeps the connections and refuses an edited `mcp.json`. See the
+//! README.
 
 #![warn(missing_docs)]
 
@@ -130,6 +138,7 @@ mod def;
 #[cfg(feature = "dev")]
 mod dev;
 mod error;
+mod mcp;
 mod remote;
 mod skills;
 mod subagent;
@@ -165,3 +174,20 @@ pub use url::Url;
 /// ```
 #[cfg(not(feature = "dev"))]
 mod dev_is_off {}
+
+/// Without the feature `mcp` an agent cannot connect to MCP servers: a build cannot start a process
+/// or reach a server because an `mcp.json` said so, unless it opts in. `bind` still refuses an
+/// agent whose `mcp.json` lists servers (`Error::McpNotConnected`), so the tools are never
+/// quietly missing.
+///
+/// ```compile_fail,E0599
+/// async fn connect(def: adam_assembly::AgentDef) {
+///     let _ = def.connect_mcp(&()).await;
+/// }
+/// ```
+///
+/// ```compile_fail,E0433
+/// let _ = adam_mcp::McpPolicy::default();
+/// ```
+#[cfg(not(feature = "mcp"))]
+mod mcp_is_off {}

@@ -17,6 +17,9 @@ a2a = ["adam-assembly/a2a"]
 # Dev reload (`adam::assembly::LiveAssembly`): read the agent directory at run time and swap the
 # agents when a file changes. Off by default: a release build cannot read prompts from disk.
 dev = ["adam-assembly/dev"]
+# `mcp.json` tools (`adam::mcp`, `AgentDef::connect_mcp`): connect to the MCP servers an agent's files
+# name and give the agent their tools. Off by default: it brings the MCP client and can start processes.
+mcp = ["adam-assembly/mcp", "dep:adam-mcp"]
 
 [dependencies]
 adam-agent-fs.workspace = true
@@ -25,10 +28,12 @@ adam-core.workspace = true
 adam-error.workspace = true
 adam-llm-agent = { workspace = true, features = ["schema"] }
 adam-macros = { workspace = true, optional = true }
+adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
 adam-runtime.workspace = true
 
 [dev-dependencies]
+adam-mcp-testkit = { path = "../adam-mcp-testkit" }
 schemars = { workspace = true, features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -425,3 +425,334 @@ fn four_braces_write_a_literal_pair() {
         "Write {{name}} for a placeholder."
     );
 }
+
+// --- MCP tools (`mcp.json`) ----------------------------------------------------------------
+//
+// Tools made by hand stand in for a connected server here: these tests are about what `bind`
+// does with them, and run without the feature `mcp`. `tests/mcp.rs` connects for real.
+
+const LINEAR_JSON: &str = r#"{"mcpServers": {
+    "linear": {"type": "http", "url": "https://mcp.example.com/mcp"},
+    "fs": {"command": "mcp-server-filesystem", "args": ["/work"]}
+}}"#;
+const SEARCH_JSON: &str =
+    r#"{"mcpServers": {"search": {"type": "http", "url": "https://search.example.com/mcp"}}}"#;
+
+/// A root with an `mcp.json`, and a subagent directory `researcher` with its own.
+fn with_mcp(root_frontmatter: &str, researcher_frontmatter: &str) -> AgentDef {
+    def(&[
+        (INSTRUCTIONS, &instructions(root_frontmatter, "Hi.")),
+        ("agent/mcp.json", LINEAR_JSON),
+        (
+            "agent/subagents/researcher/instructions.md",
+            &instructions(researcher_frontmatter, "Research."),
+        ),
+        ("agent/subagents/researcher/mcp.json", SEARCH_JSON),
+    ])
+}
+
+fn mcp(names: &[&str]) -> adam_llm_agent::ToolSet {
+    tools(names)
+}
+
+fn info_of(def: AgentDef, registered: &[&str]) -> Vec<(String, Vec<String>)> {
+    def.bind(tools(registered))
+        .unwrap()
+        .model(std::sync::Arc::new(adam_model::MockModel::new()), "m")
+        .unwrap()
+        .info()
+        .iter()
+        .map(|i| (i.name.clone(), i.tools.clone()))
+        .collect()
+}
+
+#[test]
+fn an_empty_mcp_tool_set_for_declared_servers_binds_with_a_warning() {
+    let logs = adam_mcp_testkit::LogCapture::start();
+    let bound = info_of(
+        with_mcp("name: coder", "description: Researches.")
+            .mcp_tools("coder", mcp(&["linear__list"]))
+            .mcp_tools("coder/researcher", adam_llm_agent::ToolSet::new()),
+        &[],
+    );
+    assert_eq!(bound[1], ("coder/researcher".to_owned(), vec![]));
+    let text = logs.text();
+    let warning = text
+        .lines()
+        .find(|l| l.contains("lists servers, and it has no MCP tool"))
+        .unwrap_or_else(|| panic!("no warning in: {text}"));
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(warning.contains("coder/researcher"), "{warning}");
+    assert!(warning.contains("search"), "{warning}");
+    // The root got its tool: no warning names it.
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.contains("has no MCP tool") && l.contains("agent=coder ")),
+        "{text}"
+    );
+}
+
+#[test]
+fn mcp_json_without_connections_fails_closed() {
+    let error = with_mcp("name: coder", "description: Researches.")
+        .bind(tools(&["ask_user"]))
+        .unwrap_err();
+    let Error::McpNotConnected { origin, servers } = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(origin.agent, "coder");
+    assert_eq!(origin.file.to_string_lossy(), "agent/mcp.json");
+    assert_eq!(servers, &["fs", "linear"]);
+    let text = error.to_string();
+    assert!(
+        text.contains("`mcp.json` lists the MCP servers `fs`, `linear`"),
+        "{text}"
+    );
+    assert!(text.contains("AgentDef::connect_mcp"), "{text}");
+    assert!(text.contains("AgentDef::mcp_tools"), "{text}");
+    // Without the feature the message says to turn it on.
+    assert_eq!(
+        text.contains("enable the feature `mcp`"),
+        !cfg!(feature = "mcp"),
+        "{text}"
+    );
+
+    // A subagent's own `mcp.json` counts too: the root being connected is not enough.
+    let error = with_mcp("name: coder", "description: Researches.")
+        .mcp_tools("coder", mcp(&["linear__list"]))
+        .bind(tools(&[]))
+        .unwrap_err();
+    let Error::McpNotConnected { origin, servers } = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(origin.agent, "coder/researcher");
+    assert_eq!(
+        origin.file.to_string_lossy(),
+        "agent/subagents/researcher/mcp.json"
+    );
+    assert_eq!(servers, &["search"]);
+
+    // An `mcp.json` with no servers is no file.
+    def(&[
+        (INSTRUCTIONS, &instructions("name: coder", "Hi.")),
+        ("agent/mcp.json", r#"{"mcpServers": {}}"#),
+    ])
+    .bind(tools(&[]))
+    .unwrap();
+}
+
+#[test]
+fn hand_supplied_mcp_tools_bind_like_connected() {
+    // `tools:` selects among the registered tools and the agent's own MCP tools, by name or by
+    // pattern, in the order the file lists them.
+    let bound = info_of(
+        with_mcp(
+            "name: coder\ntools: ['linear__*', ask_user]",
+            "description: Researches.",
+        )
+        .mcp_tools("coder", mcp(&["linear__list", "linear__get"]))
+        .mcp_tools("coder/researcher", mcp(&["search__web"])),
+        &["ask_user", "run_checks"],
+    );
+    assert_eq!(
+        bound,
+        [
+            (
+                "coder".to_owned(),
+                vec![
+                    "linear__list".to_owned(),
+                    "linear__get".to_owned(),
+                    "ask_user".to_owned(),
+                    // The tool that calls the subagent, after the agent's own tools.
+                    "researcher".to_owned()
+                ]
+            ),
+            // A subagent inherits nothing, and lists no tools: its own MCP tools are not selected.
+            ("coder/researcher".to_owned(), vec![]),
+        ]
+    );
+
+    // A root without `tools:` gets everything registered and its own MCP tools; a subagent lists
+    // the MCP tools it wants, as it lists any other.
+    let bound = info_of(
+        with_mcp(
+            "name: coder",
+            "description: Researches.\ntools: [search__web]",
+        )
+        .mcp_tools("coder", mcp(&["linear__list"]))
+        .mcp_tools("coder/researcher", mcp(&["search__web", "search__news"])),
+        &["ask_user"],
+    );
+    assert_eq!(
+        bound,
+        [
+            (
+                "coder".to_owned(),
+                vec![
+                    "ask_user".to_owned(),
+                    "linear__list".to_owned(),
+                    "researcher".to_owned()
+                ]
+            ),
+            (
+                "coder/researcher".to_owned(),
+                vec!["search__web".to_owned()]
+            ),
+        ]
+    );
+
+    // A pattern that matches none of them is the usual error, and lists the MCP tools too.
+    let error = with_mcp("name: coder\ntools: ['github__*']", "description: R.")
+        .mcp_tools("coder", mcp(&["linear__list"]))
+        .mcp_tools("coder/researcher", mcp(&[]))
+        .bind(tools(&["ask_user"]))
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::NoToolMatches { pattern, available, .. }
+            if pattern == "github__*" && available == &["ask_user", "linear__list"]),
+        "{error}"
+    );
+    // A misspelt MCP tool gets a suggestion, like any other.
+    let error = with_mcp("name: coder\ntools: [linear__lst]", "description: R.")
+        .mcp_tools("coder", mcp(&["linear__list"]))
+        .mcp_tools("coder/researcher", mcp(&[]))
+        .bind(tools(&[]))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("did you mean `linear__list`?"),
+        "{error}"
+    );
+}
+
+#[test]
+fn foreign_mcp_tool_name_refused() {
+    let bind = |root: &[&str], researcher: &[&str]| {
+        with_mcp("name: coder", "description: Researches.")
+            .mcp_tools("coder", mcp(root))
+            .mcp_tools("coder/researcher", mcp(researcher))
+            .bind(tools(&[]))
+            .unwrap_err()
+    };
+    // Not named after any server of the file...
+    let error = bind(&["github__pr"], &[]);
+    let Error::McpForeignTool {
+        origin,
+        tool,
+        servers,
+    } = &error
+    else {
+        panic!("{error}");
+    };
+    assert_eq!(
+        (origin.agent.as_str(), tool.as_str()),
+        ("coder", "github__pr")
+    );
+    assert_eq!(servers, &["fs", "linear"]);
+    assert!(error.to_string().contains("`<server>__<tool>`"), "{error}");
+    // ...a single underscore is not the separator...
+    assert!(matches!(
+        bind(&["linear_list"], &[]),
+        Error::McpForeignTool { .. }
+    ));
+    // ...and a server of another agent's file is not this agent's: no sharing between directories.
+    let error = bind(&["linear__list"], &["linear__list"]);
+    assert!(
+        matches!(&error, Error::McpForeignTool { origin, .. } if origin.agent == "coder/researcher"),
+        "{error}"
+    );
+    // The same tool twice is one name too many.
+    assert!(matches!(
+        bind(&["linear__list", "linear__list"], &[]),
+        Error::DuplicateTool { .. }
+    ));
+    // Tools for an agent that does not exist: a typo, with a suggestion.
+    let error = with_mcp("name: coder", "description: R.")
+        .mcp_tools("coder/researchr", mcp(&[]))
+        .bind(tools(&[]))
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::McpUnknownAgent { suggestion, .. }
+            if suggestion.as_deref() == Some("coder/researcher")),
+        "{error}"
+    );
+    // An agent with no `mcp.json` has no servers: any tool given to it is foreign.
+    let error = one("name: coder", "Hi.")
+        .mcp_tools("coder", mcp(&["linear__list"]))
+        .bind(tools(&[]))
+        .unwrap_err();
+    assert!(matches!(error, Error::McpForeignTool { .. }));
+}
+
+#[test]
+fn mcp_tool_named_like_registered_is_clash() {
+    let error = with_mcp("name: coder", "description: Researches.")
+        .mcp_tools("coder", mcp(&["linear__list"]))
+        .mcp_tools("coder/researcher", mcp(&[]))
+        .bind(tools(&["linear__list"]))
+        .unwrap_err();
+    let Error::McpToolClash { origin, tool } = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(origin.file.to_string_lossy(), "agent/mcp.json");
+    assert_eq!(tool, "linear__list");
+    assert!(
+        error
+            .to_string()
+            .contains("has the name of a registered tool"),
+        "{error}"
+    );
+}
+
+#[test]
+fn subagent_named_like_mcp_tool_is_clash() {
+    let files = |root: &str| {
+        def(&[
+            (INSTRUCTIONS, &instructions(root, "Hi.")),
+            ("agent/mcp.json", LINEAR_JSON),
+            (
+                "agent/subagents/linear__list.md",
+                &instructions("description: Lists.", "List."),
+            ),
+        ])
+    };
+    let error = files("name: coder\ntools: ['linear__*']")
+        .mcp_tools("coder", mcp(&["linear__list"]))
+        .bind(tools(&[]))
+        .unwrap_err();
+    let Error::SubagentToolClash {
+        origin,
+        parent,
+        tool,
+        clash,
+    } = &error
+    else {
+        panic!("{error}");
+    };
+    assert_eq!(origin.agent, "coder/linear__list");
+    assert_eq!((parent.as_str(), tool.as_str()), ("coder", "linear__list"));
+    assert_eq!(
+        clash,
+        &adam_assembly::ToolClash::McpTool {
+            server: "linear".into()
+        }
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("the parent's MCP server `linear`"),
+        "{error}"
+    );
+    // As with any tool: one the parent does not select is no clash.
+    files("name: coder\ntools: [ask_user]")
+        .mcp_tools("coder", mcp(&["linear__list"]))
+        .bind(tools(&["ask_user"]))
+        .unwrap();
+}
+
+#[test]
+fn a_definition_without_mcp_json_is_untouched() {
+    // No `mcp.json`, nothing given: binds as before, and `mcp_tools` for no agent is not needed.
+    let bound = info_of(one("name: coder", "Hi."), &["a"]);
+    assert_eq!(bound, [("coder".to_owned(), vec!["a".to_owned()])]);
+}

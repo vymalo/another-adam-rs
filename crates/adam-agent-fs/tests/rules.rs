@@ -540,6 +540,21 @@ fn cases() -> Vec<Case> {
             "server name `a__b`",
         ),
         with_root(
+            "mcp server name ending in an underscore",
+            vec![("agent/mcp.json", r#"{"mcpServers":{"a_":{"command":"x"}}}"#)],
+            Error,
+            "not ending in `_`",
+        ),
+        with_root(
+            "mcp allow-listed tool name starting with an underscore",
+            vec![(
+                "agent/mcp.json",
+                r#"{"mcpServers":{"a":{"command":"x","tools":["_x"]}}}"#,
+            )],
+            Error,
+            "not starting with `_`",
+        ),
+        with_root(
             "mcp allow-listed tool name too long",
             vec![(
                 "agent/mcp.json",
