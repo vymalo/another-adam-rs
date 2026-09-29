@@ -102,6 +102,22 @@ impl fmt::Display for SkillField {
     }
 }
 
+/// What a subagent's tool name collides with, in [`Error::SubagentToolClash`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolClash {
+    /// A tool of the parent: one registered with
+    /// [`AgentDef::bind`](crate::AgentDef::bind) that the parent's `tools:` (or its default) gives
+    /// it.
+    Tool,
+    /// `load_skill` or `read_skill_file`, the tools the parent's skills bring.
+    SkillTool,
+    /// Another subagent of the same parent, defined in this file.
+    Subagent {
+        /// The other subagent's file, relative to the source root.
+        file: PathBuf,
+    },
+}
+
 /// Why an [`AgentDef`](crate::AgentDef) could not be bound to agents.
 ///
 /// A mistake in the agent's files or in how it is put together, found when the process
@@ -325,6 +341,38 @@ pub enum Error {
         /// The name in conflict.
         tool: String,
     },
+    /// A subagent is called as a tool named after it, and its parent already has a tool of that
+    /// name.
+    #[error(
+        "{origin}: the parent `{parent}` would get a tool called `{tool}` to call this subagent, \
+         but {}",
+        clash_reason(.clash)
+    )]
+    SubagentToolClash {
+        /// The subagent and its file.
+        origin: Origin,
+        /// The registration name of the parent.
+        parent: String,
+        /// The tool name, which is the subagent's name.
+        tool: String,
+        /// What it collides with.
+        clash: ToolClash,
+    },
+    /// A subagent has a tool that asks the user a question ([`Tool::asks_user`]). A subagent runs as
+    /// a child of another run, so nobody could answer, and the child would wait for ever.
+    ///
+    /// [`Tool::asks_user`]: adam_llm_agent::Tool::asks_user
+    #[error(
+        "{origin}: a subagent cannot have `{tool}`: it asks the user a question, and a subagent runs \
+         as a child of another run, so nobody could answer it. List its `tools` by name, without \
+         `{tool}`, or let the parent ask instead"
+    )]
+    SubagentAsksUser {
+        /// The subagent and its file.
+        origin: Origin,
+        /// The tool that asks.
+        tool: String,
+    },
     /// The A2A card needs a description and the agent has none.
     #[error(
         "{origin}: the A2A card needs a description: set `description` (or `card.description`) in the frontmatter"
@@ -341,6 +389,24 @@ impl Classify for Error {
             Self::Manifest(source) => source.class(),
             _ => ErrorClass::Invalid,
         }
+    }
+}
+
+/// The second half of [`Error::SubagentToolClash`].
+fn clash_reason(clash: &ToolClash) -> String {
+    match clash {
+        ToolClash::Tool => {
+            "it already has a tool with that name: rename the subagent, or leave the \
+             tool out of the parent's `tools`"
+                .to_owned()
+        }
+        ToolClash::SkillTool => "its skills bring a tool with that name (`load_skill` and \
+             `read_skill_file` are reserved): rename the subagent"
+            .to_owned(),
+        ToolClash::Subagent { file } => format!(
+            "another subagent of the parent, in {}, has the same name: rename one of them",
+            portable(file)
+        ),
     }
 }
 
@@ -478,6 +544,30 @@ mod tests {
             Error::ReservedToolName {
                 origin: o.clone(),
                 tool: "load_skill".into(),
+            },
+            Error::SubagentToolClash {
+                origin: o.clone(),
+                parent: "coder".into(),
+                tool: "reviewer".into(),
+                clash: ToolClash::Tool,
+            },
+            Error::SubagentToolClash {
+                origin: o.clone(),
+                parent: "coder".into(),
+                tool: "load_skill".into(),
+                clash: ToolClash::SkillTool,
+            },
+            Error::SubagentToolClash {
+                origin: o.clone(),
+                parent: "coder".into(),
+                tool: "reviewer".into(),
+                clash: ToolClash::Subagent {
+                    file: "agent/subagents/reviewer.md".into(),
+                },
+            },
+            Error::SubagentAsksUser {
+                origin: o.clone(),
+                tool: "ask_user".into(),
             },
             Error::MissingCardDescription { origin: o },
         ];

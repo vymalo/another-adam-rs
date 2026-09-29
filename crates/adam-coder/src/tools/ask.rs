@@ -13,7 +13,7 @@ use super::{Outcome, non_empty};
 /// Ask the person who gave you the task a question and wait for the answer.
 /// Use it only when you cannot proceed without it, or to get explicit consent
 /// (for example to open a pull request with failing checks). Be specific.
-#[tool]
+#[tool(asks_user)]
 pub async fn ask_user(
     /// What you need to know
     question: String,

@@ -176,7 +176,8 @@ fn the_catalog_follows_the_prompt_and_escapes_the_descriptions() {
     assert_eq!(info(&assembly, "coder").skills, ["alpha", "beta", "gamma"]);
     assert_eq!(
         info(&assembly, "coder").tools,
-        [LOAD_SKILL, READ_SKILL_FILE]
+        // The skills' tools, then the tool that runs the subagent.
+        [LOAD_SKILL, READ_SKILL_FILE, "helper"]
     );
 }
 
@@ -201,7 +202,9 @@ fn without_a_skill_there_is_no_catalog_and_no_tool() {
     let assembly = assemble(def_of(&dir), Arc::new(MockModel::new()));
     let none = info(&assembly, "coder");
     assert_eq!(none.prompt, "You are the coder.");
-    assert!(none.tools.is_empty() && none.skills.is_empty());
+    // No skill tools, and no catalog; the subagent's tool stays.
+    assert_eq!(none.tools, ["helper"]);
+    assert!(none.skills.is_empty());
     // The subagent has its own selection, which is the default (all of its own).
     assert_eq!(info(&assembly, "coder/helper").skills, ["delta"]);
 }
@@ -439,7 +442,10 @@ async fn the_model_loads_a_skill_then_reads_one_of_its_files() {
         requests[0].system.as_deref(),
         Some(info(&assembly, "coder").prompt.as_str())
     );
-    assert_eq!(tool_names(&requests[0]), [LOAD_SKILL, READ_SKILL_FILE]);
+    assert_eq!(
+        tool_names(&requests[0]),
+        [LOAD_SKILL, READ_SKILL_FILE, "helper"]
+    );
 
     // The schemas: an enum of what each tool takes.
     let load = tool(&requests[0], LOAD_SKILL);
@@ -628,18 +634,21 @@ async fn preloading_everything_leaves_no_loader_and_no_catalog() {
     let assembly = assemble(def_of(&dir), model.clone());
     let coder = info(&assembly, "coder");
     assert_eq!(coder.preloaded, ["alpha", "beta"]);
-    assert_eq!(coder.tools, [READ_SKILL_FILE]);
+    assert_eq!(coder.tools, [READ_SKILL_FILE, "helper"]);
     assert!(!coder.prompt.contains("<available_skills>"));
     assert!(coder.prompt.contains("<skill_content name=\"alpha\">"));
     assert!(coder.prompt.contains("<skill_content name=\"beta\">"));
     run(&assembly, "coder").await;
-    assert_eq!(tool_names(&model.requests()[0]), [READ_SKILL_FILE]);
+    assert_eq!(
+        tool_names(&model.requests()[0]),
+        [READ_SKILL_FILE, "helper"]
+    );
 
-    // Nothing to read either: no tool at all.
+    // Nothing to read either: no skill tool at all (the subagent's stays).
     let dir = tree("skills: [beta]\npreload_skills: [beta]");
     let assembly = assemble(def_of(&dir), Arc::new(MockModel::new()));
     let coder = info(&assembly, "coder");
-    assert!(coder.tools.is_empty());
+    assert_eq!(coder.tools, ["helper"]);
     assert!(
         coder
             .prompt

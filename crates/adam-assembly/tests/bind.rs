@@ -162,8 +162,9 @@ fn default_tool_access_follows_the_owner_decision_d3() {
             .tools
             .clone()
     };
-    // The root with no `tools:` gets everything; a subagent with none listed gets none.
-    assert_eq!(tools_of("coder"), ["a", "b"]);
+    // The root with no `tools:` gets everything, then a tool for each subagent; a subagent with
+    // none listed gets none (and not the parent's, nor the parent's subagent tools).
+    assert_eq!(tools_of("coder"), ["a", "b", "all", "none", "quiet"]);
     assert!(tools_of("coder/quiet").is_empty());
     assert_eq!(tools_of("coder/all"), ["a", "b"]);
     assert!(tools_of("coder/none").is_empty());

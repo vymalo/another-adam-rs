@@ -43,6 +43,7 @@ type Handler = dyn Fn(ToolCtx, Value) -> Pin<Box<dyn Future<Output = Result<Tool
 pub struct FnTool {
     spec: ToolSpec,
     handler: Arc<Handler>,
+    asks_user: bool,
 }
 
 impl FnTool {
@@ -70,7 +71,16 @@ impl FnTool {
                 let fut = handler(ctx, args);
                 Box::pin(async move { fut.await.into_tool_result() })
             }),
+            asks_user: false,
         }
+    }
+
+    /// Declare that the tool can end a call with [`ToolError::NeedsInput`], as
+    /// [`Tool::asks_user`] says.
+    #[must_use]
+    pub fn asking_user(mut self) -> Self {
+        self.asks_user = true;
+        self
     }
 
     /// Start a tool whose arguments are a typed struct; needs the `schema`
@@ -96,6 +106,10 @@ impl fmt::Debug for FnTool {
 impl Tool for FnTool {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
+    }
+
+    fn asks_user(&self) -> bool {
+        self.asks_user
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
@@ -186,6 +200,29 @@ where
                     Err(refusal) => Box::pin(async move { Ok(refusal) }),
                 },
             ),
+            asks_user: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn tool() -> FnTool {
+        FnTool::raw(
+            "ask",
+            "Ask.",
+            json!({"type": "object"}),
+            |_ctx, _args| async move { Ok::<_, ToolError>("answer") },
+        )
+    }
+
+    #[test]
+    fn a_tool_does_not_ask_the_user_unless_it_says_so() {
+        assert!(!tool().asks_user());
+        assert!(tool().asking_user().asks_user());
     }
 }

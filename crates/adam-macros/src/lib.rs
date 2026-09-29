@@ -9,7 +9,7 @@
 //! use adam::prelude::*;
 //!
 //! /// Ask the person who gave you the task a question and wait for the answer.
-//! #[tool]
+//! #[tool(asks_user)]
 //! pub async fn ask_user(
 //!     /// What you need to know
 //!     question: String,
@@ -46,7 +46,9 @@ mod expand;
 /// `type = Ident` (the generated struct, default the function's name in
 /// `UpperCamelCase`), `strict` (unknown argument fields are an error),
 /// `classify` (the error is `adam_error::Classify`: retryable errors become
-/// `ToolError::Transient`, others `Permanent`) and `crate = path` (where
+/// `ToolError::Transient`, others `Permanent`), `asks_user` (the tool can end a call with
+/// `ToolError::NeedsInput`: `Tool::asks_user` says `true`, and a subagent may not have it) and
+/// `crate = path` (where
 /// `Tool` and `__private` are, default `::adam`; `::adam_llm_agent` for a
 /// crate without the facade).
 #[proc_macro_attribute]

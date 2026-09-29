@@ -170,12 +170,13 @@ impl BoundDef {
     /// One `LlmAgent` from one bound node.
     ///
     /// This is the seam the next slices extend. `bind` has already made the prompt and the tool
-    /// list final for skills (slice S7: the catalog after the prompt, `load_skill` and
-    /// `read_skill_file` after the agent's own tools), so this function only hands them over.
-    /// Slices S8 and S9 add a subagent tool for each child of `node` (the children are the nodes
-    /// whose `parent` is this one, and `remotes` holds the remote ones); slice S11 adds the tools
-    /// of `mcp.json`. Each of them changes this function and the `bind` step that resolves what
-    /// it needs.
+    /// list final: the catalog after the prompt (slice S7), and the tools in the order the model
+    /// sees them: the agent's own, `load_skill` and `read_skill_file`, then one
+    /// [`SubagentTool`](crate::SubagentTool) per local subagent (slice S9). They are added at
+    /// bind, not here, so that a name clash is found before a model is needed, and so that
+    /// [`AgentInfo::tools`] and the agent cannot disagree. This function only hands them over.
+    /// The remote subagents (`remotes`, slice S9b) join the same list in `bind`, where their names
+    /// meet the local ones; slice S11 adds the tools of `mcp.json` the same way.
     fn build(
         &self,
         node: &Node,
@@ -218,7 +219,8 @@ pub struct AgentInfo {
     /// skills catalog and the preloaded skills.
     pub prompt: String,
     /// The names of its tools, in the order the model is shown them: its own, then `load_skill`
-    /// and `read_skill_file` when it has skills to load and files to read.
+    /// and `read_skill_file` when it has skills to load and files to read, then one per local
+    /// subagent (the subagent's name: the entries of `info()` whose `parent` is this agent).
     pub tools: Vec<String>,
     /// The skills it may use, in the order of its `skills:` (by name for `all`).
     pub skills: Vec<String>,
@@ -241,9 +243,12 @@ pub struct RemoteInfo {
 /// The agents an [`AgentDef`](crate::AgentDef) makes: the root and one [`LlmAgent`] for each
 /// local subagent definition, ready to register on a runtime.
 ///
-/// A subagent is only *defined* here: registered, with its own prompt, tools and limits, but
-/// nothing lets the parent call it yet. The tool that starts it as a durable child run is a later
-/// slice. Each agent has its own skills, with the catalog and tools of slice S7.
+/// A subagent is an agent of its own, registered under `<parent>/<name>` with its own prompt,
+/// tools, skills, model alias and limits, and it inherits nothing from its parent: not the tools
+/// (a subagent with no `tools:` has none), not the skills, not the history. Its parent gets one
+/// tool named after it ([`SubagentTool`](crate::SubagentTool)) whose call starts the subagent as a
+/// durable child run on the runtime that steps the parent, so **every agent of the assembly must
+/// be registered on that runtime**, which [`register`](Self::register) does.
 #[derive(Debug)]
 pub struct Assembly {
     manifest: AgentManifest,
@@ -266,7 +271,13 @@ impl Assembly {
         &self.agents[0]
     }
 
-    /// Register every agent on a runtime builder.
+    /// Register every agent on a runtime builder: the root and each subagent. A subagent tool
+    /// starts its child on the runtime that steps the parent, and finds it by the name it is
+    /// registered under, so there is no handle to attach and nothing to forget: what registers the
+    /// agents makes the tools work. A runtime that steps the root but does not know a subagent
+    /// (a process that registered `assembly.root()` alone) refuses the call for good, and the model
+    /// sees an error result naming the missing agent. In a split deployment, register the
+    /// subagents as starters on the process that steps the parent.
     pub fn register(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
         self.agents
             .iter()

@@ -41,6 +41,12 @@ async fn classified() -> Result<&'static str, Nope> {
     Err(Nope)
 }
 
+/// Asks the user.
+#[tool(asks_user, classify)]
+async fn asker() -> Result<&'static str, Nope> {
+    Err(Nope)
+}
+
 /// The context first, state absent, nothing else.
 #[tool]
 async fn context_only(_ctx: &ToolCtx) -> String {
@@ -52,5 +58,6 @@ fn main() {
     assert_eq!(StrictOne.spec().parameters["additionalProperties"], false);
     assert!(StrictOne.spec().parameters["properties"].get("type").is_some());
     assert!(StrictOne.spec().parameters["properties"].get("n").is_some());
-    let _ = tools![Searcher, StrictOne, Classified, ContextOnly];
+    assert!(Asker.asks_user());
+    let _ = tools![Searcher, StrictOne, Classified, ContextOnly, Asker];
 }

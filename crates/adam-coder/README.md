@@ -46,7 +46,7 @@ sequenceDiagram
 | `run_checks { command, cwd? }` | `sh -lc <command>` in the worktree (a `cwd` must stay inside it), timeout kills the process group, output tail capped, secrets hidden from the child |
 | `commit_and_push { message }` | `commit_all` + `push`; artifact `branch` |
 | `open_pull_request { title, body, accept_red_checks? }` | `CodeHost::open_pull_request`; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
-| `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question |
+| `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. Declared `#[tool(asks_user)]`, so `adam-assembly` refuses to give it to a subagent |
 
 Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the

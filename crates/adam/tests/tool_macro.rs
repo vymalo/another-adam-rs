@@ -41,7 +41,7 @@ pub async fn get_weather(
 }
 
 /// Ask the person who gave you the task a question and wait for the answer.
-#[tool]
+#[tool(asks_user)]
 async fn ask_user(
     /// What you need to know
     question: String,
@@ -294,6 +294,10 @@ async fn missing_state_is_a_permanent_error_naming_the_type() {
 async fn context_arguments_ctx_and_needs_input() {
     let out = Whoami.call(&detached("whoami"), json!({})).await.unwrap();
     assert_eq!(out, ToolOutput::text("whoami / call-1"));
+
+    // Only the tool that says so declares that it asks the user.
+    assert!(AskUser.asks_user());
+    assert!(!Whoami.asks_user());
 
     let err = AskUser
         .call(&detached("ask_user"), json!({"question": " why? "}))

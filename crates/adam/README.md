@@ -99,6 +99,7 @@ Options, `#[tool(..)]`:
 | `type = Name` | the generated struct; default the function's name in `UpperCamelCase`. It has the function's visibility |
 | `strict` | unknown argument fields are refused (`deny_unknown_fields`, and `additionalProperties: false` in the schema) |
 | `classify` | the error type is `adam::error::Classify` (`adam_error::Classify`): retryable classes become `ToolError::Transient`, the others `Permanent` (`ToolError::from_classified`) |
+| `asks_user` | the tool can end a call with `ToolError::NeedsInput`: the generated `Tool::asks_user` says `true`, and `adam-assembly` refuses to give the tool to a subagent (nobody could answer it) |
 | `crate = path` | where `Tool` and `__private` live; default `::adam`. `::adam_llm_agent` works without the facade, see below |
 
 The schema is computed once per tool (a `OnceLock`) and is draft 2020-12 with subschemas inlined, no
@@ -217,7 +218,7 @@ The macro checks what it can and says so where you wrote it:
 | two `&ToolCtx` | at most one `&ToolCtx` parameter |
 | `#[args]` with another model argument | `#[args]` must be the only model argument |
 | a bad tool name | tool names must match `^[a-z][a-z0-9_]{0,63}$` |
-| an unknown option | unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, crate |
+| an unknown option | unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, crate |
 | on a struct or trait | `#[tool]` goes on an `async fn` |
 
 Every mistake of one function is reported in one compile. rustc reports the rest, with messages

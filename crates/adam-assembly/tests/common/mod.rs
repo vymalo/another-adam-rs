@@ -122,3 +122,27 @@ pub fn runtime(assembly: &adam_assembly::Assembly) -> Runtime {
         .poll_interval(Duration::from_millis(20))
         .build()
 }
+
+/// A runtime over `store` with the assembly's agents registered.
+pub fn runtime_on(assembly: &adam_assembly::Assembly, store: adam_core::DynStore) -> Runtime {
+    assembly
+        .register(Runtime::builder(store))
+        .poll_interval(Duration::from_millis(20))
+        .build()
+}
+
+/// Wait until `check` returns `Some` (or fail the test when it takes too long).
+pub async fn wait_for<T, F, Fut>(what: &str, mut check: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(found) = check().await {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}

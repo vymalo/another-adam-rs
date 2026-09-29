@@ -145,6 +145,19 @@ async fn only_the_optional_arguments_are_nullable() {
     );
 }
 
+/// `ask_user` is the one coder tool that asks the person, and the redacting wrapper says so too:
+/// `adam-assembly` refuses to give such a tool to a subagent (nobody could answer it).
+#[tokio::test]
+async fn only_ask_user_asks_the_user() {
+    let fx = Fixture::new("hello\n").await;
+    let asking: Vec<String> = coder_tools(&fx.env)
+        .into_iter()
+        .filter(|tool| tool.asks_user())
+        .map(|tool| tool.spec().name)
+        .collect();
+    assert_eq!(asking, ["ask_user"]);
+}
+
 /// The tools read `ToolEnv` from the agent's state, and the agent says so when it is missing.
 #[tokio::test]
 async fn the_tools_need_the_env_as_agent_state() {

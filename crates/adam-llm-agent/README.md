@@ -21,9 +21,9 @@ instructions + a model + a toolset. It is served over A2A by
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection) |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
-| `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default method `required_state() -> Vec<StateKey>` (none) |
+| `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) |
 | `ToolOutput` | `text`, `error`, `with_artifact` |
-| `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `emit_progress`, `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, and for tests `detached(..).with_state(..)` |
+| `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `emit_progress`, `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, and for tests `detached(..).with_state(..)` |
 | `ToolError` | `Transient`, `Permanent`, `NeedsInput { question }` (parks the run; A2A reports `input-required`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`); `#[non_exhaustive]`, see *Errors* |
 | `LlmAgentBuilder::state`, `try_build`, `tools` | `state(Arc<T>)` shares a value with the tools (one per type); `try_build() -> Result<LlmAgent, BuildError>` fails on a tool whose `required_state` was not given (`BuildError::MissingState`) or on two tools with one name (`BuildError::DuplicateTool`); `tools(ToolSet)` registers a group. `build()` is unchanged (last duplicate wins, no state check) |
 | `State<T>`, `StateKey`, `Extensions` | a cheap `Arc` handle that derefs to `T`; the key of a state type; the typed map behind them |
@@ -89,9 +89,8 @@ needs from a crate that does not use the `adam` facade.
 A tool that delegates returns `Err(ToolError::AwaitRun { run })` after starting the child:
 
 ```rust
-let child = ctx.child_run_id();                  // the same on every replay of this call
-runtime.start_child(ctx.run_id(), child, "coder/reviewer", user_message(message)).await
-    .map_err(|e| ToolError::from_classified(&e))?;   // false if a replay already started it
+// the child's id is derived from this call, so a replay finds the child it started
+let child = ctx.start_child("coder/reviewer", &message).await?;
 Err(ToolError::AwaitRun { run: child })
 ```
 
@@ -105,8 +104,11 @@ does not cancel the child. Events: `awaiting_run` and `tool_end` with status `wa
 (`ok` or `error`). The design and the failure interleavings are in
 [`docs/architecture.md`](../../docs/architecture.md#child-runs).
 
-The tool needs a `Runtime` to start the child; nothing in this crate supplies one (see `tests/child_runs.rs` for
-a tool that holds a handle). The subagent tool of the authoring layer will.
+The tool needs no `Runtime` of its own: `ToolCtx::start_child(agent, message)` starts the child on the runtime
+that is stepping the run (through `Ctx::child_starter()`, whose only possible parent is this run), under
+`child_run_id()`, and is idempotent. The agent must be registered on that runtime. A context made by
+`ToolCtx::detached` belongs to no runtime and refuses (`Permanent`). This is what `adam-assembly`'s
+`SubagentTool` does. (`tests/child_runs.rs` starts children with a `Runtime` it holds, which works too.)
 
 ## Errors
 
