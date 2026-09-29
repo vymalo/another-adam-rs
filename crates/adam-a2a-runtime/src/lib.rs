@@ -32,9 +32,11 @@
 
 mod backend;
 mod convert;
+mod ids;
 mod subscribe;
 
 pub use backend::{DEFAULT_POLL_INTERVAL, RuntimeTaskBackend};
 pub use convert::{
     InboundFn, PromptFn, artifact_id, artifact_of, default_inbound, default_prompt, task_state,
 };
+pub use ids::task_id_for;

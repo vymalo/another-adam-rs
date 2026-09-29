@@ -8,6 +8,8 @@ use adam_runtime::{Inbound, RunView};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::ids::status_message_id;
+
 /// Prefix `Runtime::cancel` puts on the error of a cancelled run.
 pub(crate) const CANCEL_PREFIX: &str = "cancelled: ";
 
@@ -95,6 +97,21 @@ fn output_text(output: &Value) -> Option<String> {
     .filter(|t| !t.trim().is_empty())
 }
 
+/// Stable name of a state, for ids (the wire name, not `Debug`).
+fn state_name(state: &TaskState) -> &'static str {
+    match state {
+        TaskState::Unspecified => "unspecified",
+        TaskState::Submitted => "submitted",
+        TaskState::Working => "working",
+        TaskState::Completed => "completed",
+        TaskState::Failed => "failed",
+        TaskState::Canceled => "canceled",
+        TaskState::InputRequired => "input-required",
+        TaskState::Rejected => "rejected",
+        TaskState::AuthRequired => "auth-required",
+    }
+}
+
 /// The message that goes with the state, if there is anything to say.
 fn status_text(view: &RunView, state: &TaskState, prompt: &PromptFn) -> Option<String> {
     match state {
@@ -113,8 +130,13 @@ fn status_text(view: &RunView, state: &TaskState, prompt: &PromptFn) -> Option<S
 /// The task status of a run, from its durable record only.
 pub(crate) fn status_of(view: &RunView, prompt: &PromptFn) -> TaskStatus {
     let state = task_state(view);
-    let message = status_text(view, &state, prompt)
-        .map(|text| Message::new(Role::Agent, vec![Part::text(text)]));
+    // The id follows the status, not the read: every event and snapshot of the
+    // same status carries the same message id.
+    let message = status_text(view, &state, prompt).map(|text| {
+        let mut message = Message::new(Role::Agent, vec![Part::text(text.clone())]);
+        message.message_id = status_message_id(&view.id.to_string(), state_name(&state), &text);
+        message
+    });
     TaskStatus {
         state,
         message,
@@ -291,6 +313,31 @@ mod tests {
                 .message
                 .is_none()
         );
+    }
+
+    #[test]
+    fn status_message_ids_follow_the_status_not_the_read() {
+        let mut v = view(RunStatus::Done);
+        v.output = Some(json!({"text": "all done"}));
+        let id = |v: &RunView| status_of(v, &prompt()).message.unwrap().message_id;
+        assert_eq!(id(&v), id(&v));
+        // Time passing (a later snapshot of the same record) changes nothing.
+        let mut later = v.clone();
+        later.updated_at = Utc::now() + chrono::Duration::seconds(5);
+        assert_eq!(id(&v), id(&later));
+
+        let mut other_text = v.clone();
+        other_text.output = Some(json!({"text": "all done!"}));
+        assert_ne!(id(&v), id(&other_text));
+
+        let mut failed = view(RunStatus::Failed);
+        failed.id = v.id;
+        failed.error = Some("all done".into());
+        assert_ne!(id(&v), id(&failed));
+
+        let mut other_task = v.clone();
+        other_task.id = adam_core::RunId::new();
+        assert_ne!(id(&v), id(&other_task));
     }
 
     #[test]
