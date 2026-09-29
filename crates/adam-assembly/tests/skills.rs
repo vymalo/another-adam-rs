@@ -136,16 +136,17 @@ fn the_catalog_of_the_fixture_matches_the_golden_file() {
         "prepare_workspace",
         "run_checks",
         "ask_user",
-        "linear__list_issues",
         "read_diff",
         "list_files",
         "fetch_page",
     ]);
-    let assembly = common::with_fixture_token(AgentDef::from_manifest(AGENT).unwrap())
-        .bind(fixture_tools)
-        .unwrap()
-        .model(Arc::new(MockModel::new()), "m")
-        .unwrap();
+    let assembly = common::with_fixture_mcp(common::with_fixture_token(
+        AgentDef::from_manifest(AGENT).unwrap(),
+    ))
+    .bind(fixture_tools)
+    .unwrap()
+    .model(Arc::new(MockModel::new()), "m")
+    .unwrap();
     let got = assembly.info()[0].prompt.clone() + "\n";
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/coder-prompt.txt");
     if std::env::var_os("ADAM_UPDATE_GOLDEN").is_some() {
@@ -713,7 +714,6 @@ async fn embedded_and_directory_manifests_behave_the_same() {
             "prepare_workspace",
             "run_checks",
             "ask_user",
-            "linear__list_issues",
             "read_diff",
             "list_files",
             "fetch_page",
@@ -757,7 +757,7 @@ async fn embedded_and_directory_manifests_behave_the_same() {
     for def in [embedded, from_dir] {
         let model = Arc::new(MockModel::new());
         script(&model);
-        let assembly = common::with_fixture_token(def)
+        let assembly = common::with_fixture_mcp(common::with_fixture_token(def))
             .bind(fixture_tools())
             .unwrap()
             .model(model.clone(), "m")

@@ -22,8 +22,8 @@ env:
   # measured minus 2. Raise it whenever coverage rises, never lower it to get a
   # change through.
   COVERAGE_MIN_LINES: "87"
-  # Not coverage: fake agent binary and the test code itself.
-  COVERAGE_IGNORE: '(adam-acp-fake-agent|/tests/)'
+  # Not coverage: fake agent binary, the MCP test server and the test code itself.
+  COVERAGE_IGNORE: '(adam-acp-fake-agent|adam-mcp-testkit|/tests/)'
 
 jobs:
   lint:
@@ -51,10 +51,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Optional features are linted and doc-tested too, or their code never runs in CI.
-      - run: cargo clippy --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp -- -D warnings
       # nextest does not run doctests; the database suites are not needed here.
       - run: cargo test --workspace --doc --locked
-      - run: cargo test --workspace --doc --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev
+      - run: cargo test --workspace --doc --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
 
   # The oldest toolchain the workspace promises to build with (`rust-version`
   # in Cargo.toml; keep the two in step).
@@ -66,7 +66,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
-      - run: cargo check --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev
+      - run: cargo check --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
 
   # The compile tests of `#[tool]` (crates/adam/tests/ui), on the toolchain their
   # rustc-produced snapshots were written with. The errors the macro produces
@@ -157,7 +157,7 @@ jobs:
         with:
           tool: nextest
       - name: Tests (memory, Postgres, MongoDB, coder end to end)
-        run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev
+        run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
       # Run the database suites a second time: this pass exercises migrate() on
       # an existing schema. The offline suites (coder end to end) do not repeat.
       - name: Database suites again, on the migrated schema
@@ -198,7 +198,7 @@ jobs:
           tool: nextest,cargo-llvm-cov
       - name: Run the tests instrumented
         run: >-
-          cargo llvm-cov nextest --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev
+          cargo llvm-cov nextest --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
           --ignore-filename-regex "$COVERAGE_IGNORE" --no-report
       - name: lcov report
         run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$COVERAGE_IGNORE"

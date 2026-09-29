@@ -14,6 +14,10 @@ pub use adam_assembly::{LiveAssembly, LiveBuilder, ReloadError, Reloaded};
 pub use adam_core as core;
 pub use adam_error as error;
 pub use adam_llm_agent::*;
+// `mcp.json` tools, only with the feature `mcp`: the MCP client (`McpPolicy`, `Env`,
+// `McpServers`) that `AgentDef::connect_mcp` uses.
+#[cfg(feature = "mcp")]
+pub use adam_mcp as mcp;
 pub use adam_model as model;
 pub use adam_runtime as runtime;
 
@@ -57,3 +61,12 @@ pub mod prelude {
 /// ```
 #[cfg(not(feature = "dev"))]
 mod dev_is_off {}
+
+/// Without the feature `mcp` there is no MCP client: a build cannot start an MCP server, or reach one,
+/// unless it opts in.
+///
+/// ```compile_fail,E0432
+/// use adam::mcp::McpPolicy;
+/// ```
+#[cfg(not(feature = "mcp"))]
+mod mcp_is_off {}

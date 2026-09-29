@@ -16,6 +16,9 @@ a2a = ["dep:adam-a2a"]
 # (`LiveAssembly`, `AgentDef::from_dir`). Off by default, so a release build cannot read prompts
 # from disk unless it opts in. The only feature that brings `notify`.
 dev = ["dep:notify", "dep:adam-core"]
+# `mcp.json` tools (`AgentDef::connect_mcp`): connect to the MCP servers an agent's files name and
+# give the agent their tools. Off by default: it brings the MCP client and can start processes.
+mcp = ["dep:adam-mcp"]
 
 [dependencies]
 # The A2A client behind remote subagents (`a2a:`): part of every build, so a manifest with a remote
@@ -27,6 +30,7 @@ adam-agent-fs.workspace = true
 adam-core = { workspace = true, optional = true }
 adam-error.workspace = true
 adam-llm-agent.workspace = true
+adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
@@ -46,6 +50,9 @@ adam-agent-fixture = { path = "../adam-agent-fixture" }
 # The in-process A2A server the remote-subagent tests talk to.
 adam-a2a = { path = "../adam-a2a", version = "0.1.0", features = ["test-util"] }
 adam-core.workspace = true
+adam-error.workspace = true
+# The MCP server the tests talk to (over HTTP: another package's binary is not available here).
+adam-mcp-testkit = { path = "../adam-mcp-testkit" }
 adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
 axum.workspace = true
 futures.workspace = true

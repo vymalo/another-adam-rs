@@ -14,13 +14,13 @@ use adam_model::{MockModel, ToolCall};
 use common::{runtime, spawn_worker, tools, wait_done};
 use serde_json::json;
 
-/// The tools the fixture's `tools:` lists name (the root's, `linear__*` for MCP, the subagents').
+/// The registered tools the fixture's `tools:` lists name (the root's and the subagents'); the
+/// root's `linear__*` names the tools of an MCP server, which come from its own `mcp.json`.
 fn fixture_tools() -> ToolSet {
     tools(&[
         "prepare_workspace",
         "run_checks",
         "ask_user",
-        "linear__list_issues",
         "read_diff",
         "list_files",
         "fetch_page",
@@ -39,7 +39,7 @@ fn from_dir() -> AgentDef {
 }
 
 fn assemble(def: AgentDef, model: Arc<MockModel>) -> Assembly {
-    common::with_fixture_token(def)
+    common::with_fixture_mcp(common::with_fixture_token(def))
         .bind(fixture_tools())
         .unwrap()
         .model(model, "gateway-default")
@@ -280,11 +280,29 @@ fn the_fixture_does_not_bind_without_its_tools() {
         .unwrap()
         .bind(tools(&["prepare_workspace", "run_checks", "ask_user"]))
         .unwrap_err();
-    // The root lists `linear__*` (an MCP server nobody registered).
+    // The root's `mcp.json` names servers that nobody connected: fail closed, before `tools:` is
+    // even looked at.
     assert!(
-        error
-            .to_string()
-            .contains("the `tools` pattern `linear__*` matches no registered tool"),
+        matches!(&error, adam_assembly::Error::McpNotConnected { servers, .. }
+            if servers == &["fs".to_owned(), "linear".to_owned()]),
+        "{error}"
+    );
+    assert!(
+        error.to_string().starts_with(
+            "agent `coder` (agent/mcp.json): `mcp.json` lists the MCP servers `fs`, `linear`"
+        ),
+        "{error}"
+    );
+
+    // With the MCP tools given, the registered tools that are missing are what is found next.
+    let error = common::with_fixture_mcp(common::with_fixture_token(
+        AgentDef::from_manifest(AGENT).unwrap(),
+    ))
+    .bind(tools(&["prepare_workspace", "run_checks", "ask_user"]))
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("`tools` names `fetch_page`")
+            || error.to_string().contains("`tools` names `read_diff`"),
         "{error}"
     );
 }

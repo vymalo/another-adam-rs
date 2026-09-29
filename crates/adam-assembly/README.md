@@ -9,20 +9,22 @@ with the agent and the file in the message, and never in the middle of a run.
 
 ## Where it sits
 
-Slices S6, S7, S9, S9b and S10 of the authoring layer, the meeting point of the "macro" track (`#[tool]`, `ToolSet`)
+Slices S6, S7, S9, S9b, S10 and S11 of the authoring layer, the meeting point of the "macro" track (`#[tool]`, `ToolSet`)
 and the "files" track (`adam-agent-fs`).
 
 ```text
 adam-agent-fs  (files -> manifest) ─┐
 adam-llm-agent (ToolSet, LlmAgent) ─┼─> adam-assembly ─> adam (facade)
 adam-model, adam-runtime ───────────┘        ▲
-adam-a2a  (feature a2a) ─────────────────────┘
+adam-a2a  (feature a2a) ─────────────────────┤
+adam-mcp  (feature mcp) ─────────────────────┘
 ```
 
 It depends on `adam-agent-fs`, `adam-llm-agent`, `adam-model`, `adam-runtime`, `adam-error`,
 `async-trait`, `serde_json`, `thiserror` and `url`, on the A2A client for remote subagents (`a2a-client-lf`,
 `a2a-lf`, `reqwest`, `tokio` for a once-cell, `secrecy` for the token, `tracing`), and on `adam-a2a` behind the
-feature `a2a`, and, behind the feature `dev` only, on [`notify`](https://crates.io/crates/notify) and `adam-core` (see
+feature `a2a`, on [`adam-mcp`](../adam-mcp/README.md) behind the feature `mcp` (the MCP client; see
+[MCP tools](#mcp-tools-feature-mcp)), and, behind the feature `dev` only, on [`notify`](https://crates.io/crates/notify) and `adam-core` (see
 [Dev reload](#dev-reload-feature-dev)). It has no `unsafe`. Its I/O is the skill tools (the bytes are read once at startup, or come
 from the binary) and the remote subagents' tool: the environment variable of `auth: bearer:VAR` at `bind`, and
 the network (agent card, `SendMessage`, `GetTask`) only when a call needs it.
@@ -52,7 +54,7 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 
 | Item | What |
 |---|---|
-| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `name()`, `manifest()`, `bind(ToolSet)` |
+| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`), `name()`, `manifest()`, `bind(ToolSet)` |
 | `IntoManifest` | `AgentManifest`, `&AgentManifest`, `EmbeddedAgent` and `&EmbeddedAgent` (what `include_agent!` gives; these bring the bytes of the skills' files) |
 | `SkillFiles` | the bytes of the files skills bundle (opaque: made by `IntoManifest` and `resources_from`) |
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
@@ -62,11 +64,11 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `Assembly` | `agents()`, `root()`, `register(RuntimeBuilder)`, `info()`, `remotes()`, `manifest()`, `card(url, version)` (feature `a2a`) |
 | `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog), `tools` (own, skill tools, then one per subagent, local or remote: what the model is offered), `skills`, `preloaded`, `limits`: what an `LlmAgent` was made from, comparable |
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
-| `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
+| `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `connect_mcp(&McpPolicy)` (feature `mcp`), `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
 | `Reloaded`, `ToolChange`, `ReloadError`, `WatchError` (feature `dev`) | what a reload did (`generation`, `changed`, `tool_changes`, `retired`), why it changed nothing (`Load(Error)` with `diagnostics()`, `NeedsRestart { added }`), why a watcher did not start |
 | `agent_dir`, `AGENT_DIR_ENV`, `AgentDef::from_dir` (feature `dev`) | the `ADAM_AGENT_DIR` override, and one `AgentDef` per agent of a directory |
 | `Error`, `Origin` | the closed error enum, and the agent and file every file-related variant carries |
-| `AliasProblem`, `TemplateProblem`, `SkillField`, `ToolClash`, `RemoteAuthProblem`, `RemoteUrlProblem` | closed enums inside `Error::ModelAlias`, `Error::Template`, `Error::UnknownSkill`, `Error::SubagentToolClash`, `Error::RemoteAuth` and `Error::RemoteUrl` |
+| `AliasProblem`, `TemplateProblem`, `SkillField`, `ToolClash`, `RemoteAuthProblem`, `RemoteUrlProblem` | closed enums inside `Error::ModelAlias`, `Error::Template`, `Error::UnknownSkill`, `Error::SubagentToolClash` (which may name a parent's MCP tool: `ToolClash::McpTool`), `Error::RemoteAuth` and `Error::RemoteUrl` |
 
 ## The stages
 
@@ -246,7 +248,8 @@ content.
 Off by default, so **a release build cannot read prompts from disk unless its author turned the feature on**
 (the `adam` facade re-exports it as `dev`); turning it on brings `notify` and logs a warning at startup.
 `LiveAssembly` does what `from_source`, `bind` and `model` do at startup, keeps the recipe, and does it again
-when a file changes. Tool code is Rust and still needs a rebuild (`cargo watch`); `mcp.json` tools are S11.
+when a file changes. Tool code is Rust and still needs a rebuild (`cargo watch`); `mcp.json` tools are connected
+once, at startup, and outlive reloads (see the paragraph on `mcp.json` below).
 
 ```rust
 use adam::assembly::LiveAssembly; // feature `dev`
@@ -330,6 +333,18 @@ the `ReloadError` (its `diagnostics()` are the loader's findings; a bind error s
 `ReloadError::Load(Error::UnknownTool { .. })`). The next good load clears it. Warnings of a load that
 succeeds are logged at `warn` (with `Strictness::Strict` they refuse the load instead).
 
+**`mcp.json` and reload (features `dev` and `mcp`).** `reload()` is synchronous and may run on the watcher's
+thread, where nothing can wait for a network, so a reload never connects. `LiveBuilder::connect_mcp(&policy).await`
+does it once, before `load()`: it reads the directory, applies the `configure` hooks added so far (so an `env` given
+there is what `${VAR}` sees), calls `AgentDef::connect_mcp` for each root and keeps the connections in the
+recipe. Every load then gives each definition its root's connections, after the hooks, so **connections outlive
+reloads**: a reload starts no process and opens no session (a test counts one `initialize` across reloads).
+The tools of an agent are discovered once, and a run in flight may already have called one, so an edit of an
+`mcp.json` is not applied: the reload hits `Error::McpChanged` (the connected file is no longer the agent's),
+which is `ReloadError::Load(..)` like any bind error, keeps the last good version, and whose message says to
+restart the process. Putting the file back makes the next reload succeed. An `mcp.json` added for an agent that
+had none is `McpNotConnected`, the same way.
+
 **The watcher.** `watch()` uses [`notify`](https://crates.io/crates/notify) on `agent/` and `agents/`
 recursively, ignores what cannot have changed a load (reads, access times, so a reload does not trigger the
 next), waits until the files have been quiet for the debounce (150 ms by default; an editor writes in several
@@ -346,7 +361,10 @@ MSRV 1.77; the API used is `recommended_watcher`, `Watcher::watch`, `RecursiveMo
 
 `Error` is a closed enum; every variant about the files carries an `Origin { agent, file }`, printed as
 ``agent `coder/reviewer` (agent/subagents/reviewer.md)``. All are `ErrorClass::Invalid` (the same input
-never succeeds) except `Manifest`, which keeps its source's class. `bind` and `model` return the first
+never succeeds) except `Manifest`, which keeps its source's class, and `Mcp`, which keeps the class of the MCP
+client's error in its `class` field (a server that is down is transient). `Mcp` is a variant of every build, with
+or without the feature `mcp`, and its `source` is an opaque `Box<dyn Error + Send + Sync>` (with the feature, an
+`adam_mcp::Error`: `source.downcast_ref::<adam_mcp::Error>()`), so that the feature adds nothing to the enum. `bind` and `model` return the first
 problem found, in the order of the tables above.
 
 ## Subagents
@@ -440,7 +458,103 @@ auth: bearer:BILLING_AGENT_TOKEN
 | an `a2a:` URL that is plain http to another machine (without the development switch) or has a user name or password | `RemoteUrl { origin, url, problem }` |
 | a remote named like a tool of the parent, like `load_skill`/`read_skill_file`, or like another subagent | `SubagentToolClash` |
 
-`mcp.json` and schedules stay in `Assembly::manifest()`. The seams for the next slices are in code, in one
+## MCP tools (feature `mcp`)
+
+An agent's `mcp.json` names MCP servers; their tools become tools of that agent, named `<server>__<tool>`.
+The client is [`adam-mcp`](../adam-mcp/README.md) (behind the feature `mcp`, off by default); this crate decides
+whose tools they are and checks them at `bind`.
+
+```rust
+use adam::mcp::McpPolicy; // feature `mcp` of `adam`
+
+let assembly = AgentDef::from_manifest(AGENT)?
+    .env("LINEAR_API_TOKEN", token())                    // what `${LINEAR_API_TOKEN}` in mcp.json reads
+    .connect_mcp(&McpPolicy::default().allow_stdio(true)).await?   // startup: every server, or an error
+    .bind(tools![PrepareWorkspace, RunChecks])?          // `tools: ["linear__*"]` selects among both
+    .state(Arc::new(env))
+    .model(model, "coder-large")?;
+```
+
+* **Per agent, not shared.** The tools come **only** from the `mcp.json` next to the agent's own instructions
+  (the root's for the root, a subagent directory's for that subagent). They are not added to the `ToolSet` given
+  to `bind`, so a subagent inherits none of its parent's, and two directories may each have a server called
+  `linear`, connected separately with their own headers. `connect_mcp` walks the root and every local subagent.
+* **Selection is `tools:`.** The catalog `tools:` selects from is the registered tools plus the agent's own MCP
+  tools, so `tools: [ask_user, "linear__*"]`, a misspelt name with its suggestion and `NoToolMatches` all work as
+  before. A root without `tools:` gets everything registered and its own MCP tools; a subagent that lists none
+  gets none, its own MCP tools included (decision D3).
+* **Fail closed.** An agent whose `mcp.json` lists servers must have been connected (or given tools with
+  `AgentDef::mcp_tools`, for a client of your own or a test): `Error::McpNotConnected { origin, servers }`
+  otherwise, and the message says what to call. `connect_mcp` itself fails at startup (`Error::Mcp { origin,
+  class, source }`, the agent and the `mcp.json` in `origin`) for anything `adam-mcp` refuses: an unset variable,
+  `type: sse`, a stdio server the policy does not allow, a server that is down, an allow-listed tool the server
+  lacks.
+* **The checks at `bind`,** in this order, per agent: connected or supplied (`McpNotConnected`); the connected
+  config is the agent's current `mcp.json` (`McpChanged`); each tool is named `<server>__<tool>` after a server
+  of **that agent's** file, and no name repeats (`McpForeignTool`, `DuplicateTool`); no MCP tool has the name of
+  a registered tool (`McpToolClash`); then `tools:` resolves against the catalog. A subagent named like an MCP
+  tool its parent selects is a `SubagentToolClash` with `ToolClash::McpTool { server }`. Tools given for an agent
+  the definition does not contain are `McpUnknownAgent`, with a suggestion, before anything else is checked.
+* **The environment.** `${VAR}` in the files reads `AgentDef::env` first and the process environment second, as
+  `auth: bearer:VAR` does, so one set of secrets serves remote subagents and MCP servers. Secrets stay
+  `SecretString`s in `adam-mcp`; none appears in a journal, state, event, log, `Debug`, error or tool result (a
+  test reads all of them). Put secrets in `headers`: a `${VAR}` in a `url` is refused unless the policy given to
+  `connect_mcp` says `allow_url_secrets(true)`, because the SDK logs URLs (see
+  [`adam-mcp`](../adam-mcp/README.md#security)).
+* **Durability.** A call runs inside the agent's journaled step `tool:CALL_ID`, so a replay of a committed call
+  returns the recorded result and does not call the server. A transition that fails *before* it commits (a
+  crash, a lost lease, a later tool of the same turn returning `Transient`) runs again from its start and calls
+  the server again: MCP has no idempotency key, so an MCP tool is **at-least-once**, and `adam-mcp` never turns
+  a failed call into `ToolError::Transient` (which would retry a call that may have run). The tests pin both
+  cases.
+* **The connections** live as long as the tools do, that is as long as the `Assembly` (drop it and the sessions
+  close and the child processes are killed). A server that dies mid-run is an error result for that call and
+  is reconnected once, on the next call, from the same recipe; the tools are never listed again.
+
+```mermaid
+sequenceDiagram
+  participant C as composition root
+  participant D as AgentDef
+  participant M as adam-mcp
+  participant B as bind
+  C->>D: from_manifest, env(..)
+  C->>D: connect_mcp(policy)
+  loop the root and each local subagent with servers in its mcp.json
+    D->>M: McpServers::connect(config, Env, policy)
+    M-->>D: the tools, or an error naming the server
+    D->>D: keep them for this agent with the config they came from
+  end
+  C->>B: bind(registered tools)
+  B->>B: per agent: connected, same file, names fit its servers, no clash
+  B->>B: tools: selects among registered and own MCP tools
+  B-->>C: BoundDef, or the first error
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Declared: mcp.json in the manifest
+  Declared --> Connected: connect_mcp
+  Declared --> Supplied: mcp_tools
+  Declared --> Refused: bind with neither (McpNotConnected)
+  Connected --> Bound: bind, same file
+  Connected --> Refused: the file changed (McpChanged)
+  Supplied --> Bound: bind, names fit the servers
+  Supplied --> Refused: a tool of no server of the file (McpForeignTool)
+  Bound --> [*]
+  Refused --> [*]
+```
+
+| Mistake | Error |
+|---|---|
+| `mcp.json` lists servers and nothing was connected or supplied | `McpNotConnected { origin, servers }`, at `bind` |
+| a server cannot be connected (variable, policy, network, allow-list) | `Mcp { origin, class, source }`, at `connect_mcp` (feature `mcp`; the variant itself is always there) |
+| the connected `mcp.json` is not the agent's current one (dev reload) | `McpChanged { origin }` |
+| a tool not named after a server of the agent's own `mcp.json` | `McpForeignTool { origin, tool, servers }` |
+| an MCP tool named like a registered tool | `McpToolClash { origin, tool }` |
+| `mcp_tools` for an agent the definition lacks | `McpUnknownAgent`, with a suggestion |
+| a subagent named like an MCP tool of its parent's selection | `SubagentToolClash` with `ToolClash::McpTool` |
+
+Schedules stay in `Assembly::manifest()`. The seams for the slices are in code, in one
 place each:
 
 | Slice | What plugs in | Where |
@@ -449,11 +563,11 @@ place each:
 | S9 subagents (built) | a `SubagentTool` per local child, the name checks, the asks-user refusal | `add_subagent_tools` and `refuse_asking_tools` in `def.rs`, in the same walk; the tool is `subagent.rs` |
 | S9b remote subagents (built) | a `RemoteSubagentTool` per remote child, through the same name checks | `add_subagent_tools` in `def.rs`; `RemoteSubagentTool::bind` and the tool are `remote.rs`; the deployment's choices (`env`, `allow_insecure_remotes`, `remote_timeout`) are `AgentDef` fields passed in as `RemoteSettings` |
 | S10 dev reload (built, feature `dev`) | `from_source` + `bind` + `model` again on a changed directory, swapped at a step boundary | `dev.rs`: a `Recipe` (the directory, the `ToolSet`, the model and the hooks that give `AgentDef` and `BoundDef` their values) that a reload runs again from the top; `AgentDef` and `BoundDef` are plain values, and a remote tool holds only plain values (URL, token, limits) until its first call, so a new bind is a new client |
-| S11 MCP tools | the discovered tools go into the `ToolSet` given to `bind`; `linear__*` patterns already match them | `AgentDef::bind`; `AgentDef::env` is where a `${VAR}` in `mcp.json` would read from too |
+| S11 MCP tools (built, feature `mcp`) | the tools of each agent's own `mcp.json`, joined to the catalog `tools:` selects from | `Walk::mcp_tools` and `Catalog::with` in `def.rs`, in the same walk (so `AgentInfo::tools` and the agent cannot disagree); the binding (per agent, with the config it was connected from) and its diagrams are `mcp.rs`; `connect_mcp` calls `adam-mcp`; `AgentDef::env` is where a `${VAR}` in `mcp.json` reads from too; `LiveBuilder::connect_mcp` keeps one binding per root for reloads |
 
 ## Tests
 
-`cargo test -p adam-assembly --all-features` (and without, for the compile-fail doctests of a build without `dev`):
+`cargo test -p adam-assembly --all-features` (and without, for the compile-fail doctests of a build without `dev` or `mcp`):
 
 * `tests/bind.rs`: unknown tool (the message asserted, the suggestion, the subagent's origin), patterns,
   default tool access, duplicate tools; unknown, unused and unset vars, values for undeclared vars and
@@ -461,6 +575,19 @@ place each:
 * `tests/model.rs`: alias resolution through three generations, alias errors, a deployment's alias list,
   missing state and state reaching a running tool, manifests by value and by reference, `from_source`
   for one agent, several agents and a directory with errors.
+* `tests/mcp.rs` (feature `mcp`, and `dev` for the last): a real MCP server (`adam-mcp-testkit`, streamable HTTP,
+  bearer token) and runs on `MockModel` through a `Runtime`: each agent gets its own `mcp.json` (two servers
+  both called `linear`, two tokens, each server called once with its own), patterns select MCP tools in the
+  file's order and the model is offered their descriptions and schemas, a clash with a registered tool and
+  with a subagent name, unconnected and failing servers name the agent and the `mcp.json` (an unset variable
+  sends no request, a stdio server without the policy, a server that is down), a parent run calls an MCP tool on
+  memory and PostgreSQL (the journal has `tool:c1`, the token is in no journal, state, event or `Debug`), a
+  committed call is not repeated when a later transition is retried, a transient failure later in the turn calls
+  the server again (at-least-once, documented), a server that went away is an error result and the run goes on,
+  and, with `dev`, a reload keeps the connections (one `initialize`) and refuses a changed `mcp.json`.
+* `tests/bind.rs` also covers `mcp.json` without the feature: unconnected servers fail closed (root and
+  subagent, with the file), tools given by hand bind like connected ones, a foreign tool name is refused, the
+  clashes and the unknown agent.
 * `tests/fixture.rs`: the fixture of [`adam-agent-fixture`](../adam-agent-fixture/README.md) (the valid
   directory of `adam-agent-fs`), embedded and read from disk, binds to equal `AgentInfo`s; each agent is
   bound as its files say; the root and a subagent run to the end on a `MockModel` through a `Runtime` on
@@ -505,8 +632,8 @@ place each:
   (a wait that would otherwise last an hour ends), and a rotated token is the one sent after it; one test
   with a real `notify` watcher on a temp directory (a burst of writes, a broken file, the fix) and a stop by
   drop. Unit tests in `dev.rs`: the pin bookkeeping of a slot, the event filter, the directory rules.
-* Without the feature the API does not exist: `compile_fail` doctests in `lib.rs` (and in `adam`), which run
-  when the crate is tested without `--all-features`.
+* Without the features the API does not exist: `compile_fail` doctests in `lib.rs` (and in `adam`) for `dev` and
+  for `mcp`, which run when the crate is tested without `--all-features`.
 * `tests/card.rs` (feature `a2a`): the card of the fixture against `tests/golden/card.json`
   (regenerate with `ADAM_UPDATE_GOLDEN=1`), the fallbacks and the missing description, and
   `AgentDef::card` equal to `Assembly::card`.

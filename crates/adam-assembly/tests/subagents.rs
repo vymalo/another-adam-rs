@@ -264,19 +264,20 @@ async fn the_embedded_fixture_runs_a_subagent_end_to_end() {
         )])
         .push_text("LGTM")
         .push_text("Reviewed: LGTM");
-    let assembly = common::with_fixture_token(AgentDef::from_manifest(AGENT).unwrap())
-        .bind(tools(&[
-            "prepare_workspace",
-            "run_checks",
-            "ask_user",
-            "linear__list_issues",
-            "read_diff",
-            "list_files",
-            "fetch_page",
-        ]))
-        .unwrap()
-        .model(model.clone(), "gateway-default")
-        .unwrap();
+    let assembly = common::with_fixture_mcp(common::with_fixture_token(
+        AgentDef::from_manifest(AGENT).unwrap(),
+    ))
+    .bind(tools(&[
+        "prepare_workspace",
+        "run_checks",
+        "ask_user",
+        "read_diff",
+        "list_files",
+        "fetch_page",
+    ]))
+    .unwrap()
+    .model(model.clone(), "gateway-default")
+    .unwrap();
     let rt = runtime_on(&assembly, Arc::new(MemoryStore::new()));
     let worker = spawn_worker(&rt);
     let run = rt

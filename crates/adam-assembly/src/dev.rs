@@ -29,6 +29,8 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::assembly::{AgentInfo, BoundDef};
 use crate::def::AgentDef;
 use crate::error::Error;
+#[cfg(feature = "mcp")]
+use crate::mcp::McpBinding;
 
 /// The environment variable that replaces the directory a caller names, when the feature `dev` is
 /// on: `ADAM_AGENT_DIR=./my-agent cargo run`.
@@ -101,6 +103,10 @@ struct Recipe {
     model: DynModel,
     alias: String,
     debounce: Duration,
+    /// The MCP connections made once by [`LiveBuilder::connect_mcp`], by root agent: given to
+    /// every definition a load makes, so a reload reuses them.
+    #[cfg(feature = "mcp")]
+    mcp: BTreeMap<String, McpBinding>,
 }
 
 /// One agent of a load, ready to install.
@@ -132,6 +138,11 @@ impl Recipe {
             let mut def = AgentDef::from_manifest(manifest)?.resources_from(&dir)?;
             for hook in &self.defs {
                 def = hook(def);
+            }
+            // After the hooks: the connections were made once, and a hook must not replace them.
+            #[cfg(feature = "mcp")]
+            if let Some(binding) = self.mcp.get(def.name()) {
+                def = def.with_mcp_binding(binding.clone());
             }
             let mut bound = def.bind(self.tools.clone())?;
             for hook in &self.bounds {
@@ -494,6 +505,43 @@ impl LiveBuilder {
         self
     }
 
+    /// Connect to the MCP servers of the agents' `mcp.json` files, once, now. Only with the
+    /// features `dev` and `mcp`.
+    ///
+    /// Reads the directory, applies the [`configure`](Self::configure) hooks added so far (an
+    /// [`env`](AgentDef::env) given there is what `${VAR}` sees), and calls
+    /// [`AgentDef::connect_mcp`] for each root. The connections are kept and given to every load,
+    /// so **they outlive reloads**: a reload does not start a process or open a session. Add the
+    /// hooks that give the environment before this call.
+    ///
+    /// A reload whose `mcp.json` differs from the one that was connected is refused, as any load
+    /// error is (the last good version stays, and the message says to restart): tools are
+    /// discovered once, at startup, and are not looked up again.
+    ///
+    /// The connections are made here and not in [`load`](Self::load) or
+    /// [`reload`](LiveAssembly::reload) because those are synchronous, and a reload may run on the
+    /// thread of the file watcher: nothing there can wait for a network.
+    ///
+    /// # Errors
+    ///
+    /// Whatever loading the files and [`AgentDef::connect_mcp`] refuse.
+    #[cfg(feature = "mcp")]
+    pub async fn connect_mcp(mut self, policy: &adam_mcp::McpPolicy) -> Result<Self, Error> {
+        let dir = self.recipe.dir();
+        let package = dir.load()?.into_package(self.recipe.strictness)?;
+        for manifest in package.agents {
+            let mut def = AgentDef::from_manifest(manifest)?;
+            for hook in &self.recipe.defs {
+                def = hook(def);
+            }
+            let def = def.connect_mcp(policy).await?;
+            self.recipe
+                .mcp
+                .insert(def.name().to_owned(), def.mcp_binding().clone());
+        }
+        Ok(self)
+    }
+
     /// Load the files for the first time. An error here is a startup error, as it is for
     /// [`AgentDef::bind`]: there is no last good version to keep yet.
     ///
@@ -572,7 +620,10 @@ impl LiveBuilder {
 ///
 /// The feature is off by default, so a release build cannot read prompts from disk unless its
 /// author turned it on; turning it on logs a warning at startup. Tool code is Rust and changes
-/// with a rebuild, and `mcp.json` tools are not part of this slice.
+/// with a rebuild. `mcp.json` tools are connected once, at startup
+/// (`LiveBuilder::connect_mcp`, feature `mcp`), and the connections outlive reloads: an edit of
+/// `mcp.json` is refused with a message that says to restart, because a tool discovered at startup
+/// is not looked up again (and a run in flight may have called it).
 ///
 /// ```
 /// use std::sync::Arc;
@@ -634,6 +685,8 @@ impl LiveAssembly {
                 model,
                 alias: alias.into(),
                 debounce: DEFAULT_DEBOUNCE,
+                #[cfg(feature = "mcp")]
+                mcp: BTreeMap::new(),
             },
         }
     }

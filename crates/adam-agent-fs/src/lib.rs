@@ -59,8 +59,8 @@ pub use manifest::{
 };
 pub use schema::{
     AgentFrontmatter, Card, CardSkill, EnvRef, Limits, McpConfig, McpServer, ModelRef, RemoteKind,
-    ScheduleFrontmatter, SkillFrontmatter, SkillSelection, ToolList, is_agent_name, is_env_name,
-    is_skill_name, is_tool_name,
+    ScheduleFrontmatter, Segment, SkillFrontmatter, SkillSelection, ToolList, is_agent_name,
+    is_env_name, is_skill_name, is_tool_name, split_env_references,
 };
 pub use source::{Dir, ManifestSource};
 
