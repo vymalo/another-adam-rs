@@ -67,7 +67,8 @@ store.
   runtime stores it as JSON and cannot check the types agree across
   processes. A mismatch starts the run, then fails it as permanent on the
   worker's first step, with an error that names the agent and points at the
-  starter. `adam_llm_agent::LlmStarter` is the starter of an `LlmAgent`.
+  starter. `adam_llm_agent::LlmStarter` is the starter of an `LlmAgent`, and
+  `adam_coder::CoderStarter` that of the coder agent.
 
 ```rust
 let runtime = Runtime::builder(store)   // store: adam_core::DynStore
