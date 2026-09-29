@@ -178,9 +178,12 @@ impl FaultyStore {
             .insert((method, run), Rule { remaining, mode });
     }
 
-    /// Stop failing `method`.
+    /// Stop failing `method`: its method-scoped script and every run-scoped script for it
+    /// ([`fail_run`](Self::fail_run)). Other methods' scripts and the counters are kept.
     pub fn heal(&self, method: Method) {
-        self.plan().rules.remove(&method);
+        let mut plan = self.plan();
+        plan.rules.remove(&method);
+        plan.run_rules.retain(|(m, _), _| *m != method);
     }
 
     /// Stop failing every method, run-scoped faults included. Counters are kept.
@@ -486,6 +489,24 @@ mod tests {
         let loaded = store.load_run(run.id).await.unwrap().unwrap();
         assert_eq!((loaded.version, loaded.status), (2, RunStatus::Done));
         store.heal_all();
+    }
+
+    #[tokio::test]
+    async fn heal_clears_the_run_scoped_scripts_of_that_method_only() {
+        let store = faulty();
+        let run = create(&store).await.expect("create");
+        store.fail_run(Method::LoadRun, run.id, 5);
+        store.fail_run(Method::CommitRun, run.id, 5);
+        assert!(store.load_run(run.id).await.is_err());
+        store.heal(Method::LoadRun);
+        assert!(store.load_run(run.id).await.expect("healed").is_some());
+        let update = RunUpdate::new(RunStatus::Done, json!({"n": 1}));
+        let err = store
+            .commit_run(run.id, 1, update)
+            .await
+            .expect_err("another method's run-scoped script is kept");
+        assert!(is_injected(&err));
+        assert_eq!(store.injected(Method::LoadRun), 1);
     }
 
     #[tokio::test]
