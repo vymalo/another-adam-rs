@@ -19,6 +19,7 @@ adam-workspace = { path = "crates/adam-workspace", version = "0.1.0" }
 a2a-client-lf = "0.2"
 a2a-lf = "0.3"
 a2a-server-lf = "0.4"
+agent-client-protocol = "2.2"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
@@ -35,6 +36,7 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
