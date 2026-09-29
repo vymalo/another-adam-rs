@@ -13,10 +13,11 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (22
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (26
   cases: create/load, state round trip, CAS conflicts, concurrent commits,
   journal ordering and first-writer-wins, claim rules and exclusivity, lease
-  expiry/renew/release, one open run per conversation, purge).
+  expiry/renew/release, pinned claims and the run owner, one open run per
+  conversation, purge).
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.
@@ -46,6 +47,10 @@ failure (see `adam_core::testing`).
 ## Tests
 
 * `tests/memory.rs`: runs the suite against `MemoryStore` (always on).
+* Pinned-claim cases (`ClaimScope::Pinned`): an owned run is never given to another worker, not
+  after a release, a commit or an expired lease; the first pinned claim sets the owner and an
+  `Any` claim neither reads nor sets it; 4 workers racing on 48 runs split them exactly once and
+  each gets back exactly its own.
 * `src/fault.rs`: unit tests and a doctest of `FaultyStore`.
 
 The Postgres and MongoDB adapters run the suite from their own

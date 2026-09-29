@@ -13,7 +13,9 @@ use futures::{FutureExt, StreamExt};
 use serde_json::Value;
 use tokio::task::{JoinHandle, JoinSet};
 
-use adam_core::{Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError, StoreResult};
+use adam_core::{
+    ClaimScope, Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError, StoreResult,
+};
 use adam_error::{Classify, ErrorClass, report};
 
 use crate::agent::{AgentError, Transition};
@@ -88,6 +90,7 @@ impl Runtime {
                     .claim_due(
                         &agents,
                         &inner.cfg.worker_id,
+                        ClaimScope::Any,
                         inner.clock.now(),
                         inner.cfg.lease_ttl,
                         free,

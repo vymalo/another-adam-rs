@@ -30,8 +30,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use adam_core::{
-    DynStore, JournalEntry, Lease, NewRun, RunId, RunRecord, RunUpdate, Store, StoreError,
-    StoreResult,
+    ClaimScope, DynStore, JournalEntry, Lease, NewRun, RunId, RunRecord, RunUpdate, Store,
+    StoreError, StoreResult,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -274,13 +274,14 @@ impl Store for FaultyStore {
         &self,
         agents: &[String],
         worker: &str,
+        scope: ClaimScope,
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
         self.run(
             Method::ClaimDue,
-            self.inner.claim_due(agents, worker, now, ttl, limit),
+            self.inner.claim_due(agents, worker, scope, now, ttl, limit),
         )
         .await
     }
@@ -406,6 +407,7 @@ mod tests {
             .claim_due(
                 &["fault-test".to_owned()],
                 "w",
+                adam_core::ClaimScope::Any,
                 adam_core::store::now(),
                 Duration::from_secs(5),
                 1,

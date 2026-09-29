@@ -225,6 +225,25 @@ impl RunRecord {
     }
 }
 
+/// Whose runs a claim may take (see [`Store::claim_due`]).
+///
+/// The enum is closed on purpose: a new scope must fail to compile in every store and every
+/// runtime that matches on it, so none of them treats it as a default.
+///
+/// A run has an *owner*: the worker that first claimed it with [`ClaimScope::Pinned`]. The
+/// owner is store-side scheduling data, not part of the run's state, and the pure state machine
+/// never sees it. See ADR 0002 (`docs/decisions/0002-workspace-placement.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum ClaimScope {
+    /// Any due run, whoever owns it. The owner is neither read nor written. This is how claiming
+    /// worked before owners existed, and what workers that share their workspace use.
+    #[default]
+    Any,
+    /// Only runs without an owner, or owned by the claiming worker. A claimed run without an
+    /// owner gets the claiming worker as its owner and keeps it until the run is deleted.
+    Pinned,
+}
+
 /// A run claimed by a worker until `until`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Lease {
@@ -429,10 +448,16 @@ pub trait Store: Send + Sync + 'static {
     /// `now + ttl`, earliest `sched_at` first. A run is claimable when it is
     /// due (`sched_at <= now`) and has no unexpired lease. Concurrent callers
     /// never receive the same run while its lease is valid.
+    ///
+    /// `scope` decides whose runs are claimable (see [`ClaimScope`]): with
+    /// [`ClaimScope::Pinned`] a run that another worker owns is skipped, and
+    /// the first claim of a run without an owner makes `worker` its owner.
+    /// [`Store::release_lease`] never clears the owner.
     async fn claim_due(
         &self,
         agents: &[String],
         worker: &str,
+        scope: ClaimScope,
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,

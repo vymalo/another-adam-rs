@@ -635,8 +635,8 @@ sequenceDiagram
     participant K as EventSink
 
     loop until shutdown
-        W->>DB: claim_due(agents, worker id, now, lease ttl, free slots)
-        DB-->>W: leases: due runs with no live lease, earliest first
+        W->>DB: claim_due(agents, worker id, claim scope, now, lease ttl, free slots)
+        DB-->>W: leases: due runs with no live lease (and, if pinned, not owned by another worker), earliest first
         W->>T: spawn advance(lease), at most concurrency at once
         T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every poll interval)
         T->>T: decode the Envelope, build a Ctx<br/>with seq, inbox and attempt
@@ -850,7 +850,7 @@ stateDiagram-v2
     Leased --> Unleased: release_lease after the commit, or after a rejected commit
     Leased --> Expired: worker died or hung, or renewal kept failing
     Leased --> Expired: store trouble while stepping, lease kept and not released
-    Expired --> Leased: claim_due by any worker
+    Expired --> Leased: claim_due by any worker (a pinned claim: only by the run's owner)
     Unleased --> [*]: run reached Done or Failed
 ```
 

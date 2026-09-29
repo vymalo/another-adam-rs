@@ -1351,6 +1351,7 @@ mod cases {
             .claim_due(
                 std::slice::from_ref(&name),
                 "someone-else",
+                adam_core::ClaimScope::Any,
                 adam_core::store::now(),
                 Duration::from_secs(30),
                 10,

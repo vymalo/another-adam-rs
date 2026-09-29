@@ -25,7 +25,7 @@ accept the poll latency.
 * `MongoStore::new(database)`: reuse your application's `Database` handle.
 * `MongoStore::with_collection_prefix(prefix)`: collection-name prefix
   (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
-* `MongoStore::database()`, `SCHEMA_VERSION`.
+* `MongoStore::database()`, `SCHEMA_VERSION` (2).
 * `codec::{json_to_bson, bson_to_json, encode_key, decode_key}`: the reversible key escaping
   (`$ref`, dotted, empty keys, NUL) applied to run state. Ordinary keys are
   stored verbatim, so `state.messages.0.role` is still a valid query path.
@@ -48,6 +48,19 @@ The guarantee table is in the [root README](../../README.md#how-each-adapter-gua
 *Unverified:* the "MongoDB 5.0+" floor is the oldest server CI runs against
 (`conformance` job), not a documented driver guarantee. The `mongodb` driver
 requirement is `3.9` (verified 2026-09-29, `Cargo.toml`).
+
+## Schema version and the owner field
+
+`SCHEMA_VERSION` is 2. Version 2 adds an `owner` field to run documents, set by the first pinned
+claim (`ClaimScope::Pinned`, see
+[`adam-core`](../adam-core/README.md#claim-scope-and-the-run-owner)). No data is rewritten: a
+document without the field reads as `owner: null` (`{ owner: null }` matches a missing field), so
+version 1 documents are unowned. `migrate()` only raises the `schema_version` document to 2
+(`$lt` guard, never lowered). The pinned claim adds `$and: [{ $or: [{ owner: null }, { owner:
+worker }] }]` to the candidate filter **and** to the `updateMany` filter, which MongoDB
+re-evaluates per document under its write lock, and `$set`s `owner` in that same `updateMany`. So
+two workers cannot both take an unowned run, and the owner is written atomically with the lease.
+`release_lease` leaves `owner` alone.
 
 ## Errors
 
@@ -74,7 +87,8 @@ None.
 
 ## Tests
 
-`tests/conformance.rs` runs the shared suite; `src/codec.rs` has property
+`tests/conformance.rs` runs the shared suite and checks that a version 1 document (no `owner`
+field) is claimable and then pinned; `src/codec.rs` has property
 tests of the key escaping; `src/lib.rs` has unit tests of the error classes
 (`driver_errors_are_classified_by_what_they_mean`,
 `the_driver_error_is_kept_as_the_source`).

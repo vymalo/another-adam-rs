@@ -16,10 +16,11 @@ database driver.
 
 | Item | What |
 |---|---|
-| `Store` (trait) | `migrate`, `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due`, `renew_lease`, `release_lease`, `purge_finished` |
+| `Store` (trait) | `migrate`, `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope`), `renew_lease`, `release_lease`, `purge_finished` |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
 | `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
+| `ClaimScope` | `Any` (default) or `Pinned`, the scope of a `claim_due`. Closed: no `#[non_exhaustive]` |
 | `Lease` | a run claimed by a worker until a deadline |
 | `StoreError`, `StoreResult` | `AlreadyExists`, `NotFound`, `Conflict`, `ConversationBusy`, `NonDeterminism`, `InvalidInput`, `Corrupt`, `Backend { class, source }`; `#[non_exhaustive]`, see *Errors* |
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
@@ -41,6 +42,25 @@ let run = store
 
 The semantics (CAS commits, first-writer-wins journal, leases, one open run
 per conversation) are described in the [root README](../../README.md#the-model).
+
+## Claim scope and the run owner
+
+`Store::claim_due(agents, worker, scope, now, ttl, limit)` takes a closed
+`ClaimScope`:
+
+| Scope | Claimable runs | Owner |
+|---|---|---|
+| `Any` (default) | every due run without a live lease | neither read nor written: claiming works as before owners existed |
+| `Pinned` | due runs without a live lease **and** with no owner or with `worker` as owner | the first claim of a run without an owner sets `worker` as the owner |
+
+A run's *owner* is scheduling data next to the lease, not part of `RunRecord` or the run state.
+`release_lease` and `commit_run` leave it alone, so a released run comes back only to the same
+worker. It is never cleared: a pinned run whose owner is gone is stranded (nothing adopts it;
+see [ADR 0002](../../docs/decisions/0002-workspace-placement.md)). `adam-core` does not know
+about `Placement`; the host maps `Placement::pins_runs()` to `ClaimScope::Pinned`
+([`adam-host`](../adam-host/README.md)). The signature change is breaking for anyone who
+implements `Store`; the conformance cases in
+[`adam-store-testkit`](../adam-store-testkit/README.md) prove an implementation.
 
 ## Errors
 
