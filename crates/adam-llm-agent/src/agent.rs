@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use adam_model::{
-    DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse, ToolCall, ToolSpec,
+    Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse, ToolCall,
+    ToolSpec,
 };
 use adam_runtime::{Agent, AgentError, Ctx, Inbound, RunEvent, Transition};
 use async_trait::async_trait;

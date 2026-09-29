@@ -90,8 +90,8 @@ struct Plan {
     injected: HashMap<Method, u64>,
 }
 
-/// The error a fault produces: a [`StoreError::Backend`] whose message starts
-/// with `injected store fault`.
+/// The error a fault produces: the source of a transient [`StoreError::Backend`], with the
+/// message `injected store fault in <method>`.
 #[derive(Debug)]
 struct Injected(Method);
 
@@ -337,7 +337,8 @@ mod tests {
         for _ in 0..2 {
             let err = create(&store).await.expect_err("scripted fault");
             assert!(is_injected(&err), "{err}");
-            assert!(err.to_string().contains("injected store fault"));
+            let source = std::error::Error::source(&err).expect("the fault is the source");
+            assert!(source.to_string().contains("injected store fault"));
         }
         assert!(create(&store).await.is_ok());
         assert!(create(&store).await.is_ok());

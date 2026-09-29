@@ -229,6 +229,7 @@ dependencies = [
 name = "adam-model"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "async-trait",
  "futures",
  "serde",
@@ -241,6 +242,7 @@ dependencies = [
 name = "adam-model-openai"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "adam-model",
  "async-trait",
  "futures",

@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use adam_model::{
-    FinishReason, Message, ModelClient, ModelDelta, ModelError, ModelRequest, ToolChoice, ToolSpec,
-    Usage,
+    Classify, ErrorClass, FinishReason, Message, ModelClient, ModelDelta, ModelError, ModelRequest,
+    ToolChoice, ToolSpec, Usage,
 };
 use adam_model_openai::{MaxTokensField, OpenAiCompatible, OpenAiConfig};
 use futures::StreamExt;
@@ -221,7 +221,7 @@ async fn malformed_tool_call_json_is_a_protocol_error() {
     )
     .await;
     let err = client(&server).complete(request()).await.unwrap_err();
-    assert!(matches!(err, ModelError::Protocol(_)), "{err:?}");
+    assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
 }
 
 #[tokio::test]
@@ -233,7 +233,7 @@ async fn unparseable_body_is_a_protocol_error() {
     )
     .await;
     let err = client(&server).complete(request()).await.unwrap_err();
-    assert!(matches!(err, ModelError::Protocol(_)), "{err:?}");
+    assert!(matches!(err, ModelError::Protocol { .. }), "{err:?}");
 }
 
 // ---------------------------------------------------------------- streaming --
@@ -345,7 +345,10 @@ async fn stream_malformed_tool_arguments_is_a_protocol_error() {
     .await;
     let items = collect(client(&server).stream(request()).await.unwrap()).await;
     let last = items.last().expect("items");
-    assert!(matches!(last, Err(ModelError::Protocol(_))), "{items:?}");
+    assert!(
+        matches!(last, Err(ModelError::Protocol { .. })),
+        "{items:?}"
+    );
     assert!(
         !items
             .iter()
@@ -364,7 +367,7 @@ async fn truncated_stream_is_a_protocol_error_not_a_fabricated_response() {
     let items = collect(client(&server).stream(request()).await.unwrap()).await;
     assert!(matches!(items[0], Ok(ModelDelta::Text(_))));
     assert!(
-        matches!(items.last(), Some(Err(ModelError::Protocol(_)))),
+        matches!(items.last(), Some(Err(ModelError::Protocol { .. }))),
         "{items:?}"
     );
     assert!(
@@ -387,7 +390,7 @@ async fn in_band_stream_error_is_surfaced() {
     .await;
     let items = collect(client(&server).stream(request()).await.unwrap()).await;
     assert!(
-        matches!(items.last(), Some(Err(ModelError::Transient(_)))),
+        matches!(items.last(), Some(Err(ModelError::Transient { .. }))),
         "{items:?}"
     );
 }
@@ -403,12 +406,8 @@ async fn stream_http_errors_fail_before_the_stream_starts() {
     let Err(err) = client(&server).stream(request()).await else {
         panic!("expected an error")
     };
-    assert_eq!(
-        err,
-        ModelError::RateLimited {
-            retry_after: Some(Duration::from_secs(3))
-        }
-    );
+    assert_eq!(err.class(), ErrorClass::RateLimited);
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(3)));
 }
 
 // ------------------------------------------------------------- error mapping --
@@ -422,12 +421,8 @@ async fn status_error(template: ResponseTemplate) -> ModelError {
 #[tokio::test]
 async fn rate_limit_with_retry_after_seconds() {
     let err = status_error(ResponseTemplate::new(429).insert_header("Retry-After", "3")).await;
-    assert_eq!(
-        err,
-        ModelError::RateLimited {
-            retry_after: Some(Duration::from_secs(3))
-        }
-    );
+    assert_eq!(err.class(), ErrorClass::RateLimited);
+    assert_eq!(err.retry_after(), Some(Duration::from_secs(3)));
     assert!(err.is_retryable());
 }
 
@@ -452,18 +447,24 @@ async fn rate_limit_with_retry_after_http_date() {
 #[tokio::test]
 async fn rate_limit_without_retry_after() {
     let err = status_error(ResponseTemplate::new(429)).await;
-    assert_eq!(err, ModelError::RateLimited { retry_after: None });
+    assert!(
+        matches!(err, ModelError::RateLimited { retry_after: None }),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
 async fn server_errors_are_transient() {
     for status in [500, 502, 503, 504] {
         let err = status_error(ResponseTemplate::new(status)).await;
-        assert!(matches!(err, ModelError::Transient(_)), "{status}: {err:?}");
+        assert!(
+            matches!(err, ModelError::Transient { .. }),
+            "{status}: {err:?}"
+        );
         assert!(err.is_retryable());
     }
     let err = status_error(ResponseTemplate::new(408)).await;
-    assert!(matches!(err, ModelError::Transient(_)), "{err:?}");
+    assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
 }
 
 #[tokio::test]
@@ -480,7 +481,7 @@ async fn other_client_errors_are_invalid_request() {
     for status in [400, 404, 409, 422] {
         let err = status_error(ResponseTemplate::new(status)).await;
         assert!(
-            matches!(err, ModelError::InvalidRequest(_)),
+            matches!(err, ModelError::InvalidRequest { .. }),
             "{status}: {err:?}"
         );
     }
@@ -537,11 +538,11 @@ async fn slow_server_times_out_as_transient() {
     .await;
     let client = client_with(&server, Duration::from_millis(200));
     let err = client.complete(request()).await.unwrap_err();
-    assert!(matches!(err, ModelError::Transient(_)), "{err:?}");
+    assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
     let Err(err) = client.stream(request()).await else {
         panic!("expected a timeout")
     };
-    assert!(matches!(err, ModelError::Transient(_)), "{err:?}");
+    assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
 }
 
 #[tokio::test]
@@ -553,7 +554,18 @@ async fn connection_refused_is_transient() {
     let config = OpenAiConfig::new(format!("http://{addr}/v1"), SecretString::from(KEY));
     let client = OpenAiCompatible::new(config).unwrap();
     let err = client.complete(request()).await.unwrap_err();
-    assert!(matches!(err, ModelError::Transient(_)), "{err:?}");
+    assert!(matches!(err, ModelError::Transient { .. }), "{err:?}");
+    assert_eq!(err.class(), ErrorClass::Transient);
+    assert!(err.is_retryable());
+
+    // The transport error is the source, not flattened into the message; the chain has it.
+    let source = std::error::Error::source(&err).expect("a transport source");
+    assert!(
+        source.downcast_ref::<reqwest::Error>().is_some(),
+        "{source:?}"
+    );
+    assert_eq!(err.to_string(), "transient model error: connection failed");
+    assert!(adam_error::report(&err).len() > err.to_string().len());
 }
 
 #[tokio::test]
@@ -574,7 +586,7 @@ async fn invalid_requests_never_reach_the_network() {
     let mut req = ModelRequest::new("m");
     req.tool_choice = ToolChoice::Required; // no tools
     let err = client(&server).complete(req).await.unwrap_err();
-    assert!(matches!(err, ModelError::InvalidRequest(_)));
+    assert!(matches!(err, ModelError::InvalidRequest { .. }));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -592,5 +604,25 @@ async fn usable_through_dyn_model() {
     assert_eq!(
         model.complete(request()).await.unwrap().message.text(),
         "ok"
+    );
+}
+
+// ------------------------------------------------------------ source chains --
+
+/// A body that is not JSON is a protocol error that keeps the parser's error as its source.
+#[tokio::test]
+async fn a_malformed_body_keeps_the_parser_error_as_its_source() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_string("not json"),
+    )
+    .await;
+    let err = client(&server).complete(request()).await.unwrap_err();
+    assert_eq!(err.class(), ErrorClass::Corrupt, "{err:?}");
+    let source = std::error::Error::source(&err).expect("a parser source");
+    assert!(
+        source.downcast_ref::<serde_json::Error>().is_some(),
+        "{source:?}"
     );
 }

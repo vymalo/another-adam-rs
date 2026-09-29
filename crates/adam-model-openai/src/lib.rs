@@ -27,7 +27,7 @@
 //!
 //! * **No retries.** Failures are mapped onto [`adam_model::ModelError`] and
 //!   returned; the runtime decides whether to retry
-//!   ([`ModelError::is_retryable`](adam_model::ModelError::is_retryable)).
+//!   ([`Classify::is_retryable`](adam_model::Classify::is_retryable)).
 //!   `Retry-After` (seconds or HTTP-date) is surfaced in
 //!   [`ModelError::RateLimited`](adam_model::ModelError::RateLimited).
 //! * **Timeouts.** [`OpenAiConfig::timeout`] bounds a whole `complete` call.
@@ -61,6 +61,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime};
 
+use adam_error::{BoxError, Classify, ErrorClass};
 use adam_model::{ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
@@ -120,11 +121,22 @@ pub enum MaxTokensField {
 }
 
 /// The configuration could not be turned into a client.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Classified as [`ErrorClass::Invalid`] (the configuration is wrong), except
+/// [`Client`](Self::Client), which is [`ErrorClass::Internal`]. No message carries the URL or
+/// the key, which may hold credentials.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OpenAiConfigError {
     /// `base_url` is not an absolute http(s) URL.
-    #[error("invalid base_url: {0}")]
-    InvalidBaseUrl(String),
+    #[error("invalid base_url: {reason}")]
+    InvalidBaseUrl {
+        /// What is wrong with it.
+        reason: String,
+        /// The parser's own error, when there is one.
+        #[source]
+        source: Option<BoxError>,
+    },
     /// An entry of `extra_headers` is not a valid HTTP header.
     #[error("invalid header `{0}`")]
     InvalidHeader(String),
@@ -132,8 +144,19 @@ pub enum OpenAiConfigError {
     #[error("api_key is not a valid bearer token")]
     InvalidApiKey,
     /// The HTTP client could not be built (for example, no TLS backend).
-    #[error("could not build the HTTP client: {0}")]
-    Client(String),
+    #[error("could not build the HTTP client")]
+    Client(#[source] BoxError),
+}
+
+impl Classify for OpenAiConfigError {
+    fn class(&self) -> ErrorClass {
+        match self {
+            Self::InvalidBaseUrl { .. } | Self::InvalidHeader(_) | Self::InvalidApiKey => {
+                ErrorClass::Invalid
+            }
+            Self::Client(_) => ErrorClass::Internal,
+        }
+    }
 }
 
 /// A [`ModelClient`] for any OpenAI-compatible chat-completions endpoint.
@@ -161,12 +184,15 @@ impl OpenAiCompatible {
     /// Build a client. Validates the URL and headers; makes no network call.
     pub fn new(config: OpenAiConfig) -> Result<Self, OpenAiConfigError> {
         let base = config.base_url.trim().trim_end_matches('/');
-        let parsed = reqwest::Url::parse(base)
-            .map_err(|e| OpenAiConfigError::InvalidBaseUrl(e.to_string()))?;
+        let parsed = reqwest::Url::parse(base).map_err(|e| OpenAiConfigError::InvalidBaseUrl {
+            reason: e.to_string(),
+            source: Some(Box::new(e)),
+        })?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-            return Err(OpenAiConfigError::InvalidBaseUrl(
-                "expected an absolute http(s) URL".into(),
-            ));
+            return Err(OpenAiConfigError::InvalidBaseUrl {
+                reason: "expected an absolute http(s) URL".into(),
+                source: None,
+            });
         }
 
         let mut headers = HeaderMap::new();
@@ -193,7 +219,7 @@ impl OpenAiCompatible {
             // Never replay a POST carrying credentials somewhere else.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|e| OpenAiConfigError::Client(e.without_url().to_string()))?;
+            .map_err(|e| OpenAiConfigError::Client(Box::new(e.without_url())))?;
 
         Ok(Self {
             http,
@@ -225,7 +251,7 @@ impl OpenAiCompatible {
         // For streams the timeout covers only the wait for response headers.
         let response = tokio::time::timeout(self.timeout, request.send())
             .await
-            .map_err(|_| ModelError::Transient(format!("no response within {:?}", self.timeout)))?
+            .map_err(|_| ModelError::transient(format!("no response within {:?}", self.timeout)))?
             .map_err(transport_error)?;
 
         let status = response.status();
@@ -250,13 +276,13 @@ fn transport_error(e: reqwest::Error) -> ModelError {
     // The URL is not secret, but it is noise; the key is never in it.
     let e = e.without_url();
     if e.is_timeout() {
-        ModelError::Transient(format!("request timed out: {e}"))
+        ModelError::transient("request timed out").with_source(e)
     } else if e.is_connect() {
-        ModelError::Transient(format!("connection failed: {e}"))
+        ModelError::transient("connection failed").with_source(e)
     } else if e.is_builder() {
-        ModelError::InvalidRequest(e.to_string())
+        ModelError::invalid_request("the request could not be built").with_source(e)
     } else {
-        ModelError::Transient(format!("transport error: {e}"))
+        ModelError::transient("transport error").with_source(e)
     }
 }
 
@@ -323,11 +349,46 @@ mod tests {
             assert!(
                 matches!(
                     OpenAiCompatible::new(config(bad)),
-                    Err(OpenAiConfigError::InvalidBaseUrl(_))
+                    Err(OpenAiConfigError::InvalidBaseUrl { .. })
                 ),
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn config_error_class_table() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("build")]
+        struct Build;
+        // Exhaustive: a new variant forces a class decision here.
+        let expected = |e: &OpenAiConfigError| match e {
+            OpenAiConfigError::InvalidBaseUrl { .. } => ErrorClass::Invalid,
+            OpenAiConfigError::InvalidHeader(_) => ErrorClass::Invalid,
+            OpenAiConfigError::InvalidApiKey => ErrorClass::Invalid,
+            OpenAiConfigError::Client(_) => ErrorClass::Internal,
+        };
+        for e in [
+            OpenAiConfigError::InvalidBaseUrl {
+                reason: "x".into(),
+                source: None,
+            },
+            OpenAiConfigError::InvalidHeader("x".into()),
+            OpenAiConfigError::InvalidApiKey,
+            OpenAiConfigError::Client(Box::new(Build)),
+        ] {
+            assert_eq!(e.class(), expected(&e), "{e}");
+            assert!(!e.is_retryable());
+        }
+        let e = OpenAiCompatible::new(config("not a url")).unwrap_err();
+        assert!(matches!(
+            e,
+            OpenAiConfigError::InvalidBaseUrl {
+                source: Some(_),
+                ..
+            }
+        ));
+        assert!(!e.to_string().contains("not a url"));
     }
 
     #[test]
@@ -339,9 +400,9 @@ mod tests {
             Err(OpenAiConfigError::InvalidHeader(_))
         ));
         let cfg = OpenAiConfig::new("https://x.example/v1", SecretString::from("line\nbreak"));
-        assert_eq!(
-            OpenAiCompatible::new(cfg).unwrap_err(),
-            OpenAiConfigError::InvalidApiKey
-        );
+        assert!(matches!(
+            OpenAiCompatible::new(cfg),
+            Err(OpenAiConfigError::InvalidApiKey)
+        ));
     }
 }

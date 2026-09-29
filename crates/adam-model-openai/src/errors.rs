@@ -30,12 +30,12 @@ pub(crate) fn from_http(
     match status.as_u16() {
         401 | 403 => ModelError::Auth(message),
         429 => ModelError::RateLimited { retry_after },
-        408 => ModelError::Transient(message),
+        408 => ModelError::transient(message),
         400 | 413 | 422 if context_length => ModelError::ContextLength(message),
-        500..=599 => ModelError::Transient(message),
-        400..=499 => ModelError::InvalidRequest(message),
+        500..=599 => ModelError::transient(message),
+        400..=499 => ModelError::invalid_request(message),
         // 1xx/3xx: redirects are not followed, so this is not an API answer.
-        _ => ModelError::Protocol(message),
+        _ => ModelError::protocol(message),
     }
 }
 
@@ -50,11 +50,11 @@ pub(crate) fn from_error_object(value: &Value) -> ModelError {
     match error_field(value, "type").or_else(|| error_field(value, "code")) {
         Some(t) if t.contains("rate_limit") => ModelError::RateLimited { retry_after: None },
         Some(t) if t.contains("invalid_request") || t.contains("authentication") => {
-            ModelError::InvalidRequest(message)
+            ModelError::invalid_request(message)
         }
         // Anything else that fails after the request was accepted is treated
         // like a server-side failure.
-        _ => ModelError::Transient(message),
+        _ => ModelError::transient(message),
     }
 }
 
@@ -119,24 +119,28 @@ mod tests {
     fn status_mapping() {
         assert!(matches!(map(401, ""), ModelError::Auth(_)));
         assert!(matches!(map(403, ""), ModelError::Auth(_)));
-        assert!(matches!(map(408, ""), ModelError::Transient(_)));
-        assert!(matches!(map(500, ""), ModelError::Transient(_)));
-        assert!(matches!(map(503, ""), ModelError::Transient(_)));
-        assert!(matches!(map(404, ""), ModelError::InvalidRequest(_)));
-        assert!(matches!(map(409, ""), ModelError::InvalidRequest(_)));
-        assert!(matches!(map(400, "nope"), ModelError::InvalidRequest(_)));
-        assert!(matches!(map(413, "too big"), ModelError::InvalidRequest(_)));
-        assert!(matches!(map(302, ""), ModelError::Protocol(_)));
-        assert_eq!(
+        assert!(matches!(map(408, ""), ModelError::Transient { .. }));
+        assert!(matches!(map(500, ""), ModelError::Transient { .. }));
+        assert!(matches!(map(503, ""), ModelError::Transient { .. }));
+        assert!(matches!(map(404, ""), ModelError::InvalidRequest { .. }));
+        assert!(matches!(map(409, ""), ModelError::InvalidRequest { .. }));
+        assert!(matches!(
+            map(400, "nope"),
+            ModelError::InvalidRequest { .. }
+        ));
+        assert!(matches!(
+            map(413, "too big"),
+            ModelError::InvalidRequest { .. }
+        ));
+        assert!(matches!(map(302, ""), ModelError::Protocol { .. }));
+        assert!(matches!(
             from_http(
                 StatusCode::TOO_MANY_REQUESTS,
                 Some(Duration::from_secs(3)),
                 ""
             ),
-            ModelError::RateLimited {
-                retry_after: Some(Duration::from_secs(3))
-            }
-        );
+            ModelError::RateLimited { retry_after: Some(d) } if d == Duration::from_secs(3)
+        ));
     }
 
     #[test]
@@ -158,7 +162,7 @@ mod tests {
         // A 500 is still transient even if the words match.
         assert!(matches!(
             map(500, &by_code.to_string()),
-            ModelError::Transient(_)
+            ModelError::Transient { .. }
         ));
     }
 
@@ -168,15 +172,21 @@ mod tests {
             400,
             r#"{"error":{"message":"bad tool","type":"invalid_request_error"}}"#,
         );
-        assert_eq!(e, ModelError::InvalidRequest("HTTP 400: bad tool".into()));
+        assert!(
+            matches!(&e, ModelError::InvalidRequest { message, source: None } if message == "HTTP 400: bad tool"),
+            "{e:?}"
+        );
         let e = map(400, "plain text");
-        assert_eq!(e, ModelError::InvalidRequest("HTTP 400: plain text".into()));
+        assert!(
+            matches!(&e, ModelError::InvalidRequest { message, source: None } if message == "HTTP 400: plain text"),
+            "{e:?}"
+        );
     }
 
     #[test]
     fn long_bodies_are_truncated() {
         let e = map(400, &"x".repeat(5000));
-        let ModelError::InvalidRequest(m) = e else {
+        let ModelError::InvalidRequest { message: m, .. } = e else {
             panic!()
         };
         assert!(m.len() < 600, "{}", m.len());
@@ -195,11 +205,14 @@ mod tests {
             ModelError::ContextLength(_)
         ));
         let v = json!({"error": {"message": "overloaded"}});
-        assert!(matches!(from_error_object(&v), ModelError::Transient(_)));
+        assert!(matches!(
+            from_error_object(&v),
+            ModelError::Transient { .. }
+        ));
         let v = json!({"error": {"message": "bad", "type": "invalid_request_error"}});
         assert!(matches!(
             from_error_object(&v),
-            ModelError::InvalidRequest(_)
+            ModelError::InvalidRequest { .. }
         ));
     }
 

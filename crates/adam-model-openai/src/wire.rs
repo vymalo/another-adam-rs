@@ -58,14 +58,12 @@ pub(crate) fn build_request(
     if let Some(t) = req.temperature
         && !t.is_finite()
     {
-        return Err(ModelError::InvalidRequest(
-            "temperature must be finite".into(),
-        ));
+        return Err(ModelError::invalid_request("temperature must be finite"));
     }
     if req.tools.is_empty() && matches!(req.tool_choice, ToolChoice::Required | ToolChoice::Tool(_))
     {
-        return Err(ModelError::InvalidRequest(
-            "tool_choice requires at least one tool".into(),
+        return Err(ModelError::invalid_request(
+            "tool_choice requires at least one tool",
         ));
     }
 
@@ -124,7 +122,7 @@ pub(crate) fn build_request(
         metadata: (!req.metadata.is_empty()).then_some(&req.metadata),
     };
     serde_json::to_vec(&wire)
-        .map_err(|e| ModelError::InvalidRequest(format!("request is not serializable: {e}")))
+        .map_err(|e| ModelError::invalid_request("request is not serializable").with_source(e))
 }
 
 fn text_message<'a>(role: &'static str, text: &str) -> WireMessage<'a> {
@@ -166,10 +164,11 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, ModelError> {
             let mut wire_calls = Vec::with_capacity(tool_calls.len());
             for call in tool_calls {
                 let arguments = serde_json::to_string(&call.arguments).map_err(|e| {
-                    ModelError::InvalidRequest(format!(
-                        "arguments of tool call {} are not serializable: {e}",
+                    ModelError::invalid_request(format!(
+                        "arguments of tool call {} are not serializable",
                         call.id
                     ))
+                    .with_source(e)
                 })?;
                 wire_calls.push(json!({
                     "id": call.id,
@@ -206,24 +205,24 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, ModelError> {
 /// Parse a non-streaming response body.
 pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError> {
     let value: Value = serde_json::from_slice(body)
-        .map_err(|e| ModelError::Protocol(format!("response is not JSON: {e}")))?;
+        .map_err(|e| ModelError::protocol("response is not JSON").with_source(e))?;
     if value.get("choices").is_none() && value.get("error").is_some() {
         return Err(from_error_object(&value));
     }
     let completion: Completion = serde_json::from_value(value)
-        .map_err(|e| ModelError::Protocol(format!("unexpected response shape: {e}")))?;
+        .map_err(|e| ModelError::protocol("unexpected response shape").with_source(e))?;
 
     let choice = completion
         .choices
         .into_iter()
         .next()
-        .ok_or_else(|| ModelError::Protocol("response has no choices".into()))?;
+        .ok_or_else(|| ModelError::protocol("response has no choices"))?;
     let message = choice
         .message
-        .ok_or_else(|| ModelError::Protocol("choice has no message".into()))?;
+        .ok_or_else(|| ModelError::protocol("choice has no message"))?;
     let finish = choice
         .finish_reason
-        .ok_or_else(|| ModelError::Protocol("choice has no finish_reason".into()))?;
+        .ok_or_else(|| ModelError::protocol("choice has no finish_reason"))?;
 
     let mut tool_calls = Vec::new();
     for (i, call) in message
@@ -325,7 +324,7 @@ fn fallback_id(index: usize) -> String {
 
 fn check_name(name: &str) -> Result<(), ModelError> {
     if name.is_empty() {
-        return Err(ModelError::Protocol("tool call has no name".into()));
+        return Err(ModelError::protocol("tool call has no name"));
     }
     Ok(())
 }
@@ -337,9 +336,10 @@ fn parse_arguments(name: &str, raw: &str) -> Result<Value, ModelError> {
         return Ok(json!({}));
     }
     serde_json::from_str(raw).map_err(|e| {
-        ModelError::Protocol(format!(
-            "arguments of tool call `{name}` are not valid JSON: {e}"
+        ModelError::protocol(format!(
+            "arguments of tool call `{name}` are not valid JSON"
         ))
+        .with_source(e)
     })
 }
 
@@ -443,12 +443,12 @@ impl Assembler {
     /// forward to the caller.
     pub(crate) fn push(&mut self, data: &str) -> Result<Vec<ModelDelta>, ModelError> {
         let value: Value = serde_json::from_str(data)
-            .map_err(|e| ModelError::Protocol(format!("stream chunk is not JSON: {e}")))?;
+            .map_err(|e| ModelError::protocol("stream chunk is not JSON").with_source(e))?;
         if value.get("choices").is_none() && value.get("error").is_some() {
             return Err(from_error_object(&value));
         }
         let chunk: Chunk = serde_json::from_value(value)
-            .map_err(|e| ModelError::Protocol(format!("unexpected stream chunk shape: {e}")))?;
+            .map_err(|e| ModelError::protocol("unexpected stream chunk shape").with_source(e))?;
 
         if let Some(usage) = chunk.usage {
             self.usage = Some(usage.into());
@@ -507,7 +507,7 @@ impl Assembler {
     pub(crate) fn finish(self) -> Result<ModelResponse, ModelError> {
         let reason = self
             .finish_reason
-            .ok_or_else(|| ModelError::Protocol("stream ended without a finish_reason".into()))?;
+            .ok_or_else(|| ModelError::protocol("stream ended without a finish_reason"))?;
         let mut tool_calls = Vec::with_capacity(self.calls.len());
         for (index, call) in self.calls {
             check_name(&call.name)?;
@@ -634,13 +634,13 @@ mod tests {
         req.tool_choice = ToolChoice::Required;
         assert!(matches!(
             build_request(&req, false, MaxTokensField::MaxTokens),
-            Err(ModelError::InvalidRequest(_))
+            Err(ModelError::InvalidRequest { .. })
         ));
         let mut req = ModelRequest::new("m");
         req.temperature = Some(f32::NAN);
         assert!(matches!(
             build_request(&req, false, MaxTokensField::MaxTokens),
-            Err(ModelError::InvalidRequest(_))
+            Err(ModelError::InvalidRequest { .. })
         ));
     }
 
@@ -722,7 +722,7 @@ mod tests {
             br#"{"choices":"nope"}"#,
         ] {
             assert!(
-                matches!(parse_completion(body), Err(ModelError::Protocol(_))),
+                matches!(parse_completion(body), Err(ModelError::Protocol { .. })),
                 "{}",
                 String::from_utf8_lossy(body)
             );
@@ -833,7 +833,7 @@ mod tests {
                 r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
             ],
         );
-        assert!(matches!(asm.finish(), Err(ModelError::Protocol(_))));
+        assert!(matches!(asm.finish(), Err(ModelError::Protocol { .. })));
     }
 
     #[test]
@@ -843,16 +843,19 @@ mod tests {
             &mut asm,
             &[r#"{"choices":[{"delta":{"content":"partial"}}]}"#],
         );
-        assert!(matches!(asm.finish(), Err(ModelError::Protocol(_))));
+        assert!(matches!(asm.finish(), Err(ModelError::Protocol { .. })));
     }
 
     #[test]
     fn garbage_chunks_and_in_band_errors() {
         let mut asm = Assembler::default();
-        assert!(matches!(asm.push("{nope"), Err(ModelError::Protocol(_))));
+        assert!(matches!(
+            asm.push("{nope"),
+            Err(ModelError::Protocol { .. })
+        ));
         assert!(matches!(
             asm.push(r#"{"error":{"message":"boom"}}"#),
-            Err(ModelError::Transient(_))
+            Err(ModelError::Transient { .. })
         ));
     }
 

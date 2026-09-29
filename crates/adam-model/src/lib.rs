@@ -41,8 +41,9 @@
 //!
 //! # Retries
 //!
-//! Implementations never retry. [`ModelError::is_retryable`] tells the runtime
-//! which failures are worth retrying; the runtime owns backoff.
+//! Implementations never retry. [`Classify::is_retryable`] tells the runtime
+//! which failures are worth retrying and [`Classify::retry_after`] how long the
+//! provider asked to wait; the runtime owns backoff.
 
 #![warn(missing_docs)]
 
@@ -51,6 +52,7 @@ mod error;
 mod mock;
 mod types;
 
+pub use adam_error::{Classify, ErrorClass};
 pub use client::{DynModel, ModelClient};
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};

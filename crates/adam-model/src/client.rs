@@ -8,7 +8,7 @@ use crate::{ModelDelta, ModelError, ModelRequest, ModelResponse};
 /// A language model behind some API.
 ///
 /// Implementations do not retry; they report failures as [`ModelError`] and
-/// the runtime decides (see [`ModelError::is_retryable`]).
+/// the runtime decides (see [`Classify::is_retryable`](adam_error::Classify::is_retryable)).
 #[async_trait]
 pub trait ModelClient: Send + Sync + 'static {
     /// One non-streaming completion.
