@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use a2a::{Message, Task, TaskArtifactUpdateEvent, TaskState, TaskStatusUpdateEvent};
+use adam_error::{BoxError, Classify, ErrorClass, report};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
@@ -82,8 +83,12 @@ pub(crate) fn state_ends_stream(state: &TaskState) -> bool {
 /// Why a [`TaskBackend`] call failed.
 ///
 /// Each variant maps to one A2A error code (see the `From<BackendError>` impl
-/// for `a2a::A2AError`).
+/// for `a2a::A2AError`), and to one [`ErrorClass`] (see the [`Classify`] impl): `TaskNotFound`
+/// is `NotFound`, `NotCancelable` is `Rejected`, `InvalidParams` is `Invalid`, `Unavailable` is
+/// `Transient` and `Internal` is `Internal`. The message of `Unavailable` and `Internal`
+/// describes this layer only; the lower error is the [`source`](std::error::Error::source).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BackendError {
     /// No such task, or it belongs to another caller (deliberately
     /// indistinguishable). A2A code `-32001`.
@@ -104,18 +109,63 @@ pub enum BackendError {
     InvalidParams(String),
     /// A dependency (database, worker pool) is temporarily unavailable.
     /// Retryable; surfaces as JSON-RPC `-32603` with a generic message.
-    #[error("backend unavailable: {0}")]
-    Unavailable(String),
+    #[error("backend unavailable: {message}")]
+    Unavailable {
+        /// What was unavailable, without the lower error's text.
+        message: String,
+        /// The lower error, when there is one.
+        #[source]
+        source: Option<BoxError>,
+    },
     /// Anything else. JSON-RPC code `-32603`; the detail is logged, not sent
     /// to the client.
-    #[error("internal error: {0}")]
-    Internal(String),
+    #[error("internal error: {message}")]
+    Internal {
+        /// What went wrong, without the lower error's text.
+        message: String,
+        /// The lower error, when there is one.
+        #[source]
+        source: Option<BoxError>,
+    },
 }
 
 impl BackendError {
-    /// Whether retrying the same call later may succeed.
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Unavailable(_))
+    /// A dependency is temporarily unavailable ([`Unavailable`](Self::Unavailable)).
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Anything else ([`Internal`](Self::Internal)).
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Keep `err` as the source of an `Unavailable` or `Internal`; other variants are returned
+    /// as they are.
+    #[must_use]
+    pub fn with_source(mut self, err: impl Into<BoxError>) -> Self {
+        if let Self::Unavailable { source, .. } | Self::Internal { source, .. } = &mut self {
+            *source = Some(err.into());
+        }
+        self
+    }
+}
+
+impl Classify for BackendError {
+    fn class(&self) -> ErrorClass {
+        match self {
+            Self::TaskNotFound(_) => ErrorClass::NotFound,
+            Self::NotCancelable { .. } => ErrorClass::Rejected,
+            Self::InvalidParams(_) => ErrorClass::Invalid,
+            Self::Unavailable { .. } => ErrorClass::Transient,
+            Self::Internal { .. } => ErrorClass::Internal,
+        }
     }
 }
 
@@ -127,12 +177,13 @@ impl From<BackendError> for a2a::A2AError {
                 a2a::A2AError::task_not_cancelable(&task_id)
             }
             BackendError::InvalidParams(msg) => a2a::A2AError::invalid_params(msg),
-            BackendError::Unavailable(detail) => {
-                tracing::error!(%detail, "backend unavailable");
+            // The trust boundary: the client gets a generic message, the log gets the chain.
+            err @ BackendError::Unavailable { .. } => {
+                tracing::error!(error = %report(&err), "backend unavailable");
                 a2a::A2AError::internal("backend temporarily unavailable")
             }
-            BackendError::Internal(detail) => {
-                tracing::error!(%detail, "backend internal error");
+            err @ BackendError::Internal { .. } => {
+                tracing::error!(error = %report(&err), "backend internal error");
                 a2a::A2AError::internal("internal error")
             }
         }
@@ -194,3 +245,72 @@ pub trait TaskBackend: Send + Sync + 'static {
 
 /// A shareable, type-erased [`TaskBackend`].
 pub type DynTaskBackend = Arc<dyn TaskBackend>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("pool exhausted")]
+    struct Lower;
+
+    /// Exhaustive: a new variant forces a class decision here.
+    fn expected(e: &BackendError) -> ErrorClass {
+        match e {
+            BackendError::TaskNotFound(_) => ErrorClass::NotFound,
+            BackendError::NotCancelable { .. } => ErrorClass::Rejected,
+            BackendError::InvalidParams(_) => ErrorClass::Invalid,
+            BackendError::Unavailable { .. } => ErrorClass::Transient,
+            BackendError::Internal { .. } => ErrorClass::Internal,
+        }
+    }
+
+    fn samples() -> Vec<BackendError> {
+        vec![
+            BackendError::TaskNotFound("t".into()),
+            BackendError::NotCancelable {
+                task_id: "t".into(),
+                state: "completed".into(),
+            },
+            BackendError::InvalidParams("x".into()),
+            BackendError::unavailable("database").with_source(Lower),
+            BackendError::internal("bug").with_source(Lower),
+        ]
+    }
+
+    #[test]
+    fn class_table() {
+        for e in samples() {
+            assert_eq!(e.class(), expected(&e), "{e}");
+        }
+        let retryable: Vec<bool> = samples().iter().map(Classify::is_retryable).collect();
+        assert_eq!(retryable, [false, false, false, true, false]);
+    }
+
+    #[test]
+    fn the_source_is_kept_and_not_repeated_in_the_message() {
+        for e in samples().into_iter().skip(3) {
+            let source = std::error::Error::source(&e).expect("source kept");
+            assert!(source.is::<Lower>());
+            assert!(!e.to_string().contains("pool exhausted"), "{e}");
+            assert!(report(&e).ends_with(": pool exhausted"));
+        }
+    }
+
+    /// The trust boundary: the client sees a generic message, never the cause.
+    #[test]
+    fn a2a_errors_do_not_leak_the_cause() {
+        let codes: Vec<(i32, String)> = samples()
+            .into_iter()
+            .map(|e| {
+                let e = a2a::A2AError::from(e);
+                (e.code, e.message)
+            })
+            .collect();
+        assert_eq!(codes[0].0, -32001);
+        assert_eq!(codes[1].0, -32002);
+        assert_eq!(codes[2].0, -32602);
+        assert_eq!(codes[3], (-32603, "backend temporarily unavailable".into()));
+        assert_eq!(codes[4], (-32603, "internal error".into()));
+    }
+}

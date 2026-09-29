@@ -173,8 +173,8 @@ pub(crate) fn map_err(e: RuntimeError) -> BackendError {
         RuntimeError::Finished { run, status } => {
             BackendError::InvalidParams(format!("task {run} is already {status}"))
         }
-        e if e.is_retryable() => BackendError::Unavailable(e.to_string()),
-        e => BackendError::Internal(e.to_string()),
+        e if e.is_retryable() => BackendError::unavailable(e.to_string()),
+        e => BackendError::internal(e.to_string()),
     }
 }
 

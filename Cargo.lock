@@ -95,6 +95,7 @@ dependencies = [
  "a2a-lf",
  "a2a-server-lf",
  "adam-a2a",
+ "adam-error",
  "async-trait",
  "axum",
  "chrono",
