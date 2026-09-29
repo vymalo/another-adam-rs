@@ -144,8 +144,18 @@ impl Ctx {
     /// When a transition fails with [`AgentError::Transient`] and is retried,
     /// the journal entries of the failed try are abandoned (the retry starts at
     /// a fresh `seq`), so its steps run again. That is what lets a recorded
-    /// `Err` be tried once more. Steps are exactly-once across crashes and
-    /// lost leases, and at-least-once across transient retries.
+    /// `Err` be tried once more.
+    ///
+    /// # Guarantees
+    ///
+    /// Once a step's outcome is recorded, it is never executed again: every
+    /// replay (after a crash, a lost lease or a stale commit) returns the
+    /// recorded outcome. The effect itself is **at-least-once**: `f` runs
+    /// before its outcome is written, so a crash between `f` completing and
+    /// the journal write landing makes the replay run `f` again, and a
+    /// transient retry re-runs the steps of the failed try. Make side effects
+    /// idempotent (idempotency keys, "create if absent", upserts) when running
+    /// them twice would be harmful.
     #[tracing::instrument(skip(self, f), fields(run = %self.run, seq = self.seq))]
     pub async fn step<T, E, F, Fut>(&mut self, name: &str, f: F) -> Result<Result<T, E>, AgentError>
     where

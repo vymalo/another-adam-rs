@@ -41,8 +41,10 @@
 //! * The version CAS is what guarantees correctness; leases only avoid
 //!   wasted work. A worker whose lease expired mid-step can not overwrite
 //!   newer state: its commit is rejected and it drops its result.
-//! * Steps are exactly-once across crashes and lost leases, at-least-once
-//!   across transient retries (see [`Ctx::step`]).
+//! * A recorded step outcome is never re-executed, but a side effect is
+//!   at-least-once: a crash between the effect and its journal write, or a
+//!   transient retry, runs it again. Keep effects idempotent (see
+//!   [`Ctx::step`]).
 //! * This crate depends on `adam-core` only. Store, sink and clock are
 //!   swappable behind traits.
 
