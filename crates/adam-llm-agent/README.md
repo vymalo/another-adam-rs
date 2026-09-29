@@ -18,13 +18,13 @@ instructions + a model + a toolset. It is served over A2A by
 
 | Item | What |
 |---|---|
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection) |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default method `required_state() -> Vec<StateKey>` (none) |
 | `ToolOutput` | `text`, `error`, `with_artifact` |
-| `ToolCtx` | run id, conversation id, attempt, call id, `emit_progress`, `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, and for tests `detached(..).with_state(..)` |
-| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question }` (parks the run; A2A reports `input-required`); `#[non_exhaustive]`, see *Errors* |
+| `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `emit_progress`, `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, and for tests `detached(..).with_state(..)` |
+| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question }` (parks the run; A2A reports `input-required`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`); `#[non_exhaustive]`, see *Errors* |
 | `LlmAgentBuilder::state`, `try_build`, `tools` | `state(Arc<T>)` shares a value with the tools (one per type); `try_build() -> Result<LlmAgent, BuildError>` fails on a tool whose `required_state` was not given (`BuildError::MissingState`) or on two tools with one name (`BuildError::DuplicateTool`); `tools(ToolSet)` registers a group. `build()` is unchanged (last duplicate wins, no state check) |
 | `State<T>`, `StateKey`, `Extensions` | a cheap `Arc` handle that derefs to `T`; the key of a state type; the typed map behind them |
 | `ToolSet`, `tools!` | an ordered group of tools: `tools![Clock, Search::new()]`, `.extend(..)`, `.wrap(\|tool\| ..)` for middleware, `names()`, `get(..)` |
@@ -33,7 +33,8 @@ instructions + a model + a toolset. It is served over A2A by
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
 | `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
 | `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
-| `Conversation`, `PendingQuestion`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into |
+| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `Conversation::pending_wait` is the question or the child run the parked run waits for (it was `pending_question`, and state stored under that name still loads) |
+| `DEFAULT_WAIT_POLL` | 60 s: how long a run waiting for a child sleeps before it reads the child itself |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
 | `TRUNCATION_MARKER_PREFIX` | prefix of the marker left where history truncation shortened a tool output |
 
@@ -83,6 +84,30 @@ become descriptions and `Option<T>` fields are not required. The feature also en
 `#[derive(JsonSchema)]` works for whoever depends on it, and it is what `#[tool(crate = ::adam_llm_agent)]`
 needs from a crate that does not use the `adam` facade.
 
+## Child runs
+
+A tool that delegates returns `Err(ToolError::AwaitRun { run })` after starting the child:
+
+```rust
+let child = ctx.child_run_id();                  // the same on every replay of this call
+runtime.start_child(ctx.run_id(), child, "coder/reviewer", user_message(message)).await
+    .map_err(|e| ToolError::from_classified(&e))?;   // false if a replay already started it
+Err(ToolError::AwaitRun { run: child })
+```
+
+The error is journaled, the agent records `PendingWait::Run` in the conversation and parks with a timer
+(`wait_poll`, 60 s). When the child finishes the runtime sends `adam.run.finished` and the parent wakes at once
+and answers the call; if that message is lost, the timer wakes the parent and it reads the child. The answer is the
+child's `output.text` (or its output as JSON); a child that failed, was cancelled or was purged gives an error
+result (`the run failed: ..`) and the run goes on. The message is matched to the wait by the child's run id, so
+copies and strays are dropped; user messages that arrive meanwhile queue behind the result. Cancelling the parent
+does not cancel the child. Events: `awaiting_run` and `tool_end` with status `waiting`, then the final `tool_end`
+(`ok` or `error`). The design and the failure interleavings are in
+[`docs/architecture.md`](../../docs/architecture.md#child-runs).
+
+The tool needs a `Runtime` to start the child; nothing in this crate supplies one (see `tests/child_runs.rs` for
+a tool that holds a handle). The subagent tool of the authoring layer will.
+
 ## Errors
 
 `ToolError` implements `adam_error::Classify` (see
@@ -93,6 +118,7 @@ needs from a crate that does not use the `adam` facade.
 | `Transient` | `Transient` | the step fails with `AgentError::Transient`; the runtime retries with backoff |
 | `Permanent` | `Invalid` | the model is told, and can go on |
 | `NeedsInput` | `Rejected` | valid, but it needs the user first: the run parks |
+| `AwaitRun` | `Rejected` | valid, but it needs a child run first: the run parks with a timer |
 
 `ToolError` is journaled, so its serde shape is frozen and it carries no
 `source`: a tool flattens its own cause into the message (with
@@ -117,6 +143,13 @@ invalid params.
 No environment variables.
 
 ## Tests
+
+`tests/child_runs.rs` is the child-run suite (one case per failure interleaving, see *Child runs*), run against
+`MemoryStore` always, against PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set and against MongoDB when
+`ADAM_TEST_MONGODB_URI` is set; it never sleeps for a fixed time (gates, a `ManualClock`, `FaultyStore::fail_run`).
+The old `Conversation` JSON with `pending_question` is a literal in `src/conversation.rs`
+(`a_state_stored_as_pending_question_still_loads`) and the old `ToolError` shapes are literals in `src/tool.rs`
+(`journals_written_before_await_run_still_decode`).
 
 `tests/llm_agent.rs` is a behavioural suite over a scripted `MockModel` and
 `MemoryStore` (`a_starter_inits_exactly_like_the_agent`, tool loop, retries and rate limits, limits, replay after a

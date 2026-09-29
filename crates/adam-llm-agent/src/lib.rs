@@ -116,7 +116,7 @@
 //! # Observing a run
 //!
 //! `Runtime::view(run).state` deserializes into [`Conversation`]: the full
-//! history, counters, and `pending_question` while the run waits for input.
+//! history, counters, and `pending_wait` while the run waits for input or for a child run.
 //! Live progress arrives as `RunEvent`s; see [`LlmAgent`] for their shapes.
 
 #![warn(missing_docs)]
@@ -137,8 +137,10 @@ mod toolset;
 mod typed;
 
 pub use adam_runtime::Artifact;
-pub use agent::{BuildError, Limits, LlmAgent, LlmAgentBuilder, LlmStarter};
-pub use conversation::{ArtifactRef, Conversation, MESSAGE_KIND, PendingQuestion, user_message};
+pub use agent::{BuildError, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter};
+pub use conversation::{
+    ArtifactRef, Conversation, MESSAGE_KIND, PendingQuestion, PendingRun, PendingWait, user_message,
+};
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
 pub use fn_tool::{FnToolBuilder, TypedFnToolBuilder};

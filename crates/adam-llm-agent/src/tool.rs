@@ -102,8 +102,13 @@ impl ToolOutput {
 /// cause into the message (with [`adam_error::report`]) before returning it.
 ///
 /// Classes: `Transient` is [`ErrorClass::Transient`], `Permanent` is [`ErrorClass::Invalid`]
-/// (the model asked for something that cannot work, and is told so), and `NeedsInput` is
-/// [`ErrorClass::Rejected`] (valid, but it needs the user first).
+/// (the model asked for something that cannot work, and is told so), and `NeedsInput` and
+/// `AwaitRun` are [`ErrorClass::Rejected`] (valid, but they need the user, or a child run, first).
+///
+/// The enum only grows: a variant added later decodes in journals written before it existed
+/// (they never contain it), and a journal that contains a new variant is not readable by a
+/// build that predates it, so the tool that returns `AwaitRun` ships with the build that
+/// understands it.
 #[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ToolError {
@@ -122,6 +127,19 @@ pub enum ToolError {
     NeedsInput {
         /// What to ask the user.
         question: String,
+    },
+    /// The answer is the result of a child run this tool started (or found: see below). The agent
+    /// parks with a timer, and the child's outcome becomes this call's result, as text, or as an
+    /// error result when the child failed.
+    ///
+    /// The tool starts the child with `Runtime::start_child`, under an id it derives from the
+    /// call ([`ToolCtx::child_run_id`]), so that running the tool again, after a crash or a
+    /// retry, finds the child it already started. The error is journaled like any other result,
+    /// and the tool is not called again for this call: the wait is settled from the run's state.
+    #[error("tool awaits run {run}")]
+    AwaitRun {
+        /// The child run whose outcome is the result.
+        run: RunId,
     },
 }
 
@@ -162,7 +180,7 @@ impl Classify for ToolError {
         match self {
             Self::Transient(_) => ErrorClass::Transient,
             Self::Permanent(_) => ErrorClass::Invalid,
-            Self::NeedsInput { .. } => ErrorClass::Rejected,
+            Self::NeedsInput { .. } | Self::AwaitRun { .. } => ErrorClass::Rejected,
         }
     }
 }
@@ -264,6 +282,13 @@ impl ToolCtx {
         &self.call_id
     }
 
+    /// The id of the child run this call starts: [`adam_runtime::child_run_id`] of this run and
+    /// [`call_id`](Self::call_id). The same on every replay of the call, so it is the id to pass to
+    /// `Runtime::start_child` and to [`ToolError::AwaitRun`].
+    pub fn child_run_id(&self) -> RunId {
+        adam_runtime::child_run_id(self.run_id, &self.call_id)
+    }
+
     /// The shared value of type `T` the agent was given, if any.
     pub fn state<T: Send + Sync + 'static>(&self) -> Option<State<T>> {
         self.extensions.get::<T>().map(State::from)
@@ -350,6 +375,69 @@ mod tests {
         fn class(&self) -> ErrorClass {
             self.0
         }
+    }
+
+    /// Journal entries as older builds wrote them, by hand: every shape that existed before
+    /// `AwaitRun` still decodes to the same value.
+    #[test]
+    fn journals_written_before_await_run_still_decode() {
+        let old = [
+            (
+                r#"{"Transient":"timed out"}"#,
+                ToolError::Transient("timed out".into()),
+            ),
+            (
+                r#"{"Permanent":"bad input"}"#,
+                ToolError::Permanent("bad input".into()),
+            ),
+            (
+                r#"{"NeedsInput":{"question":"which one?"}}"#,
+                ToolError::NeedsInput {
+                    question: "which one?".into(),
+                },
+            ),
+        ];
+        for (json, expected) in old {
+            let decoded: ToolError = serde_json::from_str(json).unwrap();
+            assert_eq!(decoded, expected, "{json}");
+            assert_eq!(
+                serde_json::to_string(&expected).unwrap(),
+                json,
+                "the shape is frozen"
+            );
+        }
+        // And a successful output, as recorded before, is not touched either.
+        let out: ToolOutput = serde_json::from_str(r#"{"content":"ok"}"#).unwrap();
+        assert_eq!(out, ToolOutput::text("ok"));
+    }
+
+    #[test]
+    fn await_run_has_a_frozen_shape_and_is_rejected_by_class() {
+        let run: RunId = serde_json::from_str(r#""0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b""#).unwrap();
+        let e = ToolError::AwaitRun { run };
+        let json = r#"{"AwaitRun":{"run":"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"}}"#;
+        assert_eq!(serde_json::to_string(&e).unwrap(), json);
+        assert_eq!(serde_json::from_str::<ToolError>(json).unwrap(), e);
+        assert_eq!(e.class(), ErrorClass::Rejected);
+        assert!(!e.is_retryable());
+        assert_eq!(
+            e.to_string(),
+            "tool awaits run 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+        );
+    }
+
+    #[test]
+    fn a_call_starts_the_same_child_on_every_replay() {
+        use adam_runtime::NoopSink;
+        let sink: DynEventSink = Arc::new(NoopSink);
+        let ctx = ToolCtx::detached("t", "call_1", sink.clone());
+        assert_eq!(ctx.child_run_id(), ctx.child_run_id());
+        assert_eq!(
+            ctx.child_run_id(),
+            adam_runtime::child_run_id(ctx.run_id(), "call_1")
+        );
+        let other = ToolCtx::detached("t", "call_2", sink);
+        assert_ne!(ctx.child_run_id(), other.child_run_id());
     }
 
     #[test]

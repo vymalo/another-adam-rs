@@ -22,11 +22,12 @@ over A2A).
 | `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, no `step`; `State` is only `Serialize`. See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
-| `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::cancelled` / `CancelToken` observe a cancel |
-| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
+| `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children (see *Child runs*) |
+| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`) |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
+| `child_run_id`, `ChildStatus`, `RUN_FINISHED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`) |
 | `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events |
 | `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
 | `RetryPolicy`, `MAX_RETRY_AFTER` | exponential backoff for transient errors |
@@ -78,6 +79,33 @@ let runtime = Runtime::builder(store)   // store: adam_core::DynStore
 let run = runtime.start("my-agent", inbound, None).await?;
 // a worker process: Runtime::builder(store).agent(MyAgent)...run_worker(..)
 ```
+
+## Child runs
+
+A run can start runs and wait for them (a subagent is one). `Runtime::start_child(parent, id, agent, input)`
+is `start_with_id` that also records the parent (`RunRecord::parent_id`): it returns `true` if it created the
+child and `false` if a run with that id already existed, so a step that runs again finds its child. Derive `id`
+from the parent and a stable key (a tool call id) with `child_run_id(parent, key)`.
+
+When a run that has a parent reaches `Done` or `Failed`, whether by a step, by `cancel`, or because its state
+cannot be read, the runtime **delivers `adam.run.finished` to the parent after the commit**. Its `Inbound::id`
+is the child's run id (so a parent deduplicates by it) and its payload is a `ChildStatus`:
+`{"status": "done", "output": ..}` or `{"status": "failed", "error": ".."}`. Read one with
+`ChildStatus::from_notice(&inbound)`.
+
+The message is a hint. It is sent after the child's commit, so a crash between the two, a failed delivery or a
+commit whose acknowledgement was lost drops it, and the child's worker only logs that. **A parent must
+therefore wait with a timer** (`Transition::Park { wake_at: Some(..) }`) and, when it wakes without the
+message, read the child with `Ctx::child_status(run)`: `Some(status)` (`is_finished()` tells if it is over),
+or `None` if the run was purged. `child_status` is a live read, not journaled, and answers only for children
+of the calling run (anything else is `AgentError::Permanent`). A parent that is finished or gone is not an
+error for the child.
+
+Cancelling a parent does not cancel its children. Take the inbox in every step that can park, including the
+step that starts the child: a message already in the inbox when a step starts is not "arrived during the step",
+and an agent that parks without reading it sleeps until its timer. The design, the failure interleavings and
+the tests that make each happen are in [`docs/architecture.md`](../../docs/architecture.md#child-runs).
+`adam-llm-agent` does all of this for a tool that returns `ToolError::AwaitRun`.
 
 ## Several processes
 
@@ -176,9 +204,9 @@ No Cargo features, no environment variables at runtime.
 unfinished run so all three own something, then twelve six-step runs stepped together: each run
 steps on one worker only) and its control
 `any_workers_let_a_run_move_between_workers` (a run seeded by one worker is finished by another), and the two
-`notifier_*` cases: two runtimes over one store and one `LocalNotifier`, a 30 s poll, a 5 s deadline) run against `MemoryStore` always,
+`notifier_*` cases: two runtimes over one store and one `LocalNotifier`, a 30 s poll, a 5 s deadline, and the child-run cases: `a_finished_child_wakes_its_parent_once`, `a_lost_notice_is_recovered_by_the_timer`, `a_parent_that_loses_its_lease_does_not_start_or_resume_twice` and the rest, which use gates, a `ManualClock` and `FaultyStore::fail_run` and never sleep for a fixed time) run against `MemoryStore` always,
 against PostgreSQL and against MongoDB when their variables are set. Unit
-tests sit in `src/cancel.rs`, `ctx.rs`, `events.rs`, `notify.rs` and `retry.rs`, and the
+tests sit in `src/cancel.rs`, `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs`, `events.rs`, `notify.rs` and `retry.rs`, and the
 class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
 (`class_table`, `from_classified_maps_retryable_to_transient_and_keeps_the_hint`,
 `a_message_never_repeats_its_source`) and `src/runtime.rs` (`error_tests`).

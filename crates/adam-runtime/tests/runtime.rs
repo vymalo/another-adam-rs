@@ -14,14 +14,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use adam_core::{ClaimScope, DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
 use adam_runtime::{
-    Agent, AgentError, AgentStarter, BroadcastSink, Classify, Clock, CollectingSink, Ctx, Inbound,
-    LocalNotifier, MAX_RETRY_AFTER, ManualClock, RetryPolicy, RunEvent, RunView, Runtime,
-    RuntimeBuilder, RuntimeError, Transition,
+    Agent, AgentError, AgentStarter, BroadcastSink, ChildStatus, Classify, Clock, CollectingSink,
+    Ctx, Inbound, LocalNotifier, MAX_RETRY_AFTER, ManualClock, RUN_FINISHED_KIND, RetryPolicy,
+    RunEvent, RunView, Runtime, RuntimeBuilder, RuntimeError, Transition, child_run_id,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -320,6 +320,196 @@ fn phase(state: &Value) -> u64 {
 
 fn count(c: &AtomicUsize) -> usize {
     c.load(SeqCst)
+}
+
+// ---------------------------------------------------------------------------
+// Child runs: a parent that starts a child and waits for it
+// ---------------------------------------------------------------------------
+
+/// The runtime a parent's step starts its child on. A step is built before the runtime it runs on,
+/// so the runtime is put here afterwards.
+type RtCell = Arc<OnceLock<Runtime>>;
+
+/// What a test learns about a parent from the outside.
+#[derive(Default)]
+struct Watch {
+    /// Times the child was really started (a replayed step does not count).
+    effects: AtomicUsize,
+    /// Steps of the parent, all phases.
+    steps: AtomicUsize,
+    /// Steps after the park: how often the parent resumed.
+    resumes: AtomicUsize,
+    /// The first step of the parent stops here until released (see [`Hold`]).
+    hold: Option<Hold>,
+}
+
+/// A gate on the first step of the parent, after it has started its child.
+#[derive(Default)]
+struct Hold {
+    reached: Notify,
+    release: Notify,
+    first: AtomicBool,
+}
+
+impl Hold {
+    fn new() -> Self {
+        Self {
+            first: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+}
+
+const WAIT: chrono::Duration = chrono::Duration::seconds(60);
+
+/// A parent: in its first step it starts a child of `child_agent` in a journaled step, as a tool
+/// does, then parks on a 60 s timer; on the next step it reads the child's finished message, or
+/// (woken without one) the child itself, and finishes with `{"via": "notice" | "read", "status"}`.
+fn parent_of(name: &str, child_agent: &str, cell: &RtCell, watch: &Arc<Watch>) -> FnAgent {
+    let (child_agent, cell, watch) = (child_agent.to_owned(), cell.clone(), watch.clone());
+    fn_agent(
+        name,
+        step_fn(move |ctx, state| {
+            let (child_agent, cell, watch) = (child_agent.clone(), cell.clone(), watch.clone());
+            async move {
+                watch.steps.fetch_add(1, SeqCst);
+                let parent = ctx.run_id();
+                let child = child_run_id(parent, "call-1");
+                if phase(&state) == 0 {
+                    let rt = cell.get().expect("the runtime is set").clone();
+                    let effects = watch.clone();
+                    let started: Result<bool, String> = ctx
+                        .step("start-child", move || async move {
+                            effects.effects.fetch_add(1, SeqCst);
+                            rt.start_child(
+                                parent,
+                                child,
+                                &child_agent,
+                                Inbound::new("start", json!({"n": 1})),
+                            )
+                            .await
+                            .map_err(|e| e.to_string())
+                        })
+                        .await?;
+                    started.map_err(AgentError::permanent)?;
+                    if let Some(hold) = &watch.hold
+                        && hold.first.swap(false, SeqCst)
+                    {
+                        hold.reached.notify_one();
+                        hold.release.notified().await;
+                    }
+                    return Ok(Transition::Park {
+                        state: json!({"phase": 1}),
+                        wake_at: Some(ctx.now() + WAIT),
+                    });
+                }
+                watch.resumes.fetch_add(1, SeqCst);
+                let notice = ctx
+                    .take_inbox()
+                    .iter()
+                    .filter_map(ChildStatus::from_notice)
+                    .find(|(run, _)| *run == child);
+                let (via, status) = match notice {
+                    Some((_, status)) => ("notice", status),
+                    None => match ctx.child_status(child).await? {
+                        Some(status) if status.is_finished() => ("read", status),
+                        Some(_) => {
+                            return Ok(Transition::Park {
+                                state,
+                                wake_at: Some(ctx.now() + WAIT),
+                            });
+                        }
+                        None => ("gone", ChildStatus::vanished()),
+                    },
+                };
+                Ok(Transition::Done {
+                    state,
+                    output: json!({"via": via, "status": status}),
+                })
+            }
+            .boxed()
+        }),
+    )
+}
+
+/// A child that finishes at once with `output`.
+fn child_done(name: &str, output: Value) -> FnAgent {
+    fn_agent(
+        name,
+        step_fn(move |_ctx, state| {
+            let output = output.clone();
+            async move { Ok(Transition::Done { state, output }) }.boxed()
+        }),
+    )
+}
+
+/// A child that fails at once with `error`.
+fn child_failing(name: &str, error: &str) -> FnAgent {
+    let error = error.to_owned();
+    fn_agent(
+        name,
+        step_fn(move |_ctx, state| {
+            let error = error.clone();
+            async move { Ok(Transition::Fail { state, error }) }.boxed()
+        }),
+    )
+}
+
+/// A child that waits for a message that never comes.
+fn child_parked(name: &str) -> FnAgent {
+    fn_agent(
+        name,
+        step_fn(|_ctx, state| {
+            async move {
+                Ok(Transition::Park {
+                    state,
+                    wake_at: None,
+                })
+            }
+            .boxed()
+        }),
+    )
+}
+
+/// A child that says it started, waits to be released, then reports whether it was cancelled.
+fn child_gated(name: &str, started: &Arc<Notify>, release: &Arc<Notify>) -> FnAgent {
+    let (started, release) = (started.clone(), release.clone());
+    fn_agent(
+        name,
+        step_fn(move |ctx, state| {
+            let (started, release) = (started.clone(), release.clone());
+            async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(Transition::Done {
+                    state,
+                    output: json!({"saw_cancel": ctx.is_cancelled()}),
+                })
+            }
+            .boxed()
+        }),
+    )
+}
+
+/// One runtime that holds a parent and its child, on a manual clock.
+fn family(
+    store: &DynStore,
+    parent: &FnAgent,
+    child: &FnAgent,
+    cell: &RtCell,
+    clock: &ManualClock,
+) -> Runtime {
+    let rt = builder(store, &uniq("w"), parent)
+        .agent(child.clone())
+        .clock(clock.clone())
+        .build();
+    cell.set(rt.clone()).ok().expect("set once");
+    rt
+}
+
+/// Wait until the store has injected at least `at_least` faults of `method`.
+async fn wait_injected(faulty: &FaultyStore, method: Method, at_least: u64, what: &str) {
+    wait_until(what, || faulty.injected(method) >= at_least).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -3112,6 +3302,596 @@ mod cases {
             "the run should have moved to pin-b: {steps:?}"
         );
     }
+
+    // -- child runs -----------------------------------------------------
+
+    /// The child records its parent, and starting the same child twice starts it once.
+    pub async fn start_child_records_the_parent_and_is_idempotent(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let parent_agent = child_parked(&name);
+        let rt = builder(&store, &uniq("w"), &parent_agent)
+            .agent(child_parked(&child_name))
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let id = child_run_id(parent, "call-1");
+
+        let first = Inbound::new("start", json!({"which": "first"}));
+        assert!(
+            rt.start_child(parent, id, &child_name, first)
+                .await
+                .expect("first")
+        );
+        let second = Inbound::new("start", json!({"which": "second"}));
+        assert!(
+            !rt.start_child(parent, id, &child_name, second)
+                .await
+                .expect("second"),
+            "the same id is the same child"
+        );
+
+        let rec = store.load_run(id).await.expect("load").expect("child");
+        assert_eq!(rec.parent_id, Some(parent));
+        assert_eq!(rec.agent, child_name);
+        assert_eq!(rec.conversation_id, None);
+        let view = rt.view(id).await.expect("view").expect("child");
+        assert_eq!(view.state["which"], "first", "the second input was ignored");
+        // A run that is not a child has no parent, and the parent is not a child of anyone.
+        assert_eq!(
+            store.load_run(parent).await.unwrap().unwrap().parent_id,
+            None
+        );
+
+        let unknown = rt
+            .start_child(parent, RunId::new(), "nobody", inbound())
+            .await;
+        assert!(
+            matches!(unknown, Err(RuntimeError::UnknownAgent(_))),
+            "{unknown:?}"
+        );
+    }
+
+    /// The child finishes, the parent resumes exactly once with its answer, and it got it from
+    /// the message: the timer (an hour off, on a clock nobody moves) could not have.
+    pub async fn a_finished_child_wakes_its_parent_once(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (cell, watch) = (RtCell::default(), Arc::new(Watch::default()));
+        let parent_agent = parent_of(&name, &child_name, &cell, &watch);
+        let child_agent = child_done(&child_name, json!({"answer": 42}));
+        let clock = ManualClock::new();
+        let rt = family(&store, &parent_agent, &child_agent, &cell, &clock);
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+
+        let done = wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        assert_eq!(
+            done.output,
+            Some(json!({"via": "notice", "status": {"status": "done", "output": {"answer": 42}}}))
+        );
+        assert_eq!(count(&watch.effects), 1, "one child was started");
+        assert_eq!(count(&watch.resumes), 1, "the parent resumed once");
+        assert_eq!(count(&watch.steps), 2);
+        assert_eq!(done.pending_inbox, 0);
+        let child = child_run_id(parent, "call-1");
+        let record = store.load_run(child).await.unwrap().unwrap();
+        assert_eq!(
+            (record.parent_id, record.status),
+            (Some(parent), RunStatus::Done)
+        );
+    }
+
+    /// The child finishes while the parent's first step is still running: the message waits in
+    /// the inbox, the step's park turns into a wake-up, and the parent resumes without its timer.
+    pub async fn a_notice_that_beats_the_park_is_not_lost(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (cell, watch) = (
+            RtCell::default(),
+            Arc::new(Watch {
+                hold: Some(Hold::new()),
+                ..Watch::default()
+            }),
+        );
+        let parent_agent = parent_of(&name, &child_name, &cell, &watch);
+        let child_agent = child_done(&child_name, json!("early"));
+        let clock = ManualClock::new();
+        let rt = family(&store, &parent_agent, &child_agent, &cell, &clock);
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let hold = watch.hold.as_ref().expect("hold");
+
+        // The parent has started its child and is held before it parks.
+        notified(&hold.reached, "the parent to start its child").await;
+        let child = child_run_id(parent, "call-1");
+        wait_done(&rt, child).await;
+        wait_for(&rt, parent, "the notice in the parent's inbox", |v| {
+            v.pending_inbox == 1
+        })
+        .await;
+        assert_eq!(count(&watch.resumes), 0);
+
+        hold.release.notify_one();
+        let done = wait_done(&rt, parent).await;
+        worker.stop().await;
+        assert_eq!(
+            done.output,
+            Some(json!({"via": "notice", "status": {"status": "done", "output": "early"}}))
+        );
+        assert_eq!(count(&watch.resumes), 1);
+        assert_eq!(count(&watch.effects), 1);
+    }
+
+    /// A child that fails, and one that is cancelled, tell the parent why.
+    pub async fn a_failed_or_cancelled_child_tells_its_parent_why(store: DynStore) {
+        let (name, failing) = (uniq("parent"), uniq("failing"));
+        let (cell, watch) = (RtCell::default(), Arc::new(Watch::default()));
+        let parent_agent = parent_of(&name, &failing, &cell, &watch);
+        let clock = ManualClock::new();
+        let rt = family(
+            &store,
+            &parent_agent,
+            &child_failing(&failing, "the build is red"),
+            &cell,
+            &clock,
+        );
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, parent).await;
+        worker.stop().await;
+        assert_eq!(
+            done.output,
+            Some(json!({
+                "via": "notice",
+                "status": {"status": "failed", "error": "the build is red"}
+            }))
+        );
+
+        // A child cancelled from outside: the cancel commit is the terminal commit, and it tells.
+        let (name, parked) = (uniq("parent"), uniq("parked"));
+        let (cell, watch) = (RtCell::default(), Arc::new(Watch::default()));
+        let parent_agent = parent_of(&name, &parked, &cell, &watch);
+        let rt = family(&store, &parent_agent, &child_parked(&parked), &cell, &clock);
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let child = child_run_id(parent, "call-1");
+        wait_for(&rt, parent, "the parent parked", |v| {
+            v.status == RunStatus::Parked && v.wake_at.is_some()
+        })
+        .await;
+        wait_for(&rt, child, "the child waiting", |v| v.waiting).await;
+        rt.cancel(child, "not needed").await.expect("cancel");
+        let done = wait_done(&rt, parent).await;
+        worker.stop().await;
+        assert_eq!(
+            done.output,
+            Some(json!({
+                "via": "notice",
+                "status": {"status": "failed", "error": "cancelled: not needed"}
+            }))
+        );
+    }
+
+    /// The message is lost: the parent's commit fails when the finished child tries to deliver it.
+    /// The parent stays parked on its timer, and when the timer fires it reads the child.
+    pub async fn a_lost_notice_is_recovered_by_the_timer(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (faulty, dynamic) = faulty(store);
+        let (cell, watch) = (RtCell::default(), Arc::new(Watch::default()));
+        let parent_agent = parent_of(&name, &child_name, &cell, &watch);
+        let clock = ManualClock::new();
+        // The front knows how to start the child; a separate runtime steps it.
+        let front = builder(&dynamic, &uniq("front"), &parent_agent)
+            .starter(JsonStarter(child_name.clone()))
+            .clock(clock.clone())
+            .build();
+        cell.set(front.clone()).ok().expect("set once");
+        let child_agent = child_done(&child_name, json!("late but sure"));
+        let back = builder(&dynamic, &uniq("back"), &child_agent).build();
+
+        let parent = front.start(&name, inbound(), None).await.expect("start");
+        let child = child_run_id(parent, "call-1");
+        let front_worker = spawn_worker(&front);
+        wait_for(&front, parent, "the parent parked on its timer", |v| {
+            v.status == RunStatus::Parked && v.wake_at.is_some()
+        })
+        .await;
+
+        // From now on the parent's next commit fails once: the child's message.
+        faulty.fail_run(Method::CommitRun, parent, 1);
+        let back_worker = spawn_worker(&back);
+        wait_done(&back, child).await;
+        wait_injected(&faulty, Method::CommitRun, 1, "the message to fail").await;
+        back_worker.stop().await;
+
+        let parked = front.view(parent).await.unwrap().unwrap();
+        assert_eq!(parked.status, RunStatus::Parked, "nobody woke the parent");
+        assert_eq!(parked.pending_inbox, 0, "and no message is waiting for it");
+        assert_eq!(count(&watch.resumes), 0);
+
+        clock.advance(Duration::from_secs(61));
+        let done = wait_done(&front, parent).await;
+        front_worker.stop().await;
+        assert_eq!(
+            done.output,
+            Some(json!({
+                "via": "read",
+                "status": {"status": "done", "output": "late but sure"}
+            }))
+        );
+        assert_eq!(count(&watch.resumes), 1);
+        assert_eq!(count(&watch.effects), 1);
+    }
+
+    /// The child's terminal commit is applied but its acknowledgement is lost, so the worker
+    /// believes it failed and sends nothing. Same recovery: the timer, then a read.
+    pub async fn a_lost_terminal_ack_sends_no_notice_and_the_timer_recovers(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (faulty, dynamic) = faulty(store);
+        let (cell, watch) = (RtCell::default(), Arc::new(Watch::default()));
+        let parent_agent = parent_of(&name, &child_name, &cell, &watch);
+        let clock = ManualClock::new();
+        let front = builder(&dynamic, &uniq("front"), &parent_agent)
+            .starter(JsonStarter(child_name.clone()))
+            .clock(clock.clone())
+            .build();
+        cell.set(front.clone()).ok().expect("set once");
+        let child_agent = child_done(&child_name, json!("done anyway"));
+        let back = builder(&dynamic, &uniq("back"), &child_agent).build();
+
+        let parent = front.start(&name, inbound(), None).await.expect("start");
+        let child = child_run_id(parent, "call-1");
+        let front_worker = spawn_worker(&front);
+        wait_for(&front, parent, "the parent parked on its timer", |v| {
+            v.status == RunStatus::Parked && v.wake_at.is_some()
+        })
+        .await;
+
+        faulty.fail_run_after_apply(Method::CommitRun, child, 1);
+        let back_worker = spawn_worker(&back);
+        wait_injected(&faulty, Method::CommitRun, 1, "the child's ack to be lost").await;
+        wait_done(&back, child).await;
+        back_worker.stop().await;
+
+        let parked = front.view(parent).await.unwrap().unwrap();
+        assert_eq!(
+            (parked.status, parked.pending_inbox),
+            (RunStatus::Parked, 0)
+        );
+
+        clock.advance(Duration::from_secs(61));
+        let done = wait_done(&front, parent).await;
+        front_worker.stop().await;
+        assert_eq!(
+            done.output,
+            Some(json!({
+                "via": "read",
+                "status": {"status": "done", "output": "done anyway"}
+            }))
+        );
+        assert_eq!(count(&watch.resumes), 1);
+    }
+
+    /// The timer fires while the child still works: the parent looks, sees it is not done, and
+    /// parks again on a later timer, without finishing and without starting anything.
+    pub async fn a_parent_woken_early_parks_again(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (cell, watch) = (RtCell::default(), Arc::new(Watch::default()));
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let parent_agent = parent_of(&name, &child_name, &cell, &watch);
+        let child_agent = child_gated(&child_name, &started, &release);
+        let clock = ManualClock::new();
+        let rt = family(&store, &parent_agent, &child_agent, &cell, &clock);
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        notified(&started, "the child").await;
+        let first = wait_for(&rt, parent, "parked on the timer", |v| {
+            v.status == RunStatus::Parked && v.wake_at.is_some()
+        })
+        .await;
+
+        clock.advance(Duration::from_secs(61));
+        let second = wait_for(&rt, parent, "parked on a later timer", |v| {
+            v.status == RunStatus::Parked && v.wake_at > first.wake_at
+        })
+        .await;
+        assert!(second.wake_at > first.wake_at);
+        assert_eq!(count(&watch.resumes), 1, "one look at the child, no answer");
+        assert_eq!(count(&watch.effects), 1, "and no second child");
+
+        release.notify_one();
+        let done = wait_done(&rt, parent).await;
+        worker.stop().await;
+        assert_eq!(done.output.expect("output")["via"], "notice");
+        assert_eq!(count(&watch.resumes), 2);
+    }
+
+    /// Cancelling a parent that waits leaves the child running (there is no cascade in v1). The
+    /// child finishes, its message finds a finished parent and is dropped without harm.
+    pub async fn cancelling_a_waiting_parent_does_not_cancel_its_child(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (cell, watch) = (RtCell::default(), Arc::new(Watch::default()));
+        let (started, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let parent_agent = parent_of(&name, &child_name, &cell, &watch);
+        let child_agent = child_gated(&child_name, &started, &release);
+        let clock = ManualClock::new();
+        let rt = family(&store, &parent_agent, &child_agent, &cell, &clock);
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        notified(&started, "the child").await;
+        wait_for(&rt, parent, "the parent parked", |v| {
+            v.status == RunStatus::Parked && v.wake_at.is_some()
+        })
+        .await;
+
+        rt.cancel(parent, "changed my mind").await.expect("cancel");
+        let cancelled = rt.view(parent).await.unwrap().unwrap();
+        assert_eq!(cancelled.status, RunStatus::Failed);
+        let child = child_run_id(parent, "call-1");
+        assert!(
+            rt.view(child).await.unwrap().unwrap().status.is_open(),
+            "the child is still running"
+        );
+
+        release.notify_one();
+        let done = wait_done(&rt, child).await;
+        assert_eq!(
+            done.output,
+            Some(json!({"saw_cancel": false})),
+            "the child was never told"
+        );
+        worker.stop().await;
+        let after = rt.view(parent).await.unwrap().unwrap();
+        assert_eq!(after.status, RunStatus::Failed);
+        assert_eq!(after.error.as_deref(), Some("cancelled: changed my mind"));
+        assert_eq!(
+            after.version, cancelled.version,
+            "nothing touched the parent"
+        );
+        assert_eq!(count(&watch.resumes), 0);
+    }
+
+    /// Fencing. The worker that started the child loses its lease before it commits; another
+    /// worker replays the step (the journal keeps the child from being started twice) and parks
+    /// the parent, and when the first worker finally commits, the store refuses it. The child
+    /// then runs, and the parent resumes once.
+    pub async fn a_parent_that_loses_its_lease_does_not_start_or_resume_twice(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (cell_a, cell_b) = (RtCell::default(), RtCell::default());
+        let watch = Arc::new(Watch {
+            hold: Some(Hold::new()),
+            ..Watch::default()
+        });
+        let parent_a = parent_of(&name, &child_name, &cell_a, &watch);
+        let parent_b = parent_of(&name, &child_name, &cell_b, &watch);
+        let a = builder(&store, "fence-a", &parent_a)
+            .starter(JsonStarter(child_name.clone()))
+            .lease_ttl(Duration::from_millis(200))
+            .lease_renewal(false)
+            .build();
+        cell_a.set(a.clone()).ok().expect("set once");
+        let b = builder(&store, "fence-b", &parent_b)
+            .starter(JsonStarter(child_name.clone()))
+            .build();
+        cell_b.set(b.clone()).ok().expect("set once");
+        let child_steps = Arc::new(AtomicUsize::new(0));
+        let child_agent = fn_agent(
+            &child_name,
+            step_fn({
+                let child_steps = child_steps.clone();
+                move |_ctx, state| {
+                    let child_steps = child_steps.clone();
+                    async move {
+                        child_steps.fetch_add(1, SeqCst);
+                        Ok(Transition::Done {
+                            state,
+                            output: json!("once"),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let c = builder(&store, "fence-c", &child_agent).build();
+
+        let parent = a.start(&name, inbound(), None).await.expect("start");
+        let wa = spawn_worker(&a);
+        let hold = watch.hold.as_ref().expect("hold");
+        notified(&hold.reached, "worker A to start the child").await;
+        assert_eq!(count(&watch.effects), 1);
+
+        // A is stuck holding a lease that runs out. B takes the run over, replays the step (the
+        // start is in the journal) and parks the parent.
+        let wb = spawn_worker(&b);
+        let parked = wait_for(&b, parent, "B to park the parent", |v| {
+            v.status == RunStatus::Parked && v.wake_at.is_some()
+        })
+        .await;
+        assert_eq!(
+            count(&watch.effects),
+            1,
+            "the replay found the recorded start"
+        );
+
+        // A finally commits its step: the version moved, the store refuses it.
+        hold.release.notify_one();
+        wa.stop().await;
+        let after_a = b.view(parent).await.unwrap().unwrap();
+        assert_eq!(
+            after_a.version, parked.version,
+            "A's stale commit changed nothing"
+        );
+        assert_eq!(count(&child_steps), 0, "the child has not run yet");
+
+        // Now the child runs, and tells the parent once.
+        let wc = spawn_worker(&c);
+        let done = wait_done(&b, parent).await;
+        wb.stop().await;
+        wc.stop().await;
+        assert_eq!(done.output.as_ref().expect("output")["via"], "notice");
+        assert_eq!(count(&watch.effects), 1, "one child was started");
+        assert_eq!(count(&child_steps), 1, "and ran once");
+        assert_eq!(count(&watch.resumes), 1, "the parent resumed once");
+        let child = child_run_id(parent, "call-1");
+        assert_eq!(
+            store.load_run(child).await.unwrap().unwrap().parent_id,
+            Some(parent)
+        );
+    }
+
+    /// `Ctx::child_status` reads the caller's own children, and nobody else's: an unrelated run
+    /// is an error, a run that does not exist is `None`.
+    pub async fn child_status_reads_only_the_callers_children(store: DynStore) {
+        let (name, child_name, other_name) = (uniq("parent"), uniq("child"), uniq("other"));
+        let agent = fn_agent(
+            &name,
+            step_fn(|ctx, state| {
+                async move {
+                    if ctx.take_inbox().is_empty() {
+                        return Ok(Transition::Park {
+                            state,
+                            wake_at: None,
+                        });
+                    }
+                    let child: RunId = serde_json::from_value(state["child"].clone()).unwrap();
+                    let other: RunId = serde_json::from_value(state["other"].clone()).unwrap();
+                    let own = ctx.child_status(child).await?;
+                    let stranger = ctx.child_status(other).await;
+                    let missing = ctx.child_status(RunId::new()).await?;
+                    Ok(Transition::Done {
+                        state,
+                        output: json!({
+                            "own": own,
+                            "stranger_is_permanent": matches!(stranger, Err(AgentError::Permanent { .. })),
+                            "missing": missing,
+                        }),
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .agent(child_parked(&child_name))
+            .agent(child_parked(&other_name))
+            .build();
+        let child = RunId::new();
+        let other = RunId::new();
+        let parent = rt
+            .start(
+                &name,
+                Inbound::new("start", json!({"child": child, "other": other})),
+                None,
+            )
+            .await
+            .expect("start");
+        rt.start_child(parent, child, &child_name, inbound())
+            .await
+            .expect("child");
+        // Not a child of the parent: started with no parent at all.
+        rt.start_with_id(other, &other_name, inbound(), None)
+            .await
+            .expect("other");
+        let worker = spawn_worker(&rt);
+        wait_waiting(&rt, parent).await;
+        wait_waiting(&rt, child).await;
+
+        rt.deliver(parent, inbound()).await.expect("wake");
+        let done = wait_done(&rt, parent).await;
+        worker.stop().await;
+        let out = done.output.expect("output");
+        assert_eq!(out["own"], json!({"status": "parked"}));
+        assert_eq!(out["stranger_is_permanent"], true);
+        assert_eq!(out["missing"], Value::Null);
+    }
+
+    /// A finished child that was purged before its parent looked is reported, not waited for.
+    pub async fn a_purged_child_reads_as_gone(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let (faulty, dynamic) = faulty(store);
+        let (cell, watch) = (RtCell::default(), Arc::new(Watch::default()));
+        let parent_agent = parent_of(&name, &child_name, &cell, &watch);
+        let clock = ManualClock::new();
+        let front = builder(&dynamic, &uniq("front"), &parent_agent)
+            .starter(JsonStarter(child_name.clone()))
+            .clock(clock.clone())
+            .build();
+        cell.set(front.clone()).ok().expect("set once");
+        let back = builder(&dynamic, &uniq("back"), &child_done(&child_name, json!(1))).build();
+
+        let parent = front.start(&name, inbound(), None).await.expect("start");
+        let child = child_run_id(parent, "call-1");
+        let front_worker = spawn_worker(&front);
+        wait_for(&front, parent, "parked", |v| {
+            v.status == RunStatus::Parked && v.wake_at.is_some()
+        })
+        .await;
+        faulty.fail_run(Method::CommitRun, parent, 1);
+        let back_worker = spawn_worker(&back);
+        wait_done(&back, child).await;
+        wait_injected(&faulty, Method::CommitRun, 1, "the message to fail").await;
+        back_worker.stop().await;
+
+        let purged = dynamic
+            .purge_finished(&child_name, chrono::Utc::now() + chrono::Duration::hours(1))
+            .await
+            .expect("purge");
+        assert!(purged >= 1);
+        clock.advance(Duration::from_secs(61));
+        let done = wait_done(&front, parent).await;
+        front_worker.stop().await;
+        assert_eq!(done.output.expect("output")["via"], "gone");
+    }
+
+    /// A finished-child message only means something to the run it is addressed to: to an
+    /// agent that does not read it, it is one more inbox entry, consumed like the rest.
+    pub async fn the_notice_is_an_ordinary_inbound_with_the_childs_id(store: DynStore) {
+        let (name, child_name) = (uniq("parent"), uniq("child"));
+        let seen = Arc::new(Mutex::new(Vec::<Inbound>::new()));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let seen = seen.clone();
+                move |ctx, state| {
+                    let seen = seen.clone();
+                    async move {
+                        let inbox = ctx.take_inbox();
+                        if inbox.is_empty() {
+                            return Ok(Transition::Park {
+                                state,
+                                wake_at: None,
+                            });
+                        }
+                        seen.lock().unwrap().extend(inbox);
+                        Ok(Transition::Done {
+                            state,
+                            output: json!(null),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .agent(child_failing(&child_name, "nope"))
+            .build();
+        let parent = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        wait_waiting(&rt, parent).await;
+        let child = RunId::new();
+        rt.start_child(parent, child, &child_name, inbound())
+            .await
+            .expect("child");
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].kind, RUN_FINISHED_KIND);
+        assert_eq!(seen[0].id, child.to_string());
+        assert_eq!(
+            seen[0].payload,
+            json!({"status": "failed", "error": "nope"})
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3171,6 +3951,18 @@ macro_rules! runtime_suite {
                 notifier_carries_a_cancel_to_another_runtime,
                 pinned_workers_step_a_run_only_on_its_owner,
                 any_workers_let_a_run_move_between_workers,
+                start_child_records_the_parent_and_is_idempotent,
+                a_finished_child_wakes_its_parent_once,
+                a_notice_that_beats_the_park_is_not_lost,
+                a_failed_or_cancelled_child_tells_its_parent_why,
+                a_lost_notice_is_recovered_by_the_timer,
+                a_lost_terminal_ack_sends_no_notice_and_the_timer_recovers,
+                a_parent_woken_early_parks_again,
+                cancelling_a_waiting_parent_does_not_cancel_its_child,
+                a_parent_that_loses_its_lease_does_not_start_or_resume_twice,
+                child_status_reads_only_the_callers_children,
+                a_purged_child_reads_as_gone,
+                the_notice_is_an_ordinary_inbound_with_the_childs_id,
             );
         }
     };
