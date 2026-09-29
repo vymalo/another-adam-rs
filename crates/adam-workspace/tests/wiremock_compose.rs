@@ -8,6 +8,7 @@
 //!
 //! One test, run in order: the `already-exists` scenario is a state machine
 //! inside the mock, so parallel tests would see each other's state.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 #![cfg(feature = "github")]
 
 use std::sync::Arc;
@@ -121,15 +122,21 @@ async fn pull_requests_and_scenarios_against_the_mock() {
         .expect_err("401");
     assert!(matches!(err, WorkspaceError::Auth(_)), "{err:?}");
 
-    // Retryable failures.
-    for scenario in ["rate-limit", "server-error"] {
-        let err = github
-            .open_pull_request(new_pr("agent/four", &format!("[mock:{scenario}]")))
-            .await
-            .expect_err(scenario);
-        assert!(
-            matches!(err, WorkspaceError::Transient(_)),
-            "{scenario}: {err:?}"
-        );
-    }
+    // Retryable failures: a rate limit is its own class, a 5xx is transient.
+    let err = github
+        .open_pull_request(new_pr("agent/four", "[mock:rate-limit]"))
+        .await
+        .expect_err("rate-limit");
+    assert!(
+        matches!(err, WorkspaceError::RateLimited { .. }),
+        "rate-limit: {err:?}"
+    );
+    let err = github
+        .open_pull_request(new_pr("agent/four", "[mock:server-error]"))
+        .await
+        .expect_err("server-error");
+    assert!(
+        matches!(err, WorkspaceError::Transient { .. }),
+        "server-error: {err:?}"
+    );
 }
