@@ -12,11 +12,11 @@ use tokio::sync::watch;
 use adam_core::{DynStore, NewRun, RunId, RunRecord, RunStatus, RunUpdate, StoreError};
 use adam_error::{BoxError, Classify, ErrorClass};
 
-use crate::agent::{Agent, AgentError, Inbound};
+use crate::agent::{Agent, AgentError, AgentStarter, Inbound};
 use crate::cancel::CancelToken;
 use crate::clock::{Clock, DynClock, SystemClock};
 use crate::envelope::Envelope;
-use crate::erased::{Erased, ErasedAgent};
+use crate::erased::{Erased, ErasedAgent, ErasedStarter, StarterOnly};
 use crate::events::{Artifact, DynEventSink, EventSink, NoopSink, RunEvent};
 use crate::retry::RetryPolicy;
 
@@ -169,9 +169,35 @@ pub(crate) struct Config {
     pub lease_renewal: bool,
 }
 
+/// One entry of the registry: a full agent, or a start-only starter. Closed on
+/// purpose: the runtime matches on it to decide what a name can do.
+#[derive(Clone)]
+pub(crate) enum Registered {
+    Agent(Arc<dyn ErasedAgent>),
+    Starter(Arc<dyn ErasedStarter>),
+}
+
+impl Registered {
+    /// Every registration can start a run.
+    pub(crate) fn starter(&self) -> &dyn ErasedStarter {
+        match self {
+            Self::Agent(a) => a.as_ref(),
+            Self::Starter(s) => s.as_ref(),
+        }
+    }
+
+    /// Only a full agent can step one.
+    pub(crate) fn agent(&self) -> Option<&Arc<dyn ErasedAgent>> {
+        match self {
+            Self::Agent(a) => Some(a),
+            Self::Starter(_) => None,
+        }
+    }
+}
+
 pub(crate) struct Inner {
     pub store: DynStore,
-    pub agents: HashMap<String, Arc<dyn ErasedAgent>>,
+    pub agents: HashMap<String, Registered>,
     pub sink: DynEventSink,
     pub clock: DynClock,
     pub cfg: Config,
@@ -245,19 +271,39 @@ impl Drop for TrackGuard {
 /// Configures and builds a [`Runtime`].
 pub struct RuntimeBuilder {
     store: DynStore,
-    agents: HashMap<String, Arc<dyn ErasedAgent>>,
+    agents: HashMap<String, Registered>,
     sink: DynEventSink,
     clock: DynClock,
     cfg: Config,
 }
 
 impl RuntimeBuilder {
-    /// Register an agent. Registering a second agent with the same name
-    /// replaces the first.
-    pub fn agent<A: Agent>(mut self, agent: A) -> Self {
+    /// Register an agent: it can start runs and step them. Registering a
+    /// second agent or starter with the same name replaces the first.
+    pub fn agent<A: Agent>(self, agent: A) -> Self {
         let erased = Erased(agent);
-        let name = erased.name().to_owned();
-        if self.agents.insert(name.clone(), Arc::new(erased)).is_some() {
+        let name = ErasedStarter::name(&erased).to_owned();
+        self.register(name, Registered::Agent(Arc::new(erased)))
+    }
+
+    /// Register a start-only agent: this runtime can start runs of its name
+    /// but never steps them, so [`Runtime::run_worker`] does not claim them.
+    /// A worker with the full [`Agent`] of the same name steps them.
+    /// Registering a second starter or agent with the same name replaces the
+    /// first.
+    ///
+    /// **The starter's `State` must be the [`Agent::State`] of the agent that
+    /// steps the run**, and `init` must produce what that agent's `init` would.
+    /// Nothing can check this across processes: a mismatch starts the run
+    /// successfully, then fails it as permanent on the worker's first step,
+    /// with an error naming the agent whose state did not decode.
+    pub fn starter<S: AgentStarter>(self, starter: S) -> Self {
+        let name = starter.name().to_owned();
+        self.register(name, Registered::Starter(Arc::new(StarterOnly(starter))))
+    }
+
+    fn register(mut self, name: String, entry: Registered) -> Self {
+        if self.agents.insert(name.clone(), entry).is_some() {
             tracing::warn!(agent = %name, "agent registered twice, keeping the last");
         }
         self
@@ -371,14 +417,14 @@ impl Runtime {
         &self.inner.cfg.worker_id
     }
 
-    /// Names of the registered agents, sorted.
+    /// Names of every registration, agents and starters alike, sorted.
     pub fn agent_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.inner.agents.keys().cloned().collect();
         names.sort();
         names
     }
 
-    fn agent(&self, name: &str) -> Result<&Arc<dyn ErasedAgent>, RuntimeError> {
+    fn registered(&self, name: &str) -> Result<&Registered, RuntimeError> {
         self.inner
             .agents
             .get(name)
@@ -397,7 +443,7 @@ impl Runtime {
         input: Inbound,
         conversation_id: Option<&str>,
     ) -> Result<RunId, RuntimeError> {
-        let erased = self.agent(agent)?;
+        let registered = self.registered(agent)?;
         for _ in 0..MAX_COMMIT_RETRIES {
             if let Some(conv) = conversation_id
                 && let Some(open) = self
@@ -409,7 +455,7 @@ impl Runtime {
             {
                 return Ok(id);
             }
-            let new = self.new_run(erased.as_ref(), input.clone(), None, conversation_id)?;
+            let new = self.new_run(registered.starter(), input.clone(), None, conversation_id)?;
             match self.inner.store.create_run(new).await {
                 Ok(rec) => {
                     self.started(&rec).await;
@@ -440,8 +486,8 @@ impl Runtime {
         input: Inbound,
         conversation_id: Option<&str>,
     ) -> Result<bool, RuntimeError> {
-        let erased = self.agent(agent)?;
-        let new = self.new_run(erased.as_ref(), input, Some(run_id), conversation_id)?;
+        let registered = self.registered(agent)?;
+        let new = self.new_run(registered.starter(), input, Some(run_id), conversation_id)?;
         match self.inner.store.create_run(new).await {
             Ok(rec) => {
                 self.started(&rec).await;
@@ -461,7 +507,7 @@ impl Runtime {
 
     fn new_run(
         &self,
-        agent: &dyn ErasedAgent,
+        agent: &dyn ErasedStarter,
         input: Inbound,
         id: Option<RunId>,
         conversation_id: Option<&str>,

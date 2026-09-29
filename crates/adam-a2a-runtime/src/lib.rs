@@ -20,6 +20,10 @@
 //! # }
 //! ```
 //!
+//! A front process that only accepts tasks can register the agent's
+//! `AgentStarter` (`RuntimeBuilder::starter`) instead of the agent: the backend
+//! never steps a run, so a worker with the full agent elsewhere does.
+//!
 //! See [`RuntimeTaskBackend`] for the mapping (tasks are runs), ownership and
 //! why subscriptions survive restarts.
 

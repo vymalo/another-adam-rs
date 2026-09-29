@@ -14,7 +14,7 @@ agent; [`adam-coder`](../adam-coder/README.md) uses it.
 
 | Item | What |
 |---|---|
-| `RuntimeTaskBackend::new(runtime, events, agent)` | `events` must be the `BroadcastSink` the runtime was built with; `agent` is the registered agent's name |
+| `RuntimeTaskBackend::new(runtime, events, agent)` | `events` must be the `BroadcastSink` the runtime was built with; `agent` is the registered name, as an agent (`.agent`) or as a start-only starter (`.starter`) |
 | `.with_poll_interval(..)`, `DEFAULT_POLL_INTERVAL` | how often a subscription re-reads the durable run |
 | `.with_prompt(..)`, `.with_inbound(..)` | override how the `input-required` question is derived (`PromptFn`) and how an A2A message becomes an `Inbound` (`InboundFn`) |
 | `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings |
@@ -32,6 +32,12 @@ let card = AgentCardConfig::new("my-agent", "Does things", "http://localhost:808
 let app = A2aServer::router(card, Arc::new(backend), AuthConfig::AllowAnonymous);
 // serve `app` with axum, and run `runtime.run_worker(shutdown)` next to it
 ```
+
+The backend only starts, delivers to, reads and cancels runs, never steps one,
+so a front process can register the agent's `AgentStarter` instead of the
+agent (`Runtime::builder(store).starter(starter)`), holding no model or
+credentials, while workers with the full agent run in another process over the
+same store. Nothing steps a task in the front itself.
 
 Mapping (full table in `src/backend.rs`): a task is a run (`task_id` is the run
 id); a new `SendMessage` is `Runtime::start`; a message with `taskId` is
@@ -76,6 +82,7 @@ round trips, ownership between callers, context handling, an `init` rejection
 that is `-32602` and not `-32603`
 (`an_init_rejection_is_invalid_params_not_internal`,
 `an_init_rejection_is_a_32602_over_http`), and a
+`a_starter_only_front_accepts_a_task_a_separate_worker_completes_it`, and a
 restart scenario in which a second backend (a second replica) rebuilds a
 subscription from the store. Unit tests in `src/backend.rs`
 (`runtime_errors_map_by_class`,

@@ -266,6 +266,33 @@ pub trait Agent: Send + Sync + 'static {
     ) -> Result<Transition<Self::State>, AgentError>;
 }
 
+/// The start-only half of an [`Agent`]: a name and the initial state of a
+/// run, without a way to step it.
+///
+/// Starting a run needs nothing but [`AgentStarter::init`]: it turns the first
+/// inbound message into the state the run is created with. Advancing the run
+/// is the [`Agent`]'s job, and an [`Agent`] usually needs a model, credentials
+/// or a sandbox that a process which only accepts requests should not have to
+/// hold. Register a starter with `RuntimeBuilder::starter` on such a process;
+/// a worker that registers the full agent under the same name steps the run.
+///
+/// `init` must produce the same state the [`Agent`] of that name would, and
+/// `State` must be the type that agent decodes (the runtime stores it as
+/// JSON). A run of a name that only a starter is registered for is never
+/// claimed by this runtime's workers.
+pub trait AgentStarter: Send + Sync + 'static {
+    /// The state a new run starts with, stored as JSON. It is the same type as
+    /// the [`Agent::State`] of the agent that steps the run.
+    type State: Serialize + Send + Sync;
+
+    /// Stable name, stored as `RunRecord::agent`. Equal to the name of the
+    /// [`Agent`] that steps these runs.
+    fn name(&self) -> &str;
+
+    /// Initial state for a new run.
+    fn init(&self, input: Inbound) -> Result<Self::State, AgentError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

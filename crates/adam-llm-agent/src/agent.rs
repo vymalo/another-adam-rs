@@ -8,7 +8,7 @@ use adam_model::{
     Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse, ToolCall,
     ToolSpec,
 };
-use adam_runtime::{Agent, AgentError, Ctx, Inbound, RunEvent, Transition};
+use adam_runtime::{Agent, AgentError, AgentStarter, Ctx, Inbound, RunEvent, Transition};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -515,6 +515,46 @@ impl LlmAgent {
     }
 }
 
+/// The first user message of a run, as a fresh [`Conversation`]. Shared by
+/// [`LlmAgent::init`] and [`LlmStarter::init`], so they cannot drift apart.
+fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
+    let text = parse_user_text(&input.payload)
+        .map_err(|reason| AgentError::permanent(format!("unusable start message: {reason}")))?;
+    Ok(Conversation::new(text))
+}
+
+/// The start-only half of an [`LlmAgent`]: it turns the first user message
+/// into the [`Conversation`] a run starts with, and needs neither a model nor
+/// tools.
+///
+/// Register it with `RuntimeBuilder::starter` on a process that only accepts
+/// requests, under the name of the [`LlmAgent`] that steps the runs on a
+/// worker. `init` accepts exactly what [`LlmAgent::init`] accepts (payload
+/// `{"text": "..."}` or a bare JSON string) and rejects what it rejects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmStarter {
+    name: String,
+}
+
+impl LlmStarter {
+    /// A starter for the agent called `name`.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl AgentStarter for LlmStarter {
+    type State = Conversation;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
+        start_conversation(input)
+    }
+}
+
 enum ToolResult {
     Answered {
         message: Message,
@@ -533,11 +573,9 @@ impl Agent for LlmAgent {
 
     /// The input is the first user message: payload `{"text": "..."}` or a bare
     /// JSON string (see [`user_message`](crate::user_message)); its `kind` is
-    /// not inspected.
+    /// not inspected. The same as [`LlmStarter::init`].
     fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
-        let text = parse_user_text(&input.payload)
-            .map_err(|reason| AgentError::permanent(format!("unusable start message: {reason}")))?;
-        Ok(Conversation::new(text))
+        start_conversation(input)
     }
 
     #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), agent = %self.name))]

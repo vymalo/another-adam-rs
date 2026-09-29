@@ -40,6 +40,10 @@
 //! Register the agent on a `Runtime` and start a run with
 //! [`user_message`]`("...")`.
 //!
+//! A process that only accepts requests registers an [`LlmStarter`] of the same
+//! name instead: it starts runs (`init` needs no model or tools) and a worker
+//! with the [`LlmAgent`] steps them.
+//!
 //! # Inbound messages
 //!
 //! Anything delivered to a run (and the start input) is read as a user
@@ -62,7 +66,7 @@ mod history;
 mod tool;
 
 pub use adam_runtime::Artifact;
-pub use agent::{Limits, LlmAgent, LlmAgentBuilder};
+pub use agent::{Limits, LlmAgent, LlmAgentBuilder, LlmStarter};
 pub use conversation::{ArtifactRef, Conversation, MESSAGE_KIND, PendingQuestion, user_message};
 pub use history::TRUNCATION_MARKER_PREFIX;
 pub use tool::{DynTool, Tool, ToolCtx, ToolError, ToolOutput};

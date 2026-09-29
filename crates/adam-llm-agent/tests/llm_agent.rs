@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, PendingQuestion,
+    Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter, PendingQuestion,
     TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
@@ -17,8 +17,8 @@ use adam_model::{
     ModelResponse, ToolCall, ToolSpec,
 };
 use adam_runtime::{
-    CancelToken, Clock, CollectingSink, ManualClock, RetryPolicy, RunEvent, RunView, Runtime,
-    RuntimeBuilder,
+    Agent, AgentStarter, CancelToken, Clock, CollectingSink, Inbound, ManualClock, RetryPolicy,
+    RunEvent, RunView, Runtime, RuntimeBuilder,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -1494,4 +1494,29 @@ async fn registering_a_tool_twice_keeps_the_last_and_one_spec() {
         Message::tool_result("c1", "second")
     );
     assert_eq!(adam_runtime::Agent::name(&agent), "llm");
+}
+
+/// The start-only half is the same function as `LlmAgent::init`: it accepts
+/// what the agent accepts and rejects what it rejects, with the same error.
+#[test]
+fn a_starter_inits_exactly_like_the_agent() {
+    let agent = LlmAgent::builder("assistant", Arc::new(MockModel::new()), "m").build();
+    let starter = LlmStarter::new("assistant");
+    assert_eq!(starter.name(), agent.name());
+
+    for input in [
+        user_message("fix the bug"),
+        Inbound::new("anything", json!("a bare string")),
+    ] {
+        let from_agent = agent.init(input.clone()).unwrap();
+        assert_eq!(starter.init(input).unwrap(), from_agent);
+    }
+
+    for payload in [json!({"text": 7}), json!({}), json!(null), json!([1])] {
+        let input = Inbound::new("message", payload);
+        let from_agent = agent.init(input.clone()).unwrap_err();
+        let from_starter = starter.init(input).unwrap_err();
+        assert_eq!(from_starter.to_string(), from_agent.to_string());
+        assert!(from_starter.to_string().contains("unusable start message"));
+    }
 }

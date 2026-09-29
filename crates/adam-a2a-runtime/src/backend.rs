@@ -65,8 +65,12 @@ const CANCEL_REASON: &str = "canceled by client";
 ///
 /// The `events` sink must be the one the runtime was built with
 /// (`RuntimeBuilder::event_sink`), otherwise no live events arrive (polling
-/// still works). The runtime must have the agent named `agent` registered;
-/// workers are run by the caller (`Runtime::run_worker`).
+/// still works). The runtime must have `agent` registered, either as an
+/// agent (`RuntimeBuilder::agent`) or as a start-only starter
+/// (`RuntimeBuilder::starter`): the backend only starts, delivers to, reads and
+/// cancels runs, and never steps one. Workers are run by the caller
+/// (`Runtime::run_worker`); a process that registered only the starter has
+/// nothing to step, so a worker with the full agent has to run elsewhere.
 #[derive(Clone)]
 pub struct RuntimeTaskBackend {
     pub(crate) runtime: Runtime,
