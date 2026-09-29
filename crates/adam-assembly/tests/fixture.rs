@@ -39,7 +39,8 @@ fn from_dir() -> AgentDef {
 }
 
 fn assemble(def: AgentDef, model: Arc<MockModel>) -> Assembly {
-    def.bind(fixture_tools())
+    common::with_fixture_token(def)
+        .bind(fixture_tools())
         .unwrap()
         .model(model, "gateway-default")
         .unwrap()
@@ -122,7 +123,9 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
             "linear__list_issues",
             "load_skill",
             "read_skill_file",
-            // One tool per subagent, named after it, after everything else.
+            // One tool per subagent, named after it, after everything else: `billing` is the
+            // fixture's remote (A2A) subagent, a tool of the same shape.
+            "billing",
             "legacy",
             "researcher",
             "reviewer"
@@ -239,6 +242,7 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
             "linear__list_issues",
             "load_skill",
             "read_skill_file",
+            "billing",
             "legacy",
             "researcher",
             "reviewer"

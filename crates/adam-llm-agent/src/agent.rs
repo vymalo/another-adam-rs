@@ -20,11 +20,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::conversation::{
-    ArtifactRef, Conversation, PendingQuestion, PendingRun, PendingWait, parse_user_text,
+    ArtifactRef, Conversation, PendingQuestion, PendingRemote, PendingRun, PendingWait,
+    parse_user_text,
 };
 use crate::history::fit_history;
 use crate::state::Extensions;
-use crate::tool::{DynTool, Tool, ToolCtx, ToolError, ToolOutput};
+use crate::tool::{DynTool, RemotePoll, Tool, ToolCtx, ToolError, ToolOutput};
 use crate::toolset::ToolSet;
 
 /// Bounds on one run. When a limit trips the run fails with a message naming
@@ -182,6 +183,10 @@ impl LlmAgentBuilder {
     /// its commit and the message), so it bounds how late the parent can be, not how often it
     /// runs: each wake without the message is one store read. A zero interval is raised to one
     /// millisecond.
+    ///
+    /// A run that waits for a task on another system ([`ToolError::AwaitRemote`]) is told nothing
+    /// when the task ends, so for it this is how often the task is looked at, and the longest a
+    /// finished task waits to be noticed.
     pub fn wait_poll(mut self, every: Duration) -> Self {
         self.wait_poll = every.max(Duration::from_millis(1));
         self
@@ -312,7 +317,9 @@ impl LlmAgentBuilder {
 /// * `Custom { kind: "input_required", payload: {question, call_id} }` before parking;
 /// * `Custom { kind: "awaiting_run", payload: {call_id, run} }` before parking on a child run,
 ///   followed by a `tool_end` with status `waiting` (not final), and later by the final
-///   `tool_end` with `ok` or `error` when the child's outcome becomes the result.
+///   `tool_end` with `ok` or `error` when the child's outcome becomes the result;
+/// * `Custom { kind: "awaiting_remote", payload: {call_id, task} }` before parking on a remote
+///   task, with the same `tool_end` sequence.
 ///
 /// # Child runs
 ///
@@ -330,6 +337,17 @@ impl LlmAgentBuilder {
 /// already used, or a stray one) is dropped. User messages that arrive
 /// meanwhile queue behind the owed result. Cancelling the parent does not
 /// cancel the child.
+///
+/// # Remote tasks
+///
+/// A tool that starts a task on another system (an A2A agent) returns
+/// [`ToolError::AwaitRemote`]. The run records a [`PendingWait::Remote`] and parks with the same
+/// timer as for a child run, but nothing tells it when the task is over, so every time the timer
+/// fires it asks the tool ([`Tool::poll_remote`]) in a journaled step named `poll:<call id>`, and
+/// parks again until the answer is [`RemotePoll::Ready`]. A replay after a crash sees the recorded
+/// answers, so the tool is not asked twice for one wake, and the call that started the task is
+/// not repeated. If the tool gave a timeout, the call is answered with an error result once it has
+/// passed (measured by the journaled clock). Cancelling the run does not cancel the remote task.
 ///
 /// # Failure handling
 ///
@@ -463,6 +481,18 @@ impl LlmAgent {
         ctx.now()
             .checked_add_signed(every)
             .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    }
+
+    /// `ms` milliseconds from now, by the journaled clock.
+    async fn deadline_after(&self, ctx: &mut Ctx, ms: u64) -> Result<DateTime<Utc>, AgentError> {
+        let now = ctx.now_journaled().await?;
+        let every = i64::try_from(ms)
+            .ok()
+            .and_then(chrono::Duration::try_milliseconds)
+            .unwrap_or(chrono::Duration::MAX);
+        Ok(now
+            .checked_add_signed(every)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC))
     }
 
     /// The child's outcome as the result of the call that waited for it. Returns the status word
@@ -657,6 +687,27 @@ impl LlmAgent {
                     ctx.emit(tool_end(&call.name, &call.id, status)).await;
                     continue;
                 }
+                ToolResult::AwaitRemote { task, timeout_ms } => {
+                    // The deadline is fixed now, from the journaled clock, so that every replay
+                    // of this transition parks with the same one.
+                    let deadline = match timeout_ms {
+                        Some(ms) => Some(self.deadline_after(ctx, ms).await?),
+                        None => None,
+                    };
+                    ctx.emit(RunEvent::Custom {
+                        kind: "awaiting_remote".into(),
+                        payload: json!({ "call_id": call.id, "task": task }),
+                    })
+                    .await;
+                    ctx.emit(tool_end(&call.name, &call.id, "waiting")).await;
+                    state.pending_wait = Some(PendingWait::Remote(PendingRemote {
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        task,
+                        deadline,
+                    }));
+                    return Ok(Flow::Wait);
+                }
             };
             state.messages.push(message);
             state.artifacts.extend(artifacts);
@@ -694,16 +745,7 @@ impl LlmAgent {
             });
         };
 
-        let tool_ctx = ToolCtx::new(
-            ctx.conversation_id().map(str::to_owned),
-            ctx.attempt(),
-            call.id.clone(),
-            call.name.clone(),
-            ctx.emitter(),
-            ctx.cancel_token(),
-            Arc::clone(&self.extensions),
-            Some(ctx.child_starter()),
-        );
+        let tool_ctx = self.tool_ctx(ctx, &call.id, &call.name);
         let args = call.arguments.clone();
         let outcome: Result<ToolOutput, ToolError> = ctx
             .step(&format!("tool:{}", call.id), move || async move {
@@ -713,27 +755,9 @@ impl LlmAgent {
 
         match outcome {
             Ok(output) => {
-                let status = if output.is_error { "error" } else { "ok" };
-                let refs: Vec<ArtifactRef> = output
-                    .artifacts
-                    .iter()
-                    .map(|a| ArtifactRef {
-                        name: a.name.clone(),
-                        mime_type: a.mime_type.clone(),
-                    })
-                    .collect();
-                for artifact in output.artifacts {
-                    ctx.emit(RunEvent::from(artifact)).await;
-                }
+                let (message, artifacts, status) = output_message(ctx, &call.id, output).await;
                 ctx.emit(end(status)).await;
-                Ok(ToolResult::Answered {
-                    message: Message::Tool {
-                        call_id: call.id.clone(),
-                        content: output.content,
-                        is_error: output.is_error,
-                    },
-                    artifacts: refs,
-                })
+                Ok(ToolResult::Answered { message, artifacts })
             }
             Err(ToolError::Permanent(reason)) => {
                 ctx.emit(end("error")).await;
@@ -756,8 +780,136 @@ impl LlmAgent {
             // No end event yet: `run_pending` says "waiting", or the final status when the
             // child's message is already here.
             Err(ToolError::AwaitRun { run }) => Ok(ToolResult::AwaitRun(run)),
+            Err(ToolError::AwaitRemote { task, timeout_ms }) => {
+                Ok(ToolResult::AwaitRemote { task, timeout_ms })
+            }
         }
     }
+
+    /// The context a tool sees for the call `call_id`, made from this transition's `Ctx`.
+    fn tool_ctx(&self, ctx: &Ctx, call_id: &str, tool: &str) -> ToolCtx {
+        ToolCtx::new(
+            ctx.conversation_id().map(str::to_owned),
+            ctx.attempt(),
+            call_id.to_owned(),
+            tool.to_owned(),
+            ctx.emitter(),
+            ctx.cancel_token(),
+            Arc::clone(&self.extensions),
+            Some(ctx.child_starter()),
+        )
+    }
+
+    /// Where the remote task a run waits for stands. `Ok(None)`: still going, park again.
+    /// `Ok(Some(status))`: the call is answered (the result is in the state) and `status` is the
+    /// word the final `tool_end` carries.
+    ///
+    /// The look is one journaled step (`poll:<call id>`), so a replay of this transition sees what
+    /// the first run saw. When the wait has a deadline the clock is read through the journal too
+    /// (`ctx.now`): a replay must take the same branch, or the steps after it would not line up.
+    async fn poll_remote(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        wait: &PendingRemote,
+    ) -> Result<Option<&'static str>, AgentError> {
+        let owed = |state: &mut Conversation, message: Message| {
+            state.messages.push(message);
+            if state
+                .pending_calls
+                .first()
+                .is_some_and(|c| c.id == wait.call_id)
+            {
+                state.pending_calls.remove(0);
+            }
+            state.pending_wait = None;
+        };
+        if let Some(deadline) = wait.deadline
+            && ctx.now_journaled().await? >= deadline
+        {
+            owed(
+                state,
+                Message::tool_error(
+                    wait.call_id.clone(),
+                    "the remote task did not finish in the time allowed; it may still be \
+                     running there, and its result is lost to this call",
+                ),
+            );
+            return Ok(Some("error"));
+        }
+        let Some(tool) = self.tool(&wait.tool).cloned() else {
+            owed(
+                state,
+                Message::tool_error(
+                    wait.call_id.clone(),
+                    format!("the tool `{}` that started this task is gone", wait.tool),
+                ),
+            );
+            return Ok(Some("error"));
+        };
+        let tool_ctx = self.tool_ctx(ctx, &wait.call_id, &wait.tool);
+        let task = wait.task.clone();
+        let polled: Result<RemotePoll, ToolError> = ctx
+            .step(&format!("poll:{}", wait.call_id), move || async move {
+                tool.poll_remote(&tool_ctx, &task).await
+            })
+            .await?;
+        match polled {
+            Ok(RemotePoll::Working) => Ok(None),
+            Ok(RemotePoll::Ready(output)) => {
+                let (message, artifacts, status) = output_message(ctx, &wait.call_id, output).await;
+                state.artifacts.extend(artifacts);
+                owed(state, message);
+                Ok(Some(status))
+            }
+            Err(ToolError::Transient(reason)) => Err(AgentError::transient(format!(
+                "tool `{}` failed while polling its remote task: {reason}",
+                wait.tool
+            ))),
+            Err(ToolError::Permanent(reason)) => {
+                owed(state, Message::tool_error(wait.call_id.clone(), reason));
+                Ok(Some("error"))
+            }
+            Err(other) => {
+                owed(
+                    state,
+                    Message::tool_error(
+                        wait.call_id.clone(),
+                        format!("polling the remote task went wrong: {other}"),
+                    ),
+                );
+                Ok(Some("error"))
+            }
+        }
+    }
+}
+
+/// A tool's output as the message that answers `call_id`, with the references to its artifacts and
+/// the status word for the `tool_end` event. The artifacts are emitted here (and recorded with the
+/// transition's commit).
+async fn output_message(
+    ctx: &Ctx,
+    call_id: &str,
+    output: ToolOutput,
+) -> (Message, Vec<ArtifactRef>, &'static str) {
+    let status = if output.is_error { "error" } else { "ok" };
+    let refs: Vec<ArtifactRef> = output
+        .artifacts
+        .iter()
+        .map(|a| ArtifactRef {
+            name: a.name.clone(),
+            mime_type: a.mime_type.clone(),
+        })
+        .collect();
+    for artifact in output.artifacts {
+        ctx.emit(RunEvent::from(artifact)).await;
+    }
+    let message = Message::Tool {
+        call_id: call_id.to_owned(),
+        content: output.content,
+        is_error: output.is_error,
+    };
+    (message, refs, status)
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -807,6 +959,10 @@ enum ToolResult {
     },
     NeedsInput(String),
     AwaitRun(RunId),
+    AwaitRemote {
+        task: String,
+        timeout_ms: Option<u64>,
+    },
 }
 
 fn tool_end(name: &str, call_id: &str, status: &'static str) -> RunEvent {
@@ -888,6 +1044,21 @@ impl Agent for LlmAgent {
             match Self::settle(ctx, &wait, &notices).await? {
                 Some(child) => {
                     let status = Self::answer_run(&mut state, &wait, &child);
+                    ctx.emit(tool_end(&wait.tool, &wait.call_id, status)).await;
+                }
+                None => {
+                    let wake_at = Some(self.next_poll(ctx));
+                    return Ok(Transition::Park { state, wake_at });
+                }
+            }
+        }
+
+        // A wait on a remote task ends when the tool says the task is over. Woken by the timer
+        // (or by a user message, which queues behind the result), the run looks once and either
+        // answers the call or parks again.
+        if let Some(PendingWait::Remote(wait)) = state.pending_wait.clone() {
+            match self.poll_remote(ctx, &mut state, &wait).await? {
+                Some(status) => {
                     ctx.emit(tool_end(&wait.tool, &wait.call_id, status)).await;
                 }
                 None => {

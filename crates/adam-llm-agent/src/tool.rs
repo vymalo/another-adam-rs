@@ -65,6 +65,37 @@ pub trait Tool: Send + Sync + 'static {
     fn asks_user(&self) -> bool {
         false
     }
+
+    /// How a task this tool started on another system stands. Only a tool that returns
+    /// [`ToolError::AwaitRemote`] implements it.
+    ///
+    /// The agent calls it, in a journaled step, each time the timer of a run parked on
+    /// [`AwaitRemote`](ToolError::AwaitRemote) fires, with the `task` the tool returned. The tool
+    /// looks (a `GetTask` to an A2A agent) and answers [`RemotePoll::Ready`] with the tool result,
+    /// or [`RemotePoll::Working`] to be asked again after the next interval. An `Err` is handled
+    /// as for [`call`](Self::call): [`Transient`](ToolError::Transient) retries the step,
+    /// [`Permanent`](ToolError::Permanent) becomes an error result for the model, and the waiting
+    /// variants are refused as an error result.
+    ///
+    /// It has no arguments of the call: what it needs to look must be in `task`. The default
+    /// refuses, which is right for a tool that never waits on a remote task. A tool that wraps
+    /// another (see [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it.
+    async fn poll_remote(&self, ctx: &ToolCtx, task: &str) -> Result<RemotePoll, ToolError> {
+        let _ = (ctx, task);
+        Err(ToolError::Permanent(format!(
+            "tool `{}` does not wait on remote tasks",
+            self.spec().name
+        )))
+    }
+}
+
+/// What [`Tool::poll_remote`] found. Journaled, hence serializable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RemotePoll {
+    /// The task is over: this is the tool result (an error result if it failed).
+    Ready(ToolOutput),
+    /// Still going. Ask again after the next interval.
+    Working,
 }
 
 /// A shared, type-erased [`Tool`].
@@ -121,13 +152,14 @@ impl ToolOutput {
 /// cause into the message (with [`adam_error::report`]) before returning it.
 ///
 /// Classes: `Transient` is [`ErrorClass::Transient`], `Permanent` is [`ErrorClass::Invalid`]
-/// (the model asked for something that cannot work, and is told so), and `NeedsInput` and
-/// `AwaitRun` are [`ErrorClass::Rejected`] (valid, but they need the user, or a child run, first).
+/// (the model asked for something that cannot work, and is told so), and `NeedsInput`, `AwaitRun`
+/// and `AwaitRemote` are [`ErrorClass::Rejected`] (valid, but they need the user, a child run, or a
+/// remote task, first).
 ///
 /// The enum only grows: a variant added later decodes in journals written before it existed
 /// (they never contain it), and a journal that contains a new variant is not readable by a
-/// build that predates it, so the tool that returns `AwaitRun` ships with the build that
-/// understands it.
+/// build that predates it, so the tool that returns `AwaitRun` or `AwaitRemote` ships with the
+/// build that understands it.
 #[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ToolError {
@@ -159,6 +191,26 @@ pub enum ToolError {
     AwaitRun {
         /// The child run whose outcome is the result.
         run: RunId,
+    },
+    /// The answer is the outcome of a task the tool started on another system (an A2A agent, a
+    /// job queue). The agent parks with a timer ([`LlmAgentBuilder::wait_poll`]
+    /// (crate::LlmAgentBuilder::wait_poll)) and, each time it fires, asks the tool how the task
+    /// stands with [`Tool::poll_remote`], as a journaled step. The tool's answer becomes this
+    /// call's result.
+    ///
+    /// The tool starts the task in the same journaled step that returns this error, and must make
+    /// the start idempotent, keyed by the call ([`ToolCtx::call_id`], [`ToolCtx::child_run_id`]),
+    /// so that a step which ran but was not recorded does not start a second task. The error is
+    /// journaled, and the tool is not called again for this call.
+    #[error("tool awaits remote task {task}")]
+    AwaitRemote {
+        /// The tool's own name for the task, handed back to [`Tool::poll_remote`]. It is
+        /// stored in the run's state and visible to whoever can read it: put no secret in it.
+        task: String,
+        /// Give up after this many milliseconds of waiting: the call is answered with an error
+        /// result and the task is left where it is. `None`: wait for ever.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
 }
 
@@ -199,7 +251,9 @@ impl Classify for ToolError {
         match self {
             Self::Transient(_) => ErrorClass::Transient,
             Self::Permanent(_) => ErrorClass::Invalid,
-            Self::NeedsInput { .. } | Self::AwaitRun { .. } => ErrorClass::Rejected,
+            Self::NeedsInput { .. } | Self::AwaitRun { .. } | Self::AwaitRemote { .. } => {
+                ErrorClass::Rejected
+            }
         }
     }
 }
@@ -475,6 +529,38 @@ mod tests {
             e.to_string(),
             "tool awaits run 0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
         );
+    }
+
+    #[test]
+    fn await_remote_has_a_frozen_shape_and_is_rejected_by_class() {
+        let e = ToolError::AwaitRemote {
+            task: "t-9".into(),
+            timeout_ms: None,
+        };
+        let json = r#"{"AwaitRemote":{"task":"t-9"}}"#;
+        assert_eq!(serde_json::to_string(&e).unwrap(), json);
+        assert_eq!(serde_json::from_str::<ToolError>(json).unwrap(), e);
+        let limited = ToolError::AwaitRemote {
+            task: "t-9".into(),
+            timeout_ms: Some(1500),
+        };
+        let json = r#"{"AwaitRemote":{"task":"t-9","timeout_ms":1500}}"#;
+        assert_eq!(serde_json::to_string(&limited).unwrap(), json);
+        assert_eq!(serde_json::from_str::<ToolError>(json).unwrap(), limited);
+        assert_eq!(e.class(), ErrorClass::Rejected);
+        assert!(!e.is_retryable());
+        assert_eq!(e.to_string(), "tool awaits remote task t-9");
+    }
+
+    #[test]
+    fn a_poll_result_round_trips() {
+        for poll in [
+            RemotePoll::Working,
+            RemotePoll::Ready(ToolOutput::error("it failed")),
+        ] {
+            let json = serde_json::to_value(&poll).unwrap();
+            assert_eq!(serde_json::from_value::<RemotePoll>(json).unwrap(), poll);
+        }
     }
 
     #[test]

@@ -264,8 +264,7 @@ async fn the_embedded_fixture_runs_a_subagent_end_to_end() {
         )])
         .push_text("LGTM")
         .push_text("Reviewed: LGTM");
-    let assembly = AgentDef::from_manifest(AGENT)
-        .unwrap()
+    let assembly = common::with_fixture_token(AgentDef::from_manifest(AGENT).unwrap())
         .bind(tools(&[
             "prepare_workspace",
             "run_checks",

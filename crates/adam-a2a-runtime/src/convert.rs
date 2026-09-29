@@ -321,6 +321,9 @@ mod tests {
         let mut v = view(RunStatus::Parked);
         v.state = json!({"pending_wait": {"call_id": "c1", "tool": "sub", "run": "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"}});
         assert_eq!(default_prompt(&v), None);
+        // Nor does a wait on a task of another system.
+        v.state = json!({"pending_wait": {"call_id": "c1", "tool": "billing", "task": "t-9"}});
+        assert_eq!(default_prompt(&v), None);
 
         let mut v = view(RunStatus::Done);
         v.output = Some(json!({"text": "all done", "artifacts": []}));

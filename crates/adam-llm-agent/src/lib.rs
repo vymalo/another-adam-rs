@@ -139,7 +139,8 @@ mod typed;
 pub use adam_runtime::Artifact;
 pub use agent::{BuildError, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter};
 pub use conversation::{
-    ArtifactRef, Conversation, MESSAGE_KIND, PendingQuestion, PendingRun, PendingWait, user_message,
+    ArtifactRef, Conversation, MESSAGE_KIND, PendingQuestion, PendingRemote, PendingRun,
+    PendingWait, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
@@ -148,6 +149,6 @@ pub use history::TRUNCATION_MARKER_PREFIX;
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
 pub use state::{Extensions, State, StateKey};
-pub use tool::{DynTool, Tool, ToolCtx, ToolError, ToolOutput};
+pub use tool::{DynTool, RemotePoll, Tool, ToolCtx, ToolError, ToolOutput};
 pub use toolset::ToolSet;
 pub use typed::{IntoToolOutput, IntoToolResult, Json, parse_args};

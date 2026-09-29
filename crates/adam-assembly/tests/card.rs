@@ -12,11 +12,12 @@ use adam_agent_fixture::AGENT;
 use adam_assembly::{AgentDef, Error, Url};
 use adam_llm_agent::ToolSet;
 use adam_model::MockModel;
-use common::{def, instructions, tools};
+use common::{def, instructions, tools, with_fixture_token};
 use serde_json::{Value, json};
 
 fn assembly_of(def: AgentDef, set: ToolSet) -> adam_assembly::Assembly {
-    def.bind(set)
+    with_fixture_token(def)
+        .bind(set)
         .unwrap()
         .model(Arc::new(MockModel::new()), "m")
         .unwrap()

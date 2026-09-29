@@ -10,6 +10,30 @@ use serde_json::{Value, json};
 const NOT_SEEN: &str =
     "The agent does not see this conversation; put everything it needs in `message`.";
 
+/// The spec every subagent tool has, local or remote: `{ "message": string }`, described by the
+/// subagent's own `description` and then the note that it starts with no history.
+pub(crate) fn subagent_spec(tool_name: &str, description: &str) -> ToolSpec {
+    ToolSpec {
+        name: tool_name.to_owned(),
+        description: match description.trim() {
+            "" => NOT_SEEN.to_owned(),
+            text => format!("{text} {NOT_SEEN}"),
+        },
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The task, with everything the agent needs to do it: \
+                                    it starts with no history and cannot ask you anything.",
+                }
+            },
+            "required": ["message"],
+            "additionalProperties": false,
+        }),
+    }
+}
+
 /// The tool that runs a subagent, one per subagent, named after it.
 ///
 /// `AgentDef::bind` adds one to the parent of every local subagent, so a user of this crate
@@ -45,25 +69,7 @@ impl SubagentTool {
     pub fn new(tool_name: impl Into<String>, agent: impl Into<String>, description: &str) -> Self {
         Self {
             agent: agent.into(),
-            spec: ToolSpec {
-                name: tool_name.into(),
-                description: match description.trim() {
-                    "" => NOT_SEEN.to_owned(),
-                    text => format!("{text} {NOT_SEEN}"),
-                },
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "message": {
-                            "type": "string",
-                            "description": "The task, with everything the agent needs to do it: \
-                                            it starts with no history and cannot ask you anything.",
-                        }
-                    },
-                    "required": ["message"],
-                    "additionalProperties": false,
-                }),
-            },
+            spec: subagent_spec(&tool_name.into(), description),
         }
     }
 
