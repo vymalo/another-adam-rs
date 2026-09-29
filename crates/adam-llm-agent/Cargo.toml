@@ -1,6 +1,7 @@
 [package]
 name = "adam-llm-agent"
 description = "Durable LLM tool-calling agent for adam-rs: the model/tool loop on top of adam-runtime"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

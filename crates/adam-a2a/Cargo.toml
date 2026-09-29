@@ -1,6 +1,7 @@
 [package]
 name = "adam-a2a"
 description = "Expose adam-rs agents as A2A (Agent2Agent) servers over axum"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

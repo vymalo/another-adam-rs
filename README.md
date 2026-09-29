@@ -9,19 +9,19 @@ trait, a shared conformance suite, and two production adapters.
 
 | Crate | What it is |
 |---|---|
-| `adam-core` | `Store` trait, run/journal/lease types, in-memory reference store |
-| `adam-store-testkit` | Conformance suite every store must pass (`store_conformance!`) |
-| `adam-store-postgres` | PostgreSQL 12+ via `sqlx` 0.9 |
-| `adam-store-mongodb` | MongoDB 5.0+ via the official driver; standalone `mongod` is enough |
-| `adam-model` | `ModelClient` trait (`complete` + streaming, tool calling), request/response types, `MockModel` test double |
-| `adam-model-openai` | `OpenAiCompatible`: any OpenAI-compatible chat-completions endpoint (gateway or provider) via `reqwest` + rustls |
-| `adam-workspace` | Per-run git worktrees over a shared mirror, commit and push, and pull requests (`CodeHost`, GitHub). The token is passed per `git` invocation and never stored |
-| `adam-runtime` | Durable agent loop: `Agent` trait, run state machine, `ctx.step` journaling, workers, retries, event sinks |
-| `adam-a2a` | Expose an agent as an A2A 1.0 server (axum): `TaskBackend` seam, bearer auth (fail closed), `InMemoryBackend` under feature `test-util` |
-| `adam-acp` | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
-| `adam-llm-agent` | `LlmAgent`: the durable model/tool-calling loop (`Tool` trait, `NeedsInput` parking, limits, history truncation) on top of `adam-runtime` |
-| `adam-a2a-runtime` | `RuntimeTaskBackend`: the A2A `TaskBackend` over `adam-runtime` (task = run, ownership per caller, `input-required` from parked runs); subscriptions are rebuilt from the store, so they survive restarts. Reusable by any agent |
-| `adam-coder` | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary; image in `docker/coder`, chart in `deploy/coder` |
+| [`adam-core`](crates/adam-core/README.md) | `Store` trait, run/journal/lease types, in-memory reference store |
+| [`adam-store-testkit`](crates/adam-store-testkit/README.md) | Conformance suite every store must pass (`store_conformance!`) |
+| [`adam-store-postgres`](crates/adam-store-postgres/README.md) | PostgreSQL 12+ via `sqlx` 0.9 |
+| [`adam-store-mongodb`](crates/adam-store-mongodb/README.md) | MongoDB 5.0+ via the official driver; standalone `mongod` is enough |
+| [`adam-model`](crates/adam-model/README.md) | `ModelClient` trait (`complete` + streaming, tool calling), request/response types, `MockModel` test double |
+| [`adam-model-openai`](crates/adam-model-openai/README.md) | `OpenAiCompatible`: any OpenAI-compatible chat-completions endpoint (gateway or provider) via `reqwest` + rustls |
+| [`adam-workspace`](crates/adam-workspace/README.md) | Per-run git worktrees over a shared mirror, commit and push, and pull requests (`CodeHost`, GitHub). The token is passed per `git` invocation and never stored |
+| [`adam-runtime`](crates/adam-runtime/README.md) | Durable agent loop: `Agent` trait, run state machine, `ctx.step` journaling, workers, retries, event sinks |
+| [`adam-a2a`](crates/adam-a2a/README.md) | Expose an agent as an A2A 1.0 server (axum): `TaskBackend` seam, bearer auth (fail closed), `InMemoryBackend` under feature `test-util` |
+| [`adam-acp`](crates/adam-acp/README.md) | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
+| [`adam-llm-agent`](crates/adam-llm-agent/README.md) | `LlmAgent`: the durable model/tool-calling loop (`Tool` trait, `NeedsInput` parking, limits, history truncation) on top of `adam-runtime` |
+| [`adam-a2a-runtime`](crates/adam-a2a-runtime/README.md) | `RuntimeTaskBackend`: the A2A `TaskBackend` over `adam-runtime` (task = run, ownership per caller, `input-required` from parked runs); subscriptions are rebuilt from the store, so they survive restarts. Reusable by any agent |
+| [`adam-coder`](crates/adam-coder/README.md) | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary; image in `docker/coder`, chart in `deploy/coder` |
 
 ## The model
 
@@ -248,6 +248,16 @@ release, one-open-run-per-conversation including a 16-way race, and purging.
 
 To add a backend (SQLite, Redis, FoundationDB, ...), implement `Store` and add
 one line: `adam_store_testkit::store_conformance!(make_store);`.
+
+## Development
+
+Every crate has a `README.md` next to its `Cargo.toml` (what it is for, its
+public API at a glance, features and environment variables, how it is tested),
+and `readme = "README.md"` in its manifest. Update the README in the same
+change as any change to the crate's public API, environment variables or
+tests. CI (the `lint` job) fails when a `crates/*/Cargo.toml` has no sibling
+`README.md`; it cannot check that the README is still accurate, so review
+does. The crate table above links each README.
 
 ## Roadmap
 
