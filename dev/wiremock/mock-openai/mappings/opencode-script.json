@@ -1,0 +1,132 @@
+{
+  "mappings": [
+    {
+      "name": "opencode script: the bash tool result is in, say it is done",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-opencode"
+            }
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          },
+          {
+            "contains": "oc-call-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "opencode-done.sse",
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        }
+      }
+    },
+    {
+      "name": "opencode script: first turn of the task calls bash",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-opencode"
+            }
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          },
+          {
+            "matchesJsonPath": "$.tools[?(@.function.name == 'bash')]"
+          },
+          {
+            "doesNotContain": "oc-call-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "opencode-bash.sse",
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        }
+      }
+    },
+    {
+      "name": "opencode fallback (stream): title generation and anything off-script",
+      "priority": 7,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-opencode"
+            }
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-text.sse",
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        },
+        "transformers": [
+          "response-template"
+        ]
+      }
+    },
+    {
+      "name": "opencode fallback: anything off-script, not streamed",
+      "priority": 8,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-opencode"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-text.json",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "transformers": [
+          "response-template"
+        ]
+      }
+    }
+  ]
+}

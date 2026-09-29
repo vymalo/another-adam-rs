@@ -231,6 +231,11 @@ jobs:
             -d '{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}' | grep -q '^data: \[DONE\]'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/v1/chat/completions \
             -H 'X-Mock-Scenario: rate-limit' -d '{"messages":[]}')" = 429
+          # mock-openai, model mock-coder: the scripted coder starts by preparing the workspace.
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-coder","messages":[{"role":"user","content":"add hello.txt"}]}' \
+            | jq -e '.choices[0].message.tool_calls[0].function.name == "prepare_workspace"' > /dev/null
           # mock-github: no open pull requests; creating one answers 201.
           test "$(curl -fsS 'http://127.0.0.1:8082/repos/local/sandbox/pulls?head=local:agent/x&state=open')" = '[]'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/repos/local/sandbox/pulls \
