@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
 use adam_a2a::{BackendError, Caller, TaskBackend, TaskEvent};
-use adam_core::RunId;
-use adam_runtime::{BroadcastSink, Classify, RunView, Runtime, RuntimeError};
+use adam_core::{RunId, StoreError};
+use adam_error::ErrorClass;
+use adam_runtime::{AgentError, BroadcastSink, Classify, RunView, Runtime, RuntimeError};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use uuid::Uuid;
@@ -166,15 +167,46 @@ impl RuntimeTaskBackend {
     }
 }
 
-/// Map a runtime failure to the backend seam's error.
+/// Map a runtime failure to the backend seam's error by its [`ErrorClass`], keeping the runtime
+/// error as the source. The A2A server logs the whole chain and sends the client only what this
+/// function chose to say.
+///
+/// | class | backend error |
+/// |---|---|
+/// | `NotFound` | `TaskNotFound` |
+/// | `Invalid`, `Rejected` | `InvalidParams` (the agent rejected the request, or the task's state forbids it) |
+/// | `Transient`, `RateLimited`, `Conflict` | `Unavailable` |
+/// | anything else | `Internal` |
 pub(crate) fn map_err(e: RuntimeError) -> BackendError {
-    match e {
-        RuntimeError::NotFound(run) => BackendError::TaskNotFound(run.to_string()),
-        RuntimeError::Finished { run, status } => {
-            BackendError::InvalidParams(format!("task {run} is already {status}"))
+    match e.class() {
+        ErrorClass::NotFound => {
+            let task = match &e {
+                RuntimeError::NotFound(run) | RuntimeError::Store(StoreError::NotFound(run)) => {
+                    run.to_string()
+                }
+                _ => "unknown".to_owned(),
+            };
+            BackendError::TaskNotFound(task)
         }
-        e if e.is_retryable() => BackendError::unavailable(e.to_string()),
-        e => BackendError::internal(e.to_string()),
+        ErrorClass::Invalid | ErrorClass::Rejected => {
+            BackendError::InvalidParams(client_detail(&e))
+        }
+        ErrorClass::Transient | ErrorClass::RateLimited | ErrorClass::Conflict => {
+            BackendError::unavailable("the task runtime is unavailable").with_source(e)
+        }
+        _ => BackendError::internal("the task runtime failed").with_source(e),
+    }
+}
+
+/// What a client may be told about a request the runtime refused: the agent's own message about
+/// the request, the state that forbids it, or a fixed sentence. Never a transport or driver text.
+fn client_detail(e: &RuntimeError) -> String {
+    match e {
+        RuntimeError::Finished { run, status } => format!("task {run} is already {status}"),
+        RuntimeError::ConversationBusy { .. } => "the conversation already has an open task".into(),
+        RuntimeError::Agent(AgentError::Permanent { message, .. }) => message.clone(),
+        RuntimeError::Store(StoreError::InvalidInput(message)) => message.clone(),
+        _ => "the request was rejected".into(),
     }
 }
 
@@ -273,5 +305,112 @@ impl TaskBackend for RuntimeTaskBackend {
         task_id: &str,
     ) -> BoxStream<'static, Result<TaskEvent, BackendError>> {
         subscribe::subscribe(self.clone(), caller.clone(), task_id.to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn lower() -> std::io::Error {
+        std::io::Error::other("connection reset by peer")
+    }
+
+    fn run() -> RunId {
+        RunId(Uuid::nil())
+    }
+
+    /// One row per class the runtime can report: what the client sees, and how it is classified.
+    #[test]
+    fn runtime_errors_map_by_class() {
+        use adam_core::store::StoreError as S;
+        let cases: Vec<(RuntimeError, ErrorClass)> = vec![
+            (RuntimeError::NotFound(run()), ErrorClass::NotFound),
+            (
+                RuntimeError::Store(S::NotFound(run())),
+                ErrorClass::NotFound,
+            ),
+            (
+                RuntimeError::Finished {
+                    run: run(),
+                    status: adam_core::RunStatus::Done,
+                },
+                ErrorClass::Invalid,
+            ),
+            (
+                RuntimeError::ConversationBusy {
+                    agent: "a".into(),
+                    conversation_id: "secret-subject:ctx".into(),
+                },
+                ErrorClass::Invalid,
+            ),
+            (
+                RuntimeError::Agent(AgentError::permanent("unusable start message: empty")),
+                ErrorClass::Invalid,
+            ),
+            (
+                RuntimeError::Store(S::InvalidInput("no NUL please".into())),
+                ErrorClass::Invalid,
+            ),
+            (RuntimeError::UnknownAgent("x".into()), ErrorClass::Invalid),
+            (
+                RuntimeError::Contended("run x".into()),
+                ErrorClass::Transient,
+            ),
+            (
+                RuntimeError::Store(S::unavailable(lower())),
+                ErrorClass::Transient,
+            ),
+            (
+                RuntimeError::Agent(AgentError::transient_after(
+                    "slow down",
+                    Duration::from_secs(3),
+                )),
+                ErrorClass::Transient,
+            ),
+            (
+                RuntimeError::Corrupt {
+                    run: run(),
+                    reason: "x".into(),
+                    source: None,
+                },
+                ErrorClass::Internal,
+            ),
+            (
+                RuntimeError::Store(S::internal(lower())),
+                ErrorClass::Internal,
+            ),
+        ];
+        for (e, kind) in cases {
+            let shown = e.to_string();
+            let class = e.class();
+            let mapped = map_err(e);
+            let ok = matches!(
+                (kind, &mapped),
+                (ErrorClass::NotFound, BackendError::TaskNotFound(_))
+                    | (ErrorClass::Invalid, BackendError::InvalidParams(_))
+                    | (ErrorClass::Transient, BackendError::Unavailable { .. })
+                    | (ErrorClass::Internal, BackendError::Internal { .. })
+            );
+            assert!(ok, "{shown} ({class:?}) mapped to {mapped:?}");
+        }
+    }
+
+    #[test]
+    fn what_a_client_is_told_carries_no_cause_and_no_conversation_id() {
+        let busy = map_err(RuntimeError::ConversationBusy {
+            agent: "a".into(),
+            conversation_id: "secret-subject:ctx".into(),
+        });
+        let told = a2a::A2AError::from(busy);
+        assert!(!told.message.contains("secret-subject"), "{}", told.message);
+
+        let down = map_err(RuntimeError::Store(StoreError::unavailable(lower())));
+        assert!(std::error::Error::source(&down).is_some());
+        let told = a2a::A2AError::from(down);
+        assert_eq!(told.code, -32603);
+        assert_eq!(told.message, "backend temporarily unavailable");
+        assert!(!told.message.contains("connection reset"));
     }
 }

@@ -119,6 +119,7 @@ dependencies = [
  "a2a-lf",
  "adam-a2a",
  "adam-core",
+ "adam-error",
  "adam-runtime",
  "adam-store-postgres",
  "async-trait",

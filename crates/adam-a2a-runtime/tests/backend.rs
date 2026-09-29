@@ -24,7 +24,8 @@ use tokio::sync::oneshot;
 /// * (none): progress, artifact `report`, then done with `finished`;
 /// * `[input]`: asks "which colour?", parks; the answer completes the run;
 /// * `[hold]`: parks on a far timer (so it is `working` until cancelled);
-/// * `[fail]`: fails with `boom`.
+/// * `[fail]`: fails with `boom`;
+/// * `[reject]`: `init` refuses the start message, like an agent that cannot read it.
 struct Scripted;
 
 #[async_trait]
@@ -40,6 +41,11 @@ impl Agent for Scripted {
             .as_str()
             .unwrap_or_default()
             .to_owned();
+        if text.contains("[reject]") {
+            return Err(AgentError::permanent(
+                "unusable start message: it asks for something this agent cannot do",
+            ));
+        }
         Ok(json!({"text": text, "phase": 0}))
     }
 
@@ -787,4 +793,75 @@ async fn round_trip_with_the_official_client_over_http() {
         Some("answered: violet")
     );
     worker.stop().await;
+}
+
+// -------------------------------------------------------------- error mapping
+
+/// Regression for A3: an `init` rejection (`AgentError::Permanent`) reached the client as
+/// `-32603 internal error` through the catch-all; it is the request that is wrong, so it is
+/// invalid params, with the agent's own message.
+#[tokio::test]
+async fn an_init_rejection_is_invalid_params_not_internal() {
+    let rig = Rig::new();
+    let err = rig
+        .backend
+        .submit(alice(), user("[reject] please"), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, BackendError::InvalidParams(m) if m.contains("unusable start message")),
+        "{err:?}"
+    );
+    assert_eq!(a2a::A2AError::from(err).code, -32602);
+}
+
+/// The same over the wire: the JSON-RPC error object carries `-32602` and the agent's message,
+/// not `-32603 internal error`.
+#[tokio::test]
+async fn an_init_rejection_is_a_32602_over_http() {
+    use a2a::SendMessageRequest;
+    use a2a_client::A2AClientFactory;
+    use a2a_client::agent_card::AgentCardResolver;
+    use a2a_client::auth::AuthInterceptor;
+    use secrecy::SecretString;
+
+    let rig = Rig::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let card = AgentCardConfig::new(
+        "scripted",
+        "Scripted test agent",
+        format!("http://{addr}/").parse().unwrap(),
+        "0.1.0",
+    );
+    let app = A2aServer::router(
+        card,
+        Arc::new(rig.backend.clone()),
+        AuthConfig::BearerTokens(vec![SecretString::from("t0")]),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+    let card = AgentCardResolver::new(None).resolve(&base).await.unwrap();
+    let client = A2AClientFactory::builder()
+        .with_interceptor(Arc::new(AuthInterceptor::bearer("t0")))
+        .build()
+        .create_from_card(&card)
+        .await
+        .unwrap();
+
+    let err = client
+        .send_message(&SendMessageRequest {
+            message: user("[reject]"),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap_err();
+    let text = format!("{err:?}");
+    assert!(text.contains("-32602"), "{text}");
+    assert!(text.contains("unusable start message"), "{text}");
+    assert!(!text.contains("-32603"), "{text}");
 }
