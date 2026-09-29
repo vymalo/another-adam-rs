@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_a2a::{A2aServer, AuthConfig};
-use adam_core::DynStore;
-use adam_host::Host;
+use adam_core::{ClaimScope, DynStore};
+use adam_host::{Host, Placement};
 use adam_model::DynModel;
 use adam_model_openai::{OpenAiCompatible, OpenAiConfig};
 use adam_notify_postgres::PgNotify;
@@ -64,9 +64,10 @@ async fn build_agent(worker: &WorkerConfig, redactor: Redactor) -> anyhow::Resul
         .context("building the model client")?,
     );
 
-    tokio::fs::create_dir_all(&worker.workspace_root)
+    let root = worker.placed_root();
+    tokio::fs::create_dir_all(&root)
         .await
-        .with_context(|| format!("creating {}", worker.workspace_root.display()))?;
+        .with_context(|| format!("creating {}", root.display()))?;
     let (workspaces, creds) = workspaces_for(worker);
     let code_host: DynCodeHost = Arc::new(
         GitHub::new(creds)
@@ -102,6 +103,15 @@ async fn run_notify(
     tokio::select! {
         result = notify.run(stop) => result.map_err(Into::into),
         result = listening => result.map_err(Into::into),
+    }
+}
+
+/// Pinned runs for the placements that keep a run's files on one worker, any run otherwise.
+fn claim_scope_for(placement: Placement) -> ClaimScope {
+    if placement.pins_runs() {
+        ClaimScope::Pinned
+    } else {
+        ClaimScope::Any
     }
 }
 
@@ -155,6 +165,8 @@ pub async fn serve(
                 store,
                 build_agent(worker, Redactor::from_config(&config)).await?,
                 &RuntimeOptions {
+                    worker_id: worker.worker_id.clone(),
+                    claim_scope: claim_scope_for(worker.placement),
                     concurrency: worker.workers,
                     ..RuntimeOptions::default()
                 },
@@ -179,6 +191,8 @@ pub async fn serve(
         %addr,
         %role,
         workers,
+        placement = config.worker.as_ref().map(|w| w.placement.as_str()),
+        worker_id = config.worker.as_ref().and_then(|w| w.worker_id.as_deref()),
         "listening"
     );
 

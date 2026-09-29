@@ -11,7 +11,8 @@ use crate::WorkerConfig;
 /// configured repository hosts, with the GitHub token scoped to the same
 /// hosts (defence in depth: the allowlist refuses a foreign host before any
 /// credential is requested, the scoped token refuses it again if a caller
-/// ever forgets the check).
+/// ever forgets the check). The root is [`WorkerConfig::placed_root`]: with the `affinity`
+/// placement, the folder named after the worker under `WORKSPACE_ROOT`.
 pub fn workspaces_for(config: &WorkerConfig) -> (Workspaces, DynGitCredentials) {
     let mut hosts = config.allowed_repo_hosts.iter();
     let first = hosts.next().map_or("github.com", String::as_str);
@@ -20,7 +21,7 @@ pub fn workspaces_for(config: &WorkerConfig) -> (Workspaces, DynGitCredentials) 
         |token, host| token.and_host(host.as_str()),
     );
     let creds: DynGitCredentials = Arc::new(creds);
-    let workspaces = Workspaces::new(config.workspace_root.clone(), creds.clone())
+    let workspaces = Workspaces::new(config.placed_root(), creds.clone())
         .allow_hosts(&config.allowed_repo_hosts)
         .allow_local(config.allow_local_repos);
     (workspaces, creds)
@@ -102,5 +103,44 @@ mod tests {
         let err = ws.prepare(&evil_repo, "run-cfg-0004").await.unwrap_err();
         assert!(matches!(err, WorkspaceError::NotFound(_)), "{err:?}");
         assert!(!evil.received_requests().await.unwrap().is_empty());
+    }
+
+    /// `affinity` keeps mirrors and worktrees in `WORKSPACE_ROOT/<WORKER_ID>`; `shared` and
+    /// `isolated` use `WORKSPACE_ROOT` itself.
+    #[tokio::test]
+    async fn the_placement_decides_the_folder_the_workspaces_live_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("nowhere.git");
+        let repo = RepoRef::new(local.to_string_lossy(), "main");
+        let cases = [
+            ("shared", "a", ""),
+            ("affinity", "b", "coder-9"),
+            ("isolated", "c", ""),
+        ];
+        for (placement, root, folder) in cases {
+            let root = tmp.path().join(root);
+            let (ws, _) = workspaces_for(&config(
+                &[
+                    ("ALLOW_LOCAL_REPOS", "true"),
+                    ("WORKSPACE_PLACEMENT", placement),
+                    ("WORKER_ID", "coder-9"),
+                ],
+                &root,
+            ));
+            // The remote is missing, but the mirror is created before it is fetched.
+            let err = ws.prepare(&repo, "run-place-0001").await.unwrap_err();
+            assert!(matches!(err, WorkspaceError::NotFound(_)), "{err:?}");
+            assert!(
+                root.join(folder).join("git").is_dir(),
+                "{placement}: mirrors under {}",
+                root.join(folder).display()
+            );
+            if !folder.is_empty() {
+                assert!(
+                    !root.join("git").exists(),
+                    "{placement}: nothing outside the worker's folder"
+                );
+            }
+        }
     }
 }

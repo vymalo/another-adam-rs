@@ -36,7 +36,8 @@ front:
 # The workers: the StatefulSet's replicas. Keep 1: runs move between workers at
 # every step, and the worktrees live on a ReadWriteOnce volume, so a second
 # worker without a shared /work would fork a run into a second pull request.
-# The chart refuses to render with more than 1 until workspace placement exists.
+# The chart refuses to render with more than 1 until it can set a workspace placement (the
+# binary has one: WORKSPACE_PLACEMENT and WORKER_ID, ADR 0002).
 replicaCount: 1
 
 # Environment of the binary (see crates/adam-coder/src/config.rs). Secrets are

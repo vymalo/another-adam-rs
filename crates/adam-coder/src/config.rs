@@ -16,6 +16,8 @@
 //! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
 //! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
 //! | `WORKSPACE_ROOT` | mirrors and worktrees (persistent storage) | `/work` |
+//! | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` ([`adam_host::Placement`]); `a2a-only` is refused | `shared` |
+//! | `WORKER_ID` | stable identity of this worker: the lease identity and, with `affinity` or `isolated`, the run owner; letters, digits, `.`, `_`, `-` | random per process; required for `affinity` and `isolated` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
 //! | `CHECK_TIMEOUT_SECS` | time limit of one `run_checks` command | `900` |
@@ -38,6 +40,21 @@
 //!   checks, the commit identity, OpenCode). They arrive in [`Config::worker`] as a
 //!   [`WorkerConfig`], which is `Some` exactly when [`Role::runs_workers`].
 //!
+//! # Workspace placement
+//!
+//! `WORKSPACE_PLACEMENT` and `WORKER_ID` are read by the roles that run workers (see
+//! [ADR 0002](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0002-workspace-placement.md)):
+//!
+//! | `WORKSPACE_PLACEMENT` | Workspace root of the worker | Runs |
+//! |---|---|---|
+//! | `shared` (default) | `WORKSPACE_ROOT`, a volume every worker mounts | any worker steps any run |
+//! | `affinity` | `WORKSPACE_ROOT/<WORKER_ID>` | pinned to the worker that first claimed them |
+//! | `isolated` | `WORKSPACE_ROOT`, a volume of this worker only | pinned, as above |
+//! | `a2a-only` | | refused: the coder's tools all need a workspace |
+//!
+//! A pinning placement without `WORKER_ID` is refused, because a random id would strand every
+//! run at the next restart. A pinned run whose worker never returns is stranded (nothing adopts it).
+//!
 //! What a role does not use is not validated: a chart may set a variable for every role, and a
 //! malformed `GITHUB_API_URL` does not stop a control plane. `LISTEN_ADDR` is read by every role.
 //!
@@ -50,7 +67,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use adam_error::{Classify, ErrorClass};
-use adam_host::Role;
+use adam_host::{Placement, Role};
 use secrecy::SecretString;
 use url::Url;
 
@@ -123,8 +140,12 @@ pub struct WorkerConfig {
     pub allow_local_repos: bool,
     /// `GITHUB_API_URL`.
     pub github_api_url: Url,
-    /// `WORKSPACE_ROOT`.
+    /// `WORKSPACE_ROOT`. Use [`WorkerConfig::placed_root`] for the folder the worker works in.
     pub workspace_root: PathBuf,
+    /// `WORKSPACE_PLACEMENT`. Never [`Placement::A2aOnly`]: the parser refuses it.
+    pub placement: Placement,
+    /// `WORKER_ID`. `Some` whenever [`Placement::pins_runs`].
+    pub worker_id: Option<String>,
     /// `WORKERS`.
     pub workers: usize,
     /// `MAX_CHECK_CYCLES`.
@@ -153,6 +174,8 @@ impl std::fmt::Debug for WorkerConfig {
             .field("allow_local_repos", &self.allow_local_repos)
             .field("github_api_url", &self.github_api_url.as_str())
             .field("workspace_root", &self.workspace_root)
+            .field("placement", &self.placement)
+            .field("worker_id", &self.worker_id)
             .field("workers", &self.workers)
             .field("max_check_cycles", &self.max_check_cycles)
             .field("check_timeout", &self.check_timeout)
@@ -268,6 +291,21 @@ impl Config {
 }
 
 impl WorkerConfig {
+    /// The folder this worker keeps mirrors and worktrees in: `WORKSPACE_ROOT` itself, or with
+    /// [`Placement::Affinity`] the folder `WORKSPACE_ROOT/<WORKER_ID>` it owns.
+    pub fn placed_root(&self) -> PathBuf {
+        match self.placement {
+            Placement::Affinity => match &self.worker_id {
+                Some(id) => self.workspace_root.join(id),
+                // `Config` refuses this combination.
+                None => self.workspace_root.clone(),
+            },
+            Placement::Shared | Placement::Isolated | Placement::A2aOnly => {
+                self.workspace_root.clone()
+            }
+        }
+    }
+
     /// Read the workers' variables, adding one line to `problems` per missing or malformed one.
     /// `None` only after a problem was recorded.
     fn parse(
@@ -298,6 +336,33 @@ impl WorkerConfig {
         let opencode_model = get("OPENCODE_MODEL").unwrap_or_else(|| model.clone());
         let workspace_root =
             PathBuf::from(get("WORKSPACE_ROOT").unwrap_or_else(|| "/work".to_owned()));
+
+        let placement = match Placement::from_optional(lookup("WORKSPACE_PLACEMENT").as_deref()) {
+            Ok(Placement::A2aOnly) => {
+                problems.push(
+                    "WORKSPACE_PLACEMENT=a2a-only is not supported by adam-coder's worker roles: \
+                     its tools need a workspace (use shared, affinity or isolated)"
+                        .into(),
+                );
+                Placement::default()
+            }
+            Ok(placement) => placement,
+            Err(e) => {
+                problems.push(format!("WORKSPACE_PLACEMENT is invalid: {e}"));
+                Placement::default()
+            }
+        };
+        let worker_id = get("WORKER_ID").map(|id| id.trim().to_owned());
+        match &worker_id {
+            Some(id) if !is_worker_id(id) => problems.push(format!(
+                "WORKER_ID {id:?} is not usable: 1 to 128 letters, digits, `.`, `_` or `-`, not starting with `.`"
+            )),
+            None if placement.pins_runs() => problems.push(format!(
+                "WORKER_ID is required when WORKSPACE_PLACEMENT is {placement}: a run stays on the \
+                 worker that owns it, so the id must be stable across restarts (a StatefulSet pod name)"
+            )),
+            _ => {}
+        }
 
         let workers = parse_or(get, "WORKERS", 4usize, problems);
         if workers == 0 {
@@ -375,6 +440,8 @@ impl WorkerConfig {
             allow_local_repos,
             github_api_url,
             workspace_root,
+            placement,
+            worker_id,
             workers,
             max_check_cycles,
             check_timeout,
@@ -392,6 +459,16 @@ impl WorkerConfig {
 const DEFAULT_REPO_HOST: &str = "github.com";
 /// API root used when `GITHUB_API_URL` is unset.
 const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
+
+/// A worker id is a lease identity and, with `affinity`, a folder name: no separator, no `..`.
+fn is_worker_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('.')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
 
 /// `name` or `name:port`: letters, digits, dots and dashes, nothing that could
 /// smuggle a scheme, path, userinfo or wildcard into an allowlist.
@@ -523,7 +600,8 @@ mod tests {
     fn debug_output_hides_secrets() {
         let c = parse(&full()).unwrap();
         let text = format!("{c:?}");
-        for secret in ["hunter2", "sk-secret", "ghp_secret", "one", "two"] {
+        // The short tokens are checked in their quoted form: a bare "one" is inside "None".
+        for secret in ["hunter2", "sk-secret", "ghp_secret", "\"one\"", "\"two\""] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
     }
@@ -744,5 +822,164 @@ mod tests {
     fn the_role_is_shown_in_debug_output() {
         let c = parse(&with_role("worker")).unwrap();
         assert!(format!("{c:?}").contains("role: Worker"));
+    }
+
+    // -- workspace placement ------------------------------------------------------------------
+
+    fn with_placement(
+        placement: &'static str,
+        worker_id: Option<&'static str>,
+    ) -> HashMap<&'static str, &'static str> {
+        let mut vars = full();
+        vars.insert("WORKSPACE_PLACEMENT", placement);
+        if let Some(id) = worker_id {
+            vars.insert("WORKER_ID", id);
+        }
+        vars
+    }
+
+    fn worker(vars: &HashMap<&'static str, &'static str>) -> WorkerConfig {
+        parse(vars).expect("valid").worker.expect("runs workers")
+    }
+
+    #[test]
+    fn placement_defaults_to_shared_with_no_worker_id() {
+        let w = worker(&full());
+        assert_eq!(w.placement, Placement::Shared);
+        assert_eq!(w.worker_id, None);
+        assert_eq!(w.placed_root(), PathBuf::from("/work"));
+        // Blank counts as unset.
+        let mut vars = full();
+        vars.insert("WORKSPACE_PLACEMENT", "  ");
+        vars.insert("WORKER_ID", "  ");
+        let w = worker(&vars);
+        assert_eq!((w.placement, w.worker_id), (Placement::Shared, None));
+    }
+
+    #[test]
+    fn shared_placement_accepts_a_worker_id_and_keeps_the_root() {
+        let w = worker(&with_placement("Shared", Some("coder-0")));
+        assert_eq!(w.placement, Placement::Shared);
+        assert_eq!(w.worker_id.as_deref(), Some("coder-0"));
+        assert_eq!(w.placed_root(), PathBuf::from("/work"));
+    }
+
+    #[test]
+    fn affinity_joins_the_worker_id_under_the_root() {
+        let w = worker(&with_placement(" affinity ", Some("coder-1")));
+        assert_eq!(w.placement, Placement::Affinity);
+        assert!(w.placement.pins_runs());
+        assert_eq!(w.workspace_root, PathBuf::from("/work"));
+        assert_eq!(w.placed_root(), PathBuf::from("/work/coder-1"));
+    }
+
+    #[test]
+    fn isolated_uses_the_root_as_it_is_and_pins_runs() {
+        let mut vars = with_placement("isolated", Some("coder-2"));
+        vars.insert("WORKSPACE_ROOT", "/pvc");
+        let w = worker(&vars);
+        assert_eq!(w.placement, Placement::Isolated);
+        assert!(w.placement.pins_runs());
+        assert_eq!(w.worker_id.as_deref(), Some("coder-2"));
+        assert_eq!(w.placed_root(), PathBuf::from("/pvc"));
+    }
+
+    #[test]
+    fn a_pinning_placement_without_a_worker_id_names_the_variable() {
+        for placement in ["affinity", "isolated"] {
+            for id in [None, Some("   ")] {
+                let err = parse(&with_placement(placement, id)).unwrap_err();
+                let problem = err
+                    .problems
+                    .iter()
+                    .find(|p| p.starts_with("WORKER_ID"))
+                    .unwrap_or_else(|| panic!("{placement}: {:?}", err.problems));
+                assert!(problem.contains("required"), "{problem}");
+                assert!(problem.contains(placement), "{problem}");
+                assert_eq!(err.class(), ErrorClass::Invalid);
+            }
+        }
+    }
+
+    #[test]
+    fn a2a_only_is_refused_by_the_worker_roles() {
+        for role in ["all", "worker"] {
+            let mut vars = with_placement("a2a-only", Some("coder-0"));
+            vars.insert("ROLE", role);
+            let err = parse(&vars).unwrap_err();
+            let problem = err
+                .problems
+                .iter()
+                .find(|p| p.starts_with("WORKSPACE_PLACEMENT"))
+                .unwrap_or_else(|| panic!("{role}: {:?}", err.problems));
+            assert!(problem.contains("a2a-only"), "{problem}");
+            assert!(problem.contains("workspace"), "{problem}");
+            assert_eq!(err.class(), ErrorClass::Invalid);
+        }
+    }
+
+    #[test]
+    fn an_unknown_placement_names_the_variable_and_the_accepted_values() {
+        let err = parse(&with_placement("pinned", None)).unwrap_err();
+        let problem = err
+            .problems
+            .iter()
+            .find(|p| p.starts_with("WORKSPACE_PLACEMENT"))
+            .unwrap_or_else(|| panic!("{:?}", err.problems));
+        assert!(problem.contains("\"pinned\""), "{problem}");
+        for placement in Placement::VALUES {
+            assert!(problem.contains(placement.as_str()), "{problem}");
+        }
+    }
+
+    #[test]
+    fn a_worker_id_is_a_safe_name() {
+        // Leaked: the test maps hold `&'static str`.
+        let (long, too_long): (&'static str, &'static str) = (
+            Box::leak("x".repeat(128).into_boxed_str()),
+            Box::leak("x".repeat(129).into_boxed_str()),
+        );
+        for good in ["a", "coder-0", "adam.coder_1", "A-b_C.9", long] {
+            let w = worker(&with_placement("affinity", Some(good)));
+            assert_eq!(w.worker_id.as_deref(), Some(good));
+        }
+        for bad in [
+            ".hidden", "..", "a/b", "a\\b", "a b", "pod:0", "ünï", too_long,
+        ] {
+            let err = parse(&with_placement("affinity", Some(bad))).unwrap_err();
+            assert!(
+                err.problems.iter().any(|p| p.starts_with("WORKER_ID")),
+                "{bad:?}: {:?}",
+                err.problems
+            );
+        }
+        // Checked for every placement, not only the ones that make a folder of it.
+        let err = parse(&with_placement("shared", Some("a/b"))).unwrap_err();
+        assert!(err.problems.iter().any(|p| p.starts_with("WORKER_ID")));
+    }
+
+    #[test]
+    fn a_control_plane_does_not_read_the_placement_variables() {
+        let mut vars = with_role("control-plane");
+        vars.insert("WORKSPACE_PLACEMENT", "a2a-only");
+        vars.insert("WORKER_ID", "a/b");
+        let c = parse(&vars).expect("a control plane ignores them");
+        assert!(c.worker.is_none());
+    }
+
+    #[test]
+    fn placement_problems_come_with_the_others() {
+        let mut vars = with_placement("isolated", None);
+        vars.remove("GITHUB_TOKEN");
+        let err = parse(&vars).unwrap_err();
+        assert!(err.problems.iter().any(|p| p.starts_with("GITHUB_TOKEN")));
+        assert!(err.problems.iter().any(|p| p.starts_with("WORKER_ID")));
+    }
+
+    #[test]
+    fn the_placement_shows_in_debug_output() {
+        let shown = format!("{:?}", worker(&with_placement("affinity", Some("coder-3"))));
+        assert!(shown.contains("Affinity"), "{shown}");
+        assert!(shown.contains("coder-3"), "{shown}");
     }
 }

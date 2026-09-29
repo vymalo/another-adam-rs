@@ -315,6 +315,45 @@ async fn an_unknown_role_is_a_configuration_error_naming_the_accepted_values() {
     );
 }
 
+/// `WORKSPACE_PLACEMENT` and `WORKER_ID`: a placement that pins runs needs a stable worker id,
+/// the coder's tools need a workspace, and every such mistake is exit 78 naming the variable,
+/// with nothing connected or started.
+#[tokio::test]
+async fn a_bad_placement_is_a_configuration_error_naming_the_variable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cases: [(&str, Option<&str>, &str); 4] = [
+        ("affinity", None, "WORKER_ID is required"),
+        ("isolated", None, "WORKER_ID is required"),
+        ("a2a-only", Some("coder-0"), "a2a-only"),
+        ("pinned", None, "\"pinned\""),
+    ];
+    for (placement, worker_id, wants) in cases {
+        let mut env = valid_env("postgres://u:p@127.0.0.1:1/x", tmp.path());
+        env.push(("WORKSPACE_PLACEMENT".into(), placement.into()));
+        if let Some(id) = worker_id {
+            env.push(("WORKER_ID".into(), id.into()));
+        }
+        let mut p = Proc::spawn(&env);
+        let status = p.exit_within(Duration::from_secs(30)).await;
+        assert_eq!(status.code(), Some(78), "{placement}: {}", p.logs());
+        let fields = failure(&p);
+        assert_eq!(fields["code"], 78);
+        let err = fields["error"].as_str().unwrap().to_owned();
+        assert!(
+            err.contains("WORKSPACE_PLACEMENT") || err.contains("WORKER_ID"),
+            "{err}"
+        );
+        assert!(
+            err.contains(wants),
+            "{placement}: {wants:?} missing from:\n{err}"
+        );
+        assert!(
+            !err.contains("connecting to Postgres"),
+            "a bad placement must stop before anything connects:\n{err}"
+        );
+    }
+}
+
 /// What each role requires. The model and GitHub variables belong to the roles that run workers
 /// (`all`, `worker`); a control plane starts without them (`a_control_plane_serves_a2a_...`). A
 /// missing front variable is one only for the roles that serve A2A. (That a worker *starts*
@@ -468,6 +507,34 @@ async fn a_worker_serves_only_healthz_needs_no_front_variables_and_stops_on_sigt
         "{out}"
     );
     assert!(!p.stderr().contains("panicked"), "{}", p.logs());
+    db.finish().await;
+}
+
+/// The `affinity` placement makes the worker keep its files in `WORKSPACE_ROOT/<WORKER_ID>`,
+/// and it logs the placement and the worker id it runs with.
+#[tokio::test]
+async fn an_affinity_worker_works_in_a_folder_named_after_its_id() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("work");
+    let mut env = role_env("worker", &db.url(), &workspace);
+    env.push(("WORKSPACE_PLACEMENT".into(), "affinity".into()));
+    env.push(("WORKER_ID".into(), "coder-7".into()));
+    let mut p = Proc::spawn(&env);
+    let _addr = p.ready().await;
+
+    assert!(
+        workspace.join("coder-7").is_dir(),
+        "the worker's own folder"
+    );
+    let out = p.stdout();
+    assert!(out.contains("affinity") && out.contains("coder-7"), "{out}");
+
+    p.sigterm().await;
+    let status = p.exit_within(Duration::from_secs(15)).await;
+    assert_eq!(status.code(), Some(0), "{}", p.logs());
     db.finish().await;
 }
 

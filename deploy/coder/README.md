@@ -134,8 +134,9 @@ exposed by the chart.
   is running, what finished), not the pushed branches or pull requests.
 * **One worker.** Runs move between workers at every step (`adam-runtime`'s worker), and
   worktrees live on a ReadWriteOnce volume, so a second worker without a shared `/work` forks a
-  run into a second pull request. The chart refuses `replicaCount` above 1 until workspace
-  placement exists (planned). The front (`topology: split`) is stateless and scales with
+  run into a second pull request. The binary now has a workspace placement
+  (`WORKSPACE_PLACEMENT`, `WORKER_ID`; ADR 0002), but the chart does not set one yet, so it
+  still refuses `replicaCount` above 1. The front (`topology: split`) is stateless and scales with
   `front.replicas`.
 * The `NetworkPolicy` depends on the cluster's CNI enforcing policies (it is
   otherwise inert) and on the namespace label `kubernetes.io/metadata.name`

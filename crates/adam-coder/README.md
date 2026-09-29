@@ -129,6 +129,8 @@ reported at once at startup):
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, worktrees, run notes | `/work` |
+| `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` (`a2a-only` is refused; see [Workspace placement](#workspace-placement)) | `shared` |
+| `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` | `900`, `16384` |
@@ -147,6 +149,32 @@ never inlined) together with `OPENCODE_DISABLE_AUTOUPDATE=1`; see
 `src/opencode.rs` for what was verified against the OpenCode sources. The
 OpenCode child does not see `GITHUB_TOKEN`, `DATABASE_URL` or
 `A2A_BEARER_TOKENS`, and the checks do not see those or `MODEL_API_KEY`.
+
+### Workspace placement
+
+`WORKSPACE_PLACEMENT` is parsed with `adam_host::Placement` (case-insensitive; unset or blank means
+`shared`) by the roles that run workers, together with `WORKER_ID`. It decides where a worker keeps
+its files and whether a run stays on one worker
+([ADR 0002](../../docs/decisions/0002-workspace-placement.md)):
+
+| `WORKSPACE_PLACEMENT` | Worker root | Runs | `WORKER_ID` |
+|---|---|---|---|
+| `shared` (default) | `WORKSPACE_ROOT`, one volume mounted by every worker (RWX); guarded by the mirror lock of [`adam-workspace`](../adam-workspace/README.md) | any worker steps any run | optional |
+| `affinity` | `WORKSPACE_ROOT/<WORKER_ID>` | pinned to the worker that first claimed them | required |
+| `isolated` | `WORKSPACE_ROOT`, a volume of this worker only (a PVC per worker) | pinned | required |
+| `a2a-only` | | refused: every tool of the coder needs a workspace | |
+
+* A pinning placement (`affinity`, `isolated`) makes `serve` build the runtime with
+  `ClaimScope::Pinned` and `worker_id = WORKER_ID` (`RuntimeOptions::claim_scope`,
+  `RuntimeOptions::worker_id`). The id must survive restarts (a StatefulSet pod name): a run stays
+  with the worker of that name. Without `WORKER_ID` the process exits 78, naming the variable.
+* `a2a-only` exits 78 for `all` and `worker`: a host whose agents only call remote agents (the
+  orchestrator) can use the placement, the coder cannot. A `control-plane` reads neither variable.
+* **Known limitation: a pinned run whose worker never returns is stranded.** No other worker
+  claims it and nothing reports it. Adoption is future work. Keep worker ids stable, and do not
+  scale a pinned deployment in.
+* Without a placement that fits, two workers on two disks fork a run silently: a second clone, a
+  second branch and a second pull request (the ADR has the chain).
 
 ### Roles
 
@@ -188,8 +216,8 @@ nothing and the system falls back to polling. A library user gets the in-process
 `Coder::new` and `Coder::control_plane`, or passes their own `LiveSignals` to
 `Coder::new_with` and `Coder::control_plane_with`.
 
-A worker's runs have no affinity today: any worker may lease any run. A deployment keeps
-one worker per workspace root, or gives the workers a shared volume (ADR 0001, decision 10).
+By default any worker may lease any run at any step. Several workers therefore need a
+[workspace placement](#workspace-placement).
 
 **Required variables by role**
 
@@ -198,7 +226,7 @@ one worker per workspace root, or gives the workers a shared volume (ADR 0001, d
 | `DATABASE_URL` | yes | yes | yes |
 | `A2A_BEARER_TOKENS`, `PUBLIC_URL` | yes | yes | not read |
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `GITHUB_TOKEN` | yes | not read | yes |
-| the rest of the table above (`OPENCODE_*`, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
+| the rest of the table above (`OPENCODE_*`, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `WORKSPACE_PLACEMENT`, `WORKER_ID`, `WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
 
 A missing required value is a configuration error (exit 78) listed with every other problem.
 What a role does not read it does not validate either: a worker ignores `A2A_BEARER_TOKENS` and
@@ -348,9 +376,14 @@ database of its own, so the role needs `CREATEDB`):
   agent refuses to build without the `ToolEnv` as state.
 * `adam-workspace/tests/workspace.rs`: the host allowlist, local paths, scoped
   tokens, and a wiremock "evil" git host that must never be contacted.
+* `tests/binary.rs` also covers placement: a pinning placement without `WORKER_ID`, `a2a-only` and
+  an unknown placement each exit 78 naming the variable and connecting to nothing, and an
+  `affinity` worker creates `WORKSPACE_ROOT/<WORKER_ID>` (with Postgres).
 * unit tests: configuration (including `ROLE`: the default, each value, an unknown one, the
   variables each role requires, and that `Config::worker` is `Some` exactly for the roles that
-  run workers), prompt, OpenCode config, shell execution (timeout
+  run workers; and placement: the default, each variant, `WORKER_ID` required by the pinning
+  ones and validated as a safe name, `a2a-only` and unknown values refused, a control plane
+  ignoring both), the folder each placement gives the workspaces (`src/repos.rs`), prompt, OpenCode config, shell execution (timeout
   kills the process group, output tail, cwd confinement, hidden secrets), run
   notes, the exit code of each root cause (`src/exit.rs`), and the scrubbing
   and bounding of failure text (`src/agent.rs`, `src/redact.rs`).
