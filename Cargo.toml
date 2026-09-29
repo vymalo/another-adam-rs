@@ -16,7 +16,11 @@ adam-model = { path = "crates/adam-model", version = "0.1.0" }
 adam-store-testkit = { path = "crates/adam-store-testkit", version = "0.1.0" }
 adam-workspace = { path = "crates/adam-workspace", version = "0.1.0" }
 
+a2a-client-lf = "0.2"
+a2a-lf = "0.3"
+a2a-server-lf = "0.4"
 async-trait = "0.1"
+axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 futures = "0.3"
@@ -25,9 +29,12 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1"
 tracing = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
