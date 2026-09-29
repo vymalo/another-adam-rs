@@ -934,25 +934,36 @@ fn bearer_header() -> [(&'static str, String); 1] {
     [("Authorization", format!("Bearer {TOKEN}"))]
 }
 
-/// A response to a bad request is one of two clean shapes: an HTTP 4xx (a
-/// plain-text body from the SDK's extractor), or HTTP 200 with a JSON-RPC
-/// error object. Never a 5xx, never an empty or truncated reply.
-fn assert_clean_rejection(what: &str, response: &Raw) {
-    assert!(
-        (400..500).contains(&response.status) || response.status == 200,
-        "{what}: unexpected status {}: {}",
-        response.status,
+/// A response to a request that is not a JSON-RPC request is always one shape: HTTP 200 with a
+/// JSON-RPC error object whose code is -32700 (the body is not JSON) or -32600 (it is JSON, but not
+/// a request, or was not declared as JSON), and whose id is null when none could be read (a request
+/// that parses but is wrong, such as `"jsonrpc": "1.0"`, gets its own id back). It is never a
+/// plain-text 400/415/422 from the SDK's extractor, never a 5xx, never empty or truncated.
+/// Returns the error code and the response id.
+fn assert_clean_rejection(what: &str, response: &Raw) -> (i64, serde_json::Value) {
+    assert_eq!(
+        response.status, 200,
+        "{what}: unexpected status: {}",
         response.body
     );
-    assert!(!response.body.is_empty(), "{what}: empty body");
-    if response.status == 200 {
-        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap_or_else(|e| {
-            panic!("{what}: 200 with a non-JSON body ({e}): {}", response.body)
-        });
-        assert_eq!(body["jsonrpc"], "2.0", "{what}: {body}");
-        assert!(body["error"]["code"].is_i64(), "{what}: {body}");
-        assert!(body.get("result").is_none(), "{what}: {body}");
-    }
+    let body: serde_json::Value = serde_json::from_str(&response.body)
+        .unwrap_or_else(|e| panic!("{what}: 200 with a non-JSON body ({e}): {}", response.body));
+    assert_eq!(body["jsonrpc"], "2.0", "{what}: {body}");
+    assert!(body.get("result").is_none(), "{what}: {body}");
+    let code = body["error"]["code"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("{what}: no error code: {body}"));
+    assert!(
+        [-32700, -32600].contains(&code),
+        "{what}: unexpected code {code}: {body}"
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "{what}: {body}"
+    );
+    (code, body["id"].clone())
 }
 
 /// Bodies that are not JSON-RPC requests, sent with a valid token: rejected
@@ -985,7 +996,25 @@ async fn malformed_json_with_a_valid_token_is_rejected_cleanly() {
         for body in bodies {
             let response = raw(server.addr, "POST", "/", &headers, body).await;
             let what = format!("body {:?}", &body[..body.len().min(24)]);
-            assert_clean_rejection(&what, &response);
+            let (code, id) = assert_clean_rejection(&what, &response);
+            // Not JSON at all is a parse error; JSON that is not a request is an invalid request.
+            let expected = match body {
+                "{not json" | "" | "[1,2" | "\u{0}" => Some(-32700),
+                "null"
+                | "{}"
+                | "[]"
+                | "\"a string\""
+                | "{\"jsonrpc\":\"2.0\",\"id\":1,\"params\":{}}" => Some(-32600),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                assert_eq!(code, expected, "{what}: {}", response.body);
+                assert!(
+                    id.is_null(),
+                    "{what}: no id could be read: {}",
+                    response.body
+                );
+            }
         }
 
         // Valid JSON-RPC with params of the wrong shape is a JSON-RPC error
@@ -1044,7 +1073,7 @@ async fn malformed_json_without_a_valid_token_is_still_401() {
 }
 
 /// A body that is not declared as JSON is refused before it is read as
-/// JSON-RPC, cleanly (415 from the SDK), for every request that is not
+/// JSON-RPC, with a -32600 error object, for every request that is not
 /// `application/json`; parameters on the media type are fine.
 #[tokio::test]
 async fn wrong_content_type_is_rejected_cleanly() {
@@ -1070,9 +1099,13 @@ async fn wrong_content_type_is_rejected_cleanly() {
             &valid_body,
         )
         .await;
-        assert_clean_rejection(&format!("content-type {content_type:?}"), &response);
-        assert_ne!(
-            response.status, 200,
+        // Refused before the body is read as JSON-RPC: had the valid `GetTask` been processed, the
+        // answer would be -32001 (task not found), not an invalid request.
+        let (code, id) =
+            assert_clean_rejection(&format!("content-type {content_type:?}"), &response);
+        assert!(id.is_null(), "{}", response.body);
+        assert_eq!(
+            code, -32600,
             "content-type {content_type:?} was accepted as JSON-RPC: {}",
             response.body
         );
@@ -1090,4 +1123,21 @@ async fn wrong_content_type_is_rejected_cleanly() {
     assert_eq!(response.status, 200, "{}", response.body);
     let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
     assert_eq!(body["error"]["code"], -32001, "task not found: {body}");
+}
+
+/// A body over the SDK's size limit is an invalid request (-32600) like any other rejection, not a
+/// bare plain-text 413.
+#[tokio::test]
+async fn an_oversized_body_is_an_invalid_request() {
+    let server = TestServer::start(TestServer::bearer()).await;
+    let credentials = bearer_header();
+    let headers: Vec<(&str, &str)> = credentials.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let huge = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"GetTask\",\"params\":{{\"id\":\"{}\"}}}}",
+        "x".repeat(a2a_server::jsonrpc::MAX_REQUEST_BODY_BYTES)
+    );
+    let response = raw(server.addr, "POST", "/", &headers, &huge).await;
+    let (code, id) = assert_clean_rejection("an oversized body", &response);
+    assert_eq!(code, -32600, "{}", response.body);
+    assert!(id.is_null(), "{}", response.body);
 }

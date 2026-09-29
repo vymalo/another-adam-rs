@@ -3,15 +3,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use a2a::error_code::{INVALID_REQUEST, PARSE_ERROR};
 use a2a_server::StaticAgentCard;
 use a2a_server::agent_card::agent_card_router;
-use a2a_server::jsonrpc::jsonrpc_router;
+use a2a_server::jsonrpc::{MAX_REQUEST_BODY_BYTES, jsonrpc_router};
+use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
+use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::middleware::{self, Next};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::StreamExt;
 
@@ -84,7 +87,8 @@ impl A2aServer {
         let authenticator = Arc::new(Authenticator::new(auth));
         let agent_card = build_card(&card, authenticator.requires_bearer());
 
-        let mut rpc = jsonrpc_router(BackendHandler::new(backend));
+        let mut rpc = jsonrpc_router(BackendHandler::new(backend))
+            .layer(middleware::from_fn(json_rpc_rejections));
         if let Some(interval) = options.keepalive_interval {
             rpc = rpc.layer(middleware::from_fn_with_state(interval, keepalive));
         }
@@ -102,6 +106,64 @@ impl A2aServer {
                 auth::authenticate,
             ))
     }
+}
+
+/// Turn the SDK extractor's plain-text rejections into JSON-RPC error objects.
+///
+/// The SDK reads the body with axum's `Json` extractor, so a body that is not a JSON-RPC request
+/// is refused before its handler runs, with a plain-text 400 (not JSON), 415 (not declared as
+/// JSON), 422 (well-formed JSON of the wrong shape, or a document that ends early) or 413 (too
+/// large). A JSON-RPC client cannot read those. This layer, inside the authentication layer (so an
+/// anonymous caller still gets a 401 and learns nothing about how requests are read), answers
+/// them the way the SDK answers every other error: HTTP 200 with an error object, code -32700
+/// (parse error) for a body that is not JSON and -32600 (invalid request) for the rest, and a null
+/// id because none could be read. The extractor's text is dropped; it is not part of the protocol.
+///
+/// The body is buffered (at most the SDK's own limit) so a 422 can be told apart: the extractor
+/// reports `[1,2` as a shape error, but it is not JSON.
+async fn json_rpc_rejections(request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await else {
+        return rejection(INVALID_REQUEST, "invalid request: the body is too large");
+    };
+    let response = next
+        .run(Request::from_parts(parts, Body::from(bytes.clone())))
+        .await;
+    let is_json = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    if is_json {
+        return response;
+    }
+    let status = response.status();
+    let not_json = || serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_err();
+    let (code, message) = match status {
+        StatusCode::BAD_REQUEST => (PARSE_ERROR, NOT_JSON),
+        StatusCode::UNPROCESSABLE_ENTITY if not_json() => (PARSE_ERROR, NOT_JSON),
+        StatusCode::UNPROCESSABLE_ENTITY => (
+            INVALID_REQUEST,
+            "invalid request: the body is not a JSON-RPC request",
+        ),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => (
+            INVALID_REQUEST,
+            "invalid request: the content type must be application/json",
+        ),
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            (INVALID_REQUEST, "invalid request: the body is too large")
+        }
+        _ => return response,
+    };
+    tracing::debug!(%status, code, "malformed JSON-RPC request");
+    rejection(code, message)
+}
+
+const NOT_JSON: &str = "parse error: the body is not valid JSON";
+/// HTTP 200 with a JSON-RPC error object and a null id.
+fn rejection(code: i32, message: &str) -> Response {
+    let error = a2a::A2AError::new(code, message).to_jsonrpc_error();
+    let body = a2a::JsonRpcResponse::error(a2a::JsonRpcId::Null, error);
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 async fn healthz() -> &'static str {
