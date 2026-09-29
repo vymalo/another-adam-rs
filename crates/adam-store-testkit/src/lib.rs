@@ -32,7 +32,9 @@ use serde_json::json;
 
 /// Generate one `#[tokio::test]` per conformance case. `$make` is a path to an
 /// `async fn() -> Option<DynStore>`; returning `None` skips the suite (for
-/// example when the database URL env var is not set).
+/// example when the database URL env var is not set), unless
+/// `ADAM_TEST_REQUIRE_DB=1` is set: then every case fails instead (see
+/// `adam_core::testing`).
 #[macro_export]
 macro_rules! store_conformance {
     ($make:path) => {
