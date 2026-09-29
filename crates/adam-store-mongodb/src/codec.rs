@@ -168,4 +168,81 @@ mod tests {
         assert_eq!(bson_to_json(&json_to_bson(&v).unwrap()).unwrap(), v);
         assert!(json_to_bson(&json!(u64::MAX)).is_err());
     }
+
+    mod prop {
+        use proptest::collection::{hash_map, vec};
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// Keys with every character the codec treats specially, next to
+        /// ordinary ones and arbitrary unicode.
+        fn arb_key() -> impl Strategy<Value = String> {
+            prop_oneof![
+                "[%.$\\x00a-z0-9 ]{0,10}",
+                any::<String>(),
+                Just(String::new()),
+            ]
+        }
+
+        /// JSON as agent state can hold it: nested, hostile keys, the whole
+        /// `i64` range, finite floats. (`u64` above `i64::MAX` is refused by
+        /// design, see `values_roundtrip`.)
+        fn arb_json() -> impl Strategy<Value = Value> {
+            let leaf = prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::Bool),
+                any::<i64>().prop_map(Value::from),
+                (-1.0e300..1.0e300_f64).prop_map(Value::from),
+                arb_key().prop_map(Value::String),
+            ];
+            leaf.prop_recursive(4, 64, 6, |inner| {
+                prop_oneof![
+                    vec(inner.clone(), 0..6).prop_map(Value::Array),
+                    hash_map(arb_key(), inner, 0..6)
+                        .prop_map(|m| Value::Object(m.into_iter().collect())),
+                ]
+            })
+        }
+
+        proptest! {
+            /// Any key survives encode -> decode, and the encoded form is
+            /// one MongoDB accepts as a field name: non-empty, no `.`, no
+            /// NUL, no leading `$`.
+            #[test]
+            fn prop_keys_roundtrip(key in arb_key()) {
+                let enc = encode_key(&key);
+                prop_assert!(!enc.is_empty());
+                prop_assert!(!enc.starts_with('$'));
+                prop_assert!(!enc.contains(['.', '\0']));
+                prop_assert_eq!(decode_key(&enc).unwrap(), key.clone());
+                // Keys that need no escaping stay verbatim and queryable.
+                if !needs_escape(&key) {
+                    prop_assert_eq!(enc, key);
+                }
+            }
+
+            /// Distinct keys never collide once encoded (or one document
+            /// would silently lose a field).
+            #[test]
+            fn prop_distinct_keys_stay_distinct(a in arb_key(), b in arb_key()) {
+                prop_assume!(a != b);
+                prop_assert_ne!(encode_key(&a), encode_key(&b));
+            }
+
+            /// Decoding arbitrary text (a hand-edited document) is an error
+            /// or a value, never a panic.
+            #[test]
+            fn prop_decode_never_panics(text in any::<String>()) {
+                let _ = decode_key(&text);
+            }
+
+            /// JSON -> BSON -> JSON is the identity.
+            #[test]
+            fn prop_values_roundtrip(value in arb_json()) {
+                let bson = json_to_bson(&value).unwrap();
+                prop_assert_eq!(bson_to_json(&bson).unwrap(), value);
+            }
+        }
+    }
 }

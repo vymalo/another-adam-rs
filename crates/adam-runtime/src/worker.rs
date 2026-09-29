@@ -15,6 +15,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use adam_core::{Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError, StoreResult};
 
 use crate::agent::{AgentError, Transition};
+use crate::cancel::CancelToken;
 use crate::ctx::{Ctx, CtxOutcome, CtxParts};
 use crate::envelope::Envelope;
 use crate::events::Artifact;
@@ -186,6 +187,26 @@ fn spawn_renewer(inner: Arc<Inner>, run: RunId) -> AbortOnDrop {
     }))
 }
 
+/// Fires `token` once the run turns terminal (or vanishes) in the store, which
+/// is how a cancel issued by another process reaches a step running here.
+fn spawn_cancel_watch(inner: Arc<Inner>, run: RunId, token: CancelToken) -> AbortOnDrop {
+    let every = inner.cfg.poll_interval.max(Duration::from_millis(1));
+    AbortOnDrop(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            match inner.store.load_run(run).await {
+                Ok(Some(rec)) if rec.status.is_open() => {}
+                Ok(_) => {
+                    tracing::debug!(%run, "run finished elsewhere while stepping; signalling cancellation");
+                    token.cancel();
+                    return;
+                }
+                Err(e) => tracing::debug!(%run, error = %e, "cancel watch could not read the run"),
+            }
+        }
+    }))
+}
+
 /// One claimed run: step it, commit, release.
 #[tracing::instrument(skip_all, fields(run = %lease.run.id, agent = %lease.run.agent))]
 async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
@@ -194,7 +215,12 @@ async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
         .cfg
         .lease_renewal
         .then(|| spawn_renewer(inner.clone(), run));
-    let release = transition(&inner, lease.run).await;
+    let cancel = CancelToken::new();
+    let tracked = inner.track(run, cancel.clone());
+    let watch = spawn_cancel_watch(inner.clone(), run, cancel.clone());
+    let release = transition(&inner, lease.run, cancel).await;
+    drop(watch);
+    drop(tracked);
     drop(renewer);
     drop(guard);
     if release && let Err(e) = inner.store.release_lease(run, &inner.cfg.worker_id).await {
@@ -227,7 +253,7 @@ enum Plan {
 }
 
 /// Returns whether the lease should be released.
-async fn transition(inner: &Arc<Inner>, rec: RunRecord) -> bool {
+async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> bool {
     let run = rec.id;
     let env = match Envelope::decode(run, &rec.state) {
         Ok(env) => env,
@@ -262,6 +288,7 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord) -> bool {
         store: inner.store.clone(),
         sink: inner.sink.clone(),
         clock: inner.clock.clone(),
+        cancel,
     });
     let stepped = AssertUnwindSafe(agent.step(&mut ctx, env.agent.clone()))
         .catch_unwind()
@@ -343,6 +370,48 @@ fn plan(
         retry_detail: None,
     };
 
+    // A transient failure: schedule the retry, or give up when the policy's
+    // attempts are used up. `hint` is a minimum wait from the error.
+    let retrying = |msg: String, hint: Option<Duration>| -> Next {
+        let failures = base.attempt.saturating_add(1);
+        let policy = &inner.cfg.retry;
+        if failures >= policy.max_attempts {
+            Next {
+                attempt: failures,
+                ..failed(format!("gave up after {failures} attempts: {msg}"))
+            }
+        } else {
+            let delay = match hint {
+                Some(at_least) => policy.delay_with_hint(failures, at_least),
+                None => policy.backoff(failures),
+            };
+            let wake_at = inner
+                .clock
+                .now()
+                .checked_add_signed(
+                    chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX),
+                )
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+            Next {
+                status: RunStatus::Runnable,
+                wake_at: Some(wake_at),
+                agent: base.agent.clone(),
+                output: Value::Null,
+                error: None,
+                attempt: failures,
+                // Abandon this try's journal entries so the retry runs
+                // its steps afresh (see `Ctx::step`).
+                seq,
+                consumed: 0,
+                artifacts: Vec::new(),
+                retry_detail: Some(format!(
+                    "attempt {failures} of {} failed, retrying in {delay:?}: {msg}",
+                    policy.max_attempts
+                )),
+            }
+        }
+    };
+
     let next = match result {
         Ok(Transition::Continue(s)) => progressed(RunStatus::Runnable, None, s, Value::Null, None),
         Ok(Transition::Park { state, wake_at }) => {
@@ -354,37 +423,8 @@ fn plan(
         Ok(Transition::Fail { state, error }) => {
             progressed(RunStatus::Failed, None, state, Value::Null, Some(error))
         }
-        Err(AgentError::Transient(msg)) => {
-            let failures = base.attempt.saturating_add(1);
-            let policy = &inner.cfg.retry;
-            if failures >= policy.max_attempts {
-                Next {
-                    attempt: failures,
-                    ..failed(format!("gave up after {failures} attempts: {msg}"))
-                }
-            } else {
-                let delay = policy.backoff(failures);
-                let wake_at = inner.clock.now()
-                    + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX);
-                Next {
-                    status: RunStatus::Runnable,
-                    wake_at: Some(wake_at),
-                    agent: base.agent.clone(),
-                    output: Value::Null,
-                    error: None,
-                    attempt: failures,
-                    // Abandon this try's journal entries so the retry runs
-                    // its steps afresh (see `Ctx::step`).
-                    seq,
-                    consumed: 0,
-                    artifacts: Vec::new(),
-                    retry_detail: Some(format!(
-                        "attempt {failures} of {} failed, retrying in {delay:?}: {msg}",
-                        policy.max_attempts
-                    )),
-                }
-            }
-        }
+        Err(AgentError::Transient(msg)) => retrying(msg, None),
+        Err(AgentError::TransientAfter(msg, at_least)) => retrying(msg, Some(at_least)),
         Err(AgentError::Permanent(msg)) => failed(msg),
         Err(AgentError::NonDeterminism(msg)) => failed(format!("non-deterministic replay: {msg}")),
         Err(AgentError::Store(e @ StoreError::InvalidData(_))) => failed(e.to_string()),

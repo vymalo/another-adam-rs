@@ -512,3 +512,164 @@ async fn a_second_prompt_while_one_runs_is_rejected() {
     assert_eq!(ok(collect(first).await), vec![ended("cancelled")]);
     drop(client);
 }
+
+/// A line on stdout that is not JSON-RPC (a stray `println!` in the agent, a
+/// banner) must neither hang the connection nor fail the turn: it is skipped
+/// and the turn completes with everything that followed.
+#[tokio::test]
+async fn garbage_on_stdout_is_ignored_and_the_turn_still_completes() {
+    let dir = root();
+    let (client, session) = start(
+        fake(dir.path(), "garbage-stdout"),
+        ClientPolicy::new(dir.path()),
+        dir.path(),
+    )
+    .await;
+    let items = ok(collect(session.prompt("go".into())).await);
+    assert!(items.contains(&text("write: ok")), "{items:?}");
+    assert_eq!(items.last(), Some(&ended("end_turn")));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("hello.txt")).expect("the write happened"),
+        "hi"
+    );
+    // The connection is still healthy afterwards.
+    let items = ok(collect(session.prompt("again".into())).await);
+    assert_eq!(items.last(), Some(&ended("end_turn")));
+    within(client.shutdown()).await.expect("shutdown");
+}
+
+/// A JSON-RPC error on `session/prompt` ends the turn stream with
+/// [`AcpError::Rpc`] carrying code and message (not retryable), an
+/// authentication error (-32000) is told apart, and the session stays usable.
+#[tokio::test]
+async fn prompt_rpc_error_surfaces_as_acp_error() {
+    let dir = root();
+    let (client, session) = start(
+        fake(dir.path(), "prompt-error"),
+        ClientPolicy::new(dir.path()),
+        dir.path(),
+    )
+    .await;
+    let items = collect(session.prompt("go".into())).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    match items[0].as_ref().unwrap_err() {
+        e @ AcpError::Rpc { code, message } => {
+            assert_eq!(*code, -32603);
+            assert!(message.contains("fake prompt failure"), "{message}");
+            assert!(
+                !e.is_retryable(),
+                "an agent's own error is not a reason to respawn"
+            );
+            assert!(e.to_string().contains("fake prompt failure"));
+        }
+        other => panic!("expected Rpc, got {other:?}"),
+    }
+    // The failed turn released the session's slot.
+    let again = collect(session.prompt("again".into())).await;
+    assert!(
+        matches!(again[..], [Err(AcpError::Rpc { .. })]),
+        "{again:?}"
+    );
+    within(client.shutdown()).await.expect("shutdown");
+
+    let dir = root();
+    let cmd = fake(dir.path(), "prompt-error").env("FAKE_ACP_ERROR_CODE", "-32000");
+    let (_client, session) = start(cmd, ClientPolicy::new(dir.path()), dir.path()).await;
+    let items = collect(session.prompt("go".into())).await;
+    assert!(
+        matches!(&items[..], [Err(AcpError::AuthRequired(m))] if m.contains("fake prompt failure")),
+        "{items:?}"
+    );
+}
+
+/// A JSON-RPC error on `session/new` is reported by `new_session`, and code
+/// -32000 is read as "authentication required".
+#[tokio::test]
+async fn session_new_rpc_error_surfaces_as_acp_error() {
+    let dir = root();
+    let client = within(AcpClient::spawn(
+        fake(dir.path(), "session-error"),
+        ClientPolicy::new(dir.path()),
+    ))
+    .await
+    .expect("spawn");
+    let err = within(client.new_session(dir.path(), vec![]))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(&err, AcpError::AuthRequired(m) if m.contains("fake session failure")),
+        "{err:?}"
+    );
+    assert!(!err.is_retryable());
+
+    let cmd = fake(dir.path(), "session-error").env("FAKE_ACP_ERROR_CODE", "-32602");
+    let client = within(AcpClient::spawn(cmd, ClientPolicy::new(dir.path())))
+        .await
+        .expect("spawn");
+    let err = within(client.new_session(dir.path(), vec![]))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(&err, AcpError::Rpc { code: -32602, message } if message.contains("fake session failure")),
+        "{err:?}"
+    );
+}
+
+/// Every stop reason arrives verbatim in `TurnEnded`: the client neither
+/// rewrites `max_tokens` or `refusal` into success nor into an error, so the
+/// caller decides.
+#[tokio::test]
+async fn non_end_turn_stop_reasons_are_reported_verbatim() {
+    for reason in [
+        "max_tokens",
+        "max_turn_requests",
+        "refusal",
+        "cancelled",
+        "end_turn",
+    ] {
+        let dir = root();
+        let cmd = fake(dir.path(), "stop-reason").env("FAKE_ACP_STOP_REASON", reason);
+        let (client, session) = start(cmd, ClientPolicy::new(dir.path()), dir.path()).await;
+        let items = ok(collect(session.prompt("go".into())).await);
+        assert_eq!(
+            items,
+            vec![text("about to stop"), ended(reason)],
+            "{reason}"
+        );
+        within(client.shutdown()).await.expect("shutdown");
+    }
+}
+
+/// `crash-once`: the first process crashes (retryable `Exited`), and a fresh
+/// process over the same marker file completes the same turn, which is what a
+/// caller's retry does.
+#[tokio::test]
+async fn crash_once_fails_the_first_process_and_the_retry_completes() {
+    let dir = root();
+    let marker = dir.path().join("once.marker");
+    let launch =
+        || fake(dir.path(), "crash-once").env("FAKE_ACP_ONCE_FILE", marker.display().to_string());
+
+    let (first, session) = start(launch(), ClientPolicy::new(dir.path()), dir.path()).await;
+    let items = collect(session.prompt("go".into())).await;
+    let err = items.last().expect("an item").as_ref().unwrap_err();
+    assert!(
+        matches!(err, AcpError::Exited { code: Some(3), .. }),
+        "{err:?}"
+    );
+    assert!(err.is_retryable());
+    assert!(marker.exists(), "the crash left its marker");
+    drop((session, first));
+
+    let (second, session) = start(launch(), ClientPolicy::new(dir.path()), dir.path()).await;
+    let items = ok(collect(session.prompt("go".into())).await);
+    assert!(items.contains(&text("write: ok")), "{items:?}");
+    assert_eq!(items.last(), Some(&ended("end_turn")));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("hello.txt")).expect("written on the retry"),
+        "hi"
+    );
+    within(second.shutdown()).await.expect("shutdown");
+}

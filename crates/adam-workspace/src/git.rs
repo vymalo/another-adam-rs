@@ -457,4 +457,82 @@ mod tests {
         assert_eq!(truncate_tail("abcdef", 3), "...def");
         assert_eq!(truncate_tail("abc", 3), "abc");
     }
+
+    mod prop {
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// The forms a token takes in git's output.
+        #[derive(Clone, Debug)]
+        enum Leak {
+            Token,
+            Basic,
+            BasicUnpadded,
+            Header,
+            ConfigValue,
+            Url,
+        }
+
+        fn arb_leak() -> impl Strategy<Value = Leak> {
+            prop_oneof![
+                Just(Leak::Token),
+                Just(Leak::Basic),
+                Just(Leak::BasicUnpadded),
+                Just(Leak::Header),
+                Just(Leak::ConfigValue),
+                Just(Leak::Url),
+            ]
+        }
+
+        proptest! {
+            /// Whatever surrounds them, and however often they repeat, the
+            /// token and its base64 forms (padded or not, in a header, in a
+            /// config value, in a URL) never survive scrubbing. Tokens are at
+            /// least 12 characters, as real ones are (a token that is a
+            /// substring of the `[REDACTED]` marker could not be scrubbed
+            /// meaningfully).
+            #[test]
+            fn prop_scrub_removes_every_token_encoding(
+                token in "[A-Za-z0-9_\\-]{12,60}",
+                scoped in any::<bool>(),
+                parts in vec(("\\PC{0,30}", arb_leak()), 1..8),
+                tail in "\\PC{0,30}",
+            ) {
+                let auth = Auth::new(token.clone().into(), scoped.then_some("https://github.com/"));
+                let b64 = auth.basic();
+                let bare = b64.trim_end_matches('=').to_owned();
+                let mut text = String::new();
+                for (noise, leak) in &parts {
+                    text.push_str(noise);
+                    match leak {
+                        Leak::Token => text.push_str(&token),
+                        Leak::Basic => text.push_str(&b64),
+                        Leak::BasicUnpadded => text.push_str(&bare),
+                        Leak::Header => text.push_str(&format!("Authorization: Basic {b64}")),
+                        Leak::ConfigValue => text.push_str(&auth.config_value()),
+                        Leak::Url => text.push_str(&format!("https://x-access-token:{token}@github.com/o/r")),
+                    }
+                }
+                text.push_str(&tail);
+                let scrubbed = auth.scrub(&text);
+                prop_assert!(!scrubbed.contains(&token), "token left in {scrubbed:?}");
+                prop_assert!(!scrubbed.contains(&b64), "base64 left in {scrubbed:?}");
+                prop_assert!(!scrubbed.contains(&bare), "unpadded base64 left in {scrubbed:?}");
+            }
+
+            /// Text without any secret passes through unchanged.
+            #[test]
+            fn prop_scrub_leaves_clean_text_alone(
+                token in "[A-Za-z0-9_\\-]{12,60}",
+                text in "[ -~]{0,200}",
+            ) {
+                let auth = Auth::new(token.clone().into(), None);
+                prop_assume!(!text.contains(&token));
+                prop_assume!(!text.contains(auth.basic().trim_end_matches('=')));
+                prop_assert_eq!(auth.scrub(&text), text);
+            }
+        }
+    }
 }

@@ -188,11 +188,27 @@ async fn raw(
     headers: &[(&str, &str)],
     body: &str,
 ) -> Raw {
+    raw_typed(addr, method, path, Some("application/json"), headers, body).await
+}
+
+/// Like [`raw`], with the `Content-Type` under the test's control (`None`
+/// sends none).
+async fn raw_typed(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Raw {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     );
+    if let Some(content_type) = content_type {
+        request.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
     for (name, value) in headers {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -911,4 +927,166 @@ async fn the_backend_seam_reports_unknown_tasks_as_not_found() {
             .unwrap()
             .is_none()
     );
+}
+
+fn bearer_header() -> [(&'static str, String); 1] {
+    [("Authorization", format!("Bearer {TOKEN}"))]
+}
+
+/// A response to a bad request is one of two clean shapes: an HTTP 4xx (a
+/// plain-text body from the SDK's extractor), or HTTP 200 with a JSON-RPC
+/// error object. Never a 5xx, never an empty or truncated reply.
+fn assert_clean_rejection(what: &str, response: &Raw) {
+    assert!(
+        (400..500).contains(&response.status) || response.status == 200,
+        "{what}: unexpected status {}: {}",
+        response.status,
+        response.body
+    );
+    assert!(!response.body.is_empty(), "{what}: empty body");
+    if response.status == 200 {
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap_or_else(|e| {
+            panic!("{what}: 200 with a non-JSON body ({e}): {}", response.body)
+        });
+        assert_eq!(body["jsonrpc"], "2.0", "{what}: {body}");
+        assert!(body["error"]["code"].is_i64(), "{what}: {body}");
+        assert!(body.get("result").is_none(), "{what}: {body}");
+    }
+}
+
+/// Bodies that are not JSON-RPC requests, sent with a valid token: rejected
+/// cleanly, and the server keeps serving afterwards.
+#[tokio::test]
+async fn malformed_json_with_a_valid_token_is_rejected_cleanly() {
+    for auth in [TestServer::bearer(), AuthConfig::AllowAnonymous] {
+        let anonymous = matches!(auth, AuthConfig::AllowAnonymous);
+        let server = TestServer::start(auth).await;
+        let credentials = bearer_header();
+        let headers: Vec<(&str, &str)> = if anonymous {
+            Vec::new()
+        } else {
+            credentials.iter().map(|(k, v)| (*k, v.as_str())).collect()
+        };
+        let bodies = [
+            "{not json",
+            "",
+            "[1,2",
+            "\u{0}",
+            "null",
+            "{}",
+            "[]",
+            "\"a string\"",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"params\":{}}",
+            "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"GetTask\"}",
+            // Deeply nested input must not blow the stack.
+            &"[".repeat(10_000),
+        ];
+        for body in bodies {
+            let response = raw(server.addr, "POST", "/", &headers, body).await;
+            let what = format!("body {:?}", &body[..body.len().min(24)]);
+            assert_clean_rejection(&what, &response);
+        }
+
+        // Valid JSON-RPC with params of the wrong shape is a JSON-RPC error
+        // (-32700/-32602 family), and an unknown method is -32601.
+        let wrong_params = raw(
+            server.addr,
+            "POST",
+            "/",
+            &headers,
+            &rpc("SendMessage", serde_json::json!("oops")),
+        )
+        .await;
+        assert_eq!(wrong_params.status, 200, "{}", wrong_params.body);
+        let body: serde_json::Value = serde_json::from_str(&wrong_params.body).unwrap();
+        assert!(
+            [-32700, -32602].contains(&body["error"]["code"].as_i64().unwrap()),
+            "{body}"
+        );
+        assert_eq!(body["id"], "1", "the request id is echoed: {body}");
+        let unknown = raw(
+            server.addr,
+            "POST",
+            "/",
+            &headers,
+            &rpc("no-such-method", serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(unknown.status, 200, "{}", unknown.body);
+        let body: serde_json::Value = serde_json::from_str(&unknown.body).unwrap();
+        assert_eq!(body["error"]["code"], -32601, "{body}");
+
+        // The abuse did not wedge or crash anything: a real client still works.
+        let client = server.client((!anonymous).then_some(TOKEN)).await;
+        let task = task_of(
+            client
+                .send_message(&user_message("still there?", None))
+                .await
+                .expect("a normal send after the bad requests"),
+        );
+        assert_eq!(task.status.state, TaskState::Completed);
+    }
+}
+
+/// Authentication comes before parsing: a garbage body without a valid token
+/// is a 401, not a parse error that would tell an anonymous caller how the
+/// server reads requests.
+#[tokio::test]
+async fn malformed_json_without_a_valid_token_is_still_401() {
+    let server = TestServer::start(TestServer::bearer()).await;
+    for body in ["{not json", "", "[1,2", "{}"] {
+        for headers in [Vec::new(), vec![("Authorization", "Bearer wrong-token")]] {
+            let response = raw(server.addr, "POST", "/", &headers, body).await;
+            assert_eq!(response.status, 401, "body {body:?} with {headers:?}");
+        }
+    }
+}
+
+/// A body that is not declared as JSON is refused before it is read as
+/// JSON-RPC, cleanly (415 from the SDK), for every request that is not
+/// `application/json`; parameters on the media type are fine.
+#[tokio::test]
+async fn wrong_content_type_is_rejected_cleanly() {
+    let server = TestServer::start(TestServer::bearer()).await;
+    let credentials = bearer_header();
+    let headers: Vec<(&str, &str)> = credentials.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let valid_body = rpc("GetTask", serde_json::json!({"id": "nope"}));
+    for content_type in [
+        None,
+        Some("text/plain"),
+        Some("application/xml"),
+        Some("application/x-www-form-urlencoded"),
+        Some("multipart/form-data; boundary=x"),
+        Some("json"),
+        Some(""),
+    ] {
+        let response = raw_typed(
+            server.addr,
+            "POST",
+            "/",
+            content_type,
+            &headers,
+            &valid_body,
+        )
+        .await;
+        assert_clean_rejection(&format!("content-type {content_type:?}"), &response);
+        assert_ne!(
+            response.status, 200,
+            "content-type {content_type:?} was accepted as JSON-RPC: {}",
+            response.body
+        );
+    }
+    // Media type parameters are not a reason to refuse.
+    let response = raw_typed(
+        server.addr,
+        "POST",
+        "/",
+        Some("application/json; charset=utf-8"),
+        &headers,
+        &valid_body,
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(body["error"]["code"], -32001, "task not found: {body}");
 }
