@@ -204,7 +204,12 @@ impl RuntimeTaskBackend {
                 .map_err(map_err)?;
             return Ok((run, context));
         }
-        let run = task_id_for(&caller.subject, context_id.as_deref(), &message.message_id);
+        let run = task_id_for(
+            &self.agent,
+            &caller.subject,
+            context_id.as_deref(),
+            &message.message_id,
+        );
         let context = context_id.clone().unwrap_or_else(a2a::new_context_id);
         let conversation = encode_conversation(&caller.subject, &context);
         for _ in 0..MAX_JOIN_ATTEMPTS {

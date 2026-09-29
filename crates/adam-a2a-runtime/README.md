@@ -18,7 +18,7 @@ agent; [`adam-coder`](../adam-coder/README.md) uses it.
 | `.with_poll_interval(..)`, `DEFAULT_POLL_INTERVAL` | how often a subscription re-reads the durable run |
 | `.with_prompt(..)`, `.with_inbound(..)` | override how the `input-required` question is derived (`PromptFn`) and how an A2A message becomes an `Inbound` (`InboundFn`) |
 | `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings |
-| `task_id_for(subject, context_id, message_id)` | the task id a new task started by that message gets (see *Stable ids*) |
+| `task_id_for(agent, subject, context_id, message_id)` | the task id a new task of `agent` started by that message gets (see *Stable ids*) |
 
 ```rust
 use std::sync::Arc;
@@ -69,7 +69,7 @@ UUID of version 8):
   state or text gives another id. (Progress messages, which exist only in the
   live stream, keep a fresh id.)
 * **Submission is idempotent by `messageId`.** A new task's id is
-  `task_id_for(subject, contextId, messageId)` and it is started with
+  `task_id_for(agent, subject, contextId, messageId)` and it is started with
   `Runtime::start_with_id`, so a client that repeats `SendMessage` /
   `SendStreamingMessage` (an outbox retry after a crash) gets the task its
   first attempt made, with the agent reading the input once. A repeat without

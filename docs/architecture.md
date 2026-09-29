@@ -871,7 +871,7 @@ How a run looks to an A2A client (`task_state` in
 The ids an A2A client sees are derived, not random. The `message_id` of a
 status message is a hash of the task id, the state and the text, so every
 event and snapshot of one status carries the same id. A new task's id is a hash
-of the caller, the `contextId` and the `messageId` (`task_id_for` in
+of the agent, the caller, the `contextId` and the `messageId` (`task_id_for` in
 `crates/adam-a2a-runtime/src/ids.rs`), started with `Runtime::start_with_id`, so
 a repeated `SendMessage` reaches the task its first attempt made and the agent
 reads the input once.

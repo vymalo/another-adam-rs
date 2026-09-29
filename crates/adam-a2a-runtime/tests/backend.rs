@@ -983,7 +983,7 @@ async fn repeating_a_message_returns_the_task_and_delivers_the_input_once() {
     assert_eq!(retry.id, first.id);
     assert_eq!(retry.context_id, "c1");
     assert_eq!(
-        adam_a2a_runtime::task_id_for("token-0", Some("c1"), "m-1").to_string(),
+        adam_a2a_runtime::task_id_for("scripted", "token-0", Some("c1"), "m-1").to_string(),
         first.id
     );
     // The start message is the run's input; nothing was delivered on top.

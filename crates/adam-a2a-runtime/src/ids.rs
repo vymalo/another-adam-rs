@@ -41,18 +41,31 @@ pub(crate) fn status_message_id(task_id: &str, state: &str, text: &str) -> Strin
 /// feeding the input in twice. Use it to look up "the task this message
 /// started" without a side table.
 ///
-/// The inputs are the caller's `subject` (two callers never share a task), the
-/// `context_id` the request carried (`None` when it carried none; that is not
-/// the same as an empty one), and the `message_id`. Different contexts give
-/// different tasks even for the same message id.
-pub fn task_id_for(subject: &str, context_id: Option<&str>, message_id: &str) -> RunId {
+/// The inputs are the `agent` the task is for (one runtime can serve several
+/// agents, and a run belongs to exactly one), the caller's `subject` (two
+/// callers never share a task), the `context_id` the request carried (`None`
+/// when it carried none; that is not the same as an empty one), and the
+/// `message_id`. Different agents or contexts give different tasks even for the
+/// same message id.
+pub fn task_id_for(
+    agent: &str,
+    subject: &str,
+    context_id: Option<&str>,
+    message_id: &str,
+) -> RunId {
     let (present, context) = match context_id {
         Some(c) => (b"1".as_slice(), c.as_bytes()),
         None => (b"0".as_slice(), b"".as_slice()),
     };
     RunId(derived(
         "adam-a2a-runtime/task/v1",
-        &[subject.as_bytes(), present, context, message_id.as_bytes()],
+        &[
+            agent.as_bytes(),
+            subject.as_bytes(),
+            present,
+            context,
+            message_id.as_bytes(),
+        ],
     ))
 }
 
@@ -62,16 +75,25 @@ mod tests {
 
     #[test]
     fn ids_are_stable_and_distinguish_every_input() {
-        let a = task_id_for("s", Some("c"), "m");
-        assert_eq!(a, task_id_for("s", Some("c"), "m"));
-        assert_ne!(a, task_id_for("t", Some("c"), "m"));
-        assert_ne!(a, task_id_for("s", Some("d"), "m"));
-        assert_ne!(a, task_id_for("s", Some("c"), "n"));
-        assert_ne!(task_id_for("s", None, "m"), task_id_for("s", Some(""), "m"));
+        let a = task_id_for("x", "s", Some("c"), "m");
+        assert_eq!(a, task_id_for("x", "s", Some("c"), "m"));
+        // Two agents of one runtime never share a task for the same message.
+        assert_ne!(a, task_id_for("y", "s", Some("c"), "m"));
+        assert_ne!(a, task_id_for("x", "t", Some("c"), "m"));
+        assert_ne!(a, task_id_for("x", "s", Some("d"), "m"));
+        assert_ne!(a, task_id_for("x", "s", Some("c"), "n"));
+        assert_ne!(
+            task_id_for("x", "s", None, "m"),
+            task_id_for("x", "s", Some(""), "m")
+        );
         // Field boundaries matter.
         assert_ne!(
-            task_id_for("ab", Some("c"), "m"),
-            task_id_for("a", Some("bc"), "m")
+            task_id_for("x", "ab", Some("c"), "m"),
+            task_id_for("x", "a", Some("bc"), "m")
+        );
+        assert_ne!(
+            task_id_for("xs", "", Some("c"), "m"),
+            task_id_for("x", "s", Some("c"), "m")
         );
         // Status ids and task ids never coincide for the same fields.
         assert_ne!(
@@ -82,7 +104,7 @@ mod tests {
 
     #[test]
     fn derived_ids_are_valid_uuids() {
-        let id = task_id_for("s", None, "m").0;
+        let id = task_id_for("x", "s", None, "m").0;
         assert_eq!(id.get_version_num(), 8);
         assert_eq!(Uuid::parse_str(&id.to_string()).unwrap(), id);
     }
