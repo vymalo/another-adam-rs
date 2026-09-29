@@ -3,12 +3,14 @@
 
 use std::sync::Arc;
 
+use adam_error::report;
 use adam_llm_agent::{Conversation, DynTool, Limits, LlmAgent};
 use adam_model::DynModel;
 use adam_runtime::{Agent, AgentError, Ctx, Inbound, Transition};
 use async_trait::async_trait;
 
 use crate::instructions::instructions;
+use crate::redact::Redactor;
 use crate::tools::notes::RunNotes;
 use crate::tools::{ToolEnv, coder_tools};
 
@@ -115,44 +117,159 @@ impl Agent for CoderAgent {
         // error body, so it passes through the redactor.
         let transition = match self.inner.step(ctx, state).await {
             Ok(t) => t,
-            Err(AgentError::Transient {
-                message,
-                retry_after,
-                source,
-            }) => {
-                return Err(AgentError::Transient {
-                    message: redactor.scrub_string(message),
-                    retry_after,
-                    source,
-                });
-            }
-            Err(AgentError::Permanent { message, source }) => {
-                return Err(AgentError::Permanent {
-                    message: redactor.scrub_string(message),
-                    source,
-                });
-            }
-            Err(e) => return Err(e),
+            Err(e) => return Err(boundary_error(e, redactor)),
         };
         match transition {
             Transition::Fail { state, error } => Ok(Transition::Fail {
                 state,
-                error: redactor.scrub_string(error),
+                error: redactor.failure_text(error),
             }),
             Transition::Done { state, mut output } => {
                 redactor.scrub_value(&mut output);
                 let notes = self.env.notes.load(&run).await.map_err(|e| {
-                    AgentError::transient(format!("cannot read the run notes: {e}"))
+                    AgentError::transient("cannot read the run notes").with_source(e)
                 })?;
                 Ok(match self.verdict(&notes) {
                     Some(error) => Transition::Fail {
                         state,
-                        error: redactor.scrub_string(error),
+                        error: redactor.failure_text(error),
                     },
                     None => Transition::Done { state, output },
                 })
             }
             other => Ok(other),
         }
+    }
+}
+
+/// The boundary a failed step crosses on its way to the run's failure text and the retry note:
+/// the whole error chain is flattened into the message, scrubbed of the process's secrets, and
+/// bounded ([`Redactor::failure_text`]). The retry hint survives; the source does not, because a
+/// source is exactly where a secret hides once nothing scrubs it. A `Store` error carries no model
+/// or tool text and passes through; a variant added later becomes a scrubbed permanent error.
+fn boundary_error(e: AgentError, redactor: &Redactor) -> AgentError {
+    let clean = |message: String,
+                 source: Option<&(dyn std::error::Error + Send + Sync + 'static)>| {
+        let text = match source {
+            Some(cause) => format!("{message}: {}", report(cause)),
+            None => message,
+        };
+        redactor.failure_text(text)
+    };
+    match e {
+        AgentError::Transient {
+            message,
+            retry_after,
+            source,
+        } => {
+            let out = AgentError::transient(clean(message, source.as_deref()));
+            match retry_after {
+                Some(after) => out.with_retry_after(after),
+                None => out,
+            }
+        }
+        AgentError::Permanent { message, source } => {
+            AgentError::permanent(clean(message, source.as_deref()))
+        }
+        AgentError::NonDeterminism { message, source } => {
+            AgentError::non_determinism(clean(message, source.as_deref()))
+        }
+        store @ AgentError::Store(_) => store,
+        other => AgentError::permanent(redactor.failure_text(report(&other))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adam_error::Classify;
+    use std::time::Duration;
+
+    const KEY: &str = "sk-live-0123456789abcdef";
+
+    fn redactor() -> Redactor {
+        Redactor::new([KEY])
+    }
+
+    fn text(e: &AgentError) -> String {
+        report(e)
+    }
+
+    /// Regression for A6: a failure's text embeds what the peer said (an upstream body, OpenCode's
+    /// stderr tail), which can echo the model key. Every variant is scrubbed, including a cause
+    /// that used to be printed after the message without passing the redactor, and the retry hint
+    /// is kept.
+    #[test]
+    fn failure_text_never_carries_the_key_whatever_the_variant() {
+        let cause = || std::io::Error::other(format!("upstream echoed Bearer {KEY} back"));
+        for e in [
+            AgentError::transient(format!("model call failed: {KEY}")),
+            AgentError::transient("model call failed").with_source(cause()),
+            AgentError::transient("slow down")
+                .with_source(cause())
+                .with_retry_after(Duration::from_secs(30)),
+            AgentError::permanent(format!("bad request: {KEY}")),
+            AgentError::permanent("bad request").with_source(cause()),
+            AgentError::non_determinism("step differs").with_source(cause()),
+        ] {
+            let before = text(&e);
+            let out = boundary_error(e, &redactor());
+            let after = text(&out);
+            assert!(!after.contains(KEY), "{after}");
+            assert!(
+                after.contains(crate::redact::REDACTED) || !before.contains(KEY),
+                "{after}"
+            );
+            assert!(std::error::Error::source(&out).is_none(), "{after}");
+        }
+    }
+
+    #[test]
+    fn the_class_and_the_retry_hint_survive_the_boundary() {
+        let out = boundary_error(
+            AgentError::transient("rate limited")
+                .with_source(std::io::Error::other("429"))
+                .with_retry_after(Duration::from_secs(30)),
+            &redactor(),
+        );
+        assert_eq!(out.retry_after(), Some(Duration::from_secs(30)));
+        assert!(out.is_retryable());
+        assert_eq!(text(&out), "transient error: rate limited: 429");
+
+        let out = boundary_error(AgentError::permanent("no"), &redactor());
+        assert!(!out.is_retryable());
+        let out = boundary_error(AgentError::non_determinism("no"), &redactor());
+        assert!(matches!(out, AgentError::NonDeterminism { .. }));
+    }
+
+    /// Store errors keep their variant: the worker decides them by class.
+    #[test]
+    fn a_store_error_passes_through() {
+        let e = AgentError::Store(adam_core::StoreError::InvalidInput("x".into()));
+        assert!(matches!(
+            boundary_error(e, &redactor()),
+            AgentError::Store(adam_core::StoreError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn failure_text_is_bounded_and_scrubbed_before_it_is_cut() {
+        let r = redactor();
+        // The key straddles the cut: cutting first would leave its front half visible.
+        let padding = "x".repeat(crate::redact::MAX_FAILURE_TEXT - KEY.len() / 2);
+        let out = r.failure_text(format!("{padding}{KEY}{}", "y".repeat(5000)));
+        assert!(
+            out.len() <= crate::redact::MAX_FAILURE_TEXT + " [truncated]".len(),
+            "{}",
+            out.len()
+        );
+        assert!(out.ends_with(" [truncated]"));
+        assert!(!out.contains(&KEY[..8]), "the front of the key leaked");
+        // A multi-byte character at the cut is not split.
+        let out = r.failure_text("é".repeat(3000));
+        assert!(out.ends_with(" [truncated]"));
+        assert!(out.is_char_boundary(out.len() - " [truncated]".len()));
+        // Short text is left alone.
+        assert_eq!(r.failure_text("short".into()), "short");
     }
 }
