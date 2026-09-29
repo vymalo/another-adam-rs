@@ -321,53 +321,57 @@ mod tests {
         RunId(Uuid::nil())
     }
 
-    /// One row per class the runtime can report: what the client sees, and how it is classified.
+    /// The A2A error a client is told, by kind.
+    #[derive(Debug, Clone, Copy)]
+    enum Told {
+        TaskNotFound,
+        InvalidParams,
+        Unavailable,
+        Internal,
+    }
+
+    /// One row per class the runtime can report: the error and what the client is told. The
+    /// class itself is only printed on failure; the runtime's own tests pin it.
     #[test]
     fn runtime_errors_map_by_class() {
         use adam_core::store::StoreError as S;
-        let cases: Vec<(RuntimeError, ErrorClass)> = vec![
-            (RuntimeError::NotFound(run()), ErrorClass::NotFound),
-            (
-                RuntimeError::Store(S::NotFound(run())),
-                ErrorClass::NotFound,
-            ),
+        let cases: Vec<(RuntimeError, Told)> = vec![
+            (RuntimeError::NotFound(run()), Told::TaskNotFound),
+            (RuntimeError::Store(S::NotFound(run())), Told::TaskNotFound),
             (
                 RuntimeError::Finished {
                     run: run(),
                     status: adam_core::RunStatus::Done,
                 },
-                ErrorClass::Invalid,
+                Told::InvalidParams,
             ),
             (
                 RuntimeError::ConversationBusy {
                     agent: "a".into(),
                     conversation_id: "secret-subject:ctx".into(),
                 },
-                ErrorClass::Invalid,
+                Told::InvalidParams,
             ),
             (
                 RuntimeError::Agent(AgentError::permanent("unusable start message: empty")),
-                ErrorClass::Invalid,
+                Told::InvalidParams,
             ),
             (
                 RuntimeError::Store(S::InvalidInput("no NUL please".into())),
-                ErrorClass::Invalid,
+                Told::InvalidParams,
             ),
-            (RuntimeError::UnknownAgent("x".into()), ErrorClass::Invalid),
-            (
-                RuntimeError::Contended("run x".into()),
-                ErrorClass::Transient,
-            ),
+            (RuntimeError::UnknownAgent("x".into()), Told::InvalidParams),
+            (RuntimeError::Contended("run x".into()), Told::Unavailable),
             (
                 RuntimeError::Store(S::unavailable(lower())),
-                ErrorClass::Transient,
+                Told::Unavailable,
             ),
             (
                 RuntimeError::Agent(AgentError::transient_after(
                     "slow down",
                     Duration::from_secs(3),
                 )),
-                ErrorClass::Transient,
+                Told::Unavailable,
             ),
             (
                 RuntimeError::Corrupt {
@@ -375,25 +379,25 @@ mod tests {
                     reason: "x".into(),
                     source: None,
                 },
-                ErrorClass::Internal,
+                Told::Internal,
             ),
-            (
-                RuntimeError::Store(S::internal(lower())),
-                ErrorClass::Internal,
-            ),
+            (RuntimeError::Store(S::internal(lower())), Told::Internal),
         ];
-        for (e, kind) in cases {
+        for (e, told) in cases {
             let shown = e.to_string();
             let class = e.class();
             let mapped = map_err(e);
             let ok = matches!(
-                (kind, &mapped),
-                (ErrorClass::NotFound, BackendError::TaskNotFound(_))
-                    | (ErrorClass::Invalid, BackendError::InvalidParams(_))
-                    | (ErrorClass::Transient, BackendError::Unavailable { .. })
-                    | (ErrorClass::Internal, BackendError::Internal { .. })
+                (told, &mapped),
+                (Told::TaskNotFound, BackendError::TaskNotFound(_))
+                    | (Told::InvalidParams, BackendError::InvalidParams(_))
+                    | (Told::Unavailable, BackendError::Unavailable { .. })
+                    | (Told::Internal, BackendError::Internal { .. })
             );
-            assert!(ok, "{shown} ({class:?}) mapped to {mapped:?}");
+            assert!(
+                ok,
+                "{shown} ({class:?}) mapped to {mapped:?}, expected {told:?}"
+            );
         }
     }
 
