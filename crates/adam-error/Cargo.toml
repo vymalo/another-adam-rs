@@ -1,0 +1,16 @@
+[package]
+name = "adam-error"
+description = "The error classification model shared by every adam-rs crate: ErrorClass, Classify, BoxError and report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true
