@@ -1,0 +1,13 @@
+{
+  "name": "docs-check",
+  "private": true,
+  "description": "Validates every Mermaid diagram and every relative Markdown link in the repository.",
+  "type": "module",
+  "scripts": {
+    "check": "node check-docs.mjs"
+  },
+  "dependencies": {
+    "jsdom": "25.0.1",
+    "mermaid": "11.17.2"
+  }
+}

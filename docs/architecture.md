@@ -1,0 +1,1196 @@
+# Architecture
+
+adam-rs is a Rust workspace of 14 crates for **durable AI agents**. An agent is
+a state machine. The runtime saves its state after every step, so a worker that
+dies loses nothing: another worker resumes from the last saved step. Every piece
+of infrastructure (database, model, code host, A2A backend) sits behind a trait,
+so each deployment picks its own.
+
+This document describes the code **as built**. For the durable model in detail
+(runs, journal, leases, scheduling) and the store adapters, read the
+[root README](../README.md). This page shows how the parts connect.
+
+> **Status of the facts.** Everything about this repository's own behaviour was
+> *verified* on 2026-09-29 by reading the code at commit `172a117` (`main`).
+> Claims about third-party products and standards are marked *verified* or
+> *unverified* where they occur, and collected in
+> [Verified and unverified](#verified-and-unverified).
+
+Contents:
+
+* [The crate map](#the-crate-map)
+* [Ports and implementations](#ports-and-implementations)
+* [The path of a task](#the-path-of-a-task)
+* [The run lifecycle](#the-run-lifecycle)
+* [The error tree](#the-error-tree)
+* [The coder agent](#the-coder-agent)
+* [Where to go next](#where-to-go-next)
+* [Verified and unverified](#verified-and-unverified)
+
+## The crate map
+
+Arrows point from a crate to a crate it depends on. Solid arrows come from
+`[dependencies]` in the `Cargo.toml` files. Dotted arrows are
+`[dev-dependencies]` that are not also normal dependencies (tests only). Grey
+arrows go to `adam-error`: every crate except `adam-store-testkit` depends on
+it.
+
+```mermaid
+flowchart TB
+    subgraph agents["Agents"]
+        coder["adam-coder"]
+        llm["adam-llm-agent"]
+    end
+    subgraph runtime["Runtime"]
+        a2art["adam-a2a-runtime"]
+        rt["adam-runtime"]
+    end
+    subgraph impls["Implementations"]
+        pg["adam-store-postgres"]
+        mongo["adam-store-mongodb"]
+        openai["adam-model-openai"]
+        ws["adam-workspace"]
+        acp["adam-acp"]
+    end
+    subgraph contracts["Contracts and ports"]
+        a2a["adam-a2a"]
+        core["adam-core"]
+        model["adam-model"]
+        err["adam-error"]
+    end
+    subgraph kits["Test kits"]
+        testkit["adam-store-testkit"]
+    end
+
+    coder --> a2a
+    coder --> a2art
+    coder --> acp
+    coder --> core
+    coder --> llm
+    coder --> model
+    coder --> openai
+    coder --> rt
+    coder --> pg
+    coder --> ws
+    a2art --> a2a
+    a2art --> core
+    a2art --> rt
+    llm --> core
+    llm --> model
+    llm --> rt
+    rt --> core
+    openai --> model
+    mongo --> core
+    pg --> core
+    testkit --> core
+
+    rt -.-> mongo
+    rt -.-> pg
+    rt -.-> testkit
+    a2art -.-> pg
+    mongo -.-> testkit
+    pg -.-> testkit
+
+    a2a --> err
+    a2art --> err
+    acp --> err
+    coder --> err
+    core --> err
+    llm --> err
+    openai --> err
+    model --> err
+    rt --> err
+    mongo --> err
+    pg --> err
+    ws --> err
+
+    linkStyle 27,28,29,30,31,32,33,34,35,36,37,38 stroke:#999,stroke-width:1px
+```
+
+The layers, from the bottom:
+
+* **Contracts and ports.** Small crates that define what other crates
+  implement or call.
+  * [`adam-error`](../crates/adam-error/README.md): `ErrorClass`, `Classify`,
+    `BoxError`, `report()`. No I/O, no async.
+  * [`adam-core`](../crates/adam-core/README.md): the `Store` trait, the run,
+    journal and lease types, and `MemoryStore`, the reference implementation.
+  * [`adam-model`](../crates/adam-model/README.md): the `ModelClient` trait and
+    its request and response types. It also holds `MockModel`, a scripted
+    double that is always compiled.
+  * [`adam-a2a`](../crates/adam-a2a/README.md): the `TaskBackend` seam, and
+    the axum server that exposes any backend as an A2A 1.0 agent. It knows
+    nothing about the runtime.
+* **Implementations.** Each one is a separate crate, so a binary links only what
+  it uses.
+  * `adam-store-postgres` and `adam-store-mongodb` implement `Store`.
+  * `adam-model-openai` implements `ModelClient` for any OpenAI-compatible
+    chat-completions endpoint.
+  * `adam-workspace` runs `git` for mirrors, worktrees, commit and push. It
+    also owns two small ports of its own, `GitCredentials` and `CodeHost`
+    (GitHub).
+  * `adam-acp` is a client for the Agent Client Protocol: it drives a coding
+    agent (OpenCode) over stdio.
+* **Runtime.**
+  * `adam-runtime` owns the run state machine, the journal, the workers and the
+    retry policy. It depends on `adam-core` and `adam-error` only.
+  * `adam-a2a-runtime` implements the `adam-a2a` seam over the runtime.
+* **Agents.**
+  * `adam-llm-agent` is a reusable model-and-tools loop written as an
+    `adam_runtime::Agent`.
+  * `adam-coder` is the coder agent and the only binary. It is a composition
+    root: it wires the pieces below it.
+* **Test kits.** `adam-store-testkit` is the conformance suite every store must
+  pass. The other test doubles live inside the crates they double for (see
+  [Ports and implementations](#ports-and-implementations)).
+
+Dev-only edges (dotted): the runtime's tests run against real Postgres and
+MongoDB stores, and every store runs the testkit. `adam-a2a`,
+`adam-workspace` and `adam-coder` also enable their own `test-util` feature in
+tests. That adds no new crate edge.
+
+The workspace is `crates/*` (see the root `Cargo.toml`), so a new crate joins by
+adding a directory.
+
+## Ports and implementations
+
+A **port** is a trait that a crate defines and other crates implement. The
+core never names an implementation: it holds a `dyn` handle (`DynStore`,
+`DynModel`, `DynTaskBackend`, `DynCodeHost`, ...). Swapping happens **at build
+time**: pick the crates in `Cargo.toml` (and features), and pick the values in
+the composition root. There are no runtime plugins and no dynamic loading. This
+is the same rule as ADR 0009 of the sibling orchestration layer
+(`vymalo/another-agentic-system`): swappable implementations, at build time
+(*verified* 2026-09-29: invariant 6 in that repository's agent guide, `AGENTS.md`).
+
+```mermaid
+classDiagram
+    direction LR
+
+    namespace adam_core {
+        class Store {
+            <<interface>>
+            migrate()
+            create_run()
+            commit_run()
+            journal_get()
+            journal_put()
+            claim_due()
+            renew_lease()
+            release_lease()
+        }
+        class MemoryStore
+    }
+    namespace adam_store_postgres {
+        class PgStore
+    }
+    namespace adam_store_mongodb {
+        class MongoStore
+    }
+    namespace adam_store_testkit {
+        class FaultyStore
+    }
+    Store <|.. MemoryStore
+    Store <|.. PgStore
+    Store <|.. MongoStore
+    Store <|.. FaultyStore
+
+    namespace adam_model {
+        class ModelClient {
+            <<interface>>
+            complete()
+            stream()
+        }
+        class MockModel
+    }
+    namespace adam_model_openai {
+        class OpenAiCompatible
+    }
+    ModelClient <|.. OpenAiCompatible
+    ModelClient <|.. MockModel
+
+    namespace adam_a2a {
+        class TaskBackend {
+            <<interface>>
+            submit()
+            get()
+            cancel()
+            subscribe()
+        }
+        class InMemoryBackend
+    }
+    namespace adam_a2a_runtime {
+        class RuntimeTaskBackend
+    }
+    TaskBackend <|.. RuntimeTaskBackend
+    TaskBackend <|.. InMemoryBackend
+
+    namespace adam_workspace {
+        class CodeHost {
+            <<interface>>
+            open_pull_request()
+            find_pull_request()
+        }
+        class GitCredentials {
+            <<interface>>
+            token_for()
+        }
+        class GitHub
+        class MemoryCodeHost
+        class StaticToken
+        class ScopedToken
+    }
+    CodeHost <|.. GitHub
+    CodeHost <|.. MemoryCodeHost
+    GitCredentials <|.. StaticToken
+    GitCredentials <|.. ScopedToken
+
+    namespace adam_runtime {
+        class Agent {
+            <<interface>>
+            name()
+            init()
+            step()
+        }
+        class EventSink {
+            <<interface>>
+            emit()
+        }
+        class Clock {
+            <<interface>>
+            now()
+        }
+        class NoopSink
+        class BroadcastSink
+        class CollectingSink
+        class SystemClock
+        class ManualClock
+    }
+    EventSink <|.. NoopSink
+    EventSink <|.. BroadcastSink
+    EventSink <|.. CollectingSink
+    Clock <|.. SystemClock
+    Clock <|.. ManualClock
+
+    namespace adam_llm_agent {
+        class Tool {
+            <<interface>>
+            spec()
+            call()
+        }
+        class LlmAgent
+    }
+    namespace adam_coder {
+        class CoderAgent
+        class PrepareWorkspace
+        class DelegateToOpenCode
+        class RunChecks
+        class CommitAndPush
+        class OpenPullRequest
+        class AskUser
+    }
+    Agent <|.. LlmAgent
+    Agent <|.. CoderAgent
+    Tool <|.. PrepareWorkspace
+    Tool <|.. DelegateToOpenCode
+    Tool <|.. RunChecks
+    Tool <|.. CommitAndPush
+    Tool <|.. OpenPullRequest
+    Tool <|.. AskUser
+
+    namespace adam_acp {
+        class PermissionPrompt {
+            <<interface>>
+            ask()
+        }
+        class StaticPrompt
+    }
+    PermissionPrompt <|.. StaticPrompt
+```
+
+Each box is a crate (underscores stand for hyphens). The six coder tools are
+`prepare_workspace`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
+`open_pull_request` and `ask_user`. A seventh type, `Redacting`, wraps each of
+them to scrub secrets (`crates/adam-coder/src/tools/mod.rs`). `CoderAgent`
+wraps an `LlmAgent` and adds its completion rule.
+
+The boundaries, by what they swap:
+
+| Port | Defined in | Real implementations | Doubles |
+|---|---|---|---|
+| `Store` | `adam-core` | `PgStore`, `MongoStore` | `MemoryStore` (reference), `FaultyStore` (fault injection, `adam-store-testkit`) |
+| `ModelClient` | `adam-model` | `OpenAiCompatible` | `MockModel` |
+| `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` | `InMemoryBackend` (feature `test-util`) |
+| `CodeHost` | `adam-workspace` | `GitHub` (feature `github`, on by default) | `MemoryCodeHost` (feature `test-util`) |
+| `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `StaticToken` (one token, any host) | none needed |
+| `Agent` | `adam-runtime` | `LlmAgent`, `CoderAgent` | test agents |
+| `Tool` | `adam-llm-agent` | the coder tools | test tools |
+| `EventSink` | `adam-runtime` | `BroadcastSink` | `NoopSink` (default), `CollectingSink` |
+| `Clock` | `adam-runtime` | `SystemClock` | `ManualClock` |
+| `PermissionPrompt` | `adam-acp` | none in this repository (the default policy needs no prompt) | `StaticPrompt` |
+
+Not every boundary is a trait. `Workspaces` (in `adam-workspace`) and
+`AcpClient` (in `adam-acp`) are concrete types: one shells out to the `git`
+CLI, the other spawns a child process. The traits in `adam-workspace` cover the
+parts that vary (credentials and the code host).
+
+Rules the code follows, from the crate docs:
+
+* No implementation type appears in a trait signature. A driver error is boxed
+  as a `BoxError` `source` (see [The error tree](#the-error-tree)).
+* A store passes the **conformance suite** in `adam-store-testkit`
+  (`store_conformance!`), so "passes the testkit" means "behaves like every other
+  store". To add a backend, implement `Store` and add one line.
+* The correctness guarantee is the version compare-and-swap in
+  `Store::commit_run`, not the lease. Any store that honours the trait keeps
+  it.
+
+### How a binary composes them
+
+`adam-coder` is the composition root. Its `serve` function
+(`crates/adam-coder/src/serve.rs`) is the whole process, and `main` is
+`serve(Config::from_env(), sigterm)`. To use MongoDB, another model client or
+another code host, write another root that builds the same pieces.
+
+```mermaid
+flowchart LR
+    env["Config::from_env()<br/>environment variables"] --> serve
+
+    subgraph serve["adam-coder: serve()"]
+        direction LR
+        pg["PgStore::connect + migrate()<br/>as DynStore"]
+        mdl["OpenAiCompatible::new<br/>as DynModel"]
+        creds["ScopedToken<br/>as DynGitCredentials"]
+        wsp["Workspaces::new<br/>allow_hosts, allow_local"]
+        gh["GitHub::new(creds)<br/>as DynCodeHost"]
+        tenv["ToolEnv<br/>workspaces + code host + settings + Redactor"]
+        agent["CoderAgent::new<br/>model + ToolEnv"]
+        coder["Coder::new(store, agent)"]
+        rtm["Runtime<br/>BroadcastSink as EventSink"]
+        bk["RuntimeTaskBackend"]
+        router["A2aServer::router<br/>card + backend + AuthConfig"]
+        http["axum::serve"]
+        wrk["Runtime::run_worker"]
+
+        creds --> wsp
+        creds --> gh
+        wsp --> tenv
+        gh --> tenv
+        tenv --> agent
+        mdl --> agent
+        agent --> coder
+        pg --> coder
+        coder --> rtm
+        coder --> bk
+        bk --> router
+        router --> http
+        rtm --> wrk
+    end
+```
+
+Two tasks run side by side: the HTTP server and the worker loop. On SIGTERM the
+server stops taking connections (open streams get 10 seconds), and the workers
+finish and commit the steps they are in. If either half stops on its own, the
+other is stopped and the process exits with an error.
+
+## The path of a task
+
+A task is a **run**. Its id is the A2A `task_id`, and its A2A `context_id` is
+part of the run's conversation id. A client talks JSON-RPC over HTTP to the
+server in `adam-a2a`. The server hands the request to a `TaskBackend`
+(`adam-a2a-runtime`), which starts or feeds a run in the `Runtime`. A worker
+advances the run one step at a time and commits each step to the store. The
+client sees the run's progress as task events on an SSE stream.
+
+Two sequence diagrams follow. The first is the request and the event stream.
+The second is the worker that does the work.
+
+### Request in, events out
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as A2A client
+    participant S as adam-a2a<br/>auth + JSON-RPC router
+    participant H as BackendHandler<br/>adam-a2a
+    participant B as RuntimeTaskBackend<br/>adam-a2a-runtime
+    participant R as Runtime<br/>adam-runtime
+    participant DB as Store<br/>Postgres
+    participant K as BroadcastSink
+
+    C->>S: POST / SendStreamingMessage<br/>Authorization: Bearer token
+    S->>S: drop any client identity header,<br/>compare SHA-256 digests in constant time
+    alt missing, wrong or duplicated credentials
+        S-->>C: 401 + WWW-Authenticate: Bearer<br/>JSON-RPC error -32000
+    end
+    S->>H: request + trusted Caller (token-N)
+    H->>H: validate: parts not empty, role ROLE_USER
+    H->>B: submit(caller, message, task_id, context_id)
+    B->>B: default_inbound(message) gives an Inbound<br/>conversation = subject:context id
+    B->>R: start(agent, inbound, conversation)
+    R->>DB: open_run_for_conversation
+    alt the conversation has an open run
+        R->>DB: load_run, then commit_run with the message in the inbox
+    else no open run
+        R->>R: agent.init(input) gives the first state (an Envelope)
+        R->>DB: create_run (Runnable, version 1)
+        R->>K: emit Status(Runnable, started)
+    end
+    R-->>B: run id
+    B->>R: view(run)
+    R->>DB: load_run
+    B-->>H: Task (submitted)
+    H->>B: subscribe(caller, task id)
+    B->>K: subscribe_run(run), attach to live events first
+    B->>R: view(run), the snapshot, read after attaching
+    B-->>C: SSE: snapshot (state submitted or working)
+    Note over R,DB: Workers advance the run. See the next diagram.
+    loop until a terminal state or input-required
+        par live events
+            K-->>B: Progress, Custom or Artifact event
+            B-->>C: SSE: status-update (working) or artifact-update
+        and durable poll, every 250 ms or when a Status event arrives
+            B->>R: view(run)
+            R->>DB: load_run
+            B-->>C: SSE: status change or new artifact
+        end
+    end
+    B-->>C: SSE ends after completed, failed, canceled or input-required
+```
+
+What the diagram cannot say:
+
+* **Authentication fails closed.** Only `GET /.well-known/agent-card.json` and
+  `GET /healthz` are public. Every other route, including unknown ones, needs a
+  bearer token (`crates/adam-a2a/src/auth.rs`). An empty token list rejects
+  everything. `AuthConfig::AllowAnonymous` exists for local development and logs
+  a warning.
+* **Errors are HTTP 200 with a JSON-RPC error object,** as the A2A SDK does it.
+  A body that is not JSON gets `-32700` and a null id. A body that is JSON but
+  not a request gets `-32600`. The mapping from error class to code is in
+  [The error tree](#the-error-tree).
+* **Ownership needs no side table.** The caller's subject is part of the run's
+  conversation id (`subject:context id`), and that is durable. A task that
+  belongs to someone else looks exactly like one that does not exist.
+* **Follow-ups.** A message that carries a `taskId` is delivered to the run
+  with `Runtime::deliver`, and only while the task is `input-required`. Any
+  other state gives `-32602`. A message with a `contextId` and no `taskId`
+  is delivered to the context's open task, or starts a new one when there is
+  none.
+* **Streams survive restarts.** The subscription takes its snapshot from
+  `Runtime::view`, which reads the durable record, and then polls it. The live
+  events from the `BroadcastSink` only cut the latency and add intermediate
+  progress. They are lost if the process dies, and nothing depends on them, so a
+  subscriber attached to another replica, or after a restart, sees the same
+  states and artifacts.
+* **The task outlives the connection.** Dropping the SSE stream drops only the
+  subscription. Only `CancelTask` cancels.
+* **Other methods.** `SendMessage` (blocking), `GetTask`, `CancelTask` and
+  `SubscribeToTask` are served. `ListTasks` is unsupported, push-notification
+  methods return `PushNotificationNotSupported`, and there is no extended agent
+  card (`crates/adam-a2a/src/handler.rs`).
+
+### The worker: claim, step, journal, commit
+
+The worker loop is `Runtime::run_worker` in
+`crates/adam-runtime/src/worker.rs`. It runs in the same process as the A2A
+server, and any number of processes can share one database.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as run_worker loop
+    participant DB as Store
+    participant T as advance task
+    participant A as Agent.step<br/>LlmAgent inside CoderAgent
+    participant X as Ctx
+    participant M as ModelClient<br/>OpenAiCompatible
+    participant L as Tool<br/>coder tools
+    participant E as workspace, OpenCode, GitHub
+    participant K as EventSink
+
+    loop until shutdown
+        W->>DB: claim_due(agents, worker id, now, lease ttl, free slots)
+        DB-->>W: leases: due runs with no live lease, earliest first
+        W->>T: spawn advance(lease), at most concurrency at once
+        T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every poll interval)
+        T->>T: decode the Envelope, build a Ctx<br/>with seq, inbox and attempt
+        T->>A: step(ctx, state)
+        A->>X: take_inbox()
+        A->>X: step("model:N", call the model)
+        X->>DB: journal_get(run, seq)
+        alt already recorded (replay)
+            DB-->>X: recorded entry, the effect does not run again
+        else not recorded
+            X->>M: complete(request)
+            M-->>X: response, or ModelError
+            X->>DB: journal_put(run, entry), first writer wins
+        end
+        X-->>A: the recorded outcome
+        A->>K: emit Custom agent_text
+        loop each tool call of the turn
+            A->>X: step("tool:call id", run the tool)
+            X->>DB: journal_get(run, seq)
+            opt not recorded
+                X->>L: call(ctx, args)
+                L->>E: git, OpenCode over ACP, shell checks, pull request
+                L->>K: emit Progress and Artifact events
+                X->>DB: journal_put(run, entry)
+            end
+        end
+        A-->>T: Transition (Continue, Park, Done, Fail) or AgentError
+        T->>DB: commit_run(run, version, update), compare-and-swap
+        alt version moved (someone else advanced or cancelled the run)
+            DB-->>T: Conflict
+            T->>T: merge only newly delivered messages,<br/>otherwise drop this result
+        end
+        T->>K: emit Status (Parked, Done, Failed, or retry note)
+        T->>DB: release_lease
+    end
+```
+
+What the diagram cannot say:
+
+* **One step is one model turn.** `LlmAgent::step` calls the model once (in the
+  journaled step `model:N`, non-streaming `complete`), runs the tools that call
+  asked for (each in a journaled step `tool:<call id>`), and returns
+  `Continue`. Every turn is committed before the next begins.
+* **The journal makes replay safe, not effects exactly-once.** A recorded
+  outcome is never run again. But the effect runs *before* its outcome is
+  written, so a crash in between runs it again on replay. Tools must be safe to
+  repeat. The coder's tools are (see
+  [The coder agent](#the-coder-agent)). A replay that asks for a different
+  step name at a recorded `seq` fails the run with `NonDeterminism`.
+* **The lease is an optimisation.** The compare-and-swap on `version` is the
+  guarantee. A worker whose lease expired mid-step cannot overwrite newer state:
+  its commit is rejected and it drops its result.
+* **Messages that arrive during a step** are kept. The commit merges them,
+  and a step that asked to park resumes at once (`Runnable`) instead of
+  sleeping through them.
+* **Retry.** A transient failure does not fail the run. It is committed as
+  `Runnable` with a `wake_at` in the future, and the journal entries of the
+  failed try are abandoned, so the retry runs its steps afresh. See
+  [The run lifecycle](#the-run-lifecycle).
+* **Defaults** (`crates/adam-runtime/src/runtime.rs`, `retry.rs`): lease 30 s,
+  idle poll 250 ms, 4 concurrent runs per worker loop, 5 tries per transition,
+  backoff 1 s doubling to 60 s.
+
+## The run lifecycle
+
+`RunStatus` (`crates/adam-core/src/store/mod.rs`) has four values: `Runnable`,
+`Parked`, `Done` and `Failed`. The transitions below are the ones the runtime
+makes (`runtime.rs` and `worker.rs`).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Runnable: start or start_with_id, version 1
+
+    Runnable --> Runnable: Continue, next turn
+    Runnable --> Runnable: transient error with tries left, wake_at is now plus max of backoff and retry_after
+    Runnable --> Runnable: lease expired, any worker re-claims and resumes from the last commit
+    Runnable --> Runnable: Park requested but a message arrived during the step
+    Runnable --> Parked: Park, with a timer or waiting for a message
+    Runnable --> Done: Transition Done
+    Runnable --> Failed: Transition Fail
+    Runnable --> Failed: Permanent, NonDeterminism, or store Corrupt or Invalid
+    Runnable --> Failed: transient error, tries used up
+    Runnable --> Failed: unreadable state envelope
+    Runnable --> Failed: cancel
+
+    Parked --> Runnable: deliver, an inbound message
+    Parked --> Runnable: timer due, step commits Continue
+    Parked --> Parked: timer due, agent parks again
+    Parked --> Done: timer due, Transition Done
+    Parked --> Failed: timer due, a failure as above
+    Parked --> Failed: cancel
+
+    Done --> [*]
+    Failed --> [*]
+```
+
+The lease is not a `RunStatus`. It is a separate lifecycle that a run goes
+through each time a worker takes it:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unleased
+    Unleased --> Leased: claim_due, run is due and has no unexpired lease
+    Leased --> Leased: renew_lease every ttl/3 while the step runs
+    Leased --> Unleased: release_lease after the commit, or after a rejected commit
+    Leased --> Expired: worker died or hung, or renewal kept failing
+    Leased --> Expired: store trouble while stepping, lease kept and not released
+    Expired --> Leased: claim_due by any worker
+    Unleased --> [*]: run reached Done or Failed
+```
+
+How the two fit:
+
+* **What makes a run due.** `sched_at` is derived from status and `wake_at`
+  (`adam_core::store::sched_at`): `Runnable` is due at once, or at `wake_at`
+  for a retry backoff. `Parked` with a `wake_at` is due then. `Parked` without
+  one is never due: only `deliver` or `cancel` moves it. `Done` and `Failed`
+  are never due.
+* **Retries.** A step that fails with `AgentError::Transient` (or that panics,
+  which is treated as transient) is committed as `Runnable` with
+  `wake_at = now + delay` and `attempt + 1`. The delay is the policy's
+  exponential backoff. If the error carries a `retry_after` (a provider's
+  `Retry-After`), the delay is the larger of the backoff and the hint, and a
+  hint is capped at 24 hours (`MAX_RETRY_AFTER`). When `attempt` reaches
+  `RetryPolicy::max_attempts` the run is `Failed` with "gave up after N
+  attempts".
+* **Store trouble.** If the store fails while a step runs, the class decides.
+  `Corrupt` and `Invalid` fail the run, because a row that can never be read
+  must not be leased for ever. Any other class commits nothing and keeps the
+  lease, so the run is retried when the lease expires and is not hammered.
+* **Cancel.** `Runtime::cancel` commits `Failed` with the error
+  `cancelled: <reason>`. A step running at that moment is told through its
+  `CancelToken` (at once in the same process, within one poll interval from
+  another one). Its later commit is rejected by the compare-and-swap. A run that
+  already finished is left as it is.
+* **Deliver.** `Runtime::deliver` appends to the inbox. A `Parked` run becomes
+  `Runnable` at once, even if it was waiting on a timer. A run that is `Done`
+  or `Failed` answers `Finished`.
+* **Terminal states** are `Done` and `Failed`. A finished run is kept until
+  `Store::purge_finished` deletes it with its journal.
+
+How a run looks to an A2A client (`task_state` in
+`crates/adam-a2a-runtime/src/convert.rs`):
+
+| Run | A2A task state |
+|---|---|
+| `Runnable`, version 1 (no worker has committed yet) | `submitted` |
+| `Runnable`, or `Parked` with a timer | `working` |
+| `Parked` with no timer | `input-required` |
+| `Done` | `completed` |
+| `Failed` with an error that starts `cancelled: ` | `canceled` |
+| `Failed` otherwise | `failed` |
+
+## The error tree
+
+Each library defines its own error enum with `thiserror`. A variant says **what
+happened**. Its `ErrorClass` (from `adam-error`) says **what to do**. Retry loops,
+the A2A error a client sees and the process exit code all decide from the class,
+never from a variant. Every enum implements `Classify`, and its test matches
+every variant exhaustively, so a new variant forces a class decision.
+
+The first diagram shows which variants map to which class. A dotted arrow means
+the enum wraps another and takes its class. `Unsupported` is a valid class, but
+no enum in this repository maps to it today (checked by reading the 11
+`impl Classify` blocks outside tests).
+
+```mermaid
+flowchart LR
+    subgraph enums["Library error enums"]
+        direction TB
+        subgraph core_e["adam-core"]
+            StoreError
+        end
+        subgraph rt_e["adam-runtime"]
+            AgentError
+            RuntimeError
+        end
+        subgraph model_e["adam-model and adam-model-openai"]
+            ModelError
+            OpenAiConfigError
+        end
+        subgraph ws_e["adam-workspace"]
+            WorkspaceError
+        end
+        subgraph acp_e["adam-acp"]
+            AcpError
+        end
+        subgraph a2a_e["adam-a2a"]
+            BackendError
+        end
+        subgraph llm_e["adam-llm-agent"]
+            ToolError
+        end
+        subgraph coder_e["adam-coder"]
+            ConfigError
+            StoppedUnexpectedly
+        end
+    end
+
+    subgraph classes["adam_error::ErrorClass"]
+        direction TB
+        Transient
+        RateLimited
+        Conflict
+        Invalid
+        NotFound
+        Rejected
+        Unauthenticated
+        Unsupported["Unsupported (none map here)"]
+        Corrupt
+        Internal
+    end
+
+    StoreError -->|"Backend chosen by adapter: unavailable"| Transient
+    StoreError -->|Conflict| Conflict
+    StoreError -->|InvalidInput| Invalid
+    StoreError -->|NotFound| NotFound
+    StoreError -->|"AlreadyExists, ConversationBusy"| Rejected
+    StoreError -->|"Corrupt, NonDeterminism, Backend corrupt_source"| Corrupt
+    StoreError -->|"Backend internal"| Internal
+
+    AgentError -->|"Transient, no retry_after"| Transient
+    AgentError -->|"Transient with retry_after"| RateLimited
+    AgentError -->|Permanent| Invalid
+    AgentError -->|NonDeterminism| Corrupt
+    StoreError -.->|"Store(e)"| AgentError
+
+    RuntimeError -->|UnknownAgent| Invalid
+    RuntimeError -->|NotFound| NotFound
+    RuntimeError -->|"Finished, ConversationBusy"| Rejected
+    RuntimeError -->|Corrupt| Corrupt
+    RuntimeError -->|Contended| Conflict
+    AgentError -.->|"Agent(e)"| RuntimeError
+    StoreError -.->|"Store(e)"| RuntimeError
+
+    ModelError -->|RateLimited| RateLimited
+    ModelError -->|Transient| Transient
+    ModelError -->|"ContextLength, InvalidRequest"| Invalid
+    ModelError -->|Auth| Unauthenticated
+    ModelError -->|Protocol| Corrupt
+    OpenAiConfigError -->|"InvalidBaseUrl, InvalidHeader, InvalidApiKey"| Invalid
+    OpenAiConfigError -->|Client| Internal
+
+    WorkspaceError -->|Auth| Unauthenticated
+    WorkspaceError -->|NotFound| NotFound
+    WorkspaceError -->|Invalid| Invalid
+    WorkspaceError -->|Transient| Transient
+    WorkspaceError -->|RateLimited| RateLimited
+    WorkspaceError -->|Conflict| Rejected
+    WorkspaceError -->|Corrupt| Corrupt
+    WorkspaceError -->|"Git, Http, Io"| Internal
+
+    AcpError -->|"Exited, Timeout"| Transient
+    AcpError -->|AuthRequired| Unauthenticated
+    AcpError -->|"Config, Rpc -32602"| Invalid
+    AcpError -->|Protocol| Corrupt
+    AcpError -->|"TurnInProgress, Closed"| Rejected
+    AcpError -->|"Spawn, other Rpc"| Internal
+
+    BackendError -->|TaskNotFound| NotFound
+    BackendError -->|NotCancelable| Rejected
+    BackendError -->|InvalidParams| Invalid
+    BackendError -->|Unavailable| Transient
+    BackendError -->|Internal| Internal
+
+    ToolError -->|Transient| Transient
+    ToolError -->|Permanent| Invalid
+    ToolError -->|NeedsInput| Rejected
+
+    ConfigError --> Invalid
+    StoppedUnexpectedly --> Internal
+```
+
+The second diagram shows what each class decides. The full table (with the
+"alert" column and the exact messages) is the **Errors** section of the
+[root README](../README.md#errors). It is the reference, so this page does
+not repeat it.
+
+```mermaid
+flowchart LR
+    subgraph classes["ErrorClass"]
+        direction TB
+        Transient
+        RateLimited
+        Conflict
+        Invalid
+        NotFound
+        Rejected
+        Unauthenticated
+        Unsupported
+        Corrupt
+        Internal
+    end
+
+    Transient & RateLimited & Conflict --> retry["is_retryable: retry<br/>RetryPolicy backoff, or wake at retry_after"]
+    Corrupt & Internal --> alert["should_alert: tell an operator"]
+
+    Transient & RateLimited & Conflict --> a1["A2A -32603<br/>backend temporarily unavailable"]
+    Invalid & Rejected --> a2["A2A -32602<br/>invalid params"]
+    NotFound --> a3["A2A -32001<br/>task not found"]
+    Unauthenticated & Unsupported & Corrupt & Internal --> a4["A2A -32603<br/>internal error"]
+
+    Transient & RateLimited & Conflict --> x1["exit 69<br/>EX_UNAVAILABLE"]
+    Invalid --> x2["exit 78<br/>EX_CONFIG"]
+    Corrupt & Internal --> x3["exit 70<br/>EX_SOFTWARE"]
+    NotFound & Rejected & Unauthenticated & Unsupported --> x4["exit 1"]
+```
+
+Where each decision is made:
+
+* **Retry** is in `adam-runtime` (`worker.rs`). The model, workspace and ACP
+  errors reach it through the agent: a retryable one becomes
+  `AgentError::Transient` (directly in `LlmAgent` for a model error, or through
+  `ToolError::Transient` for a tool), carrying its `retry_after`. Anything else
+  fails the call. In the coder, a permanent tool failure is an error result
+  the model sees, and the run goes on.
+* **Conflict** retries at once and is bounded: the runtime's commit, deliver,
+  cancel and start loops try up to 16 times (`MAX_COMMIT_RETRIES`). Then
+  `deliver`, `cancel` and `start` report `Contended`, and a worker drops its
+  result with a warning.
+* **The A2A code** is chosen at the trust boundary in two steps. First
+  `adam-a2a-runtime` maps a `RuntimeError` **by class** to a `BackendError`
+  (`map_err` in `crates/adam-a2a-runtime/src/backend.rs`): `NotFound` to
+  `TaskNotFound`, `Invalid` and `Rejected` to `InvalidParams`, the three
+  retryable classes to `Unavailable`, the rest to `Internal`. Then `adam-a2a`
+  maps each `BackendError` to a code (`crates/adam-a2a/src/backend.rs`). The
+  client gets a fixed sentence. The cause chain goes to the log, never to the
+  client. `-32002` (task cannot be canceled) comes from
+  `BackendError::NotCancelable`, which the backend raises when `CancelTask`
+  targets a task that is finished and not already canceled.
+* **The exit code** is chosen by `adam_coder::exit_code`
+  (`crates/adam-coder/src/exit.rs`). It walks the `anyhow` chain from the
+  outside in and takes the first match. A `ConfigError` is 78. A typed error
+  (`StoreError`, `OpenAiConfigError`, `WorkspaceError`, `RuntimeError`,
+  `StoppedUnexpectedly`) is decided by its class, as in the diagram. A panicked
+  task is 70. A plain `std::io::Error` (a port that cannot bind, a directory
+  that cannot be created) is 71. Anything else is 1. The process logs one
+  structured line, `adam-coder failed`, with the whole cause chain and none of
+  the process's secrets. The values are BSD `sysexits.h` numbers (*unverified*,
+  see the end of this page).
+
+Two rules keep this tree honest (details in the
+[`adam-error` README](../crates/adam-error/README.md)):
+
+* A message describes its own layer only, and the lower error is the `source`.
+  `adam_error::report(&e)` prints the chain (`a: b: c`) once, and only where an
+  error is flattened: the journal, a response to a client, a log line.
+* Library crates use `thiserror`. Only binaries use `anyhow`.
+
+## The coder agent
+
+`adam-coder` turns a coding task into a pull request. A client sends
+"in repository X, do Y". The agent makes the change in a private git worktree,
+runs the project's own checks, and opens a pull request. It is an `LlmAgent`
+with six tools and one extra rule, running on the durable runtime and served
+over A2A.
+
+### What it does
+
+The model decides the order of the tools. The tools enforce the rules, so the
+rules hold even if the model ignores its prompt.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as A2A client
+    participant A as coder agent<br/>LlmAgent + tools
+    participant M as model gateway<br/>OpenAI-compatible
+    participant G as Workspaces<br/>git CLI
+    participant O as OpenCode<br/>opencode acp
+    participant Sh as sh -lc<br/>project checks
+    participant R as git remote
+    participant H as GitHub API
+
+    C->>A: SendStreamingMessage "in repo X (base main), do Y"
+    loop each model turn
+        A->>M: complete(history + 6 tool specs)
+        M-->>A: text or tool calls
+    end
+    Note over A,M: The turns below are the model's tool calls, in the order it picks.
+
+    A->>G: prepare_workspace(repo_url, base_branch)
+    G->>G: check the host against ALLOWED_REPO_HOSTS
+    G->>R: git fetch --prune origin (token in the env of this one call)
+    G->>G: git worktree add, new branch agent/short-run-id from origin/base
+    A-->>C: progress: worktree ready
+
+    A->>O: delegate_to_opencode(instructions)
+    O->>M: its own model calls, same gateway
+    O-->>A: ACP updates: text, plan, tool calls
+    A-->>C: progress lines
+    O-->>A: TurnEnded, then the files that changed
+
+    loop until green, or the check cycles are used up
+        A->>Sh: run_checks(command), with a time limit
+        Sh-->>A: exit code and output tail
+        opt exit code is not 0
+            A->>O: delegate_to_opencode(fix the failure)
+        end
+    end
+
+    A->>G: commit_and_push(message)
+    G->>G: git add -A, git commit
+    G->>R: git push origin agent/short-run-id (never forced)
+    A-->>C: artifact "branch"
+
+    A->>A: open_pull_request guard: HEAD is pushed, and the last check passed on this exact tree
+    A->>H: find an open PR for the branch, else POST the pull request
+    H-->>A: number and URL
+    A-->>C: artifact "pull_request"
+
+    opt the model needs a decision from the user
+        A-->>C: input-required (ask_user question)
+        C->>A: SendMessage with taskId (the answer)
+    end
+    A-->>C: completed, with the pull request as an artifact
+```
+
+The same flow as states, from the point of view of the run notes and the
+tools' guards:
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoWorkspace
+    NoWorkspace --> WorktreeReady: prepare_workspace
+    WorktreeReady --> Edited: delegate_to_opencode
+    Edited --> ChecksGreen: run_checks passes
+    Edited --> ChecksRed: run_checks fails, one cycle used
+    Edited --> Pushed: commit_and_push without a green check, unless the budget is used up
+    ChecksRed --> Edited: delegate_to_opencode to fix, cycles left
+    ChecksRed --> Exhausted: failed runs reach MAX_CHECK_CYCLES
+    ChecksRed --> Pushed: commit_and_push, unless the budget is used up
+    ChecksGreen --> Pushed: commit_and_push
+    Pushed --> Edited: more changes, the green run no longer covers the tree
+    Pushed --> PullRequest: open_pull_request, checks green on the pushed tree
+    Pushed --> PullRequest: accept_red_checks after the user agreed through ask_user
+    PullRequest --> Completed: the model ends its turn
+    Exhausted --> FailedRun: the model reports the findings and stops, the run fails
+    Completed --> [*]
+    FailedRun --> [*]
+```
+
+`Exhausted` has no way out except failure: `run_checks`, `commit_and_push` and
+`open_pull_request` all refuse, and `accept_red_checks` never overrides it. The states are not stored as an enum:
+they follow from the per-run notes (failures counted, last check and its tree,
+pushed sha, pull request) and the worktree.
+
+What the diagrams cannot say (`crates/adam-coder/src/`):
+
+* **The tools** (`tools/`): `prepare_workspace`, `delegate_to_opencode`,
+  `run_checks`, `commit_and_push`, `open_pull_request` and `ask_user`.
+* **Rules in code.**
+  * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`
+    refuses to run. `commit_and_push` and `open_pull_request` refuse too.
+  * `open_pull_request` refuses unless the pushed `HEAD` is the current commit
+    and the last check run passed **on exactly the tree it contains**.
+  * A completed run with no pull request fails, if its last check was red or
+    the credentials were rejected (`CoderAgent::verdict`). "The model said it
+    is done" is not the same as "delivered".
+* **Safe to repeat.** A tool call that dies before its result is journaled
+  runs again, so each tool is safe to repeat. `prepare_workspace` reuses the
+  run's worktree, `commit_and_push` does nothing when there is nothing new,
+  `open_pull_request` returns the open pull request of the same branch, and
+  failed checks are counted per call id.
+* **Where state lives.** Conversation, journal and run state are in Postgres.
+  The mirrors, worktrees and per-run notes
+  (`<WORKSPACE_ROOT>/coder/<run>.json`) are files under `WORKSPACE_ROOT`. Git is
+  the durable artifact: a lost database loses the run ledger, not the pushed
+  branches or the pull requests.
+* **Secrets.**
+  * The git token reaches `git` only through the environment of a single
+    invocation, never in a remote URL or `.git/config`, and only for hosts on
+    the allow-list (`ScopedToken` plus `Workspaces::allow_hosts`).
+  * OpenCode's child process gets `MODEL_API_KEY` through its environment (its
+    config says `{env:MODEL_API_KEY}`, so the key is not inlined). `GITHUB_TOKEN`,
+    `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child.
+  * A `Redactor` scrubs the process's own secrets from every tool result, event
+    and failure text.
+* **Limits** (`coder_limits()`): 200 model turns, 400 tool calls, 8192 output
+  tokens per call, 100,000 tokens of history sent to the model. A limit that
+  trips fails the run.
+* **Cancel.** When a run is cancelled while OpenCode works, the tool sends ACP
+  `session/cancel`, waits 2 seconds, then kills OpenCode and its process group.
+* **Configuration** is environment variables only. The table is in
+  `crates/adam-coder/src/config.rs` and the
+  [crate README](../crates/adam-coder/README.md). Every problem is reported at
+  once as `invalid configuration`.
+
+### How it is deployed
+
+One container, one process, one database. The image is built by
+`docker/coder/Dockerfile` and installed by the Helm chart in `deploy/coder`.
+
+```mermaid
+flowchart LR
+    orch["Orchestrator<br/>namespace another-agentic-system"]
+    gw["OpenAI-compatible<br/>model gateway"]
+    remote["Git remote<br/>github.com"]
+    ghapi["GitHub REST API"]
+
+    subgraph k8s["Kubernetes: Helm chart deploy/coder"]
+        np["NetworkPolicy<br/>ingress only from the orchestrator namespace"]
+        svc["Service<br/>ClusterIP :8080, no Ingress"]
+        subgraph pod["Pod: StatefulSet, 1 replica, uid 10001"]
+            tini["tini (PID 1)<br/>forwards SIGTERM, reaps children"]
+            coder["adam-coder<br/>A2A server + workers"]
+            oc["opencode acp<br/>child process"]
+            kids["sh, git<br/>child processes"]
+            tini --> coder
+            coder --> oc
+            coder --> kids
+        end
+        pvc[("PVC at /work<br/>mirrors, worktrees, notes")]
+        cnpg[("CloudNativePG cluster<br/>Postgres: runs and journal")]
+        secret["ExternalSecret to Secret<br/>MODEL_API_KEY, GITHUB_TOKEN, A2A_BEARER_TOKENS"]
+    end
+
+    orch -->|"A2A JSON-RPC + bearer token"| svc
+    np -.->|guards| svc
+    svc --> coder
+    coder --- pvc
+    coder -->|"DATABASE_URL"| cnpg
+    secret -.-> coder
+    coder -->|"chat completions"| gw
+    oc -->|"chat completions"| gw
+    coder -->|"git fetch, git push"| remote
+    coder -->|"find and open pull request"| ghapi
+```
+
+Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
+
+* **Image.** Two stages. The first compiles `adam-coder` on `rust:1.94-trixie`
+  (the base image is pinned by tag and digest) so that its glibc matches the
+  runtime image. The second is the `workspace` image of
+  `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini,
+  OpenCode), pinned by an immutable tag. The last `RUN` is a smoke test as uid
+  10001. The entrypoint is `tini -- adam-coder`. It listens on `0.0.0.0:8080`.
+* **One replica.** The worktrees live on a ReadWriteOnce volume and the
+  workspace layer assumes one process per workspace root. Runs are leased in
+  Postgres, so more replicas work only with a shared `/work`.
+* **Probes** hit `/healthz`. Graceful shutdown gets 120 seconds: on SIGTERM the
+  workers finish the steps they are in. A step cut short by SIGKILL is taken
+  over by the next start once its lease expires.
+* **No Ingress.** The orchestrator reaches the Service inside the cluster with
+  a bearer token. The chart's `NetworkPolicy` allows ingress only from the
+  orchestrator's namespace. It is enforced only if the cluster's CNI enforces
+  network policies.
+* **Secrets** come from an `ExternalSecret` (AWS Secrets Manager through External
+  Secrets). The database URL is the `uri` key of the Secret that CloudNativePG
+  creates.
+* **Known risks** (stated in the chart README): no database backups, and one
+  replica.
+
+How a change reaches the chart (`.github/workflows/coder.yml`):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Dev as Pull request
+    participant CI as coder.yml
+    participant GH as ghcr.io
+    participant Chart as deploy/coder/values.yaml
+
+    Dev->>CI: helm lint and template, kubeconform, hadolint, shellcheck
+    Dev->>CI: build the image and run the container smoke test
+    CI-->>Dev: green
+    Dev->>CI: merge to main
+    CI->>CI: build the image and smoke-test it again
+    CI->>GH: push ghcr.io/vymalo/another-adam-rs/coder, tag sha-XXXXXXX
+    CI->>Chart: set image.tag, commit "chore(deploy): bump coder to sha-XXXXXXX"
+```
+
+The workflow ends at the commit. How the chart is then applied to the cluster
+is outside this repository (*unverified* here).
+
+### The local Compose stack
+
+`compose.yaml` runs the databases, WireMock stand-ins for the external systems,
+a local git remote, and, under the `app` profile, the coder wired to all of
+them. Ports bind to `127.0.0.1` and every credential is a dummy. The
+[root README](../README.md#local-development) has the ports, the environment
+variables, and the scenario switches of each mock.
+
+```mermaid
+flowchart LR
+    subgraph host["Host"]
+        cargo["cargo test<br/>ADAM_TEST_* variables"]
+        curl["curl, an A2A client"]
+    end
+
+    subgraph stack["Compose project adam-rs"]
+        pgs[("postgres :5432<br/>database adam_test")]
+        mongos[("mongodb :27017<br/>standalone")]
+        moai["mock-openai :8081<br/>WireMock, chat completions"]
+        mogh["mock-github :8082<br/>WireMock, pull requests"]
+        gitsrv["git-server :8083<br/>nginx + git-http-backend<br/>local/sandbox.git"]
+        cdr["coder :8080<br/>profile app, built from docker/coder/Dockerfile"]
+    end
+
+    curl -->|"A2A, bearer dev-token"| cdr
+    cdr -->|"DATABASE_URL"| pgs
+    cdr -->|"MODEL_BASE_URL"| moai
+    cdr -->|"GITHUB_API_URL"| mogh
+    cdr -->|"repository in the task"| gitsrv
+
+    cargo --> pgs
+    cargo --> mongos
+    cargo --> moai
+    cargo --> mogh
+```
+
+* `mongodb` is used by the store tests only. The coder does not use it.
+* The coder waits until `postgres`, `mock-openai`, `mock-github` and `git-server`
+  are healthy.
+* The mock model is canned: it answers in text, or calls the first declared tool
+  with `{}`. So it cannot drive OpenCode through a real change, and a local run
+  does not end in a pull request. A complete run needs a model that can call
+  tools. The git remote and the pull request API can still be `git-server` and
+  `mock-github`. See the root README for this caveat and for the live smoke
+  test in the [`adam-coder` README](../crates/adam-coder/README.md).
+* The `compose` job in `.github/workflows/ci.yml` starts the mocks and runs the
+  real clients (`OpenAiCompatible`, `GitHub`) against them, so the mappings
+  cannot rot.
+
+## Where to go next
+
+| Crate | Layer | README |
+|---|---|---|
+| `adam-error` | contracts | [crates/adam-error](../crates/adam-error/README.md) |
+| `adam-core` | contracts | [crates/adam-core](../crates/adam-core/README.md) |
+| `adam-model` | contracts | [crates/adam-model](../crates/adam-model/README.md) |
+| `adam-a2a` | contracts | [crates/adam-a2a](../crates/adam-a2a/README.md) |
+| `adam-store-postgres` | implementation | [crates/adam-store-postgres](../crates/adam-store-postgres/README.md) |
+| `adam-store-mongodb` | implementation | [crates/adam-store-mongodb](../crates/adam-store-mongodb/README.md) |
+| `adam-model-openai` | implementation | [crates/adam-model-openai](../crates/adam-model-openai/README.md) |
+| `adam-workspace` | implementation | [crates/adam-workspace](../crates/adam-workspace/README.md) |
+| `adam-acp` | implementation | [crates/adam-acp](../crates/adam-acp/README.md) |
+| `adam-runtime` | runtime | [crates/adam-runtime](../crates/adam-runtime/README.md) |
+| `adam-a2a-runtime` | runtime | [crates/adam-a2a-runtime](../crates/adam-a2a-runtime/README.md) |
+| `adam-llm-agent` | agent | [crates/adam-llm-agent](../crates/adam-llm-agent/README.md) |
+| `adam-coder` | agent, binary | [crates/adam-coder](../crates/adam-coder/README.md) |
+| `adam-store-testkit` | test kit | [crates/adam-store-testkit](../crates/adam-store-testkit/README.md) |
+
+Also:
+
+* [Root README](../README.md): the durable model, how each store keeps its
+  promises, local development, errors, testing.
+* [`deploy/coder/README.md`](../deploy/coder/README.md): the Helm chart, its
+  secrets and its known risks.
+
+## Verified and unverified
+
+**Verified 2026-09-29, source: this repository at commit `172a117`.** The crate
+graph (from each `Cargo.toml`), the traits and their implementations (from a
+search for every `pub trait` and `impl` of it), every error enum and its
+`Classify` impl, the run transitions (`runtime.rs`, `worker.rs`), the request
+path, the coder's tools and rules, the Dockerfile, the chart templates and
+`compose.yaml`. Nothing was executed to check them: the diagrams come from
+reading the code. The Mermaid syntax of every diagram is checked in CI by
+`tools/docs-check`.
+
+**Unverified.**
+
+* The `sysexits.h` numbers 78, 69, 71 and 70 are from memory. The code and the
+  root README say the same. The header is not in this repository.
+* The A2A method names (`SendMessage`, `SendStreamingMessage`, `GetTask`,
+  `CancelTask`, `SubscribeToTask`), the `TASK_STATE_*` names and the error
+  codes `-32001` and `-32002` are as documented in `crates/adam-a2a/src/lib.rs`
+  for the pinned SDK (`a2a-lf` 0.3, `a2a-server-lf` 0.4). They were not checked
+  here against the A2A specification.
+* How the SDK frames SSE, and that it sends a keepalive comment every 15 seconds,
+  is taken from the `adam-a2a` docs, not re-tested.
+* OpenCode's behaviour (ACP over stdio, `{env:VAR}` substitution in its
+  inline config) is as recorded in `crates/adam-coder/src/opencode.rs`, which
+  cites the OpenCode source at `sst/opencode@7945de2`. It was not re-checked
+  here, and a live run against a real gateway is not covered by CI.
+* The chart was rendered but, per its README, not applied to a cluster or
+  validated against the CRD schemas of the installed operators. The compose
+  `app` profile was validated with `docker compose config` only when it was
+  written.
+* How the chart reaches the cluster after the tag bump is outside this
+  repository.
