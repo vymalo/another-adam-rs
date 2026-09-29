@@ -21,6 +21,7 @@
 //! | [`agent`] | [`CoderAgent`]: `LlmAgent` + the completion policy (red checks and no PR = failed) |
 //! | [`tools`] | the six tools, [`ToolEnv`] and [`CoderSettings`] |
 //! | [`instructions`] | the system prompt |
+//! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
 //! | [`app`] | [`Coder`]: runtime + A2A backend + router |
 //! | [`config`] | the binary's environment variables |
@@ -58,6 +59,7 @@ pub mod app;
 pub mod config;
 pub mod instructions;
 pub mod opencode;
+pub mod redact;
 mod repos;
 pub mod tools;
 
@@ -65,5 +67,6 @@ pub use agent::{AGENT_NAME, CoderAgent, coder_limits};
 pub use app::{Coder, RuntimeOptions, agent_card};
 pub use config::{Config, ConfigError};
 pub use instructions::instructions;
+pub use redact::Redactor;
 pub use repos::workspaces_for;
 pub use tools::{CoderSettings, ToolEnv, coder_tools};

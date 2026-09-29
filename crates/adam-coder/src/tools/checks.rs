@@ -133,9 +133,13 @@ impl Tool for RunChecks {
             Err(reason) => return Ok(ToolOutput::error(reason)),
         };
 
-        ctx.emit_progress(format!("running checks: {command}"))
-            .await;
-        let outcome = run_shell(
+        // What the command printed is not ours to publish: scrub the process's
+        // secrets before the tail reaches the model, the notes, an event or a
+        // failed run's findings. The command line is shown scrubbed too.
+        let redactor = &self.env.redactor;
+        let shown = redactor.scrub(command).into_owned();
+        ctx.emit_progress(format!("running checks: {shown}")).await;
+        let mut outcome = run_shell(
             &dir,
             command,
             self.env.settings.check_timeout,
@@ -146,14 +150,16 @@ impl Tool for RunChecks {
             adam_llm_agent::ToolError::Transient(format!("cannot start the shell: {e}"))
         })?;
 
+        outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
+
         // The code the command just ran on, so a pull request can be tied to
         // the exact tree that was verified.
         let tree = super::gitcli::working_tree_id(wt.path()).await;
         let passed = outcome.passed();
-        let text = render(command, &outcome, self.env.settings.check_timeout);
+        let text = render(&shown, &outcome, self.env.settings.check_timeout);
         let failures = notes.record_check(CheckRecord {
             call_id: ctx.call_id().to_owned(),
-            command: command.to_owned(),
+            command: shown.clone(),
             passed,
             exit_code: outcome.exit_code,
             tail: outcome.tail.clone(),
@@ -165,9 +171,9 @@ impl Tool for RunChecks {
             .await
             .map_err(|e| notes_error(&e))?;
         ctx.emit_progress(if passed {
-            format!("checks passed: {command}")
+            format!("checks passed: {shown}")
         } else {
-            format!("checks failed ({failures} of {max} cycles used): {command}")
+            format!("checks failed ({failures} of {max} cycles used): {shown}")
         })
         .await;
 

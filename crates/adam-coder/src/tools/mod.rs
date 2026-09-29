@@ -35,11 +35,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_llm_agent::{DynTool, ToolCtx, ToolError, ToolOutput};
+use adam_llm_agent::{DynTool, Tool, ToolCtx, ToolError, ToolOutput};
+use adam_model::ToolSpec;
 use adam_workspace::{DynCodeHost, GitIdentity, WorkspaceError, Workspaces, Worktree};
 use serde_json::Value;
 
 use crate::opencode::OpenCodeLaunch;
+use crate::redact::Redactor;
 
 pub mod ask;
 pub mod checks;
@@ -98,6 +100,9 @@ pub struct ToolEnv {
     pub settings: CoderSettings,
     /// Per-run bookkeeping.
     pub notes: NotesStore,
+    /// Removes the process's secrets from everything a tool returns, reports
+    /// or fails with. Empty (a no-op) until [`ToolEnv::with_redactor`].
+    pub redactor: Redactor,
 }
 
 impl ToolEnv {
@@ -109,7 +114,16 @@ impl ToolEnv {
             code_host,
             settings,
             notes,
+            redactor: Redactor::default(),
         }
+    }
+
+    /// Scrub the values `redactor` knows from every tool result, tool error and
+    /// progress line of OpenCode and the checks.
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     /// [`workspace_error`], and when the credentials were rejected also a note
@@ -153,15 +167,58 @@ impl ToolEnv {
 }
 
 /// Every coder tool over `env`, in the order they are offered to the model.
+///
+/// Each tool is wrapped so that what it returns or fails with passes through
+/// [`ToolEnv::redactor`] first.
 pub fn coder_tools(env: &Arc<ToolEnv>) -> Vec<DynTool> {
-    vec![
+    let tools: Vec<DynTool> = vec![
         Arc::new(prepare::PrepareWorkspace::new(env.clone())),
         Arc::new(delegate::DelegateToOpenCode::new(env.clone())),
         Arc::new(checks::RunChecks::new(env.clone())),
         Arc::new(publish::CommitAndPush::new(env.clone())),
         Arc::new(publish::OpenPullRequest::new(env.clone())),
         Arc::new(ask::AskUser),
-    ]
+    ];
+    tools
+        .into_iter()
+        .map(|inner| -> DynTool {
+            Arc::new(Redacting {
+                inner,
+                redactor: env.redactor.clone(),
+            })
+        })
+        .collect()
+}
+
+/// A tool whose results and errors are scrubbed by a [`Redactor`].
+struct Redacting {
+    inner: DynTool,
+    redactor: Redactor,
+}
+
+#[async_trait::async_trait]
+impl Tool for Redacting {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let r = &self.redactor;
+        match self.inner.call(ctx, args).await {
+            Ok(mut out) => {
+                out.content = r.scrub_string(out.content);
+                for artifact in &mut out.artifacts {
+                    r.scrub_value(&mut artifact.data);
+                }
+                Ok(out)
+            }
+            Err(ToolError::Transient(m)) => Err(ToolError::Transient(r.scrub_string(m))),
+            Err(ToolError::Permanent(m)) => Err(ToolError::Permanent(r.scrub_string(m))),
+            Err(ToolError::NeedsInput { question }) => Err(ToolError::NeedsInput {
+                question: r.scrub_string(question),
+            }),
+        }
+    }
 }
 
 /// A non-empty string argument.

@@ -34,7 +34,7 @@ use tokio::sync::{Notify, oneshot};
 
 type Client = A2AClient<Box<dyn Transport>>;
 
-const TOKEN: &str = "coder-test-token";
+const TOKEN: &str = common::A2A_TOKEN;
 
 struct Server {
     coder: Coder,
@@ -1301,42 +1301,6 @@ async fn a_github_401_fails_the_run_with_a_clear_message(store: DynStore) {
 
 // ------------------------------------------------------------- the A2A front
 
-/// One raw HTTP/1.1 request; `(status, body)`.
-async fn raw(
-    addr: std::net::SocketAddr,
-    method: &str,
-    path: &str,
-    bearer: Option<&str>,
-) -> (u16, String) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"nope"}}"#;
-    let auth = bearer.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
-    let payload = if method == "POST" {
-        format!(
-            "Content-Type: application/json\r\nContent-Length: {}\r\n{auth}\r\n{body}",
-            body.len()
-        )
-    } else {
-        format!("{auth}\r\n")
-    };
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream
-        .write_all(
-            format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{payload}")
-                .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
-    let status = response
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .expect("a status line");
-    (status, response)
-}
-
 /// The coder's own router (not just `adam-a2a`'s) refuses a missing or wrong
 /// token with 401 and never runs anything, while the agent card and
 /// `/healthz` stay open.
@@ -1355,7 +1319,7 @@ async fn wrong_token_on_the_coder_router_is_401(store: DynStore) {
     });
 
     for bearer in [None, Some("wrong"), Some(""), Some("coder-test-toke")] {
-        let (status, response) = raw(addr, "POST", "/", bearer).await;
+        let (status, response) = common::raw(addr, "POST", "/", bearer).await;
         assert_eq!(status, 401, "{bearer:?}: {response}");
         assert!(
             response
@@ -1366,16 +1330,174 @@ async fn wrong_token_on_the_coder_router_is_401(store: DynStore) {
         assert!(!response.contains(TOKEN), "{response}");
     }
     // The right token gets past authentication (the task does not exist).
-    let (status, response) = raw(addr, "POST", "/", Some(TOKEN)).await;
+    let (status, response) = common::raw(addr, "POST", "/", Some(TOKEN)).await;
     assert_ne!(status, 401, "{response}");
 
-    let (status, card) = raw(addr, "GET", "/.well-known/agent-card.json", None).await;
+    let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
     assert_eq!(status, 200, "{card}");
     assert!(card.contains("adam-coder") && card.contains(&format!("http://{addr}/")));
-    let (status, _) = raw(addr, "GET", "/healthz", None).await;
+    let (status, _) = common::raw(addr, "GET", "/healthz", None).await;
     assert_eq!(status, 200);
 
     assert!(mock.requests().is_empty(), "no run was started");
+}
+
+// ------------------------------------------------------------------ secrets
+
+/// Everything a client (or an operator reading the run) can see of a run:
+/// the stream, the fetched task, the run's error, output and stored state, the
+/// notes on disk.
+async fn everything_visible(server: &Server, fx: &Fixture, seen: &Seen) -> String {
+    let run = run_id(&seen.task_id);
+    let view = server.coder.runtime.view(run).await.unwrap().unwrap();
+    let task = server
+        .client
+        .get_task(&a2a::GetTaskRequest {
+            id: seen.task_id.clone(),
+            history_length: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    let notes = std::fs::read_to_string(fx.root.join("coder").join(format!("{run}.json")))
+        .unwrap_or_default();
+    format!(
+        "{:?}\n{:?}\n{:?}\n{}\n{:?} {:?} {}\n{notes}",
+        seen.labels,
+        seen.messages,
+        seen.artifacts,
+        serde_json::to_string(&task).unwrap(),
+        view.error,
+        view.output,
+        view.state,
+    )
+}
+
+fn assert_no_secret(haystack: &str, what: &str) {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    for secret in common::SECRETS {
+        for form in [
+            secret.to_owned(),
+            b64.encode(secret),
+            b64.encode(format!("x-access-token:{secret}")),
+        ] {
+            assert!(
+                !haystack.contains(&form),
+                "{what}: {form} appears in what a client can see:\n{haystack}"
+            );
+        }
+    }
+}
+
+/// OpenCode dies printing secrets to stderr (a key in a message, an
+/// Authorization header): the stderr tail is part of the error a client
+/// reads, and the values must be gone from it, from the stream, the task, the
+/// run's stored error and state.
+async fn secrets_in_opencode_stderr_never_reach_the_client(store: DynStore) {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let (launch, _) = common::scripted_agent(
+        agent_dir.path(),
+        "printf 'auth failed for key %s\\n' \"$LEAK_KEY\" >&2\n\
+         printf 'Authorization: Basic %s\\n' \"$(printf 'x-access-token:%s' \"$LEAK_GH\" | base64 | tr -d '\\n')\" >&2\n\
+         printf 'bearer %s and db password %s\\n' \"$LEAK_A2A\" \"$LEAK_DB\" >&2\n\
+         FAKE_ACP_SCENARIO=crash exec \"$AGENT\"",
+        OpenCodeLaunch::program("unused")
+            .env("LEAK_KEY", common::MODEL_KEY)
+            .env("LEAK_GH", common::GITHUB_TOKEN)
+            .env("LEAK_A2A", common::A2A_TOKEN)
+            .env("LEAK_DB", common::DB_PASSWORD),
+    );
+    let fx = Fixture::with("hello\n", |s| s.opencode = launch).await;
+    let mock = Arc::new(MockModel::new());
+    prepare_and_delegate(&mock, &fx, &["c2"]);
+    // One attempt only: the first transient failure ends the run.
+    let server = Server::start(coder_retrying(&fx, mock.clone(), store, 1)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "add hello.txt").await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:?}",
+        seen.labels
+    );
+    let error = seen
+        .messages
+        .iter()
+        .find(|m| m.contains("gave up after 1 attempts"))
+        .unwrap_or_else(|| panic!("no failure message in {:#?}", seen.messages));
+    assert!(
+        error.contains("auth failed for key [redacted]"),
+        "the diagnosis is kept, the key is not: {error}"
+    );
+    assert!(
+        error.contains("bearer [redacted] and db password [redacted]"),
+        "{error}"
+    );
+    assert!(error.contains("Authorization: Basic [redacted]"), "{error}");
+    assert_no_secret(
+        &everything_visible(&server, &fx, &seen).await,
+        "opencode stderr",
+    );
+}
+
+/// A failing check prints secrets (say a test dumps its environment): the
+/// findings a client reads as the run's error, the tool result the model sees,
+/// the notes and the progress lines are clean.
+async fn secrets_in_check_output_never_reach_the_client(store: DynStore) {
+    // OpenCode writes a file that holds secrets (a dumped environment); the
+    // failing check prints it.
+    let dump = format!(
+        "GITHUB_TOKEN={}\nMODEL_API_KEY={}\ndb=postgres://u:{}@h/db\n",
+        common::GITHUB_TOKEN,
+        common::MODEL_KEY,
+        common::DB_PASSWORD
+    );
+    let fx = Fixture::with(&dump, |s| s.max_check_cycles = 1).await;
+    let mock = Arc::new(MockModel::new());
+    prepare_and_delegate(&mock, &fx, &["c2"]);
+    mock.push_tool_calls(vec![call(
+        "c3",
+        "run_checks",
+        json!({"command": "cat hello.txt; exit 1"}),
+    )])
+    .push_text("The checks fail.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "add hello.txt").await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:?}",
+        seen.labels
+    );
+    let error = seen
+        .messages
+        .iter()
+        .find(|m| m.contains("checks are failing and no pull request was opened"))
+        .unwrap_or_else(|| panic!("no verdict in {:#?}", seen.messages));
+    assert!(
+        error.contains("GITHUB_TOKEN=[redacted]")
+            && error.contains("db=postgres://u:[redacted]@h/db"),
+        "the findings are kept, the secrets are not: {error}"
+    );
+    let results = tool_results(&mock.requests().last().unwrap().messages);
+    let (_, seen_by_model, _) = results.iter().find(|(c, _, _)| c == "c3").unwrap();
+    assert!(
+        seen_by_model.contains("GITHUB_TOKEN=[redacted]"),
+        "{seen_by_model}"
+    );
+    assert_no_secret(seen_by_model, "the model's tool result");
+    assert_no_secret(
+        &everything_visible(&server, &fx, &seen).await,
+        "check output",
+    );
 }
 
 // -------------------------------------------------------------------- ownership
@@ -1436,6 +1558,8 @@ macro_rules! coder_suite {
                 opencode_crashing_once_is_retried_and_completes,
                 two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs,
                 a_github_401_fails_the_run_with_a_clear_message,
+                secrets_in_opencode_stderr_never_reach_the_client,
+                secrets_in_check_output_never_reach_the_client,
                 wrong_token_on_the_coder_router_is_401,
                 another_caller_cannot_see_or_resume_the_task,
             );

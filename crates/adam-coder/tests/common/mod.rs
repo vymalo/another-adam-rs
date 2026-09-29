@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use adam_coder::opencode::OpenCodeLaunch;
-use adam_coder::{CoderSettings, ToolEnv};
+use adam_coder::{CoderSettings, Redactor, ToolEnv};
 use adam_model::ToolCall;
 use adam_workspace::{
     CodeHost, DynCodeHost, GitHub, NewPullRequest, PullRequest, RepoRef, ScopedToken,
@@ -28,6 +28,15 @@ pub const PR_URL: &str = "https://github.com/octo/widgets/pull/7";
 
 /// Token of the fixture; every test can assert it never leaks.
 pub const GITHUB_TOKEN: &str = "ghp_FAKEtoken0123456789abcdefghijklmnop";
+
+/// The other secrets a coder process holds; the fixture registers all of them
+/// with the redactor, and tests plant them where they must never surface.
+pub const MODEL_KEY: &str = "sk-live-0123456789abcdefSECRETKEY";
+pub const A2A_TOKEN: &str = "coder-test-token";
+pub const DB_PASSWORD: &str = "pg-pa55w0rd-very-secret";
+
+/// Every secret value above.
+pub const SECRETS: [&str; 4] = [GITHUB_TOKEN, MODEL_KEY, A2A_TOKEN, DB_PASSWORD];
 
 /// URL of pull request `number` of the mock repository.
 pub fn pull_url(number: u64) -> String {
@@ -296,7 +305,9 @@ impl Fixture {
             .env("FAKE_ACP_WRITE_CONTENT", content);
         let mut settings = CoderSettings::new(launch);
         tweak(&mut settings);
-        let env = Arc::new(ToolEnv::new(workspaces, code_host, settings));
+        let env = Arc::new(
+            ToolEnv::new(workspaces, code_host, settings).with_redactor(Redactor::new(SECRETS)),
+        );
         Self {
             tmp,
             remote,
@@ -314,11 +325,14 @@ impl Fixture {
         let workspaces = Workspaces::new(self.tmp.path().join("production-work"), creds)
             .allow_hosts(["github.com"])
             .allow_local(false);
-        Arc::new(ToolEnv::new(
-            workspaces,
-            self.env.code_host.clone(),
-            self.env.settings.clone(),
-        ))
+        Arc::new(
+            ToolEnv::new(
+                workspaces,
+                self.env.code_host.clone(),
+                self.env.settings.clone(),
+            )
+            .with_redactor(Redactor::new(SECRETS)),
+        )
     }
 
     pub fn remote_url(&self) -> String {
@@ -446,4 +460,70 @@ pub fn scripted_agent(dir: &Path, script: &str, base: OpenCodeLaunch) -> (OpenCo
 /// How often the launch log says the agent was started.
 pub fn launches(log: &Path) -> usize {
     std::fs::read_to_string(log).map_or(0, |t| t.lines().count())
+}
+
+/// One raw HTTP/1.1 request; `(status, whole response)`.
+pub async fn raw(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> (u16, String) {
+    try_raw(addr, method, path, bearer)
+        .await
+        .expect("an HTTP response")
+}
+
+/// [`raw`], reporting a refused connection or a broken response as an error.
+pub async fn try_raw(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+) -> std::io::Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"nope"}}"#;
+    let auth = bearer.map_or(String::new(), |t| format!("Authorization: Bearer {t}\r\n"));
+    let payload = if method == "POST" {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n{auth}\r\n{body}",
+            body.len()
+        )
+    } else {
+        format!("{auth}\r\n")
+    };
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
+    stream
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n{payload}")
+                .as_bytes(),
+        )
+        .await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| std::io::Error::other("no status line"))?;
+    Ok((status, response))
+}
+
+/// The official A2A client for the server at `addr`, authenticating with
+/// `token`. The agent card's `url` decides where requests go, so the server's
+/// `PUBLIC_URL` must be reachable at `addr`.
+pub async fn a2a_client(
+    addr: std::net::SocketAddr,
+    token: &str,
+) -> a2a_client::A2AClient<Box<dyn a2a_client::Transport>> {
+    let card = a2a_client::agent_card::AgentCardResolver::new(None)
+        .resolve(&format!("http://{addr}"))
+        .await
+        .expect("the agent card");
+    a2a_client::A2AClientFactory::builder()
+        .with_interceptor(Arc::new(a2a_client::auth::AuthInterceptor::bearer(token)))
+        .build()
+        .create_from_card(&card)
+        .await
+        .expect("an A2A client")
 }

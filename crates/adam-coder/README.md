@@ -132,6 +132,19 @@ Local paths, `file://` and plain `http://` are refused unless
 `ALLOW_LOCAL_REPOS=true`, which exists for development and tests; local
 remotes never receive the token.
 
+### Secrets in output
+
+Text from things this process does not control (OpenCode's stderr tail in an
+"ACP agent exited" error, a check's output, a provider's error body) reaches
+clients as run errors, events and tool results. A `Redactor` built from the
+configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN`, every
+`A2A_BEARER_TOKENS` entry and the `DATABASE_URL` password (and their Base64
+forms) with `[redacted]` in tool results and errors, in OpenCode's and the
+checks' progress lines, in the checks' findings, and in the agent's final
+failure message. It is exact-value replacement, not a detector: a secret that
+was transformed (hashed, split) is not found, and values shorter than 4
+characters are not registered.
+
 SIGTERM stops accepting connections and lets in-flight steps finish and commit;
 a step cut short by a hard kill is taken over by the next start when its lease
 expires. Logs are JSON on stdout (`RUST_LOG` filters).

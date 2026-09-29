@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::{Value, json};
 
+use crate::redact::Redactor;
+
 use super::{Outcome, ToolEnv, str_arg};
 
 /// Most of the agent's reply kept for the summary.
@@ -121,14 +123,15 @@ impl Tool for DelegateToOpenCode {
                     reply.push_str(&chunk);
                     line.push_str(&chunk);
                     if line.contains('\n') || line.len() >= PROGRESS_CAP {
-                        flush(ctx, &mut line).await;
+                        flush(ctx, &self.env.redactor, &mut line).await;
                     }
                 }
                 AcpUpdate::Thought(_) => {}
                 other => {
-                    flush(ctx, &mut line).await;
+                    flush(ctx, &self.env.redactor, &mut line).await;
                     if let Some(message) = describe(&other) {
-                        ctx.emit_progress(message).await;
+                        ctx.emit_progress(self.env.redactor.scrub_string(message))
+                            .await;
                     }
                     if let AcpUpdate::TurnEnded {
                         stop_reason: reason,
@@ -139,7 +142,7 @@ impl Tool for DelegateToOpenCode {
                 }
             }
         }
-        flush(ctx, &mut line).await;
+        flush(ctx, &self.env.redactor, &mut line).await;
         drop(turn);
         if let Err(e) = client.shutdown().await {
             tracing::debug!(error = %e, "OpenCode did not shut down cleanly");
@@ -181,8 +184,8 @@ impl Tool for DelegateToOpenCode {
     }
 }
 
-async fn flush(ctx: &ToolCtx, line: &mut String) {
-    let text = clip(line, PROGRESS_CAP);
+async fn flush(ctx: &ToolCtx, redactor: &Redactor, line: &mut String) {
+    let text = clip(&redactor.scrub(line), PROGRESS_CAP);
     line.clear();
     if !text.is_empty() {
         ctx.emit_progress(format!("opencode: {text}")).await;

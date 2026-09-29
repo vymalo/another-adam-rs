@@ -12,7 +12,7 @@ use std::time::Duration;
 use adam_a2a::AuthConfig;
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::{
-    Coder, CoderAgent, CoderSettings, Config, RuntimeOptions, ToolEnv, workspaces_for,
+    Coder, CoderAgent, CoderSettings, Config, Redactor, RuntimeOptions, ToolEnv, workspaces_for,
 };
 use adam_core::DynStore;
 use adam_model::DynModel;
@@ -79,7 +79,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
     settings.draft_pull_requests = config.pr_draft;
     settings.identity = GitIdentity::new(&config.git_author_name, &config.git_author_email);
 
-    let env = Arc::new(ToolEnv::new(workspaces, code_host, settings));
+    let env = Arc::new(
+        ToolEnv::new(workspaces, code_host, settings).with_redactor(Redactor::from_config(&config)),
+    );
     let agent = CoderAgent::new(model, config.model.clone(), env);
     let coder = Coder::new(
         store,

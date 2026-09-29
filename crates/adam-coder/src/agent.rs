@@ -109,13 +109,35 @@ impl Agent for CoderAgent {
         state: Conversation,
     ) -> Result<Transition<Conversation>, AgentError> {
         let run = ctx.run_id().to_string();
-        match self.inner.step(ctx, state).await? {
-            Transition::Done { state, output } => {
+        let redactor = &self.env.redactor;
+        // Whatever leaves this step as a failure, a retry note or the final
+        // answer may quote OpenCode's stderr, a check's output or a provider's
+        // error body, so it passes through the redactor.
+        let transition = match self.inner.step(ctx, state).await {
+            Ok(t) => t,
+            Err(AgentError::Transient(m)) => {
+                return Err(AgentError::Transient(redactor.scrub_string(m)));
+            }
+            Err(AgentError::Permanent(m)) => {
+                return Err(AgentError::Permanent(redactor.scrub_string(m)));
+            }
+            Err(e) => return Err(e),
+        };
+        match transition {
+            Transition::Fail { state, error } => Ok(Transition::Fail {
+                state,
+                error: redactor.scrub_string(error),
+            }),
+            Transition::Done { state, mut output } => {
+                redactor.scrub_value(&mut output);
                 let notes = self.env.notes.load(&run).await.map_err(|e| {
                     AgentError::transient(format!("cannot read the run notes: {e}"))
                 })?;
                 Ok(match self.verdict(&notes) {
-                    Some(error) => Transition::Fail { state, error },
+                    Some(error) => Transition::Fail {
+                        state,
+                        error: redactor.scrub_string(error),
+                    },
                     None => Transition::Done { state, output },
                 })
             }
