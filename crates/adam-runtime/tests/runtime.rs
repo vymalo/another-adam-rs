@@ -2374,6 +2374,14 @@ mod cases {
     }
 
     /// A hinted retry still counts as an attempt: the budget bounds retries.
+    ///
+    /// The test moves the clock once per scheduled retry, after seeing it
+    /// scheduled, and the lease outlives all of it. (It used to step the clock
+    /// by 6 s every 30 ms against a 10 s lease: on a loaded machine the lease
+    /// lapsed before the first step even began, the claim loop picked the run
+    /// up again from a record read before that step committed, and the step
+    /// ran a second time on the same attempt. The stale run was discarded by
+    /// the version check, but it made the call count 4.)
     pub async fn hinted_retries_still_exhaust_the_attempt_budget(store: DynStore) {
         let name = uniq("hint-budget");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2397,6 +2405,7 @@ mod cases {
         let clock = ManualClock::new();
         let rt = builder(&store, &uniq("w"), &agent)
             .clock(clock.clone())
+            .lease_ttl(Duration::from_secs(24 * 3600))
             .retry(RetryPolicy {
                 max_attempts: 3,
                 initial_backoff: Duration::from_millis(10),
@@ -2404,20 +2413,23 @@ mod cases {
                 multiplier: 2.0,
             })
             .build();
+        let t0 = clock.now();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
-        // Each retry is 5 s away on the manual clock; step the clock until
-        // the run gives up.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let failed = loop {
-            let v = rt.view(run).await.expect("view").expect("run");
-            if v.status == RunStatus::Failed {
-                break v;
-            }
+        // Each failure schedules a retry at least 5 s away (the hint, not the
+        // 10-50 ms policy). Nothing steps before the test moves the clock.
+        let hint = chrono::Duration::seconds(5);
+        for attempt in 1..3 {
+            let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| {
+                v.attempt == attempt
+            })
+            .await;
+            let wake_at = scheduled.wake_at.expect("timer");
+            assert!(wake_at >= t0 + hint, "the hint was not honoured: {wake_at}");
+            assert_eq!(count(&calls), attempt as usize, "stepped before its time");
             clock.advance(Duration::from_secs(6));
-            assert!(Instant::now() < deadline, "never gave up: {v:#?}");
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        };
+        }
+        let failed = wait_failed(&rt, run).await;
         worker.stop().await;
         assert_eq!(count(&calls), 3);
         let error = failed.error.expect("error");
