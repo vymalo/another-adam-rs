@@ -433,6 +433,28 @@ pub fn happy_script_titled(mock: &adam_model::MockModel, remote_url: &str, title
     .push_text("Opened the pull request.");
 }
 
+/// An OpenAI chat-completions reply that calls one tool.
+pub fn tool_reply(id: &str, name: &str, arguments: Value) -> Value {
+    json!({
+        "choices": [{
+            "message": {"role": "assistant", "content": null, "tool_calls": [{
+                "id": id, "type": "function",
+                "function": {"name": name, "arguments": arguments.to_string()}
+            }]},
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+    })
+}
+
+/// An OpenAI chat-completions reply that answers with text.
+pub fn text_reply(text: &str) -> Value {
+    json!({
+        "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+    })
+}
+
 /// An ACP "OpenCode" that is a shell script around the fake agent, so tests
 /// can script what the real one would do across launches. The script runs with
 /// `$AGENT` set to the fake agent (which reads the `FAKE_ACP_*` variables of

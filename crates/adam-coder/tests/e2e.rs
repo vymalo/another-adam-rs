@@ -4,9 +4,9 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use a2a::{
     Message, Part, Role, SendMessageRequest, SendMessageResponse, StreamResponse, Task, TaskState,
@@ -23,14 +23,17 @@ use adam_llm_agent::{Conversation, DynTool, Tool, ToolCtx, ToolError, ToolOutput
 use adam_model::{
     DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolSpec,
 };
+use adam_model_openai::{OpenAiCompatible, OpenAiConfig};
 use adam_runtime::{BroadcastSink, RetryPolicy, RunView, Runtime};
 use async_trait::async_trait;
-use common::{Fixture, PR_URL, call, happy_script, pg};
+use common::{Fixture, PR_URL, call, happy_script, pg, text_reply, tool_reply};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use secrecy::SecretString;
 use serde_json::json;
 use tokio::sync::{Notify, oneshot};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 type Client = A2AClient<Box<dyn Transport>>;
 
@@ -1130,6 +1133,142 @@ async fn opencode_crashing_once_is_retried_and_completes(store: DynStore) {
     assert!(seen.artifacts.iter().any(|(n, _)| n == "pull_request"));
 }
 
+// ------------------------------------------------------------ rate limits
+
+/// A model gateway (`POST /chat/completions`) that answers its first request
+/// with `429` and `Retry-After: <hint_secs>`, then replies by *turn* (the
+/// number of tool results in the conversation, so a retried request gets the
+/// same answer). Every request is logged with its arrival time and status.
+struct RateLimitedOnce {
+    hint_secs: u64,
+    replies: Vec<serde_json::Value>,
+    log: Arc<Mutex<Vec<(Instant, u16)>>>,
+}
+
+impl Respond for RateLimitedOnce {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+        let turn = body["messages"]
+            .as_array()
+            .map_or(0, |m| m.iter().filter(|m| m["role"] == "tool").count());
+        let mut log = self.log.lock().unwrap();
+        let (status, template) = if log.is_empty() {
+            (
+                429,
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", self.hint_secs.to_string().as_str())
+                    .set_body_json(
+                        json!({"error": {"message": "slow down", "type": "rate_limit_exceeded"}}),
+                    ),
+            )
+        } else {
+            match self.replies.get(turn) {
+                Some(reply) => (200, ResponseTemplate::new(200).set_body_json(reply)),
+                None => (
+                    500,
+                    ResponseTemplate::new(500).set_body_string("script exhausted"),
+                ),
+            }
+        };
+        log.push((Instant::now(), status));
+        template
+    }
+}
+
+/// The model answers the first request with `429` and `Retry-After`. The
+/// real OpenAI-compatible client carries the hint to the runtime
+/// (`AgentError::TransientAfter`), which waits at least that long before the
+/// retry (the policy's own backoff here is 50 ms), and the run then completes
+/// with exactly one pull request.
+async fn rate_limited_model_backs_off_and_completes(store: DynStore) {
+    const HINT: Duration = Duration::from_secs(1);
+    let fx = Fixture::new("hello\n").await;
+    let replies = vec![
+        tool_reply(
+            "c1",
+            "prepare_workspace",
+            json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+        ),
+        tool_reply(
+            "c2",
+            "delegate_to_opencode",
+            json!({"instructions": "add hello.txt containing hello"}),
+        ),
+        tool_reply(
+            "c3",
+            "run_checks",
+            json!({"command": "test -f hello.txt && cat hello.txt"}),
+        ),
+        tool_reply(
+            "c4",
+            "commit_and_push",
+            json!({"message": "feat: add hello.txt"}),
+        ),
+        tool_reply(
+            "c5",
+            "open_pull_request",
+            json!({"title": "feat: add hello.txt", "body": "Adds hello.txt.\n\n## Verification\n- `test -f hello.txt`: passed"}),
+        ),
+        text_reply("Opened the pull request."),
+    ];
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let gateway = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(RateLimitedOnce {
+            hint_secs: HINT.as_secs(),
+            replies,
+            log: log.clone(),
+        })
+        .mount(&gateway)
+        .await;
+    let model: DynModel = Arc::new(
+        OpenAiCompatible::new(OpenAiConfig::new(
+            gateway.uri(),
+            SecretString::from("test-key"),
+        ))
+        .unwrap(),
+    );
+    let server = Server::start(coder_retrying(&fx, model, store, 3)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "add hello.txt").await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?} {:#?}",
+        seen.labels,
+        seen.messages
+    );
+    let log = log.lock().unwrap().clone();
+    let statuses: Vec<u16> = log.iter().map(|(_, s)| *s).collect();
+    assert_eq!(
+        statuses,
+        [429, 200, 200, 200, 200, 200, 200],
+        "one rate limit, then the six turns of the script"
+    );
+    let waited = log[1].0.duration_since(log[0].0);
+    assert!(
+        waited >= HINT,
+        "the retry came {waited:?} after the 429, before its Retry-After of {HINT:?}"
+    );
+    assert!(
+        waited < HINT + Duration::from_secs(20),
+        "and it did not wait much longer than asked: {waited:?}"
+    );
+    let branches = fx.agent_branches();
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    assert_eq!(fx.commits_ahead(&branches[0]), 1);
+    assert_eq!(
+        fx.created_pulls().await.len(),
+        1,
+        "exactly one pull request"
+    );
+    assert!(seen.artifacts.iter().any(|(n, _)| n == "pull_request"));
+}
+
 // ------------------------------------------------------- concurrent tasks
 
 /// One scripted model per task, chosen by a marker in the task's text: two
@@ -1556,6 +1695,7 @@ macro_rules! coder_suite {
                 crash_during_delegate_to_opencode_reruns_on_the_same_worktree,
                 opencode_crashing_every_time_fails_the_run_with_its_stderr,
                 opencode_crashing_once_is_retried_and_completes,
+                rate_limited_model_backs_off_and_completes,
                 two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs,
                 a_github_401_fails_the_run_with_a_clear_message,
                 secrets_in_opencode_stderr_never_reach_the_client,

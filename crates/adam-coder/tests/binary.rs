@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse};
 use adam_core::{RunId, RunStatus};
 use common::pg::TestDb;
+use common::{text_reply, tool_reply};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -332,26 +333,6 @@ impl Respond for Script {
 /// How many turns the model has been asked about so far.
 fn turns(asked: &Mutex<Vec<usize>>) -> usize {
     asked.lock().unwrap().iter().max().map_or(0, |t| t + 1)
-}
-
-fn tool_reply(id: &str, name: &str, arguments: Value) -> Value {
-    json!({
-        "choices": [{
-            "message": {"role": "assistant", "content": null, "tool_calls": [{
-                "id": id, "type": "function",
-                "function": {"name": name, "arguments": arguments.to_string()}
-            }]},
-            "finish_reason": "tool_calls"
-        }],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-    })
-}
-
-fn text_reply(text: &str) -> Value {
-    json!({
-        "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-    })
 }
 
 /// SIGTERM while OpenCode is working: the process does not abandon the step. It
