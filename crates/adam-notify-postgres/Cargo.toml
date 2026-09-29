@@ -1,0 +1,39 @@
+[package]
+name = "adam-notify-postgres"
+description = "Cross-process run events and wake-up/cancel signals for adam-rs over PostgreSQL LISTEN/NOTIFY"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["tls-rustls"]
+tls-rustls = ["sqlx/tls-rustls"]
+tls-native-tls = ["sqlx/tls-native-tls"]
+
+[dependencies]
+adam-core.workspace = true
+adam-error.workspace = true
+adam-runtime.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+adam-notify-testkit.workspace = true
+adam-core.workspace = true
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
+async-trait.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

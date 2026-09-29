@@ -280,6 +280,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-notify-postgres"
+version = "0.1.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-notify-testkit",
+ "adam-runtime",
+ "adam-store-postgres",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "adam-notify-testkit"
+version = "0.1.0"
+dependencies = [
+ "adam-core",
+ "adam-runtime",
+ "futures",
+ "tokio",
+]
+
+[[package]]
 name = "adam-runtime"
 version = "0.1.0"
 dependencies = [

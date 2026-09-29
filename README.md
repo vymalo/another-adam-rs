@@ -18,11 +18,13 @@ trait, a shared conformance suite, and two production adapters.
 | [`adam-core`](crates/adam-core/README.md) | `Store` trait, run/journal/lease types, in-memory reference store |
 | [`adam-store-testkit`](crates/adam-store-testkit/README.md) | Conformance suite every store must pass (`store_conformance!`) |
 | [`adam-store-postgres`](crates/adam-store-postgres/README.md) | PostgreSQL 12+ via `sqlx` 0.9 |
-| [`adam-store-mongodb`](crates/adam-store-mongodb/README.md) | MongoDB 5.0+ via the official driver; standalone `mongod` is enough |
+| [`adam-store-mongodb`](crates/adam-store-mongodb/README.md) | MongoDB 5.0+ via the official driver; standalone `mongod` is enough. No cross-process signals: workers poll |
 | [`adam-model`](crates/adam-model/README.md) | `ModelClient` trait (`complete` + streaming, tool calling), request/response types, `MockModel` test double |
 | [`adam-model-openai`](crates/adam-model-openai/README.md) | `OpenAiCompatible`: any OpenAI-compatible chat-completions endpoint (gateway or provider) via `reqwest` + rustls |
 | [`adam-workspace`](crates/adam-workspace/README.md) | Per-run git worktrees over a shared mirror, commit and push, and pull requests (`CodeHost`, GitHub). The token is passed per `git` invocation and never stored |
 | [`adam-runtime`](crates/adam-runtime/README.md) | Durable agent loop: `Agent` trait, run state machine, `ctx.step` journaling, workers, retries, event sinks |
+| [`adam-notify-postgres`](crates/adam-notify-postgres/README.md) | Cross-process run events (`PgEventSink`) and wake-up/cancel signals (`PgNotifier`) over PostgreSQL `LISTEN`/`NOTIFY`: a latency optimisation next to polling, never the truth |
+| [`adam-notify-testkit`](crates/adam-notify-testkit/README.md) | Conformance suite every `Notifier` (and its event transport) must pass (`notifier_conformance!`) |
 | [`adam-a2a`](crates/adam-a2a/README.md) | Expose an agent as an A2A 1.0 server (axum): `TaskBackend` seam, bearer auth (fail closed), `InMemoryBackend` under feature `test-util` |
 | [`adam-acp`](crates/adam-acp/README.md) | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
 | [`adam-llm-agent`](crates/adam-llm-agent/README.md) | `LlmAgent`: the durable model/tool-calling loop (`Tool` trait, `NeedsInput` parking, limits, history truncation) on top of `adam-runtime` |
@@ -356,7 +358,10 @@ claiming 60 runs with no double lease, lease expiry and takeover, renew and
 release, one-open-run-per-conversation including a 16-way race, and purging.
 
 To add a backend (SQLite, Redis, FoundationDB, ...), implement `Store` and add
-one line: `adam_store_testkit::store_conformance!(make_store);`.
+one line: `adam_store_testkit::store_conformance!(make_store);`. Likewise a new
+`Notifier` (a Redis or NATS transport, say) runs
+`adam_notify_testkit::notifier_conformance!(make_pair);`; the Postgres one needs
+`ADAM_TEST_POSTGRES_URL` (a superuser, for its reconnect test).
 
 ## Development
 

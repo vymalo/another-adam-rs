@@ -1,6 +1,6 @@
 # Architecture
 
-adam-rs is a Rust workspace of 14 crates for **durable AI agents**. An agent is
+adam-rs is a Rust workspace of 16 crates for **durable AI agents**. An agent is
 a state machine. The runtime saves its state after every step, so a worker that
 dies loses nothing: another worker resumes from the last saved step. Every piece
 of infrastructure (database, model, code host, A2A backend) sits behind a trait,
@@ -32,7 +32,7 @@ Contents:
 Arrows point from a crate to a crate it depends on. Solid arrows come from
 `[dependencies]` in the `Cargo.toml` files. Dotted arrows are
 `[dev-dependencies]` that are not also normal dependencies (tests only). Grey
-arrows go to `adam-error`: every crate except `adam-store-testkit` depends on
+arrows go to `adam-error`: every crate except the two test kits depends on
 it.
 
 ```mermaid
@@ -49,6 +49,7 @@ flowchart TB
         pg["adam-store-postgres"]
         mongo["adam-store-mongodb"]
         openai["adam-model-openai"]
+        pgn["adam-notify-postgres"]
         ws["adam-workspace"]
         acp["adam-acp"]
     end
@@ -61,6 +62,7 @@ flowchart TB
     end
     subgraph kits["Test kits"]
         testkit["adam-store-testkit"]
+        nk["adam-notify-testkit"]
     end
 
     coder --> a2a
@@ -85,6 +87,10 @@ flowchart TB
     mongo --> core
     pg --> core
     testkit --> core
+    pgn --> core
+    pgn --> rt
+    nk --> core
+    nk --> rt
 
     rt -.-> mongo
     rt -.-> pg
@@ -92,6 +98,8 @@ flowchart TB
     a2art -.-> pg
     mongo -.-> testkit
     pg -.-> testkit
+    pgn -.-> nk
+    pgn -.-> pg
 
     a2a --> err
     a2art --> err
@@ -106,8 +114,9 @@ flowchart TB
     pg --> err
     ws --> err
     host --> err
+    pgn --> err
 
-    linkStyle 28,29,30,31,32,33,34,35,36,37,38,39,40 stroke:#999,stroke-width:1px
+    linkStyle 34,35,36,37,38,39,40,41,42,43,44,45,46,47 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -138,6 +147,10 @@ The layers, from the bottom:
     (GitHub).
   * `adam-acp` is a client for the Agent Client Protocol: it drives a coding
     agent (OpenCode) over stdio.
+  * `adam-notify-postgres` implements two ports of the runtime, `EventSink`
+    (`PgEventSink`) and `Notifier` (`PgNotifier`), over PostgreSQL
+    `LISTEN`/`NOTIFY`. It is separate from `adam-store-postgres` because the
+    store must not depend on the runtime.
 * **Runtime.**
   * `adam-runtime` owns the run state machine, the journal, the workers and the
     retry policy. It depends on `adam-core` and `adam-error` only.
@@ -148,11 +161,15 @@ The layers, from the bottom:
   * `adam-coder` is the coder agent and the only binary. It is a composition
     root: it wires the pieces below it.
 * **Test kits.** `adam-store-testkit` is the conformance suite every store must
-  pass. The other test doubles live inside the crates they double for (see
+  pass, and `adam-notify-testkit` the one every `Notifier` (and its event
+  transport) must pass. It is a crate of its own because `adam-runtime` cannot
+  dev-depend on a crate that depends on it. The other test doubles live inside
+  the crates they double for (see
   [Ports and implementations](#ports-and-implementations)).
 
 Dev-only edges (dotted): the runtime's tests run against real Postgres and
-MongoDB stores, and every store runs the testkit. `adam-a2a`,
+MongoDB stores, every store runs the store testkit, and `adam-notify-postgres`
+runs the notifier testkit and its two-runtime tests over `adam-store-postgres`. `adam-a2a`,
 `adam-workspace` and `adam-coder` also enable their own `test-util` feature in
 tests. That adds no new crate edge.
 
@@ -291,6 +308,13 @@ classDiagram
     Clock <|.. SystemClock
     Clock <|.. ManualClock
 
+    namespace adam_notify_postgres {
+        class PgEventSink
+        class PgNotifier
+    }
+    EventSink <|.. PgEventSink
+    Notifier <|.. PgNotifier
+
     namespace adam_llm_agent {
         class Tool {
             <<interface>>
@@ -351,8 +375,8 @@ The boundaries, by what they swap:
 | `Agent` | `adam-runtime` | `LlmAgent`, `CoderAgent` | test agents |
 | `AgentStarter` | `adam-runtime` | `LlmStarter`, `CoderStarter` | test starters |
 | `Tool` | `adam-llm-agent` | the coder tools | test tools |
-| `EventSink` | `adam-runtime` | `BroadcastSink` | `NoopSink` (default), `CollectingSink` |
-| `Notifier` | `adam-runtime` | none yet (a Postgres adapter is next) | `LocalNotifier` (in-process; also the fan-out inside adapters) |
+| `EventSink` | `adam-runtime` | `BroadcastSink` (in-process), `PgEventSink` (`adam-notify-postgres`: local first, then `NOTIFY` to other processes) | `NoopSink` (default), `CollectingSink` |
+| `Notifier` | `adam-runtime` | `PgNotifier` (`adam-notify-postgres`) | `LocalNotifier` (in-process; also the fan-out inside `PgNotify`) |
 | `Clock` | `adam-runtime` | `SystemClock` | `ManualClock` |
 | `PermissionPrompt` | `adam-acp` | none in this repository (the default policy needs no prompt) | `StaticPrompt` |
 
@@ -644,6 +668,101 @@ What the diagram cannot say:
 * **Defaults** (`crates/adam-runtime/src/runtime.rs`, `retry.rs`): lease 30 s,
   idle poll 250 ms, 4 concurrent runs per worker loop, 5 tries per transition,
   backoff 1 s doubling to 60 s.
+
+### Across processes: signals and events
+
+With the front and the workers in different processes, they share only the
+database. Left alone, a worker finds a new run at its next poll and a step
+learns of a cancel at the next poll of its run. `adam-notify-postgres` closes
+both gaps over `LISTEN`/`NOTIFY` without changing who is right: every
+notification is a hint, the compare-and-swap and the polling stay in place, and
+a run completes with the crate removed, only later. The processes are wired by
+their composition root (`adam-coder` is a follow-up; the crate's
+`tests/two_runtimes.rs` wires a front and a worker the same way).
+
+Each process has one `PgNotify` (`crates/adam-notify-postgres/src/lib.rs`) whose
+`run` holds a listener on two channels, `{prefix}events` and `{prefix}signals`,
+and a publisher that drains a queue with `pg_notify`. Its `PgEventSink` is the
+runtime's event sink and its `PgNotifier` the runtime's notifier.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as A2A client
+    participant F as Front<br/>RuntimeTaskBackend + Runtime
+    participant FN as Front PgNotify
+    participant DB as PostgreSQL<br/>runs table and NOTIFY
+    participant WN as Worker PgNotify
+    participant W as Worker<br/>run_worker + Agent.step
+
+    C->>F: SendStreamingMessage
+    F->>DB: create_run (Runnable)
+    F-)FN: publish Signal Runnable (queued, never waits)
+    FN-)DB: pg_notify(signals, runnable)
+    DB-)WN: NOTIFY signals
+    WN->>W: Delivery Signal Runnable, for an agent this worker steps
+    W->>W: notify_workers, the idle loop wakes
+    W->>DB: claim_due
+    W->>W: Agent.step, then ctx.emit Progress
+    W->>WN: PgEventSink.emit: local BroadcastSink first, then queued
+    WN-)DB: pg_notify(events, origin = worker, progress)
+    DB-)FN: NOTIFY events
+    FN->>F: origin is not ours: emit into the front's BroadcastSink
+    F-->>C: SSE status-update, from the live subscription
+    W->>DB: commit_run (Parked), emit Status
+    Note over F,C: a Status event makes the subscription re-read the durable run
+    C->>F: CancelTask
+    F->>DB: commit_run (Failed, cancelled)
+    F-)FN: publish Signal Finished, after firing its own local token
+    FN-)DB: pg_notify(signals, finished)
+    DB-)WN: NOTIFY signals
+    WN->>W: Delivery Signal Finished
+    W->>W: fire_cancel(run): ctx.cancelled() resolves in the step
+```
+
+What the diagram cannot say:
+
+* **Every arrow into the database from a notifier is best effort.** `publish` and
+  `emit` only queue (1 024 items, then drop) and return; a failed `pg_notify`
+  drops its item. The worker that polls would have found the run anyway,
+  `Runtime::view` holds the durable status and artifacts, and the worker's cancel
+  watch finds a finished run at its next poll.
+* **No echo, no re-publish.** Events carry the sender's id; the listener skips
+  its own and delivers others' into the local `BroadcastSink`, never back into
+  the database. Signals have no origin: the publisher hears its own too.
+* **Size.** A payload of 8000 bytes or more is rejected by PostgreSQL, so nothing
+  over 7 999 is sent. An oversize `Status` loses the tail of its detail; any other
+  oversize event stays local, and there is no events table (durable status and
+  artifacts are already the run record, and replayable events would cost a write
+  per event).
+* **The listener holds one pooled connection** and needs a session, so no
+  transaction-mode pooler in front of it.
+* **Not built here:** MongoDB has no equivalent (no change streams on a standalone
+  `mongod`), so it keeps polling; `adam-coder` does not use the crate yet.
+
+The listener's lifecycle (`crates/adam-notify-postgres/src/lib.rs`, `listen_loop`
+and `session`):
+
+```mermaid
+stateDiagram-v2
+    [*] --> Connecting
+    Connecting --> Listening: connected and LISTEN active, Resync broadcast
+    Connecting --> Reconnecting: connect or LISTEN failed
+    Listening --> Listening: notification dispatched
+    Listening --> Resyncing: try_recv returned None, sqlx reconnected and listened again
+    Resyncing --> Listening: Resync broadcast
+    Listening --> Reconnecting: try_recv failed
+    Reconnecting --> Connecting: after the backoff, 100 ms doubling to 10 s
+    Connecting --> [*]: stop, or the pool is closed
+    Listening --> [*]: stop, or the pool is closed
+    Reconnecting --> [*]: stop
+```
+
+A `Resync` tells the subscribers that notifications may have been lost while the
+connection was down. In the runtime (`crates/adam-runtime/src/worker.rs`) it makes
+the worker poll at once and re-read every run it is stepping, firing the cancel
+token of those that finished. `LISTEN` is active before the `Resync` is sent, so
+what happens after the catch-up is heard.
 
 ## The run lifecycle
 
@@ -1221,11 +1340,13 @@ flowchart LR
 | `adam-model-openai` | implementation | [crates/adam-model-openai](../crates/adam-model-openai/README.md) |
 | `adam-workspace` | implementation | [crates/adam-workspace](../crates/adam-workspace/README.md) |
 | `adam-acp` | implementation | [crates/adam-acp](../crates/adam-acp/README.md) |
+| `adam-notify-postgres` | implementation | [crates/adam-notify-postgres](../crates/adam-notify-postgres/README.md) |
 | `adam-runtime` | runtime | [crates/adam-runtime](../crates/adam-runtime/README.md) |
 | `adam-a2a-runtime` | runtime | [crates/adam-a2a-runtime](../crates/adam-a2a-runtime/README.md) |
 | `adam-llm-agent` | agent | [crates/adam-llm-agent](../crates/adam-llm-agent/README.md) |
 | `adam-coder` | agent, binary | [crates/adam-coder](../crates/adam-coder/README.md) |
 | `adam-store-testkit` | test kit | [crates/adam-store-testkit](../crates/adam-store-testkit/README.md) |
+| `adam-notify-testkit` | test kit | [crates/adam-notify-testkit](../crates/adam-notify-testkit/README.md) |
 
 Also:
 
@@ -1244,6 +1365,13 @@ path, the coder's tools and rules, the Dockerfile, the chart templates and
 `compose.yaml`. Nothing was executed to check them: the diagrams come from
 reading the code. The Mermaid syntax of every diagram is checked in CI by
 `tools/docs-check`.
+
+**Verified 2026-09-29, source: this repository with the `Notifier` port and
+`adam-notify-postgres`, executed.** The cross-process fan-out and the listener
+lifecycle above are checked by `crates/adam-notify-postgres/tests/two_runtimes.rs`
+(a front and a worker with a 30 s poll, against PostgreSQL 16), and the
+`NOTIFY` payload limit of 8000 bytes against a 16.13 server. See the crate's
+README for the third-party facts (PostgreSQL docs, `sqlx-postgres` 0.9.0 source).
 
 **Unverified.**
 

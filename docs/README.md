@@ -2,7 +2,7 @@
 
 | Document | What it answers |
 |---|---|
-| [Architecture](architecture.md) | How the 14 crates fit together, which traits are the swappable boundaries, what happens to a task from A2A request to pull request, how a run moves through its states, how errors decide behaviour, and how the coder agent is built and deployed. Every process has a Mermaid diagram. |
+| [Architecture](architecture.md) | How the 16 crates fit together, which traits are the swappable boundaries, what happens to a task from A2A request to pull request, how a run moves through its states, how errors decide behaviour, and how the coder agent is built and deployed. Every process has a Mermaid diagram. |
 | [Decisions](decisions/) | Architecture decision records. [0001](decisions/0001-library-first-host-roles.md): adam-rs is library-first; hosts run a control plane and workers through the closed `Role` enum and supervisor in `adam-host`. |
 
 Other places to look:
