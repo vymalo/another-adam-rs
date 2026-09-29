@@ -5,6 +5,7 @@
 .claude
 deploy
 docs
-docker-compose.yml
+compose.yaml
+dev
 **/*.md
 !crates/adam-coder/src/**/*.md

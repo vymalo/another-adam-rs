@@ -102,17 +102,132 @@ let run = store.commit_run(run.id, run.version, RunUpdate::new(RunStatus::Parked
   Lease expiry uses the `now` the caller passes in; keep worker clocks in sync
   (NTP) and leave lease TTLs well above expected clock skew.
 
+## Local development
+
+`compose.yaml` (Compose Spec) starts the databases, WireMock mocks of the
+external systems the code talks to, and a local git remote. Ports bind to
+`127.0.0.1` only and every credential in the file is a dummy.
+
+```sh
+docker compose up -d --wait        # postgres, mongodb, mock-openai, mock-github, git-server
+docker compose --profile app up -d --build --wait   # ... plus the coder, wired to the mocks
+docker compose down -v             # stop and forget all state (volumes included)
+```
+
+| Service | Host address | What it is |
+|---|---|---|
+| `postgres` | `127.0.0.1:5432` | PostgreSQL 16, database `adam_test`, user and password `postgres` |
+| `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone |
+| `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`) |
+| `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) |
+| `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git`; no authentication |
+| `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token` |
+
+Host ports can be moved with `POSTGRES_PORT`, `MONGODB_PORT`, `MOCK_OPENAI_PORT`,
+`MOCK_GITHUB_PORT`, `GIT_SERVER_PORT` and `CODER_PORT` (for example in a `.env`
+file next to `compose.yaml`).
+
+### Pointing the code at the mocks
+
+```sh
+export ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/adam_test
+export ADAM_TEST_MONGODB_URI=mongodb://127.0.0.1:27017
+export ADAM_TEST_MOCK_OPENAI_URL=http://127.0.0.1:8081       # root of the mock, no /v1
+export ADAM_TEST_MOCK_GITHUB_URL=http://127.0.0.1:8082
+
+# a locally run adam-coder (cargo run -p adam-coder):
+export DATABASE_URL=$ADAM_TEST_POSTGRES_URL
+export MODEL_BASE_URL=http://127.0.0.1:8081/v1 MODEL_API_KEY=mock-api-key MODEL=mock-model
+export GITHUB_API_URL=http://127.0.0.1:8082 GITHUB_TOKEN=dev-github-token
+export A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/
+```
+
+OpenCode (which the coder runs) reaches the mock model through the same
+`MODEL_BASE_URL`: its `@ai-sdk/openai-compatible` provider speaks the same
+chat-completions wire format the mock serves.
+
+### `mock-openai` scenarios
+
+Selected by the request header `X-Mock-Scenario: <name>`, or by putting
+`[mock:<name>]` anywhere in the request body (for example in the prompt). The
+mappings are in `dev/wiremock/mock-openai/`.
+
+| Scenario | Answer |
+|---|---|
+| (none) | a text answer; with `"stream": true` an SSE stream: role chunk, text chunks, finish chunk, a usage chunk (empty `choices`), `data: [DONE]` |
+| `tool-call` | a call of the **first tool the request declares** with arguments `{}` (`finish_reason: tool_calls`), streamed or not. Once the history holds a `tool` message the mock answers in text instead, so an agent loop ends |
+| `rate-limit` | `429` with `Retry-After: 2` |
+| `server-error` | `500` |
+| `unauthorized` | `401` `invalid_api_key` |
+| `context-length` | `400` `context_length_exceeded` |
+
+The error scenarios apply to streaming and non-streaming requests alike and
+persist as long as the header or keyword is sent.
+
+### `mock-github` scenarios
+
+The mock answers `GET /repos/{owner}/{repo}/pulls` (no open pull requests) and
+`POST /repos/{owner}/{repo}/pulls` (`201`, with number, `html_url` and `head.ref`
+derived from the request). Same switches: header `X-Mock-Scenario`, or
+`[mock:<name>]` in the request body of a `POST` (the pull request title or
+body); `GET` requests can only use the header.
+
+| Switch | Answer |
+|---|---|
+| `Authorization: Bearer bad-token`, or scenario `unauthorized` | `401` "Bad credentials" |
+| `rate-limit` | `403` with `x-ratelimit-remaining: 0` |
+| `server-error` | `500` |
+| `already-exists` (on the `POST`) | `422` "A pull request already exists", and the **next** `GET` returns a pull request (#42) once, then the mock is back to normal: a lost race with another opener |
+| a `head` query containing `already-open` | the list returns pull request #7, so opening is idempotent |
+
+### `git-server`
+
+```sh
+git clone http://127.0.0.1:8083/local/sandbox.git      # README.md, check.sh, justfile
+```
+
+Inside the compose network the same repository is
+`http://git-server:8080/local/sandbox.git`, which is what a coder task should
+name. It has no authentication (any credentials are accepted) and its
+repositories live in the `git-data` volume. The layout is
+`/<owner>/<repo>.git`, the shape `adam-workspace` and the mock GitHub expect.
+
+### Running the coder against the mocks
+
+```sh
+docker compose --profile app up -d --build --wait
+curl -N http://127.0.0.1:8080/ \
+  -H 'Authorization: Bearer dev-token' -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":"1","method":"SendStreamingMessage","params":{"message":{
+        "messageId":"m1","role":"ROLE_USER","parts":[{"text":
+        "In http://git-server:8080/local/sandbox.git (base branch main), add hello.txt containing hello."}]}}}'
+```
+
+This exercises the A2A endpoint, authentication, the store and the agent loop
+against the mock model. The mock model is canned: it answers in text, or calls
+the first declared tool with `{}`, so it cannot drive OpenCode through a real
+change and the run does not end in a pull request. A complete run needs a model
+that can call tools (see the live smoke test in `crates/adam-coder/README.md`);
+the git remote and the pull request API of that run can still be `git-server`
+and `mock-github`. (The `app` profile was validated with `docker compose config`
+only when this was written: no container runtime was available.)
+
 ## Testing
 
 ```sh
-docker compose up -d
+docker compose up -d --wait
 export ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/adam_test
 export ADAM_TEST_MONGODB_URI=mongodb://localhost:27017
+export ADAM_TEST_MOCK_OPENAI_URL=http://localhost:8081
+export ADAM_TEST_MOCK_GITHUB_URL=http://localhost:8082
 cargo test --workspace
 ```
 
 Each database suite is skipped when its variable is unset, so `cargo test`
-works with no databases (only the in-memory store runs). The suites isolate
+works with no databases (only the in-memory store runs). The same holds for
+the two tests that check the real clients against the mocks of `compose.yaml`
+(`adam-model-openai/tests/wiremock_compose.rs` and
+`adam-workspace/tests/wiremock_compose.rs`). The suites isolate
 cases by agent name, so they run in parallel on one shared database with no
 cleanup between runs.
 

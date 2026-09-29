@@ -1,0 +1,29 @@
+{
+  "mappings": [
+    {
+      "name": "list models",
+      "priority": 5,
+      "request": {
+        "method": "GET",
+        "urlPathPattern": "(/v1)?/models"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "object": "list",
+          "data": [
+            {
+              "id": "mock-model",
+              "object": "model",
+              "created": 1700000000,
+              "owned_by": "mock-openai"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

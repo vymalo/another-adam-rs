@@ -1,0 +1,322 @@
+{
+  "mappings": [
+    {
+      "name": "401 (header)",
+      "priority": 1,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "unauthorized"
+          }
+        }
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "jsonBody": {
+          "message": "Bad credentials",
+          "documentation_url": "https://docs.github.com/rest/pulls/pulls"
+        }
+      }
+    },
+    {
+      "name": "401 (bad token)",
+      "priority": 1,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "headers": {
+          "Authorization": {
+            "equalTo": "Bearer bad-token"
+          }
+        }
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "jsonBody": {
+          "message": "Bad credentials",
+          "documentation_url": "https://docs.github.com/rest/pulls/pulls"
+        }
+      }
+    },
+    {
+      "name": "401 (keyword)",
+      "priority": 1,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "method": "POST",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:unauthorized]"
+          }
+        ]
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "jsonBody": {
+          "message": "Bad credentials",
+          "documentation_url": "https://docs.github.com/rest/pulls/pulls"
+        }
+      }
+    },
+    {
+      "name": "rate limit (header)",
+      "priority": 2,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "rate-limit"
+          }
+        }
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "x-ratelimit-remaining": "0",
+          "x-ratelimit-limit": "5000",
+          "x-ratelimit-reset": "1893456000"
+        },
+        "jsonBody": {
+          "message": "API rate limit exceeded for user ID 1.",
+          "documentation_url": "https://docs.github.com/rest/pulls/pulls"
+        }
+      }
+    },
+    {
+      "name": "rate limit (keyword)",
+      "priority": 2,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "method": "POST",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:rate-limit]"
+          }
+        ]
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "x-ratelimit-remaining": "0",
+          "x-ratelimit-limit": "5000",
+          "x-ratelimit-reset": "1893456000"
+        },
+        "jsonBody": {
+          "message": "API rate limit exceeded for user ID 1.",
+          "documentation_url": "https://docs.github.com/rest/pulls/pulls"
+        }
+      }
+    },
+    {
+      "name": "500 (header)",
+      "priority": 2,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "server-error"
+          }
+        }
+      },
+      "response": {
+        "status": 500,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "jsonBody": {
+          "message": "Server Error",
+          "documentation_url": "https://docs.github.com/rest/pulls/pulls"
+        }
+      }
+    },
+    {
+      "name": "500 (keyword)",
+      "priority": 2,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "method": "POST",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:server-error]"
+          }
+        ]
+      },
+      "response": {
+        "status": 500,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "jsonBody": {
+          "message": "Server Error",
+          "documentation_url": "https://docs.github.com/rest/pulls/pulls"
+        }
+      }
+    },
+    {
+      "name": "already exists: create (header)",
+      "priority": 2,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "method": "POST",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "already-exists"
+          }
+        }
+      },
+      "response": {
+        "status": 422,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "jsonBody": {
+          "message": "Validation Failed",
+          "documentation_url": "https://docs.github.com/rest/pulls/pulls",
+          "errors": [
+            {
+              "resource": "PullRequest",
+              "code": "custom",
+              "message": "A pull request already exists for mock-owner:agent/mock."
+            }
+          ]
+        }
+      },
+      "scenarioName": "already-exists",
+      "requiredScenarioState": "Started",
+      "newScenarioState": "PR exists"
+    },
+    {
+      "name": "already exists: create (keyword)",
+      "priority": 2,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "method": "POST",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:already-exists]"
+          }
+        ]
+      },
+      "response": {
+        "status": 422,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "jsonBody": {
+          "message": "Validation Failed",
+          "documentation_url": "https://docs.github.com/rest/pulls/pulls",
+          "errors": [
+            {
+              "resource": "PullRequest",
+              "code": "custom",
+              "message": "A pull request already exists for mock-owner:agent/mock."
+            }
+          ]
+        }
+      },
+      "scenarioName": "already-exists",
+      "requiredScenarioState": "Started",
+      "newScenarioState": "PR exists"
+    },
+    {
+      "name": "already exists: the next probe finds it",
+      "priority": 3,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "method": "GET"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json",
+          "x-ratelimit-limit": "5000",
+          "x-ratelimit-remaining": "4999"
+        },
+        "bodyFileName": "pull-list-existing.json",
+        "transformers": [
+          "response-template"
+        ]
+      },
+      "scenarioName": "already-exists",
+      "requiredScenarioState": "PR exists",
+      "newScenarioState": "Started"
+    },
+    {
+      "name": "probe finds an open PR (head contains already-open)",
+      "priority": 3,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "method": "GET",
+        "queryParameters": {
+          "head": {
+            "contains": "already-open"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json",
+          "x-ratelimit-limit": "5000",
+          "x-ratelimit-remaining": "4999"
+        },
+        "bodyFileName": "pull-list-existing.json",
+        "transformers": [
+          "response-template"
+        ]
+      }
+    },
+    {
+      "name": "list pull requests: none open",
+      "priority": 10,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "method": "GET"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json",
+          "x-ratelimit-limit": "5000",
+          "x-ratelimit-remaining": "4999"
+        },
+        "jsonBody": []
+      }
+    },
+    {
+      "name": "create pull request",
+      "priority": 10,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/pulls",
+        "method": "POST"
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json",
+          "x-ratelimit-limit": "5000",
+          "x-ratelimit-remaining": "4999"
+        },
+        "bodyFileName": "pull-created.json",
+        "transformers": [
+          "response-template"
+        ]
+      }
+    }
+  ]
+}

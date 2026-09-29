@@ -174,3 +174,57 @@ jobs:
             lcov.info
             summary.txt
           if-no-files-found: ignore
+
+  # compose.yaml must keep working: the WireMock mappings are exercised by the
+  # real clients (OpenAiCompatible, GitHub), so they cannot rot.
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compose files are valid
+        run: |
+          docker compose config -q
+          docker compose --profile app config -q
+      - name: Start postgres and the mocks
+        run: docker compose up -d --build --wait postgres mock-openai mock-github git-server
+      - name: Smoke-test each service
+        run: |
+          set -eu
+          # mock-openai: text answer, streamed answer ending in [DONE], 429.
+          curl -fsS http://127.0.0.1:8081/v1/models | grep -q mock-model
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"m","messages":[{"role":"user","content":"hi"}]}' | grep -q '"finish_reason": "stop"'
+          curl -fsSN http://127.0.0.1:8081/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}' | grep -q '^data: \[DONE\]'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/v1/chat/completions \
+            -H 'X-Mock-Scenario: rate-limit' -d '{"messages":[]}')" = 429
+          # mock-github: no open pull requests; creating one answers 201.
+          test "$(curl -fsS 'http://127.0.0.1:8082/repos/local/sandbox/pulls?head=local:agent/x&state=open')" = '[]'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/repos/local/sandbox/pulls \
+            -d '{"title":"t","head":"agent/x","base":"main"}')" = 201
+          # git-server: clone, push a branch, see it on the remote.
+          git clone -q http://127.0.0.1:8083/local/sandbox.git "$RUNNER_TEMP/sandbox"
+          cd "$RUNNER_TEMP/sandbox"
+          sh check.sh
+          git checkout -q -b agent/ci
+          echo hello > hello.txt
+          git add hello.txt
+          git -c user.name=ci -c user.email=ci@example.invalid commit -q -m "add hello.txt"
+          git push -q origin agent/ci
+          git ls-remote --heads http://127.0.0.1:8083/local/sandbox.git | grep -q refs/heads/agent/ci
+      - name: Real clients against the mocks
+        env:
+          ADAM_TEST_MOCK_OPENAI_URL: http://127.0.0.1:8081
+          ADAM_TEST_MOCK_GITHUB_URL: http://127.0.0.1:8082
+        run: cargo test -p adam-model-openai -p adam-workspace --test wiremock_compose
+      - name: Logs
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

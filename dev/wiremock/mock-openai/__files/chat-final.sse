@@ -1,0 +1,15 @@
+{{#assign 'cid'~}}chatcmpl-mock{{randomValue length=12 type='ALPHANUMERIC'}}{{~/assign}}
+{{~#assign 'model'~}}{{{toJson (jsonPath request.body '$.model' default='mock-model')}}}{{~/assign}}
+{{~#assign 'ts'~}}{{now format='unix'}}{{~/assign~}}
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[{"index":0,"delta":{"content":"The tool finished; "},"finish_reason":null}]}
+
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[{"index":0,"delta":{"content":"that is all the mock model has to say."},"finish_reason":null}]}
+
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[],"usage":{"prompt_tokens":32,"completion_tokens":13,"total_tokens":45}}
+
+data: [DONE]
+
