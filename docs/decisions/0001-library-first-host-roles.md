@@ -2,7 +2,7 @@
 
 Status: **Accepted** (2026-09-29). The owner answered the open questions the same day. Two
 questions stayed open: cross-process events (*resolved 2026-09-29, see below*), and the exact
-workspace placement enum.
+workspace placement enum (*resolved 2026-09-29: decided in [ADR 0002](0002-workspace-placement.md)*).
 
 ## Context
 
@@ -108,6 +108,11 @@ role. The rename is outside this repo.
     The exact enum and the mechanism are follow-up design work. **The runtime has no
     run-to-worker affinity today:** any worker may lease any run. Until affinity exists, a coder
     deployment runs one worker, or uses a shared volume.
+
+    *Amended 2026-09-29:* [ADR 0002](0002-workspace-placement.md) closes this. The enum is
+    `Placement { Shared, Affinity, Isolated, A2aOnly }` in `adam-host`, and affinity is a
+    store-level claim scope (`ClaimScope::Pinned`) over a run owner. The table above is the
+    candidate list; ADR 0002 has the final one.
 
 ## Consequences
 
