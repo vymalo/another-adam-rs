@@ -152,3 +152,42 @@ fn a_card_needs_a_description() {
     );
     assert!(blank.card(url(), "1").is_err());
 }
+
+/// The card is a fact about the files: a definition gives it before any tool, state or model is
+/// bound, and it is the card the assembled agent gives.
+#[test]
+fn a_definition_gives_the_card_before_it_is_bound() {
+    let fixture_tools = tools(&[
+        "prepare_workspace",
+        "run_checks",
+        "ask_user",
+        "linear__list_issues",
+        "read_diff",
+        "list_files",
+        "fetch_page",
+    ]);
+    let def = AgentDef::from_manifest(AGENT).unwrap();
+    let early = def.card(url(), "1.2.3").unwrap();
+    let assembly = assembly_of(def, fixture_tools);
+    let bound = assembly.card(url(), "1.2.3").unwrap();
+    assert_eq!(
+        serde_json::to_string(&sorted(render(&early))).unwrap(),
+        serde_json::to_string(&sorted(render(&bound))).unwrap()
+    );
+    assert_eq!(early.skills.len(), bound.skills.len());
+    assert!(!early.skills.is_empty());
+
+    // The same refusal, from the definition.
+    let bare = def_of_name_only();
+    assert!(matches!(
+        bare.card(url(), "1").unwrap_err(),
+        Error::MissingCardDescription { .. }
+    ));
+}
+
+fn def_of_name_only() -> AgentDef {
+    def(&[(
+        "agent/instructions.md",
+        &instructions("name: helper", "Hi."),
+    )])
+}

@@ -1,0 +1,22 @@
+{
+  "name": "adam-coder",
+  "description": "Coder agent: turns a coding task into a verified pull request.",
+  "url": "https://agents.example.com/coder/",
+  "version": "0.1.0",
+  "skills": [
+    {
+      "id": "coding-task",
+      "name": "Coding task to pull request",
+      "description": "Given a repository and a task, makes the change in a private worktree with OpenCode, runs the project's own checks, and opens a pull request. Reports the pull request as an artifact and asks the caller when it needs an answer.",
+      "tags": [
+        "code",
+        "git",
+        "pull-request"
+      ],
+      "examples": [
+        "In https://github.com/acme/widgets (base branch main), add a hello.txt containing hi."
+      ]
+    }
+  ],
+  "extensions": []
+}

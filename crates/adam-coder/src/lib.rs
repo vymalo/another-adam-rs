@@ -18,9 +18,9 @@
 //!
 //! | Module | What |
 //! |---|---|
-//! | [`agent`] | [`CoderAgent`]: `LlmAgent` + the completion policy (red checks and no PR = failed); [`CoderStarter`]: its start-only half |
+//! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks and no PR = failed); [`CoderStarter`]: its start-only half |
 //! | [`tools`] | the six tools (`#[tool]` functions reading [`ToolEnv`] from the agent's state) and [`CoderSettings`] |
-//! | [`instructions`] | the system prompt |
+//! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`) |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
 //! | [`app`] | [`Coder`]: runtime + A2A backend + router; [`Coder::control_plane`] for a process that only starts runs; [`LiveSignals`]: events and wake-up signals, in-process or across processes |
@@ -80,18 +80,16 @@ pub mod agent;
 pub mod app;
 pub mod config;
 pub mod exit;
-pub mod instructions;
 pub mod opencode;
 pub mod redact;
 mod repos;
 mod serve;
 pub mod tools;
 
-pub use agent::{AGENT_NAME, CoderAgent, CoderStarter, coder_limits};
+pub use agent::{AGENT_NAME, CoderAgent, CoderStarter};
 pub use app::{Coder, LiveSignals, RuntimeOptions, agent_card};
 pub use config::{Config, ConfigError, WorkerConfig};
 pub use exit::exit_code;
-pub use instructions::instructions;
 pub use redact::Redactor;
 pub use repos::workspaces_for;
 pub use serve::serve;

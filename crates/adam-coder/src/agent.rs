@@ -1,32 +1,32 @@
-//! The coder as a durable agent: an [`LlmAgent`] with the coder's instructions
+//! The coder as a durable agent: an [`LlmAgent`](adam_llm_agent::LlmAgent) with the coder's instructions
 //! and tools, plus one rule the tools cannot express alone.
 
 use std::sync::Arc;
 
+use adam::{AgentDef, Assembly, AssemblyError};
 use adam_error::report;
-use adam_llm_agent::{Conversation, DynTool, Limits, LlmAgent, LlmStarter};
+use adam_llm_agent::{Conversation, DynTool, LlmStarter, ToolSet};
 use adam_model::DynModel;
 use adam_runtime::{Agent, AgentError, AgentStarter, Ctx, Inbound, Transition};
 use async_trait::async_trait;
 
-use crate::instructions::instructions;
 use crate::redact::Redactor;
 use crate::tools::notes::RunNotes;
 use crate::tools::{ToolEnv, coder_tools};
 
-/// The agent's name, as stored in `RunRecord::agent`.
+/// The agent's name, as stored in `RunRecord::agent`. It is the `name` in `agent/instructions.md`
+/// (the two are checked against each other by a unit test).
 pub const AGENT_NAME: &str = "coder";
 
-/// Bounds of one coding run. A real task takes far more turns than the
-/// `LlmAgent` defaults allow (every delegation, check and commit is a turn).
-pub fn coder_limits() -> Limits {
-    Limits {
-        max_turns: 200,
-        max_tool_calls: 400,
-        max_output_tokens: 8192,
-        max_history_tokens: 100_000,
-    }
+/// The agent `build.rs` embedded from `agent/`: its prompt, limits and A2A card.
+mod embedded {
+    // The generated module also has `AGENTS` and `PACKAGE`, which nothing here uses.
+    #![allow(dead_code)]
+
+    adam::include_agent!();
 }
+
+pub(crate) use embedded::AGENT;
 
 /// The start-only half of the [`CoderAgent`]: its name and its `init`, with no model, tools or
 /// credentials.
@@ -50,7 +50,11 @@ impl AgentStarter for CoderStarter {
     }
 }
 
-/// [`LlmAgent`] + the coder's completion policy.
+/// [`LlmAgent`](adam_llm_agent::LlmAgent) + the coder's completion policy.
+///
+/// The `LlmAgent` is assembled from `agent/instructions.md` (the prompt, the limits, the
+/// `max_check_cycles` var) and the [`coder_tools`]; this type adds the one thing files cannot say,
+/// the policy below (see the README, "Where the prompt and the card live").
 ///
 /// When the model stops (a turn without tool calls) the run normally
 /// completes. But a run that ends with the last check run red and no pull
@@ -62,37 +66,83 @@ impl AgentStarter for CoderStarter {
 /// answered 401/403): the model cannot fix a bad token, so ending without a
 /// pull request is a failure that names the token, not a completed task.
 pub struct CoderAgent {
-    inner: LlmAgent,
+    assembly: Assembly,
     env: Arc<ToolEnv>,
 }
 
 impl CoderAgent {
     /// The coder over `model` (gateway alias `model_alias`) with the standard
     /// tools.
+    ///
+    /// # Panics
+    ///
+    /// When the agent cannot be assembled: see [`try_new`](Self::try_new). The embedded files are
+    /// fixed at build time and a unit test binds them, so only a `model_alias` that is empty or
+    /// has whitespace in it can cause this; a process that takes the alias from its environment
+    /// should call `try_new` and report the error.
     pub fn new(model: DynModel, model_alias: impl Into<String>, env: Arc<ToolEnv>) -> Self {
-        let tools = coder_tools(&env);
-        Self::with_tools(model, model_alias, env, tools)
+        expect_assembled(Self::try_new(model, model_alias, env))
     }
 
     /// Like [`new`](Self::new) with an explicit toolset, for tests that wrap
     /// the standard tools.
+    ///
+    /// # Panics
+    ///
+    /// When the agent cannot be assembled: see [`try_with_tools`](Self::try_with_tools).
     pub fn with_tools(
         model: DynModel,
         model_alias: impl Into<String>,
         env: Arc<ToolEnv>,
         tools: impl IntoIterator<Item = DynTool>,
     ) -> Self {
-        let mut builder = LlmAgent::builder(AGENT_NAME, model, model_alias)
-            .instructions(instructions(env.settings.max_check_cycles))
-            .limits(coder_limits())
-            .state(env.clone());
-        for tool in tools {
-            builder = builder.dyn_tool(tool);
-        }
-        Self {
-            inner: builder.build(),
-            env,
-        }
+        expect_assembled(Self::try_with_tools(model, model_alias, env, tools))
+    }
+
+    /// [`new`](Self::new), returning the error instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`AssemblyError`] (boxed: it is large) when the agent cannot be assembled, as the assembly reports it: a
+    /// `model_alias` that is empty or has whitespace in it.
+    pub fn try_new(
+        model: DynModel,
+        model_alias: impl Into<String>,
+        env: Arc<ToolEnv>,
+    ) -> Result<Self, Box<AssemblyError>> {
+        let tools = coder_tools(&env);
+        Self::try_with_tools(model, model_alias, env, tools)
+    }
+
+    /// [`with_tools`](Self::with_tools), returning the error instead of panicking.
+    ///
+    /// The steps are the ones any agent written as files takes: the embedded definition, the value
+    /// of the `max_check_cycles` var (the prompt tells the model the limit the tools enforce), the
+    /// tools, the state they read and the model.
+    ///
+    /// # Errors
+    ///
+    /// [`AssemblyError`] (boxed: it is large) when the agent cannot be assembled, as the assembly reports it: a
+    /// `model_alias` that is empty or has whitespace in it.
+    pub fn try_with_tools(
+        model: DynModel,
+        model_alias: impl Into<String>,
+        env: Arc<ToolEnv>,
+        tools: impl IntoIterator<Item = DynTool>,
+    ) -> Result<Self, Box<AssemblyError>> {
+        let assembly = AgentDef::from_manifest(AGENT)?
+            .var("max_check_cycles", env.settings.max_check_cycles)
+            .bind(tools.into_iter().collect::<ToolSet>())?
+            .state(env.clone())
+            .model(model, model_alias)?;
+        Ok(Self { assembly, env })
+    }
+
+    /// What the agent was assembled from: the prompt the model sees, the limits, the tools it is
+    /// offered and the model alias (`assembly().info()[0]`), and the A2A card
+    /// (`assembly().card(url, version)`).
+    pub fn assembly(&self) -> &Assembly {
+        &self.assembly
     }
 
     /// Why the run must fail instead of completing, if it must.
@@ -114,6 +164,12 @@ impl CoderAgent {
             notes.checks.failures, last.command, last.exit_code, last.tail
         ))
     }
+}
+
+/// The panic of the constructors that do not return a `Result`.
+#[allow(clippy::expect_used)] // documented under `# Panics` on the callers
+fn expect_assembled(assembled: Result<CoderAgent, Box<AssemblyError>>) -> CoderAgent {
+    assembled.expect("the coder's embedded agent must assemble")
 }
 
 #[async_trait]
@@ -138,7 +194,7 @@ impl Agent for CoderAgent {
         // Whatever leaves this step as a failure, a retry note or the final
         // answer may quote OpenCode's stderr, a check's output or a provider's
         // error body, so it passes through the redactor.
-        let transition = match self.inner.step(ctx, state).await {
+        let transition = match self.assembly.root().step(ctx, state).await {
             Ok(t) => t,
             Err(e) => return Err(boundary_error(e, redactor)),
         };
@@ -209,6 +265,14 @@ mod tests {
     use std::time::Duration;
 
     const KEY: &str = "sk-live-0123456789abcdef";
+
+    /// The runs are stored under `AGENT_NAME` and the starter registers that name; the assembled
+    /// agent registers the `name` of its file. They must not drift apart.
+    #[test]
+    fn the_embedded_agent_is_named_like_the_constant() {
+        assert_eq!(AGENT.name, AGENT_NAME);
+        assert_eq!(CoderStarter.name(), AGENT.name);
+    }
 
     fn redactor() -> Redactor {
         Redactor::new([KEY])

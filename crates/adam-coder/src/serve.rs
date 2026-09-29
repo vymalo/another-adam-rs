@@ -87,7 +87,8 @@ async fn build_agent(worker: &WorkerConfig, redactor: Redactor) -> anyhow::Resul
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 
     let env = Arc::new(ToolEnv::new(workspaces, code_host, settings).with_redactor(redactor));
-    Ok(CoderAgent::new(model, worker.model.clone(), env))
+    // The alias comes from the environment, so a bad one is a startup error, not a panic.
+    CoderAgent::try_new(model, worker.model.clone(), env).context("assembling the coder agent")
 }
 
 /// Drive the notifier until `stop`, and log once `LISTEN` is active.
