@@ -26,6 +26,7 @@ adam-host = { path = "../adam-host", version = "0.1.0" }
 adam-llm-agent = { path = "../adam-llm-agent", version = "0.1.0" }
 adam-model.workspace = true
 adam-model-openai = { path = "../adam-model-openai", version = "0.1.0" }
+adam-notify-postgres = { path = "../adam-notify-postgres", version = "0.1.0" }
 adam-runtime.workspace = true
 adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
 adam-workspace.workspace = true
@@ -39,6 +40,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "signal"] }
+tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true

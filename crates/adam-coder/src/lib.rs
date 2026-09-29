@@ -23,7 +23,7 @@
 //! | [`instructions`] | the system prompt |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
-//! | [`app`] | [`Coder`]: runtime + A2A backend + router; [`Coder::control_plane`] for a process that only starts runs |
+//! | [`app`] | [`Coder`]: runtime + A2A backend + router; [`Coder::control_plane`] for a process that only starts runs; [`LiveSignals`]: events and wake-up signals, in-process or across processes |
 //! | [`config`] | the binary's environment variables |
 //! | [`serve()`] | the whole process: store, model, GitHub, and the A2A server and workers its `ROLE` runs (through `adam_host::Host`), until a shutdown future resolves |
 //!
@@ -59,6 +59,12 @@
 //! # }
 //! ```
 //!
+//! By default a process's live events stay in the process and other processes are found by
+//! polling the store. [`Coder::new_with`] and [`Coder::control_plane_with`] take
+//! [`LiveSignals`] to change that; the binary passes the Postgres `LISTEN`/`NOTIFY` ones
+//! (`adam-notify-postgres`), so a worker wakes at once for a run another process started and a
+//! front streams the progress of a run a worker steps.
+//!
 //! Every infrastructure piece is a trait object handed in from outside: the
 //! store, the model, the code host and the git credentials. The binary
 //! (`adam-coder`) is only [`serve`] over [`Config::from_env`]: a composition
@@ -82,7 +88,7 @@ mod serve;
 pub mod tools;
 
 pub use agent::{AGENT_NAME, CoderAgent, CoderStarter, coder_limits};
-pub use app::{Coder, RuntimeOptions, agent_card};
+pub use app::{Coder, LiveSignals, RuntimeOptions, agent_card};
 pub use config::{Config, ConfigError, WorkerConfig};
 pub use exit::exit_code;
 pub use instructions::instructions;

@@ -143,6 +143,7 @@ jobs:
         run: >-
           cargo nextest run --locked --profile ci
           -p adam-store-postgres -p adam-store-mongodb -p adam-runtime -p adam-a2a-runtime
+          -p adam-notify-postgres
 
   # Line coverage of the whole workspace against the newest servers. The lcov
   # file is an artifact; the summary is on the run page; the gate ratchets.

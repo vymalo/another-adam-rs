@@ -1,7 +1,8 @@
 # 0001. Library first: host roles in `adam-host`
 
 Status: **Accepted** (2026-09-29). The owner answered the open questions the same day. Two
-questions stay open: cross-process events, and the exact workspace placement enum.
+questions stayed open: cross-process events (*resolved 2026-09-29, see below*), and the exact
+workspace placement enum.
 
 ## Context
 
@@ -127,7 +128,9 @@ role. The rename is outside this repo.
 * When the halves are separate processes, some things degrade until they are built: live
   events only reach subscribers in the same process, the worker wakes by polling instead of a
   wake signal, and a cancel reaches the worker by polling. Each has a planned fix (Postgres
-  `NOTIFY`), not part of this change.
+  `NOTIFY`), not part of this change. *Amended 2026-09-29: built and wired into `adam-coder`
+  (see "Cross-process events" under Resolved questions); the degradation above is only what
+  remains with polling alone.*
 * The supervisor pulls `tokio`, `tokio-util` and `tracing` into `adam-host`. A host that
   only wants `Role` turns the default feature off.
 
@@ -156,12 +159,23 @@ role. The rename is outside this repo.
 * **Where `Role` lives, and whether it is closed.** Resolved: `adam-host`, closed (decisions 2
   and 3).
 * **How hosts depend on adam-rs.** Resolved: git rev, public repository (decision 9).
+* **Cross-process events.** Resolved 2026-09-29 as proposed: an event sink and a notifier over
+  Postgres `LISTEN`/`NOTIFY`, with polling staying on as the fallback and as the truth.
+  `adam-runtime` has the `Notifier` port (`RuntimeBuilder::notifier`),
+  `adam-notify-postgres` the adapter (`PgNotify`, `PgEventSink`, `PgNotifier`), and
+  `adam-coder`'s `serve` wires it in every role: one `PgNotify` per process over the store's
+  pool, run as the host component `notify` (a worker component in `all` and `worker`, stopped
+  after the `worker` component; a control-plane component in `control-plane`). So a worker
+  wakes at once for a run another process started, a cancel reaches a step in another process
+  at once, and a control plane's stream carries a worker's `Progress` events as they happen.
+  *Verified 2026-09-29: the payload limit is under 8000 bytes (a 7 999-byte payload is sent, an
+  8000-byte one is refused by PostgreSQL 16.13; `crates/adam-notify-postgres/tests/conformance.rs`),
+  and `crates/adam-coder/tests/binary.rs` runs a control plane and a worker as two processes
+  and sees the worker's progress text in the control plane's stream.* Postgres only: MongoDB
+  keeps polling. No new environment variable.
 
 ## Open questions
 
-* **Cross-process events.** Live events and worker wake-up between a control plane and a
-  worker in other processes. Proposed: an event sink and listener over Postgres `NOTIFY`
-  (payload limit 8000 bytes, *unverified*: from memory), with polling as the fallback.
 * **The exact placement enum and mechanism** (decision 10). Are `Shared`, `Affinity` and
   `Isolated` the right names and the right set? How does a worker own a folder and claim only
   its runs (a lease with a worker id, or a routing key)? What happens to a run when its worker

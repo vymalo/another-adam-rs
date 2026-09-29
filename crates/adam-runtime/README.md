@@ -102,9 +102,13 @@ stays on with a notifier configured (timers and retry backoffs are found by
 polling only). Without a notifier the behaviour is exactly what it was.
 
 `LocalNotifier` connects runtimes inside one process (tests, or a process that
-is front and worker in one). Across processes use an adapter crate. Live
-*events* of a run stepped elsewhere are a separate port, `EventSink`: a
-`Notifier` carries only the two signals above.
+is front and worker in one). Across processes use an adapter:
+[`adam-notify-postgres`](../adam-notify-postgres/README.md) (`PgNotifier`, over
+`LISTEN`/`NOTIFY`). A new adapter is checked by
+[`adam-notify-testkit`](../adam-notify-testkit/README.md)'s
+`notifier_conformance!`. Live *events* of a run stepped elsewhere are a separate
+port, `EventSink` (`PgEventSink` carries them); a `Notifier` carries only the two
+signals above.
 
 ## Errors
 
@@ -174,4 +178,6 @@ when unset, even with `ADAM_TEST_REQUIRE_DB=1`.
 [`adam-core`](../adam-core/README.md),
 [`adam-llm-agent`](../adam-llm-agent/README.md),
 [`adam-a2a-runtime`](../adam-a2a-runtime/README.md),
+[`adam-notify-postgres`](../adam-notify-postgres/README.md),
+[`adam-notify-testkit`](../adam-notify-testkit/README.md),
 [`adam-error`](../adam-error/README.md).

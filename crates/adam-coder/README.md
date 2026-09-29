@@ -146,16 +146,35 @@ unset or blank means `all`). Anything else is a configuration error (exit 78) th
 | Role | Starts | Listener | Workspace root |
 |---|---|---|---|
 | `all` (default) | the A2A server and the workers, in one process: today's behaviour | A2A and `/healthz` on `LISTEN_ADDR` | created |
-| `control-plane` | the A2A server over `Coder::control_plane`: a `Runtime` with the agent's `CoderStarter` only, used to start, deliver to, cancel and view runs; `run_worker` is never called | A2A and `/healthz` on `LISTEN_ADDR` | **not** created |
+| `control-plane` | the A2A server over `Coder::control_plane_with`: a `Runtime` with the agent's `CoderStarter` only, used to start, deliver to, cancel and view runs; `run_worker` is never called | A2A and `/healthz` on `LISTEN_ADDR` | **not** created |
 | `worker` | `Runtime::run_worker`, and a listener that answers `GET /healthz` (`200 ok`, the route the A2A router serves) and nothing else | `/healthz` only on `LISTEN_ADDR` | created |
 
-The roles meet only in the Postgres store (the run record's version compare-and-swap, and
-leases), so any number of each can share one database. Two things follow until a
-cross-process event path exists (see ADR 0001, "Open questions"):
+Every role also runs the component `notify` (below). The roles meet in the Postgres store (the
+run record's version compare-and-swap, and leases), so any number of each can share one
+database; the store is what is correct, and `notify` only makes it fast.
 
-* The control plane learns what a worker did by **polling** the run, so its A2A stream is a
-  poll interval (250 ms) late. Every state and artifact still arrives.
-* A cancel reaches the worker on its next poll of the run, not at once.
+**Live events and wake-up across processes.** Every process builds one
+[`PgNotify`](../adam-notify-postgres/README.md) over the store's own connection pool and runs
+its listener as the host component `notify` (a worker component in `all` and `worker`, which
+stops only after the `worker` component has finished, so the last step's events and signals
+are still sent; a control-plane component in `control-plane`). It logs
+`listening for notifications` once `LISTEN` is active. With it:
+
+* A run started or answered through a control plane wakes an idle worker in another process at
+  once, instead of at its next poll (250 ms).
+* A cancel reaches the step running in another process at once, instead of at the worker's
+  next read of the run.
+* The control plane's A2A stream carries the `Progress`, `Custom` and `Artifact` events of a
+  run a worker steps as they happen, not only the states and artifacts it finds by polling.
+
+It is Postgres only (MongoDB has no equivalent here, and `adam-coder` is Postgres only), needs
+no variable, and changes nothing about correctness: `NOTIFY` is at most once and not durable,
+polling stays on at 250 ms, and a run completes with the listener gone, only later. The
+listener holds one connection of the store's pool, and needs a direct or session-mode
+connection: behind a transaction-mode pooler (PgBouncer's default) `LISTEN` silently does
+nothing and the system falls back to polling. A library user gets the in-process behaviour from
+`Coder::new` and `Coder::control_plane`, or passes their own `LiveSignals` to
+`Coder::new_with` and `Coder::control_plane_with`.
 
 A worker's runs have no affinity today: any worker may lease any run. A deployment keeps
 one worker per workspace root, or gives the workers a shared volume (ADR 0001, decision 10).
@@ -304,8 +323,10 @@ database of its own, so the role needs `CREATEDB`):
   plane and a worker as two processes over one database**: the control plane is given no model
   or GitHub configuration and its log shows none; the task is sent to it before the worker
   exists and waits unclaimed (the model is not asked, the run's version does not move), then the worker starts, steps it to a
-  branch and a pull request, and the control plane's stream (by polling) reports the artifacts
-  and `completed`.
+  branch and a pull request, and the control plane's stream reports the artifacts and
+  `completed`, and a `working` update carrying the text of the worker's `Progress` event
+  (`preparing a worktree of ...`), which exists only as a live event and so proves events
+  crossed the two processes over `NOTIFY`. Both processes log `listening for notifications`.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy.
 * `adam-workspace/tests/workspace.rs`: the host allowlist, local paths, scoped

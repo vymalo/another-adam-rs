@@ -9,9 +9,18 @@
 //!
 //! | Role | Components | Also |
 //! |---|---|---|
-//! | `all` (default) | `a2a-server` (control plane), `worker` | |
-//! | `control-plane` | `a2a-server` | [`Coder::control_plane`]: a runtime with the agent's starter only, no model or GitHub configuration |
-//! | `worker` | `worker`, `health` | `/healthz` on [`Config::listen_addr`], no A2A |
+//! | `all` (default) | `a2a-server` (control plane), `worker`, `notify` | |
+//! | `control-plane` | `a2a-server`, `notify` | [`Coder::control_plane_with`]: a runtime with the agent's starter only, no model or GitHub configuration |
+//! | `worker` | `worker`, `health`, `notify` | `/healthz` on [`Config::listen_addr`], no A2A |
+//!
+//! `notify` is the [`adam_notify_postgres::PgNotify`] listener and publisher: live events and
+//! wake-up/cancel signals cross processes over Postgres `LISTEN`/`NOTIFY`, so a worker takes a
+//! run another process started at once instead of at its next poll, and a control plane streams
+//! the progress of a run a worker steps as it happens. It is a latency optimisation: polling
+//! stays on and correctness never depends on a notification (see `adam-notify-postgres`). With a
+//! worker it stops only after the worker has finished, then sends what is still queued for up to
+//! `adam_notify_postgres::DRAIN_ON_STOP`, so the last step's events and signals normally still
+//! reach other processes (best effort, like any notification).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -22,16 +31,21 @@ use adam_core::DynStore;
 use adam_host::Host;
 use adam_model::DynModel;
 use adam_model_openai::{OpenAiCompatible, OpenAiConfig};
+use adam_notify_postgres::PgNotify;
+use adam_runtime::BroadcastSink;
 use adam_store_postgres::PgStore;
 use adam_workspace::{DynCodeHost, GitHub, GitIdentity};
 use anyhow::Context as _;
 use secrecy::ExposeSecret as _;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 use crate::repos::workspaces_for;
-use crate::{Coder, CoderAgent, CoderSettings, Config, RuntimeOptions, ToolEnv, WorkerConfig};
+use crate::{
+    Coder, CoderAgent, CoderSettings, Config, LiveSignals, RuntimeOptions, ToolEnv, WorkerConfig,
+};
 
 /// How long open connections (SSE streams never end on their own) get to
 /// finish after the shutdown signal before the server is dropped.
@@ -75,6 +89,22 @@ async fn build_agent(worker: &WorkerConfig, redactor: Redactor) -> anyhow::Resul
     Ok(CoderAgent::new(model, worker.model.clone(), env))
 }
 
+/// Drive the notifier until `stop`, and log once `LISTEN` is active.
+async fn run_notify(
+    notify: PgNotify,
+    stop: impl Future<Output = ()> + Send,
+) -> Result<(), adam_error::BoxError> {
+    let listening = async {
+        notify.wait_listening().await;
+        tracing::info!("listening for notifications");
+        std::future::pending::<Result<(), adam_notify_postgres::NotifyError>>().await
+    };
+    tokio::select! {
+        result = notify.run(stop) => result.map_err(Into::into),
+        result = listening => result.map_err(Into::into),
+    }
+}
+
 /// Run the coder until `shutdown` resolves (SIGTERM in the binary).
 ///
 /// Which components run depends on [`Config::role`]; see the module docs. On
@@ -95,14 +125,25 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
     let role = config.role;
-    let store: DynStore = {
+    let (store, pool): (DynStore, _) = {
         let store = PgStore::connect(config.database_url.expose_secret())
             .await
             .context("connecting to Postgres")?;
         adam_core::Store::migrate(&store)
             .await
             .context("migrating the schema")?;
-        Arc::new(store)
+        let pool = store.pool().clone();
+        (Arc::new(store), pool)
+    };
+
+    // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own pool. The
+    // listener (`notify.run`) is a host component below; the runtime only holds the two halves.
+    let broadcast = BroadcastSink::default();
+    let notify = PgNotify::new(pool, broadcast.clone());
+    let live = LiveSignals {
+        broadcast,
+        sink: Arc::new(notify.event_sink()),
+        notifier: Some(Arc::new(notify.notifier())),
     };
 
     // Only a role that runs workers builds the agent: model, GitHub client, workspaces. A control
@@ -110,18 +151,19 @@ pub async fn serve(
     // only (`CoderStarter`), so it takes no model or GitHub configuration.
     let (coder, workers) = match &config.worker {
         Some(worker) => (
-            Coder::new(
+            Coder::new_with(
                 store,
                 build_agent(worker, Redactor::from_config(&config)).await?,
                 &RuntimeOptions {
                     concurrency: worker.workers,
                     ..RuntimeOptions::default()
                 },
+                live,
             ),
             Some(worker.workers),
         ),
         None => (
-            Coder::control_plane(store, &RuntimeOptions::default()),
+            Coder::control_plane_with(store, &RuntimeOptions::default(), live),
             None,
         ),
     };
@@ -168,16 +210,26 @@ pub async fn serve(
                 .map_err(Into::into)
         })
     };
+    // With workers, `notify` is a worker component that stops when the `worker` component is done
+    // (or gone): the host cancels the components of a tier together, and a step finishing after
+    // the cancel still emits events and signals that should be sent. Without workers it stops with
+    // the control plane.
+    let notify_stop = CancellationToken::new();
     let host = if role.runs_workers() {
         let runtime = coder.runtime.clone();
+        let done = notify_stop.clone().drop_guard();
         host.worker("worker", |stop| async move {
+            let _done = done;
             runtime
                 .run_worker(stop.cancelled_owned())
                 .await
                 .map_err(Into::into)
         })
+        .worker("notify", |_| {
+            run_notify(notify, notify_stop.cancelled_owned())
+        })
     } else {
-        host
+        host.control_plane("notify", |stop| run_notify(notify, stop.cancelled_owned()))
     };
 
     host.run(shutdown).await?;

@@ -1,0 +1,21 @@
+[package]
+name = "adam-notify-testkit"
+description = "Conformance test suite for adam-rs Notifier and cross-process EventSink implementations"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-core.workspace = true
+adam-runtime.workspace = true
+futures.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

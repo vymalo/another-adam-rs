@@ -47,12 +47,14 @@ id); a new `SendMessage` is `Runtime::start`; a message with `taskId` is
 task owned by someone else looks like one that does not exist. Subscriptions
 are built from `Runtime::view` and polling, so they work for a task started by
 another process or before a restart; live events only reduce latency. Across
-processes those events do not exist unless something carries them (an
-`EventSink` adapter), so a subscription of a task another process is stepping
-advances at the durable poll; a `Notifier` on the runtimes
-(`RuntimeBuilder::notifier`) additionally makes the worker pick up the start,
-and a `CancelTask` reach the running step, at once instead of at its poll.
-Wiring one into `adam-coder` is a follow-up.
+processes those events do not exist unless something carries them, so a
+subscription of a task another process is stepping advances at the durable poll.
+[`adam-notify-postgres`](../adam-notify-postgres/README.md) carries them (its
+`PgEventSink` as the runtime's sink, with this backend subscribing to the
+`BroadcastSink` it delivers into) and also wakes the worker on a start and
+delivers a `CancelTask` to the running step at once (a `Notifier`), instead of at
+the next poll. `adam-coder` wires it in for every role (`Coder::new_with`,
+`Coder::control_plane_with`).
 
 ## Errors
 
