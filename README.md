@@ -15,6 +15,7 @@ trait, a shared conformance suite, and two production adapters.
 | `adam-store-mongodb` | MongoDB 5.0+ via the official driver; standalone `mongod` is enough |
 | `adam-model` | `ModelClient` trait (`complete` + streaming, tool calling), request/response types, `MockModel` test double |
 | `adam-model-openai` | `OpenAiCompatible`: any OpenAI-compatible chat-completions endpoint (gateway or provider) via `reqwest` + rustls |
+| `adam-workspace` | Per-run git worktrees over a shared mirror, commit and push, and pull requests (`CodeHost`, GitHub). The token is passed per `git` invocation and never stored |
 
 ## The model
 
