@@ -65,7 +65,7 @@ pub(crate) type Outcome = Result<ToolOutput, ToolError>;
 /// worktree ([`publish`]) therefore check [`ToolCtx::is_cancelled`] first and
 /// refuse with this.
 pub(crate) fn cancelled(what: &str) -> ToolError {
-    ToolError::Permanent(format!("cancelled: the run was canceled; {what}"))
+    ToolError::Permanent(format!("cancelled: the run was cancelled; {what}"))
 }
 
 /// Tunables of the tools.
