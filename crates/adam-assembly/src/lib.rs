@@ -109,8 +109,17 @@
 //! [`AgentDef::env`]) and fails closed; the URL must be https unless it is local
 //! ([`AgentDef::allow_insecure_remotes`]); the token is never logged or journaled. See the README.
 //!
-//! Not here yet: `mcp.json` tools (S11) and reloading from disk (S10). The manifest keeps their
-//! files, and [`AgentDef::bind`] is where they plug in.
+//! # Dev reload
+//!
+//! With the feature `dev` (off by default, so a release build cannot read prompts from disk unless
+//! it opts in), `LiveAssembly` reads the agent directory at run time and swaps the agents when a
+//! file changes: a running run picks up new instructions at its next step, an invalid edit keeps
+//! the last good version and logs the diagnostics. A change to an agent's tool set applies to runs
+//! that start later, so that durable replay never sees a tool appear or vanish. The rules are in
+//! the docs of `LiveAssembly` and in the README.
+//!
+//! Not here yet: `mcp.json` tools (S11). The manifest keeps their files, and [`AgentDef::bind`]
+//! is where they plug in.
 
 #![warn(missing_docs)]
 
@@ -118,6 +127,8 @@ mod assembly;
 #[cfg(feature = "a2a")]
 mod card;
 mod def;
+#[cfg(feature = "dev")]
+mod dev;
 mod error;
 mod remote;
 mod skills;
@@ -127,6 +138,11 @@ mod template;
 
 pub use assembly::{AgentInfo, Assembly, BoundDef, RemoteInfo};
 pub use def::{AgentDef, IntoManifest};
+#[cfg(feature = "dev")]
+pub use dev::{
+    AGENT_DIR_ENV, DEFAULT_DEBOUNCE, LiveAssembly, LiveBuilder, ReloadError, Reloaded, ToolChange,
+    Watch, WatchError, agent_dir,
+};
 pub use error::{
     AliasProblem, Error, Origin, RemoteAuthProblem, RemoteUrlProblem, SkillField, ToolClash,
 };
@@ -137,3 +153,15 @@ pub use template::TemplateProblem;
 /// The URL type of [`Assembly::card`], so a caller needs no `url` dependency of its own.
 #[cfg(feature = "a2a")]
 pub use url::Url;
+
+/// Without the feature `dev` the reload API does not exist: a release build cannot ask for it.
+///
+/// ```compile_fail,E0432
+/// use adam_assembly::LiveAssembly;
+/// ```
+///
+/// ```compile_fail,E0599
+/// let _ = adam_assembly::AgentDef::from_dir("agent");
+/// ```
+#[cfg(not(feature = "dev"))]
+mod dev_is_off {}

@@ -7,6 +7,10 @@ pub use adam_assembly::{
     AgentDef, AgentInfo, AliasProblem, Assembly, BoundDef, Error as AssemblyError, IntoManifest,
     Origin, RemoteInfo, TemplateProblem,
 };
+// Dev reload, only with the feature `dev`: the agent directory read at run time and swapped when a
+// file changes. See `adam_assembly::LiveAssembly`.
+#[cfg(feature = "dev")]
+pub use adam_assembly::{LiveAssembly, LiveBuilder, ReloadError, Reloaded};
 pub use adam_core as core;
 pub use adam_error as error;
 pub use adam_llm_agent::*;
@@ -45,3 +49,11 @@ pub mod prelude {
         ToolSet, tools,
     };
 }
+
+/// Without the feature `dev` nothing here can read the agent directory at run time.
+///
+/// ```compile_fail,E0432
+/// use adam::LiveAssembly;
+/// ```
+#[cfg(not(feature = "dev"))]
+mod dev_is_off {}

@@ -799,21 +799,88 @@ folds `RuntimeBuilder::agent` over the agents; a subagent's prompt lines are cou
 the manifest keeps no `body_offset`; and `state(..)` comes before `model(..)` because `model(..)` is the
 step that builds the agents and finds a missing state.
 
-## Dev reload (planned)
+## Dev reload (built: feature `dev`)
 
-| | `build.rs` (default) | function-like proc macro | run-time `AgentDir::load` (dev) |
+Slice S10. The comparison of the three ways to get an agent into a process, for the record:
+
+| | `build.rs` (default) | function-like proc macro | run-time `Dir` (dev) |
 |---|---|---|---|
 | Finds new files | yes (`cargo::rerun-if-changed=agent` scans the directory, *verified 2026-09-29*, <https://doc.rust-lang.org/cargo/reference/build-scripts.html>) | no: tracking paths from a proc macro is nightly-only (`proc_macro::tracked`, *verified 2026-09-29*, <https://doc.rust-lang.org/proc_macro/tracked/index.html>) | n/a |
-| Errors | file and line, before rustc runs | `compile_error!` at the call site | at startup |
+| Errors | file and line, before rustc runs | `compile_error!` at the call site | at startup, and on each reload |
 | Cost at startup | none | none | parse |
 
-With the `dev` feature (off by default, so a release binary cannot read prompts from disk unless it
-opts in), `AgentDef::from_dir("agent")` plus `.watch()` (slice S10; `from_source` is the building block)
-rebuilds the same manifest at run time. Each
-`step` takes the current definition, so a running run picks up new instructions at its next step and
-never mid-step; an invalid edit keeps the last good version and logs the diagnostics. Tool code changes
-need a rebuild. Runs are durable in the store, so a restart resumes them (use the Compose Postgres, not
-the in-memory store).
+With the `dev` feature of `adam-assembly` (re-exported by `adam` as `dev`; **off by default**, so a release
+binary cannot read prompts from disk unless it opts in, and turning it on logs a warning), a
+`LiveAssembly` does what `from_source`, `bind` and `model` do at startup and keeps the recipe (the directory, the
+`ToolSet`, the model, and the closures that give `AgentDef` and `BoundDef` their values: `var`, `env`,
+`remote_timeout`, `state`, `wait_poll`), so it can do it again. `ADAM_AGENT_DIR` replaces the directory the code
+names. It registers one stand-in agent per name with the runtime; each `step` takes the current `Arc<LlmAgent>`
+for that name once and makes the whole transition with it. Tool code changes need a rebuild. Runs are durable
+in the store, so a restart resumes them (use the Compose Postgres, not the in-memory store).
+
+```mermaid
+sequenceDiagram
+  participant E as editor
+  participant W as watcher thread (notify)
+  participant L as LiveAssembly
+  participant G as registry (one lock)
+  participant R as runtime worker
+  E->>W: file written
+  W->>W: wait until quiet (debounce)
+  W->>L: reload()
+  L->>L: Dir::load, into_package, AgentDef, bind, model
+  alt every stage succeeds and no agent name is new
+    L->>G: install every name at once, generation + 1
+  else a file or bind error, or a new agent name
+    L->>L: change nothing, keep the error, log each diagnostic
+  end
+  R->>G: step of run X
+  G-->>R: the run's pinned version, or the newest (pinned now)
+  R->>R: the whole transition with that version
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Live: load, generation 1
+  Live --> Loading: a change once quiet, or reload()
+  Loading --> Live: installed, last_error cleared
+  Loading --> Refused: file error, bind error, new agent name
+  Refused --> Loading: the next change
+  Refused --> Refused: the last good version steps every run
+```
+
+**What a reload changes.** The prompt is not journaled and the model request is rebuilt on every turn, so a
+new prompt, limits, model alias, tool description, `{{var}}` value, wait timer, remote timeout or token apply to
+every run **at its next step**, never in the middle of one. A re-bind builds new tools, and a remote tool makes
+its HTTP client on its first call, so a rotated token or a new URL is what the next call uses.
+
+**The replay rule.** A run's journal is keyed by step names (`model:3`, `tool:<call id>`), and a replayed
+transition (lease lost, stale commit) that finds `tool:c1` where its code now answers "unknown tool" fails with
+`NonDeterminism`. So a change to *which tools exist* is the one thing that must not reach a run that has
+started. The tool set of an agent is the set of its tools' names, and:
+
+* an unchanged tool set is swapped for everyone;
+* a changed one applies to **runs that start after the reload**: a run that has taken a step keeps the newest
+  version with the tool set it started with (its prompt edits stop until the tool set goes back, which brings
+  it along again), and it ends with its pin;
+* a **new agent name** (a new subagent, a renamed root) is refused as a whole, `NeedsRestart`, because the
+  runtime registers its agents once, when it is built;
+* a **removed** agent stays registered with its last version, for its own runs and for parents still on the old
+  tool set: a run never fails because a file went away;
+* a **restart is a deploy**: the pins live in memory, and a new process steps every run with the files as they
+  are, as a production deploy of new code does.
+
+The alternatives were to refuse a tool-set change while any run is in flight (a parked conversation would
+block the developer indefinitely, and the process cannot see a cancelled run) and to swap at transition
+boundaries without pinning (which is safe between transitions and unsafe in the one case, a replayed
+transition, that matters). An in-flight transition already holds its `Arc`, so the swap cannot tear it.
+
+**An invalid edit** keeps the last good version and logs every diagnostic (file, line, message) and then
+`reload refused, keeping the last good version`; `last_error()` exposes it (`ReloadError::diagnostics()` for the
+loader's findings, `Load(Error::UnknownTool { .. })` and the other bind errors as they are) until the next good
+load. The watcher is `notify` 8 (*verified 2026-09-29*, crates.io: 8.2.0 is the current stable, CC0-1.0, MSRV
+1.77) with a debounce of our own, ignoring reads, so a reload does not trigger the next. See the
+[crate README](../crates/adam-assembly/README.md#dev-reload-feature-dev) for the API and the tests.
 
 ## Crate layout
 
@@ -823,9 +890,9 @@ the in-memory store).
 |---|---|---|
 | `adam-macros` | proc-macro | **built (S2)**: `#[tool]`; a thin shim over a pure, unit-tested `expand` function |
 | `adam-agent-fs` | lib | **built (S4, S5)**: frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` with the `Dir` and `EmbeddedPackage` implementations, the digest of a manifest, and the `build.rs` codegen behind the feature `build`. No async, no runtime dependency |
-| `adam-assembly` | lib | **built (S6, S7, S9, S9b)**: `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s (root and local subagents); `{{var}}` templating; the skills catalog with `load_skill` and `read_skill_file`; `SubagentTool`, one per local subagent; a tool per remote (A2A) subagent, with bearer auth from the environment; the A2A card behind feature `a2a`. Planned: dev reload |
+| `adam-assembly` | lib | **built (S6, S7, S9, S9b, S10)**: `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s (root and local subagents); `{{var}}` templating; the skills catalog with `load_skill` and `read_skill_file`; `SubagentTool`, one per local subagent; a tool per remote (A2A) subagent, with bearer auth from the environment; the A2A card behind feature `a2a`; dev reload behind feature `dev` (`LiveAssembly`, `notify`) |
 | `adam-mcp` | lib | MCP client (the official Rust SDK): MCP tools as `Tool`s, `${VAR}` expansion, fail closed |
-| `adam` | facade | **built (S2, S5, S6)**: `prelude`, the macro, feature `macros` (default), `include_agent!`, `adam::agent_fs`, `AgentDef` and its stages, `adam::assembly`, feature `a2a`. Planned: features `mcp`, `dev` |
+| `adam` | facade | **built (S2, S5, S6)**: `prelude`, the macro, feature `macros` (default), `include_agent!`, `adam::agent_fs`, `AgentDef` and its stages, `adam::assembly`, features `a2a` and `dev`. Planned: feature `mcp` |
 | `adam-agent-fixture` | test fixture | **built (S5)**, not published: a `build.rs` plus `include_agent!()` over the `adam-agent-fs` test fixture, and the tests that compare embedded and directory |
 | `cargo-adam` | bin | `new`, `check`, `dev` (roadmap 6) |
 
@@ -947,4 +1014,5 @@ what the model does and needs a comparison with a live model; it is not a slice.
 | S8 | child runs in the runtime: `start_child`, the finished message, `Ctx::child_status`, `ToolError::AwaitRun`, `pending_wait` | built |
 | S9 | subagents: `SubagentTool`, its binding, name-clash and asks-user checks, `ToolCtx::start_child` | built |
 | S9b | remote (A2A) subagents: `AwaitRemote`, `PendingWait::Remote`, `Tool::poll_remote`, `auth: bearer:VAR`, the journaled send and the poll on the timer | built |
-| S10, S11 | dev reload; `mcp.json` tools | planned |
+| S10 | dev reload: feature `dev`, `LiveAssembly`, `reload`, `watch`, the swap at step boundaries, the replay rule | built |
+| S11 | `mcp.json` tools | planned |

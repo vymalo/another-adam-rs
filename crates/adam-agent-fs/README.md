@@ -155,7 +155,8 @@ stateDiagram-v2
   Generated --> Watching: adam_agent.rs written only if its bytes changed
 ```
 
-Reading the same files at run time (the `dev` feature of slice S10) is `Dir::new(root).load()`:
+Reading the same files at run time (the `dev` feature of `adam-assembly`, slice S10, which also reloads them
+when they change) is `Dir::new(root).load()`:
 both give a `Package`, and the two are equal for the same files, which the tests assert.
 `Dir::digest(&manifest)` and `EmbeddedAgent::digest` are equal too.
 

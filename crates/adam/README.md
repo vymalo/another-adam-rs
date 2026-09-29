@@ -16,11 +16,14 @@ adam = "0.1"
 |---|---|---|
 | `macros` | yes | `#[tool]` (`adam::tool`, and in the prelude) |
 | `a2a` | no | `Assembly::card`: the root agent's `card:` as an `adam_a2a::AgentCardConfig` (turns on `adam-assembly/a2a`) |
+| `dev` | no | dev reload: `adam::LiveAssembly` reads the agent directory at run time and swaps the agents when a file changes (turns on `adam-assembly/dev`, which brings `notify`). Off by default, so a release build cannot read prompts from disk unless it opts in |
 
 The authoring layer around it (agent directories, skills, subagents) is designed in
 [`docs/authoring.md`](../../docs/authoring.md). What exists: `#[tool]`, the agent directory
 embedded at build time (`adam::include_agent!()`, below), and `AgentDef`, which binds it to
-`LlmAgent`s ([`adam-assembly`](../adam-assembly/README.md), also `adam::assembly`).
+`LlmAgent`s ([`adam-assembly`](../adam-assembly/README.md), also `adam::assembly`), and, with the feature
+`dev`, `adam::LiveAssembly`, which reloads the directory while the process runs (the rules for runs in flight
+are in the [dev reload](../adam-assembly/README.md#dev-reload-feature-dev) section).
 
 ## `#[tool]`
 

@@ -9,7 +9,7 @@ with the agent and the file in the message, and never in the middle of a run.
 
 ## Where it sits
 
-Slices S6, S7, S9 and S9b of the authoring layer, the meeting point of the "macro" track (`#[tool]`, `ToolSet`)
+Slices S6, S7, S9, S9b and S10 of the authoring layer, the meeting point of the "macro" track (`#[tool]`, `ToolSet`)
 and the "files" track (`adam-agent-fs`).
 
 ```text
@@ -22,7 +22,8 @@ adam-a2a  (feature a2a) ──────────────────�
 It depends on `adam-agent-fs`, `adam-llm-agent`, `adam-model`, `adam-runtime`, `adam-error`,
 `async-trait`, `serde_json`, `thiserror` and `url`, on the A2A client for remote subagents (`a2a-client-lf`,
 `a2a-lf`, `reqwest`, `tokio` for a once-cell, `secrecy` for the token, `tracing`), and on `adam-a2a` behind the
-feature `a2a`. It has no `unsafe`. Its I/O is the skill tools (the bytes are read once at startup, or come
+feature `a2a`, and, behind the feature `dev` only, on [`notify`](https://crates.io/crates/notify) and `adam-core` (see
+[Dev reload](#dev-reload-feature-dev)). It has no `unsafe`. Its I/O is the skill tools (the bytes are read once at startup, or come
 from the binary) and the remote subagents' tool: the environment variable of `auth: bearer:VAR` at `bind`, and
 the network (agent card, `SendMessage`, `GetTask`) only when a call needs it.
 
@@ -61,6 +62,9 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `Assembly` | `agents()`, `root()`, `register(RuntimeBuilder)`, `info()`, `remotes()`, `manifest()`, `card(url, version)` (feature `a2a`) |
 | `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog), `tools` (own, skill tools, then one per subagent, local or remote: what the model is offered), `skills`, `preloaded`, `limits`: what an `LlmAgent` was made from, comparable |
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
+| `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
+| `Reloaded`, `ToolChange`, `ReloadError`, `WatchError` (feature `dev`) | what a reload did (`generation`, `changed`, `tool_changes`, `retired`), why it changed nothing (`Load(Error)` with `diagnostics()`, `NeedsRestart { added }`), why a watcher did not start |
+| `agent_dir`, `AGENT_DIR_ENV`, `AgentDef::from_dir` (feature `dev`) | the `ADAM_AGENT_DIR` override, and one `AgentDef` per agent of a directory |
 | `Error`, `Origin` | the closed error enum, and the agent and file every file-related variant carries |
 | `AliasProblem`, `TemplateProblem`, `SkillField`, `ToolClash`, `RemoteAuthProblem`, `RemoteUrlProblem` | closed enums inside `Error::ModelAlias`, `Error::Template`, `Error::UnknownSkill`, `Error::SubagentToolClash`, `Error::RemoteAuth` and `Error::RemoteUrl` |
 
@@ -237,6 +241,107 @@ Known limit: a loaded skill is a tool result, and the loop may truncate an old o
 `limits.max_history_tokens`. `preload_skills` is the way around it until the loop learns to protect skill
 content.
 
+## Dev reload (feature `dev`)
+
+Off by default, so **a release build cannot read prompts from disk unless its author turned the feature on**
+(the `adam` facade re-exports it as `dev`); turning it on brings `notify` and logs a warning at startup.
+`LiveAssembly` does what `from_source`, `bind` and `model` do at startup, keeps the recipe, and does it again
+when a file changes. Tool code is Rust and still needs a rebuild (`cargo watch`); `mcp.json` tools are S11.
+
+```rust
+use adam::assembly::LiveAssembly; // feature `dev`
+
+let live = LiveAssembly::builder(adam::assembly::agent_dir("."), model, "coder-large")
+    .tools(tools![PrepareWorkspace, RunChecks])
+    .configure(|def| def.var("repo", "acme/widgets").env("BILLING_TOKEN", token()).remote_timeout(secs(600)))
+    .configure_bound(move |bound| bound.state(env.clone()).wait_poll(secs(5)))
+    .load()?;                                       // a bad first load is a startup error
+let runtime = live.register(Runtime::builder(store)).build(); // stable names, current version
+let _watch = live.watch()?;                        // notify; dropping it stops the watching
+```
+
+`ADAM_AGENT_DIR` replaces the directory the code names (with the feature on); it may name the directory that
+holds `agent/` (or `agents/`), or that directory itself. `AgentDef::from_dir(path)` is the one-shot
+`from_source(&Dir::new(root), Strictness::Lenient)` with the same rule. A store that survives the process
+(the Compose Postgres) lets a restart resume runs; the in-memory store cannot.
+
+```mermaid
+sequenceDiagram
+  participant E as editor
+  participant W as Watch (notify, thread)
+  participant L as LiveAssembly
+  participant G as registry
+  participant R as Runtime worker
+  E->>W: file written
+  W->>W: wait until the files are quiet (debounce)
+  W->>L: reload()
+  L->>L: load, validate, bind, build every agent
+  alt every stage succeeds
+    L->>G: install (one lock, every name)
+    L-->>W: Reloaded (logged)
+  else a stage fails, or a new agent name appears
+    L->>L: keep the registry, keep the error, log each diagnostic
+    L-->>W: ReloadError (logged)
+  end
+  R->>G: step of run X: which version?
+  G-->>R: the run's pinned version, or the newest (and pin it)
+  R->>R: the whole transition with that Arc<LlmAgent>
+  R->>G: the run ended: drop its pin
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Live: load (generation 1)
+  Live --> Loading: a change, once quiet, or reload()
+  Loading --> Live: installed (generation + 1, last_error cleared)
+  Loading --> Refused: a file or bind error, or a new agent name
+  Refused --> Loading: the next change
+  Refused --> Refused: last_error kept, the old version steps every run
+```
+
+**What a reload changes, and when.** Each `step` of a run takes the current `Arc<LlmAgent>` once and makes its
+whole transition with it, so a swap is never seen in the middle of a step, and a running run picks up new
+instructions at its next step. The prompt is not journaled and the model request is rebuilt on every turn, so
+a new prompt, limits, model alias, tool description, `{{var}}` value, wait timer, remote timeout or rotated
+token (the hooks run again, and a re-bind gives a remote tool a fresh client) apply to every run at its next
+step.
+
+**The replay rule.** A run is durable: its journal is keyed by step names (`model:3`, `tool:<call id>`), and a
+transition that is replayed must take the same steps, or it fails with `NonDeterminism`. What would change the
+steps is a change to *which tools exist*. So the tool set of an agent (its tools' names) decides which
+versions may step the same run:
+
+| Reload | Runs already stepped | Runs that start later |
+|---|---|---|
+| same tool set | swap to the new version | the new version |
+| changed tool set | keep the newest version **with the tool set they started with**, until they end | the new version |
+| goes back to an old tool set | the runs on it follow it again | the new version |
+| a new agent name (a new subagent, a renamed root) | *refused as a whole* (`NeedsRestart`): the runtime registers agents once, when it is built | - |
+| an agent removed from the files | it stays registered with its last version (`retired()`), for its runs and for parents on the old tool set | a parent on the new tool set has no tool for it |
+
+A pin is dropped when its run ends (done, failed, or a permanent error). A run that is cancelled while nobody
+steps it leaves a small entry (and its old version) until the process ends; `runs_on_previous_tools()` counts
+the runs that are on a replaced tool set. A restart is a deploy: pins are in memory, and a new process steps
+every run with the files as they are, as a production deploy of new code does.
+
+**An invalid edit.** The old version stays in force for every run. Each diagnostic of the files is logged at
+`error` with its file and line, then `reload refused, keeping the last good version`; `last_error()` returns
+the `ReloadError` (its `diagnostics()` are the loader's findings; a bind error such as an unknown tool is
+`ReloadError::Load(Error::UnknownTool { .. })`). The next good load clears it. Warnings of a load that
+succeeds are logged at `warn` (with `Strictness::Strict` they refuse the load instead).
+
+**The watcher.** `watch()` uses [`notify`](https://crates.io/crates/notify) on `agent/` and `agents/`
+recursively, ignores what cannot have changed a load (reads, access times, so a reload does not trigger the
+next), waits until the files have been quiet for the debounce (150 ms by default; an editor writes in several
+steps), then calls `reload()` on its own thread. A reload reads the disk on the calling thread. There is no
+watcher for `ADAM_AGENT_DIR` itself: it is read once, when the builder is made.
+
+**`notify` (verified 2026-09-29, crates.io API and the manifests in the registry):** version 8.2.0 is the
+current stable release (`9.0.0-rc.5` is a pre-release, not used); licence CC0-1.0 (accepted by `deny.toml`);
+MSRV 1.77; the API used is `recommended_watcher`, `Watcher::watch`, `RecursiveMode::Recursive` and
+`EventKind`. It comes in only through the feature `dev`; the debounce is ours (about 15 lines), so
+`notify-debouncer-mini` is not a dependency.
+
 ## Errors
 
 `Error` is a closed enum; every variant about the files carries an `Origin { agent, file }`, printed as
@@ -343,12 +448,12 @@ place each:
 | S7 skills (built) | the catalog appended to the prompt, `load_skill` and `read_skill_file` added to the tools | `add_skills` in `def.rs`, called while `bind` resolves an agent, so `Node::prompt` and `Node::tools` are final when `BoundDef::build` hands them to `LlmAgent`; the logic is `skills.rs` |
 | S9 subagents (built) | a `SubagentTool` per local child, the name checks, the asks-user refusal | `add_subagent_tools` and `refuse_asking_tools` in `def.rs`, in the same walk; the tool is `subagent.rs` |
 | S9b remote subagents (built) | a `RemoteSubagentTool` per remote child, through the same name checks | `add_subagent_tools` in `def.rs`; `RemoteSubagentTool::bind` and the tool are `remote.rs`; the deployment's choices (`env`, `allow_insecure_remotes`, `remote_timeout`) are `AgentDef` fields passed in as `RemoteSettings` |
-| S10 dev reload | `from_source` + `bind` + `model` again on a changed directory, swapped at a step boundary | a caller of this crate; `AgentDef` and `BoundDef` are plain values, and a remote tool holds only plain values (URL, token, limits) until its first call, so a new bind is a new client |
+| S10 dev reload (built, feature `dev`) | `from_source` + `bind` + `model` again on a changed directory, swapped at a step boundary | `dev.rs`: a `Recipe` (the directory, the `ToolSet`, the model and the hooks that give `AgentDef` and `BoundDef` their values) that a reload runs again from the top; `AgentDef` and `BoundDef` are plain values, and a remote tool holds only plain values (URL, token, limits) until its first call, so a new bind is a new client |
 | S11 MCP tools | the discovered tools go into the `ToolSet` given to `bind`; `linear__*` patterns already match them | `AgentDef::bind`; `AgentDef::env` is where a `${VAR}` in `mcp.json` would read from too |
 
 ## Tests
 
-`cargo test -p adam-assembly --all-features`:
+`cargo test -p adam-assembly --all-features` (and without, for the compile-fail doctests of a build without `dev`):
 
 * `tests/bind.rs`: unknown tool (the message asserted, the suggestion, the subagent's origin), patterns,
   default tool access, duplicate tools; unknown, unused and unset vars, values for undeclared vars and
@@ -387,6 +492,21 @@ place each:
   `a/../../b`, not in the list, `SKILL.md`, a binary file, bad arguments), `preload_skills` (prompt,
   enum, "already loaded", files still readable), a subagent with its own selection, and the embedded
   fixture against the same files read from disk giving equal `AgentInfo`s and equal tool results.
+* `tests/dev.rs` (feature `dev`): a temp directory is edited while a run is parked on a question, and the
+  model request of the run's next step carries the new prompt (memory and PostgreSQL); an unchanged file
+  swaps and reports no change; an invalid edit keeps the old version (the run's next step still has the old
+  prompt), the loader's diagnostic is in `last_error()` and in the captured log, a bind error is refused
+  the same way, and the fix applies and clears the error; a bad first load and a missing directory are
+  startup errors; a changed tool set: a run that has taken a step keeps its tools, prompt and the call it is
+  owed (the removed tool runs for real), a run that starts after the reload gets the new tools, the pin ends
+  with the run, and going back to the old set updates the runs on it; a new subagent is `NeedsRestart` and
+  changes nothing; a removed one stays registered and serves a run; vars and state given by hooks are
+  applied on every load; `remote_timeout` and `wait_poll` are still in force in a version made by a reload
+  (a wait that would otherwise last an hour ends), and a rotated token is the one sent after it; one test
+  with a real `notify` watcher on a temp directory (a burst of writes, a broken file, the fix) and a stop by
+  drop. Unit tests in `dev.rs`: the pin bookkeeping of a slot, the event filter, the directory rules.
+* Without the feature the API does not exist: `compile_fail` doctests in `lib.rs` (and in `adam`), which run
+  when the crate is tested without `--all-features`.
 * `tests/card.rs` (feature `a2a`): the card of the fixture against `tests/golden/card.json`
   (regenerate with `ADAM_UPDATE_GOLDEN=1`), the fallbacks and the missing description, and
   `AgentDef::card` equal to `Assembly::card`.
