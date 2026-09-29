@@ -202,6 +202,31 @@ impl Worker {
     }
 }
 
+/// A clock that stands still until [`advance`](Self::advance)d, for asserting
+/// on exact schedules. It starts a minute ahead of the wall clock so that
+/// timestamps the store stamps in real time (a new run is due at its
+/// `updated_at`) are never in its future.
+#[derive(Clone)]
+struct FrozenClock(Arc<Mutex<chrono::DateTime<chrono::Utc>>>);
+
+impl FrozenClock {
+    fn new() -> Self {
+        let start = adam_core::store::now() + chrono::Duration::minutes(1);
+        Self(Arc::new(Mutex::new(start)))
+    }
+
+    fn advance(&self, by: Duration) {
+        let by = chrono::Duration::from_std(by).expect("in range");
+        *self.0.lock().expect("lock") += by;
+    }
+}
+
+impl Clock for FrozenClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        *self.0.lock().expect("lock")
+    }
+}
+
 async fn wait_for(
     rt: &Runtime,
     run: RunId,
@@ -655,6 +680,11 @@ mod cases {
     }
 
     /// Transient errors retry with growing `wake_at`, then fail.
+    ///
+    /// The clock is frozen, so a scheduled retry stays scheduled until the
+    /// test moves time: each backoff is read from the stored `wake_at` at
+    /// leisure and is exact, instead of sampling a window of `initial` ms
+    /// (150) that a stalled poll on a loaded machine can miss entirely.
     pub async fn retries_back_off_then_fail(store: DynStore) {
         let name = uniq("retry");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -687,38 +717,38 @@ mod cases {
             multiplier: 2.0,
         };
         let sink = CollectingSink::new();
+        let clock = FrozenClock::new();
         let rt = builder(&store, &uniq("w"), &agent)
             .retry(policy)
+            .clock(clock.clone())
             .event_sink(sink.clone())
             .build();
         let run = rt.start(&name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
 
-        // Record the backoff each failed try scheduled.
-        let mut delays: Vec<(u32, i64)> = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let last = loop {
-            let v = rt.view(run).await.expect("view").expect("run");
-            if v.status == RunStatus::Failed {
-                break v;
-            }
-            if let Some(wake_at) = v.wake_at
-                && v.attempt > 0
-                && !delays.iter().any(|(a, _)| *a == v.attempt)
-            {
-                assert_eq!(v.status, RunStatus::Runnable);
-                delays.push((v.attempt, (wake_at - v.updated_at).num_milliseconds()));
-            }
-            assert!(Instant::now() < deadline, "timed out: {v:#?}");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
+        // After each failed try the run waits, runnable, for its backoff to
+        // pass. Time is frozen, so `wake_at - now` is exactly that backoff,
+        // and the run cannot be tried again before the test advances time.
+        let mut delays: Vec<i64> = Vec::new();
+        for failed_tries in 1..=2u32 {
+            let v = wait_for(&rt, run, "a retry is scheduled", |v| {
+                v.attempt == failed_tries && v.wake_at.is_some()
+            })
+            .await;
+            assert_eq!(v.status, RunStatus::Runnable);
+            let delay = v.wake_at.expect("wake_at") - clock.now();
+            assert_eq!(
+                count(&calls),
+                failed_tries as usize,
+                "not tried again before its backoff has passed"
+            );
+            delays.push(delay.num_milliseconds());
+            clock.advance(delay.to_std().expect("a backoff in the future"));
+        }
+        let last = wait_for(&rt, run, "gave up", |v| v.status == RunStatus::Failed).await;
         worker.stop().await;
 
-        assert_eq!(delays.len(), 2, "two retries were scheduled: {delays:?}");
-        let (d1, d2) = (delays[0].1, delays[1].1);
-        assert!((60..=150).contains(&d1), "first backoff ~150ms, got {d1}");
-        assert!((210..=300).contains(&d2), "second backoff ~300ms, got {d2}");
-        assert!(d2 > d1 + 60, "backoff must grow: {d1} then {d2}");
+        assert_eq!(delays, [150, 300], "two retries with doubling backoff");
         assert_eq!(last.attempt, 3);
         let error = last.error.expect("error");
         assert!(
