@@ -344,6 +344,7 @@ pub(crate) fn classify(command: &str, code: Option<i32>, stderr: &str) -> Worksp
         "early eof",
         "rpc failed",
         "returned error: 5",
+        "returned error: 429",
         "the remote end hung up",
         "tls connection",
         "ssl_",
@@ -430,6 +431,10 @@ mod tests {
             ),
             (
                 "fatal: unable to access 'x': The requested URL returned error: 503",
+                "transient",
+            ),
+            (
+                "fatal: unable to access 'x': The requested URL returned error: 429",
                 "transient",
             ),
             ("fatal: something odd", "git"),

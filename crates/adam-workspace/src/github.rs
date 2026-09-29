@@ -101,9 +101,10 @@ impl GitHub {
         let pulls: Vec<ApiPull> = resp.json().await.map_err(|e| decode_error(e, token))?;
         // The API filters by `owner:branch`; double-check the branch so a
         // lenient server (or mock) cannot make us return somebody else's PR.
+        // A PR without a `head` cannot be proven to be ours, so it never matches.
         Ok(pulls
             .into_iter()
-            .find(|p| p.head.as_ref().is_none_or(|h| h.branch == branch))
+            .find(|p| p.head.as_ref().is_some_and(|h| h.branch == branch))
             .map(|p| p.into_pull_request(branch)))
     }
 }
@@ -208,14 +209,16 @@ fn transport(e: reqwest::Error, token: &SecretString) -> WorkspaceError {
     WorkspaceError::Transient(scrub(&e.without_url().to_string(), token))
 }
 
+/// A 2xx response whose body does not decode: usually a truncated or
+/// proxy-mangled response, so it is worth retrying.
 fn decode_error(e: reqwest::Error, token: &SecretString) -> WorkspaceError {
-    WorkspaceError::Http {
-        status: 200,
-        message: scrub(
-            &format!("unexpected response body: {}", e.without_url()),
-            token,
+    WorkspaceError::Transient(scrub(
+        &format!(
+            "code host sent a success status with an unreadable body: {}",
+            e.without_url()
         ),
-    }
+        token,
+    ))
 }
 
 /// Pass 2xx responses through, map everything else to a [`WorkspaceError`].

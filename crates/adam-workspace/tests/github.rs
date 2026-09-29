@@ -378,3 +378,39 @@ async fn local_repositories_are_not_github_repositories() {
     assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_listed_pull_request_without_a_head_never_matches() {
+    let server = MockServer::start().await;
+    list_mock("agent/018f3a2b")
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "number": 3,
+            "html_url": "https://github.com/octo/widgets/pull/3",
+            "state": "open",
+        }])))
+        .mount(&server)
+        .await;
+
+    let found = client(&server)
+        .find_pull_request(&repo(), "agent/018f3a2b")
+        .await
+        .unwrap();
+    assert_eq!(found, None);
+}
+
+#[tokio::test]
+async fn an_unreadable_success_body_is_transient() {
+    let server = MockServer::start().await;
+    list_mock("agent/018f3a2b")
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>proxy</html>"))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .find_pull_request(&repo(), "agent/018f3a2b")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::Transient(_)), "{err:?}");
+    assert!(err.is_retryable());
+    assert!(!err.to_string().contains(TOKEN));
+}
