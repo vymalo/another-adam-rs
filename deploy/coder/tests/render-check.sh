@@ -100,6 +100,11 @@ helm template coder "$chart" --namespace coder-ns --set config.role=control-plan
   --set externalSecrets.properties.modelApiKey=null \
   --set externalSecrets.properties.githubToken=null > "$out"
 check "a control plane renders without the two worker secret properties" lacks "$secrets_of_workers"
+# The binary trims and case-folds ROLE, so the chart must too.
+helm template coder "$chart" --namespace coder-ns --set-string 'config.role= Control-Plane ' \
+  --set externalSecrets.properties.modelApiKey=null \
+  --set externalSecrets.properties.githubToken=null > "$out"
+check "a padded, mixed-case control-plane role is a control plane too" lacks "$model_and_github"
 
 # The roles that run workers keep all of it, and their two secrets are required.
 for role in "" all worker; do
