@@ -35,6 +35,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use adam_error::{Classify, report};
 use adam_llm_agent::{DynTool, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
 use adam_workspace::{DynCodeHost, GitIdentity, WorkspaceError, Workspaces, Worktree};
@@ -243,10 +244,13 @@ pub(crate) fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// A workspace failure as a tool error: worth retrying, or a report to the
 /// model.
 pub(crate) fn workspace_error(e: &WorkspaceError) -> ToolError {
+    // The tool error is journaled and shown to the model: a boundary, so the chain is flattened
+    // here, once.
+    let text = report(e);
     if e.is_retryable() {
-        ToolError::Transient(e.to_string())
+        ToolError::Transient(text)
     } else {
-        ToolError::Permanent(e.to_string())
+        ToolError::Permanent(text)
     }
 }
 

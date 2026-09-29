@@ -244,7 +244,7 @@ impl Workspaces {
     /// * [`WorkspaceError::Corrupt`]: the worktree path exists but is not a
     ///   worktree of this mirror; call [`Workspaces::remove`].
     /// * network and auth failures from `git fetch` (see
-    ///   [`WorkspaceError::is_retryable`]).
+    ///   [`Classify::is_retryable`](adam_error::Classify::is_retryable)).
     #[tracing::instrument(skip(self, repo), fields(repo = %repo.url, run = %run))]
     pub async fn prepare(&self, repo: &RepoRef, run: &str) -> WorkspaceResult<Worktree> {
         validate_run(run)?;

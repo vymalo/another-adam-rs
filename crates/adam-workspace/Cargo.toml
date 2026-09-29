@@ -16,6 +16,7 @@ github = ["dep:reqwest"]
 test-util = []
 
 [dependencies]
+adam-error.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 reqwest = { workspace = true, optional = true }

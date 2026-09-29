@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use adam_error::{Classify, ErrorClass};
 use adam_workspace::{
     CodeHost, GitHub, NewPullRequest, PullRequest, RepoRef, StaticToken, WorkspaceError,
 };
@@ -253,7 +254,7 @@ async fn maps_http_errors_to_workspace_errors() {
     for status in [500, 502, 503] {
         let err = open_with(status, json!({"message": "boom"})).await;
         assert!(
-            matches!(err, WorkspaceError::Transient(_)),
+            matches!(err, WorkspaceError::Transient { .. }),
             "{status}: {err:?}"
         );
         assert!(err.is_retryable());
@@ -288,7 +289,7 @@ async fn errors_on_the_probe_are_mapped_too() {
 }
 
 #[tokio::test]
-async fn rate_limiting_is_transient_and_forbidden_is_auth() {
+async fn rate_limiting_is_rate_limited_and_forbidden_is_auth() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(query_param("head", "octo:agent/limited"))
@@ -312,6 +313,7 @@ async fn rate_limiting_is_transient_and_forbidden_is_auth() {
         .await
         .unwrap_err();
     assert!(err.is_retryable(), "{err:?}");
+    assert_eq!(err.class(), ErrorClass::RateLimited, "{err:?}");
     let err = gh
         .find_pull_request(&repo(), "agent/forbidden")
         .await
@@ -411,7 +413,58 @@ async fn an_unreadable_success_body_is_transient() {
         .find_pull_request(&repo(), "agent/018f3a2b")
         .await
         .unwrap_err();
-    assert!(matches!(err, WorkspaceError::Transient(_)), "{err:?}");
+    assert!(matches!(err, WorkspaceError::Transient { .. }), "{err:?}");
     assert!(err.is_retryable());
     assert!(!err.to_string().contains(TOKEN));
+}
+
+#[tokio::test]
+async fn a_429_carries_the_retry_after_the_host_sent() {
+    let server = MockServer::start().await;
+    list_mock("agent/slow")
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "7")
+                .set_body_json(json!({"message": "slow down"})),
+        )
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .find_pull_request(&repo(), "agent/slow")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::RateLimited { .. }), "{err:?}");
+    assert_eq!(err.class(), ErrorClass::RateLimited);
+    assert!(err.is_retryable());
+    assert_eq!(err.retry_after(), Some(std::time::Duration::from_secs(7)));
+}
+
+#[tokio::test]
+async fn a_rate_limit_without_retry_after_has_none() {
+    let server = MockServer::start().await;
+    list_mock("agent/quiet")
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .find_pull_request(&repo(), "agent/quiet")
+        .await
+        .unwrap_err();
+    assert_eq!(err.class(), ErrorClass::RateLimited);
+    assert_eq!(err.retry_after(), None);
+}
+
+#[tokio::test]
+async fn a_transport_failure_keeps_the_reqwest_error_as_its_source() {
+    let gh = GitHub::new(Arc::new(StaticToken::new(TOKEN)))
+        .unwrap()
+        .with_api_base("http://127.0.0.1:1");
+    let err = gh.find_pull_request(&repo(), "agent/x").await.unwrap_err();
+    assert_eq!(err.class(), ErrorClass::Transient, "{err:?}");
+    let source = std::error::Error::source(&err).expect("a transport source");
+    assert!(
+        source.downcast_ref::<reqwest::Error>().is_some(),
+        "{source:?}"
+    );
+    assert!(!adam_error::report(&err).contains(TOKEN));
 }

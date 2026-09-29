@@ -206,19 +206,20 @@ fn split_head<'a>(default_owner: &'a str, head: &'a str) -> (&'a str, &'a str) {
 }
 
 fn transport(e: reqwest::Error, token: &SecretString) -> WorkspaceError {
-    WorkspaceError::Transient(scrub(&e.without_url().to_string(), token))
+    // `without_url` drops the only place a request can name a secret; the token itself travels
+    // in a header, which reqwest errors never print.
+    let e = e.without_url();
+    WorkspaceError::transient(scrub("code host request failed", token)).with_source(e)
 }
 
 /// A 2xx response whose body does not decode: usually a truncated or
 /// proxy-mangled response, so it is worth retrying.
 fn decode_error(e: reqwest::Error, token: &SecretString) -> WorkspaceError {
-    WorkspaceError::Transient(scrub(
-        &format!(
-            "code host sent a success status with an unreadable body: {}",
-            e.without_url()
-        ),
+    WorkspaceError::transient(scrub(
+        "code host sent a success status with an unreadable body",
         token,
     ))
+    .with_source(e.without_url())
 }
 
 /// Pass 2xx responses through, map everything else to a [`WorkspaceError`].
@@ -232,22 +233,53 @@ async fn check(resp: Response, token: &SecretString) -> WorkspaceResult<Response
             .headers()
             .get("x-ratelimit-remaining")
             .is_some_and(|v| v == "0");
+    let retry_after = rate_limited
+        .then(|| retry_after(resp.headers(), std::time::SystemTime::now()))
+        .flatten();
     let body = resp.text().await.unwrap_or_default();
     let message = scrub(&api_message(&body), token);
     Err(match status {
         StatusCode::UNAUTHORIZED => WorkspaceError::Auth(message),
-        _ if rate_limited && status == StatusCode::FORBIDDEN => WorkspaceError::Transient(message),
+        _ if rate_limited
+            && matches!(
+                status,
+                StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+            ) =>
+        {
+            WorkspaceError::RateLimited { retry_after }
+        }
         StatusCode::FORBIDDEN => WorkspaceError::Auth(message),
         StatusCode::NOT_FOUND => WorkspaceError::NotFound(message),
         StatusCode::UNPROCESSABLE_ENTITY => WorkspaceError::Invalid(message),
-        s if s.is_server_error() || s == StatusCode::TOO_MANY_REQUESTS => {
-            WorkspaceError::Transient(format!("HTTP {}: {message}", s.as_u16()))
+        s if s.is_server_error() => {
+            WorkspaceError::transient(format!("HTTP {}: {message}", s.as_u16()))
         }
         s => WorkspaceError::Http {
             status: s.as_u16(),
             message,
         },
     })
+}
+
+/// The longest wait a rate-limited response can ask for; a larger value is a broken header.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
+
+/// How long the host asked us to wait: `Retry-After` in seconds, else the moment its rate limit
+/// resets (`x-ratelimit-reset`, epoch seconds) minus `now`. `None` when it said neither.
+fn retry_after(
+    headers: &reqwest::header::HeaderMap,
+    now: std::time::SystemTime,
+) -> Option<Duration> {
+    let number =
+        |name: &str| -> Option<u64> { headers.get(name)?.to_str().ok()?.trim().parse().ok() };
+    let wait = match number("retry-after") {
+        Some(secs) => Duration::from_secs(secs),
+        None => {
+            let reset = std::time::UNIX_EPOCH + Duration::from_secs(number("x-ratelimit-reset")?);
+            reset.duration_since(now).unwrap_or_default()
+        }
+    };
+    Some(wait.min(MAX_RETRY_AFTER))
 }
 
 /// GitHub's `{"message": .., "errors": [{"message": .., "code": ..}]}`
@@ -298,5 +330,52 @@ fn scrub(text: &str, token: &SecretString) -> String {
         text.to_owned()
     } else {
         text.replace(secret, "[REDACTED]")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn retry_after_prefers_the_header_then_the_reset_time() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "7")]), now),
+            Some(Duration::from_secs(7))
+        );
+        // Retry-After wins over the reset time.
+        assert_eq!(
+            retry_after(
+                &headers(&[("retry-after", "7"), ("x-ratelimit-reset", "1090")]),
+                now
+            ),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            retry_after(&headers(&[("x-ratelimit-reset", "1090")]), now),
+            Some(Duration::from_secs(90))
+        );
+        // A reset in the past is "now", not an underflow.
+        assert_eq!(
+            retry_after(&headers(&[("x-ratelimit-reset", "900")]), now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(retry_after(&headers(&[]), now), None);
+        assert_eq!(retry_after(&headers(&[("retry-after", "soon")]), now), None);
+        // A broken header cannot park a run for a day.
+        assert_eq!(
+            retry_after(&headers(&[("retry-after", "86400")]), now),
+            Some(MAX_RETRY_AFTER)
+        );
     }
 }

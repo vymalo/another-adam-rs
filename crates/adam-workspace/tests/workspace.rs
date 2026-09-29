@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use adam_error::Classify;
 use adam_workspace::{
     FileStatus, GitCredentials, GitIdentity, RepoRef, ScopedToken, StaticToken, WorkspaceError,
     Workspaces,

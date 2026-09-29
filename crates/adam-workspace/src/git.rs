@@ -289,7 +289,7 @@ impl GitCmd {
             .map_err(|e| WorkspaceError::io(format!("cannot run git {sub}"), e))?;
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Err(_) => {
-                return Err(WorkspaceError::Transient(format!(
+                return Err(WorkspaceError::transient(format!(
                     "git {sub} timed out after {}s",
                     timeout.as_secs()
                 )));
@@ -349,7 +349,7 @@ pub(crate) fn classify(command: &str, code: Option<i32>, stderr: &str) -> Worksp
         "tls connection",
         "ssl_",
     ]) {
-        WorkspaceError::Transient(message)
+        WorkspaceError::transient(message)
     } else {
         WorkspaceError::Git {
             command: command.to_owned(),
@@ -444,7 +444,7 @@ mod tests {
                 WorkspaceError::Auth(_) => "auth",
                 WorkspaceError::NotFound(_) => "not_found",
                 WorkspaceError::Invalid(_) => "invalid",
-                WorkspaceError::Transient(_) => "transient",
+                WorkspaceError::Transient { .. } => "transient",
                 WorkspaceError::Git { .. } => "git",
                 other => panic!("unexpected {other:?}"),
             };

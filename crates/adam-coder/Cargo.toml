@@ -21,6 +21,7 @@ adam-a2a = { path = "../adam-a2a", version = "0.1.0" }
 adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0" }
 adam-acp = { path = "../adam-acp", version = "0.1.0" }
 adam-core.workspace = true
+adam-error.workspace = true
 adam-llm-agent = { path = "../adam-llm-agent", version = "0.1.0" }
 adam-model.workspace = true
 adam-model-openai = { path = "../adam-model-openai", version = "0.1.0" }

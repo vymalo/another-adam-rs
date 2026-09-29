@@ -161,6 +161,7 @@ dependencies = [
  "adam-a2a-runtime",
  "adam-acp",
  "adam-core",
+ "adam-error",
  "adam-llm-agent",
  "adam-model",
  "adam-model-openai",
@@ -328,6 +329,7 @@ dependencies = [
 name = "adam-workspace"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "adam-workspace",
  "async-trait",
  "base64 0.22.1",
