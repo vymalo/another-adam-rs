@@ -411,6 +411,97 @@ async fn dropping_the_client_kills_the_child() {
     assert!(wait_gone(pid).await, "child {pid} survived the client");
 }
 
+/// The agent ignores `session/cancel` (a hung tool, a bug), so only killing
+/// it stops the turn. `kill` must take the agent *and* what it started (the
+/// shell commands of a real coding agent live in the agent's process group)
+/// and must not return before the agent is reaped.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn kill_stops_a_stubborn_agent_its_children_and_reaps_it() {
+    let dir = root();
+    let pid_file = dir.path().join("agent.pid");
+    let child_file = dir.path().join("child.pid");
+    let cmd = fake(dir.path(), "stubborn")
+        .env("FAKE_ACP_PID_FILE", pid_file.display().to_string())
+        .env("FAKE_ACP_CHILD_PID_FILE", child_file.display().to_string());
+    let (client, session) = start(cmd, ClientPolicy::new(dir.path()), dir.path()).await;
+    let agent = read_pid(&pid_file);
+    let mut turn = session.prompt("never finish".into());
+    assert_eq!(within(turn.next()).await.unwrap().unwrap(), text("working"));
+    let grandchild = read_pid(&child_file);
+    assert!(!process_gone(grandchild), "the agent's child should run");
+
+    // A cancel is only a request: this agent does not honour it.
+    within(session.cancel()).await.expect("cancel is sent");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), turn.next())
+            .await
+            .is_err(),
+        "the stubborn agent ended its turn"
+    );
+
+    within(client.kill()).await.expect("kill");
+    assert!(
+        std::fs::metadata(format!("/proc/{agent}")).is_err(),
+        "the agent {agent} must be reaped (not even a zombie) when kill returns"
+    );
+    assert!(
+        wait_gone(grandchild).await,
+        "the agent's child {grandchild} survived"
+    );
+    // The turn ends with an error rather than hanging.
+    let rest = collect(turn).await;
+    assert!(
+        matches!(rest.as_slice(), [Err(AcpError::Exited { .. })]),
+        "{rest:?}"
+    );
+}
+
+/// Dropping the client (the coder's tool being dropped, a panic) also takes
+/// the agent's process group with it, not only the agent.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropping_the_client_kills_the_agents_children_too() {
+    let dir = root();
+    let pid_file = dir.path().join("agent.pid");
+    let child_file = dir.path().join("child.pid");
+    let cmd = fake(dir.path(), "slow")
+        .env("FAKE_ACP_PID_FILE", pid_file.display().to_string())
+        .env("FAKE_ACP_CHILD_PID_FILE", child_file.display().to_string());
+    let (client, session) = start(cmd, ClientPolicy::new(dir.path()), dir.path()).await;
+    let agent = read_pid(&pid_file);
+    let mut turn = session.prompt("busy".into());
+    assert_eq!(within(turn.next()).await.unwrap().unwrap(), text("working"));
+    let grandchild = read_pid(&child_file);
+    drop(turn);
+    drop(session);
+    drop(client);
+    assert!(wait_gone(agent).await, "agent {agent} survived the client");
+    assert!(
+        wait_gone(grandchild).await,
+        "its child {grandchild} survived"
+    );
+}
+
+/// `kill` on an agent that already died reports how it died, like `shutdown`.
+#[tokio::test]
+async fn kill_after_a_crash_reports_the_exit() {
+    let dir = root();
+    let (client, session) = start(
+        fake(dir.path(), "crash"),
+        ClientPolicy::new(dir.path()),
+        dir.path(),
+    )
+    .await;
+    let items = collect(session.prompt("boom".into())).await;
+    assert!(items.last().is_some_and(Result::is_err), "{items:?}");
+    let err = within(client.kill()).await.unwrap_err();
+    assert!(
+        matches!(err, AcpError::Exited { code: Some(3), .. }),
+        "{err:?}"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn graceful_shutdown_lets_the_child_exit() {

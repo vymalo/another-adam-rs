@@ -13,6 +13,7 @@
 //! |---|---|
 //! | `script` | thought, two text chunks, a plan, a tool call, a permission request (locations: `FAKE_ACP_PERM_LOCATION`, default `<cwd>/inside.txt`), `fs/write_text_file` of `<cwd>/inside.txt`, another write to `FAKE_ACP_OUTSIDE_PATH` (if set), a `terminal/create` probe, tool call update, `end_turn` |
 //! | `slow` | one text chunk, then waits for `session/cancel` and ends with `cancelled` |
+//! | `stubborn` | one text chunk, then never ends the turn and ignores `session/cancel`: only killing the process stops it |
 //! | `crash` | one text chunk, writes to stderr, exits with code 3 |
 //! | `write-file` | writes `FAKE_ACP_WRITE_CONTENT` to `FAKE_ACP_WRITE_PATH` (relative paths are joined to the session cwd) through `fs/write_text_file`, then `end_turn`. With `FAKE_ACP_WRITE_PERMISSION=1` it asks permission first |
 //! | `hang-init` | never answers `initialize` |
@@ -23,6 +24,11 @@
 //! | `crash-once` | like `crash` if the marker file `FAKE_ACP_ONCE_FILE` does not exist (it is created first), like `write-file` afterwards: "crashes once, then works" across process restarts |
 //!
 //! `FAKE_ACP_PID_FILE`, if set, receives the process id at `initialize`.
+//!
+//! `FAKE_ACP_CHILD_PID_FILE`, if set, makes the `slow` and `stubborn` turns
+//! start a `sleep 600` child (in the agent's own process group, like the shell
+//! commands a real coding agent runs) and receives its process id: what a
+//! client must also clean up when it kills the agent.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -184,9 +190,15 @@ async fn run_turn(
     match scenario().as_str() {
         "slow" => {
             let cancelled = cancel.notified(); // register before announcing
+            start_child();
             say(cx, &sid, "working")?;
             cancelled.await;
             Ok(PromptResponse::new(StopReason::Cancelled))
+        }
+        "stubborn" => {
+            start_child();
+            say(cx, &sid, "working")?;
+            std::future::pending().await
         }
         "crash" => crash(cx, &sid).await,
         "crash-once" => {
@@ -227,6 +239,23 @@ async fn run_turn(
         }
         "write-file" => write_file_turn(cx, &sid, &cwd).await,
         _ => script_turn(cx, &sid, &cwd).await,
+    }
+}
+
+/// The `FAKE_ACP_CHILD_PID_FILE` child: a long sleep that outlives the agent
+/// unless someone kills it.
+fn start_child() {
+    let Some(file) = env("FAKE_ACP_CHILD_PID_FILE") else {
+        return;
+    };
+    let spawned = std::process::Command::new("sleep")
+        .arg("600")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Ok(child) = spawned {
+        let _ = std::fs::write(file, child.id().to_string());
     }
 }
 
