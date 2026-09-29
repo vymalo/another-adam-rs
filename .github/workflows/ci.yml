@@ -1,15 +1,34 @@
 name: ci
 
+# Push to main and every pull request: not both on every branch push. A newer
+# push to a pull request cancels the run it supersedes; runs on main finish.
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # Line coverage gate of the coverage job. Measured 89.2% on 2026-09-29 with
+  # cargo-llvm-cov 0.6.21 (workspace, Postgres, no MongoDB: adam-store-mongodb's
+  # 273 lines counted as uncovered, so CI with MongoDB reads higher), gated at
+  # measured minus 2. Raise it whenever coverage rises, never lower it to get a
+  # change through.
+  COVERAGE_MIN_LINES: "87"
+  # Not coverage: fake agent binary and the test code itself.
+  COVERAGE_IGNORE: '(adam-acp-fake-agent|/tests/)'
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -17,10 +36,45 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # nextest does not run doctests; the database suites are not needed here.
+      - run: cargo test --workspace --doc --locked
+
+  # The oldest toolchain the workspace promises to build with (`rust-version`
+  # in Cargo.toml; keep the two in step).
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
+
+  # Licenses, advisories, banned and unknown sources: see deny.toml.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # Every workflow file parses and is type-correct; shell in `run:` is shellchecked.
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
 
   conformance:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -40,15 +94,83 @@ jobs:
       mongodb:
         image: mongo:${{ matrix.mongodb }}
         ports: ["27017:27017"]
+    env:
+      ADAM_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/adam_test
+      ADAM_TEST_MONGODB_URI: mongodb://localhost:27017
+      # A database suite that would skip (variable unset) fails instead: see
+      # adam_core::testing. Without this, a typo here turns the suites green.
+      ADAM_TEST_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Conformance (memory, Postgres, MongoDB)
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Tests (memory, Postgres, MongoDB, coder end to end)
+        run: cargo nextest run --workspace --locked --profile ci
+      # Run the database suites a second time: this pass exercises migrate() on
+      # an existing schema. The offline suites (coder end to end) do not repeat.
+      - name: Database suites again, on the migrated schema
+        run: >-
+          cargo nextest run --locked --profile ci
+          -p adam-store-postgres -p adam-store-mongodb -p adam-runtime -p adam-a2a-runtime
+
+  # Line coverage of the whole workspace against the newest servers. The lcov
+  # file is an artifact; the summary is on the run page; the gate ratchets.
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17
         env:
-          ADAM_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/adam_test
-          ADAM_TEST_MONGODB_URI: mongodb://localhost:27017
-        # Run twice: the second pass exercises migrate() on an existing schema.
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: adam_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+      mongodb:
+        image: mongo:8.0
+        ports: ["27017:27017"]
+    env:
+      ADAM_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/adam_test
+      ADAM_TEST_MONGODB_URI: mongodb://localhost:27017
+      ADAM_TEST_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest,cargo-llvm-cov
+      - name: Run the tests instrumented
+        run: >-
+          cargo llvm-cov nextest --workspace --locked --profile ci
+          --ignore-filename-regex "$COVERAGE_IGNORE" --no-report
+      - name: lcov report
+        run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$COVERAGE_IGNORE"
+      - name: Summary and gate
         run: |
-          cargo test --workspace
-          cargo test --workspace
+          cargo llvm-cov report --summary-only --ignore-filename-regex "$COVERAGE_IGNORE" | tee summary.txt
+          {
+            echo "### Coverage"
+            echo
+            echo '```'
+            cat summary.txt
+            echo '```'
+            echo
+            echo "Gate: line coverage >= ${COVERAGE_MIN_LINES}%."
+          } >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE" \
+            --fail-under-lines "$COVERAGE_MIN_LINES" > /dev/null
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lcov
+          path: |
+            lcov.info
+            summary.txt
+          if-no-files-found: ignore

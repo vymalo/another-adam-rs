@@ -39,6 +39,10 @@ check "fsGroupChangePolicy is OnRootMismatch" has 'fsGroupChangePolicy: OnRootMi
 check "runs as uid 10001, non-root" has 'runAsUser: 10001'
 check "the PVC is on longhorn and mounted at /work" has 'storageClassName: "longhorn"'
 check "/work is the workspace root" has 'mountPath: /work'
+grace() { # the pod gets at least 60 s to finish in-flight steps after SIGTERM
+  awk '/terminationGracePeriodSeconds:/ { print ($2 >= 60) ? "ok" : "short"; found = 1 } END { if (!found) print "missing" }' "$out" | grep -qx ok
+}
+check "terminationGracePeriodSeconds is at least 60" grace
 check "liveness, readiness and startup probes use /healthz" count 'path: /healthz' 3
 check "a CNPG Cluster exists" has '^kind: Cluster$'
 check "DATABASE_URL comes from the CNPG app secret" has 'name: coder-db-app'
@@ -69,4 +73,4 @@ helm template coder "$chart" --namespace coder-ns \
 check "the repository allowlist is values-driven and comma-joined" has 'value: "github.com,ghe.example.com:8443"'
 check "the GitHub API URL is values-driven" has 'value: "https://ghe.example.com/api/v3"'
 
-[ "$fail" -eq 0 ] && echo "render checks passed" || { echo "render checks FAILED"; exit 1; }
+if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

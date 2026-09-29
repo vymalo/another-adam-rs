@@ -1,0 +1,15 @@
+# cargo-nextest configuration. `cargo nextest run` uses the default profile;
+# CI uses `--profile ci`.
+
+[profile.default]
+# Fail a hung test instead of waiting for the job timeout.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[profile.ci]
+retries = 0
+fail-fast = false
+# The coder end-to-end tests build a fake agent with a nested cargo (slow on a
+# cold, instrumented build): flag a test after 60 s, kill it after 5 minutes.
+slow-timeout = { period = "60s", terminate-after = 5 }
+status-level = "slow"
+final-status-level = "fail"
