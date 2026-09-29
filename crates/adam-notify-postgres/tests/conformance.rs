@@ -84,3 +84,53 @@ async fn an_event_at_the_size_limit_crosses_and_one_byte_more_does_not() {
         "the oversize one is skipped, the rest arrive in order"
     );
 }
+
+/// What is still queued when `run` stops goes out before `run` returns: here
+/// the items are queued before `run` starts and `stop` is already resolved, so
+/// only the drain can send them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn items_queued_at_stop_are_drained() {
+    use adam_runtime::{Delivery, Notifier, Signal};
+    use futures::StreamExt;
+
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let prefix = format!("adam_n{}_", &Uuid::new_v4().simple().to_string()[..8]);
+    let listening = side(&url, &prefix).await;
+    let mut on_listening = listening.notifier.subscribe();
+
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .expect("connect");
+    let stopping = PgNotify::new(pool, BroadcastSink::default())
+        .with_channel_prefix(&prefix)
+        .expect("prefix");
+    let sent: Vec<Signal> = (0..3)
+        .map(|_| Signal::Finished {
+            run: adam_core::RunId::new(),
+        })
+        .collect();
+    let notifier = stopping.notifier();
+    for signal in &sent {
+        notifier.publish(signal.clone()).await;
+    }
+    stopping
+        .run(std::future::ready(()))
+        .await
+        .expect("a stopped run is Ok");
+
+    let mut got = Vec::new();
+    while got.len() < sent.len() {
+        let delivery = tokio::time::timeout(std::time::Duration::from_secs(5), on_listening.next())
+            .await
+            .expect("the drained signals arrive in time")
+            .expect("open");
+        if let Delivery::Signal(signal) = delivery {
+            got.push(signal);
+        }
+    }
+    assert_eq!(got, sent, "every queued signal arrives, in order");
+}

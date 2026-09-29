@@ -55,7 +55,6 @@
 mod error;
 mod wire;
 
-use std::convert::Infallible;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -73,6 +72,10 @@ use crate::wire::{Encoded, EventIn, SignalIn, WIRE_VERSION, encode_event, encode
 
 pub use crate::error::NotifyError;
 pub use crate::wire::MAX_PAYLOAD_BYTES;
+
+/// How long [`PgNotify::run`] keeps sending the items still queued when its
+/// `stop` resolves.
+pub const DRAIN_ON_STOP: Duration = Duration::from_secs(2);
 
 /// Channel-name prefix unless [`PgNotify::with_channel_prefix`] says otherwise.
 const DEFAULT_PREFIX: &str = "adam_";
@@ -218,17 +221,25 @@ impl PgNotify {
     /// a clone), and with [`NotifyError::PoolClosed`] once the pool is closed.
     ///
     /// The listener holds one connection of the pool for as long as this
-    /// runs. Items still queued when `stop` resolves are not sent.
+    /// runs. When `stop` resolves, the `pg_notify` in flight completes and the
+    /// items still queued are sent for up to [`DRAIN_ON_STOP`] before `run`
+    /// returns, so the events of a step that ended just before the stop still
+    /// go out; what cannot be sent in that time is dropped (best effort, like
+    /// any notification).
     pub async fn run(&self, stop: impl Future<Output = ()> + Send) -> Result<(), NotifyError> {
         let inner = &*self.inner;
         let mut outbox = inner.take_outbox()?;
-        let publisher = inner.publish_loop(outbox.receiver());
-        let listener = inner.listen_loop(stop);
-        tokio::pin!(publisher, listener);
-        tokio::select! {
-            result = &mut listener => result,
-            never = &mut publisher => match never {},
-        }
+        // The listener ends the run; the publisher notices between two items
+        // (never in the middle of a `pg_notify`) and then drains the queue.
+        let (stopped_tx, stopped_rx) = watch::channel(false);
+        let listener = async {
+            let result = inner.listen_loop(stop).await;
+            stopped_tx.send_replace(true);
+            result
+        };
+        let (result, ()) =
+            tokio::join!(listener, inner.publish_loop(outbox.receiver(), stopped_rx));
+        result
     }
 }
 
@@ -290,28 +301,64 @@ impl Inner {
         }
     }
 
-    /// Send queued items, one `pg_notify` at a time, in order.
-    async fn publish_loop(&self, outbox: &mut mpsc::Receiver<Outgoing>) -> Infallible {
+    /// Send queued items, one `pg_notify` at a time, in order, until `stopped`;
+    /// then send what is left for at most [`DRAIN_ON_STOP`]. A send is never
+    /// cut short by the stop: it runs in the arm, after the `select!`.
+    async fn publish_loop(
+        &self,
+        outbox: &mut mpsc::Receiver<Outgoing>,
+        mut stopped: watch::Receiver<bool>,
+    ) {
         loop {
-            let Some(item) = outbox.recv().await else {
-                // The sender lives in `self`; unreachable, but never spin.
-                std::future::pending().await
-            };
-            let channel = if item.signals {
-                &self.signals_channel
-            } else {
-                &self.events_channel
-            };
-            let sent = sqlx::query("SELECT pg_notify($1, $2)")
-                .bind(channel)
-                .bind(&item.payload)
-                .execute(&self.pool)
-                .await;
-            if let Err(e) = sent {
-                let n = self.failed.fetch_add(1, Relaxed) + 1;
-                if should_log(n) {
-                    tracing::warn!(error = %e, failed = n, "pg_notify failed, dropping (best effort)");
-                }
+            tokio::select! {
+                biased;
+                // Drop the watch guard inside, so the future stays `Send`.
+                () = async { drop(stopped.wait_for(|stopped| *stopped).await); } => break,
+                item = outbox.recv() => match item {
+                    Some(item) => self.send(item).await,
+                    // The sender lives in `self`; unreachable, but never spin.
+                    None => break,
+                },
+            }
+        }
+        self.drain(outbox, DRAIN_ON_STOP).await;
+    }
+
+    /// Send what is already queued, in order, for at most `within`.
+    async fn drain(&self, outbox: &mut mpsc::Receiver<Outgoing>, within: Duration) {
+        let sending = async {
+            let mut sent = 0_usize;
+            while let Ok(item) = outbox.try_recv() {
+                self.send(item).await;
+                sent += 1;
+            }
+            sent
+        };
+        match tokio::time::timeout(within, sending).await {
+            Ok(0) => {}
+            Ok(sent) => tracing::debug!(sent, "sent the notifications queued at stop"),
+            Err(_) => tracing::warn!(
+                "stopped before every queued notification was sent, dropping the rest (best effort)"
+            ),
+        }
+    }
+
+    /// One `pg_notify`; a failure drops the item.
+    async fn send(&self, item: Outgoing) {
+        let channel = if item.signals {
+            &self.signals_channel
+        } else {
+            &self.events_channel
+        };
+        let sent = sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(channel)
+            .bind(&item.payload)
+            .execute(&self.pool)
+            .await;
+        if let Err(e) = sent {
+            let n = self.failed.fetch_add(1, Relaxed) + 1;
+            if should_log(n) {
+                tracing::warn!(error = %e, failed = n, "pg_notify failed, dropping (best effort)");
             }
         }
     }

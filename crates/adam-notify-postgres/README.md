@@ -111,7 +111,9 @@ stateDiagram-v2
   drains the queue in order with `SELECT pg_notify($1, $2)` on the pool, one at a
   time, so one process's notifications keep their order (and `NOTIFY` delivers
   in commit order). A failed `pg_notify` drops its item and warns the same way.
-  Items still queued when `stop` resolves are not sent.
+  When `stop` resolves, the items still queued are sent for up to
+  `DRAIN_ON_STOP` (2 s) before `run` returns; what cannot be sent in that time
+  is dropped, as any notification may be.
 * **Listener.** `PgListener::connect_with(&pool)` then `LISTEN` on both channels.
   Only after `LISTEN` is active does it mark itself listening and broadcast
   `Delivery::Resync`, so subscribers catch up after the gap has closed. When sqlx

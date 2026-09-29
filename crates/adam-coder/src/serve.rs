@@ -18,8 +18,9 @@
 //! run another process started at once instead of at its next poll, and a control plane streams
 //! the progress of a run a worker steps as it happens. It is a latency optimisation: polling
 //! stays on and correctness never depends on a notification (see `adam-notify-postgres`). With a
-//! worker it stops only after the worker has finished, so the last step's events and signals are
-//! still sent.
+//! worker it stops only after the worker has finished, then sends what is still queued for up to
+//! `adam_notify_postgres::DRAIN_ON_STOP`, so the last step's events and signals normally still
+//! reach other processes (best effort, like any notification).
 
 use std::future::Future;
 use std::sync::Arc;
