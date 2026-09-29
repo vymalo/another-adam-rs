@@ -80,6 +80,21 @@ position) does not duplicate anything: `commit_all` is a no-op without changes,
 pushing a commit the remote already has is a no-op, and
 `CodeHost::open_pull_request` returns the open pull request of the same head.
 
+### Cancel and rate limits
+
+* **CancelTask** fails the run as `cancelled: ...` (A2A `canceled`) at once and
+  fires the step's `CancelToken`. `delegate_to_opencode` then sends ACP
+  `session/cancel`, gives OpenCode two seconds to end its turn, kills it **and
+  its process group** (the commands it started) and waits until it is reaped
+  before returning, so nothing outlives the tool. `commit_and_push` and
+  `open_pull_request` refuse to act once the token has fired, so a later call of
+  the same model turn cannot publish a cancelled run. The child is started in
+  its own process group, so a terminal Ctrl-C does not reach it; the coder's
+  own shutdown and cancel paths do.
+* **429 with `Retry-After`** from the model gateway is carried to the runtime
+  (`ModelError::RateLimited` -> `AgentError::TransientAfter`): the retry waits at
+  least that long, whatever the backoff says.
+
 ## Configuration
 
 Environment variables (`src/config.rs` is the reference; every problem is

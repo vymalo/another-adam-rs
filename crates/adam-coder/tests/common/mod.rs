@@ -433,6 +433,28 @@ pub fn happy_script_titled(mock: &adam_model::MockModel, remote_url: &str, title
     .push_text("Opened the pull request.");
 }
 
+/// An OpenAI chat-completions reply that calls one tool.
+pub fn tool_reply(id: &str, name: &str, arguments: Value) -> Value {
+    json!({
+        "choices": [{
+            "message": {"role": "assistant", "content": null, "tool_calls": [{
+                "id": id, "type": "function",
+                "function": {"name": name, "arguments": arguments.to_string()}
+            }]},
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+    })
+}
+
+/// An OpenAI chat-completions reply that answers with text.
+pub fn text_reply(text: &str) -> Value {
+    json!({
+        "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+    })
+}
+
 /// An ACP "OpenCode" that is a shell script around the fake agent, so tests
 /// can script what the real one would do across launches. The script runs with
 /// `$AGENT` set to the fake agent (which reads the `FAKE_ACP_*` variables of
@@ -460,6 +482,56 @@ pub fn scripted_agent(dir: &Path, script: &str, base: OpenCodeLaunch) -> (OpenCo
 /// How often the launch log says the agent was started.
 pub fn launches(log: &Path) -> usize {
     std::fs::read_to_string(log).map_or(0, |t| t.lines().count())
+}
+
+/// The process id a test agent wrote to `file`, once it has (polls up to 30 s).
+pub async fn wait_for_pid(file: &Path) -> u32 {
+    for _ in 0..3000 {
+        if let Some(pid) = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+        {
+            return pid;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{} never got a pid", file.display());
+}
+
+/// Whether process `pid` is gone. With `reaped` a zombie still counts as
+/// alive (its parent never collected it); without, a zombie is dead, which is
+/// all one can ask of a grandchild that an init without a reaper adopted.
+pub fn process_gone(pid: u32, reaped: bool) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) if Path::new("/proc/self/stat").exists() => true,
+        Ok(stat) => {
+            !reaped
+                && stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+        }
+        // No /proc: ask the shell.
+        Err(_) => !Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success()),
+    }
+}
+
+/// Wait up to `within` for `pid` to be gone (see [`process_gone`]).
+pub async fn wait_gone(pid: u32, reaped: bool, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if process_gone(pid, reaped) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// One raw HTTP/1.1 request; `(status, whole response)`.

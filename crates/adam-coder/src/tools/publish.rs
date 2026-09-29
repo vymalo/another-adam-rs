@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::gitcli::{commits_ahead, head_sha, head_tree};
 use super::notes::PullRequestNote;
-use super::{Outcome, ToolEnv, notes_error, str_arg, workspace_error};
+use super::{Outcome, ToolEnv, cancelled, notes_error, str_arg, workspace_error};
 
 /// Commits everything in the worktree and pushes the run's branch.
 ///
@@ -49,6 +49,9 @@ impl Tool for CommitAndPush {
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Outcome {
+        if ctx.is_cancelled() {
+            return Err(cancelled("nothing was committed or pushed"));
+        }
         let Some(message) = str_arg(&args, "message") else {
             return Ok(ToolOutput::error("message is required"));
         };
@@ -176,6 +179,9 @@ impl Tool for OpenPullRequest {
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Outcome {
+        if ctx.is_cancelled() {
+            return Err(cancelled("no pull request was opened"));
+        }
         let (Some(title), Some(body)) = (str_arg(&args, "title"), str_arg(&args, "body")) else {
             return Ok(ToolOutput::error("title and body are required"));
         };

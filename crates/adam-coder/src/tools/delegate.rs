@@ -1,17 +1,19 @@
 //! `delegate_to_opencode { instructions }`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use adam_acp::{AcpClient, AcpError, AcpUpdate, ClientPolicy};
+use adam_acp::{AcpClient, AcpError, AcpUpdate, ClientPolicy, Session};
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use serde_json::{Value, json};
 
 use crate::redact::Redactor;
 
-use super::{Outcome, ToolEnv, str_arg};
+use super::{Outcome, ToolEnv, cancelled, str_arg};
 
 /// Most of the agent's reply kept for the summary.
 const SUMMARY_CAP: usize = 8 * 1024;
@@ -19,6 +21,9 @@ const SUMMARY_CAP: usize = 8 * 1024;
 const PROGRESS_CAP: usize = 300;
 /// Most changed files listed in the result.
 const MAX_LISTED_FILES: usize = 40;
+/// How long OpenCode gets to end its turn after `session/cancel` before it is
+/// killed.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Has OpenCode make a change in the worktree, over ACP.
 ///
@@ -28,6 +33,12 @@ const MAX_LISTED_FILES: usize = 40;
 /// summary plus the files that changed. The agent may read and write files only
 /// under the worktree (`ClientPolicy::fs_root`), and its permission requests
 /// are answered by `PermissionMode::AllowWithinRoot`.
+///
+/// **Cancellation.** When the run is cancelled ([`ToolCtx::cancelled`]) while
+/// OpenCode works, the tool sends ACP `session/cancel`, gives OpenCode a couple
+/// of seconds to end its turn, then kills it and everything it started (its
+/// process group) and waits until it is reaped, before returning. Nothing is
+/// left running once the tool has returned.
 pub struct DelegateToOpenCode {
     env: Arc<ToolEnv>,
 }
@@ -44,6 +55,33 @@ fn acp_error(e: &AcpError) -> ToolError {
         ToolError::Transient(format!("OpenCode: {e}"))
     } else {
         ToolError::Permanent(format!("OpenCode: {e}"))
+    }
+}
+
+/// Stop OpenCode after a cancel: ask it to end its turn (`session/cancel`),
+/// give it [`CANCEL_GRACE`] to do so, then kill it and its process group and
+/// wait until it is reaped.
+async fn stop(
+    client: AcpClient,
+    session: Option<&Session>,
+    turn: Option<BoxStream<'static, Result<AcpUpdate, AcpError>>>,
+) {
+    if let Some(session) = session
+        && let Err(e) = session.cancel().await
+    {
+        tracing::debug!(error = %e, "could not send session/cancel");
+    }
+    if let Some(mut turn) = turn {
+        // A well-behaved agent ends the turn with `cancelled` (or dies).
+        let drained =
+            tokio::time::timeout(CANCEL_GRACE, async { while turn.next().await.is_some() {} })
+                .await;
+        if drained.is_err() {
+            tracing::warn!("OpenCode did not end its turn after session/cancel; killing it");
+        }
+    }
+    if let Err(e) = client.kill().await {
+        tracing::debug!(error = %e, "OpenCode was already gone or could not be reaped");
     }
 }
 
@@ -104,19 +142,38 @@ impl Tool for DelegateToOpenCode {
 
         ctx.emit_progress("starting OpenCode").await;
         let command = self.env.settings.opencode.command(&dir);
-        let client = AcpClient::spawn(command, ClientPolicy::new(&dir))
-            .await
-            .map_err(|e| acp_error(&e))?;
-        let session = client
-            .new_session(&dir, Vec::new())
-            .await
-            .map_err(|e| acp_error(&e))?;
+        // A cancel before the process is up needs no cleanup here: the spawn
+        // future kills what it started when it is dropped.
+        let client = tokio::select! {
+            biased;
+            () = ctx.cancelled() => return Err(cancelled("OpenCode was stopped")),
+            client = AcpClient::spawn(command, ClientPolicy::new(&dir)) => client,
+        }
+        .map_err(|e| acp_error(&e))?;
+        let session = tokio::select! {
+            biased;
+            () = ctx.cancelled() => {
+                stop(client, None, None).await;
+                return Err(cancelled("OpenCode was stopped"));
+            }
+            session = client.new_session(&dir, Vec::new()) => session,
+        }
+        .map_err(|e| acp_error(&e))?;
 
         let mut turn = session.prompt(instructions.to_owned());
         let mut reply = String::new();
         let mut line = String::new();
         let mut stop_reason = None;
-        while let Some(update) = turn.next().await {
+        loop {
+            let update = tokio::select! {
+                biased;
+                () = ctx.cancelled() => {
+                    stop(client, Some(&session), Some(turn)).await;
+                    return Err(cancelled("OpenCode was stopped"));
+                }
+                update = turn.next() => update,
+            };
+            let Some(update) = update else { break };
             let update = update.map_err(|e| acp_error(&e))?;
             match update {
                 AcpUpdate::AgentText(chunk) => {

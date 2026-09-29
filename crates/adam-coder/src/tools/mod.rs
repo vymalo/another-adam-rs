@@ -57,6 +57,17 @@ pub use notes::{NotesStore, RunNotes};
 /// What a tool call returns.
 pub(crate) type Outcome = Result<ToolOutput, ToolError>;
 
+/// What a tool fails with when the run was cancelled under (or before) it.
+///
+/// The run is already `Failed` (`cancelled: ...`) by then and whatever the
+/// call returns is dropped, but the loop that called the tool goes on to the
+/// next call of the same model turn: the tools with effects outside the
+/// worktree ([`publish`]) therefore check [`ToolCtx::is_cancelled`] first and
+/// refuse with this.
+pub(crate) fn cancelled(what: &str) -> ToolError {
+    ToolError::Permanent(format!("cancelled: the run was cancelled; {what}"))
+}
+
 /// Tunables of the tools.
 #[derive(Debug, Clone)]
 pub struct CoderSettings {

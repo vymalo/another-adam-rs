@@ -48,6 +48,8 @@ const STDERR_TAIL_LINES: usize = 200;
 const STDERR_TAIL_BYTES: usize = 64 * 1024;
 /// A single stderr line is truncated to this many bytes in the tail.
 const STDERR_LINE_MAX: usize = 4096;
+/// How long [`AcpClient::kill`] waits for the killed agent to be reaped.
+const KILL_WAIT: Duration = Duration::from_secs(10);
 /// JSON-RPC code agents use for "authenticate first".
 const AUTH_REQUIRED_CODE: i32 = -32000;
 
@@ -337,19 +339,23 @@ impl AcpClient {
             )));
         }
         let program = cmd.resolve_program()?;
-        let mut child = tokio::process::Command::new(&program)
+        let mut command = tokio::process::Command::new(&program);
+        command
             .args(&cmd.args)
             .envs(&cmd.env)
             .current_dir(&cmd.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|source| AcpError::Spawn {
-                program: cmd.program.display().to_string(),
-                source,
-            })?;
+            .kill_on_drop(true);
+        // Its own process group, so that killing the agent can take along
+        // what it started (a coding agent runs shell commands, servers...).
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|source| AcpError::Spawn {
+            program: cmd.program.display().to_string(),
+            source,
+        })?;
         tracing::info!(pid = child.id(), program = %program.display(), "agent process started");
 
         let (Some(stdin), Some(stdout), Some(stderr)) =
@@ -484,6 +490,43 @@ impl AcpClient {
             None => Err(AcpError::Timeout {
                 operation: "shutdown",
                 after: bound,
+            }),
+        }
+    }
+}
+
+impl AcpClient {
+    /// Kill the agent now and wait until it is gone.
+    ///
+    /// The agent gets `SIGKILL`, and so does everything left in its process
+    /// group (the commands it started); the call returns after the agent has
+    /// been reaped, so no process of ours outlives it. Use it when a graceful
+    /// [`shutdown`](Self::shutdown) is not wanted, for example after a
+    /// cancelled turn.
+    ///
+    /// `Ok` when the agent went away because we asked; [`AcpError::Exited`]
+    /// when it had already died, [`AcpError::Timeout`] if it could not be
+    /// reaped within ten seconds.
+    #[tracing::instrument(name = "acp.kill", skip_all)]
+    pub async fn kill(self) -> Result<(), AcpError> {
+        let core = &self.core;
+        let mut rx = core.shared.exit.subscribe();
+        // Only a live agent is killed on purpose: an exit that happened
+        // before this call keeps reading as the crash it was.
+        if rx.borrow().is_none() {
+            core.shared.shutdown_requested.store(true, Ordering::SeqCst);
+        }
+        core.cancel.cancel();
+        let info = match tokio::time::timeout(KILL_WAIT, rx.wait_for(Option::is_some)).await {
+            Ok(Ok(v)) => v.clone(),
+            _ => None,
+        };
+        match info {
+            Some(i) if i.expected => Ok(()),
+            Some(i) => Err(i.to_error()),
+            None => Err(AcpError::Timeout {
+                operation: "kill",
+                after: KILL_WAIT,
             }),
         }
     }
@@ -659,10 +702,16 @@ async fn supervise(
     grace: Duration,
 ) {
     tokio::pin!(conn);
+    let group = child.id();
+    // `biased`, cancel first: dropping the last handle cancels *and* closes
+    // the command channel, which ends the connection. Without the priority the
+    // connection ending could win the race and turn a kill into a graceful
+    // exit, which does not sweep the agent's process group.
     let ev = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Ev::Cancelled,
         r = &mut conn => Ev::ConnDone(r),
         s = child.wait() => Ev::ChildExit(s),
-        () = cancel.cancelled() => Ev::Cancelled,
     };
     let mut expected = false;
     let mut wind_down = false;
@@ -676,6 +725,7 @@ async fn supervise(
                 Ok(s) => s,
                 Err(_) => {
                     tracing::warn!("agent did not exit after its stdin closed; killing it");
+                    kill_group(group).await;
                     let _ = child.start_kill();
                     child.wait().await
                 }
@@ -687,6 +737,9 @@ async fn supervise(
         }
         Ev::Cancelled => {
             expected = true;
+            // Before the agent is reaped: its pid names the group only while
+            // the group leader still exists.
+            kill_group(group).await;
             let _ = child.start_kill();
             child.wait().await
         }
@@ -713,6 +766,39 @@ async fn supervise(
         let _ = tokio::time::timeout(Duration::from_secs(2), &mut conn).await;
     }
 }
+
+/// `SIGKILL` the process group led by the agent (`pid`; it was started with
+/// `process_group(0)`, so its group id is its pid), so that what the agent
+/// started dies with it.
+///
+/// Called only while the agent is still unreaped, because only then its pid
+/// cannot have been reused. When the agent exits by itself its group is not
+/// swept: by then the pid is free and could belong to something else.
+///
+/// Uses the shell's `kill` builtin: `kill(2)` needs `libc` and `unsafe`, and
+/// `kill(1)` may be absent from slim images. Best effort: a failure is logged
+/// and the agent alone is killed by the caller.
+#[cfg(unix)]
+async fn kill_group(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    let killed = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -s KILL -- -{pid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    if !matches!(killed, Ok(s) if s.success()) {
+        tracing::warn!(
+            pid,
+            "could not kill the agent's process group; killing the agent only"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+async fn kill_group(_pid: Option<u32>) {}
 
 // ---------------------------------------------------------------------------
 // The connection
