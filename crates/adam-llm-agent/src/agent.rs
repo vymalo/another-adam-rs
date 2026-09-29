@@ -183,8 +183,9 @@ impl LlmAgentBuilder {
 ///
 /// * Retryable model error (`ModelError::is_retryable`) or
 ///   [`ToolError::Transient`]: `AgentError::Transient`, retried by the runtime.
-///   A `ModelError::RateLimited` that carries a `retry_after` becomes
-///   `AgentError::with_retry_after`, so the retry waits at least that long
+///   A `ModelError::RateLimited` that carries a `retry_after` becomes an
+///   `AgentError::Transient` with that hint (`with_retry_after`), so the
+///   retry waits at least that long
 ///   (the runtime's backoff still applies when it is longer).
 /// * Other model error: the run fails (`model call failed: ...`).
 /// * [`ToolError::Permanent`], `ToolOutput { is_error: true }` and unknown

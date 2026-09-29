@@ -247,7 +247,8 @@ leaves the run to its lease and is logged with its class.
 
 **Exit codes** of `adam-coder` (sysexits.h values, *unverified*: from memory)
 are found by walking the `anyhow` chain from the outside in: 78 configuration
-(`ConfigError`, `OpenAiConfigError`, or any `Invalid` error), 69 a dependency
+(`ConfigError`, an invalid `OpenAiConfigError`, or any other `Invalid` error; a
+`Client` build failure is `Internal`, so 70), 69 a dependency
 that is unreachable at boot (Postgres), 71 an OS error (a port that cannot
 bind), 70 a half of the process that stopped, a panic or an internal error,
 1 anything else, 0 after a clean SIGTERM. The failure is one structured JSON

@@ -1178,7 +1178,7 @@ impl Respond for RateLimitedOnce {
 
 /// The model answers the first request with `429` and `Retry-After`. The
 /// real OpenAI-compatible client carries the hint to the runtime
-/// (`AgentError::TransientAfter`), which waits at least that long before the
+/// (`AgentError::Transient` with `retry_after`), which waits at least that long before the
 /// retry (the policy's own backoff here is 50 ms), and the run then completes
 /// with exactly one pull request.
 async fn rate_limited_model_backs_off_and_completes(store: DynStore) {

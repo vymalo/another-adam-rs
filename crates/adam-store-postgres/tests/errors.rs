@@ -1,4 +1,6 @@
-//! How the Postgres adapter reports failures. Gated like the conformance suite.
+//! How the Postgres adapter reports failures. The tests that need a server are
+//! gated like the conformance suite; `an_unreachable_server_is_transient` runs
+//! offline.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use adam_core::{NewRun, Store, StoreError};
