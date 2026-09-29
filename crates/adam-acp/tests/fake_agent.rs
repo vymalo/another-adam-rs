@@ -9,6 +9,7 @@ use adam_acp::{
     AcpClient, AcpCommand, AcpError, AcpOptions, AcpUpdate, ClientPolicy, PermissionKind,
     PermissionMode, PlanEntry, Session, StaticPrompt,
 };
+use adam_error::Classify as _;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 

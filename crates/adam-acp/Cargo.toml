@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+adam-error.workspace = true
 agent-client-protocol.workspace = true
 async-trait.workspace = true
 futures.workspace = true
