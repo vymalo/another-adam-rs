@@ -26,7 +26,7 @@ authentication behave like the real tool.
 | `CodeHost` (trait), `DynCodeHost` | `open_pull_request`, `find_pull_request`; `NewPullRequest`, `PullRequest` |
 | `GitHub` | GitHub REST `CodeHost`: `new(creds)`, `with_api_base(url)`; idempotent (returns the open pull request of the same head) |
 | `MemoryCodeHost` | in-memory `CodeHost`, feature `test-util` |
-| `WorkspaceError`, `WorkspaceResult` | `Auth`, `NotFound`, `Invalid`, `Transient`, `Conflict`, `Corrupt`, `Git { .. }` |
+| `WorkspaceError`, `WorkspaceResult` | `Auth`, `NotFound`, `Invalid`, `Transient`, `RateLimited { retry_after }`, `Conflict`, `Corrupt`, `Git { .. }`, `Http { .. }`, `Io { .. }`; `#[non_exhaustive]`, see *Errors* |
 
 ```rust
 use std::sync::Arc;
@@ -60,6 +60,30 @@ operator named. The token reaches `git` only through the environment of one
 invocation: never in a remote URL, `.git/config`, logs or error messages.
 URLs with embedded credentials and ssh/scp forms are refused.
 
+## Errors
+
+`WorkspaceError` implements `adam_error::Classify` (see
+[`adam-error`](../adam-error/README.md)).
+
+| Variant | Class |
+|---|---|
+| `Auth` | `Unauthenticated` |
+| `NotFound` | `NotFound` |
+| `Invalid` | `Invalid` |
+| `Transient { message, source }` | `Transient` |
+| `RateLimited { retry_after }` | `RateLimited` |
+| `Conflict` (the run id is bound to another repository) | `Rejected` |
+| `Corrupt` | `Corrupt` |
+| `Git`, `Http`, `Io` | `Internal` |
+
+Only `Transient` and `RateLimited` are retryable. The `GitHub` code host
+answers HTTP 429, and a 403 that GitHub marks as a rate limit, with
+`RateLimited`; `retry_after` is the `Retry-After` header, else the time until
+`x-ratelimit-reset`, capped at one hour. HTTP 5xx and transport failures are
+`Transient`, with the `reqwest` error kept as the `source` (its URL removed).
+`Io` keeps the `io::Error` as its `source`. No message or source carries the
+token, and a message does not repeat its source.
+
 ## Features
 
 | Feature | Default | Effect |
@@ -77,11 +101,15 @@ Offline. The `git` CLI must be on `PATH`.
 * `tests/workspace.rs`: worktrees against local bare repositories, the host
   allowlist, local-path policy, scoped tokens, and a `wiremock` "evil" git
   host that must never be contacted.
-* `tests/github.rs`: the `GitHub` code host against a `wiremock` server.
+* `tests/github.rs`: the `GitHub` code host against a `wiremock` server,
+  including error classes, `Retry-After` and transport source chains.
+* Unit tests in `src/error.rs` (`class_table` and the source-chain checks) and
+  `src/github.rs` (`retry_after_prefers_the_header_then_the_reset_time`).
 
 No conformance testkit exists for `CodeHost` or `GitCredentials` yet.
 
 ## See also
 
 [`adam-coder`](../adam-coder/README.md),
-[`adam-acp`](../adam-acp/README.md).
+[`adam-acp`](../adam-acp/README.md),
+[`adam-error`](../adam-error/README.md).

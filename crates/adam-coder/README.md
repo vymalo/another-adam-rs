@@ -92,8 +92,8 @@ pushing a commit the remote already has is a no-op, and
   its own process group, so a terminal Ctrl-C does not reach it; the coder's
   own shutdown and cancel paths do.
 * **429 with `Retry-After`** from the model gateway is carried to the runtime
-  (`ModelError::RateLimited` -> `AgentError::TransientAfter`): the retry waits at
-  least that long, whatever the backoff says.
+  (`ModelError::RateLimited` -> `AgentError::Transient` with a `retry_after`):
+  the retry waits at least that long, whatever the backoff says.
 
 ## Configuration
 
@@ -156,8 +156,13 @@ clients as run errors, events and tool results. A `Redactor` built from the
 configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN`, every
 `A2A_BEARER_TOKENS` entry and the `DATABASE_URL` password (and their Base64
 forms) with `[redacted]` in tool results and errors, in OpenCode's and the
-checks' progress lines, in the checks' findings, and in the agent's final
-failure message. It is exact-value replacement, not a detector: a secret that
+checks' progress lines, in the checks' findings, in the agent's final
+failure message, and in the process's own `adam-coder failed` log line.
+A failed step's error crosses one boundary (`boundary_error` in
+`src/agent.rs`): its whole cause chain is flattened into the message, scrubbed,
+and cut to `MAX_FAILURE_TEXT` (2048 bytes, ` [truncated]` appended) *after*
+scrubbing, so a secret on the cut cannot leave its front half. The retry hint
+survives; the `source` does not. It is exact-value replacement, not a detector: a secret that
 was transformed (hashed, split) is not found, and values shorter than 4
 characters are not registered.
 
@@ -166,6 +171,39 @@ a step cut short by a hard kill is taken over by the next start when its lease
 expires. Logs are JSON on stdout (`RUST_LOG` filters).
 
 Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
+
+## Errors
+
+The library errors it composes are classified (see
+[`adam-error`](../adam-error/README.md)); this crate adds `ConfigError`
+(`Invalid`: the same environment never works; it lists every problem and never
+a secret) and `StoppedUnexpectedly` (`Internal`: the server or the workers
+stopped while still needed).
+
+A failure ends the process with one structured log line, `adam-coder failed`
+(JSON on stdout, fields `error`, the whole scrubbed cause chain, and `code`),
+and nothing on stderr. The exit code (`src/exit.rs`, `exit_code`) comes from
+walking the `anyhow` chain from the outside in and taking the first match:
+
+| Exit code | Meaning | Root cause |
+|---|---|---|
+| 0 | clean shutdown after SIGTERM or Ctrl-C | not an error |
+| 78 (`EX_CONFIG`) | configuration; do not restart | `ConfigError`, or an `Invalid` `StoreError`, `OpenAiConfigError`, `WorkspaceError` or `RuntimeError` |
+| 69 (`EX_UNAVAILABLE`) | a dependency is unreachable; restart later | a `Transient`, `RateLimited` or `Conflict` one of those, such as Postgres at boot |
+| 71 (`EX_OSERR`) | the OS refused something | an `io::Error` with no typed error above it: a listener that cannot bind |
+| 70 (`EX_SOFTWARE`) | internal | `StoppedUnexpectedly`, a panicked task, or a `Corrupt` or `Internal` typed error (including `OpenAiConfigError::Client`) |
+| 1 | anything else | for example `NotFound`, `Rejected`, `Unauthenticated` (a bad `GITHUB_TOKEN`) or an untyped error |
+
+The typed errors it looks for are `StoreError`, `OpenAiConfigError`,
+`WorkspaceError`, `RuntimeError` and `StoppedUnexpectedly`. Because the walk goes
+outside in, an unreachable Postgres is 69 although an `io::Error` is at the
+bottom of its chain. The values are BSD `sysexits.h`'s, *unverified* (from
+memory).
+
+At run time, tool failures are flattened once where they cross to the model:
+a `WorkspaceError` or `AcpError` becomes `ToolError::Transient` when
+`is_retryable()` and `ToolError::Permanent` otherwise, with the chain printed
+once (`adam_error::report`) and then scrubbed.
 
 ## Tests
 
@@ -188,10 +226,11 @@ database of its own, so the role needs `CREATEDB`):
   (retried, completes); two concurrent tasks on one repository (two branches,
   two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`).
 * `tests/binary.rs`: the `adam-coder` binary as a process. All problems of a
-  bad configuration reported together with a non-zero exit; Postgres
-  unreachable at boot (clear "connecting to Postgres" error, exit 1, no
-  password, no panic; sqlx retries the connection for its 30 s acquire timeout
-  first); with Postgres: the card and `/healthz`, a clean exit 0 on SIGTERM, and
+  bad configuration reported together with exit 78; Postgres unreachable at boot
+  (a clear "connecting to Postgres: ..." chain in exactly one `adam-coder failed`
+  line, exit 69, nothing on stderr, no password, no panic; sqlx retries the
+  connection for its 30 s acquire timeout first); with Postgres: the card and
+  `/healthz`, a clean exit 0 on SIGTERM, and
   SIGTERM in the middle of OpenCode's turn (the process waits for the step,
   commits it, exits 0; a second process over the same database and workspace
   finishes the run with one commit, one push and one pull request). The last
@@ -204,7 +243,8 @@ database of its own, so the role needs `CREATEDB`):
   tokens, and a wiremock "evil" git host that must never be contacted.
 * unit tests: configuration, prompt, OpenCode config, shell execution (timeout
   kills the process group, output tail, cwd confinement, hidden secrets), run
-  notes.
+  notes, the exit code of each root cause (`src/exit.rs`), and the scrubbing
+  and bounding of failure text (`src/agent.rs`, `src/redact.rs`).
 
 The fake agent binary is built by the tests themselves (`CARGO_BIN_EXE_*`
 exists only inside `adam-acp`): `tests/common/mod.rs` runs

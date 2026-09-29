@@ -42,6 +42,28 @@ task owned by someone else looks like one that does not exist. Subscriptions
 are built from `Runtime::view` and polling, so they work for a task started by
 another process or before a restart; live events only reduce latency.
 
+## Errors
+
+The backend has no error type of its own: it returns `adam_a2a::BackendError`.
+`RuntimeError` is mapped by its class (see
+[`adam-error`](../adam-error/README.md)), and is kept as the `source` of the
+result so the A2A server can log the chain while the client sees only what the
+mapping chose to say.
+
+| `RuntimeError` class | `BackendError` | Client sees |
+|---|---|---|
+| `NotFound` | `TaskNotFound` | `-32001` |
+| `Invalid`, `Rejected` | `InvalidParams` | `-32602` with a safe detail |
+| `Transient`, `RateLimited`, `Conflict` | `Unavailable` | `-32603` "backend temporarily unavailable" |
+| anything else | `Internal` | `-32603` "internal error" |
+
+The `-32602` detail is one of: "task <id> is already <status>", "the
+conversation already has an open task", the agent's own message for an `init`
+rejection (`AgentError::Permanent`, such as an unreadable start message), a
+store's `InvalidInput` message, or "the request was rejected". A transport or
+driver text, and the conversation id (which holds the caller's subject), never
+reach the client.
+
 ## Features and environment
 
 No Cargo features, no environment variables at runtime.
@@ -50,9 +72,15 @@ No Cargo features, no environment variables at runtime.
 
 `tests/backend.rs` drives the backend with a real A2A client over HTTP and a
 scripted agent: snapshot/progress/artifact/completed order, `input-required`
-round trips, ownership between callers, context handling, and a
+round trips, ownership between callers, context handling, an `init` rejection
+that is `-32602` and not `-32603`
+(`an_init_rejection_is_invalid_params_not_internal`,
+`an_init_rejection_is_a_32602_over_http`), and a
 restart scenario in which a second backend (a second replica) rebuilds a
-subscription from the store.
+subscription from the store. Unit tests in `src/backend.rs`
+(`runtime_errors_map_by_class`,
+`what_a_client_is_told_carries_no_cause_and_no_conversation_id`) and
+`src/convert.rs`.
 
 | Variable | Meaning |
 |---|---|
@@ -63,4 +91,5 @@ subscription from the store.
 
 [`adam-a2a`](../adam-a2a/README.md),
 [`adam-runtime`](../adam-runtime/README.md),
-[`adam-coder`](../adam-coder/README.md).
+[`adam-coder`](../adam-coder/README.md),
+[`adam-error`](../adam-error/README.md).

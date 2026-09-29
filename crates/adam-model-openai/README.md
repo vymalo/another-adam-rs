@@ -18,7 +18,7 @@ never see this crate's types. Retries are not done here: failures map onto
 | `OpenAiConfig` | `base_url`, `api_key: SecretString`, `timeout`, `extra_headers`; `OpenAiConfig::new(base_url, api_key)` |
 | `OpenAiCompatible` | the client: `OpenAiCompatible::new(config)`, `.with_max_tokens_field(field)` |
 | `MaxTokensField` | `MaxTokens` (default) or `MaxCompletionTokens`, for models that want the newer field name |
-| `OpenAiConfigError` | invalid configuration |
+| `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `Client`; see *Errors* |
 
 ```rust
 use std::sync::Arc;
@@ -41,6 +41,33 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   header, and never appears in `Debug`, errors or logs. An empty key sends no
   header.
 * Malformed tool-call argument JSON is `ModelError::Protocol`.
+* A transport failure (timeout, connection error) is a `Transient` that keeps
+  the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
+  that keeps the parser's error. The message does not repeat the source.
+
+## Errors
+
+Failures map onto `adam_model::ModelError`, which is classified (see
+[`adam-model`](../adam-model/README.md#errors) and
+[`adam-error`](../adam-error/README.md)). The client never retries.
+
+| Cause | `ModelError` | Class |
+|---|---|---|
+| HTTP 429 (`Retry-After` kept) | `RateLimited` | `RateLimited` |
+| HTTP 408, 5xx; timeout; connection failure; transport error | `Transient` | `Transient` |
+| HTTP 401, 403 | `Auth` | `Unauthenticated` |
+| HTTP 400, 413, 422 naming the context window | `ContextLength` | `Invalid` |
+| any other 4xx; a request that cannot be built | `InvalidRequest` | `Invalid` |
+| 1xx/3xx (redirects are not followed); malformed JSON, tool arguments or stream | `Protocol` | `Corrupt` |
+
+An error object inside a `200` or a stream is `RateLimited` for a
+`rate_limit` type, `ContextLength` for a context-length code, `InvalidRequest`
+for `invalid_request` or `authentication`, and `Transient` for anything else.
+
+`OpenAiConfigError` (from `OpenAiCompatible::new`) is `Invalid` for
+`InvalidBaseUrl`, `InvalidHeader` and `InvalidApiKey`, and `Internal` for
+`Client` (the HTTP client could not be built; the `reqwest` error is its
+`source`). No message carries the URL, the header value or the key.
 
 ## Features and environment
 
@@ -49,7 +76,10 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
 ## Tests
 
 * `tests/http.rs`: the client against a `wiremock` server (requests, streaming,
-  tool calls, error mapping, timeouts). Always runs, no network.
+  tool calls, error mapping and classes, timeouts, source chains). Always
+  runs, no network.
+* Unit tests: `src/errors.rs` (`status_mapping`) and `src/lib.rs`
+  (`config_error_class_table`).
 * `tests/live.rs`: optional, against a real endpoint. Passes without doing
   anything unless the variables are set.
 

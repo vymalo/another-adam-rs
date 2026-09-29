@@ -22,7 +22,7 @@ prompts.
 | `AcpUpdate`, `PlanEntry`, `McpServerSpec` | streamed updates (text, thoughts, plan, tool calls, `TurnEnded { stop_reason }`) |
 | `ClientPolicy` | `ClientPolicy::new(fs_root)`, `.with_permission(mode)`: the directory the agent may read and write, and how permissions are answered. `terminal: true` is not implemented and makes `spawn` fail with `AcpError::Config` |
 | `PermissionMode` (`AllowWithinRoot` default, `DenyAll`, `Ask(prompt)`), `PermissionPrompt`, `StaticPrompt`, `PermissionRequest`, `PermissionDecision`, `PermissionChoice`, `PermissionKind` | how `session/request_permission` is answered |
-| `AcpError`, `AcpResult` | errors |
+| `AcpError`, `AcpResult` | errors; `#[non_exhaustive]`, see *Errors* |
 
 ```rust
 use adam_acp::{AcpClient, AcpCommand, AcpUpdate, ClientPolicy};
@@ -57,6 +57,26 @@ agent for tests, not for production. Build it with
 `crash-once`); the table of scenarios and the `FAKE_ACP_*` variables each one
 reads is in the binary's module docs.
 
+## Errors
+
+`AcpError` implements `adam_error::Classify` (see
+[`adam-error`](../adam-error/README.md)).
+
+| Variant | Class |
+|---|---|
+| `Exited`, `Timeout` | `Transient` |
+| `AuthRequired` | `Unauthenticated` |
+| `Config`, `Rpc` with code `-32602` | `Invalid` |
+| `Protocol` | `Corrupt` |
+| `TurnInProgress`, `Closed` | `Rejected` |
+| `Spawn`, any other `Rpc` | `Internal` |
+
+`is_retryable()` (from `Classify`) keeps its meaning: retrying on a **fresh**
+agent process may succeed, which holds only for a crashed agent (`Exited`) or a
+stalled turn (`Timeout`). A missing binary, bad configuration and a protocol
+violation are not retryable. `Spawn` keeps the OS error as its `source` and its
+message no longer repeats it, so `adam_error::report` prints the cause once.
+
 ## Features and environment
 
 No Cargo features. Runtime configuration is the `AcpCommand` (program,
@@ -75,6 +95,9 @@ re-checked here.
   killing the child and its process group). Always
   runs; the binary comes from `CARGO_BIN_EXE_adam-acp-fake-agent`.
 * `tests/live_opencode.rs`: a real `opencode acp` creating a file.
+* Unit tests in `src/error.rs` (`class_table`,
+  `spawn_display_does_not_repeat_its_source`), `src/command.rs`, `src/guard.rs`
+  and `src/update.rs`.
 
 | Variable | Meaning |
 |---|---|
@@ -86,4 +109,5 @@ The live test is not run in CI.
 ## See also
 
 [`adam-coder`](../adam-coder/README.md),
-[`adam-workspace`](../adam-workspace/README.md).
+[`adam-workspace`](../adam-workspace/README.md),
+[`adam-error`](../adam-error/README.md).
