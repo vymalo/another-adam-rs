@@ -6,7 +6,8 @@
 //!
 //! ```ignore
 //! async fn make_store() -> Option<adam_core::DynStore> {
-//!     let url = std::env::var("ADAM_TEST_POSTGRES_URL").ok()?; // skip if unset
+//!     // skip if unset (panics instead when ADAM_TEST_REQUIRE_DB=1)
+//!     let url = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL")?;
 //!     let store = PgStore::connect(&url).await.unwrap();
 //!     Some(std::sync::Arc::new(store))
 //! }
@@ -17,6 +18,8 @@
 //! against one shared database without cleaning it between tests.
 
 pub mod fault;
+
+pub use adam_core::testing::skipped;
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -29,7 +32,9 @@ use serde_json::json;
 
 /// Generate one `#[tokio::test]` per conformance case. `$make` is a path to an
 /// `async fn() -> Option<DynStore>`; returning `None` skips the suite (for
-/// example when the database URL env var is not set).
+/// example when the database URL env var is not set), unless
+/// `ADAM_TEST_REQUIRE_DB=1` is set: then every case fails instead (see
+/// `adam_core::testing`).
 #[macro_export]
 macro_rules! store_conformance {
     ($make:path) => {
@@ -51,7 +56,12 @@ macro_rules! store_conformance {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn $case() {
                 let Some(store) = $make().await else {
-                    eprintln!("skipping {}: store not configured", stringify!($case));
+                    // Panics when ADAM_TEST_REQUIRE_DB=1 (CI), so an
+                    // unconfigured store never passes silently.
+                    $crate::skipped(&format!(
+                        "{}: store not configured",
+                        stringify!($case)
+                    ));
                     return;
                 };
                 store.migrate().await.expect("migrate");

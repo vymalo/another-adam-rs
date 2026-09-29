@@ -116,6 +116,14 @@ works with no databases (only the in-memory store runs). The suites isolate
 cases by agent name, so they run in parallel on one shared database with no
 cleanup between runs.
 
+CI must not pass by skipping: set `ADAM_TEST_REQUIRE_DB=1` and a suite whose
+variable is unset **fails** instead of skipping (CI sets it in every job that
+provides the databases). Gate new database tests with
+`adam_core::testing::test_env("ADAM_TEST_...")`, which honours the flag.
+CI runs the tests with [cargo-nextest](https://nexte.st) (`cargo nextest run
+--workspace`, profile `ci` in `.config/nextest.toml`) plus `cargo test --doc`,
+and gates line coverage (`cargo llvm-cov nextest --workspace`).
+
 The suite (22 cases) covers: exact JSON roundtrip (unicode, i64 bounds,
 floats, special keys), CAS conflicts, 16-way concurrent commits with a single
 winner, journal ordering, first-writer-wins and 16-way races,

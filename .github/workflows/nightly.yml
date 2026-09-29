@@ -1,0 +1,94 @@
+name: nightly
+
+# Live tests against real services: a real OpenAI-compatible endpoint and a real
+# `opencode acp`. They need secrets, so each job runs only when its secrets
+# exist (a fork, or a repository without them, just skips) and the schedule is
+# a smoke alarm for provider drift, never a merge gate.
+#
+# Secrets (repository or organization):
+#   ADAM_TEST_OPENAI_BASE_URL, ADAM_TEST_OPENAI_API_KEY, ADAM_TEST_OPENAI_MODEL (optional)
+#   ADAM_TEST_OPENCODE_CONFIG  inline JSON for OPENCODE_CONFIG_CONTENT (model + provider)
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-model:
+    name: live OpenAI-compatible model
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ADAM_TEST_OPENAI_BASE_URL: ${{ secrets.ADAM_TEST_OPENAI_BASE_URL }}
+      ADAM_TEST_OPENAI_API_KEY: ${{ secrets.ADAM_TEST_OPENAI_API_KEY }}
+      ADAM_TEST_OPENAI_MODEL: ${{ secrets.ADAM_TEST_OPENAI_MODEL }}
+    steps:
+      - name: Are the secrets available?
+        id: have
+        run: |
+          if [ -n "$ADAM_TEST_OPENAI_BASE_URL" ] && [ -n "$ADAM_TEST_OPENAI_API_KEY" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ADAM_TEST_OPENAI_BASE_URL / ADAM_TEST_OPENAI_API_KEY are not set: skipping" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.have.outputs.run == 'true'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.have.outputs.run == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.have.outputs.run == 'true'
+      - uses: taiki-e/install-action@v2
+        if: steps.have.outputs.run == 'true'
+        with:
+          tool: nextest
+      - name: live tests of adam-model-openai
+        if: steps.have.outputs.run == 'true'
+        run: cargo nextest run --locked --profile ci -p adam-model-openai --test live
+
+  live-opencode:
+    name: live opencode acp
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ADAM_TEST_OPENCODE: "1"
+      ADAM_TEST_OPENCODE_CONFIG: ${{ secrets.ADAM_TEST_OPENCODE_CONFIG }}
+    steps:
+      - name: Is the OpenCode config available?
+        id: have
+        run: |
+          if [ -n "$ADAM_TEST_OPENCODE_CONFIG" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ADAM_TEST_OPENCODE_CONFIG is not set: skipping" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.have.outputs.run == 'true'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.have.outputs.run == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.have.outputs.run == 'true'
+      - uses: taiki-e/install-action@v2
+        if: steps.have.outputs.run == 'true'
+        with:
+          tool: nextest
+      # Verified 2026-09-29: registry.npmjs.org/opencode-ai exists (the OpenCode
+      # CLI). Not verified: that the tests pass with it; check the first run.
+      - name: Install OpenCode
+        if: steps.have.outputs.run == 'true'
+        run: npm install --global opencode-ai
+      - name: live opencode test of adam-acp
+        if: steps.have.outputs.run == 'true'
+        run: cargo nextest run --locked --profile ci -p adam-acp --test live_opencode

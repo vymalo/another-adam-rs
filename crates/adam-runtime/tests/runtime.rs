@@ -37,7 +37,7 @@ async fn memory_store() -> Option<DynStore> {
 }
 
 async fn postgres_store() -> Option<DynStore> {
-    let url = std::env::var("ADAM_TEST_POSTGRES_URL").ok()?;
+    let url = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL")?;
     let store = adam_store_postgres::PgStore::connect(&url)
         .await
         .expect("connect to postgres");

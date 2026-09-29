@@ -1,7 +1,13 @@
 name: coder
 
 # The coder agent (crates/adam-coder + crates/adam-a2a-runtime): checks on pull
-# requests, an image on main, and a tag bump in the deploy chart.
+# requests, an image on main, and a tag bump in the deploy chart. The Rust
+# checks (fmt, clippy, tests, MSRV, coverage) run for every pull request in
+# ci.yml; this workflow covers what only the image and the chart can show.
+#
+# The image is built on pull requests too and smoke-tested as a container (a
+# Postgres service, a stub model, a real start under tini). On main the very
+# image that passed is the one pushed.
 #
 # The bump follows the pattern of vymalo/another-agentic-system#11 (deploy-bump):
 # set the image tag in the chart's values.yaml to `sha-<first 7 of the commit>`
@@ -29,6 +35,9 @@ env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/vymalo/another-adam-rs/coder
   HELM_VERSION: v3.19.0
+  KUBECONFORM_VERSION: v0.7.0
+  # Kubernetes version the rendered manifests are validated against.
+  KUBERNETES_VERSION: 1.31.0
 
 concurrency:
   group: coder-${{ github.ref }}
@@ -38,21 +47,6 @@ permissions:
   contents: read
 
 jobs:
-  rust:
-    name: fmt, clippy, test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt -p adam-coder -p adam-a2a-runtime --check
-      - run: cargo clippy -p adam-coder -p adam-a2a-runtime --all-targets -- -D warnings
-      # The tests are offline: a local bare git remote, a scripted model, the
-      # adam-acp fake agent (built by the tests) and a mock GitHub.
-      - run: cargo test -p adam-coder -p adam-a2a-runtime
-
   helm:
     name: helm lint and template
     runs-on: ubuntu-latest
@@ -65,6 +59,23 @@ jobs:
       - run: helm template coder deploy/coder --namespace another-agentic-system > /dev/null
       - name: Rendered chart keeps its guarantees
         run: sh deploy/coder/tests/render-check.sh
+      # Schema-check the render: core kinds against the Kubernetes schemas, the
+      # CNPG Cluster and the ExternalSecret against the datreeio CRDs catalog.
+      # A kind without a schema fails (no -ignore-missing-schemas), so a new
+      # CRD in the chart has to be covered by the catalog.
+      - name: kubeconform
+        env:
+          KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+        run: |
+          set -eu
+          curl -sSfL -o "$RUNNER_TEMP/kubeconform.tgz" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "$KUBECONFORM_SHA256  $RUNNER_TEMP/kubeconform.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/kubeconform.tgz" -C "$RUNNER_TEMP" kubeconform
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            | "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
+                -schema-location default \
+                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' -
 
   dockerfile:
     name: lint Dockerfile
@@ -74,6 +85,18 @@ jobs:
       - uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: docker/coder/Dockerfile
+
+  scripts:
+    name: shell scripts and stub model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh
+      - name: bump-tag.sh is idempotent and edits only image.tag
+        run: sh deploy/coder/tests/bump-tag-test.sh
+      - name: the stub model compiles
+        run: python3 -m py_compile docker/coder/test/fake-model.py
 
   bump-dry-run:
     name: show the tag bump
@@ -98,52 +121,78 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
   image:
-    name: build and push the image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [rust, helm, dockerfile]
+    name: build, smoke-test and push the image
+    needs: [helm, dockerfile, scripts]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
     outputs:
-      pushed: ${{ steps.guard.outputs.ready }}
+      pushed: ${{ steps.guard.outputs.push }}
+    services:
+      # The coder's database for the container smoke test.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
     steps:
       - uses: actions/checkout@v4
       # docker/coder/Dockerfile pins the workspace base image by tag. If it is
       # ever set back to a placeholder (…-PENDING) that does not exist, say so
-      # instead of failing every push to main.
+      # instead of failing every build. `push` is true only on main.
       - name: Is the base image tag real?
         id: guard
         run: |
           if grep -Eq '^ARG WORKSPACE_TAG=.*PENDING' docker/coder/Dockerfile; then
             echo "::warning file=docker/coder/Dockerfile::WORKSPACE_TAG is a placeholder (…-PENDING); not building the image. Set it to a published <toolchain>-<sha7> tag of the workspace image."
             echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "push=false" >> "$GITHUB_OUTPUT"
           else
             echo "ready=true" >> "$GITHUB_OUTPUT"
+            if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+              echo "push=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "push=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
       - uses: docker/setup-buildx-action@v3
         if: steps.guard.outputs.ready == 'true'
-      - uses: docker/login-action@v3
-        if: steps.guard.outputs.ready == 'true'
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Tag
-        id: tag
-        run: echo "tag=sha-$(printf '%s' "$GITHUB_SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+      # Build only (no push) and load into the local daemon for the smoke test.
+      # The Dockerfile's own last RUN is a smoke test of the tools. Fork pull
+      # requests cannot write the cache: ignore-error keeps them green.
       - uses: docker/build-push-action@v6
         if: steps.guard.outputs.ready == 'true'
         with:
           context: .
           file: docker/coder/Dockerfile
           platforms: linux/amd64
-          push: true
-          tags: ${{ env.IMAGE }}:${{ steps.tag.outputs.tag }}
+          push: false
+          load: true
+          tags: coder:smoke
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
+      - name: Container smoke test
+        if: steps.guard.outputs.ready == 'true'
+        run: sh docker/coder/test/container-smoke.sh coder:smoke
+      - uses: docker/login-action@v3
+        if: steps.guard.outputs.push == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Push the image that just passed, not a rebuild of it.
+      - name: Push
+        if: steps.guard.outputs.push == 'true'
+        run: |
+          tag="sha-$(printf '%s' "$GITHUB_SHA" | cut -c1-7)"
+          docker tag coder:smoke "$IMAGE:$tag"
+          docker push "$IMAGE:$tag"
 
   bump:
     name: bump the tag in the chart

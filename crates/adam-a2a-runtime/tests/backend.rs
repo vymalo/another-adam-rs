@@ -402,8 +402,7 @@ async fn subscriptions_are_rebuilt_from_the_store_after_a_restart() {
 /// database holds.
 #[tokio::test]
 async fn subscriptions_are_rebuilt_from_postgres_after_a_restart() {
-    let Ok(url) = std::env::var("ADAM_TEST_POSTGRES_URL") else {
-        eprintln!("skipped: ADAM_TEST_POSTGRES_URL is not set");
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
         return;
     };
     let store = adam_store_postgres::PgStore::connect(&url)

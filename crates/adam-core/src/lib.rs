@@ -5,6 +5,10 @@
 //! pick Postgres, MongoDB, or their own storage without touching agent code.
 
 pub mod store;
+// Test support for this workspace's database-gated suites, not part of the
+// supported API.
+#[doc(hidden)]
+pub mod testing;
 
 pub use store::memory::MemoryStore;
 pub use store::{
