@@ -427,7 +427,9 @@ fn plan(
         Err(AgentError::TransientAfter(msg, at_least)) => retrying(msg, Some(at_least)),
         Err(AgentError::Permanent(msg)) => failed(msg),
         Err(AgentError::NonDeterminism(msg)) => failed(format!("non-deterministic replay: {msg}")),
-        Err(AgentError::Store(e @ StoreError::InvalidData(_))) => failed(e.to_string()),
+        Err(AgentError::Store(e @ (StoreError::InvalidInput(_) | StoreError::Corrupt(_)))) => {
+            failed(e.to_string())
+        }
         Err(AgentError::Store(e @ StoreError::NonDeterminism { .. })) => {
             failed(format!("non-deterministic replay: {e}"))
         }

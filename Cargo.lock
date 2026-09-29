@@ -190,6 +190,7 @@ dependencies = [
 name = "adam-core"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "async-trait",
  "chrono",
  "serde",
@@ -260,6 +261,7 @@ name = "adam-runtime"
 version = "0.1.0"
 dependencies = [
  "adam-core",
+ "adam-error",
  "adam-store-mongodb",
  "adam-store-postgres",
  "adam-store-testkit",

@@ -62,7 +62,7 @@ impl PgStore {
             .max_connections(16)
             .connect(url)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         Ok(Self::from_pool(pool))
     }
 
@@ -82,7 +82,7 @@ impl PgStore {
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
             && !prefix.starts_with(|c: char| c.is_ascii_digit());
         if !valid {
-            return Err(StoreError::InvalidData(format!(
+            return Err(StoreError::InvalidInput(format!(
                 "invalid table prefix {prefix:?}"
             )));
         }
@@ -122,13 +122,13 @@ impl PgStore {
                 return StoreError::NotFound(run);
             }
             if db.code().as_deref() == Some("22P05") {
-                return StoreError::InvalidData(
+                return StoreError::InvalidInput(
                     "PostgreSQL JSONB cannot store the NUL character (\\u0000) in strings or keys"
                         .into(),
                 );
             }
         }
-        StoreError::backend(err)
+        StoreError::unavailable(err)
     }
 }
 
@@ -304,62 +304,68 @@ fn safe(sql: &Arc<str>) -> AssertSqlSafe<Arc<str>> {
 }
 
 fn to_i64(n: u64, what: &str) -> StoreResult<i64> {
-    i64::try_from(n).map_err(|_| StoreError::InvalidData(format!("{what} {n} exceeds i64::MAX")))
+    i64::try_from(n).map_err(|_| StoreError::InvalidInput(format!("{what} {n} exceeds i64::MAX")))
 }
 
 fn run_from_row(row: &PgRow) -> StoreResult<RunRecord> {
-    let status: String = row.try_get("status").map_err(StoreError::backend)?;
-    let version: i64 = row.try_get("version").map_err(StoreError::backend)?;
-    let Json(state): Json<Value> = row.try_get("state").map_err(StoreError::backend)?;
+    let status: String = row.try_get("status").map_err(StoreError::unavailable)?;
+    let version: i64 = row.try_get("version").map_err(StoreError::unavailable)?;
+    let Json(state): Json<Value> = row.try_get("state").map_err(StoreError::unavailable)?;
     Ok(RunRecord {
-        id: RunId(row.try_get::<Uuid, _>("id").map_err(StoreError::backend)?),
-        agent: row.try_get("agent").map_err(StoreError::backend)?,
+        id: RunId(
+            row.try_get::<Uuid, _>("id")
+                .map_err(StoreError::unavailable)?,
+        ),
+        agent: row.try_get("agent").map_err(StoreError::unavailable)?,
         conversation_id: row
             .try_get("conversation_id")
-            .map_err(StoreError::backend)?,
+            .map_err(StoreError::unavailable)?,
         parent_id: row
             .try_get::<Option<Uuid>, _>("parent_id")
-            .map_err(StoreError::backend)?
+            .map_err(StoreError::unavailable)?
             .map(RunId),
         status: RunStatus::parse(&status)
-            .ok_or_else(|| StoreError::InvalidData(format!("unknown run status {status:?}")))?,
+            .ok_or_else(|| StoreError::Corrupt(format!("unknown run status {status:?}")))?,
         state,
-        wake_at: row.try_get("wake_at").map_err(StoreError::backend)?,
+        wake_at: row.try_get("wake_at").map_err(StoreError::unavailable)?,
         version: u64::try_from(version)
-            .map_err(|_| StoreError::InvalidData(format!("negative version {version}")))?,
-        created_at: row.try_get("created_at").map_err(StoreError::backend)?,
-        updated_at: row.try_get("updated_at").map_err(StoreError::backend)?,
+            .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
+        created_at: row.try_get("created_at").map_err(StoreError::unavailable)?,
+        updated_at: row.try_get("updated_at").map_err(StoreError::unavailable)?,
     })
 }
 
 fn entry_from_row(row: &PgRow) -> StoreResult<JournalEntry> {
-    let seq: i64 = row.try_get("seq").map_err(StoreError::backend)?;
-    let Json(payload): Json<Value> = row.try_get("payload").map_err(StoreError::backend)?;
+    let seq: i64 = row.try_get("seq").map_err(StoreError::unavailable)?;
+    let Json(payload): Json<Value> = row.try_get("payload").map_err(StoreError::unavailable)?;
     Ok(JournalEntry {
-        seq: u64::try_from(seq)
-            .map_err(|_| StoreError::InvalidData(format!("negative seq {seq}")))?,
-        name: row.try_get("name").map_err(StoreError::backend)?,
-        ok: row.try_get("ok").map_err(StoreError::backend)?,
+        seq: u64::try_from(seq).map_err(|_| StoreError::Corrupt(format!("negative seq {seq}")))?,
+        name: row.try_get("name").map_err(StoreError::unavailable)?,
+        ok: row.try_get("ok").map_err(StoreError::unavailable)?,
         payload,
-        recorded_at: row.try_get("recorded_at").map_err(StoreError::backend)?,
+        recorded_at: row
+            .try_get("recorded_at")
+            .map_err(StoreError::unavailable)?,
     })
 }
 
 #[async_trait]
 impl Store for PgStore {
     async fn migrate(&self) -> StoreResult<()> {
-        let mut tx = self.pool.begin().await.map_err(StoreError::backend)?;
+        let mut tx = self.pool.begin().await.map_err(StoreError::unavailable)?;
         // Serialize concurrent migrations; CREATE .. IF NOT EXISTS alone can
         // still race on the catalog.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
             .bind(format!("adam-rs:migrate:{}", self.prefix))
             .execute(&mut *tx)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         for stmt in &self.sql.migrate {
-            tx.execute(safe(stmt)).await.map_err(StoreError::backend)?;
+            tx.execute(safe(stmt))
+                .await
+                .map_err(StoreError::unavailable)?;
         }
-        tx.commit().await.map_err(StoreError::backend)
+        tx.commit().await.map_err(StoreError::unavailable)
     }
 
     async fn create_run(&self, new: NewRun) -> StoreResult<RunRecord> {
@@ -388,7 +394,7 @@ impl Store for PgStore {
             .bind(id.0)
             .fetch_optional(&self.pool)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         row.as_ref().map(run_from_row).transpose()
     }
 
@@ -434,7 +440,7 @@ impl Store for PgStore {
             .bind(id.0)
             .fetch_optional(&self.pool)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         match actual {
             None => Err(StoreError::NotFound(id)),
             Some(actual) => Err(StoreError::Conflict {
@@ -455,7 +461,7 @@ impl Store for PgStore {
             .bind(conversation_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         row.as_ref().map(run_from_row).transpose()
     }
 
@@ -468,7 +474,7 @@ impl Store for PgStore {
             .bind(seq)
             .fetch_optional(&self.pool)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         row.as_ref().map(entry_from_row).transpose()
     }
 
@@ -489,7 +495,7 @@ impl Store for PgStore {
         }
         // Someone else recorded this step first: theirs is the truth.
         let existing = self.journal_get(run, entry.seq).await?.ok_or_else(|| {
-            StoreError::InvalidData(format!("journal entry {run}/{} vanished", entry.seq))
+            StoreError::Corrupt(format!("journal entry {run}/{} vanished", entry.seq))
         })?;
         if existing.name != entry.name {
             return Err(StoreError::NonDeterminism {
@@ -507,7 +513,7 @@ impl Store for PgStore {
             .bind(run.0)
             .fetch_all(&self.pool)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         rows.iter().map(entry_from_row).collect()
     }
 
@@ -532,12 +538,13 @@ impl Store for PgStore {
             .bind(until)
             .fetch_all(&self.pool)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         // RETURNING order is unspecified; restore the claim order.
         let mut claimed = rows
             .iter()
             .map(|row| {
-                let sched: DateTime<Utc> = row.try_get("sched_at").map_err(StoreError::backend)?;
+                let sched: DateTime<Utc> =
+                    row.try_get("sched_at").map_err(StoreError::unavailable)?;
                 Ok((sched, run_from_row(row)?))
             })
             .collect::<StoreResult<Vec<_>>>()?;
@@ -567,7 +574,7 @@ impl Store for PgStore {
             .bind(add_ttl(now, ttl))
             .execute(&self.pool)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         Ok(done.rows_affected() == 1)
     }
 
@@ -577,7 +584,7 @@ impl Store for PgStore {
             .bind(worker)
             .execute(&self.pool)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         Ok(())
     }
 
@@ -590,7 +597,7 @@ impl Store for PgStore {
                 .bind(PURGE_BATCH)
                 .execute(&self.pool)
                 .await
-                .map_err(StoreError::backend)?;
+                .map_err(StoreError::unavailable)?;
             total += done.rows_affected();
             if done.rows_affected() < PURGE_BATCH as u64 {
                 return Ok(total);

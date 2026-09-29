@@ -3,6 +3,7 @@
 //! Runs only when `ADAM_TEST_OPENAI_BASE_URL` and `ADAM_TEST_OPENAI_API_KEY`
 //! are set (and optionally `ADAM_TEST_OPENAI_MODEL`, default `gpt-4o-mini`);
 //! otherwise it passes without doing anything.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::time::Duration;
 

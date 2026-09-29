@@ -10,6 +10,7 @@
 //!
 //! Every case takes a fresh agent name from [`uniq`], so cases can share one
 //! database and run in parallel without cleanup.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};

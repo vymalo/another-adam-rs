@@ -21,3 +21,6 @@ uuid.workspace = true
 proptest.workspace = true
 adam-store-testkit.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

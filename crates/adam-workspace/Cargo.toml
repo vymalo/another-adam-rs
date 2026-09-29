@@ -34,3 +34,6 @@ adam-workspace = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["fs", "process", "sync", "time", "macros", "rt-multi-thread"] }
 wiremock.workspace = true
+
+[lints]
+workspace = true

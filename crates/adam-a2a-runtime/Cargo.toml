@@ -32,3 +32,6 @@ axum.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

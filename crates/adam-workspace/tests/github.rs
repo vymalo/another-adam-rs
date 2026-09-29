@@ -1,4 +1,5 @@
 //! `GitHub` against a mock server (no network).
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 #![cfg(feature = "github")]
 
 use std::sync::Arc;

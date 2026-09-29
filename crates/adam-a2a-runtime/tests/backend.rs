@@ -1,6 +1,7 @@
 //! The backend against a real `Runtime` over the in-memory store, with a tiny
 //! scripted agent. Restart cases build a second runtime + backend over the same
 //! store, which is what a replica or a restarted process looks like.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::sync::Arc;
 use std::time::Duration;

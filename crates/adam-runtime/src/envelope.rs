@@ -69,6 +69,6 @@ impl Envelope {
     }
 
     pub fn encode(&self) -> Result<Value, StoreError> {
-        serde_json::to_value(self).map_err(|e| StoreError::InvalidData(e.to_string()))
+        serde_json::to_value(self).map_err(|e| StoreError::InvalidInput(e.to_string()))
     }
 }

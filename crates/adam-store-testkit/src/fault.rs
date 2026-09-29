@@ -106,7 +106,7 @@ impl std::error::Error for Injected {}
 /// Whether `err` was produced by a [`FaultyStore`] fault (and not by the
 /// wrapped store).
 pub fn is_injected(err: &StoreError) -> bool {
-    matches!(err, StoreError::Backend(e) if e.is::<Injected>())
+    matches!(err, StoreError::Backend { source, .. } if source.is::<Injected>())
 }
 
 /// Wraps a store and fails scripted calls with [`StoreError::Backend`]; every
@@ -200,10 +200,10 @@ impl FaultyStore {
     ) -> StoreResult<T> {
         match self.strike(method) {
             None => op.await,
-            Some(Mode::Before) => Err(StoreError::backend(Injected(method))),
+            Some(Mode::Before) => Err(StoreError::unavailable(Injected(method))),
             Some(Mode::After) => {
                 let _ = op.await;
-                Err(StoreError::backend(Injected(method)))
+                Err(StoreError::unavailable(Injected(method)))
             }
         }
     }

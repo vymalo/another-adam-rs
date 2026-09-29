@@ -1,6 +1,7 @@
 //! Behavioural suite of `LlmAgent`: scripted `MockModel`, `MemoryStore`, and a
 //! real `Runtime` with workers. Crash cases abort a worker mid-step exactly
 //! like adam-runtime's `crash_safety` test.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};

@@ -1,6 +1,7 @@
 //! The `adam-coder` binary as a process: configuration errors, an unreachable
 //! Postgres, serving and SIGTERM. Offline, except that the cases which need a
 //! database use `ADAM_TEST_POSTGRES_URL` (and skip without it).
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
 

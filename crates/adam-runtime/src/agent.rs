@@ -129,7 +129,9 @@ impl AgentError {
             Self::Transient(_) | Self::TransientAfter(..) => true,
             Self::Store(e) => !matches!(
                 e,
-                StoreError::InvalidData(_) | StoreError::NonDeterminism { .. }
+                StoreError::InvalidInput(_)
+                    | StoreError::Corrupt(_)
+                    | StoreError::NonDeterminism { .. }
             ),
             Self::Permanent(_) | Self::NonDeterminism(_) => false,
         }

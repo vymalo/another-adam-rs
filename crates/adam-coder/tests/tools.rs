@@ -1,4 +1,5 @@
 //! The tools one by one, against real worktrees over a local bare remote.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
 

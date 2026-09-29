@@ -17,6 +17,9 @@
 //! Cases isolate themselves with a unique agent name, so they run in parallel
 //! against one shared database without cleaning it between tests.
 
+// A conformance suite is test code: a failed unwrap is a failed assertion.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod fault;
 
 pub use adam_core::testing::skipped;
@@ -155,7 +158,7 @@ pub mod cases {
     }
 
     /// Some backends (PostgreSQL JSONB) cannot store `\u0000`. They must say so
-    /// with `InvalidData`, not an opaque backend error, and must not corrupt it.
+    /// with `InvalidInput`, not an opaque backend error, and must not corrupt it.
     pub async fn nul_characters_roundtrip_or_reject_cleanly(store: DynStore) {
         for state in [json!({"text": "a\u{0}b"}), json!({"k\u{0}ey": 1})] {
             match store.create_run(NewRun::new(agent(), state.clone())).await {
@@ -163,8 +166,8 @@ pub mod cases {
                     assert_eq!(run.state, state);
                     assert_eq!(store.load_run(run.id).await.unwrap().unwrap().state, state);
                 }
-                Err(StoreError::InvalidData(_)) => {}
-                Err(other) => panic!("expected a roundtrip or InvalidData, got {other:?}"),
+                Err(StoreError::InvalidInput(_)) => {}
+                Err(other) => panic!("expected a roundtrip or InvalidInput, got {other:?}"),
             }
         }
     }

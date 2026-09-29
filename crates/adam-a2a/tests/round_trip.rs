@@ -1,6 +1,7 @@
 //! Round trips through a real listener with the official A2A client
 //! (`a2a-client-lf`), plus raw HTTP where the client hides what we need to see
 //! (status codes, SSE comment frames).
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::net::SocketAddr;
 use std::sync::Arc;

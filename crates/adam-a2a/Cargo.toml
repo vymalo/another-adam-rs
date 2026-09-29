@@ -35,3 +35,6 @@ url.workspace = true
 adam-a2a = { path = ".", features = ["test-util"] }
 a2a-client-lf.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

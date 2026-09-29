@@ -1,4 +1,5 @@
 //! End-to-end tests against the scripted `adam-acp-fake-agent` binary.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::future::Future;
 use std::path::Path;

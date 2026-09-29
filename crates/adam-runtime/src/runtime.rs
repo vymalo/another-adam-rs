@@ -10,6 +10,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use adam_core::{DynStore, NewRun, RunId, RunRecord, RunStatus, RunUpdate, StoreError};
+use adam_error::ErrorClass;
 
 use crate::agent::{Agent, AgentError, Inbound};
 use crate::cancel::CancelToken;
@@ -72,7 +73,13 @@ impl RuntimeError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Contended(_) => true,
-            Self::Store(e) => matches!(e, StoreError::Backend(_) | StoreError::Conflict { .. }),
+            Self::Store(e) => matches!(
+                e,
+                StoreError::Backend {
+                    class: ErrorClass::Transient,
+                    ..
+                } | StoreError::Conflict { .. }
+            ),
             _ => false,
         }
     }

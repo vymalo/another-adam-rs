@@ -23,3 +23,6 @@ proptest.workspace = true
 chrono.workspace = true
 futures.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

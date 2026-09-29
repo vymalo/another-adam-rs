@@ -72,7 +72,7 @@ impl MongoStore {
     pub async fn connect(uri: &str, db: &str) -> StoreResult<Self> {
         let client = Client::with_uri_str(uri)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         Ok(Self::new(client.database(db)))
     }
 
@@ -89,7 +89,7 @@ impl MongoStore {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
         if !valid {
-            return Err(StoreError::InvalidData(format!(
+            return Err(StoreError::InvalidInput(format!(
                 "invalid collection prefix {prefix:?}"
             )));
         }
@@ -124,7 +124,7 @@ impl MongoStore {
             .find_one(doc! { "_id": uuid(id), "purging": { "$ne": true } })
             .projection(doc! { "_id": 1 })
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         Ok(found.is_some())
     }
 
@@ -136,10 +136,10 @@ impl MongoStore {
         }
         let docs: Vec<Document> = find
             .await
-            .map_err(StoreError::backend)?
+            .map_err(StoreError::unavailable)?
             .try_collect()
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         Ok(docs
             .into_iter()
             .filter_map(|d| d.get("_id").cloned())
@@ -152,7 +152,7 @@ impl MongoStore {
             .runs
             .find_one(doc! { "_id": uuid(id), "purging": { "$ne": true } })
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         found.as_ref().map(run_from_doc).transpose()
     }
 
@@ -161,7 +161,7 @@ impl MongoStore {
             .journal
             .find_one(doc! { "_id": journal_id(run, seq) })
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         found.as_ref().map(entry_from_doc).transpose()
     }
 }
@@ -193,11 +193,11 @@ fn open_key(id: RunId, agent: &str, conversation: Option<&str>, status: RunStatu
 }
 
 fn to_i64(n: u64, what: &str) -> StoreResult<i64> {
-    i64::try_from(n).map_err(|_| StoreError::InvalidData(format!("{what} {n} exceeds i64::MAX")))
+    i64::try_from(n).map_err(|_| StoreError::InvalidInput(format!("{what} {n} exceeds i64::MAX")))
 }
 
 fn bad(field: &str) -> StoreError {
-    StoreError::InvalidData(format!(
+    StoreError::Corrupt(format!(
         "missing or malformed field {field:?} in stored document"
     ))
 }
@@ -326,7 +326,7 @@ impl Store for MongoStore {
             )
             .upsert(true)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         Ok(())
     }
 
@@ -372,7 +372,7 @@ impl Store for MongoStore {
                     })
                 }
             }
-            Err(err) => Err(StoreError::backend(err)),
+            Err(err) => Err(StoreError::unavailable(err)),
         }
     }
 
@@ -381,7 +381,7 @@ impl Store for MongoStore {
             .runs
             .find_one(doc! { "_id": uuid(id) })
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         found.as_ref().map(run_from_doc).transpose()
     }
 
@@ -439,7 +439,7 @@ impl Store for MongoStore {
                 agent: current.agent,
                 conversation_id: current.conversation_id.unwrap_or_default(),
             }),
-            Err(err) => Err(StoreError::backend(err)),
+            Err(err) => Err(StoreError::unavailable(err)),
         }
     }
 
@@ -452,7 +452,7 @@ impl Store for MongoStore {
             .runs
             .find_one(doc! { "open_key": open_conversation_key(agent, conversation_id) })
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         found.as_ref().map(run_from_doc).transpose()
     }
 
@@ -486,18 +486,18 @@ impl Store for MongoStore {
                     self.journal
                         .delete_one(doc! { "_id": journal_id(run, entry.seq) })
                         .await
-                        .map_err(StoreError::backend)?;
+                        .map_err(StoreError::unavailable)?;
                     return Err(StoreError::NotFound(run));
                 }
                 entry_from_doc(&doc)
             }
             Err(err) if is_duplicate_key(&err) => {
                 let existing = self.find_journal(run, entry.seq).await?.ok_or_else(|| {
-                    StoreError::InvalidData(format!("journal entry {run}/{} vanished", entry.seq))
+                    StoreError::Corrupt(format!("journal entry {run}/{} vanished", entry.seq))
                 })?;
                 check_same_step(run, existing, entry)
             }
-            Err(err) => Err(StoreError::backend(err)),
+            Err(err) => Err(StoreError::unavailable(err)),
         }
     }
 
@@ -507,10 +507,10 @@ impl Store for MongoStore {
             .find(doc! { "run_id": uuid(run) })
             .sort(doc! { "seq": 1 })
             .await
-            .map_err(StoreError::backend)?
+            .map_err(StoreError::unavailable)?
             .try_collect()
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         docs.iter().map(entry_from_doc).collect()
     }
 
@@ -547,10 +547,10 @@ impl Store for MongoStore {
                 .limit(i64::try_from(want).unwrap_or(i64::MAX))
                 .projection(doc! { "_id": 1 })
                 .await
-                .map_err(StoreError::backend)?
+                .map_err(StoreError::unavailable)?
                 .try_collect::<Vec<Document>>()
                 .await
-                .map_err(StoreError::backend)?
+                .map_err(StoreError::unavailable)?
                 .into_iter()
                 .filter_map(|d| d.get("_id").cloned())
                 .collect();
@@ -571,7 +571,7 @@ impl Store for MongoStore {
                     } },
                 )
                 .await
-                .map_err(StoreError::backend)?;
+                .map_err(StoreError::unavailable)?;
             claimed += usize::try_from(updated.modified_count).unwrap_or(usize::MAX);
             if claimed >= limit || updated.modified_count as usize == candidates.len() {
                 break;
@@ -585,10 +585,10 @@ impl Store for MongoStore {
             .find(doc! { "_id": { "$in": tried }, "lease_token": &token, "lease_owner": worker })
             .sort(doc! { "sched_at": 1, "_id": 1 })
             .await
-            .map_err(StoreError::backend)?
+            .map_err(StoreError::unavailable)?
             .try_collect()
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         docs.iter()
             .map(|d| {
                 Ok(Lease {
@@ -615,7 +615,7 @@ impl Store for MongoStore {
                 doc! { "$set": { "lease_until": date(add_ttl(now, ttl)) } },
             )
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         Ok(result.matched_count == 1)
     }
 
@@ -626,7 +626,7 @@ impl Store for MongoStore {
                 doc! { "$set": { "lease_owner": Bson::Null, "lease_until": Bson::Null, "lease_token": Bson::Null } },
             )
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
         Ok(())
     }
 
@@ -657,7 +657,7 @@ impl Store for MongoStore {
             self.runs
                 .update_many(filter, doc! { "$set": { "purging": true } })
                 .await
-                .map_err(StoreError::backend)?;
+                .map_err(StoreError::unavailable)?;
             let doomed = self
                 .ids(doc! { "_id": { "$in": &ids }, "purging": true }, None)
                 .await?;
@@ -666,12 +666,12 @@ impl Store for MongoStore {
             self.journal
                 .delete_many(doc! { "run_id": { "$in": &doomed } })
                 .await
-                .map_err(StoreError::backend)?;
+                .map_err(StoreError::unavailable)?;
             let deleted = self
                 .runs
                 .delete_many(doc! { "_id": { "$in": &doomed }, "purging": true })
                 .await
-                .map_err(StoreError::backend)?;
+                .map_err(StoreError::unavailable)?;
             total += deleted.deleted_count;
             if (ids.len() as i64) < PURGE_BATCH {
                 return Ok(total);
@@ -693,7 +693,7 @@ async fn ensure_indexes<const N: usize>(
         Err(err) if matches!(err.kind.as_ref(), ErrorKind::Command(c) if c.code == NAMESPACE_NOT_FOUND) => {
             Vec::new()
         }
-        Err(err) => return Err(StoreError::backend(err)),
+        Err(err) => return Err(StoreError::unavailable(err)),
     };
     let missing: Vec<IndexModel> = models
         .into_iter()
@@ -705,7 +705,7 @@ async fn ensure_indexes<const N: usize>(
     if !missing.is_empty() {
         coll.create_indexes(missing)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(StoreError::unavailable)?;
     }
     Ok(())
 }

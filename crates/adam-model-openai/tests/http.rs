@@ -1,4 +1,5 @@
 //! HTTP-level tests against a local mock server. No network needed.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::time::Duration;
 

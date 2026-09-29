@@ -49,3 +49,6 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 tempfile.workspace = true
 uuid.workspace = true
 wiremock.workspace = true
+
+[lints]
+workspace = true

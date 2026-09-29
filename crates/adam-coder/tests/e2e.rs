@@ -1,6 +1,7 @@
 //! The coder end to end, offline: A2A client -> A2A server -> runtime -> the
 //! coder agent (scripted `MockModel`) -> real worktrees over a local bare git
 //! remote, the adam-acp fake agent for OpenCode, and a mock GitHub.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
 
