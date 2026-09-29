@@ -14,17 +14,21 @@ rust-version = "1.94"
 adam-core = { path = "crates/adam-core", version = "0.1.0" }
 adam-model = { path = "crates/adam-model", version = "0.1.0" }
 adam-store-testkit = { path = "crates/adam-store-testkit", version = "0.1.0" }
+adam-workspace = { path = "crates/adam-workspace", version = "0.1.0" }
 
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 futures = "0.3"
+httpdate = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream", "json", "query"] }
+secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
+url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-httpdate = "1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream"] }
-secrecy = "0.10"
 wiremock = "0.6"
