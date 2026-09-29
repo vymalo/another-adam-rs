@@ -431,6 +431,95 @@ async fn concurrent_prepare_push_and_remove_do_not_interfere() {
     git(&env.mirror(), &["fsck", "--strict", "--no-dangling"]);
 }
 
+/// Two `Workspaces` on one root stand for two worker processes on a shared volume: they share
+/// no in-process lock, only the file lock next to the mirror.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_workspaces_on_one_root_do_not_trip_over_each_others_git_locks() {
+    let env = Env::new();
+    let other = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let ws = if i % 2 == 0 {
+            env.ws.clone()
+        } else {
+            other.clone()
+        };
+        let repo = env.repo.clone();
+        tasks.push(tokio::spawn(async move {
+            let run = format!("shared-{i:04}");
+            let wt = ws.prepare(&repo, &run).await?;
+            std::fs::write(wt.path().join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
+            wt.commit_all("work", &me()).await?;
+            wt.push().await?;
+            if i % 3 == 0 {
+                ws.remove(&run).await?;
+            }
+            Ok::<_, WorkspaceError>(wt.branch().to_owned())
+        }));
+    }
+    let mut branches = Vec::new();
+    for t in tasks {
+        let branch = t.await.unwrap().expect("no \"could not lock\" error");
+        git(&env.remote, &["rev-parse", &format!("refs/heads/{branch}")]);
+        branches.push(branch);
+    }
+    branches.sort_unstable();
+    branches.dedup();
+    assert_eq!(branches.len(), 16, "every run has its own branch");
+    git(&env.mirror(), &["fsck", "--strict", "--no-dangling"]);
+    let list = git(&env.mirror(), &["worktree", "list", "--porcelain"]);
+    // The bare mirror plus the runs that were not removed (i % 3 != 0 -> 10 of 16).
+    assert_eq!(list.matches("worktree ").count(), 1 + 10, "{list}");
+}
+
+/// The lock is a file next to the mirror, so a lock held by another process (here: another
+/// handle) stops `prepare` until it lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mirror_locked_by_another_process_makes_prepare_wait() {
+    let env = Env::new();
+    env.ws.prepare(&env.repo, "first-run-0001").await.unwrap();
+    let lock_path = {
+        let mut name = env.mirror().into_os_string();
+        name.push(".lock");
+        PathBuf::from(name)
+    };
+    assert!(lock_path.is_file(), "{}", lock_path.display());
+    assert_eq!(
+        lock_path.parent(),
+        env.mirror().parent(),
+        "the lock file is a sibling of the mirror, not inside it"
+    );
+
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    held.lock().unwrap();
+
+    let ws = env.ws.clone();
+    let repo = env.repo.clone();
+    let mut waiting = tokio::spawn(async move {
+        ws.prepare(&repo, "second-run-0002")
+            .await
+            .map(|w| w.branch().to_owned())
+    });
+    let early = tokio::time::timeout(std::time::Duration::from_millis(400), &mut waiting).await;
+    assert!(early.is_err(), "prepare must wait for the mirror lock");
+    assert!(
+        !env.root.join("worktrees/second-run-0002").exists(),
+        "nothing was done to the mirror meanwhile"
+    );
+
+    held.unlock().unwrap();
+    let branch = tokio::time::timeout(std::time::Duration::from_secs(20), waiting)
+        .await
+        .expect("prepare goes on once the lock is free")
+        .unwrap()
+        .unwrap();
+    assert!(branch.starts_with("agent/"));
+    assert!(env.root.join("worktrees/second-run-0002").is_dir());
+}
+
 #[tokio::test]
 async fn status_reports_every_kind_of_change() {
     let env = Env::new();

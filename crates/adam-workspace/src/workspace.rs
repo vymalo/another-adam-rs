@@ -45,11 +45,21 @@ const MAX_RUN_ID: usize = 128;
 /// # Concurrency
 ///
 /// A per-mirror async lock serialises `fetch` and worktree add/remove (and the
-/// few mirror-config writes) within this process. That is the whole story:
-/// **one process per root** is assumed (the coder runs as a one-replica
-/// StatefulSet with the root on its PVC), so there is no file lock. A second
-/// process would not corrupt anything, since git's own lock files make it
-/// fail loudly, but it may see spurious "could not lock" errors.
+/// few mirror-config writes) within this process. Under it, an exclusive
+/// advisory file lock on `<mirror>.lock` (`std::fs::File::lock`, `flock(2)` on
+/// Linux) serialises them across processes, so several workers can share one
+/// root (the `shared` workspace placement) without git's own lock files making
+/// one of them fail with "could not lock". The lock file sits next to the
+/// mirror directory, never inside it, and the lock goes away with the file
+/// handle, so a crashed process frees it. Both locks are held for the same
+/// stretch: the async one first, then the file lock (taken on a blocking
+/// thread), released in the opposite order.
+///
+/// A root used by one process pays for one uncontended `flock` per operation.
+/// The volume must honour file locks. *Unverified* for NFS and for Longhorn RWX:
+/// test two workers against one repository before relying on it. A volume that
+/// refuses the lock makes `prepare`, `remove` and `push` fail with
+/// [`WorkspaceError::Io`] instead of running unlocked.
 ///
 /// # Lifecycle
 ///
@@ -70,6 +80,14 @@ pub(crate) struct Inner {
     pub(crate) creds: DynGitCredentials,
     policy: Policy,
     locks: Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// Held while a mirror is being changed: the in-process lock, then the file lock. Fields drop
+/// in order, so the file lock is released first.
+#[must_use = "the mirror is only locked while the guard is alive"]
+pub(crate) struct MirrorGuard {
+    _file: std::fs::File,
+    _local: tokio::sync::OwnedMutexGuard<()>,
 }
 
 /// Which repositories a [`Workspaces`] accepts. The default accepts
@@ -255,8 +273,7 @@ impl Workspaces {
         self.inner.validate_base(&repo.base_branch).await?;
         let mirror = self.inner.root.join(loc.mirror_relative());
 
-        let lock = self.inner.lock_for(&mirror);
-        let _guard = lock.lock().await;
+        let _guard = self.inner.lock_mirror(&mirror).await?;
 
         let path = self.inner.worktree_path(run);
         let meta = self.inner.read_meta(run).await?;
@@ -388,8 +405,7 @@ impl Workspaces {
         let loc = RepoRef::new(&meta.url, &meta.base_branch).locate()?;
         let mirror = self.inner.root.join(loc.mirror_relative());
 
-        let lock = self.inner.lock_for(&mirror);
-        let _guard = lock.lock().await;
+        let _guard = self.inner.lock_mirror(&mirror).await?;
 
         let have_mirror = exists(&mirror.join("HEAD")).await?;
         if have_mirror {
@@ -428,7 +444,38 @@ impl Inner {
         self.root.join("meta").join(format!("{run}.json"))
     }
 
-    pub(crate) fn lock_for(&self, mirror: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    /// Lock `mirror` against this process's other tasks and against other processes on the same
+    /// root. See the *Concurrency* section of [`Workspaces`].
+    pub(crate) async fn lock_mirror(&self, mirror: &Path) -> WorkspaceResult<MirrorGuard> {
+        let local = self.lock_for(mirror).lock_owned().await;
+        let path = mirror_lock_path(mirror);
+        let file = tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)?;
+            file.lock()?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| WorkspaceError::io("the mirror lock task failed", io::Error::other(e)))?
+        .map_err(|e| {
+            WorkspaceError::io(
+                "cannot lock the mirror (does the volume support file locks?)",
+                e,
+            )
+        })?;
+        Ok(MirrorGuard {
+            _file: file,
+            _local: local,
+        })
+    }
+
+    fn lock_for(&self, mirror: &Path) -> Arc<tokio::sync::Mutex<()>> {
         // The std mutex is never held across an await.
         let mut locks = self
             .locks
@@ -702,6 +749,14 @@ impl Inner {
 }
 
 /// Run ids become directory and branch names, so they are restricted.
+/// `<mirror>.lock`, a sibling of the mirror directory (`.../repo.git` -> `.../repo.git.lock`).
+/// A mirror is always named `<name>.git`, so no other mirror can have this name.
+fn mirror_lock_path(mirror: &Path) -> PathBuf {
+    let mut name = mirror.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
 fn validate_run(run: &str) -> WorkspaceResult<()> {
     let ok = !run.is_empty()
         && run.len() <= MAX_RUN_ID
