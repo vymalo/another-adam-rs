@@ -91,6 +91,7 @@ dependencies = [
 name = "adam"
 version = "0.1.0"
 dependencies = [
+ "adam-agent-fs",
  "adam-core",
  "adam-error",
  "adam-llm-agent",
@@ -174,6 +175,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-agent-fixture"
+version = "0.1.0"
+dependencies = [
+ "adam",
+ "adam-agent-fs",
+ "tempfile",
+]
+
+[[package]]
 name = "adam-agent-fs"
 version = "0.1.0"
 dependencies = [
@@ -182,8 +192,10 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror",
+ "trybuild",
  "url",
 ]
 

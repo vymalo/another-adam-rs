@@ -1,8 +1,8 @@
 # The authoring layer
 
 Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
-facade), S3 (`adam-coder` tools through `#[tool]`) and S4 (`adam-agent-fs`, the parser and validator of
-agent directories) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+facade), S3 (`adam-coder` tools through `#[tool]`), S4 (`adam-agent-fs`, the parser and validator of
+agent directories) and S5 (the `build.rs` codegen and `adam::include_agent!()`) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
 the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
@@ -191,8 +191,9 @@ match `^[a-z][a-z0-9_]{0,63}$`.
 Slice S4. [`adam-agent-fs`](../crates/adam-agent-fs/README.md) reads a directory into an
 `AgentManifest` and reports every problem as a `Diagnostic { severity, path, line, message }` (severity
 is the closed enum `Error | Warning`). It is the one parser and the one validator: the `build.rs` codegen
-(S5) and the run-time `dev` loader (S10) will call it, so the two paths cannot disagree. It has no
-`build.rs` code, no async and no adam runtime dependency. Nothing in it expands `${VAR}`.
+(S5, below) and the run-time `dev` loader (S10) call it, so the two paths cannot disagree. It has no
+async and no adam runtime dependency, and the codegen is a feature (`build`) of the same crate.
+Nothing in it expands `${VAR}`.
 
 ```mermaid
 sequenceDiagram
@@ -260,6 +261,87 @@ The test suite is the specification: one fixture directory per rule, each produc
 all 75 vendored `.agents/skills/*/SKILL.md` of this repository parse with no error and no warning; a Claude
 Code agent and two Copilot agents parse unchanged as subagents; and the splitter never panics on arbitrary
 text.
+
+## Build and dev (built: `build.rs` codegen)
+
+Slice S5. `adam_agent_fs::build("agent").emit()` in `build.rs` and `adam::include_agent!()` in the
+crate are the default way to ship an agent: the directory is parsed, validated and embedded at
+build time, so a mistake stops the build before rustc runs and nothing is parsed at startup. The
+same `Dir` source reads the same files at run time (the `dev` feature of slice S10); both produce a
+`Package`, and the tests assert that the embedded one equals the one read from the directory.
+
+```mermaid
+sequenceDiagram
+  participant C as cargo
+  participant B as build.rs
+  participant D as Dir source
+  participant O as OUT_DIR
+  participant R as rustc
+  C->>B: run (first build, or a watched path changed)
+  B->>D: load agent or agents
+  D-->>B: Report with the package and every diagnostic
+  B-->>C: cargo::rerun-if-changed for the directory and each file
+  B-->>C: cargo::warning and cargo::error with path and line
+  alt an error, or a warning under strict
+    B-->>C: Err, the build stops before rustc
+  else valid
+    B->>O: adam_agent.rs and adam_manifest.json, only when changed
+    C->>R: compile the crate
+    R->>O: include_agent! includes adam_agent.rs
+    R->>R: include_bytes! and include_str! read the files
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Watching: first build
+  Watching --> Loading: a watched path changed, or build.rs changed
+  Loading --> Refused: an error, or a warning under strict
+  Loading --> Generated: the package is valid
+  Refused --> Loading: the file is fixed (its path is still watched)
+  Generated --> Watching: adam_agent.rs written only if its bytes changed
+```
+
+* **Diagnostics are build errors.** Every finding is one line, `cargo::error=path:line: message` (or
+  `cargo::warning=` for a warning), with the path relative to the package root. A warning fails the
+  build under `.strict()`. `emit()` returns `Err(BuildError)` whose `Debug` is its message. Nothing is
+  written for a refused directory, and the watch list is printed anyway so that fixing the file
+  rebuilds.
+* **Rerun tracking.** `cargo::rerun-if-changed` is printed for the agent directory (cargo scans a
+  directory recursively, so a new file is noticed) and for every file and directory in it, ignored
+  files included. If the directory does not exist nothing is printed: a path that does not exist makes
+  cargo rerun the script on every build, and with no directive cargo's default (rerun when the
+  package changes) applies. `OUT_DIR/adam_agent.rs` is rewritten only when its bytes change.
+  *Verified 2026-09-29* with cargo 1.94.1 on a scratch build script: a missing `rerun-if-changed` path
+  is reported `Dirty ... the file ... is missing` on every build, a new file in a watched directory
+  makes the package dirty, and `cargo::error=` fails the build even when the script exits 0.
+* **`build("agent")` or `build("agents")`.** The argument names the directory (`agent/` one agent,
+  `agents/<name>/` several) and must match the layout found; anything else is an error. Both present
+  is the error of the discovery rules, neither is an error unless `.optional()`.
+* **The generated file** defines `AGENTS` (a slice of `EmbeddedAgent`, sorted by name), `AGENT` (the
+  single agent of an `agent/` package) and `PACKAGE` (an `EmbeddedPackage`). It is `'static` data:
+  prompts, skill bodies and schedule prompts are raw string literals (normalised: frontmatter removed,
+  LF endings, trimmed); the frontmatter is JSON, read back into the same `AgentFrontmatter`; `mcp.json`
+  is `include_str!` of the file and stays unexpanded, so no secret passes through the build; skill
+  resources are `include_bytes!`, at most 1 MiB per skill. Every agent, at every depth, carries a
+  `digest`: SHA-256 over the JSON of the normalised manifest and the bytes of each resource, the same
+  for a directory (`Dir::digest`) and for its embedded copy (`EmbeddedAgent::verify`). The plan's
+  `body_offset` (a body's line in its file, for bind-time messages) is not there yet; slice S6 adds
+  it if binding needs it.
+* **Two sources, one type.** `ManifestSource::load()` is implemented by `Dir` and by
+  `EmbeddedPackage`, both giving a `Report` and a `Package`. `adam::agent_fs` is the whole crate
+  re-exported by the facade, and generated code refers to it as `::adam::agent_fs` (change it with
+  `.crate_path(..)` for a crate that depends on `adam-agent-fs` directly).
+* **Versions must match.** The generated code fills the public fields of the `Embedded*` types, so
+  the crate that runs `build()` and the crate that runs the binary must be the same version of
+  `adam-agent-fs` (they are, when both come from the workspace or from `adam`).
+
+The tests: a golden file of the generated source; a trybuild pass test that compiles and runs the
+generated source for a single, a multi-agent and an absent package under `deny(warnings)`; the
+`adam-agent-fixture` crate, which has a real `build.rs` and `adam::include_agent!()` and asserts
+embedded equals directory; an invalid directory gives `path:line` errors and no file; and
+`rerun-if-changed` equals the set of all files. Details are in the
+[`adam-agent-fs` README](../crates/adam-agent-fs/README.md#embedding-at-build-time).
 
 ## The `#[tool]` contract
 
@@ -401,7 +483,7 @@ parent does not cancel its children in v1; they finish within their own limits.
 Remote subagents (`a2a:`) use the same tool shape: a journaled A2A `SendMessage`, then a park on the
 remote task id and a poll on the timer.
 
-## Dev and build (planned)
+## Binding and dev reload (planned; the build half is above)
 
 ```mermaid
 sequenceDiagram
@@ -413,7 +495,7 @@ sequenceDiagram
   participant L as LlmAgent
   B->>F: build("agent")
   F->>F: split frontmatter, validate, list diagnostics
-  F->>O: static manifest, bodies embedded with include_str
+  F->>O: static manifest: normalised bodies, resources with include_bytes
   M->>O: adam::include_agent!()
   M->>D: from_manifest, then bind(tools), state(..), model(..)
   D->>D: unknown tool, unknown var or missing state fails here
@@ -440,10 +522,11 @@ the in-memory store).
 | Crate | Kind | Contents |
 |---|---|---|
 | `adam-macros` | proc-macro | **built (S2)**: `#[tool]`; a thin shim over a pure, unit-tested `expand` function |
-| `adam-agent-fs` | lib | **built (S4)**: frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` with the `Dir` implementation. Planned (S5): the embedded source and the `build.rs` codegen behind a feature. No async, no runtime dependency |
+| `adam-agent-fs` | lib | **built (S4, S5)**: frontmatter splitter, schemas, discovery, validation with diagnostics, `ManifestSource` with the `Dir` and `EmbeddedPackage` implementations, the digest of a manifest, and the `build.rs` codegen behind the feature `build`. No async, no runtime dependency |
 | `adam-assembly` | lib | `AgentDef`: manifest + `ToolSet` + model + state into `LlmAgent`s; `{{var}}` templating; skills; `SubagentTool`; the A2A card |
 | `adam-mcp` | lib | MCP client (the official Rust SDK): MCP tools as `Tool`s, `${VAR}` expansion, fail closed |
-| `adam` | facade | **built (S2)**: `prelude`, the macro, feature `macros` (default). Planned: `include_agent!`, features `a2a`, `mcp`, `dev` |
+| `adam` | facade | **built (S2, S5)**: `prelude`, the macro, feature `macros` (default), `include_agent!`, `adam::agent_fs`. Planned: features `a2a`, `mcp`, `dev` |
+| `adam-agent-fixture` | test fixture | **built (S5)**, not published: a `build.rs` plus `include_agent!()` over the `adam-agent-fs` test fixture, and the tests that compare embedded and directory |
 | `cargo-adam` | bin | `new`, `check`, `dev` (roadmap 6) |
 
 `ManifestSource` is the seam between where the files come from and what they mean, so that a backend can be swapped
@@ -519,7 +602,8 @@ type already sets the pattern).
 | S2 | `#[tool]` and the `adam` facade | built |
 | S3 | `adam-coder` tools through `#[tool]`, no behaviour change | built |
 | S4 | `adam-agent-fs`: parse and validate agent directories | built |
-| S5, S6 | `build.rs` codegen, `adam-assembly` | planned |
+| S5 | `build.rs` codegen and `adam::include_agent!()` | built |
+| S6 | `adam-assembly` | planned |
 | S7 | skills | planned |
 | S8, S9 | child runs and subagents | planned; S8 needs a review of the design above first |
 | S10, S11 | dev reload; `mcp.json` tools | planned |

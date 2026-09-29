@@ -15,6 +15,7 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [workspace.dependencies]
+adam = { path = "crates/adam", version = "0.1.0" }
 adam-agent-fs = { path = "crates/adam-agent-fs", version = "0.1.0" }
 adam-core = { path = "crates/adam-core", version = "0.1.0" }
 adam-error = { path = "crates/adam-error", version = "0.1.0" }

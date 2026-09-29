@@ -8,17 +8,24 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# `adam_agent_fs::build("agent").emit()` for a build script: the code generator that embeds an
+# agent directory in the binary. Off by default; a crate lists it under `[build-dependencies]`.
+build = []
+
 [dependencies]
 adam-error.workspace = true
 serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 url.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+trybuild.workspace = true
 
 [lints]
 workspace = true

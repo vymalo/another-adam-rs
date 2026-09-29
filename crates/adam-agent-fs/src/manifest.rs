@@ -1,12 +1,14 @@
 //! The owned manifest: what a directory of agent files means, after parsing and validation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use serde::{Serialize, Serializer};
 
 use crate::schema::{AgentFrontmatter, McpConfig, SkillFrontmatter};
 use crate::{Diagnostic, Error};
 
 /// How a skill is laid out on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SkillLayout {
     /// `skills/<name>/SKILL.md`, with optional `scripts/`, `references/` and `assets/`.
     Directory,
@@ -15,7 +17,7 @@ pub enum SkillLayout {
 }
 
 /// A skill, in the Agent Skills sense: a catalog entry and a body loaded on demand.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Skill {
     /// The name the catalog uses: the directory name (or the file stem of a flat skill).
     pub name: String,
@@ -34,6 +36,7 @@ pub struct Skill {
     /// Directory or flat.
     pub layout: SkillLayout,
     /// The `SKILL.md` (or flat) file, relative to the source root.
+    #[serde(serialize_with = "portable_path")]
     pub path: PathBuf,
     /// The other files of a directory skill, relative to the skill directory with `/`
     /// separators, sorted. Their contents are not read here.
@@ -65,7 +68,7 @@ impl Skill {
 }
 
 /// How to authenticate to a remote subagent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum RemoteAuth {
     /// `bearer:VAR`: the token is in the environment variable `VAR`, read at startup.
     Bearer {
@@ -75,7 +78,7 @@ pub enum RemoteAuth {
 }
 
 /// A subagent that lives elsewhere: an A2A agent, addressed by its agent-card URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemoteAgent {
     /// The tool name the parent sees.
     pub name: String,
@@ -88,11 +91,12 @@ pub struct RemoteAgent {
     /// The body of the file, if any: it extends the tool description.
     pub note: String,
     /// The file, relative to the source root.
+    #[serde(serialize_with = "portable_path")]
     pub path: PathBuf,
 }
 
 /// A subagent: a local agent of its own, or a remote A2A agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Subagent {
     /// Hosted in this process, with its own instructions, tools, skills and subagents.
     Local(Box<AgentManifest>),
@@ -111,7 +115,7 @@ impl Subagent {
 }
 
 /// One extra file of `instructions/`, appended after `instructions.md`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InstructionPart {
     /// The file name.
     pub file: String,
@@ -120,7 +124,7 @@ pub struct InstructionPart {
 }
 
 /// The system prompt of an agent, in the pieces it is written in.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Instructions {
     /// The body of `instructions.md` (or of the subagent file).
     pub body: String,
@@ -141,7 +145,7 @@ impl Instructions {
 }
 
 /// A scheduled prompt (`schedules/<name>.md`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Schedule {
     /// From the path: `schedules/a/b.md` is `a/b`.
     pub name: String,
@@ -154,15 +158,17 @@ pub struct Schedule {
     /// The body of the file.
     pub prompt: String,
     /// The file, relative to the source root.
+    #[serde(serialize_with = "portable_path")]
     pub path: PathBuf,
 }
 
 /// One agent with everything that belongs to it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentManifest {
     /// The agent's name.
     pub name: String,
     /// The instructions file (or the subagent file), relative to the source root.
+    #[serde(serialize_with = "portable_path")]
     pub path: PathBuf,
     /// The parsed frontmatter, with Claude's `maxTurns` folded into `limits`.
     pub frontmatter: AgentFrontmatter,
@@ -179,7 +185,7 @@ pub struct AgentManifest {
 }
 
 /// How the agents of a package are laid out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Layout {
     /// No agent was read: there is no agent directory (and the source was told that is
     /// fine), or both `agent/` and `agents/` exist (an error).
@@ -191,7 +197,7 @@ pub enum Layout {
 }
 
 /// Everything a source holds: one agent or several.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Package {
     /// How the agents are laid out.
     pub layout: Layout,
@@ -250,4 +256,10 @@ impl Report {
             Ok(self.package)
         }
     }
+}
+
+/// A path with `/` separators on every platform, so a manifest and its digest do not depend on
+/// where they were built.
+fn portable_path<S: Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&path.to_string_lossy().replace('\\', "/"))
 }

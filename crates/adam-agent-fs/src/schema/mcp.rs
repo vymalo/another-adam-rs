@@ -6,13 +6,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::names::is_env_name;
 
 /// The transport of a remote MCP server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RemoteKind {
     /// `type: http`.
     Http,
@@ -23,7 +23,7 @@ pub enum RemoteKind {
 }
 
 /// One MCP server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum McpServer {
     /// A process the runtime spawns (`command`; `type` is `stdio` or absent).
     Stdio {
@@ -73,7 +73,7 @@ impl McpServer {
 }
 
 /// A parsed `mcp.json`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct McpConfig {
     /// The servers by name. The model sees their tools as `<server>__<tool>`.
     pub servers: BTreeMap<String, McpServer>,

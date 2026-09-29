@@ -32,8 +32,8 @@ Contents:
 Arrows point from a crate to a crate it depends on. Solid arrows come from
 `[dependencies]` in the `Cargo.toml` files. Dotted arrows are
 `[dev-dependencies]` that are not also normal dependencies (tests only). Grey
-arrows go to `adam-error`: every crate except the two test kits and
-`adam-macros` depends on it.
+arrows go to `adam-error`: every crate except the two test kits,
+`adam-agent-fixture` and `adam-macros` depends on it.
 
 ```mermaid
 flowchart TB
@@ -68,6 +68,7 @@ flowchart TB
     subgraph kits["Test kits"]
         testkit["adam-store-testkit"]
         nk["adam-notify-testkit"]
+        fixture["adam-agent-fixture"]
     end
 
     coder --> a2a
@@ -98,6 +99,9 @@ flowchart TB
     pgn --> rt
     nk --> core
     nk --> rt
+    fixture --> adam
+    fixture --> agentfs
+    adam --> agentfs
     adam --> core
     adam --> llm
     adam --> macros
@@ -130,7 +134,7 @@ flowchart TB
     host --> err
     pgn --> err
 
-    linkStyle 41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56 stroke:#999,stroke-width:1px
+    linkStyle 44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -184,17 +188,23 @@ The layers, from the bottom:
   * `adam-agent-fs` parses and validates an agent directory (`agent/instructions.md`,
     skills, subagents, `mcp.json`, schedules) into an `AgentManifest` and reports
     every mistake with its file and line. It is a leaf over `serde` and
-    `serde-saphyr`, with no async and no runtime dependency; the `build.rs`
-    codegen and the binding to `LlmAgent` build on it later. See
-    [`docs/authoring.md`](authoring.md).
+    `serde-saphyr`, with no async and no runtime dependency. Its feature `build`
+    is the code generator a `build.rs` calls to embed the directory in the
+    binary as a `'static` manifest; the binding to `LlmAgent` builds on it
+    later. See [`docs/authoring.md`](authoring.md).
   * `adam` is the facade a user writes agents against: `prelude`, the
-    re-exported `adam-llm-agent` API, and the `#[tool]` macro behind the
-    default feature `macros`. Generated code refers to `adam::__private`.
+    re-exported `adam-llm-agent` API, the `#[tool]` macro behind the
+    default feature `macros`, and `adam-agent-fs` as `adam::agent_fs` with the
+    `include_agent!` macro for the agent embedded by `build.rs`. Generated
+    code refers to `adam::__private` and `adam::agent_fs`.
     See [`docs/authoring.md`](authoring.md).
 * **Test kits.** `adam-store-testkit` is the conformance suite every store must
   pass, and `adam-notify-testkit` the one every `Notifier` (and its event
   transport) must pass. It is a crate of its own because `adam-runtime` cannot
-  dev-depend on a crate that depends on it. The other test doubles live inside
+  dev-depend on a crate that depends on it. `adam-agent-fixture` (not
+  published) is a crate with a real `build.rs` and `adam::include_agent!()`; its
+  tests prove that an embedded agent equals the directory it came from. The
+  other test doubles live inside
   the crates they double for (see
   [Ports and implementations](#ports-and-implementations)).
 

@@ -1,0 +1,22 @@
+[package]
+name = "adam-agent-fixture"
+description = "Test fixture: a crate whose build.rs embeds an agent directory and includes it with adam::include_agent!"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[build-dependencies]
+adam-agent-fs = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true

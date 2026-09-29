@@ -3,7 +3,8 @@
 The facade of adam-rs: one dependency for writing an agent. It re-exports
 [`adam-llm-agent`](../adam-llm-agent/README.md) (with its `schema` feature), the `#[tool]` macro of
 [`adam-macros`](../adam-macros/README.md), and the model, runtime, core and error crates as modules
-(`adam::model`, `adam::runtime`, `adam::core`, `adam::error`), and it adds a `prelude`.
+(`adam::model`, `adam::runtime`, `adam::core`, `adam::error`), [`adam-agent-fs`](../adam-agent-fs/README.md)
+as `adam::agent_fs`, and it adds a `prelude` and the `include_agent!` macro.
 
 ```toml
 [dependencies]
@@ -14,8 +15,9 @@ adam = "0.1"
 |---|---|---|
 | `macros` | yes | `#[tool]` (`adam::tool`, and in the prelude) |
 
-The authoring layer around it (agent directories, skills, subagents) is planned in
-[`docs/authoring.md`](../../docs/authoring.md); `#[tool]` is the part that exists.
+The authoring layer around it (agent directories, skills, subagents) is designed in
+[`docs/authoring.md`](../../docs/authoring.md). What exists: `#[tool]`, and the agent directory
+embedded at build time (`adam::include_agent!()`, below). The binding to `LlmAgent` is planned.
 
 ## `#[tool]`
 
@@ -119,6 +121,49 @@ async fn echo(text: String) -> Result<ToolOutput, ToolError> {
 Your own `#[derive(Deserialize, JsonSchema)]` types (for `#[args]`, or as an argument type) still need
 `serde` and `schemars` in your `Cargo.toml`; `adam-llm-agent`'s `schema` feature enables schemars'
 `derive`.
+
+### Agent directories: `include_agent!`
+
+An agent written as Markdown files (`agent/instructions.md`, skills, subagents, `mcp.json`) is
+compiled into the binary by a build script and included with one line.
+
+```toml
+[dependencies]
+adam = "0.1"
+
+[build-dependencies]
+adam-agent-fs = { version = "0.1", features = ["build"] }
+```
+
+```rust,ignore
+// build.rs: parses and validates agent/ before rustc runs; a mistake is a build error with
+// file:line, and a new or changed file reruns the script.
+fn main() -> Result<(), adam_agent_fs::BuildError> {
+    adam_agent_fs::build("agent").emit()?;
+    Ok(())
+}
+```
+
+```rust,ignore
+// src/main.rs
+adam::include_agent!(); // AGENTS, AGENT (for agent/) and PACKAGE, all `'static`
+
+fn main() {
+    println!("{} {}", AGENT.name, AGENT.digest);      // the digest identifies these exact files
+    println!("{}", AGENT.instructions.body);          // the prompt, no parsing at startup
+    for skill in AGENT.skills {                       // the catalog
+        println!("{}: {}", skill.name, skill.description);
+    }
+}
+```
+
+`AGENT` is an [`adam::agent_fs::EmbeddedAgent`](../adam-agent-fs/README.md#embedding-at-build-time).
+`PACKAGE` is an `EmbeddedPackage`, a `ManifestSource` like `adam::agent_fs::Dir`, so the same
+`Package` can come from the binary or from a directory at run time and the two compared. The macro
+is `include!(concat!(env!("OUT_DIR"), "/adam_agent.rs"))` and nothing else; it needs the build
+script and a crate that depends on `adam` (the generated code names `::adam::agent_fs`; use
+`.crate_path("::adam_agent_fs")` when it depends on `adam-agent-fs` directly).
+[`adam-agent-fixture`](../adam-agent-fixture/README.md) is a complete example with tests.
 
 ### Compile errors
 

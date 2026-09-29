@@ -30,6 +30,18 @@ pub enum Error {
         /// Every finding, in discovery order (not only the failing ones).
         diagnostics: Vec<Diagnostic>,
     },
+    /// The manifest could not be encoded for its digest, or an embedded manifest could not be
+    /// decoded: the generated code and this crate disagree about the schema.
+    #[error("cannot {action} the manifest of `{what}`")]
+    Codec {
+        /// `encode` or `decode`.
+        action: &'static str,
+        /// The agent, file or field concerned.
+        what: String,
+        /// The underlying error.
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 fn summary(diagnostics: &[Diagnostic]) -> String {
@@ -56,13 +68,25 @@ impl Classify for Error {
             Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
                 ErrorClass::NotFound
             }
-            Self::Io { .. } => ErrorClass::Internal,
+            Self::Io { .. } | Self::Codec { .. } => ErrorClass::Internal,
             Self::Invalid { .. } => ErrorClass::Invalid,
         }
     }
 }
 
 impl Error {
+    pub(crate) fn codec(
+        action: &'static str,
+        what: impl Into<String>,
+        source: serde_json::Error,
+    ) -> Self {
+        Self::Codec {
+            action,
+            what: what.into(),
+            source,
+        }
+    }
+
     pub(crate) fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
         Self::Io {
             path: path.into(),
