@@ -14,6 +14,7 @@ trait, a shared conformance suite, and two production adapters.
 | Crate | What it is |
 |---|---|
 | [`adam-error`](crates/adam-error/README.md) | The error model every crate shares: `ErrorClass`, the `Classify` trait, `BoxError` and `report()`. Pure: no I/O, no async |
+| [`adam-host`](crates/adam-host/README.md) | The contract with a host app: the closed process `Role` (`all`, `control-plane`, `worker`) and a small role-aware supervisor that starts the matching components, stops them in order (control plane, then workers) and names the one that failed. Std-only `Role`; the supervisor is feature `supervisor` (tokio) |
 | [`adam-core`](crates/adam-core/README.md) | `Store` trait, run/journal/lease types, in-memory reference store |
 | [`adam-store-testkit`](crates/adam-store-testkit/README.md) | Conformance suite every store must pass (`store_conformance!`) |
 | [`adam-store-postgres`](crates/adam-store-postgres/README.md) | PostgreSQL 12+ via `sqlx` 0.9 |
