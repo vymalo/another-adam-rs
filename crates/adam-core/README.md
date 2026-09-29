@@ -21,7 +21,7 @@ database driver.
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
 | `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
 | `Lease` | a run claimed by a worker until a deadline |
-| `StoreError`, `StoreResult` | `Conflict`, `NotFound`, `AlreadyExists`, `ConversationBusy`, `NonDeterminism`, `InvalidData`, `Backend` |
+| `StoreError`, `StoreResult` | `AlreadyExists`, `NotFound`, `Conflict`, `ConversationBusy`, `NonDeterminism`, `InvalidInput`, `Corrupt`, `Backend { class, source }`; `#[non_exhaustive]`, see *Errors* |
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
 | `testing` (`#[doc(hidden)]`) | `test_env`, `skipped`, `require_db`: gate for database-backed tests, not part of the supported API |
 
@@ -42,6 +42,29 @@ let run = store
 The semantics (CAS commits, first-writer-wins journal, leases, one open run
 per conversation) are described in the [root README](../../README.md#the-model).
 
+## Errors
+
+`StoreError` implements `adam_error::Classify`; callers decide from the class,
+never from the variant (see [`adam-error`](../adam-error/README.md)).
+
+| Variant | Class |
+|---|---|
+| `AlreadyExists`, `ConversationBusy` | `Rejected` |
+| `NotFound` | `NotFound` |
+| `Conflict` | `Conflict` |
+| `NonDeterminism`, `Corrupt` | `Corrupt` |
+| `InvalidInput` | `Invalid` |
+| `Backend { class, source }` | the `class` the adapter chose |
+
+`InvalidInput` is data the store cannot hold (a NUL in a `JSONB` string, an
+integer above `i64::MAX`, a bad table prefix); `Corrupt` is data read back that
+breaks an invariant (an unknown status, a negative version, a vanished journal
+entry). `Backend` keeps the driver's error as its `source` (a `BoxError`, so no
+driver type is in this crate) and its message does not repeat it. An adapter
+builds it with `StoreError::unavailable(e)` (`Transient`),
+`StoreError::internal(e)` (`Internal`) or `StoreError::corrupt_source(e)`
+(`Corrupt`). Only `Conflict` and a transient `Backend` are retryable.
+
 ## Features and environment
 
 No Cargo features. The `testing` helpers read `ADAM_TEST_REQUIRE_DB`
@@ -52,10 +75,14 @@ instead of skipping.
 
 `MemoryStore` is run through the conformance suite by
 `crates/adam-store-testkit/tests/memory.rs`. Behavioural tests of the types
-live next to the code. Database gating is described in the
+live next to the code; those in `src/store/mod.rs` (`class_table`,
+`retryable_is_derived_from_the_class`,
+`backend_display_does_not_repeat_its_source`) pin the class of every
+`StoreError` variant with an exhaustive `match`. Database gating is described in the
 [root README](../../README.md#testing).
 
 ## See also
 
 [`adam-store-testkit`](../adam-store-testkit/README.md),
-[`adam-runtime`](../adam-runtime/README.md) (the consumer of `Store`).
+[`adam-runtime`](../adam-runtime/README.md) (the consumer of `Store`),
+[`adam-error`](../adam-error/README.md).

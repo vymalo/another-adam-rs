@@ -20,10 +20,11 @@ over A2A).
 |---|---|
 | `Agent` (trait) | `name`, `init(Inbound) -> State`, `async step(&mut Ctx, State) -> Transition<State>` |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
-| `AgentError` | `Transient`, `TransientAfter` (minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism` |
+| `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::cancelled` / `CancelToken` observe a cancel |
 | `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `start`, `start_with_id`, `deliver`, `cancel`, `view`, `run_worker(shutdown)` |
-| `RunView`, `RuntimeError` | the durable read side, and errors |
+| `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`) |
+| `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
 | `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events |
 | `RetryPolicy`, `MAX_RETRY_AFTER` | exponential backoff for transient errors |
@@ -46,6 +47,39 @@ at-least-once (a crash between the effect and its journal write runs it
 again): keep effects idempotent. The lifecycle and guarantees are in the crate
 docs (`src/lib.rs`) and the [root README](../../README.md#the-model).
 
+## Errors
+
+`AgentError` and `RuntimeError` implement `adam_error::Classify`; the worker
+decides from the class (see [`adam-error`](../adam-error/README.md)).
+
+| `AgentError` | Class | The run |
+|---|---|---|
+| `Transient`, no `retry_after` | `Transient` | retried after `RetryPolicy`'s backoff |
+| `Transient` with `retry_after` | `RateLimited` | retried after `max(backoff, retry_after)`, the hint capped at `MAX_RETRY_AFTER` |
+| `Permanent` | `Invalid` | `Failed` |
+| `NonDeterminism` | `Corrupt` | `Failed` |
+| `Store(e)` | `e.class()` | `Failed` for `Corrupt` and `Invalid`; otherwise left to its lease and logged with its class |
+
+| `RuntimeError` | Class |
+|---|---|
+| `UnknownAgent` | `Invalid` |
+| `NotFound` | `NotFound` |
+| `Finished`, `ConversationBusy` | `Rejected` |
+| `Corrupt { run, reason, source }` | `Corrupt` |
+| `Contended` | `Conflict` |
+| `Agent(e)`, `Store(e)` | the class of `e` |
+
+Build an `AgentError` with `AgentError::transient(msg)`,
+`transient_after(msg, wait)`, `permanent(msg)` or `non_determinism(msg)`, then
+`.with_retry_after(wait)` (only a `Transient` has one) and `.with_source(err)`.
+`AgentError::from_classified(context, err)` turns any classified error into a
+`Transient` (retryable, keeping its `retry_after`) or a `Permanent`, with `err`
+as the source. `TransientAfter` no longer exists. A message describes its own
+layer only; the run's stored failure text is a boundary, so the worker flattens
+`message: cause` there once. A store error that fails a run, and every store
+error the worker leaves to its lease, is logged with `adam_error::report`
+(the second also with its class and `alert`).
+
 ## Features and environment
 
 No Cargo features, no environment variables at runtime.
@@ -54,7 +88,10 @@ No Cargo features, no environment variables at runtime.
 
 `tests/runtime.rs` is one behavioural suite run against `MemoryStore` always,
 against PostgreSQL and against MongoDB when their variables are set. Unit
-tests sit in `src/cancel.rs`, `ctx.rs`, `events.rs` and `retry.rs`.
+tests sit in `src/cancel.rs`, `ctx.rs`, `events.rs` and `retry.rs`, and the
+class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
+(`class_table`, `from_classified_maps_retryable_to_transient_and_keeps_the_hint`,
+`a_message_never_repeats_its_source`) and `src/runtime.rs` (`error_tests`).
 
 | Variable | Meaning |
 |---|---|
@@ -75,4 +112,5 @@ when unset, even with `ADAM_TEST_REQUIRE_DB=1`.
 
 [`adam-core`](../adam-core/README.md),
 [`adam-llm-agent`](../adam-llm-agent/README.md),
-[`adam-a2a-runtime`](../adam-a2a-runtime/README.md).
+[`adam-a2a-runtime`](../adam-a2a-runtime/README.md),
+[`adam-error`](../adam-error/README.md).

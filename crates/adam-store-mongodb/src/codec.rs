@@ -42,9 +42,9 @@ pub fn bson_to_json(value: &Bson) -> Result<Value, StoreError> {
         Bson::Boolean(b) => Value::Bool(*b),
         Bson::Int32(i) => Value::from(*i),
         Bson::Int64(i) => Value::from(*i),
-        Bson::Double(f) => Number::from_f64(*f).map(Value::Number).ok_or_else(|| {
-            StoreError::InvalidData(format!("non-finite number {f} in stored state"))
-        })?,
+        Bson::Double(f) => Number::from_f64(*f)
+            .map(Value::Number)
+            .ok_or_else(|| StoreError::Corrupt(format!("non-finite number {f} in stored state")))?,
         Bson::String(s) => Value::String(s.clone()),
         Bson::Array(items) => {
             Value::Array(items.iter().map(bson_to_json).collect::<Result<_, _>>()?)
@@ -66,10 +66,14 @@ fn number_to_bson(n: &Number) -> Result<Bson, StoreError> {
     if let Some(i) = n.as_i64() {
         Ok(Bson::Int64(i))
     } else if n.is_u64() {
-        Err(StoreError::InvalidData(format!(
+        Err(StoreError::InvalidInput(format!(
             "integer {n} exceeds i64::MAX and cannot be stored in BSON"
         )))
     } else {
+        #[allow(
+            clippy::expect_used,
+            reason = "a serde_json number that is neither i64 nor u64 is a finite f64"
+        )]
         Ok(Bson::Double(n.as_f64().expect("finite f64 in serde_json")))
     }
 }
@@ -111,7 +115,7 @@ pub fn decode_key(key: &str) -> Result<String, StoreError> {
             Some("24") => '$',
             Some("00") => '\0',
             _ => {
-                return Err(StoreError::InvalidData(format!(
+                return Err(StoreError::Corrupt(format!(
                     "malformed escaped key {key:?}"
                 )));
             }

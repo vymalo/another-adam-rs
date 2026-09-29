@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+adam-error.workspace = true
 a2a-lf.workspace = true
 adam-a2a = { path = "../adam-a2a", version = "0.1.0" }
 adam-core.workspace = true
@@ -32,3 +33,6 @@ axum.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

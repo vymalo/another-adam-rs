@@ -1,9 +1,11 @@
 //! Worktree behaviour against local bare repositories (no network).
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use adam_error::Classify;
 use adam_workspace::{
     FileStatus, GitCredentials, GitIdentity, RepoRef, ScopedToken, StaticToken, WorkspaceError,
     Workspaces,

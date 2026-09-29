@@ -1,6 +1,7 @@
 //! The coder end to end, offline: A2A client -> A2A server -> runtime -> the
 //! coder agent (scripted `MockModel`) -> real worktrees over a local bare git
 //! remote, the adam-acp fake agent for OpenCode, and a mock GitHub.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
 
@@ -1177,7 +1178,7 @@ impl Respond for RateLimitedOnce {
 
 /// The model answers the first request with `429` and `Retry-After`. The
 /// real OpenAI-compatible client carries the hint to the runtime
-/// (`AgentError::TransientAfter`), which waits at least that long before the
+/// (`AgentError::Transient` with `retry_after`), which waits at least that long before the
 /// retry (the policy's own backoff here is 50 ms), and the run then completes
 /// with exactly one pull request.
 async fn rate_limited_model_backs_off_and_completes(store: DynStore) {

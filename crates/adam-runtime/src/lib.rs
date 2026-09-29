@@ -22,9 +22,10 @@
 //!   ([`Runtime::deliver`]).
 //! * [`Transition::Done`] / [`Transition::Fail`]: terminal.
 //! * [`AgentError::Transient`]: retried with exponential backoff
-//!   ([`RetryPolicy`]), then `Failed`. [`AgentError::TransientAfter`] is the
-//!   same with a minimum wait (a rate limit's `Retry-After`); the retry waits
-//!   `max(backoff, hint)`. [`AgentError::Permanent`]: `Failed`.
+//!   ([`RetryPolicy`]), then `Failed`. With a `retry_after` (a rate limit's
+//!   `Retry-After`, see [`AgentError::with_retry_after`]) the retry waits
+//!   `max(backoff, hint)`. [`AgentError::Permanent`]: `Failed`. Errors carry an
+//!   [`ErrorClass`] ([`Classify`]); the runtime decides from the class.
 //! * [`Runtime::cancel`]: `Failed` with the reason, unless already finished.
 //!   A step that is running at that moment can observe it through
 //!   [`Ctx::cancelled`] / [`CancelToken`] and stop early.
@@ -65,6 +66,7 @@ mod retry;
 mod runtime;
 mod worker;
 
+pub use adam_error::{Classify, ErrorClass};
 pub use agent::{Agent, AgentError, Inbound, Transition};
 pub use cancel::CancelToken;
 pub use clock::{Clock, DynClock, ManualClock, SystemClock};

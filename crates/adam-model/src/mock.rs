@@ -43,11 +43,11 @@ struct Inner {
 ///
 /// ```
 /// use std::sync::Arc;
-/// use adam_model::{MockModel, ModelClient, ModelError, ModelRequest};
+/// use adam_model::{Classify, MockModel, ModelClient, ModelError, ModelRequest};
 ///
 /// # futures::executor::block_on(async {
 /// let mock = Arc::new(MockModel::new());
-/// mock.push_error(ModelError::Transient("blip".into()));
+/// mock.push_error(ModelError::transient("blip"));
 /// mock.push_text("done");
 ///
 /// let model: Arc<dyn ModelClient> = mock.clone();
@@ -144,8 +144,8 @@ impl MockModel {
         let mut inner = self.lock();
         inner.calls.push(RecordedCall { request, streaming });
         inner.script.pop_front().unwrap_or_else(|| {
-            Err(ModelError::InvalidRequest(
-                "MockModel script exhausted: no queued response".into(),
+            Err(ModelError::invalid_request(
+                "MockModel script exhausted: no queued response",
             ))
         })
     }
@@ -191,6 +191,7 @@ mod tests {
 
     use super::*;
     use crate::FinishReason;
+    use adam_error::Classify;
 
     #[tokio::test]
     async fn pops_in_order_and_records() {
@@ -205,10 +206,10 @@ mod tests {
             mock.complete(req.clone()).await.unwrap().message.text(),
             "one"
         );
-        assert_eq!(
+        assert!(matches!(
             mock.complete(req.clone()).await.unwrap_err(),
-            ModelError::Auth("nope".into())
-        );
+            ModelError::Auth(m) if m == "nope"
+        ));
         assert_eq!(mock.requests(), vec![req.clone(), req.clone()]);
         assert_eq!(mock.last_request(), Some(req));
         assert_eq!(mock.remaining(), 0);
@@ -220,7 +221,7 @@ mod tests {
             .complete(ModelRequest::new("m"))
             .await
             .unwrap_err();
-        assert!(matches!(err, ModelError::InvalidRequest(_)));
+        assert!(matches!(err, ModelError::InvalidRequest { .. }));
         assert!(!err.is_retryable());
     }
 

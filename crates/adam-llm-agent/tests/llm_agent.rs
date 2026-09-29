@@ -1,6 +1,7 @@
 //! Behavioural suite of `LlmAgent`: scripted `MockModel`, `MemoryStore`, and a
 //! real `Runtime` with workers. Crash cases abort a worker mid-step exactly
 //! like adam-runtime's `crash_safety` test.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
@@ -382,7 +383,7 @@ async fn init_rejects_unreadable_start_input() {
     assert!(agent.init(Inbound::new("x", json!("bare"))).is_ok());
     assert!(matches!(
         agent.init(Inbound::new("message", json!({"nope": 1}))),
-        Err(AgentError::Permanent(_))
+        Err(AgentError::Permanent { .. })
     ));
 }
 
@@ -647,7 +648,7 @@ async fn transient_model_error_retries_then_succeeds() {
     let h = Harness::new();
     let agent = h.agent().build();
     h.mock
-        .push_error(ModelError::Transient("502".into()))
+        .push_error(ModelError::transient("502"))
         .push_error(ModelError::RateLimited { retry_after: None })
         .push_text("recovered");
     let rt = h.runtime_with(&agent, "w", quick_retry);
@@ -675,7 +676,7 @@ async fn retryable_model_error_that_persists_fails_after_the_retry_budget() {
     let h = Harness::new();
     let agent = h.agent().build();
     for _ in 0..3 {
-        h.mock.push_error(ModelError::Transient("down".into()));
+        h.mock.push_error(ModelError::transient("down"));
     }
     let rt = h.runtime_with(&agent, "w", quick_retry);
     let run = rt

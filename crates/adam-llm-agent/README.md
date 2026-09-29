@@ -23,7 +23,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec` and `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` |
 | `ToolOutput` | `text`, `error`, `with_artifact` |
 | `ToolCtx` | run id, conversation id, attempt, call id, `emit_progress`, `cancelled` / `cancel_token` |
-| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question }` (parks the run; A2A reports `input-required`) |
+| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question }` (parks the run; A2A reports `input-required`); `#[non_exhaustive]`, see *Errors* |
 | `Conversation`, `PendingQuestion`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
 | `TRUNCATION_MARKER_PREFIX` | prefix of the marker left where history truncation shortened a tool output |
@@ -43,6 +43,31 @@ let agent = LlmAgent::builder("assistant", Arc::new(MockModel::new()), "my-model
 
 A complete `Tool` implementation is in the crate docs (`src/lib.rs`).
 
+## Errors
+
+`ToolError` implements `adam_error::Classify` (see
+[`adam-error`](../adam-error/README.md)).
+
+| `ToolError` | Class | The run |
+|---|---|---|
+| `Transient` | `Transient` | the step fails with `AgentError::Transient`; the runtime retries with backoff |
+| `Permanent` | `Invalid` | the model is told, and can go on |
+| `NeedsInput` | `Rejected` | valid, but it needs the user first: the run parks |
+
+`ToolError` is journaled, so its serde shape is frozen and it carries no
+`source`: a tool flattens its own cause into the message (with
+`adam_error::report`) before it returns.
+
+Model failures are classified by `adam_model::ModelError` and journaled as a
+record of `retryable`, the flattened message (`report`, so the chain is printed
+once), `retry_after_ms` and the `class` name (records written before classes
+existed decode with `class` absent). A retryable one becomes
+`AgentError::Transient`, with `with_retry_after` when the provider sent a
+`Retry-After`, so the retry waits at least that long; any other fails the run
+with `model call failed: ...`. An unreadable start message is
+`AgentError::Permanent` (`unusable start message: ...`), which A2A reports as
+invalid params.
+
 ## Features and environment
 
 None.
@@ -52,10 +77,14 @@ None.
 `tests/llm_agent.rs` is a behavioural suite over a scripted `MockModel` and
 `MemoryStore` (tool loop, retries and rate limits, limits, replay after a
 crash, `NeedsInput` parking, cancellation, history truncation). Property tests
-of the truncation are in `src/history.rs`. Offline, no environment variables.
+of the truncation are in `src/history.rs`; the journal record of a model
+failure is tested in `src/agent.rs`
+(`a_journaled_failure_keeps_the_class_the_hint_and_the_whole_chain`,
+`old_journal_records_decode`). Offline, no environment variables.
 
 ## See also
 
 [`adam-runtime`](../adam-runtime/README.md),
 [`adam-model`](../adam-model/README.md),
-[`adam-coder`](../adam-coder/README.md).
+[`adam-coder`](../adam-coder/README.md),
+[`adam-error`](../adam-error/README.md).

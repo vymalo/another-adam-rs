@@ -2,7 +2,6 @@
 //! SSE byte stream into [`ModelDelta`]s.
 
 use std::collections::VecDeque;
-use std::fmt::Display;
 use std::time::Duration;
 
 use adam_model::{ModelDelta, ModelError};
@@ -142,7 +141,7 @@ pub(crate) fn deltas<S, B, E>(
 where
     S: Stream<Item = Result<B, E>> + Send + 'static,
     B: AsRef<[u8]> + Send,
-    E: Display + Send,
+    E: std::error::Error + Send + Sync + 'static,
 {
     let state = State {
         bytes: Box::pin(bytes),
@@ -165,12 +164,12 @@ where
                 return None;
             }
             match tokio::time::timeout(st.idle, st.bytes.next()).await {
-                Err(_elapsed) => st.fail(ModelError::Transient(format!(
+                Err(_elapsed) => st.fail(ModelError::transient(format!(
                     "no data from the model for {:?}",
                     st.idle
                 ))),
                 Ok(Some(Err(e))) => {
-                    st.fail(ModelError::Transient(format!("stream interrupted: {e}")));
+                    st.fail(ModelError::transient("stream interrupted").with_source(e));
                 }
                 Ok(Some(Ok(chunk))) => {
                     let events = st.parser.push(chunk.as_ref());
@@ -230,7 +229,7 @@ mod tests {
 
     fn byte_stream(
         chunks: Vec<&'static str>,
-    ) -> impl Stream<Item = Result<Vec<u8>, String>> + Send + 'static {
+    ) -> impl Stream<Item = Result<Vec<u8>, std::io::Error>> + Send + 'static {
         stream::iter(chunks.into_iter().map(|c| Ok(c.as_bytes().to_vec())))
     }
 
@@ -280,7 +279,7 @@ mod tests {
         .await;
         assert_eq!(items.len(), 2);
         assert!(matches!(items[0], Ok(ModelDelta::Text(_))));
-        assert!(matches!(items[1], Err(ModelError::Protocol(_))));
+        assert!(matches!(items[1], Err(ModelError::Protocol { .. })));
         // [DONE] with no finish_reason is just as truncated.
         let items: Vec<_> = deltas(
             byte_stream(vec!["data: [DONE]\n\n"]),
@@ -288,7 +287,10 @@ mod tests {
         )
         .collect()
         .await;
-        assert!(matches!(items.as_slice(), [Err(ModelError::Protocol(_))]));
+        assert!(matches!(
+            items.as_slice(),
+            [Err(ModelError::Protocol { .. })]
+        ));
     }
 
     #[tokio::test]
@@ -306,12 +308,12 @@ mod tests {
     async fn transport_error_mid_stream_is_transient_and_final() {
         let bytes = stream::iter(vec![
             Ok(TEXT_STREAM[0].as_bytes().to_vec()),
-            Err("connection reset".to_string()),
+            Err(std::io::Error::other("connection reset")),
             Ok(TEXT_STREAM[1].as_bytes().to_vec()),
         ]);
         let items: Vec<_> = deltas(bytes, Duration::from_secs(5)).collect().await;
         assert_eq!(items.len(), 2);
-        assert!(matches!(items[1], Err(ModelError::Transient(_))));
+        assert!(matches!(items[1], Err(ModelError::Transient { .. })));
     }
 
     #[tokio::test]
@@ -319,16 +321,21 @@ mod tests {
         let items: Vec<_> = deltas(byte_stream(vec!["data: {oops\n\n"]), Duration::from_secs(5))
             .collect()
             .await;
-        assert!(matches!(items.as_slice(), [Err(ModelError::Protocol(_))]));
+        assert!(matches!(
+            items.as_slice(),
+            [Err(ModelError::Protocol { .. })]
+        ));
     }
 
     #[tokio::test(start_paused = true)]
     async fn idle_timeout_is_transient() {
-        let bytes = stream::iter(vec![Ok::<_, String>(TEXT_STREAM[0].as_bytes().to_vec())])
-            .chain(stream::pending());
+        let bytes = stream::iter(vec![Ok::<_, std::io::Error>(
+            TEXT_STREAM[0].as_bytes().to_vec(),
+        )])
+        .chain(stream::pending());
         let items: Vec<_> = deltas(bytes, Duration::from_secs(30)).collect().await;
         assert_eq!(items.len(), 2);
-        assert!(matches!(items[1], Err(ModelError::Transient(_))));
+        assert!(matches!(items[1], Err(ModelError::Transient { .. })));
     }
 
     mod prop {

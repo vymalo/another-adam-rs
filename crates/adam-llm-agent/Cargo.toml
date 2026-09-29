@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+adam-error.workspace = true
 adam-core.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
@@ -23,3 +24,6 @@ proptest.workspace = true
 chrono.workspace = true
 futures.workspace = true
 tokio.workspace = true
+
+[lints]
+workspace = true

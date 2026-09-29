@@ -4,6 +4,7 @@
 //! ADAM_TEST_MONGODB_URI=mongodb://localhost:27017 cargo test -p adam-store-mongodb
 //! ```
 //! Skipped when the variable is unset, unless `ADAM_TEST_REQUIRE_DB=1` (then it fails).
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::sync::Arc;
 

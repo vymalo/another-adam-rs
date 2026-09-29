@@ -13,6 +13,7 @@ use serde_json::Value;
 use tokio::task::{JoinHandle, JoinSet};
 
 use adam_core::{Lease, RunId, RunRecord, RunStatus, RunUpdate, StoreError, StoreResult};
+use adam_error::{Classify, ErrorClass, report};
 
 use crate::agent::{AgentError, Transition};
 use crate::cancel::CancelToken;
@@ -294,7 +295,7 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
         .catch_unwind()
         .await;
     let result = stepped.unwrap_or_else(|panic| {
-        Err(AgentError::Transient(format!(
+        Err(AgentError::transient(format!(
             "agent panicked: {}",
             panic_message(&panic)
         )))
@@ -317,9 +318,21 @@ async fn transition(inner: &Arc<Inner>, rec: RunRecord, cancel: CancelToken) -> 
             true
         }
         Err(e) => {
-            tracing::error!(error = %e, "commit failed; the run will be retried when its lease expires");
+            tracing::error!(error = %report(&e), "commit failed; the run will be retried when its lease expires");
             false
         }
+    }
+}
+
+/// `message`, then its cause when it has one: the run's failure text is a boundary, so the chain
+/// is flattened here.
+fn with_cause(
+    message: String,
+    source: Option<&(dyn std::error::Error + Send + Sync + 'static)>,
+) -> String {
+    match source {
+        Some(cause) => format!("{message}: {}", report(cause)),
+        None => message,
     }
 }
 
@@ -423,18 +436,43 @@ fn plan(
         Ok(Transition::Fail { state, error }) => {
             progressed(RunStatus::Failed, None, state, Value::Null, Some(error))
         }
-        Err(AgentError::Transient(msg)) => retrying(msg, None),
-        Err(AgentError::TransientAfter(msg, at_least)) => retrying(msg, Some(at_least)),
-        Err(AgentError::Permanent(msg)) => failed(msg),
-        Err(AgentError::NonDeterminism(msg)) => failed(format!("non-deterministic replay: {msg}")),
-        Err(AgentError::Store(e @ StoreError::InvalidData(_))) => failed(e.to_string()),
-        Err(AgentError::Store(e @ StoreError::NonDeterminism { .. })) => {
-            failed(format!("non-deterministic replay: {e}"))
+        // A retry hint from the peer only lengthens the policy's backoff.
+        Err(AgentError::Transient {
+            message,
+            retry_after,
+            source,
+        }) => retrying(with_cause(message, source.as_deref()), retry_after),
+        Err(AgentError::Permanent { message, source }) => {
+            failed(with_cause(message, source.as_deref()))
         }
-        Err(AgentError::Store(e)) => {
-            tracing::error!(error = %e, "store error while stepping; leaving the run leased");
-            return Plan::Leave;
-        }
+        Err(AgentError::NonDeterminism { message, source }) => failed(format!(
+            "non-deterministic replay: {}",
+            with_cause(message, source.as_deref())
+        )),
+        Err(AgentError::Store(e)) => match e.class() {
+            ErrorClass::Corrupt if matches!(e, StoreError::NonDeterminism { .. }) => {
+                failed(format!("non-deterministic replay: {e}"))
+            }
+            // Data that can never be read, or a request the store can never accept: retrying
+            // would loop for ever, so the run ends.
+            ErrorClass::Corrupt | ErrorClass::Invalid => {
+                tracing::error!(
+                    error = %report(&e),
+                    "the store cannot read or accept this run's data; failing the run"
+                );
+                failed(report(&e))
+            }
+            // Anything else (an unreachable store, a bug): leave the run to its lease.
+            class => {
+                tracing::error!(
+                    error = %report(&e),
+                    class = ?class,
+                    alert = class.should_alert(),
+                    "store error while stepping; leaving the run leased"
+                );
+                return Plan::Leave;
+            }
+        },
     };
     Plan::Commit(Box::new(next))
 }

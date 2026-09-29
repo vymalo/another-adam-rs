@@ -1,6 +1,7 @@
 //! The `adam-coder` binary as a process: configuration errors, an unreachable
 //! Postgres, serving and SIGTERM. Offline, except that the cases which need a
 //! database use `ADAM_TEST_POSTGRES_URL` (and skip without it).
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
 
@@ -185,15 +186,38 @@ impl Proc {
 
 // ------------------------------------------------------------------- offline
 
+/// The failure the process logged, as one structured line: the `fields` of the
+/// `adam-coder failed` event on stdout (the JSON logger's stream). A failure is
+/// exactly one such line, and nothing goes to stderr.
+fn failure(p: &Proc) -> Value {
+    let out = p.stdout();
+    let lines: Vec<Value> = out
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["fields"]["message"] == "adam-coder failed")
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one failure line:\n{}", p.logs());
+    assert_eq!(lines[0]["level"], "ERROR", "{}", p.logs());
+    assert!(
+        p.stderr().trim().is_empty(),
+        "no Debug dump outside the logger:\n{}",
+        p.stderr()
+    );
+    lines[0]["fields"].clone()
+}
+
 /// A misconfigured deployment must be fixed in one round trip: every problem
-/// is listed, the exit code is non-zero, and nothing is started.
+/// is listed, the exit code is 78 (`EX_CONFIG`, so a supervisor does not
+/// restart it), and nothing is started.
 #[tokio::test]
-async fn missing_and_bad_variables_are_reported_together_and_exit_non_zero() {
+async fn missing_and_bad_variables_are_reported_together_and_exit_78() {
     // Nothing set.
     let mut p = Proc::spawn(&[]);
     let status = p.exit_within(Duration::from_secs(30)).await;
-    assert!(!status.success());
-    let err = p.stderr();
+    assert_eq!(status.code(), Some(78), "{}", p.logs());
+    let fields = failure(&p);
+    assert_eq!(fields["code"], 78);
+    let err = fields["error"].as_str().unwrap().to_owned();
     assert!(err.contains("reading the configuration"), "{err}");
     for name in [
         "DATABASE_URL",
@@ -216,8 +240,8 @@ async fn missing_and_bad_variables_are_reported_together_and_exit_non_zero() {
     env.push(("WORKERS".into(), "0".into()));
     let mut p = Proc::spawn(&env);
     let status = p.exit_within(Duration::from_secs(30)).await;
-    assert!(!status.success());
-    let err = p.stderr();
+    assert_eq!(status.code(), Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
     for name in [
         "ALLOWED_REPO_HOSTS",
         "ALLOW_LOCAL_REPOS",
@@ -233,8 +257,9 @@ async fn missing_and_bad_variables_are_reported_together_and_exit_non_zero() {
     assert!(!err.contains(GITHUB_TOKEN), "{err}");
 }
 
-/// Postgres unreachable at boot: a clear error, a non-zero exit, no panic, no
-/// password in the output, and no waiting around.
+/// Postgres unreachable at boot: a clear error, exit code 69 (`EX_UNAVAILABLE`, so
+/// a supervisor retries later), no panic, no password in the output, and no
+/// waiting around.
 #[tokio::test]
 async fn boot_fails_fast_when_postgres_is_unreachable() {
     let tmp = tempfile::tempdir().unwrap();
@@ -245,15 +270,21 @@ async fn boot_fails_fast_when_postgres_is_unreachable() {
     let started = Instant::now();
     let mut p = Proc::spawn(&env);
     let status = p.exit_within(Duration::from_secs(45)).await;
-    assert!(!status.success(), "{}", p.logs());
     assert_eq!(
         status.code(),
-        Some(1),
-        "an error exit, not a signal or panic"
+        Some(69),
+        "an unreachable dependency, not a signal, a panic or a generic failure:\n{}",
+        p.logs()
     );
+    let fields = failure(&p);
+    assert_eq!(fields["code"], 69);
     let (out, err) = (p.stdout(), p.stderr());
-    assert!(err.contains("connecting to Postgres"), "{err}");
-    assert!(!err.contains("panicked"), "{err}");
+    let chain = fields["error"].as_str().unwrap();
+    assert!(chain.starts_with("connecting to Postgres: "), "{chain}");
+    assert!(
+        !out.contains("panicked") && !err.contains("panicked"),
+        "{out}"
+    );
     for text in [&out, &err] {
         assert!(!text.contains("s3cr3tpassw0rd"), "password leaked:\n{text}");
         assert!(!text.contains(GITHUB_TOKEN), "token leaked:\n{text}");

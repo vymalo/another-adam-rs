@@ -90,8 +90,8 @@ struct Plan {
     injected: HashMap<Method, u64>,
 }
 
-/// The error a fault produces: a [`StoreError::Backend`] whose message starts
-/// with `injected store fault`.
+/// The error a fault produces: the source of a transient [`StoreError::Backend`], with the
+/// message `injected store fault in <method>`.
 #[derive(Debug)]
 struct Injected(Method);
 
@@ -106,7 +106,7 @@ impl std::error::Error for Injected {}
 /// Whether `err` was produced by a [`FaultyStore`] fault (and not by the
 /// wrapped store).
 pub fn is_injected(err: &StoreError) -> bool {
-    matches!(err, StoreError::Backend(e) if e.is::<Injected>())
+    matches!(err, StoreError::Backend { source, .. } if source.is::<Injected>())
 }
 
 /// Wraps a store and fails scripted calls with [`StoreError::Backend`]; every
@@ -200,10 +200,10 @@ impl FaultyStore {
     ) -> StoreResult<T> {
         match self.strike(method) {
             None => op.await,
-            Some(Mode::Before) => Err(StoreError::backend(Injected(method))),
+            Some(Mode::Before) => Err(StoreError::unavailable(Injected(method))),
             Some(Mode::After) => {
                 let _ = op.await;
-                Err(StoreError::backend(Injected(method)))
+                Err(StoreError::unavailable(Injected(method)))
             }
         }
     }
@@ -337,7 +337,8 @@ mod tests {
         for _ in 0..2 {
             let err = create(&store).await.expect_err("scripted fault");
             assert!(is_injected(&err), "{err}");
-            assert!(err.to_string().contains("injected store fault"));
+            let source = std::error::Error::source(&err).expect("the fault is the source");
+            assert!(source.to_string().contains("injected store fault"));
         }
         assert!(create(&store).await.is_ok());
         assert!(create(&store).await.is_ok());

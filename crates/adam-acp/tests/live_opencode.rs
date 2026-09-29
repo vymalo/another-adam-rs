@@ -1,6 +1,7 @@
 //! Live test against a real `opencode acp`. Skipped unless `ADAM_TEST_OPENCODE=1`,
 //! `opencode` is on `PATH` and a model is configured (OpenCode's own config, or
 //! `ADAM_TEST_OPENCODE_CONFIG` as inline JSON for `OPENCODE_CONFIG_CONTENT`).
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::time::Duration;
 

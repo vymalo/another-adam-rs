@@ -46,6 +46,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use adam_error::{BoxError, Classify, ErrorClass};
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -264,41 +265,108 @@ impl JournalEntry {
     }
 }
 
+/// What can go wrong talking to a [`Store`].
+///
+/// A variant says what happened; [`Classify::class`] says what to do about it. Callers decide
+/// on the class (retry, fail the run, leave the lease), never on a variant. No driver type
+/// appears here: an adapter boxes the foreign error as the `source` of [`Backend`](Self::Backend)
+/// after choosing its class.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StoreError {
+    /// A run with this id exists already.
     #[error("run {0} already exists")]
     AlreadyExists(RunId),
+    /// No run has this id.
     #[error("run {0} not found")]
     NotFound(RunId),
+    /// Another writer moved the run's version first.
     #[error("version conflict on run {run}: expected {expected}, found {actual}")]
     Conflict {
+        /// The run.
         run: RunId,
+        /// The version the caller expected.
         expected: u64,
+        /// The version found in the store.
         actual: u64,
     },
+    /// The conversation already has an open run.
     #[error("conversation {conversation_id:?} of agent {agent:?} already has an open run")]
     ConversationBusy {
+        /// The agent that owns the conversation.
         agent: String,
+        /// The conversation.
         conversation_id: String,
     },
+    /// Replaying the journal met a step the code no longer asks for.
     #[error(
         "non-deterministic replay on run {run} at step {seq}: journal has {recorded:?}, code asked for {requested:?}"
     )]
     NonDeterminism {
+        /// The run.
         run: RunId,
+        /// The step's position in the journal.
         seq: u64,
+        /// The step name the journal has.
         recorded: String,
+        /// The step name the code asked for.
         requested: String,
     },
-    #[error("invalid data: {0}")]
-    InvalidData(String),
-    #[error("storage backend error: {0}")]
-    Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// The caller passed data the store cannot hold (a bad table prefix, a NUL in a JSONB
+    /// string, a number beyond the column). The same input never succeeds.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    /// Data read back from the store breaks an invariant (an unknown status, a negative
+    /// version, an entry that vanished).
+    #[error("corrupt stored data: {0}")]
+    Corrupt(String),
+    /// The database driver failed. The adapter that boxed `source` chose `class`.
+    #[error("storage backend error")]
+    Backend {
+        /// What to do about it, chosen by the adapter that knows the driver.
+        class: ErrorClass,
+        /// The driver's own error.
+        #[source]
+        source: BoxError,
+    },
 }
 
 impl StoreError {
-    pub fn backend(err: impl std::error::Error + Send + Sync + 'static) -> Self {
-        Self::Backend(Box::new(err))
+    /// The backend is unreachable or busy: network, pool, restart, deadlock. Retryable.
+    pub fn unavailable(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Backend {
+            class: ErrorClass::Transient,
+            source: Box::new(source),
+        }
+    }
+
+    /// The backend rejected a statement it should never have received: a bug. Not retryable.
+    pub fn internal(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Backend {
+            class: ErrorClass::Internal,
+            source: Box::new(source),
+        }
+    }
+
+    /// The backend returned a row or document that cannot be decoded. Not retryable.
+    pub fn corrupt_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Backend {
+            class: ErrorClass::Corrupt,
+            source: Box::new(source),
+        }
+    }
+}
+
+impl Classify for StoreError {
+    fn class(&self) -> ErrorClass {
+        match self {
+            Self::AlreadyExists(_) | Self::ConversationBusy { .. } => ErrorClass::Rejected,
+            Self::NotFound(_) => ErrorClass::NotFound,
+            Self::Conflict { .. } => ErrorClass::Conflict,
+            Self::NonDeterminism { .. } | Self::Corrupt(_) => ErrorClass::Corrupt,
+            Self::InvalidInput(_) => ErrorClass::Invalid,
+            Self::Backend { class, .. } => *class,
+        }
     }
 }
 
@@ -407,6 +475,10 @@ pub fn sched_at(
 }
 
 /// Truncate to millisecond precision (see the module docs on time).
+#[allow(
+    clippy::expect_used,
+    reason = "a millisecond count taken from a DateTime is always representable"
+)]
 pub fn truncate_ms(t: DateTime<Utc>) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(t.timestamp_millis())
         .single()
@@ -432,4 +504,98 @@ pub fn add_ttl(now: DateTime<Utc>, ttl: Duration) -> DateTime<Utc> {
 /// length-prefixed so no two `(agent, conversation)` pairs share a key.
 pub fn open_conversation_key(agent: &str, conversation_id: &str) -> String {
     format!("{}:{agent}{conversation_id}", agent.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run() -> RunId {
+        RunId(Uuid::nil())
+    }
+
+    /// Exhaustive: a new variant forces a class decision here.
+    fn expected(e: &StoreError) -> ErrorClass {
+        match e {
+            StoreError::AlreadyExists(_) => ErrorClass::Rejected,
+            StoreError::NotFound(_) => ErrorClass::NotFound,
+            StoreError::Conflict { .. } => ErrorClass::Conflict,
+            StoreError::ConversationBusy { .. } => ErrorClass::Rejected,
+            StoreError::NonDeterminism { .. } => ErrorClass::Corrupt,
+            StoreError::InvalidInput(_) => ErrorClass::Invalid,
+            StoreError::Corrupt(_) => ErrorClass::Corrupt,
+            StoreError::Backend { class, .. } => *class,
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("driver said no")]
+    struct Driver;
+
+    fn samples() -> Vec<StoreError> {
+        vec![
+            StoreError::AlreadyExists(run()),
+            StoreError::NotFound(run()),
+            StoreError::Conflict {
+                run: run(),
+                expected: 1,
+                actual: 2,
+            },
+            StoreError::ConversationBusy {
+                agent: "a".into(),
+                conversation_id: "c".into(),
+            },
+            StoreError::NonDeterminism {
+                run: run(),
+                seq: 0,
+                recorded: "x".into(),
+                requested: "y".into(),
+            },
+            StoreError::InvalidInput("nul".into()),
+            StoreError::Corrupt("negative version".into()),
+            StoreError::unavailable(Driver),
+            StoreError::internal(Driver),
+            StoreError::corrupt_source(Driver),
+        ]
+    }
+
+    #[test]
+    fn class_table() {
+        for e in samples() {
+            assert_eq!(e.class(), expected(&e), "{e}");
+        }
+        assert_eq!(
+            StoreError::unavailable(Driver).class(),
+            ErrorClass::Transient
+        );
+        assert_eq!(StoreError::internal(Driver).class(), ErrorClass::Internal);
+        assert_eq!(
+            StoreError::corrupt_source(Driver).class(),
+            ErrorClass::Corrupt
+        );
+    }
+
+    #[test]
+    fn retryable_is_derived_from_the_class() {
+        let retryable: Vec<bool> = samples().iter().map(Classify::is_retryable).collect();
+        // Conflict and an unavailable backend retry; nothing else does.
+        assert_eq!(
+            retryable,
+            [
+                false, false, true, false, false, false, false, true, false, false
+            ]
+        );
+    }
+
+    #[test]
+    fn backend_display_does_not_repeat_its_source() {
+        let e = StoreError::unavailable(Driver);
+        let source = std::error::Error::source(&e).map(ToString::to_string);
+        assert_eq!(source.as_deref(), Some("driver said no"));
+        assert!(!e.to_string().contains("driver said no"));
+        assert_eq!(
+            adam_error::report(&e),
+            "storage backend error: driver said no"
+        );
+    }
 }

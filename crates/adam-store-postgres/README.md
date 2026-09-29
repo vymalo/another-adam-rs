@@ -32,8 +32,30 @@ Tables are `<prefix>runs` (state as `JSONB`), `<prefix>journal` (primary key
 `(run_id, seq)`, `ON DELETE CASCADE`) and `<prefix>meta`. Claiming is
 `FOR UPDATE SKIP LOCKED`; one open run per conversation is a partial unique
 index. No transaction is held open while agent code runs. `JSONB` cannot hold
-`\u0000`: such state is rejected with `StoreError::InvalidData`. The guarantee
+`\u0000`: such state is rejected with `StoreError::InvalidInput`. The guarantee
 table is in the [root README](../../README.md#how-each-adapter-guarantees-the-contract).
+
+## Errors
+
+Failures are `adam_core::StoreError` (see [`adam-core`](../adam-core/README.md#errors)
+and [`adam-error`](../adam-error/README.md)). A driver error becomes
+`StoreError::Backend { class, source }`, with the `sqlx` error as the source
+and this adapter's choice of class:
+
+| Driver error | Class |
+|---|---|
+| I/O, TLS, protocol, pool timed out or closed, worker crashed | `Transient` |
+| database error with SQLSTATE class `08` or `53`, or `40001`, `40P01`, `57P01`, `57P02`, `57P03` | `Transient` |
+| a value or column that cannot be decoded, a missing column | `Corrupt` |
+| bad connection configuration | `Invalid` |
+| any other database error (a rejected statement) and anything else | `Internal` |
+
+A poisoned row is therefore `Corrupt`, not retryable and alerting, so the
+runtime fails that run instead of re-leasing it for ever. The adapter's own
+checks are `InvalidInput` (a NUL in `JSONB`, an integer above `i64::MAX`, a bad
+table prefix) and `Corrupt` (an unknown status, a negative version or `seq`, a
+journal entry that vanished). *Unverified:* the SQLSTATE codes are from the
+PostgreSQL manual's error-code appendix, recalled from memory, not re-checked.
 
 ## Features
 
@@ -45,6 +67,11 @@ table is in the [root README](../../README.md#how-each-adapter-guarantees-the-co
 ## Tests
 
 `tests/conformance.rs` runs the shared suite against a real server.
+`tests/errors.rs` checks the classes: an undecodable row is `Corrupt` and not
+retryable (needs the server), and an unreachable server is `Transient` (offline).
+Unit tests in `src/lib.rs` cover the driver-error table, and one of them
+(`sqlstates_are_classified_against_a_real_server`) provokes real SQLSTATEs
+when the server variable is set.
 
 | Variable | Meaning |
 |---|---|
@@ -63,4 +90,5 @@ CI runs it against PostgreSQL 12 and 17 (`conformance` job in
 
 ## See also
 
-[`adam-store-mongodb`](../adam-store-mongodb/README.md), the other adapter.
+[`adam-store-mongodb`](../adam-store-mongodb/README.md), the other adapter;
+[`adam-error`](../adam-error/README.md).

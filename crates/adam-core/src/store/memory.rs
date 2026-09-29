@@ -121,6 +121,10 @@ impl Store for MemoryStore {
                 });
             }
         }
+        #[allow(
+            clippy::expect_used,
+            reason = "presence was checked above under the same lock"
+        )]
         let slot = inner.runs.get_mut(&id).expect("checked above");
         slot.run.status = update.status;
         slot.run.state = update.state;
@@ -201,6 +205,10 @@ impl Store for MemoryStore {
         Ok(due
             .into_iter()
             .map(|(_, id)| {
+                #[allow(
+                    clippy::expect_used,
+                    reason = "the id was listed a moment ago under the same lock"
+                )]
                 let slot = inner.runs.get_mut(&id).expect("just listed");
                 slot.lease = Some((worker.to_owned(), until));
                 Lease {

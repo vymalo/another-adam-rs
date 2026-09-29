@@ -10,8 +10,13 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ssegning/adam-rs"
 rust-version = "1.94"
 
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
 [workspace.dependencies]
 adam-core = { path = "crates/adam-core", version = "0.1.0" }
+adam-error = { path = "crates/adam-error", version = "0.1.0" }
 adam-model = { path = "crates/adam-model", version = "0.1.0" }
 adam-runtime = { path = "crates/adam-runtime", version = "0.1.0" }
 adam-store-testkit = { path = "crates/adam-store-testkit", version = "0.1.0" }

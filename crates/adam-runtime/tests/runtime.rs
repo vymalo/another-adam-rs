@@ -10,6 +10,7 @@
 //!
 //! Every case takes a fresh agent name from [`uniq`], so cases can share one
 //! database and run in parallel without cleanup.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -18,8 +19,9 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
 use adam_runtime::{
-    Agent, AgentError, BroadcastSink, Clock, CollectingSink, Ctx, Inbound, MAX_RETRY_AFTER,
-    ManualClock, RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder, RuntimeError, Transition,
+    Agent, AgentError, BroadcastSink, Classify, Clock, CollectingSink, Ctx, Inbound,
+    MAX_RETRY_AFTER, ManualClock, RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder,
+    RuntimeError, Transition,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -1707,7 +1709,7 @@ mod cases {
     }
 
     // -----------------------------------------------------------------------
-    // Retry hints (`AgentError::TransientAfter`)
+    // Retry hints (`AgentError::with_retry_after`)
     // -----------------------------------------------------------------------
 
     /// A retry hint (a rate limit's `Retry-After`) delays the retry at least

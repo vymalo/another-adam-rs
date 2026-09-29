@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+adam-error.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
@@ -16,3 +17,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
+
+[lints]
+workspace = true

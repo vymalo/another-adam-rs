@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+adam-error.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
@@ -17,3 +18,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+
+[lints]
+workspace = true

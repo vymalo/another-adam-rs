@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+adam-error.workspace = true
 adam-model.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -25,3 +26,6 @@ tracing.workspace = true
 proptest.workspace = true
 wiremock.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

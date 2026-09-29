@@ -1,4 +1,5 @@
 //! End-to-end tests against the scripted `adam-acp-fake-agent` binary.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::future::Future;
 use std::path::Path;
@@ -8,6 +9,7 @@ use adam_acp::{
     AcpClient, AcpCommand, AcpError, AcpOptions, AcpUpdate, ClientPolicy, PermissionKind,
     PermissionMode, PlanEntry, Session, StaticPrompt,
 };
+use adam_error::Classify as _;
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
 

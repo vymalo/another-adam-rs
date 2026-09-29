@@ -19,6 +19,7 @@ use anyhow::Context as _;
 use secrecy::ExposeSecret as _;
 use tokio::sync::watch;
 
+use crate::exit::StoppedUnexpectedly;
 use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 use crate::repos::workspaces_for;
@@ -155,8 +156,8 @@ pub async fn serve(
         flatten(worker.await).context("worker failed while shutting down")?;
     }
     match early {
-        Some((name, Err(e))) => Err(e.context(format!("{name} stopped unexpectedly"))),
-        Some((name, Ok(()))) => anyhow::bail!("{name} stopped unexpectedly"),
+        Some((name, Err(e))) => Err(e.context(StoppedUnexpectedly(name))),
+        Some((name, Ok(()))) => Err(StoppedUnexpectedly(name).into()),
         None => {
             tracing::info!("stopped");
             Ok(())

@@ -95,11 +95,13 @@ dependencies = [
  "a2a-lf",
  "a2a-server-lf",
  "adam-a2a",
+ "adam-error",
  "async-trait",
  "axum",
  "chrono",
  "futures",
  "secrecy",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "subtle",
@@ -118,6 +120,7 @@ dependencies = [
  "a2a-lf",
  "adam-a2a",
  "adam-core",
+ "adam-error",
  "adam-runtime",
  "adam-store-postgres",
  "async-trait",
@@ -139,6 +142,7 @@ dependencies = [
 name = "adam-acp"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "agent-client-protocol",
  "async-trait",
  "futures",
@@ -161,6 +165,7 @@ dependencies = [
  "adam-a2a-runtime",
  "adam-acp",
  "adam-core",
+ "adam-error",
  "adam-llm-agent",
  "adam-model",
  "adam-model-openai",
@@ -190,6 +195,7 @@ dependencies = [
 name = "adam-core"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "async-trait",
  "chrono",
  "serde",
@@ -200,10 +206,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-error"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "adam-llm-agent"
 version = "0.1.0"
 dependencies = [
  "adam-core",
+ "adam-error",
  "adam-model",
  "adam-runtime",
  "async-trait",
@@ -221,6 +235,7 @@ dependencies = [
 name = "adam-model"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "async-trait",
  "futures",
  "serde",
@@ -233,6 +248,7 @@ dependencies = [
 name = "adam-model-openai"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "adam-model",
  "async-trait",
  "futures",
@@ -253,6 +269,7 @@ name = "adam-runtime"
 version = "0.1.0"
 dependencies = [
  "adam-core",
+ "adam-error",
  "adam-store-mongodb",
  "adam-store-postgres",
  "adam-store-testkit",
@@ -273,6 +290,7 @@ name = "adam-store-mongodb"
 version = "0.1.0"
 dependencies = [
  "adam-core",
+ "adam-error",
  "adam-store-testkit",
  "async-trait",
  "chrono",
@@ -289,6 +307,7 @@ name = "adam-store-postgres"
 version = "0.1.0"
 dependencies = [
  "adam-core",
+ "adam-error",
  "adam-store-testkit",
  "async-trait",
  "chrono",
@@ -315,6 +334,7 @@ dependencies = [
 name = "adam-workspace"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "adam-workspace",
  "async-trait",
  "base64 0.22.1",

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_acp::{AcpClient, AcpError, AcpUpdate, ClientPolicy, Session};
+use adam_error::{Classify, report};
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
@@ -51,10 +52,12 @@ impl DelegateToOpenCode {
 }
 
 fn acp_error(e: &AcpError) -> ToolError {
+    // Journaled and shown to the model: a boundary, so the chain is flattened here, once.
+    let text = format!("OpenCode: {}", report(e));
     if e.is_retryable() {
-        ToolError::Transient(format!("OpenCode: {e}"))
+        ToolError::Transient(text)
     } else {
-        ToolError::Permanent(format!("OpenCode: {e}"))
+        ToolError::Permanent(text)
     }
 }
 

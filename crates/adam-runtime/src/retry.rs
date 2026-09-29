@@ -1,13 +1,13 @@
 //! Retry policy for [`AgentError::Transient`](crate::AgentError::Transient)
-//! and [`AgentError::TransientAfter`](crate::AgentError::TransientAfter).
+//! with a `retry_after` hint ([`AgentError::with_retry_after`](crate::AgentError::with_retry_after)).
 
 use std::time::Duration;
 
-/// The longest wait a retry hint ([`AgentError::TransientAfter`]) can ask
+/// The longest wait a retry hint ([`AgentError::with_retry_after`]) can ask
 /// for: 24 hours. Longer hints are capped to it, so a misbehaving upstream
 /// cannot park a run for years.
 ///
-/// [`AgentError::TransientAfter`]: crate::AgentError::TransientAfter
+/// [`AgentError::with_retry_after`]: crate::AgentError::with_retry_after
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Exponential backoff for transient failures.

@@ -5,6 +5,7 @@
 //! passes without doing anything. Start the mock with
 //! `docker compose up -d --wait mock-openai`; the scenario switches these
 //! tests use are documented in the README ("Local development").
+#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -201,7 +202,9 @@ async fn error_scenarios_map_onto_model_errors() {
                 } if *d == Duration::from_secs(2)
             )
         }),
-        ("server-error", |e| matches!(e, ModelError::Transient(_))),
+        ("server-error", |e| {
+            matches!(e, ModelError::Transient { .. })
+        }),
         ("unauthorized", |e| matches!(e, ModelError::Auth(_))),
         ("context-length", |e| {
             matches!(e, ModelError::ContextLength(_))

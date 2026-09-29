@@ -2,12 +2,20 @@
 
 use std::time::Duration;
 
+use adam_error::{Classify, ErrorClass};
+
 /// Everything that can go wrong while driving an ACP agent.
+///
+/// Decide from [`Classify::class`]: `Exited` and `Timeout` are `Transient` (worth another
+/// attempt on a fresh agent process), `AuthRequired` is `Unauthenticated`, `Config` and an RPC
+/// error with code -32602 are `Invalid`, `Protocol` is `Corrupt`, `TurnInProgress` and `Closed`
+/// are `Rejected`, and `Spawn` and any other RPC error are `Internal`. A message describes this
+/// layer only; [`adam_error::report`] prints the chain.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AcpError {
     /// The agent program could not be found or started.
-    #[error("cannot start ACP agent `{program}`: {source}")]
+    #[error("cannot start ACP agent `{program}`")]
     Spawn {
         /// The program as configured (before path resolution).
         program: String,
@@ -58,12 +66,23 @@ pub enum AcpError {
     Closed,
 }
 
-impl AcpError {
-    /// Whether retrying the operation on a **fresh** agent process may
-    /// succeed. A crashed agent or a stalled turn is worth another attempt;
+/// JSON-RPC "invalid params".
+const RPC_INVALID_PARAMS: i32 = -32602;
+
+impl Classify for AcpError {
+    /// [`is_retryable`](Classify::is_retryable) means: retrying the operation on a **fresh**
+    /// agent process may succeed. A crashed agent or a stalled turn is worth another attempt;
     /// a missing binary, bad configuration or protocol violation is not.
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Exited { .. } | Self::Timeout { .. })
+    fn class(&self) -> ErrorClass {
+        match self {
+            Self::Exited { .. } | Self::Timeout { .. } => ErrorClass::Transient,
+            Self::AuthRequired(_) => ErrorClass::Unauthenticated,
+            Self::Config(_) => ErrorClass::Invalid,
+            Self::Rpc { code, .. } if *code == RPC_INVALID_PARAMS => ErrorClass::Invalid,
+            Self::Rpc { .. } | Self::Spawn { .. } => ErrorClass::Internal,
+            Self::Protocol(_) => ErrorClass::Corrupt,
+            Self::TurnInProgress | Self::Closed => ErrorClass::Rejected,
+        }
     }
 }
 
@@ -85,3 +104,83 @@ fn tail_desc(tail: &str) -> String {
 
 /// Result alias for this crate.
 pub type AcpResult<T> = Result<T, AcpError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exhaustive: a new variant forces a class decision here.
+    fn expected(e: &AcpError) -> ErrorClass {
+        match e {
+            AcpError::Spawn { .. } => ErrorClass::Internal,
+            AcpError::Exited { .. } => ErrorClass::Transient,
+            AcpError::Timeout { .. } => ErrorClass::Transient,
+            AcpError::Rpc { code: -32602, .. } => ErrorClass::Invalid,
+            AcpError::Rpc { .. } => ErrorClass::Internal,
+            AcpError::AuthRequired(_) => ErrorClass::Unauthenticated,
+            AcpError::Protocol(_) => ErrorClass::Corrupt,
+            AcpError::Config(_) => ErrorClass::Invalid,
+            AcpError::TurnInProgress => ErrorClass::Rejected,
+            AcpError::Closed => ErrorClass::Rejected,
+        }
+    }
+
+    fn samples() -> Vec<AcpError> {
+        vec![
+            AcpError::Spawn {
+                program: "opencode".into(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            AcpError::Exited {
+                code: Some(1),
+                stderr_tail: String::new(),
+            },
+            AcpError::Timeout {
+                operation: "initialize",
+                after: Duration::from_secs(1),
+            },
+            AcpError::Rpc {
+                code: -32602,
+                message: "bad params".into(),
+            },
+            AcpError::Rpc {
+                code: -32603,
+                message: "boom".into(),
+            },
+            AcpError::AuthRequired("no provider".into()),
+            AcpError::Protocol("x".into()),
+            AcpError::Config("x".into()),
+            AcpError::TurnInProgress,
+            AcpError::Closed,
+        ]
+    }
+
+    #[test]
+    fn class_table() {
+        for e in samples() {
+            assert_eq!(e.class(), expected(&e), "{e}");
+        }
+        // Retry behaviour is unchanged: only a crashed agent or a stalled turn.
+        let retryable: Vec<bool> = samples().iter().map(Classify::is_retryable).collect();
+        assert_eq!(
+            retryable,
+            [
+                false, true, true, false, false, false, false, false, false, false
+            ]
+        );
+    }
+
+    /// Regression for A4: `{:#}` printed a spawn failure's OS error twice.
+    #[test]
+    fn spawn_display_does_not_repeat_its_source() {
+        let e = &samples()[0];
+        let source = std::error::Error::source(e)
+            .expect("source kept")
+            .to_string();
+        assert!(!e.to_string().contains(&source), "{e}");
+        assert_eq!(
+            adam_error::report(e),
+            format!("cannot start ACP agent `opencode`: {source}")
+        );
+    }
+}

@@ -28,6 +28,13 @@ use crate::Config;
 /// What replaces a secret.
 pub const REDACTED: &str = "[redacted]";
 
+/// The most a run's failure text (`RunView::error`, the A2A `Failed` status message) may carry, in
+/// bytes. Upstream bodies and OpenCode's stderr tail can be long, and the text is shown to clients.
+pub const MAX_FAILURE_TEXT: usize = 2048;
+
+/// Appended to a failure text that was cut.
+const TRUNCATED: &str = " [truncated]";
+
 /// Shortest value that is worth (and safe) replacing.
 pub const MIN_SECRET_LEN: usize = 4;
 
@@ -112,6 +119,23 @@ impl Redactor {
             Cow::Borrowed(_) => text,
             Cow::Owned(clean) => clean,
         }
+    }
+
+    /// `text` scrubbed, then cut to [`MAX_FAILURE_TEXT`] bytes (at a character boundary, with a
+    /// marker): what a run's failure text may carry out of the process. It is in this order on
+    /// purpose: cutting first could leave the front half of a secret that scrubbing would then no
+    /// longer recognise.
+    pub fn failure_text(&self, text: String) -> String {
+        let mut clean = self.scrub_string(text);
+        if clean.len() > MAX_FAILURE_TEXT {
+            let mut end = MAX_FAILURE_TEXT;
+            while !clean.is_char_boundary(end) {
+                end -= 1;
+            }
+            clean.truncate(end);
+            clean.push_str(TRUNCATED);
+        }
+        clean
     }
 
     /// Scrub every string (and object key) inside `value`.

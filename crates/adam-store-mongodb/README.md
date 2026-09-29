@@ -32,12 +32,31 @@ let store: DynStore = Arc::new(store);
 
 Every operation is a single-document atomic write, so a standalone `mongod`
 is enough (no multi-document transactions). Integers above `i64::MAX` are
-rejected with `StoreError::InvalidData`. Time is truncated to milliseconds.
+rejected with `StoreError::InvalidInput`. Time is truncated to milliseconds.
 The guarantee table is in the [root README](../../README.md#how-each-adapter-guarantees-the-contract).
 
 *Unverified:* the "MongoDB 5.0+" floor is the oldest server CI runs against
 (`conformance` job), not a documented driver guarantee. The `mongodb` driver
 requirement is `3.9` (verified 2026-09-29, `Cargo.toml`).
+
+## Errors
+
+Failures are `adam_core::StoreError` (see [`adam-core`](../adam-core/README.md#errors)
+and [`adam-error`](../adam-error/README.md)). A driver error becomes
+`StoreError::Backend { class, source }`, with the `mongodb` error as the source
+and this adapter's choice of class:
+
+| Driver error | Class |
+|---|---|
+| labelled `TransientTransactionError` or `RetryableWriteError`; I/O, DNS, pool cleared, server selection, transaction | `Transient` |
+| a reply that cannot be decoded (BSON deserialization, invalid response) | `Corrupt` |
+| authentication failed | `Unauthenticated` |
+| invalid argument, invalid TLS configuration | `Invalid` |
+| any other rejected command | `Internal` |
+
+The adapter's own checks are `InvalidInput` (an integer above `i64::MAX`, a bad
+collection prefix) and `Corrupt` (a non-finite number in stored state, a
+malformed escaped key, a journal entry that vanished).
 
 ## Features
 
@@ -46,7 +65,9 @@ None.
 ## Tests
 
 `tests/conformance.rs` runs the shared suite; `src/codec.rs` has property
-tests of the key escaping.
+tests of the key escaping; `src/lib.rs` has unit tests of the error classes
+(`driver_errors_are_classified_by_what_they_mean`,
+`the_driver_error_is_kept_as_the_source`).
 
 | Variable | Meaning |
 |---|---|
@@ -63,4 +84,5 @@ CI runs it against MongoDB 5.0 and 8.0.
 
 ## See also
 
-[`adam-store-postgres`](../adam-store-postgres/README.md), the other adapter.
+[`adam-store-postgres`](../adam-store-postgres/README.md), the other adapter;
+[`adam-error`](../adam-error/README.md).
