@@ -85,6 +85,21 @@ jobs:
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
           ./actionlint -color
 
+  # Every Mermaid diagram parses (pinned Mermaid), every relative Markdown link
+  # and #heading resolves, every crate has a README. See tools/docs-check.
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install pinned checker dependencies
+        run: npm --prefix tools/docs-check ci --no-fund --no-audit
+      - name: Check diagrams and links
+        run: node tools/docs-check/check-docs.mjs
+
   conformance:
     runs-on: ubuntu-latest
     timeout-minutes: 45
