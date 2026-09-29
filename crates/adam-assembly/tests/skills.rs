@@ -141,8 +141,7 @@ fn the_catalog_of_the_fixture_matches_the_golden_file() {
         "list_files",
         "fetch_page",
     ]);
-    let assembly = AgentDef::from_manifest(AGENT)
-        .unwrap()
+    let assembly = common::with_fixture_token(AgentDef::from_manifest(AGENT).unwrap())
         .bind(fixture_tools)
         .unwrap()
         .model(Arc::new(MockModel::new()), "m")
@@ -758,7 +757,7 @@ async fn embedded_and_directory_manifests_behave_the_same() {
     for def in [embedded, from_dir] {
         let model = Arc::new(MockModel::new());
         script(&model);
-        let assembly = def
+        let assembly = common::with_fixture_token(def)
             .bind(fixture_tools())
             .unwrap()
             .model(model.clone(), "m")

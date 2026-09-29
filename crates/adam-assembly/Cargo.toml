@@ -11,9 +11,13 @@ rust-version.workspace = true
 [features]
 default = []
 # `Assembly::card`: the root agent's `card:` frontmatter as an `adam_a2a::AgentCardConfig`.
-a2a = ["dep:adam-a2a", "dep:url"]
+a2a = ["dep:adam-a2a"]
 
 [dependencies]
+# The A2A client behind remote subagents (`a2a:`): part of every build, so a manifest with a remote
+# subagent binds the same way with or without the feature `a2a` (which is the server-side card).
+a2a-client-lf.workspace = true
+a2a-lf.workspace = true
 adam-a2a = { path = "../adam-a2a", version = "0.1.0", optional = true }
 adam-agent-fs.workspace = true
 adam-error.workspace = true
@@ -21,19 +25,28 @@ adam-llm-agent.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-url = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 # The embedded agent (`build.rs` + `include_agent!`) that the end-to-end tests bind. The fixture
 # depends on `adam`, which depends on this crate: a dev-dependency cycle, which cargo allows.
 adam-agent-fixture = { path = "../adam-agent-fixture" }
+# The in-process A2A server the remote-subagent tests talk to.
+adam-a2a = { path = "../adam-a2a", version = "0.1.0", features = ["test-util"] }
 adam-core.workspace = true
 adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
+axum.workspace = true
+futures.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

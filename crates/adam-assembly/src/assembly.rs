@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent};
 use adam_llm_agent::{Limits, LlmAgent, LlmAgentBuilder};
@@ -27,6 +28,7 @@ pub struct BoundDef {
     remotes: Vec<Remote>,
     state: Vec<ApplyState>,
     aliases: Option<Vec<String>>,
+    wait_poll: Option<Duration>,
 }
 
 impl std::fmt::Debug for BoundDef {
@@ -54,6 +56,7 @@ impl BoundDef {
             remotes,
             state: Vec::new(),
             aliases: None,
+            wait_poll: None,
         }
     }
 
@@ -77,6 +80,17 @@ impl BoundDef {
         S: Into<String>,
     {
         self.aliases = Some(aliases.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// How long an agent that waits for something (a subagent's child run, the task of a remote
+    /// subagent) sleeps between looks: [`LlmAgentBuilder::wait_poll`], for every agent. The default
+    /// is the loop's, 60 seconds. A child run tells its parent when it is done, so the timer is
+    /// only its fallback; **a remote subagent has no such message**, so this is how often its task
+    /// is looked at, and the longest a finished remote task waits to be noticed.
+    #[must_use]
+    pub fn wait_poll(mut self, every: Duration) -> Self {
+        self.wait_poll = Some(every);
         self
     }
 
@@ -175,8 +189,8 @@ impl BoundDef {
     /// [`SubagentTool`](crate::SubagentTool) per local subagent (slice S9). They are added at
     /// bind, not here, so that a name clash is found before a model is needed, and so that
     /// [`AgentInfo::tools`] and the agent cannot disagree. This function only hands them over.
-    /// The remote subagents (`remotes`, slice S9b) join the same list in `bind`, where their names
-    /// meet the local ones; slice S11 adds the tools of `mcp.json` the same way.
+    /// The remote subagents (slice S9b) join the same list in `bind`, where their names meet the
+    /// local ones; slice S11 adds the tools of `mcp.json` the same way.
     fn build(
         &self,
         node: &Node,
@@ -187,6 +201,9 @@ impl BoundDef {
         let mut builder = LlmAgent::builder(node.name.clone(), Arc::clone(model), alias)
             .instructions(node.prompt.clone())
             .limits(node.limits);
+        if let Some(every) = self.wait_poll {
+            builder = builder.wait_poll(every);
+        }
         for (_, tool) in &node.tools {
             builder = builder.dyn_tool(Arc::clone(tool));
         }
@@ -230,8 +247,9 @@ pub struct AgentInfo {
     pub limits: Limits,
 }
 
-/// A remote (A2A) subagent found in the files. It is data here: the tool that calls it is a
-/// later slice (S9b).
+/// A remote (A2A) subagent found in the files, as data. Its tool is in the parent's
+/// [`AgentInfo::tools`], made by [`AgentDef::bind`](crate::AgentDef::bind) with the URL and the token
+/// checked; this is what the files said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteInfo {
     /// The registration name of the agent that owns it.

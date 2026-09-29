@@ -99,8 +99,18 @@
 //! with a tool of its parent: both are errors at [`AgentDef::bind`]. The tool needs no runtime
 //! handle: [`Assembly::register`] registers every agent, and that is all it needs.
 //!
-//! Not here yet: remote subagents (S9b), `mcp.json` tools (S11) and reloading from disk (S10). The
-//! manifest keeps their files, and [`AgentDef::bind`] is where they plug in.
+//! # Remote subagents
+//!
+//! A subagent file with `a2a:` is a tool of the same shape whose call is a journaled A2A
+//! `SendMessage` to another agent. The parent then waits on the remote task and looks at it with
+//! `GetTask` each time its wait timer fires ([`BoundDef::wait_poll`]); the answer is the text of the
+//! task's artifacts, and a failed, canceled or input-required task is an error result. `auth:
+//! bearer:VAR` reads a token from the environment variable `VAR` at [`AgentDef::bind`] (see
+//! [`AgentDef::env`]) and fails closed; the URL must be https unless it is local
+//! ([`AgentDef::allow_insecure_remotes`]); the token is never logged or journaled. See the README.
+//!
+//! Not here yet: `mcp.json` tools (S11) and reloading from disk (S10). The manifest keeps their
+//! files, and [`AgentDef::bind`] is where they plug in.
 
 #![warn(missing_docs)]
 
@@ -109,6 +119,7 @@ mod assembly;
 mod card;
 mod def;
 mod error;
+mod remote;
 mod skills;
 mod subagent;
 mod suggest;
@@ -116,7 +127,9 @@ mod template;
 
 pub use assembly::{AgentInfo, Assembly, BoundDef, RemoteInfo};
 pub use def::{AgentDef, IntoManifest};
-pub use error::{AliasProblem, Error, Origin, SkillField, ToolClash};
+pub use error::{
+    AliasProblem, Error, Origin, RemoteAuthProblem, RemoteUrlProblem, SkillField, ToolClash,
+};
 pub use skills::{LOAD_SKILL, READ_SKILL_FILE, SkillError, SkillFiles};
 pub use subagent::SubagentTool;
 pub use template::TemplateProblem;

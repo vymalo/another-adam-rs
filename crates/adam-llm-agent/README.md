@@ -24,7 +24,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) |
 | `ToolOutput` | `text`, `error`, `with_artifact` |
 | `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `emit_progress`, `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, and for tests `detached(..).with_state(..)` |
-| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question }` (parks the run; A2A reports `input-required`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`); `#[non_exhaustive]`, see *Errors* |
+| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question }` (parks the run; A2A reports `input-required`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer); `#[non_exhaustive]`, see *Errors* |
 | `LlmAgentBuilder::state`, `try_build`, `tools` | `state(Arc<T>)` shares a value with the tools (one per type); `try_build() -> Result<LlmAgent, BuildError>` fails on a tool whose `required_state` was not given (`BuildError::MissingState`) or on two tools with one name (`BuildError::DuplicateTool`); `tools(ToolSet)` registers a group. `build()` is unchanged (last duplicate wins, no state check) |
 | `State<T>`, `StateKey`, `Extensions` | a cheap `Arc` handle that derefs to `T`; the key of a state type; the typed map behind them |
 | `ToolSet`, `tools!` | an ordered group of tools: `tools![Clock, Search::new()]`, `.extend(..)`, `.wrap(\|tool\| ..)` for middleware, `names()`, `get(..)` |
@@ -33,7 +33,8 @@ instructions + a model + a toolset. It is served over A2A by
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
 | `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
 | `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
-| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `Conversation::pending_wait` is the question or the child run the parked run waits for (it was `pending_question`, and state stored under that name still loads) |
+| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads) |
+| `Tool::poll_remote`, `RemotePoll` | how a tool that returned `AwaitRemote` answers "how does the task stand": `Ready(ToolOutput)` or `Working`; the default refuses |
 | `DEFAULT_WAIT_POLL` | 60 s: how long a run waiting for a child sleeps before it reads the child itself |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
 | `TRUNCATION_MARKER_PREFIX` | prefix of the marker left where history truncation shortened a tool output |
@@ -110,6 +111,39 @@ that is stepping the run (through `Ctx::child_starter()`, whose only possible pa
 `ToolCtx::detached` belongs to no runtime and refuses (`Permanent`). This is what `adam-assembly`'s
 `SubagentTool` does. (`tests/child_runs.rs` starts children with a `Runtime` it holds, which works too.)
 
+## Remote tasks
+
+A tool that starts a task on another system (an A2A agent, a job queue) and cannot wait for it inside one call
+returns `Err(ToolError::AwaitRemote { task, timeout_ms })` from the step that started it, and implements
+`Tool::poll_remote`:
+
+```rust
+async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+    // start it, idempotently: key the request by ctx.call_id() or ctx.child_run_id()
+    let task = start(ctx.child_run_id().to_string(), &args).await?;
+    Err(ToolError::AwaitRemote { task, timeout_ms: Some(3_600_000) })
+}
+
+async fn poll_remote(&self, ctx: &ToolCtx, task: &str) -> Result<RemotePoll, ToolError> {
+    Ok(match look(task).await? {
+        Some(result) => RemotePoll::Ready(result), // becomes the tool result
+        None => RemotePoll::Working,               // ask again after the next interval
+    })
+}
+```
+
+The agent records `PendingWait::Remote` (`{call_id, tool, task, deadline}`) and parks with the `wait_poll`
+timer. Nothing tells it the task is over, so each time the timer fires it calls `poll_remote` in a journaled
+step named `poll:<call id>`: a replay sees the recorded answer and never asks the tool twice for one wake.
+`Ready` is the result (an error result if `is_error`); `Err(Transient)` fails the wake and retries it;
+`Err(Permanent)` is an error result. With a `timeout_ms` the call is answered with an error result once the
+wait is older (by the journaled clock) and the tool is not asked again. `task` is stored in the run's state:
+put no secret in it. The tool is looked up by the name in the wait, so a definition that lost the tool answers
+the call with an error result. A user message that arrives meanwhile wakes the run for one look and queues
+behind the result. Events: `awaiting_remote` and `tool_end` with status `waiting`, then the final `tool_end`.
+Cancelling the run does not cancel the remote task. This is what `adam-assembly`'s remote subagents do; the
+design is in [`docs/architecture.md`](../../docs/architecture.md#remote-tasks-the-same-wait-without-a-message).
+
 ## Errors
 
 `ToolError` implements `adam_error::Classify` (see
@@ -121,6 +155,7 @@ that is stepping the run (through `Ctx::child_starter()`, whose only possible pa
 | `Permanent` | `Invalid` | the model is told, and can go on |
 | `NeedsInput` | `Rejected` | valid, but it needs the user first: the run parks |
 | `AwaitRun` | `Rejected` | valid, but it needs a child run first: the run parks with a timer |
+| `AwaitRemote` | `Rejected` | valid, but it needs a remote task first: the run parks with a timer and polls |
 
 `ToolError` is journaled, so its serde shape is frozen and it carries no
 `source`: a tool flattens its own cause into the message (with
@@ -152,6 +187,12 @@ No environment variables.
 The old `Conversation` JSON with `pending_question` is a literal in `src/conversation.rs`
 (`a_state_stored_as_pending_question_still_loads`) and the old `ToolError` shapes are literals in `src/tool.rs`
 (`journals_written_before_await_run_still_decode`).
+
+`tests/remote_tasks.rs` is the remote-task suite (`MemoryStore`, and PostgreSQL when `ADAM_TEST_POSTGRES_URL` is
+set): polling on the moved clock until `Ready` with one start, a new process that polls on without starting,
+a failed result, permanent and transient poll errors, the timeout, a tool that cannot be polled, and a user
+message queueing behind the result. The shapes of `AwaitRemote` and of the wait are literals in `src/tool.rs`
+and `src/conversation.rs`.
 
 `tests/llm_agent.rs` is a behavioural suite over a scripted `MockModel` and
 `MemoryStore` (`a_starter_inits_exactly_like_the_agent`, tool loop, retries and rate limits, limits, replay after a

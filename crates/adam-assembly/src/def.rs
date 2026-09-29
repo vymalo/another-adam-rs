@@ -4,15 +4,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use adam_agent_fs::{
     AgentManifest, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
     ManifestSource, ModelRef, Strictness, Subagent, ToolList,
 };
 use adam_llm_agent::{DynTool, Limits, ToolSet};
+use secrecy::SecretString;
 
 use crate::assembly::BoundDef;
 use crate::error::{Error, Origin, ToolClash};
+use crate::remote::{RemoteSettings, RemoteSubagentTool};
 use crate::skills::{self, SkillFiles};
 use crate::subagent::SubagentTool;
 use crate::suggest::closest;
@@ -100,6 +103,8 @@ pub struct AgentDef {
     values: BTreeMap<String, BTreeMap<String, String>>,
     /// The bytes of the files the skills bundle.
     files: SkillFiles,
+    /// What the deployment decides about remote (`a2a:`) subagents.
+    remote: RemoteSettings,
 }
 
 impl AgentDef {
@@ -115,6 +120,7 @@ impl AgentDef {
             manifest: manifest.into_manifest()?,
             values: BTreeMap::new(),
             files,
+            remote: RemoteSettings::default(),
         })
     }
 
@@ -190,6 +196,37 @@ impl AgentDef {
         self
     }
 
+    /// Give an environment variable a value here, in code, for the agent files that read one:
+    /// `auth: bearer:BILLING_TOKEN` on a remote subagent reads `BILLING_TOKEN`. A value given here
+    /// wins over the process environment, so a composition root that fetches its secrets from a
+    /// vault (or a test) does not have to put them in the environment. The value is held as a
+    /// secret: it is not shown by `Debug`, and no error carries it.
+    #[must_use]
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.remote.env).insert(name.into(), SecretString::from(value.into()));
+        self
+    }
+
+    /// Allow remote subagents at plain `http` URLs that are not this machine. **Development
+    /// only:** the messages and the bearer token cross the network in the clear. Off by default:
+    /// `bind` refuses such a URL with [`Error::RemoteUrl`], and the client refuses an agent card
+    /// that offers such an interface. `localhost`, `*.localhost` and loopback addresses never need
+    /// it.
+    #[must_use]
+    pub fn allow_insecure_remotes(mut self, allow: bool) -> Self {
+        self.remote.allow_insecure = allow;
+        self
+    }
+
+    /// How long a parent waits for the task of a remote subagent before the call is answered with
+    /// an error result (default one hour; the remote task is left where it is). A zero is raised to
+    /// one millisecond.
+    #[must_use]
+    pub fn remote_timeout(mut self, max_wait: Duration) -> Self {
+        self.remote.max_wait = max_wait.max(Duration::from_millis(1));
+        self
+    }
+
     /// Check the definition against the registered tools and render the prompts.
     ///
     /// Everything that can be wrong with the files, given these tools, is found here, at
@@ -212,6 +249,13 @@ impl AgentDef {
     /// * a subagent with a tool that asks the user ([`Error::SubagentAsksUser`]): nobody would
     ///   answer it.
     ///
+    /// A remote subagent (`a2a:`) gets a tool of the same shape and the same name checks, and is
+    /// checked here too: its URL must be https (or local, unless
+    /// [`allow_insecure_remotes`](Self::allow_insecure_remotes)) and carry no credentials
+    /// ([`Error::RemoteUrl`]), and the variable of its `auth: bearer:VAR` must hold a token
+    /// ([`Error::RemoteAuth`]). The token is read now and kept in memory, and the network is not
+    /// touched until the first call.
+    ///
     /// Nothing is built yet: the model and the state come next ([`BoundDef`]).
     ///
     /// # Errors
@@ -223,6 +267,7 @@ impl AgentDef {
             catalog: &catalog,
             values: &self.values,
             files: &self.files,
+            remote: &self.remote,
             nodes: Vec::new(),
             remotes: Vec::new(),
         };
@@ -262,7 +307,8 @@ pub(crate) struct Node {
     pub(crate) preloaded: Vec<String>,
 }
 
-/// A remote (A2A) subagent, found on the way. Data only until slice S9b.
+/// A remote (A2A) subagent, found on the way: what [`Assembly::remotes`](crate::Assembly::remotes) lists.
+/// Its tool is made in `add_subagent_tools`.
 #[derive(Debug, Clone)]
 pub(crate) struct Remote {
     /// The registration name of the agent that owns it.
@@ -302,6 +348,7 @@ struct Walk<'a> {
     catalog: &'a Catalog,
     values: &'a BTreeMap<String, BTreeMap<String, String>>,
     files: &'a SkillFiles,
+    remote: &'a RemoteSettings,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
 }
@@ -329,7 +376,7 @@ impl Walk<'_> {
             add_skills(&origin, manifest, self.files, &mut prompt, &mut tools)?;
         // The tools `add_skills` appended, so a clash can say whose tool it hit.
         let skill_tools: Vec<String> = tools[registered..].iter().map(|(n, _)| n.clone()).collect();
-        add_subagent_tools(&origin, manifest, &skill_tools, &mut tools)?;
+        add_subagent_tools(&origin, manifest, &skill_tools, self.remote, &mut tools)?;
         let index = self.nodes.len();
         self.nodes.push(Node {
             name: name.clone(),
@@ -407,29 +454,31 @@ fn refuse_asking_tools(origin: &Origin, tools: &[(String, DynTool)]) -> Result<(
     }
 }
 
-/// Give the agent a tool for each of its local subagents, named after the subagent and placed
-/// after the agent's own tools and its skills' tools, in the order of the manifest. The name must
-/// not be one the agent's model already sees.
+/// Give the agent a tool for each of its subagents, local and remote, named after the subagent and
+/// placed after the agent's own tools and its skills' tools, in the order of the manifest. The name
+/// must not be one the agent's model already sees.
 fn add_subagent_tools(
     origin: &Origin,
     manifest: &AgentManifest,
     skill_tools: &[String],
+    remote: &RemoteSettings,
     tools: &mut Vec<(String, DynTool)>,
 ) -> Result<(), Error> {
     // The subagent tools added so far, by name, with the file of the subagent that owns each.
     let mut subagents: Vec<(&str, &std::path::Path)> = Vec::new();
     for sub in &manifest.subagents {
-        let Subagent::Local(child) = sub else {
-            continue;
+        let (name, file) = match sub {
+            Subagent::Local(child) => (child.name.as_str(), child.path.as_path()),
+            Subagent::Remote(agent) => (agent.name.as_str(), agent.path.as_path()),
         };
-        let clash = if let Some((_, file)) = subagents.iter().find(|(n, _)| *n == child.name) {
+        let clash = if let Some((_, file)) = subagents.iter().find(|(n, _)| *n == name) {
             Some(ToolClash::Subagent {
                 file: file.to_path_buf(),
             })
-        } else if tools.iter().any(|(n, _)| *n == child.name) {
+        } else if tools.iter().any(|(n, _)| n == name) {
             // Whose tool it is depends on what `add_skills` added, not on the name: without
             // skills, a registered tool may be called `load_skill`.
-            Some(if skill_tools.contains(&child.name) {
+            Some(if skill_tools.iter().any(|t| t == name) {
                 ToolClash::SkillTool
             } else {
                 ToolClash::Tool
@@ -437,24 +486,27 @@ fn add_subagent_tools(
         } else {
             None
         };
+        let sub_origin = Origin::new(format!("{}/{name}", origin.agent), file);
         if let Some(clash) = clash {
             return Err(Error::SubagentToolClash {
-                origin: Origin::new(
-                    format!("{}/{}", origin.agent, child.name),
-                    child.path.clone(),
-                ),
+                origin: sub_origin,
                 parent: origin.agent.clone(),
-                tool: child.name.clone(),
+                tool: name.to_owned(),
                 clash,
             });
         }
-        let tool = SubagentTool::new(
-            child.name.clone(),
-            format!("{}/{}", origin.agent, child.name),
-            child.frontmatter.description.as_deref().unwrap_or_default(),
-        );
-        subagents.push((&child.name, &child.path));
-        tools.push((child.name.clone(), Arc::new(tool)));
+        let tool: DynTool = match sub {
+            Subagent::Local(child) => Arc::new(SubagentTool::new(
+                child.name.clone(),
+                format!("{}/{}", origin.agent, child.name),
+                child.frontmatter.description.as_deref().unwrap_or_default(),
+            )),
+            Subagent::Remote(agent) => {
+                Arc::new(RemoteSubagentTool::bind(&sub_origin, agent, remote)?)
+            }
+        };
+        subagents.push((name, file));
+        tools.push((name.to_owned(), tool));
     }
     Ok(())
 }

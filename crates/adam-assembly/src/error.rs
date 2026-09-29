@@ -118,6 +118,62 @@ pub enum ToolClash {
     },
 }
 
+/// Why the bearer token of a remote subagent was refused, in [`Error::RemoteAuth`]. Never carries
+/// the value of the variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteAuthProblem {
+    /// The variable is not set, in the environment or through
+    /// [`AgentDef::env`](crate::AgentDef::env).
+    Missing,
+    /// The variable is set, and empty (or only blanks).
+    Empty,
+    /// The value cannot be a bearer token: it has whitespace or a control character inside it, a
+    /// character outside printable ASCII, or is not valid Unicode.
+    NotAToken,
+}
+
+impl fmt::Display for RemoteAuthProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "it is not set",
+            Self::Empty => "it is empty",
+            Self::NotAToken => "its value is not a bearer token (printable ASCII, no whitespace)",
+        })
+    }
+}
+
+/// Why the URL of a remote subagent was refused, in [`Error::RemoteUrl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteUrlProblem {
+    /// It does not parse as a URL.
+    Unparseable,
+    /// It is not `http` or `https`, or has no host.
+    NotHttp,
+    /// It has a user name or a password in it. The URL is logged and shown in errors; the token
+    /// goes in `auth: bearer:VAR`.
+    Credentials,
+    /// It is plain `http` to a host that is not this machine (`localhost`, `127.0.0.0/8`, `::1`).
+    /// The messages and the token would cross the network in the clear.
+    Insecure,
+}
+
+impl fmt::Display for RemoteUrlProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unparseable => "it is not a URL",
+            Self::NotHttp => "it is not an http(s) URL with a host",
+            Self::Credentials => {
+                "it has a user name or password in it: put the token in `auth: bearer:VAR` instead"
+            }
+            Self::Insecure => {
+                "it is plain http to a host that is not this machine, so every message and the \
+                 token would cross the network in the clear: use https (or, for development \
+                 only, call AgentDef::allow_insecure_remotes)"
+            }
+        })
+    }
+}
+
 /// Why an [`AgentDef`](crate::AgentDef) could not be bound to agents.
 ///
 /// A mistake in the agent's files or in how it is put together, found when the process
@@ -373,6 +429,31 @@ pub enum Error {
         /// The tool that asks.
         tool: String,
     },
+    /// A remote subagent's `auth: bearer:VAR` names an environment variable that cannot give a
+    /// token. The token is read at [`AgentDef::bind`](crate::AgentDef::bind), and a remote
+    /// subagent with no usable credential is refused (fail closed) rather than called without.
+    #[error(
+        "{origin}: `auth: bearer:{var}` needs the environment variable `{var}` to hold the token, \
+         but {problem}: set it, or remove `auth` from the remote subagent"
+    )]
+    RemoteAuth {
+        /// The remote subagent and its file.
+        origin: Origin,
+        /// The variable's name (never its value).
+        var: String,
+        /// What is wrong with it.
+        problem: RemoteAuthProblem,
+    },
+    /// A remote subagent's `a2a:` URL cannot be used.
+    #[error("{origin}: `a2a: {url}` is refused: {problem}")]
+    RemoteUrl {
+        /// The remote subagent and its file.
+        origin: Origin,
+        /// The URL as it can be shown: without a user name or password, and without a query.
+        url: String,
+        /// Why.
+        problem: RemoteUrlProblem,
+    },
     /// The A2A card needs a description and the agent has none.
     #[error(
         "{origin}: the A2A card needs a description: set `description` (or `card.description`) in the frontmatter"
@@ -569,6 +650,16 @@ mod tests {
                 origin: o.clone(),
                 tool: "ask_user".into(),
             },
+            Error::RemoteAuth {
+                origin: o.clone(),
+                var: "BILLING_TOKEN".into(),
+                problem: RemoteAuthProblem::Missing,
+            },
+            Error::RemoteUrl {
+                origin: o.clone(),
+                url: "http://billing.example.com/".into(),
+                problem: RemoteUrlProblem::Insecure,
+            },
             Error::MissingCardDescription { origin: o },
         ];
         for error in cases {
@@ -592,6 +683,41 @@ mod tests {
             "agent `coder` (agent/instructions.md): prompt line 3: uses `{{max_check_cycle}}`, \
              which `vars` does not declare; did you mean `max_check_cycles`?; declared: `max_check_cycles`"
         );
+    }
+
+    #[test]
+    fn remote_problems_name_the_variable_and_never_a_value() {
+        let error = Error::RemoteAuth {
+            origin: origin(),
+            var: "BILLING_TOKEN".into(),
+            problem: RemoteAuthProblem::Missing,
+        };
+        assert_eq!(
+            error.to_string(),
+            "agent `coder` (agent/instructions.md): `auth: bearer:BILLING_TOKEN` needs the \
+             environment variable `BILLING_TOKEN` to hold the token, but it is not set: set it, \
+             or remove `auth` from the remote subagent"
+        );
+        for problem in [
+            RemoteAuthProblem::Empty,
+            RemoteAuthProblem::NotAToken,
+            RemoteAuthProblem::Missing,
+        ] {
+            assert!(!problem.to_string().is_empty());
+        }
+        let url = Error::RemoteUrl {
+            origin: origin(),
+            url: "http://billing.example.com/card".into(),
+            problem: RemoteUrlProblem::Insecure,
+        };
+        assert!(url.to_string().contains("in the clear"), "{url}");
+        for problem in [
+            RemoteUrlProblem::Unparseable,
+            RemoteUrlProblem::NotHttp,
+            RemoteUrlProblem::Credentials,
+        ] {
+            assert!(!problem.to_string().is_empty());
+        }
     }
 
     #[test]

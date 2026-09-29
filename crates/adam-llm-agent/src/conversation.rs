@@ -3,6 +3,7 @@
 use adam_core::RunId;
 use adam_model::{Message, ToolCall, Usage};
 use adam_runtime::Inbound;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -63,12 +64,34 @@ pub struct PendingRun {
     pub run: RunId,
 }
 
+/// A tool call that waits for a task on another system to finish.
+///
+/// One kind of [`PendingWait`]. The run is parked with a timer; each time the timer fires the
+/// agent asks the tool that made the call how the task stands
+/// ([`Tool::poll_remote`](crate::Tool::poll_remote)) as a journaled step, until it has an answer
+/// or `deadline` has passed. See [`ToolError::AwaitRemote`](crate::ToolError::AwaitRemote).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingRemote {
+    /// The tool call the task's outcome will be returned for.
+    pub call_id: String,
+    /// The tool that started the task, and that is asked how it stands.
+    pub tool: String,
+    /// The tool's own name for the task (for an A2A agent, the remote task id). The agent does
+    /// not read it.
+    pub task: String,
+    /// When the agent gives up waiting and answers the call with an error result, if the tool
+    /// asked for a limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<DateTime<Utc>>,
+}
+
 /// What a parked run is waiting for, so that one result can complete the call
 /// that owes it.
 ///
 /// Serialized without a tag, by its fields: `{call_id, tool, question}` for a
 /// [`Question`](Self::Question) (the shape the field had when it could only hold
-/// a question) and `{call_id, tool, run}` for a [`Run`](Self::Run).
+/// a question), `{call_id, tool, run}` for a [`Run`](Self::Run) and
+/// `{call_id, tool, task}` for a [`Remote`](Self::Remote).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PendingWait {
@@ -76,6 +99,8 @@ pub enum PendingWait {
     Run(PendingRun),
     /// The tool needs the user's answer; the next message is the tool result.
     Question(PendingQuestion),
+    /// The tool started a task on another system; polling it gives the tool result.
+    Remote(PendingRemote),
 }
 
 impl PendingWait {
@@ -84,6 +109,7 @@ impl PendingWait {
         match self {
             Self::Run(w) => &w.call_id,
             Self::Question(w) => &w.call_id,
+            Self::Remote(w) => &w.call_id,
         }
     }
 }
@@ -235,6 +261,52 @@ mod tests {
         // A null field, as `Conversation::default` serializes, is no wait at all.
         let none: Conversation = serde_json::from_value(json!({"pending_question": null})).unwrap();
         assert_eq!(none.pending_wait, None);
+    }
+
+    #[test]
+    fn a_wait_on_a_remote_task_keeps_its_own_shape_and_the_others_still_read() {
+        let literal = json!({
+            "pending_wait": {"call_id": "c1", "tool": "billing", "task": "t-9"}
+        });
+        let c: Conversation = serde_json::from_value(literal.clone()).unwrap();
+        assert_eq!(
+            c.pending_wait,
+            Some(PendingWait::Remote(PendingRemote {
+                call_id: "c1".into(),
+                tool: "billing".into(),
+                task: "t-9".into(),
+                deadline: None,
+            }))
+        );
+        assert_eq!(
+            c.pending_wait.as_ref().map(PendingWait::call_id),
+            Some("c1")
+        );
+        // No deadline, no field: the shape is the literal.
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["pending_wait"],
+            literal["pending_wait"]
+        );
+        // With a deadline it round-trips.
+        let with = json!({
+            "pending_wait": {"call_id": "c1", "tool": "billing", "task": "t-9",
+                             "deadline": "2026-01-02T03:04:05Z"}
+        });
+        let c: Conversation = serde_json::from_value(with.clone()).unwrap();
+        assert!(matches!(
+            &c.pending_wait,
+            Some(PendingWait::Remote(r)) if r.deadline.is_some()
+        ));
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["pending_wait"]["deadline"],
+            with["pending_wait"]["deadline"]
+        );
+        // The untagged variants do not swallow each other.
+        let q: Conversation = serde_json::from_value(json!({
+            "pending_wait": {"call_id": "c1", "tool": "ask", "question": "?"}
+        }))
+        .unwrap();
+        assert!(matches!(q.pending_wait, Some(PendingWait::Question(_))));
     }
 
     #[test]

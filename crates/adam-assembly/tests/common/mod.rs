@@ -58,6 +58,12 @@ pub fn def(files: &[(&str, &str)]) -> AgentDef {
     AgentDef::from_manifest(agents.remove(0)).unwrap()
 }
 
+/// The fixture's remote subagent says `auth: bearer:BILLING_AGENT_TOKEN`, which `bind` reads and
+/// refuses to go without: give it a value, as a deployment's environment would.
+pub fn with_fixture_token(def: AgentDef) -> AgentDef {
+    def.env("BILLING_AGENT_TOKEN", "fixture-token")
+}
+
 /// `agent/instructions.md` with this frontmatter and body.
 pub fn instructions(frontmatter: &str, body: &str) -> String {
     format!("---\n{frontmatter}\n---\n{body}\n")

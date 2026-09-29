@@ -204,6 +204,8 @@ dependencies = [
 name = "adam-assembly"
 version = "0.1.0"
 dependencies = [
+ "a2a-client-lf",
+ "a2a-lf",
  "adam-a2a",
  "adam-agent-fixture",
  "adam-agent-fs",
@@ -214,11 +216,17 @@ dependencies = [
  "adam-runtime",
  "adam-store-postgres",
  "async-trait",
+ "axum",
+ "futures",
  "proptest",
+ "reqwest",
+ "secrecy",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "url",
 ]
 

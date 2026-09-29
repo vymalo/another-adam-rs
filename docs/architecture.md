@@ -1151,6 +1151,85 @@ the next step read `take_inbox()` for messages of kind `adam.run.finished` (`Chi
 already in the inbox when a step starts is not "arrived during the step", so an agent that parks without
 reading it sleeps until its timer.
 
+### Remote tasks: the same wait without a message
+
+A subagent on another A2A agent (`a2a:` in its file, [authoring](authoring.md#remote-subagents-a2a-s9b)) is
+the same idea with one thing missing: nothing tells the parent when the remote task is over. The tool starts
+the task, returns `ToolError::AwaitRemote { task, timeout_ms }`, and the parent records
+`PendingWait::Remote { call_id, tool, task, deadline }` and parks with the `wait_poll` timer. Each time the
+timer fires the agent asks the tool how the task stands, as a journaled step, until it is over. There is no
+`adam.run.finished` here and no fallback role for the timer: **the timer is the mechanism**.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Parent run<br/>LlmAgent
+    participant J as Journal
+    participant T as RemoteSubagentTool
+    participant A as Remote A2A agent
+    participant DB as Store
+
+    P->>J: step tool:c1
+    J->>T: call(message)
+    T->>A: SendMessage, returnImmediately, messageId = child_run_id(parent, c1)
+    A-->>T: Task, working
+    J-->>P: Err(AwaitRemote { task, timeout_ms }), journaled
+    P->>J: now_journaled, to fix the deadline
+    P->>DB: commit Park, wake_at = now + wait_poll, pending_wait = Remote { c1, tool, task, deadline }
+    Note over P,DB: the timer fires and the run is claimed again
+    P->>J: now_journaled, deadline not reached
+    P->>J: step poll:c1
+    J->>T: poll_remote(task)
+    T->>A: GetTask
+    A-->>T: Task, working
+    J-->>P: Ok(Working), journaled
+    P->>DB: commit Park, wake_at = now + wait_poll
+    Note over P,DB: the next wake finds the task final
+    J-->>P: Ok(Ready(result)), journaled
+    P->>P: the result answers c1, the wait is cleared, the loop goes on
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Calling: the model calls the tool
+    Calling --> Answered: the reply is final already (a message, or a task in a final state)
+    Calling --> Waiting: AwaitRemote journaled, deadline fixed, run parked with a timer
+    Waiting --> Waiting: timer wake, poll:c1 says working (or a user message queued behind the result)
+    Waiting --> Answered: poll:c1 says ready
+    Waiting --> Answered: the deadline has passed (an error result, no poll)
+    Waiting --> Answered: a permanent poll error, or the tool is gone (an error result)
+    Waiting --> Waiting: a transient poll error (the wake is retried with backoff)
+    Waiting --> Cancelled: the parent is cancelled (the remote task is not)
+    Answered --> [*]: tool result is the tool's answer
+    Cancelled --> [*]
+```
+
+* **Every look is a journal step.** `poll:<call id>` records `Working` or `Ready(result)`, and, when the wait
+  has a deadline, `ctx.now` is read through the journal (`Ctx::now_journaled`) so that a replay takes the
+  same branch (a replay that skipped a recorded `poll:` step because the clock had moved would meet the
+  wrong step name at the next `seq` and fail as non-deterministic). A transient poll error fails the wake as
+  `AgentError::Transient`, and the retry looks again from a fresh `seq`.
+* **The start is idempotent by message id, not by run id.** A child run is started under an id the runtime
+  refuses to create twice; a remote task is started by a `SendMessage` whose `messageId` is
+  `child_run_id(parent run, call id)`. The guarantee is only as good as the remote's memory of that id
+  (`adam-a2a-runtime` starts the task under `task_id_for(agent, caller, context, messageId)`, so a repeat reaches
+  the same task). The journal makes the call once per recorded outcome regardless.
+* **Failure interleavings.**
+
+| # | What happens | What the design does | Test |
+|---|---|---|---|
+| 1 | The process dies while the parent waits | The wait is in the run's committed state. A new process claims the run at the timer and polls the recorded task: no second send | `a_restart_mid_wait_resumes_polling_without_sending_again` (`adam-assembly`), `a_new_process_keeps_polling_without_starting_the_task_again` (`adam-llm-agent`) |
+| 2 | The send reaches the remote and its response is lost | The step fails transiently and is retried; the retry sends the same `messageId`, and a deduplicating remote returns the task it made | `a_send_whose_response_is_lost_is_retried_under_the_same_message_id` |
+| 3 | The remote finishes while nobody polls | The next timer wake finds it final and answers | the restart case above |
+| 4 | The task never ends | At the deadline (default one hour, `AgentDef::remote_timeout`) the call is answered with an error result; the remote task keeps running | `a_task_that_never_ends_is_given_up_on_after_the_limit`, `a_task_that_outlives_its_timeout_is_an_error_result_without_another_look` |
+| 5 | The remote fails, cancels, rejects, or wants input | An error result naming the state and the remote's message; the run goes on | `a_remote_task_that_fails_is_an_error_result_and_the_parent_goes_on`, `a_remote_task_that_is_canceled_is_an_error_result`, `a_remote_that_needs_input_is_an_error_result_because_nobody_can_answer` |
+| 6 | The remote answers 401 or the card points the token elsewhere | An error result; nothing is sent to the other origin | `a_wrong_token_is_an_error_result_not_a_failed_run_and_the_token_stays_out_of_it`, `a_card_that_points_the_token_at_another_origin_is_refused_before_anything_is_sent` |
+
+* **What it refuses to do.** No streaming yet (`SubscribeToTask` would end the wait sooner; the poll stays as
+  the fallback); no cancel of the remote task when the parent is cancelled or the wait times out (that needs a
+  tool hook for cancellation); no `contextId` continuity between calls. And, as with child runs, **no mixed
+  versions**: a build that predates `AwaitRemote` cannot read a journal that contains it.
+
 ## The error tree
 
 Each library defines its own error enum with `thiserror`. A variant says **what

@@ -9,7 +9,7 @@ with the agent and the file in the message, and never in the middle of a run.
 
 ## Where it sits
 
-Slices S6 and S7 of the authoring layer, the meeting point of the "macro" track (`#[tool]`, `ToolSet`)
+Slices S6, S7, S9 and S9b of the authoring layer, the meeting point of the "macro" track (`#[tool]`, `ToolSet`)
 and the "files" track (`adam-agent-fs`).
 
 ```text
@@ -20,9 +20,11 @@ adam-a2a  (feature a2a) ──────────────────�
 ```
 
 It depends on `adam-agent-fs`, `adam-llm-agent`, `adam-model`, `adam-runtime`, `adam-error`,
-`async-trait`, `serde_json` and `thiserror`, and on `adam-a2a` and `url` behind the feature `a2a`. It has no `unsafe`, no I/O of its
-own (the manifest is already in memory; the bytes of a skill's files are read once at startup, or come
-from the binary) and no async code except the two skill tools' `Tool::call`.
+`async-trait`, `serde_json`, `thiserror` and `url`, on the A2A client for remote subagents (`a2a-client-lf`,
+`a2a-lf`, `reqwest`, `tokio` for a once-cell, `secrecy` for the token, `tracing`), and on `adam-a2a` behind the
+feature `a2a`. It has no `unsafe`. Its I/O is the skill tools (the bytes are read once at startup, or come
+from the binary) and the remote subagents' tool: the environment variable of `auth: bearer:VAR` at `bind`, and
+the network (agent card, `SendMessage`, `GetTask`) only when a call needs it.
 
 ## Use
 
@@ -49,18 +51,18 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 
 | Item | What |
 |---|---|
-| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `name()`, `manifest()`, `bind(ToolSet)` |
+| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `name()`, `manifest()`, `bind(ToolSet)` |
 | `IntoManifest` | `AgentManifest`, `&AgentManifest`, `EmbeddedAgent` and `&EmbeddedAgent` (what `include_agent!` gives; these bring the bytes of the skills' files) |
 | `SkillFiles` | the bytes of the files skills bundle (opaque: made by `IntoManifest` and `resources_from`) |
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
 | `SkillError` | why `load_skill` or `read_skill_file` refused a call: closed enum, its `Display` is the tool result the model reads |
-| `BoundDef` | `state(Arc<T>)`, `model_aliases(..)`, `model(DynModel, alias)` |
+| `BoundDef` | `state(Arc<T>)`, `model_aliases(..)`, `wait_poll(Duration)` (how often a waiting agent looks: a remote subagent's task is polled at this interval), `model(DynModel, alias)` |
 | `SubagentTool` | the tool that runs a subagent as a child run: `new(tool_name, agent, description)`, `agent()`. `bind` adds one per local subagent, so a user never builds one |
 | `Assembly` | `agents()`, `root()`, `register(RuntimeBuilder)`, `info()`, `remotes()`, `manifest()`, `card(url, version)` (feature `a2a`) |
-| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog), `tools` (own, skill tools, then one per subagent: what the model is offered), `skills`, `preloaded`, `limits`: what an `LlmAgent` was made from, comparable |
-| `RemoteInfo` | a remote (`a2a:`) subagent, as data |
+| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `prompt` (rendered, with the skills catalog), `tools` (own, skill tools, then one per subagent, local or remote: what the model is offered), `skills`, `preloaded`, `limits`: what an `LlmAgent` was made from, comparable |
+| `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
 | `Error`, `Origin` | the closed error enum, and the agent and file every file-related variant carries |
-| `AliasProblem`, `TemplateProblem`, `SkillField`, `ToolClash` | closed enums inside `Error::ModelAlias`, `Error::Template`, `Error::UnknownSkill` and `Error::SubagentToolClash` |
+| `AliasProblem`, `TemplateProblem`, `SkillField`, `ToolClash`, `RemoteAuthProblem`, `RemoteUrlProblem` | closed enums inside `Error::ModelAlias`, `Error::Template`, `Error::UnknownSkill`, `Error::SubagentToolClash`, `Error::RemoteAuth` and `Error::RemoteUrl` |
 
 ## The stages
 
@@ -281,16 +283,68 @@ someone does, so the parent would wait for ever. The tool declares it (`#[tool(a
 (a deadline on the child would only make "waits for ever" into "fails late"). It is a declaration: a tool
 that returns `NeedsInput` without saying so would still park its child.
 
-A remote subagent (`a2a:`) is data in `Assembly::remotes()` (its tool is S9b). `mcp.json` and schedules
-stay in `Assembly::manifest()`. The seams for the next slices are in code, in one place each:
+## Remote subagents
+
+A subagent file with `a2a:` is a tool on the parent whose work is done by another A2A agent. Everything above
+about the tool's shape holds: `{ "message": string }`, the description and the same "does not see this
+conversation" note (the body of the file, if any, extends the description), no questions to the user, the same
+name checks (`SubagentToolClash`, in manifest order with the local subagents). It is not an `LlmAgent` of the
+assembly, so there is nothing to register on the runtime for it.
+
+```markdown
+---
+description: Handles billing questions for a customer account.
+a2a: https://billing.example.com/.well-known/agent-card.json
+auth: bearer:BILLING_AGENT_TOKEN
+---
+```
+
+* **A call** is one journaled `SendMessage` (`returnImmediately`) whose message id is derived from the parent's
+  run and the tool call, so a retry or a replay sends the same id (a server that recognises repeated ids, as
+  `adam-a2a-runtime` does, returns the task it already made). A reply that is already final is the result;
+  otherwise the tool returns `ToolError::AwaitRemote { task, timeout_ms }` and the parent parks.
+* **The wait** is polled: nothing tells the parent the task is over, so each time its `wait_poll` timer fires
+  the agent calls `Tool::poll_remote` (a `GetTask`) in a journaled step, until the task is final or the wait
+  passes `AgentDef::remote_timeout` (default one hour: an error result, the remote task is left running).
+  Set `BoundDef::wait_poll` for the remote (default 60 s). See "Remote subagents" in
+  [`docs/authoring.md`](../../docs/authoring.md#remote-subagents-a2a-s9b) and the diagrams in
+  [`docs/architecture.md`](../../docs/architecture.md#remote-tasks-the-same-wait-without-a-message).
+* **The result:** `completed` gives the text of the artifacts (else of the status message), cut at 64 KiB;
+  `failed`, `canceled` and `rejected` are error results with the remote's message; **`input-required` and
+  `auth-required` are error results too**, because nobody can answer a subagent (the message says so and tells
+  the model to call again with the whole task). Files and data parts are described, never stored.
+* **Auth.** `auth: bearer:VAR` reads `VAR` at `bind`: `AgentDef::env(VAR, value)` first, then the process
+  environment; trimmed; refused as `Error::RemoteAuth { origin, var, problem }` (`Missing`, `Empty`,
+  `NotAToken`) without ever showing a value. The token is a `SecretString`, sent as `Authorization: Bearer` on
+  the card fetch and every call, and appears in no journal entry, event, log line, error message or `Debug`
+  (tests read all of them). It goes only to the origin of the card URL: a card that advertises an interface on
+  another host or port is refused for an agent with `auth`, and redirects are not followed.
+* **The URL** must be `https`, or `http` to `localhost`, `*.localhost`, `127.0.0.0/8` or `::1`
+  (`Error::RemoteUrl { problem: Insecure }` otherwise, unless `AgentDef::allow_insecure_remotes(true)`, for
+  development only). A URL with a user name or password is `Credentials`, always refused, and errors show the URL
+  without them.
+* **The client** is made by the first call that needs it (agent card fetched with a size cap, a safe interface
+  chosen, the token attached) and kept in the tool, so `bind` never touches the network and everything it decides
+  is plain values: a reload binds again and gets a new client.
+* **Failures.** A transport error or a JSON-RPC internal error is transient (the step is retried; the message id
+  makes that safe); a 401, a task that no longer exists, or an invalid card is an error result for the model.
+
+| Mistake | Error, at `bind` |
+|---|---|
+| `auth: bearer:VAR` and `VAR` unset, empty or not a token | `RemoteAuth { origin, var, problem }` |
+| an `a2a:` URL that is plain http to another machine (without the development switch) or has a user name or password | `RemoteUrl { origin, url, problem }` |
+| a remote named like a tool of the parent, like `load_skill`/`read_skill_file`, or like another subagent | `SubagentToolClash` |
+
+`mcp.json` and schedules stay in `Assembly::manifest()`. The seams for the next slices are in code, in one
+place each:
 
 | Slice | What plugs in | Where |
 |---|---|---|
 | S7 skills (built) | the catalog appended to the prompt, `load_skill` and `read_skill_file` added to the tools | `add_skills` in `def.rs`, called while `bind` resolves an agent, so `Node::prompt` and `Node::tools` are final when `BoundDef::build` hands them to `LlmAgent`; the logic is `skills.rs` |
 | S9 subagents (built) | a `SubagentTool` per local child, the name checks, the asks-user refusal | `add_subagent_tools` and `refuse_asking_tools` in `def.rs`, in the same walk; the tool is `subagent.rs` |
-| S9b remote subagents | a tool per `RemoteInfo`; its name joins the checks of `add_subagent_tools` | `Walk::agent` in `def.rs`, which already sees `remotes` |
-| S10 dev reload | `from_source` + `bind` + `model` again on a changed directory, swapped at a step boundary | a caller of this crate; `AgentDef` and `BoundDef` are plain values |
-| S11 MCP tools | the discovered tools go into the `ToolSet` given to `bind`; `linear__*` patterns already match them | `AgentDef::bind` |
+| S9b remote subagents (built) | a `RemoteSubagentTool` per remote child, through the same name checks | `add_subagent_tools` in `def.rs`; `RemoteSubagentTool::bind` and the tool are `remote.rs`; the deployment's choices (`env`, `allow_insecure_remotes`, `remote_timeout`) are `AgentDef` fields passed in as `RemoteSettings` |
+| S10 dev reload | `from_source` + `bind` + `model` again on a changed directory, swapped at a step boundary | a caller of this crate; `AgentDef` and `BoundDef` are plain values, and a remote tool holds only plain values (URL, token, limits) until its first call, so a new bind is a new client |
+| S11 MCP tools | the discovered tools go into the `ToolSet` given to `bind`; `linear__*` patterns already match them | `AgentDef::bind`; `AgentDef::env` is where a `${VAR}` in `mcp.json` would read from too |
 
 ## Tests
 
@@ -305,7 +359,8 @@ stay in `Assembly::manifest()`. The seams for the next slices are in code, in on
 * `tests/fixture.rs`: the fixture of [`adam-agent-fixture`](../adam-agent-fixture/README.md) (the valid
   directory of `adam-agent-fs`), embedded and read from disk, binds to equal `AgentInfo`s; each agent is
   bound as its files say; the root and a subagent run to the end on a `MockModel` through a `Runtime` on
-  the in-memory store.
+  the in-memory store. The fixture's remote subagent says `auth: bearer:BILLING_AGENT_TOKEN`, so these tests
+  give it a value with `AgentDef::env` (an unset variable is a bind error).
 * `tests/subagents.rs`: a parent calls a subagent which calls its own (root, researcher, summarizer) on a
   `MockModel` through a `Runtime`, on the memory store and on PostgreSQL when `ADAM_TEST_POSTGRES_URL` is
   set: each model request's prompt, tool list and history asserted, the answers coming back as tool results,
@@ -314,6 +369,16 @@ stay in `Assembly::manifest()`. The seams for the next slices are in code, in on
   fails and the parent is told; a child's turns are not the parent's); a call without a `message`; a runtime
   that does not know the child; a parent whose process goes away while it waits and is stepped by a new
   runtime that gets the child's answer; every name clash and the asks-user refusal.
+* `tests/remote.rs`: an in-process `adam-a2a` server (`InMemoryBackend` where it suffices, a scripted backend
+  for a failing task, a repeated message id and a lost response), a parent on `MockModel` through a `Runtime`
+  on the memory store and on PostgreSQL when set: a remote called, polled and answered (the request's tools and
+  description, the message id derived from run and call, `Authorization: Bearer` on every request, the journal
+  recording `tool:` and `poll:` and no token anywhere in it, the state, the events, the logs or `Debug`);
+  failed, canceled and input-required tasks as error results; a blank message sends nothing; a missing, empty
+  or malformed token variable is a bind error naming it; a wrong token; a card that points the token at another
+  origin; a restart mid-wait that polls on without sending again; a send whose response is lost and is retried
+  under the same message id; the wait limit; plain http refused unless local or allowed; clashes with a tool, a
+  skill tool and a subagent; the tool's place among the subagents.
 * `tests/skills.rs`: the catalog against `tests/golden/coder-prompt.txt` (the fixture; regenerate with
   `ADAM_UPDATE_GOLDEN=1`) and against a hand-written text with escaping; no skill, no tool; `skills:`
   selection and order; unknown, unselected and unsupplied skills, an over-size skill and a reserved tool
@@ -326,7 +391,8 @@ stay in `Assembly::manifest()`. The seams for the next slices are in code, in on
   (regenerate with `ADAM_UPDATE_GOLDEN=1`), the fallbacks and the missing description, and
   `AgentDef::card` equal to `Assembly::card`.
 * Unit tests next to the code: the template scanner (with proptest), the suggestions, the error texts,
-  glob matching, the limits, the path checks and the tool results of `skills.rs`.
+  glob matching, the limits, the path checks and the tool results of `skills.rs`, and, in `remote.rs`, the
+  URL and token rules, every task state's mapping, the cut of a long answer and the same-origin rule.
 
 The dev-dependency on `adam-agent-fixture` is a cycle through `adam` (which re-exports this crate);
 cargo allows cycles through dev-dependencies, and only the integration tests use the fixture.
