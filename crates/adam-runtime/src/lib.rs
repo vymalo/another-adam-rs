@@ -1,0 +1,71 @@
+//! Durable agent-loop runtime for adam-rs.
+//!
+//! Any agent (an LLM tool loop, a coordinator, a deterministic workflow)
+//! becomes durable by implementing [`Agent`]: a state machine that advances by
+//! one [`Transition`] per [`Agent::step`]. The [`Runtime`] persists the state
+//! after every transition, compare-and-swap on the run's version, so a worker
+//! that dies loses nothing: another worker resumes from the last commit.
+//!
+//! # Side effects and replay
+//!
+//! `step` may run again after a crash, a lost lease or a retry. Side effects
+//! therefore go through [`Ctx::step`], which records each outcome (`Ok` or
+//! `Err`) in the journal at the next `seq`; a re-execution gets the recorded
+//! result back instead of running the effect again. Asking for a different
+//! step name at a recorded `seq` fails the run with
+//! [`AgentError::NonDeterminism`] rather than diverging silently.
+//!
+//! # Run lifecycle
+//!
+//! * [`Transition::Continue`]: commit, stay runnable.
+//! * [`Transition::Park`]: wait for a timer and/or an inbound message
+//!   ([`Runtime::deliver`]).
+//! * [`Transition::Done`] / [`Transition::Fail`]: terminal.
+//! * [`AgentError::Transient`]: retried with exponential backoff
+//!   ([`RetryPolicy`]), then `Failed`. [`AgentError::Permanent`]: `Failed`.
+//! * [`Runtime::cancel`]: `Failed` with the reason, unless already finished.
+//!
+//! # Observing runs
+//!
+//! Two channels, deliberately different:
+//!
+//! * **Events** ([`EventSink`], [`RunEvent`]): live and best effort, lost if
+//!   the process dies. In-process fan-out: [`BroadcastSink`].
+//! * **The durable record** ([`Runtime::view`] -> [`RunView`]): status,
+//!   output, error, attempt, timers, emitted artifacts and the agent's own
+//!   state, all read from the store. A consumer that restarts (or lives in
+//!   another process) polls this to rebuild what it missed.
+//!
+//! # Guarantees
+//!
+//! * The version CAS is what guarantees correctness; leases only avoid
+//!   wasted work. A worker whose lease expired mid-step can not overwrite
+//!   newer state: its commit is rejected and it drops its result.
+//! * A recorded step outcome is never re-executed, but a side effect is
+//!   at-least-once: a crash between the effect and its journal write, or a
+//!   transient retry, runs it again. Keep effects idempotent (see
+//!   [`Ctx::step`]).
+//! * This crate depends on `adam-core` only. Store, sink and clock are
+//!   swappable behind traits.
+
+#![warn(missing_docs)]
+
+mod agent;
+mod clock;
+mod ctx;
+mod envelope;
+mod erased;
+mod events;
+mod retry;
+mod runtime;
+mod worker;
+
+pub use agent::{Agent, AgentError, Inbound, Transition};
+pub use clock::{Clock, DynClock, ManualClock, SystemClock};
+pub use ctx::Ctx;
+pub use events::{
+    Artifact, BroadcastSink, CollectingSink, DynEventSink, EventSink, NoopSink, RunEvent,
+    RunSubscription, SinkEvent,
+};
+pub use retry::RetryPolicy;
+pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};

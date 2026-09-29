@@ -46,6 +46,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-runtime"
+version = "0.1.0"
+dependencies = [
+ "adam-core",
+ "adam-store-postgres",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "adam-store-mongodb"
 version = "0.1.0"
 dependencies = [
