@@ -84,6 +84,24 @@ impl fmt::Display for AliasProblem {
     }
 }
 
+/// The frontmatter key that names a skill that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillField {
+    /// `skills:`, the skills the agent may use.
+    Skills,
+    /// `preload_skills:`, the skills whose body is in the prompt.
+    PreloadSkills,
+}
+
+impl fmt::Display for SkillField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Skills => "skills",
+            Self::PreloadSkills => "preload_skills",
+        })
+    }
+}
+
 /// Why an [`AgentDef`](crate::AgentDef) could not be bound to agents.
 ///
 /// A mistake in the agent's files or in how it is put together, found when the process
@@ -231,6 +249,82 @@ pub enum Error {
         #[source]
         source: BuildError,
     },
+    /// `skills:` or `preload_skills:` names a skill the agent does not have. An agent's skills
+    /// are the ones under its own `skills/`; a subagent inherits none.
+    #[error(
+        "{origin}: `{field}` names `{skill}`, which is not a skill of this agent{}; its skills: {}",
+        hint(.suggestion.as_deref()),
+        list(.available)
+    )]
+    UnknownSkill {
+        /// The agent and file that name it.
+        origin: Origin,
+        /// The key that names it.
+        field: SkillField,
+        /// The name as written.
+        skill: String,
+        /// The closest skill of the agent, when one is close.
+        suggestion: Option<String>,
+        /// Every skill of the agent, sorted.
+        available: Vec<String>,
+    },
+    /// `preload_skills:` names a skill that `skills:` does not select.
+    #[error(
+        "{origin}: `preload_skills` names `{skill}`, which `skills` does not select: add it to \
+         `skills` or remove it; selected: {}",
+        list(.selected)
+    )]
+    PreloadNotSelected {
+        /// The agent and file that name it.
+        origin: Origin,
+        /// The skill.
+        skill: String,
+        /// The skills `skills:` selects, in order.
+        selected: Vec<String>,
+    },
+    /// A selected skill bundles a file whose bytes were not supplied: the manifest was made
+    /// without its source. An embedded agent, [`AgentDef::from_source`](crate::AgentDef::from_source)
+    /// and [`AgentDef::resources_from`](crate::AgentDef::resources_from) supply them.
+    #[error(
+        "{origin}: skill `{skill}` bundles `{file}`, but its bytes were not supplied: read the agent with \
+         AgentDef::from_source, or call AgentDef::resources_from with the source of its files"
+    )]
+    SkillFilesUnavailable {
+        /// The agent that uses the skill.
+        origin: Origin,
+        /// The skill.
+        skill: String,
+        /// The first file without bytes.
+        file: String,
+    },
+    /// A skill bundles more than [`SKILL_RESOURCE_LIMIT`](adam_agent_fs::SKILL_RESOURCE_LIMIT)
+    /// bytes: they are held in memory, so the build script refuses it too.
+    #[error(
+        "{origin}: the files bundled with skill `{skill}` are {bytes} bytes; at most {limit} may be \
+         bundled: move the rest into the sandbox seed or shrink them"
+    )]
+    SkillTooLarge {
+        /// The agent that owns the skill and the skill's `SKILL.md`.
+        origin: Origin,
+        /// The skill.
+        skill: String,
+        /// The size of its files (or the running total when the limit was passed).
+        bytes: u64,
+        /// The limit.
+        limit: u64,
+    },
+    /// The agent has skills, so it gets the tools `load_skill` and `read_skill_file`, and a
+    /// registered tool already has one of those names.
+    #[error(
+        "{origin}: the agent has skills, which bring a tool called `{tool}`, but a tool with that \
+         name is registered too: rename it, or leave it out of `tools`, or set `skills: []`"
+    )]
+    ReservedToolName {
+        /// The agent and file.
+        origin: Origin,
+        /// The name in conflict.
+        tool: String,
+    },
     /// The A2A card needs a description and the agent has none.
     #[error(
         "{origin}: the A2A card needs a description: set `description` (or `card.description`) in the frontmatter"
@@ -251,12 +345,12 @@ impl Classify for Error {
 }
 
 /// `; did you mean `x`?`, or nothing.
-fn hint(suggestion: Option<&str>) -> String {
+pub(crate) fn hint(suggestion: Option<&str>) -> String {
     suggestion.map_or_else(String::new, |s| format!("; did you mean `{s}`?"))
 }
 
 /// The names in backticks, or `none`.
-fn list(items: &[String]) -> String {
+pub(crate) fn list(items: &[String]) -> String {
     if items.is_empty() {
         "none".to_owned()
     } else {
@@ -357,6 +451,33 @@ mod tests {
                     suggestion: Some("bigger".into()),
                     allowed: vec!["bigger".into()],
                 },
+            },
+            Error::UnknownSkill {
+                origin: o.clone(),
+                field: SkillField::PreloadSkills,
+                skill: "triag".into(),
+                suggestion: Some("triage".into()),
+                available: vec!["triage".into()],
+            },
+            Error::PreloadNotSelected {
+                origin: o.clone(),
+                skill: "triage".into(),
+                selected: vec![],
+            },
+            Error::SkillFilesUnavailable {
+                origin: o.clone(),
+                skill: "triage".into(),
+                file: "a.md".into(),
+            },
+            Error::SkillTooLarge {
+                origin: o.clone(),
+                skill: "triage".into(),
+                bytes: 2_000_000,
+                limit: 1_048_576,
+            },
+            Error::ReservedToolName {
+                origin: o.clone(),
+                tool: "load_skill".into(),
             },
             Error::MissingCardDescription { origin: o },
         ];

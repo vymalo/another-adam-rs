@@ -120,6 +120,8 @@ impl BoundDef {
                 model_alias: alias.clone(),
                 prompt: node.prompt.clone(),
                 tools: node.tools.iter().map(|(name, _)| name.clone()).collect(),
+                skills: node.skills.clone(),
+                preloaded: node.preloaded.clone(),
                 limits: node.limits,
             });
             resolved.push(alias);
@@ -167,11 +169,13 @@ impl BoundDef {
 
     /// One `LlmAgent` from one bound node.
     ///
-    /// This is the seam the next slices extend. Slice S7 appends the skill catalog to the
-    /// prompt and adds `load_skill` and `read_skill_file` to the tools; slices S8 and S9 add a
-    /// subagent tool for each child of `node` (the children are the nodes whose `parent` is
-    /// this one, and `remotes` holds the remote ones); slice S11 adds the tools of `mcp.json`.
-    /// Each of them changes only this function and the `bind` step that resolves what it needs.
+    /// This is the seam the next slices extend. `bind` has already made the prompt and the tool
+    /// list final for skills (slice S7: the catalog after the prompt, `load_skill` and
+    /// `read_skill_file` after the agent's own tools), so this function only hands them over.
+    /// Slices S8 and S9 add a subagent tool for each child of `node` (the children are the nodes
+    /// whose `parent` is this one, and `remotes` holds the remote ones); slice S11 adds the tools
+    /// of `mcp.json`. Each of them changes this function and the `bind` step that resolves what
+    /// it needs.
     fn build(
         &self,
         node: &Node,
@@ -210,10 +214,16 @@ pub struct AgentInfo {
     pub file: PathBuf,
     /// The gateway alias its model calls use.
     pub model_alias: String,
-    /// The system prompt, with the vars substituted.
+    /// The system prompt the model sees: the instructions with the vars substituted, then the
+    /// skills catalog and the preloaded skills.
     pub prompt: String,
-    /// The names of its tools, in the order the model is shown them.
+    /// The names of its tools, in the order the model is shown them: its own, then `load_skill`
+    /// and `read_skill_file` when it has skills to load and files to read.
     pub tools: Vec<String>,
+    /// The skills it may use, in the order of its `skills:` (by name for `all`).
+    pub skills: Vec<String>,
+    /// The subset of [`skills`](Self::skills) whose body is in the prompt (`preload_skills:`).
+    pub preloaded: Vec<String>,
     /// The loop's limits.
     pub limits: Limits,
 }
@@ -232,8 +242,8 @@ pub struct RemoteInfo {
 /// local subagent definition, ready to register on a runtime.
 ///
 /// A subagent is only *defined* here: registered, with its own prompt, tools and limits, but
-/// nothing lets the parent call it yet. The tool that starts it as a durable child run, and the
-/// skills catalog, are later slices.
+/// nothing lets the parent call it yet. The tool that starts it as a durable child run is a later
+/// slice. Each agent has its own skills, with the catalog and tools of slice S7.
 #[derive(Debug)]
 pub struct Assembly {
     manifest: AgentManifest,
@@ -273,8 +283,8 @@ impl Assembly {
         &self.remotes
     }
 
-    /// The manifest the root agent was made from: its skills, `mcp.json` and schedules, which
-    /// later slices bind.
+    /// The manifest the root agent was made from: its skills, `mcp.json` and schedules (the
+    /// skills are bound; `mcp.json` and schedules are for later slices).
     pub fn manifest(&self) -> &AgentManifest {
         &self.manifest
     }

@@ -20,6 +20,8 @@ adam-error.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 url = { workspace = true, optional = true }
 
@@ -28,9 +30,7 @@ url = { workspace = true, optional = true }
 # depends on `adam`, which depends on this crate: a dev-dependency cycle, which cargo allows.
 adam-agent-fixture = { path = "../adam-agent-fixture" }
 adam-core.workspace = true
-async-trait.workspace = true
 proptest.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

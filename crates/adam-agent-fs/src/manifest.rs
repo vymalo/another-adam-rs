@@ -7,6 +7,11 @@ use serde::{Serialize, Serializer};
 use crate::schema::{AgentFrontmatter, McpConfig, SkillFrontmatter};
 use crate::{Diagnostic, Error};
 
+/// The most bytes of resources (`scripts/`, `references/`, `assets/`) one skill may bundle: 1 MiB.
+/// A build script refuses a skill over it, and the run-time readers that load a skill's bytes
+/// (`adam-assembly`) refuse it again, whatever the source.
+pub const SKILL_RESOURCE_LIMIT: u64 = 1024 * 1024;
+
 /// How a skill is laid out on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum SkillLayout {

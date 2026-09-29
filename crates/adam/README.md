@@ -192,10 +192,16 @@ let runtime = assembly.register(Runtime::builder(store)).build(); // the root an
 A typo in the files fails `bind`: a `tools: [run_check]` gets
 ``agent `coder` (agent/instructions.md): `tools` names `run_check`, which is not a registered tool; did you mean `run_checks`?``,
 and so do a `{{placeholder}}` that `vars` does not declare, a var that is never used, and a var with no
-value. The stages, the rules for tools, vars, models and state, and the seams left for skills and
+value. The stages, the rules for tools, vars, models, state and skills, and the seams left for
 subagents are in the [`adam-assembly` README](../adam-assembly/README.md). `Assembly::info()` describes
-each agent made (name, alias, rendered prompt, tools, limits); with the `a2a` feature,
+each agent made (name, alias, rendered prompt, tools, skills, limits); with the `a2a` feature,
 `Assembly::card(url, version)` is the root's `AgentCardConfig`.
+
+An agent's `skills/` need no code: the prompt gets a catalog (name and description of each skill) and the
+agent gets a `load_skill` tool (the body of `SKILL.md`) and a `read_skill_file` tool (a bundled text file),
+the [Agent Skills](https://agentskills.io/specification) progressive disclosure. `preload_skills:` puts a
+body in the prompt instead. It works the same for the embedded agent and for a directory read with
+`AgentDef::from_source`.
 
 ### Compile errors
 

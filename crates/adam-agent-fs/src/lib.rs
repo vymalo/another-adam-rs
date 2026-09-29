@@ -55,7 +55,7 @@ pub use frontmatter::{Split, SplitError, split};
 pub use load::{parse_mcp, parse_skill};
 pub use manifest::{
     AgentManifest, InstructionPart, Instructions, Layout, Package, RemoteAgent, RemoteAuth, Report,
-    Schedule, Skill, SkillLayout, Strictness, Subagent,
+    SKILL_RESOURCE_LIMIT, Schedule, Skill, SkillLayout, Strictness, Subagent,
 };
 pub use schema::{
     AgentFrontmatter, Card, CardSkill, EnvRef, Limits, McpConfig, McpServer, ModelRef, RemoteKind,

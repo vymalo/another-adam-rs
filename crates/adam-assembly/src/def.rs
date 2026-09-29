@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use adam_agent_fs::{
     AgentManifest, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
@@ -12,6 +13,7 @@ use adam_llm_agent::{DynTool, Limits, ToolSet};
 
 use crate::assembly::BoundDef;
 use crate::error::{Error, Origin};
+use crate::skills::{self, SkillFiles};
 use crate::suggest::closest;
 use crate::template::{self, Piece};
 
@@ -26,6 +28,13 @@ pub trait IntoManifest {
     /// An embedded manifest whose frontmatter cannot be decoded: the generated code and
     /// `adam-agent-fs` are not the same version.
     fn into_manifest(self) -> Result<AgentManifest, adam_agent_fs::Error>;
+
+    /// The bytes of the files the skills bundle. The default is none, which is right for a
+    /// manifest whose skills bundle nothing; a directory's manifest gets them from
+    /// [`AgentDef::resources_from`] and an embedded agent brings its own.
+    fn skill_files(&self) -> SkillFiles {
+        SkillFiles::default()
+    }
 }
 
 impl IntoManifest for AgentManifest {
@@ -44,11 +53,19 @@ impl IntoManifest for EmbeddedAgent {
     fn into_manifest(self) -> Result<AgentManifest, adam_agent_fs::Error> {
         self.to_manifest()
     }
+
+    fn skill_files(&self) -> SkillFiles {
+        SkillFiles::from_embedded(self)
+    }
 }
 
 impl IntoManifest for &EmbeddedAgent {
     fn into_manifest(self) -> Result<AgentManifest, adam_agent_fs::Error> {
         self.to_manifest()
+    }
+
+    fn skill_files(&self) -> SkillFiles {
+        SkillFiles::from_embedded(self)
     }
 }
 
@@ -80,6 +97,8 @@ pub struct AgentDef {
     manifest: AgentManifest,
     /// Values supplied by the code, by agent (its registration name) and var.
     values: BTreeMap<String, BTreeMap<String, String>>,
+    /// The bytes of the files the skills bundle.
+    files: SkillFiles,
 }
 
 impl AgentDef {
@@ -90,10 +109,29 @@ impl AgentDef {
     ///
     /// [`Error::Manifest`] when an embedded manifest cannot be decoded.
     pub fn from_manifest(manifest: impl IntoManifest) -> Result<Self, Error> {
+        let files = manifest.skill_files();
         Ok(Self {
             manifest: manifest.into_manifest()?,
             values: BTreeMap::new(),
+            files,
         })
+    }
+
+    /// Read the files the skills bundle (`references/`, `scripts/`, `assets/`) from `source`,
+    /// the source the manifest came from, so that `read_skill_file` can serve them. Only a
+    /// manifest made without its source needs this: an embedded agent brings its files, and
+    /// [`from_source`](Self::from_source) calls this itself.
+    ///
+    /// The files are read now, once, so that a missing one is a startup error and a run never
+    /// touches the disk.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Manifest`] when a file cannot be read, and [`Error::SkillTooLarge`] for a skill
+    /// whose files are over [`SKILL_RESOURCE_LIMIT`](adam_agent_fs::SKILL_RESOURCE_LIMIT).
+    pub fn resources_from(mut self, source: &impl ManifestSource) -> Result<Self, Error> {
+        self.files = SkillFiles::read(&self.manifest, source)?;
+        Ok(self)
     }
 
     /// One definition per agent of a source: one for an `agent/` package, one per directory of
@@ -112,7 +150,7 @@ impl AgentDef {
             .into_package(strictness)?
             .agents
             .into_iter()
-            .map(Self::from_manifest)
+            .map(|agent| Self::from_manifest(agent)?.resources_from(source))
             .collect()
     }
 
@@ -175,6 +213,7 @@ impl AgentDef {
         let mut walk = Walk {
             catalog: &catalog,
             values: &self.values,
+            files: &self.files,
             nodes: Vec::new(),
             remotes: Vec::new(),
         };
@@ -208,6 +247,10 @@ pub(crate) struct Node {
     pub(crate) prompt: String,
     pub(crate) tools: Vec<(String, DynTool)>,
     pub(crate) limits: Limits,
+    /// The skills the agent may use, in order.
+    pub(crate) skills: Vec<String>,
+    /// The skills whose body is in the prompt.
+    pub(crate) preloaded: Vec<String>,
 }
 
 /// A remote (A2A) subagent, found on the way. Data only until slice S9b.
@@ -249,6 +292,7 @@ impl Catalog {
 struct Walk<'a> {
     catalog: &'a Catalog,
     values: &'a BTreeMap<String, BTreeMap<String, String>>,
+    files: &'a SkillFiles,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
 }
@@ -261,13 +305,15 @@ impl Walk<'_> {
         parent: Option<usize>,
     ) -> Result<(), Error> {
         let origin = Origin::new(name.clone(), manifest.path.clone());
-        let tools = resolve_tools(
+        let mut tools = resolve_tools(
             &origin,
             manifest.frontmatter.tools.as_ref(),
             parent.is_none(),
             self.catalog,
         )?;
-        let prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
+        let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
+        let (skills, preloaded) =
+            add_skills(&origin, manifest, self.files, &mut prompt, &mut tools)?;
         let index = self.nodes.len();
         self.nodes.push(Node {
             name: name.clone(),
@@ -282,6 +328,8 @@ impl Walk<'_> {
             prompt,
             tools,
             limits: limits(manifest.frontmatter.limits.as_ref()),
+            skills,
+            preloaded,
         });
         for sub in &manifest.subagents {
             match sub {
@@ -296,6 +344,39 @@ impl Walk<'_> {
         }
         Ok(())
     }
+}
+
+/// Give the agent its skills: the catalog and the preloaded skills after the prompt, then the
+/// tools `load_skill` and `read_skill_file` after the agent's own. Returns the names of the
+/// selected and of the preloaded skills. Nothing is added for an agent without skills.
+fn add_skills(
+    origin: &Origin,
+    manifest: &AgentManifest,
+    files: &SkillFiles,
+    prompt: &mut String,
+    tools: &mut Vec<(String, DynTool)>,
+) -> Result<(Vec<String>, Vec<String>), Error> {
+    let Some(set) = skills::resolve(origin, manifest, files)? else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let set = Arc::new(set);
+    let added = set.tools();
+    for tool in &added {
+        let name = tool.spec().name;
+        if tools.iter().any(|(n, _)| *n == name) {
+            return Err(Error::ReservedToolName {
+                origin: origin.clone(),
+                tool: name,
+            });
+        }
+    }
+    tools.extend(added.into_iter().map(|tool| (tool.spec().name, tool)));
+    let section = set.prompt_section();
+    // A prompt is never empty (the loader refuses an agent without instructions), and a set
+    // with skills always has a section.
+    prompt.push_str("\n\n");
+    prompt.push_str(&section);
+    Ok((set.names(), set.preloaded()))
 }
 
 /// The loop's limits: what the frontmatter sets, the loop's default for the rest.

@@ -20,10 +20,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::manifest::{AgentManifest, Layout, Package, Report, Strictness};
-use crate::{Diagnostic, Dir, Error, ManifestSource};
-
-/// The most bytes of resources (`scripts/`, `references/`, `assets/`) one skill may embed.
-const RESOURCE_LIMIT: u64 = 1024 * 1024;
+use crate::{Diagnostic, Dir, Error, ManifestSource, SKILL_RESOURCE_LIMIT};
 
 /// The name of the generated source in `OUT_DIR`.
 const SOURCE_FILE: &str = "adam_agent.rs";
@@ -413,12 +410,12 @@ fn check_resources(
                 let path = root.join(dir).join(resource);
                 total += fs::metadata(&path).map_err(|e| Error::io(&path, e))?.len();
             }
-            if total > RESOURCE_LIMIT {
+            if total > SKILL_RESOURCE_LIMIT {
                 diagnostics.push(Diagnostic::error(
                     &skill.path,
                     None,
                     format!(
-                        "the resources of skill `{}` are {total} bytes; at most {RESOURCE_LIMIT} \
+                        "the resources of skill `{}` are {total} bytes; at most {SKILL_RESOURCE_LIMIT} \
                          (1 MiB) are embedded in the binary",
                         skill.name
                     ),

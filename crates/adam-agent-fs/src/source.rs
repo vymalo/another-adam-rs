@@ -4,6 +4,7 @@
 //! signature holds only manifest types and diagnostics, so an embedded source (a generated
 //! static manifest) and a remote one can sit next to [`Dir`] without touching a caller.
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,16 @@ pub trait ManifestSource {
     /// Read and validate. `Err` is for a source that cannot be read at all; problems in the
     /// content are diagnostics in the [`Report`].
     fn load(&self) -> Result<Report, Error>;
+
+    /// The bytes of one bundled resource of a skill this source produced: `name` is an entry of
+    /// [`Skill::resources`] (`references/style.md`). The manifest lists resources without reading
+    /// them, so a consumer that serves them (a `read_skill_file` tool) reads them here.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when `name` is not a resource of `skill` (so a `..` cannot leave the skill's
+    /// directory) or the bytes cannot be read.
+    fn read_resource(&self, skill: &Skill, name: &str) -> Result<Cow<'static, [u8]>, Error>;
 }
 
 /// A directory on disk.
@@ -93,6 +104,23 @@ impl ManifestSource for Dir {
             package,
             diagnostics: loader.diagnostics,
         })
+    }
+
+    fn read_resource(&self, skill: &Skill, name: &str) -> Result<Cow<'static, [u8]>, Error> {
+        let dir = skill.path.parent().unwrap_or(Path::new(""));
+        let path = self.root.join(dir).join(name);
+        if !skill.resources.iter().any(|r| r == name) {
+            return Err(Error::io(
+                path,
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("not a resource of skill `{}`", skill.name),
+                ),
+            ));
+        }
+        fs::read(&path)
+            .map(Cow::Owned)
+            .map_err(|e| Error::io(path, e))
     }
 }
 

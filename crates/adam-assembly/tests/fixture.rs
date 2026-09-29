@@ -119,19 +119,28 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
             "prepare_workspace",
             "run_checks",
             "ask_user",
-            "linear__list_issues"
+            "linear__list_issues",
+            "load_skill",
+            "read_skill_file"
         ]
     );
+    assert_eq!(coder.skills, ["release-notes", "triage"]);
+    assert!(coder.preloaded.is_empty());
     assert_eq!(coder.limits.max_turns, 200);
     assert_eq!(coder.limits.max_tool_calls, 400);
     assert_eq!(coder.limits.max_output_tokens, 8192);
     assert_eq!(coder.limits.max_history_tokens, 100_000);
-    assert_eq!(
-        coder.prompt,
-        "You are the coder agent. You turn one coding task into a verified pull request.\n\
+    // The instructions, then the skills catalog (asserted whole in `tests/skills.rs`).
+    let instructions = "You are the coder agent. You turn one coding task into a verified pull request.\n\
          Stop after at most 3 failed check cycles.\n\
          Strict mode is true.\n\n\
-         ## Style\n\nKeep commits small."
+         ## Style\n\nKeep commits small.";
+    assert!(
+        coder
+            .prompt
+            .starts_with(&format!("{instructions}\n\nThe following skills")),
+        "{}",
+        coder.prompt
     );
     assert_eq!(
         coder.description.as_deref(),
@@ -153,7 +162,10 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
 
     // A subagent that lists no tools has none, and one that nests keeps its own.
     assert!(info("coder/legacy").tools.is_empty());
-    assert_eq!(info("coder/researcher").tools, ["fetch_page"]);
+    // A subagent has its own skills (`web-search`, no files) and inherits none of the parent's.
+    assert_eq!(info("coder/researcher").tools, ["fetch_page", "load_skill"]);
+    assert_eq!(info("coder/researcher").skills, ["web-search"]);
+    assert!(info("coder/reviewer").skills.is_empty());
     assert!(info("coder/researcher/summarizer").tools.is_empty());
     assert_eq!(
         info("coder/researcher/summarizer").parent.as_deref(),
@@ -217,7 +229,9 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
             "prepare_workspace",
             "run_checks",
             "ask_user",
-            "linear__list_issues"
+            "linear__list_issues",
+            "load_skill",
+            "read_skill_file"
         ]
     );
     // The tool ran and its output went back to the model.
