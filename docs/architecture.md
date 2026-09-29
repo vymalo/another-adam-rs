@@ -1169,6 +1169,13 @@ sequenceDiagram
     A-->>C: completed, with the pull request as an artifact
 ```
 
+The `pull_request` artifact has two parts: a data part with the JSON
+(`url`, `number` as a string, `branch`, `repository`) and, after it, an A2A
+`url` part (`Part.url`, A2A v1) with the pull request's URL, so a chat surface
+shows a link. The mapping is `adam_a2a_runtime::artifact_of`, which does this
+for any artifact whose data is an object with an absolute `http(s)` `url`; the
+`branch` artifact has no such field and stays a single data part.
+
 The same flow as states, from the point of view of the run notes and the
 tools' guards:
 

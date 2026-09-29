@@ -350,6 +350,19 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
     };
     assert_eq!(data["url"], PR_URL);
     assert_eq!(data["number"], "7", "numbers travel as strings over A2A");
+    // And the same URL as a link a chat UI can show: an A2A `url` part after the data part.
+    assert_eq!(pr.parts.len(), 2, "{:?}", pr.parts);
+    assert_eq!(
+        pr.parts[1].content,
+        a2a::PartContent::Url(PR_URL.to_owned())
+    );
+    assert_eq!(
+        serde_json::to_value(&pr.parts[1]).unwrap(),
+        json!({"url": PR_URL})
+    );
+    // The branch artifact has no URL of its own: it stays one data part.
+    let (_, branch) = seen.artifacts.iter().find(|(n, _)| n == "branch").unwrap();
+    assert_eq!(branch.parts.len(), 1, "{:?}", branch.parts);
 
     // The branch is on the remote with the file, in one commit.
     let branches = fx.agent_branches();
@@ -1492,6 +1505,13 @@ async fn two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs(store: Dy
             panic!("data part expected")
         };
         urls.push(data["url"].as_str().unwrap().to_owned());
+        // The durable copy carries the link part too, and it is the same URL.
+        assert_eq!(pr.parts.len(), 2, "{title}: {:?}", pr.parts);
+        assert_eq!(
+            pr.parts[1].content,
+            a2a::PartContent::Url(data["url"].as_str().unwrap().to_owned()),
+            "{title}"
+        );
     }
     urls.sort();
     assert_eq!(urls, [PR_URL.to_owned(), common::pull_url(8)]);

@@ -45,7 +45,7 @@ sequenceDiagram
 | `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), streams its updates as progress, returns its summary and the changed files |
 | `run_checks { command, cwd? }` | `sh -lc <command>` in the worktree (a `cwd` must stay inside it), timeout kills the process group, output tail capped, secrets hidden from the child |
 | `commit_and_push { message }` | `commit_all` + `push`; artifact `branch` |
-| `open_pull_request { title, body, accept_red_checks? }` | `CodeHost::open_pull_request`; artifact `pull_request` (`url`, `number` as a string, `branch`, `repository`) |
+| `open_pull_request { title, body, accept_red_checks? }` | `CodeHost::open_pull_request`; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question |
 
 Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../adam/README.md#tool)) in
