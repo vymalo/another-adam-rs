@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use adam_core::RunId;
 use adam_model::ToolSpec;
-use adam_runtime::{Artifact, DynEventSink, Emitter, RunEvent};
+use adam_runtime::{Artifact, CancelToken, DynEventSink, Emitter, RunEvent};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -115,6 +115,7 @@ pub struct ToolCtx {
     call_id: String,
     tool_name: String,
     emitter: Emitter,
+    cancel: CancelToken,
 }
 
 impl ToolCtx {
@@ -124,6 +125,7 @@ impl ToolCtx {
         call_id: String,
         tool_name: String,
         emitter: Emitter,
+        cancel: CancelToken,
     ) -> Self {
         Self {
             run_id: emitter.run_id(),
@@ -132,6 +134,7 @@ impl ToolCtx {
             call_id,
             tool_name,
             emitter,
+            cancel,
         }
     }
 
@@ -144,7 +147,22 @@ impl ToolCtx {
     ) -> Self {
         let tool_name = tool_name.into();
         let emitter = Emitter::new(RunId::new(), "detached", sink);
-        Self::new(None, 0, call_id.into(), tool_name, emitter)
+        Self::new(
+            None,
+            0,
+            call_id.into(),
+            tool_name,
+            emitter,
+            CancelToken::new(),
+        )
+    }
+
+    /// Replace the cancellation token, so a test can fire it
+    /// ([`CancelToken::cancel`]) and check that the tool stops. Contexts
+    /// built by the agent already carry the run's own token.
+    pub fn with_cancel_token(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     /// The run this call belongs to.
@@ -172,6 +190,38 @@ impl ToolCtx {
     /// The name this tool was called by.
     pub fn tool_name(&self) -> &str {
         &self.tool_name
+    }
+
+    /// Whether the run was cancelled (or finished by someone else) while this
+    /// call runs. See [`ToolCtx::cancelled`].
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Resolves when the run is cancelled; never resolves for a run that is
+    /// not. A tool with long-running work (a subprocess, a remote job, a
+    /// stream) `select!`s on it to stop early:
+    ///
+    /// ```ignore
+    /// tokio::select! {
+    ///     out = child.wait() => out,
+    ///     () = ctx.cancelled() => { child.kill().await?; Err(ToolError::Permanent("cancelled".into())) }
+    /// }
+    /// ```
+    ///
+    /// Cancelling commits the run as `Failed`, so whatever the tool returns
+    /// afterwards is dropped: stop fast, clean up, and return anything (an
+    /// `Err(ToolError::Permanent(..))` reads best in logs). Nothing here
+    /// aborts the call; a tool that ignores the signal simply runs to its end.
+    /// See [`adam_runtime::CancelToken`].
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await;
+    }
+
+    /// The token behind [`cancelled`](Self::cancelled), for handing to code
+    /// that takes one (for example a spawned task).
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
     }
 
     /// Report progress to observers as [`RunEvent::Progress`]. Best effort and

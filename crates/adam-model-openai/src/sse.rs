@@ -330,4 +330,63 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(matches!(items[1], Err(ModelError::Transient(_))));
     }
+
+    mod prop {
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+
+        use super::*;
+
+        /// A byte stream shaped like SSE (data lines, comments, other fields,
+        /// both line endings, unicode, blank lines) or plain noise.
+        fn arb_input() -> impl Strategy<Value = Vec<u8>> {
+            let line = prop_oneof![
+                "\\PC{0,30}".prop_map(|v| format!("data: {v}")),
+                "\\PC{0,30}".prop_map(|v| format!("data:{v}")),
+                "\\PC{0,30}".prop_map(|v| format!(": {v}")),
+                "\\PC{0,30}".prop_map(|v| format!("event: {v}")),
+                "\\PC{0,30}".prop_map(|v| format!("id: {v}")),
+                Just("data".to_owned()),
+                Just(String::new()),
+            ];
+            let ending = prop_oneof![Just("\n"), Just("\r\n")];
+            let structured = vec((line, ending), 0..20).prop_map(|lines| {
+                lines
+                    .into_iter()
+                    .flat_map(|(l, e)| format!("{l}{e}").into_bytes())
+                    .collect::<Vec<u8>>()
+            });
+            prop_oneof![structured, vec(any::<u8>(), 0..200)]
+        }
+
+        fn events_in_chunks(input: &[u8], cuts: &[usize]) -> Vec<String> {
+            let mut cuts: Vec<usize> = cuts.iter().map(|c| c % (input.len() + 1)).collect();
+            cuts.sort_unstable();
+            let mut parser = SseParser::default();
+            let mut out = Vec::new();
+            let mut from = 0;
+            for cut in cuts.into_iter().chain([input.len()]) {
+                out.extend(parser.push(&input[from..cut]));
+                from = cut;
+            }
+            out.extend(parser.finish());
+            out
+        }
+
+        proptest! {
+            /// However the network cuts the byte stream (also inside a
+            /// multi-byte character, or between `\r` and `\n`), the parser
+            /// yields the same events as when fed everything at once.
+            #[test]
+            fn prop_any_split_yields_same_events(
+                input in arb_input(),
+                cuts in vec(any::<usize>(), 0..8),
+            ) {
+                prop_assert_eq!(events_in_chunks(&input, &cuts), events_in_chunks(&input, &[]));
+                // And byte by byte, the finest split there is.
+                let every: Vec<usize> = (0..input.len()).collect();
+                prop_assert_eq!(events_in_chunks(&input, &every), events_in_chunks(&input, &[]));
+            }
+        }
+    }
 }

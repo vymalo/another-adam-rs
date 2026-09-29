@@ -16,6 +16,8 @@
 //! Cases isolate themselves with a unique agent name, so they run in parallel
 //! against one shared database without cleaning it between tests.
 
+pub mod fault;
+
 use std::collections::HashSet;
 use std::time::Duration;
 

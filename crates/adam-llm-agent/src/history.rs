@@ -196,4 +196,100 @@ mod tests {
         // "abcd" + name "t" + "{}" = 4 + 1 + 2 = 7 chars -> 2 tokens.
         assert_eq!(estimate_tokens(&m), 2);
     }
+
+    mod prop {
+        use proptest::collection::vec;
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn arb_message() -> impl Strategy<Value = Message> {
+            let text = "\\PC{0,120}";
+            prop_oneof![
+                text.prop_map(Message::user_text),
+                text.prop_map(Message::assistant_text),
+                ("[a-z]{1,3}", 0usize..3, text).prop_map(|(id, n, args)| Message::Assistant {
+                    content: vec![],
+                    tool_calls: (0..n)
+                        .map(|i| ToolCall {
+                            id: format!("{id}{i}"),
+                            name: "tool".into(),
+                            arguments: json!({ "x": args }),
+                        })
+                        .collect(),
+                }),
+                ("[a-z]{1,3}", "\\PC{0,700}", any::<bool>()).prop_map(|(id, out, err)| {
+                    if err {
+                        Message::tool_error(id, out)
+                    } else {
+                        Message::tool_result(id, out)
+                    }
+                }),
+            ]
+        }
+
+        fn total(messages: &[Message]) -> usize {
+            messages.iter().map(message_chars).sum()
+        }
+
+        proptest! {
+            /// Fitting never drops, reorders or rewrites anything but tool
+            /// outputs; a rewritten output keeps its head and says so; the
+            /// results after the last assistant message are untouched; the
+            /// result is never longer than the input, and fits the budget
+            /// unless nothing shortenable is left.
+            #[test]
+            fn prop_fit_history_keeps_count_order_and_budget(
+                messages in vec(arb_message(), 0..14),
+                max_tokens in 0u32..1200,
+            ) {
+                let fitted = fit_history(&messages, max_tokens);
+                prop_assert_eq!(fitted.len(), messages.len());
+                prop_assert!(total(&fitted) <= total(&messages));
+
+                let protected_from = messages
+                    .iter()
+                    .rposition(|m| matches!(m, Message::Assistant { .. }))
+                    .map_or(0, |i| i + 1);
+                for (i, (before, after)) in messages.iter().zip(&fitted).enumerate() {
+                    match (before, after) {
+                        (
+                            Message::Tool { call_id: a, content: old, is_error: ea },
+                            Message::Tool { call_id: b, content: new, is_error: eb },
+                        ) => {
+                            prop_assert_eq!(a, b, "tool call ids are kept");
+                            prop_assert_eq!(ea, eb);
+                            if old != new {
+                                prop_assert!(i < protected_from, "unseen result touched");
+                                prop_assert!(max_tokens > 0);
+                                prop_assert!(new.contains(TRUNCATION_MARKER_PREFIX));
+                                let head = new.split(&format!("\n{TRUNCATION_MARKER_PREFIX}")).next().unwrap();
+                                prop_assert!(old.starts_with(head), "the head is kept");
+                            }
+                        }
+                        _ => prop_assert_eq!(before, after, "only tool outputs may change"),
+                    }
+                }
+
+                if max_tokens == 0 {
+                    prop_assert_eq!(&fitted, &messages);
+                } else if total(&fitted) > usize::try_from(max_tokens).unwrap() * 4 {
+                    // Over budget: every candidate was already as short as it
+                    // can get (rewritten, or not longer than its own marker).
+                    for (i, (before, after)) in messages.iter().zip(&fitted).enumerate() {
+                        if let (
+                            Message::Tool { content: old, .. },
+                            Message::Tool { content: new, .. },
+                        ) = (before, after)
+                            && i < protected_from
+                            && old == new
+                        {
+                            let len = old.chars().count();
+                            prop_assert!(len <= marker(len).chars().count());
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

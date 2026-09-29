@@ -6,16 +6,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
+use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, PendingQuestion,
     TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
-    DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
-    ToolCall, ToolSpec,
+    DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest,
+    ModelResponse, ToolCall, ToolSpec,
 };
-use adam_runtime::{CollectingSink, RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder};
+use adam_runtime::{
+    CancelToken, Clock, CollectingSink, ManualClock, RetryPolicy, RunEvent, RunView, Runtime,
+    RuntimeBuilder,
+};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
@@ -706,6 +709,275 @@ async fn permanent_model_error_fails_the_run_without_retrying() {
     assert!(error.contains("bad key"), "{error}");
     assert_eq!(h.mock.requests().len(), 1);
     assert_eq!(view.attempt, 0);
+}
+
+#[tokio::test]
+async fn rate_limited_model_waits_for_retry_after_then_succeeds() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock
+        .push_error(ModelError::RateLimited {
+            retry_after: Some(Duration::from_secs(30)),
+        })
+        .push_text("through");
+    let clock = ManualClock::new();
+    let t0 = clock.now();
+    let rt = h.runtime_with(&agent, "w", |b| quick_retry(b).clock(clock.clone()));
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+
+    let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
+    let wake_at = scheduled.wake_at.expect("a retry carries a timer");
+    let thirty = chrono::Duration::seconds(30);
+    assert!(wake_at >= t0 + thirty, "Retry-After ignored: {wake_at}");
+    assert!(wake_at <= clock.now() + thirty, "{wake_at}");
+
+    // Five seconds short of the hint, several polls later: no second call.
+    let gap = (wake_at - clock.now() - chrono::Duration::seconds(5))
+        .to_std()
+        .expect("in the future");
+    clock.advance(gap);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(h.mock.requests().len(), 1, "retried before Retry-After");
+
+    clock.advance(Duration::from_secs(10));
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(
+        view.output,
+        Some(json!({"text": "through", "artifacts": []}))
+    );
+    assert_eq!(h.mock.requests().len(), 2);
+    let retrying: Vec<String> = h
+        .sink
+        .events_for(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Status {
+                detail: Some(d), ..
+            } if d.contains("retrying") => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retrying.len(), 1);
+    assert!(retrying[0].contains("retrying in 30s"), "{retrying:?}");
+    assert!(retrying[0].contains("rate limited"), "{retrying:?}");
+}
+
+/// Journal entries written before retry hints existed have no
+/// `retry_after_ms`; they must still decode and retry like a plain transient
+/// error.
+#[tokio::test]
+async fn model_failures_journaled_before_retry_hints_still_decode() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock.push_text("recovered");
+    let rt = h.runtime_with(&agent, "w", quick_retry);
+    let run = rt
+        .start("llm", user_message("hi"), None)
+        .await
+        .expect("start");
+    h.store
+        .journal_put(
+            run,
+            JournalEntry::err(
+                0,
+                "model:0",
+                json!({"retryable": true, "message": "rate limited (from an old journal)"}),
+            ),
+        )
+        .await
+        .expect("seed the journal");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.output.expect("output")["text"], "recovered");
+    assert_eq!(
+        h.mock.requests().len(),
+        1,
+        "the recorded failure was replayed"
+    );
+}
+
+fn length_limited(text: &str) -> ModelResponse {
+    ModelResponse {
+        finish: FinishReason::Length,
+        ..ModelResponse::text(text)
+    }
+}
+
+#[tokio::test]
+async fn length_finish_without_tools_is_done_and_marked_truncated() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock
+        .push_response(length_limited("the answer was cut o"))
+        .push_text("a complete answer");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+    let cut = rt
+        .start("llm", user_message("long please"), None)
+        .await
+        .expect("start");
+    let cut = wait_done(&rt, cut).await;
+    let whole = rt
+        .start("llm", user_message("short please"), None)
+        .await
+        .expect("start");
+    let whole = wait_done(&rt, whole).await;
+    worker.stop().await;
+
+    assert_eq!(
+        cut.output,
+        Some(json!({"text": "the answer was cut o", "artifacts": [], "truncated": true}))
+    );
+    assert_eq!(
+        whole.output,
+        Some(json!({"text": "a complete answer", "artifacts": []})),
+        "a normal stop is not marked"
+    );
+}
+
+#[tokio::test]
+async fn context_length_error_fails_with_the_message() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock.push_error(ModelError::ContextLength(
+        "prompt is 300000 tokens, the window is 128000".into(),
+    ));
+    let rt = h.runtime_with(&agent, "w", quick_retry);
+    let run = rt
+        .start("llm", user_message("a huge prompt"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+
+    let error = view.error.expect("error");
+    assert!(error.contains("model call failed"), "{error}");
+    assert!(error.contains("context length exceeded"), "{error}");
+    assert!(error.contains("300000 tokens"), "{error}");
+    assert_eq!(h.mock.requests().len(), 1, "not retried");
+    assert_eq!(view.attempt, 0);
+}
+
+#[tokio::test]
+async fn persistent_transient_tool_error_fails_after_the_retry_budget() {
+    let h = Harness::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = h
+        .agent()
+        .tool({
+            let calls = calls.clone();
+            fn_tool("flaky", move |_, _| {
+                calls.fetch_add(1, SeqCst);
+                Err(ToolError::Transient("disk busy".into()))
+            })
+        })
+        .build();
+    for _ in 0..3 {
+        // Each retry asks the model again (see the retry test above).
+        h.mock.push_tool_calls(vec![call("c1", "flaky", json!({}))]);
+    }
+    let rt = h.runtime_with(&agent, "w", quick_retry);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_failed(&rt, run).await;
+    worker.stop().await;
+
+    let error = view.error.expect("error");
+    assert!(error.contains("gave up after 3 attempts"), "{error}");
+    assert!(error.contains("tool `flaky` failed"), "{error}");
+    assert!(error.contains("disk busy"), "{error}");
+    assert_eq!(calls.load(SeqCst), 3, "one call per attempt");
+    assert_eq!(h.mock.requests().len(), 3);
+    assert_eq!(view.attempt, 3);
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation reaches a running tool
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cancelling_the_run_stops_a_running_tool() {
+    let h = Harness::new();
+    let started = Arc::new(Notify::new());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let agent = h
+        .agent()
+        .tool(AsyncTool({
+            let (started, stopped) = (started.clone(), stopped.clone());
+            move |ctx: ToolCtx| {
+                let (started, stopped) = (started.clone(), stopped.clone());
+                async move {
+                    assert!(!ctx.is_cancelled());
+                    started.notify_one();
+                    tokio::select! {
+                        () = ctx.cancelled() => {
+                            stopped.store(true, SeqCst);
+                            Err(ToolError::Permanent("cancelled while running".into()))
+                        }
+                        () = tokio::time::sleep(Duration::from_secs(60)) => {
+                            Ok(ToolOutput::text("ran to the end"))
+                        }
+                    }
+                }
+            }
+        }))
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "async_tool", json!({}))])
+        .push_text("never reached");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    notified(&started, "the tool to start").await;
+
+    rt.cancel(run, "user pressed stop").await.expect("cancel");
+    // A tool that ignored the signal would hold `stop` for 60 s.
+    worker.stop().await;
+
+    assert!(stopped.load(SeqCst), "the tool saw the cancellation");
+    let view = rt.view(run).await.expect("view").expect("run");
+    assert_eq!(view.status, RunStatus::Failed);
+    assert_eq!(view.error.as_deref(), Some("cancelled: user pressed stop"));
+    assert_eq!(h.mock.requests().len(), 1, "no model call after the cancel");
+}
+
+#[tokio::test]
+async fn a_detached_tool_ctx_is_never_cancelled_unless_given_a_token() {
+    let sink: adam_runtime::DynEventSink = Arc::new(CollectingSink::new());
+    let ctx = ToolCtx::detached("t", "c1", sink.clone());
+    assert!(!ctx.is_cancelled());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), ctx.cancelled())
+            .await
+            .is_err(),
+        "nothing fires a detached context"
+    );
+
+    let token = CancelToken::new();
+    let ctx = ToolCtx::detached("t", "c1", sink).with_cancel_token(token.clone());
+    let waiter = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { ctx.cancelled().await }
+    });
+    token.cancel();
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("released")
+        .expect("task");
+    assert!(ctx.is_cancelled() && ctx.cancel_token().is_cancelled());
 }
 
 // ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 # Enables the `test-util` feature for this crate's own tests.
 adam-workspace = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

@@ -1,7 +1,7 @@
 //! [`Runtime`]: starting, feeding, cancelling and observing runs.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use adam_core::{DynStore, NewRun, RunId, RunRecord, RunStatus, RunUpdate, StoreError};
 
 use crate::agent::{Agent, AgentError, Inbound};
+use crate::cancel::CancelToken;
 use crate::clock::{Clock, DynClock, SystemClock};
 use crate::envelope::Envelope;
 use crate::erased::{Erased, ErasedAgent};
@@ -157,9 +158,37 @@ pub(crate) struct Inner {
     /// Bumped whenever local work appears, so local workers do not wait for
     /// the next poll.
     pub wake: watch::Sender<u64>,
+    /// Cancellation tokens of the transitions this runtime is stepping now.
+    pub in_flight: Mutex<HashMap<RunId, CancelToken>>,
 }
 
 impl Inner {
+    /// Register the token of a transition about to run; the returned guard
+    /// removes it again.
+    pub fn track(self: &Arc<Self>, run: RunId, token: CancelToken) -> TrackGuard {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(run, token);
+        TrackGuard {
+            inner: self.clone(),
+            run,
+        }
+    }
+
+    /// Fire the token of `run` if this runtime is stepping it.
+    pub fn fire_cancel(&self, run: RunId) {
+        let token = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&run)
+            .cloned();
+        if let Some(token) = token {
+            token.cancel();
+        }
+    }
+
     pub fn notify_workers(&self) {
         self.wake.send_modify(|n| *n = n.wrapping_add(1));
     }
@@ -174,6 +203,22 @@ impl Inner {
         self.sink
             .emit(run, agent, RunEvent::Status { status, detail })
             .await;
+    }
+}
+
+/// Removes a run's cancellation token from the in-flight map on drop.
+pub(crate) struct TrackGuard {
+    inner: Arc<Inner>,
+    run: RunId,
+}
+
+impl Drop for TrackGuard {
+    fn drop(&mut self) {
+        self.inner
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.run);
     }
 }
 
@@ -260,6 +305,7 @@ impl RuntimeBuilder {
                 clock: self.clock,
                 cfg: self.cfg,
                 wake: watch::channel(0).0,
+                in_flight: Mutex::default(),
             }),
         }
     }
@@ -494,6 +540,12 @@ impl Runtime {
     /// untouched. A run being stepped right now is failed by the same CAS
     /// commit, so the worker's later commit is rejected and it drops its
     /// result.
+    ///
+    /// A step that is running at that moment is told through its
+    /// [`CancelToken`] ([`Ctx::cancelled`](crate::Ctx::cancelled)): at once if
+    /// this runtime holds the run, within one poll interval if another
+    /// process does. The step is not aborted; it may stop early or run to its
+    /// end (its result is dropped either way).
     #[tracing::instrument(skip(self))]
     pub async fn cancel(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
         for _ in 0..MAX_COMMIT_RETRIES {
@@ -504,6 +556,9 @@ impl Runtime {
                 .await?
                 .ok_or(RuntimeError::NotFound(run))?;
             if rec.status.is_terminal() {
+                // Finished already (maybe cancelled elsewhere): a step of ours
+                // that is still running is pointless.
+                self.inner.fire_cancel(run);
                 return Ok(());
             }
             let mut env = Envelope::decode(run, &rec.state)?;
@@ -513,6 +568,7 @@ impl Runtime {
             let update = RunUpdate::new(RunStatus::Failed, env.encode()?);
             match self.inner.store.commit_run(run, rec.version, update).await {
                 Ok(_) => {
+                    self.inner.fire_cancel(run);
                     self.inner
                         .emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
                         .await;

@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use adam_core::{DynStore, JournalEntry, RunId, StoreError};
 
 use crate::agent::{AgentError, Inbound};
+use crate::cancel::CancelToken;
 use crate::clock::DynClock;
 use crate::events::{Artifact, DynEventSink, RunEvent};
 
@@ -34,6 +35,7 @@ pub struct Ctx {
     consumed: usize,
     store: DynStore,
     clock: DynClock,
+    cancel: CancelToken,
     emitter: Emitter,
 }
 
@@ -124,6 +126,7 @@ pub(crate) struct CtxParts {
     pub store: DynStore,
     pub sink: DynEventSink,
     pub clock: DynClock,
+    pub cancel: CancelToken,
 }
 
 impl Ctx {
@@ -137,6 +140,7 @@ impl Ctx {
             consumed: 0,
             store: p.store,
             clock: p.clock,
+            cancel: p.cancel,
             emitter: Emitter {
                 run: p.run,
                 agent: Arc::from(p.agent),
@@ -297,6 +301,26 @@ impl Ctx {
         taken
     }
 
+    /// A handle on this transition's cancellation signal, cloneable and
+    /// `'static`, so it can be moved into a [`Ctx::step`] closure or a spawned
+    /// task (this `Ctx` cannot: `step` borrows it mutably). See [`CancelToken`].
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
+    }
+
+    /// Whether the run was cancelled (or finished by someone else) while this
+    /// transition runs. See [`CancelToken`].
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Resolves when the run is cancelled: `select!` it against long work to
+    /// stop early. Never resolves for a run that is not cancelled. See
+    /// [`CancelToken`].
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await;
+    }
+
     /// Progress for observers (A2A streaming, UIs). Not durable, best effort,
     /// with one exception: [`RunEvent::Artifact`] is also recorded with the
     /// transition's commit (see `RunView::artifacts`), and dropped again if
@@ -354,6 +378,7 @@ mod tests {
             store,
             sink: Arc::new(sink.clone()),
             clock: Arc::new(SystemClock),
+            cancel: CancelToken::new(),
         })
     }
 

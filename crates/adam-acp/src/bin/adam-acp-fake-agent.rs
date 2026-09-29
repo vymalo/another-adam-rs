@@ -16,6 +16,11 @@
 //! | `crash` | one text chunk, writes to stderr, exits with code 3 |
 //! | `write-file` | writes `FAKE_ACP_WRITE_CONTENT` to `FAKE_ACP_WRITE_PATH` (relative paths are joined to the session cwd) through `fs/write_text_file`, then `end_turn`. With `FAKE_ACP_WRITE_PERMISSION=1` it asks permission first |
 //! | `hang-init` | never answers `initialize` |
+//! | `garbage-stdout` | writes a line that is not JSON to stdout, then behaves like `write-file` (so a client that tolerates the noise still completes the turn) |
+//! | `prompt-error` | answers `session/prompt` with a JSON-RPC error: code `FAKE_ACP_ERROR_CODE` (default `-32603`), message `fake prompt failure` |
+//! | `session-error` | answers `session/new` with a JSON-RPC error (code `FAKE_ACP_ERROR_CODE`, default `-32000`, which clients read as "authentication required") |
+//! | `stop-reason` | one text chunk, then ends the turn with `FAKE_ACP_STOP_REASON` (`end_turn`, `max_tokens`, `max_turn_requests`, `refusal` or `cancelled`; default `max_tokens`) |
+//! | `crash-once` | like `crash` if the marker file `FAKE_ACP_ONCE_FILE` does not exist (it is created first), like `write-file` afterwards: "crashes once, then works" across process restarts |
 //!
 //! `FAKE_ACP_PID_FILE`, if set, receives the process id at `initialize`.
 
@@ -67,6 +72,12 @@ async fn main() -> Result<(), Error> {
         )
         .on_receive_request(
             async move |req: NewSessionRequest, responder, _cx| {
+                if scenario() == "session-error" {
+                    let code = env("FAKE_ACP_ERROR_CODE")
+                        .and_then(|c| c.parse().ok())
+                        .unwrap_or(-32000);
+                    return responder.respond_with_error(Error::new(code, "fake session failure"));
+                }
                 if let Ok(mut st) = s_new.lock() {
                     st.cwd = Some(req.cwd);
                 }
@@ -177,15 +188,53 @@ async fn run_turn(
             cancelled.await;
             Ok(PromptResponse::new(StopReason::Cancelled))
         }
-        "crash" => {
-            say(cx, &sid, "about to crash")?;
-            tokio::time::sleep(Duration::from_millis(200)).await; // let the chunk flush
-            eprintln!("fake agent: fatal: simulated crash");
-            std::process::exit(3);
+        "crash" => crash(cx, &sid).await,
+        "crash-once" => {
+            let marker = env("FAKE_ACP_ONCE_FILE").map(PathBuf::from);
+            match marker {
+                Some(m) if !m.exists() => {
+                    let _ = std::fs::write(&m, "crashed");
+                    crash(cx, &sid).await
+                }
+                _ => write_file_turn(cx, &sid, &cwd).await,
+            }
+        }
+        "garbage-stdout" => {
+            use std::io::Write as _;
+            {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(b"this line is not json-rpc\n");
+                let _ = out.flush();
+            }
+            write_file_turn(cx, &sid, &cwd).await
+        }
+        "prompt-error" => {
+            let code = env("FAKE_ACP_ERROR_CODE")
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(-32603);
+            Err(Error::new(code, "fake prompt failure"))
+        }
+        "stop-reason" => {
+            say(cx, &sid, "about to stop")?;
+            let reason = match env("FAKE_ACP_STOP_REASON").as_deref() {
+                Some("end_turn") => StopReason::EndTurn,
+                Some("max_turn_requests") => StopReason::MaxTurnRequests,
+                Some("refusal") => StopReason::Refusal,
+                Some("cancelled") => StopReason::Cancelled,
+                _ => StopReason::MaxTokens,
+            };
+            Ok(PromptResponse::new(reason))
         }
         "write-file" => write_file_turn(cx, &sid, &cwd).await,
         _ => script_turn(cx, &sid, &cwd).await,
     }
+}
+
+async fn crash(cx: &ConnectionTo<Client>, sid: &SessionId) -> Result<PromptResponse, Error> {
+    say(cx, sid, "about to crash")?;
+    tokio::time::sleep(Duration::from_millis(200)).await; // let the chunk flush
+    eprintln!("fake agent: fatal: simulated crash");
+    std::process::exit(3);
 }
 
 async fn write_file_turn(

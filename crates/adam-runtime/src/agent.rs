@@ -1,5 +1,7 @@
 //! The [`Agent`] trait and the values that flow through it.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -81,6 +83,17 @@ pub enum AgentError {
     /// exponential backoff, up to `RetryPolicy::max_attempts`.
     #[error("transient error: {0}")]
     Transient(String),
+    /// Like [`AgentError::Transient`], with a minimum wait before the retry:
+    /// a rate limit's `Retry-After`, a maintenance window, a job that reports
+    /// when it will be ready.
+    ///
+    /// The runtime schedules the retry at `max(backoff, at_least)` from now:
+    /// the hint can lengthen the wait but never shorten the policy's own
+    /// backoff. It counts as one failed attempt like any transient error, so
+    /// `RetryPolicy::max_attempts` still bounds the retries. Hints longer
+    /// than [`MAX_RETRY_AFTER`](crate::MAX_RETRY_AFTER) are capped to it.
+    #[error("transient error (retry in at least {1:?}): {0}")]
+    TransientAfter(String, Duration),
     /// Not worth retrying: the run becomes `Failed`.
     #[error("permanent error: {0}")]
     Permanent(String),
@@ -100,6 +113,11 @@ impl AgentError {
         Self::Transient(msg.to_string())
     }
 
+    /// Shorthand for [`AgentError::TransientAfter`].
+    pub fn transient_after(msg: impl std::fmt::Display, at_least: Duration) -> Self {
+        Self::TransientAfter(msg.to_string(), at_least)
+    }
+
     /// Shorthand for [`AgentError::Permanent`].
     pub fn permanent(msg: impl std::fmt::Display) -> Self {
         Self::Permanent(msg.to_string())
@@ -108,7 +126,7 @@ impl AgentError {
     /// Whether the transition that returned this will be tried again.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transient(_) => true,
+            Self::Transient(_) | Self::TransientAfter(..) => true,
             Self::Store(e) => !matches!(
                 e,
                 StoreError::InvalidData(_) | StoreError::NonDeterminism { .. }

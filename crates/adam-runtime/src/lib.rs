@@ -22,8 +22,12 @@
 //!   ([`Runtime::deliver`]).
 //! * [`Transition::Done`] / [`Transition::Fail`]: terminal.
 //! * [`AgentError::Transient`]: retried with exponential backoff
-//!   ([`RetryPolicy`]), then `Failed`. [`AgentError::Permanent`]: `Failed`.
+//!   ([`RetryPolicy`]), then `Failed`. [`AgentError::TransientAfter`] is the
+//!   same with a minimum wait (a rate limit's `Retry-After`); the retry waits
+//!   `max(backoff, hint)`. [`AgentError::Permanent`]: `Failed`.
 //! * [`Runtime::cancel`]: `Failed` with the reason, unless already finished.
+//!   A step that is running at that moment can observe it through
+//!   [`Ctx::cancelled`] / [`CancelToken`] and stop early.
 //!
 //! # Observing runs
 //!
@@ -51,6 +55,7 @@
 #![warn(missing_docs)]
 
 mod agent;
+mod cancel;
 mod clock;
 mod ctx;
 mod envelope;
@@ -61,11 +66,12 @@ mod runtime;
 mod worker;
 
 pub use agent::{Agent, AgentError, Inbound, Transition};
+pub use cancel::CancelToken;
 pub use clock::{Clock, DynClock, ManualClock, SystemClock};
 pub use ctx::{Ctx, Emitter};
 pub use events::{
     Artifact, BroadcastSink, CollectingSink, DynEventSink, EventSink, NoopSink, RunEvent,
     RunSubscription, SinkEvent,
 };
-pub use retry::RetryPolicy;
+pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};

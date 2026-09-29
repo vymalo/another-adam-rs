@@ -1,6 +1,7 @@
 //! [`LlmAgent`]: the durable model <-> tools loop.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use adam_model::{
     DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse, ToolCall, ToolSpec,
@@ -52,13 +53,24 @@ impl Default for Limits {
 struct ModelFailure {
     retryable: bool,
     message: String,
+    /// The provider's `Retry-After`, in milliseconds. Absent in journals
+    /// written before hints were honoured, which decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_after_ms: Option<u64>,
 }
 
 impl From<ModelError> for ModelFailure {
     fn from(e: ModelError) -> Self {
+        let retry_after_ms = match &e {
+            ModelError::RateLimited {
+                retry_after: Some(d),
+            } => Some(u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            _ => None,
+        };
         Self {
             retryable: e.is_retryable(),
             message: e.to_string(),
+            retry_after_ms,
         }
     }
 }
@@ -166,6 +178,9 @@ impl LlmAgentBuilder {
 ///
 /// * Retryable model error (`ModelError::is_retryable`) or
 ///   [`ToolError::Transient`]: `AgentError::Transient`, retried by the runtime.
+///   A `ModelError::RateLimited` that carries a `retry_after` becomes
+///   `AgentError::TransientAfter`, so the retry waits at least that long
+///   (the runtime's backoff still applies when it is longer).
 /// * Other model error: the run fails (`model call failed: ...`).
 /// * [`ToolError::Permanent`], `ToolOutput { is_error: true }` and unknown
 ///   tool names: an error tool result for the model; the run goes on.
@@ -308,10 +323,13 @@ impl LlmAgent {
             // A recorded error is replayed forever on crash-replay, but a
             // transient retry starts at a fresh seq, so it calls again.
             Err(f) if f.retryable => {
-                return Err(AgentError::Transient(format!(
-                    "model call failed: {}",
-                    f.message
-                )));
+                let message = format!("model call failed: {}", f.message);
+                return Err(match f.retry_after_ms {
+                    // The provider said how long to wait: the runtime waits
+                    // at least that long (see `AgentError::TransientAfter`).
+                    Some(ms) => AgentError::TransientAfter(message, Duration::from_millis(ms)),
+                    None => AgentError::Transient(message),
+                });
             }
             Err(f) => return Ok(Flow::Fail(format!("model call failed: {}", f.message))),
         };
@@ -436,6 +454,7 @@ impl LlmAgent {
             call.id.clone(),
             call.name.clone(),
             ctx.emitter(),
+            ctx.cancel_token(),
         );
         let args = call.arguments.clone();
         let outcome: Result<ToolOutput, ToolError> = ctx

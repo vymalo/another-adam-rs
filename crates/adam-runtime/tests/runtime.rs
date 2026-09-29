@@ -1,8 +1,10 @@
-//! Behavioural suite of the runtime, run against `MemoryStore` always and
-//! against PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set:
+//! Behavioural suite of the runtime, run against `MemoryStore` always,
+//! against PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set and against MongoDB
+//! when `ADAM_TEST_MONGODB_URI` is set:
 //!
 //! ```sh
 //! ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/adam_test \
+//! ADAM_TEST_MONGODB_URI=mongodb://localhost:27017 \
 //!     cargo test -p adam-runtime
 //! ```
 //!
@@ -16,9 +18,10 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
 use adam_runtime::{
-    Agent, AgentError, BroadcastSink, CollectingSink, Ctx, Inbound, ManualClock, RetryPolicy,
-    RunEvent, RunView, Runtime, RuntimeBuilder, RuntimeError, Transition,
+    Agent, AgentError, BroadcastSink, Clock, CollectingSink, Ctx, Inbound, MAX_RETRY_AFTER,
+    ManualClock, RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder, RuntimeError, Transition,
 };
+use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -40,6 +43,28 @@ async fn postgres_store() -> Option<DynStore> {
         .expect("connect to postgres");
     adam_core::Store::migrate(&store).await.expect("migrate");
     Some(Arc::new(store))
+}
+
+async fn mongodb_store() -> Option<DynStore> {
+    let uri = std::env::var("ADAM_TEST_MONGODB_URI").ok()?;
+    let db = std::env::var("ADAM_TEST_MONGODB_DB").unwrap_or_else(|_| "adam_test".into());
+    let store = adam_store_mongodb::MongoStore::connect(&uri, &db)
+        .await
+        .expect("connect to mongodb")
+        // Own collections, so migrating here never races the conformance
+        // suite's cases that run in another test binary at the same time.
+        .with_collection_prefix("adam_rt_")
+        .expect("collection prefix");
+    adam_core::Store::migrate(&store).await.expect("migrate");
+    Some(Arc::new(store))
+}
+
+/// `store` behind a [`FaultyStore`]: the handle to script faults and the
+/// `DynStore` the runtime is built on.
+fn faulty(store: DynStore) -> (Arc<FaultyStore>, DynStore) {
+    let faulty = Arc::new(FaultyStore::new(store));
+    let dynamic: DynStore = faulty.clone();
+    (faulty, dynamic)
 }
 
 fn uniq(prefix: &str) -> String {
@@ -522,11 +547,17 @@ mod cases {
         let wake_at = parked.wake_at.expect("timer set");
         assert!(!parked.waiting, "a timer is not 'waiting for input'");
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(count(&steps), 1, "not stepped before wake_at");
-        assert_eq!(
+        // Read first, then the time: if the time is still before `wake_at`,
+        // the read was too, so a second step would be a real early wake-up.
+        // (On a loaded machine the 200 ms sleep can overshoot the timer.)
+        let (steps_seen, status) = (
+            count(&steps),
             rt.view(run).await.expect("view").expect("run").status,
-            RunStatus::Parked
         );
+        if adam_core::store::now() < wake_at {
+            assert_eq!(steps_seen, 1, "not stepped before wake_at");
+            assert_eq!(status, RunStatus::Parked);
+        }
 
         wait_done(&rt, run).await;
         worker.stop().await;
@@ -1085,7 +1116,9 @@ mod cases {
                     let calls = calls.clone();
                     async move {
                         calls.fetch_add(1, SeqCst);
-                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        // Three lease periods: without renewal the run would be
+                        // taken over at least twice.
+                        tokio::time::sleep(Duration::from_millis(3000)).await;
                         Ok(Transition::Done {
                             state,
                             output: json!("slow but ours"),
@@ -1095,9 +1128,12 @@ mod cases {
                 }
             }),
         );
+        // Renewal runs every ttl/3 (~333 ms), leaving ~667 ms for a slow store
+        // round trip before the lease could lapse. A 300 ms lease left ~200 ms
+        // and flaked on loaded CI runners.
         let short = |w: &str| {
             builder(&store, w, &agent)
-                .lease_ttl(Duration::from_millis(300))
+                .lease_ttl(Duration::from_millis(1000))
                 .build()
         };
         let (a, b) = (short("renew-a"), short("renew-b"));
@@ -1669,6 +1705,790 @@ mod cases {
         }
         worker.stop().await;
     }
+
+    // -----------------------------------------------------------------------
+    // Retry hints (`AgentError::TransientAfter`)
+    // -----------------------------------------------------------------------
+
+    /// A retry hint (a rate limit's `Retry-After`) delays the retry at least
+    /// that long: not stepped 5 s before the hint is up, stepped after it.
+    pub async fn transient_with_minimum_delay_waits_at_least_that_long(store: DynStore) {
+        let name = uniq("hint");
+        let steps = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let steps = steps.clone();
+                move |ctx, state| {
+                    let steps = steps.clone();
+                    async move {
+                        steps.fetch_add(1, SeqCst);
+                        if ctx.attempt() == 0 {
+                            return Err(AgentError::transient_after(
+                                "slow down",
+                                Duration::from_secs(30),
+                            ));
+                        }
+                        Ok(Transition::Done {
+                            state,
+                            output: json!("through"),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let clock = ManualClock::new();
+        let t0 = clock.now();
+        let sink = CollectingSink::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .clock(clock.clone())
+            .event_sink(sink.clone())
+            .retry(RetryPolicy {
+                max_attempts: 3,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(50),
+                multiplier: 2.0,
+            })
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+
+        let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| {
+            v.attempt == 1 && v.status == RunStatus::Runnable
+        })
+        .await;
+        let wake_at = scheduled.wake_at.expect("a retry carries a timer");
+        let thirty = chrono::Duration::seconds(30);
+        assert!(wake_at >= t0 + thirty, "hint ignored: wake_at {wake_at}");
+        assert!(
+            wake_at <= clock.now() + thirty,
+            "the hint is a minimum, not a bonus on top of the backoff: {wake_at}"
+        );
+
+        // 5 s before the hint is up: several polls later, still not stepped.
+        let gap = (wake_at - clock.now() - chrono::Duration::seconds(5))
+            .to_std()
+            .expect("the timer is in the future");
+        clock.advance(gap);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(count(&steps), 1, "stepped before the hint elapsed");
+        assert_eq!(
+            rt.view(run).await.expect("view").expect("run").status,
+            RunStatus::Runnable
+        );
+
+        clock.advance(Duration::from_secs(10));
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!("through")));
+        assert_eq!(count(&steps), 2);
+        let retry_events: Vec<String> = sink
+            .events_for(run)
+            .into_iter()
+            .filter_map(|e| match e {
+                RunEvent::Status {
+                    status: RunStatus::Runnable,
+                    detail: Some(d),
+                } if d.contains("retrying") => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retry_events.len(), 1);
+        assert!(
+            retry_events[0].contains("retrying in 30s") && retry_events[0].contains("slow down"),
+            "{retry_events:?}"
+        );
+    }
+
+    /// The hint can lengthen the wait, never shorten the policy's backoff, and
+    /// it is a floor (`max`), not an addition.
+    pub async fn retry_hint_never_shortens_the_backoff(store: DynStore) {
+        let name = uniq("hint-short");
+        let agent = fn_agent(
+            &name,
+            step_fn(|ctx, state| {
+                async move {
+                    if ctx.attempt() == 0 {
+                        return Err(AgentError::transient_after(
+                            "tiny hint",
+                            Duration::from_secs(1),
+                        ));
+                    }
+                    Ok(Transition::Done {
+                        state,
+                        output: json!(null),
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let clock = ManualClock::new();
+        let t0 = clock.now();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .clock(clock.clone())
+            .retry(RetryPolicy {
+                max_attempts: 3,
+                initial_backoff: Duration::from_secs(20),
+                max_backoff: Duration::from_secs(60),
+                multiplier: 2.0,
+            })
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
+        let wake_at = scheduled.wake_at.expect("timer");
+        let twenty = chrono::Duration::seconds(20);
+        assert!(wake_at >= t0 + twenty, "backoff was shortened: {wake_at}");
+        assert!(
+            wake_at <= clock.now() + twenty,
+            "hint and backoff must not add up: {wake_at}"
+        );
+        clock.advance(Duration::from_secs(25));
+        wait_done(&rt, run).await;
+        worker.stop().await;
+    }
+
+    /// A hostile or broken hint (`Duration::MAX`) neither overflows the
+    /// timestamp arithmetic nor parks the run forever: it is capped.
+    pub async fn huge_retry_hint_is_capped_and_does_not_panic(store: DynStore) {
+        let name = uniq("hint-huge");
+        let agent = fn_agent(
+            &name,
+            step_fn(|ctx, state| {
+                async move {
+                    if ctx.attempt() == 0 {
+                        return Err(AgentError::transient_after("forever", Duration::MAX));
+                    }
+                    Ok(Transition::Done {
+                        state,
+                        output: json!(null),
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let clock = ManualClock::new();
+        let t0 = clock.now();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .clock(clock.clone())
+            .retry(RetryPolicy {
+                max_attempts: 3,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(50),
+                multiplier: 2.0,
+            })
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let scheduled = wait_for(&rt, run, "the retry to be scheduled", |v| v.attempt == 1).await;
+        let cap = chrono::Duration::from_std(MAX_RETRY_AFTER).expect("cap fits");
+        let wake_at = scheduled.wake_at.expect("timer");
+        assert!(wake_at >= t0 + cap, "capped too low: {wake_at}");
+        assert!(wake_at <= clock.now() + cap, "not capped: {wake_at}");
+        clock.advance(MAX_RETRY_AFTER + Duration::from_secs(60));
+        wait_done(&rt, run).await;
+        worker.stop().await;
+    }
+
+    /// A hinted retry still counts as an attempt: the budget bounds retries.
+    pub async fn hinted_retries_still_exhaust_the_attempt_budget(store: DynStore) {
+        let name = uniq("hint-budget");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let calls = calls.clone();
+                move |_ctx, _state| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, SeqCst);
+                        Err(AgentError::transient_after(
+                            "still limited",
+                            Duration::from_secs(5),
+                        ))
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .clock(clock.clone())
+            .retry(RetryPolicy {
+                max_attempts: 3,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(50),
+                multiplier: 2.0,
+            })
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        // Each retry is 5 s away on the manual clock; step the clock until
+        // the run gives up.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let failed = loop {
+            let v = rt.view(run).await.expect("view").expect("run");
+            if v.status == RunStatus::Failed {
+                break v;
+            }
+            clock.advance(Duration::from_secs(6));
+            assert!(Instant::now() < deadline, "never gave up: {v:#?}");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        };
+        worker.stop().await;
+        assert_eq!(count(&calls), 3);
+        let error = failed.error.expect("error");
+        assert!(
+            error.contains("gave up after 3 attempts") && error.contains("still limited"),
+            "{error}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Store outages (`FaultyStore`)
+    // -----------------------------------------------------------------------
+
+    /// `claim_due` failing five times in a row does not stop the worker; the
+    /// run ends `Done` once the store answers again, and it ran once.
+    pub async fn store_outage_during_claim_is_survived(store: DynStore) {
+        let (faults, store) = faulty(store);
+        let name = uniq("claim-outage");
+        let effects = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let effects = effects.clone();
+                move |ctx, state| {
+                    let effects = effects.clone();
+                    async move {
+                        let _: Result<u8, String> = ctx
+                            .step("effect", || async move {
+                                effects.fetch_add(1, SeqCst);
+                                Ok(1)
+                            })
+                            .await?;
+                        Ok(Transition::Done {
+                            state,
+                            output: json!("finished"),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        faults.fail(Method::ClaimDue, 5);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        assert!(
+            !worker.handle.is_finished(),
+            "the worker must outlive the outage"
+        );
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!("finished")));
+        assert_eq!(faults.injected(Method::ClaimDue), 5);
+        assert_eq!(count(&effects), 1);
+    }
+
+    /// A commit that fails leaves the lease to expire; the next claim replays
+    /// the journal, so the effect still ran once, and the run finishes.
+    pub async fn commit_failure_leaves_run_to_lease_expiry(store: DynStore) {
+        let (faults, store) = faulty(store);
+        let name = uniq("commit-fail");
+        let effects = Arc::new(AtomicUsize::new(0));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (effects, invocations) = (effects.clone(), invocations.clone());
+                move |ctx, state| {
+                    let (effects, invocations) = (effects.clone(), invocations.clone());
+                    async move {
+                        invocations.fetch_add(1, SeqCst);
+                        let _: Result<u8, String> = ctx
+                            .step("effect", || async move {
+                                effects.fetch_add(1, SeqCst);
+                                Ok(1)
+                            })
+                            .await?;
+                        Ok(Transition::Done {
+                            state,
+                            output: json!("finished"),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .lease_ttl(Duration::from_millis(300))
+            .build();
+        faults.fail(Method::CommitRun, 1);
+        let started = Instant::now();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+
+        assert_eq!(done.output, Some(json!("finished")));
+        assert_eq!(faults.injected(Method::CommitRun), 1);
+        assert_eq!(count(&invocations), 2, "stepped again after the failure");
+        assert_eq!(
+            count(&effects),
+            1,
+            "the journal kept the effect from re-running"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(290),
+            "the run was retried before its lease expired: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The commit *was* applied but its acknowledgement was lost: the run
+    /// carries on from the committed state, nothing before it re-runs.
+    pub async fn commit_ack_lost_is_survived(store: DynStore) {
+        let (faults, store) = faulty(store);
+        let name = uniq("ack-lost");
+        let effects = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let effects = effects.clone();
+                move |ctx, _state| {
+                    let effects = effects.clone();
+                    async move {
+                        let (index, phase) = (phase(&_state) as usize, phase(&_state));
+                        let _: Result<u8, String> = ctx
+                            .step(&format!("effect-{phase}"), || async move {
+                                effects[index].fetch_add(1, SeqCst);
+                                Ok(1)
+                            })
+                            .await?;
+                        Ok(if phase == 0 {
+                            Transition::Continue(json!({"phase": 1}))
+                        } else {
+                            Transition::Done {
+                                state: json!({"phase": 1}),
+                                output: json!("finished"),
+                            }
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .lease_ttl(Duration::from_millis(300))
+            .build();
+        faults.fail_after_apply(Method::CommitRun, 1);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+
+        assert_eq!(done.output, Some(json!("finished")));
+        assert_eq!(faults.injected(Method::CommitRun), 1);
+        assert_eq!(count(&effects[0]), 1, "phase 0 was committed, never redone");
+        assert_eq!(count(&effects[1]), 1);
+        let journal = store.journal_list(run).await.expect("journal");
+        let names: Vec<_> = journal.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["effect-0", "effect-1"]);
+    }
+
+    /// A journal write that fails after the effect ran is the one place an
+    /// effect can run twice (the crash window between doing and recording):
+    /// the run still completes, with exactly one more execution.
+    pub async fn journal_write_failure_reruns_the_step_after_the_lease_expires(store: DynStore) {
+        let (faults, store) = faulty(store);
+        let name = uniq("journal-fail");
+        let effects = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let effects = effects.clone();
+                move |ctx, state| {
+                    let effects = effects.clone();
+                    async move {
+                        let seen: Result<usize, String> = ctx
+                            .step(
+                                "effect",
+                                || async move { Ok(effects.fetch_add(1, SeqCst) + 1) },
+                            )
+                            .await?;
+                        Ok(Transition::Done {
+                            state,
+                            output: json!(seen.unwrap_or(0)),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .lease_ttl(Duration::from_millis(300))
+            .build();
+        faults.fail(Method::JournalPut, 1);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+
+        assert_eq!(faults.injected(Method::JournalPut), 1);
+        assert_eq!(count(&effects), 2, "unrecorded, so it ran again");
+        assert_eq!(
+            done.output,
+            Some(json!(2)),
+            "and only the second result was recorded"
+        );
+    }
+
+    /// A lease that cannot be renewed expires under a slow step; another
+    /// worker takes the run over and finishes it, and the slow worker's late
+    /// commit is rejected.
+    pub async fn renew_failure_lets_another_worker_take_over(store: DynStore) {
+        let (faults, faulty_store) = faulty(store.clone());
+        let name = uniq("renew-fail");
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let slow_finished = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (invocations, started, slow_finished) =
+                    (invocations.clone(), started.clone(), slow_finished.clone());
+                move |_ctx, state| {
+                    let (invocations, started, slow_finished) =
+                        (invocations.clone(), started.clone(), slow_finished.clone());
+                    async move {
+                        if invocations.fetch_add(1, SeqCst) == 0 {
+                            started.notify_one();
+                            tokio::time::sleep(Duration::from_millis(900)).await;
+                            slow_finished.fetch_add(1, SeqCst);
+                            return Ok(Transition::Done {
+                                state,
+                                output: json!("slow"),
+                            });
+                        }
+                        Ok(Transition::Done {
+                            state,
+                            output: json!("fast"),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        faults.fail_always(Method::RenewLease);
+        let a = builder(&faulty_store, "renew-fail-a", &agent)
+            .lease_ttl(Duration::from_millis(300))
+            .build();
+        let b = builder(&store, "renew-fail-b", &agent).build();
+        let run = a.start(&name, inbound(), None).await.expect("start");
+        let wa = spawn_worker(&a);
+        notified(&started, "the slow step").await;
+        let wb = spawn_worker(&b);
+
+        let done = wait_done(&b, run).await;
+        assert_eq!(done.output, Some(json!("fast")));
+        let committed_version = done.version;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while count(&slow_finished) == 0 {
+            assert!(Instant::now() < deadline, "the slow step never finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        wa.stop().await;
+        wb.stop().await;
+
+        assert!(
+            faults.injected(Method::RenewLease) >= 1,
+            "the renewal was attempted and failed"
+        );
+        let after = b.view(run).await.expect("view").expect("run");
+        assert_eq!(after.output, Some(json!("fast")), "the late commit lost");
+        assert_eq!(after.version, committed_version);
+        assert_eq!(count(&invocations), 2);
+    }
+
+    /// A lease that cannot be released simply expires; the run still goes on.
+    pub async fn release_failure_is_harmless(store: DynStore) {
+        let (faults, store) = faulty(store);
+        let name = uniq("release-fail");
+        let agent = fn_agent(
+            &name,
+            step_fn(|_ctx, state| {
+                async move {
+                    Ok(if phase(&state) == 0 {
+                        Transition::Continue(json!({"phase": 1}))
+                    } else {
+                        Transition::Done {
+                            state,
+                            output: json!("finished"),
+                        }
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let rt = builder(&store, &uniq("w"), &agent)
+            .lease_ttl(Duration::from_millis(200))
+            .build();
+        faults.fail_always(Method::ReleaseLease);
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!("finished")));
+        assert!(faults.injected(Method::ReleaseLease) >= 2);
+    }
+
+    /// Every API call reports an outage as a retryable store error and leaves
+    /// the run exactly as it was; the same call works once the store is back.
+    pub async fn api_calls_surface_store_outage_as_retryable_errors(store: DynStore) {
+        let (faults, store) = faulty(store);
+        let name = uniq("api-outage");
+        let agent = fn_agent(
+            &name,
+            step_fn(|_ctx, state| {
+                async move {
+                    Ok(Transition::Park {
+                        state,
+                        wake_at: None,
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let retryable = |e: RuntimeError| {
+            assert!(
+                matches!(&e, RuntimeError::Store(s) if adam_store_testkit::fault::is_injected(s)),
+                "{e:?}"
+            );
+            assert!(e.is_retryable(), "{e:?}");
+        };
+
+        // start, plain and through a conversation lookup
+        faults.fail(Method::CreateRun, 1);
+        retryable(rt.start(&name, inbound(), None).await.expect_err("outage"));
+        faults.fail(Method::OpenRunForConversation, 1);
+        retryable(
+            rt.start(&name, inbound(), Some("conv"))
+                .await
+                .expect_err("outage"),
+        );
+        faults.fail(Method::CreateRun, 1);
+        retryable(
+            rt.start_with_id(RunId::new(), &name, inbound(), None)
+                .await
+                .expect_err("outage"),
+        );
+        let run = rt.start(&name, inbound(), None).await.expect("recovered");
+
+        // view, deliver, cancel: reads and writes both
+        faults.fail(Method::LoadRun, 1);
+        retryable(rt.view(run).await.expect_err("outage"));
+        faults.fail(Method::LoadRun, 1);
+        retryable(rt.deliver(run, inbound()).await.expect_err("outage"));
+        faults.fail(Method::CommitRun, 1);
+        retryable(rt.deliver(run, inbound()).await.expect_err("outage"));
+        faults.fail(Method::CommitRun, 1);
+        retryable(rt.cancel(run, "x").await.expect_err("outage"));
+
+        let untouched = rt.view(run).await.expect("view").expect("run");
+        assert_eq!(untouched.status, RunStatus::Runnable);
+        assert_eq!(untouched.pending_inbox, 0, "a failed deliver adds nothing");
+        assert_eq!(untouched.error, None, "a failed cancel cancels nothing");
+
+        rt.deliver(run, inbound()).await.expect("deliver recovers");
+        rt.cancel(run, "now for real")
+            .await
+            .expect("cancel recovers");
+        let view = rt.view(run).await.expect("view").expect("run");
+        assert_eq!(view.status, RunStatus::Failed);
+        assert_eq!(view.error.as_deref(), Some("cancelled: now for real"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancellation signal (`Ctx::cancelled`)
+    // -----------------------------------------------------------------------
+
+    /// `Runtime::cancel` reaches the step that is running: `Ctx::cancelled`
+    /// (also through a cloned token in a spawned task) resolves, the step
+    /// stops early, and its result is still dropped.
+    pub async fn cancel_signals_the_step_that_is_running(store: DynStore) {
+        let name = uniq("cancel-signal");
+        let started = Arc::new(Notify::new());
+        let observed = Arc::new(Notify::new());
+        let spawned_saw = Arc::new(Notify::new());
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (started, observed, spawned_saw) =
+                    (started.clone(), observed.clone(), spawned_saw.clone());
+                move |ctx, state| {
+                    let (started, observed, spawned_saw) =
+                        (started.clone(), observed.clone(), spawned_saw.clone());
+                    async move {
+                        assert!(!ctx.is_cancelled());
+                        let token = ctx.cancel_token();
+                        tokio::spawn(async move {
+                            token.cancelled().await;
+                            spawned_saw.notify_one();
+                        });
+                        started.notify_one();
+                        tokio::select! {
+                            () = ctx.cancelled() => {
+                                assert!(ctx.is_cancelled());
+                                observed.notify_one();
+                                Ok(Transition::Done { state, output: json!("stopped early") })
+                            }
+                            () = tokio::time::sleep(Duration::from_secs(60)) => {
+                                Ok(Transition::Done { state, output: json!("ran to the end") })
+                            }
+                        }
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let sink = CollectingSink::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .event_sink(sink.clone())
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        notified(&started, "the step").await;
+
+        rt.cancel(run, "stop").await.expect("cancel");
+        notified(&observed, "the step to see the cancellation").await;
+        notified(&spawned_saw, "the cloned token to fire").await;
+        // Would take 60 s (and fail `stop`'s timeout) if the step had not
+        // been told.
+        worker.stop().await;
+
+        let view = rt.view(run).await.expect("view").expect("run");
+        assert_eq!(view.status, RunStatus::Failed);
+        assert_eq!(view.error.as_deref(), Some("cancelled: stop"));
+        assert_eq!(view.output, None, "the stopped step's result is dropped");
+        assert!(
+            !sink.events_for(run).iter().any(|e| matches!(
+                e,
+                RunEvent::Status {
+                    status: RunStatus::Done,
+                    ..
+                }
+            )),
+            "a dropped result must not be announced"
+        );
+    }
+
+    /// A cancel issued by another process (another `Runtime` on the same
+    /// store) reaches the step through the worker's watch on the run.
+    pub async fn cancel_issued_elsewhere_signals_the_step(store: DynStore) {
+        let name = uniq("cancel-remote");
+        let started = Arc::new(Notify::new());
+        let observed = Arc::new(Notify::new());
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (started, observed) = (started.clone(), observed.clone());
+                move |ctx, state| {
+                    let (started, observed) = (started.clone(), observed.clone());
+                    async move {
+                        started.notify_one();
+                        tokio::select! {
+                            () = ctx.cancelled() => {
+                                observed.notify_one();
+                                Ok(Transition::Done { state, output: json!("stopped early") })
+                            }
+                            () = tokio::time::sleep(Duration::from_secs(60)) => {
+                                Ok(Transition::Done { state, output: json!("ran to the end") })
+                            }
+                        }
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let a = builder(&store, "cancel-remote-a", &agent).build();
+        let b = builder(&store, "cancel-remote-b", &agent).build();
+        let run = a.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&a);
+        notified(&started, "the step on a").await;
+
+        b.cancel(run, "from b")
+            .await
+            .expect("cancel on the other runtime");
+        notified(&observed, "a's step to see b's cancellation").await;
+        worker.stop().await;
+        let view = a.view(run).await.expect("view").expect("run");
+        assert_eq!(view.error.as_deref(), Some("cancelled: from b"));
+    }
+
+    /// The signal is per run: cancelling one run leaves a concurrent run's
+    /// token untouched, and a fresh transition starts with a fresh token.
+    pub async fn cancel_only_signals_its_own_run(store: DynStore) {
+        let name = uniq("cancel-scoped");
+        let started = [Arc::new(Notify::new()), Arc::new(Notify::new())];
+        let observed = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (started, observed, release) =
+                    (started.clone(), observed.clone(), release.clone());
+                move |ctx, state| {
+                    let (started, observed, release) =
+                        (started.clone(), observed.clone(), release.clone());
+                    async move {
+                        let which = state["which"].as_u64().unwrap_or(0) as usize;
+                        started[which].notify_one();
+                        if which == 0 {
+                            ctx.cancelled().await;
+                            observed.notify_one();
+                            return Ok(Transition::Done {
+                                state,
+                                output: json!("cancelled"),
+                            });
+                        }
+                        release.notified().await;
+                        Ok(Transition::Done {
+                            state,
+                            output: json!({"saw_cancel": ctx.is_cancelled()}),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let victim = rt
+            .start(&name, Inbound::new("start", json!({"which": 0})), None)
+            .await
+            .expect("start");
+        let bystander = rt
+            .start(&name, Inbound::new("start", json!({"which": 1})), None)
+            .await
+            .expect("start");
+        let worker = spawn_worker(&rt);
+        notified(&started[0], "the victim's step").await;
+        notified(&started[1], "the bystander's step").await;
+
+        rt.cancel(victim, "only you").await.expect("cancel");
+        notified(&observed, "the victim to see it").await;
+        release.notify_one();
+        let done = wait_done(&rt, bystander).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!({"saw_cancel": false})));
+        assert_eq!(
+            rt.view(victim).await.expect("view").expect("run").status,
+            RunStatus::Failed
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,6 +2529,20 @@ macro_rules! runtime_suite {
                 panic_is_a_transient_failure,
                 deliver_wakes_local_workers_immediately,
                 unknown_envelope_version_is_rejected,
+                transient_with_minimum_delay_waits_at_least_that_long,
+                retry_hint_never_shortens_the_backoff,
+                huge_retry_hint_is_capped_and_does_not_panic,
+                hinted_retries_still_exhaust_the_attempt_budget,
+                store_outage_during_claim_is_survived,
+                commit_failure_leaves_run_to_lease_expiry,
+                commit_ack_lost_is_survived,
+                journal_write_failure_reruns_the_step_after_the_lease_expires,
+                renew_failure_lets_another_worker_take_over,
+                release_failure_is_harmless,
+                api_calls_surface_store_outage_as_retryable_errors,
+                cancel_signals_the_step_that_is_running,
+                cancel_issued_elsewhere_signals_the_step,
+                cancel_only_signals_its_own_run,
             );
         }
     };
@@ -1728,3 +2562,4 @@ macro_rules! runtime_suite {
 
 runtime_suite!(memory, super::memory_store);
 runtime_suite!(postgres, super::postgres_store);
+runtime_suite!(mongodb, super::mongodb_store);

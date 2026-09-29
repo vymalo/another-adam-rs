@@ -20,4 +20,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
+adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.1.0" }
 adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
+adam-store-testkit.workspace = true
