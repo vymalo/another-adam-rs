@@ -66,7 +66,10 @@ fi
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE "$github/__admin/requests" || true)
 if [ "$code" = 200 ]; then ok "mock-github journal reset"; else bad "mock-github journal reset: HTTP $code"; fi
 
-rpc=$(jq -n --arg id "e2e-$(date +%s)" --arg text "$text" '{
+# The message id names the task (same agent, no context: same id, same task), so
+# it must differ between runs, including two variants started in one second.
+message_id="e2e-${NO_OPENCODE:-0}-$(date +%s)-$$"
+rpc=$(jq -n --arg id "$message_id" --arg text "$text" '{
   jsonrpc: "2.0", id: "1", method: "SendStreamingMessage",
   params: {message: {messageId: $id, role: "ROLE_USER", parts: [{text: $text}]}}}')
 
