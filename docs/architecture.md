@@ -868,6 +868,10 @@ How a run looks to an A2A client (`task_state` in
 | `Failed` with an error that starts `cancelled: ` | `canceled` |
 | `Failed` otherwise | `failed` |
 
+The `message_id` of a status message is a hash of the task id, the state and the
+text, so every stream event and `tasks/get` snapshot of one status carries the
+same id and a consumer that keys on it sees the status once.
+
 ## The error tree
 
 Each library defines its own error enum with `thiserror`. A variant says **what

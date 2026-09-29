@@ -56,6 +56,18 @@ delivers a `CancelTask` to the running step at once (a `Notifier`), instead of a
 the next poll. `adam-coder` wires it in for every role (`Coder::new_with`,
 `Coder::control_plane_with`).
 
+## Stable ids
+
+The message id of a status is derived, not drawn at random per read, so a
+consumer that keys on it sees each status once (a SHA-256 of length-prefixed
+fields, laid out as a UUID of version 8):
+
+* **Status messages.** The `message_id` of a task's status message is a
+  function of the task id, the state and the message text. The stream event and
+  every `tasks/get` snapshot of the same status carry the same id; another
+  state or text gives another id. (Progress messages, which exist only in the
+  live stream, keep a fresh id.)
+
 ## Errors
 
 The backend has no error type of its own: it returns `adam_a2a::BackendError`.

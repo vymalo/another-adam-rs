@@ -357,6 +357,19 @@ async fn a_new_task_is_a_run_and_streams_snapshot_progress_artifact_completed() 
 
     let done = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
     assert_eq!(done.status.state, TaskState::Completed);
+    // The status message is the same message wherever it is read: in the
+    // stream, and in any number of snapshots.
+    let streamed = match events.last().unwrap() {
+        TaskEvent::Status(u) => u.status.message.clone().expect("completed message"),
+        other => panic!("not a status: {other:?}"),
+    };
+    let polled = done.status.message.clone().expect("completed message");
+    assert_eq!(streamed.message_id, polled.message_id);
+    let again = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
+    assert_eq!(
+        again.status.message.map(|m| m.message_id),
+        Some(polled.message_id)
+    );
     let artifacts = done.artifacts.expect("artifacts on the task");
     assert_eq!(artifacts[0].name.as_deref(), Some("report"));
     assert_eq!(artifacts[0].parts[0].as_text(), Some("# done"));
