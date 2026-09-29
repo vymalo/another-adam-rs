@@ -320,7 +320,9 @@ classDiagram
             <<interface>>
             spec()
             call()
+            required_state()
         }
+        class FnTool
         class LlmAgent
         class LlmStarter
     }
@@ -334,6 +336,7 @@ classDiagram
         class OpenPullRequest
         class AskUser
     }
+    Tool <|.. FnTool
     Agent <|.. LlmAgent
     Agent <|.. CoderAgent
     AgentStarter <|.. LlmStarter
@@ -359,7 +362,12 @@ Each box is a crate (underscores stand for hyphens). The six coder tools are
 `prepare_workspace`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
 `open_pull_request` and `ask_user`. A seventh type, `Redacting`, wraps each of
 them to scrub secrets (`crates/adam-coder/src/tools/mod.rs`). `CoderAgent`
-wraps an `LlmAgent` and adds its completion rule. `AgentStarter` is the start-only half
+wraps an `LlmAgent` and adds its completion rule. `FnTool` is a tool made from a closure. A tool
+reads shared dependencies with `ToolCtx::state::<T>()` (given to the agent with
+`LlmAgentBuilder::state`), declares them in `Tool::required_state`, and
+`LlmAgentBuilder::try_build` fails at startup when one is missing; `parse_args`,
+`IntoToolOutput`, `ToolSet` and, with the `schema` feature, `spec_for` remove the boilerplate
+(see the [crate README](../crates/adam-llm-agent/README.md)). `AgentStarter` is the start-only half
 of `Agent` (`name` and `init`, no `step`): a process that only accepts requests registers
 a starter (`LlmStarter`, `CoderStarter`) and never holds the agent's model or credentials.
 
@@ -374,7 +382,7 @@ The boundaries, by what they swap:
 | `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `StaticToken` (one token, any host) | none needed |
 | `Agent` | `adam-runtime` | `LlmAgent`, `CoderAgent` | test agents |
 | `AgentStarter` | `adam-runtime` | `LlmStarter`, `CoderStarter` | test starters |
-| `Tool` | `adam-llm-agent` | the coder tools | test tools |
+| `Tool` | `adam-llm-agent` | the coder tools, `FnTool` | test tools |
 | `EventSink` | `adam-runtime` | `BroadcastSink` (in-process), `PgEventSink` (`adam-notify-postgres`: local first, then `NOTIFY` to other processes) | `NoopSink` (default), `CollectingSink` |
 | `Notifier` | `adam-runtime` | `PgNotifier` (`adam-notify-postgres`) | `LocalNotifier` (in-process; also the fan-out inside `PgNotify`) |
 | `Clock` | `adam-runtime` | `SystemClock` | `ManualClock` |

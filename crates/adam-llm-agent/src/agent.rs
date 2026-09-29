@@ -1,6 +1,7 @@
 //! [`LlmAgent`]: the durable model <-> tools loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use adam_error::report;
@@ -15,7 +16,9 @@ use serde_json::{Value, json};
 
 use crate::conversation::{ArtifactRef, Conversation, PendingQuestion, parse_user_text};
 use crate::history::fit_history;
+use crate::state::Extensions;
 use crate::tool::{DynTool, Tool, ToolCtx, ToolError, ToolOutput};
+use crate::toolset::ToolSet;
 
 /// Bounds on one run. When a limit trips the run fails with a message naming
 /// it (`RunView::error`); a limit never silently degrades the run, except the
@@ -88,6 +91,34 @@ pub struct LlmAgentBuilder {
     instructions: Option<String>,
     tools: Vec<DynTool>,
     limits: Limits,
+    extensions: Extensions,
+}
+
+/// Why [`LlmAgentBuilder::try_build`] refused to build an agent.
+///
+/// A mistake in how the agent is put together, found at startup.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BuildError {
+    /// A tool needs shared state the agent was not given.
+    #[error("tool `{tool}` needs shared state `{state}`: register it with LlmAgentBuilder::state")]
+    MissingState {
+        /// The tool that declared the need ([`Tool::required_state`]).
+        tool: String,
+        /// The type of the missing state.
+        state: String,
+    },
+    /// Two tools have the same name, and the model could not tell them apart.
+    #[error("two tools are called `{name}`")]
+    DuplicateTool {
+        /// The repeated name.
+        name: String,
+    },
+}
+
+impl Classify for BuildError {
+    fn class(&self) -> adam_model::ErrorClass {
+        adam_model::ErrorClass::Invalid
+    }
 }
 
 impl LlmAgentBuilder {
@@ -99,7 +130,7 @@ impl LlmAgentBuilder {
 
     /// Register a tool. A second tool with the same name replaces the first.
     pub fn tool(self, tool: impl Tool) -> Self {
-        self.dyn_tool(std::sync::Arc::new(tool))
+        self.dyn_tool(Arc::new(tool))
     }
 
     /// Register an already shared tool.
@@ -108,10 +139,83 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// Register every tool of a [`ToolSet`], in order.
+    pub fn tools(self, tools: ToolSet) -> Self {
+        tools
+            .into_iter()
+            .fold(self, |builder, tool| builder.dyn_tool(tool))
+    }
+
+    /// Share `value` with the tools: they read it with
+    /// [`ToolCtx::state`] (as `State<T>`), and
+    /// [`try_build`](Self::try_build) checks it exists for every tool that
+    /// declares it in [`Tool::required_state`]. One value per type; a second
+    /// call with the same `T` replaces the first.
+    pub fn state<T: Send + Sync + 'static>(mut self, value: Arc<T>) -> Self {
+        self.extensions.insert(value);
+        self
+    }
+
     /// Replace the [`Limits`] (default: [`Limits::default`]).
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Build the agent, or say what is wrong with how it was put together:
+    /// a tool whose [`Tool::required_state`] was not registered with
+    /// [`state`](Self::state), or two tools with one name.
+    ///
+    /// [`build`](Self::build) keeps accepting both (the last duplicate wins,
+    /// with a warning; a missing state shows up when the tool runs), for
+    /// compatibility. Prefer this one.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use adam_llm_agent::{BuildError, LlmAgent, Tool, ToolCtx, ToolError, ToolOutput, StateKey};
+    /// use adam_model::{MockModel, ToolSpec};
+    /// use async_trait::async_trait;
+    /// use serde_json::{Value, json};
+    ///
+    /// struct Db;
+    /// struct Lookup;
+    ///
+    /// #[async_trait]
+    /// impl Tool for Lookup {
+    ///     fn spec(&self) -> ToolSpec {
+    ///         ToolSpec { name: "lookup".into(), description: "Look up.".into(),
+    ///                    parameters: json!({"type": "object", "properties": {}}) }
+    ///     }
+    ///     fn required_state(&self) -> Vec<StateKey> { vec![StateKey::of::<Db>()] }
+    ///     async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+    ///         let _db = ctx.require_state::<Db>()?;
+    ///         Ok(ToolOutput::text("found"))
+    ///     }
+    /// }
+    ///
+    /// let model = Arc::new(MockModel::new());
+    /// let missing = LlmAgent::builder("a", model.clone(), "m").tool(Lookup).try_build();
+    /// assert!(matches!(missing, Err(BuildError::MissingState { .. })));
+    /// let ok = LlmAgent::builder("a", model, "m").state(Arc::new(Db)).tool(Lookup).try_build();
+    /// assert!(ok.is_ok());
+    /// ```
+    pub fn try_build(self) -> Result<LlmAgent, BuildError> {
+        let mut names = HashSet::new();
+        for tool in &self.tools {
+            let name = tool.spec().name;
+            for key in tool.required_state() {
+                if !self.extensions.contains(key) {
+                    return Err(BuildError::MissingState {
+                        tool: name,
+                        state: key.to_string(),
+                    });
+                }
+            }
+            if !names.insert(name.clone()) {
+                return Err(BuildError::DuplicateTool { name });
+            }
+        }
+        Ok(self.build())
     }
 
     /// Build the agent.
@@ -143,6 +247,7 @@ impl LlmAgentBuilder {
             index,
             specs,
             limits: self.limits,
+            extensions: Arc::new(self.extensions),
         }
     }
 }
@@ -201,6 +306,7 @@ pub struct LlmAgent {
     index: HashMap<String, usize>,
     specs: Vec<ToolSpec>,
     limits: Limits,
+    extensions: Arc<Extensions>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -248,6 +354,7 @@ impl LlmAgent {
             instructions: None,
             tools: Vec::new(),
             limits: Limits::default(),
+            extensions: Extensions::new(),
         }
     }
 
@@ -461,6 +568,7 @@ impl LlmAgent {
             call.name.clone(),
             ctx.emitter(),
             ctx.cancel_token(),
+            Arc::clone(&self.extensions),
         );
         let args = call.arguments.clone();
         let outcome: Result<ToolOutput, ToolError> = ctx

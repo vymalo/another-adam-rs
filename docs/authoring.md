@@ -1,7 +1,7 @@
 # The authoring layer
 
-Status: **design, planned, nothing here exists yet** except where a row says otherwise (see
-[Delivery order](#delivery-order)). Accepted by the owner on 2026-09-29 (decisions D1 to D6 below).
+Status: **design; only slice S1 (the typed tool helpers in `adam-llm-agent`) is built**, the rest is
+planned (see [Delivery order](#delivery-order)). Accepted by the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
 
@@ -219,8 +219,7 @@ of `adam-llm-agent`.
   compiler checks; the agent files name tools, and binding fails at startup on an unknown name.
 
 `FnTool` builds a tool at run time (an MCP tool is one). The typed helpers it and the macro rely on
-(`ToolSpec` from a schema, `IntoToolOutput`, `parse_args`, `State<T>`, `ToolSet`) are slice S1 and live
-in [`adam-llm-agent`](../crates/adam-llm-agent/README.md).
+(`spec_for`, `IntoToolOutput`, `parse_args`, `State<T>`, `ToolSet`) are slice S1, built, and live in [`adam-llm-agent`](../crates/adam-llm-agent/README.md).
 
 ## Skills and subagents at run time (planned)
 
@@ -384,7 +383,7 @@ type already sets the pattern).
 | Slice | What | State |
 |---|---|---|
 | S0 | this document | this change |
-| S1 | typed tool helpers in `adam-llm-agent` (feature `schema`) | next |
+| S1 | typed tool helpers in `adam-llm-agent` (feature `schema` for the schema part) | built |
 | S2 | `#[tool]` and the `adam` facade | planned |
 | S3 | `adam-coder` tools through `#[tool]`, no behaviour change | planned |
 | S4 to S6 | `adam-agent-fs` (parse, validate), `build.rs` codegen, `adam-assembly` | planned |

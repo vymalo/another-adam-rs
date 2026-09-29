@@ -8,18 +8,25 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Argument schemas from `schemars::JsonSchema`: `spec_for`, `ToolSpecExt::for_args`, `FnTool::builder`.
+schema = ["dep:schemars"]
+
 [dependencies]
 adam-error.workspace = true
 adam-core.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
+schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+schemars = { workspace = true, features = ["derive"] }
 proptest.workspace = true
 chrono.workspace = true
 futures.workspace = true

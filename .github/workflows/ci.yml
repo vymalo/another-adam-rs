@@ -50,8 +50,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Optional features are linted and doc-tested too, or their code never runs in CI.
+      - run: cargo clippy --workspace --all-targets --locked --features adam-llm-agent/schema -- -D warnings
       # nextest does not run doctests; the database suites are not needed here.
       - run: cargo test --workspace --doc --locked
+      - run: cargo test --workspace --doc --locked --features adam-llm-agent/schema
 
   # The oldest toolchain the workspace promises to build with (`rust-version`
   # in Cargo.toml; keep the two in step).
@@ -63,6 +66,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
+      - run: cargo check --workspace --all-targets --locked --features adam-llm-agent/schema
 
   # Licenses, advisories, banned and unknown sources: see deny.toml.
   deny:
@@ -136,7 +140,7 @@ jobs:
         with:
           tool: nextest
       - name: Tests (memory, Postgres, MongoDB, coder end to end)
-        run: cargo nextest run --workspace --locked --profile ci
+        run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema
       # Run the database suites a second time: this pass exercises migrate() on
       # an existing schema. The offline suites (coder end to end) do not repeat.
       - name: Database suites again, on the migrated schema
@@ -177,7 +181,7 @@ jobs:
           tool: nextest,cargo-llvm-cov
       - name: Run the tests instrumented
         run: >-
-          cargo llvm-cov nextest --workspace --locked --profile ci
+          cargo llvm-cov nextest --workspace --locked --profile ci --features adam-llm-agent/schema
           --ignore-filename-regex "$COVERAGE_IGNORE" --no-report
       - name: lcov report
         run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$COVERAGE_IGNORE"
