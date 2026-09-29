@@ -5,6 +5,7 @@
 //! pick Postgres, MongoDB, or their own storage without touching agent code.
 
 pub mod store;
+pub mod testing;
 
 pub use store::memory::MemoryStore;
 pub use store::{
