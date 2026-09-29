@@ -18,6 +18,7 @@ use crate::clock::{Clock, DynClock, SystemClock};
 use crate::envelope::Envelope;
 use crate::erased::{Erased, ErasedAgent, ErasedStarter, StarterOnly};
 use crate::events::{Artifact, DynEventSink, EventSink, NoopSink, RunEvent};
+use crate::notify::{DynNotifier, Notifier, Signal};
 use crate::retry::RetryPolicy;
 
 /// How often a commit that lost a CAS race is retried before giving up.
@@ -204,6 +205,9 @@ pub(crate) struct Inner {
     /// Bumped whenever local work appears, so local workers do not wait for
     /// the next poll.
     pub wake: watch::Sender<u64>,
+    /// Tells other processes about work and cancels, and them about ours.
+    /// `None`: only polling crosses a process boundary.
+    pub notifier: Option<DynNotifier>,
     /// Cancellation tokens of the transitions this runtime is stepping now.
     pub in_flight: Mutex<HashMap<RunId, CancelToken>>,
 }
@@ -237,6 +241,27 @@ impl Inner {
 
     pub fn notify_workers(&self) {
         self.wake.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// A run of `agent` became runnable now: wake local workers and tell
+    /// other processes.
+    pub async fn announce_runnable(&self, run: RunId, agent: &str) {
+        self.notify_workers();
+        if let Some(notifier) = &self.notifier {
+            notifier
+                .publish(Signal::Runnable {
+                    run,
+                    agent: agent.to_owned(),
+                })
+                .await;
+        }
+    }
+
+    /// `run` was finished by a cancel: tell other processes stepping it.
+    pub async fn announce_finished(&self, run: RunId) {
+        if let Some(notifier) = &self.notifier {
+            notifier.publish(Signal::Finished { run }).await;
+        }
     }
 
     pub async fn emit_status(
@@ -274,6 +299,7 @@ pub struct RuntimeBuilder {
     agents: HashMap<String, Registered>,
     sink: DynEventSink,
     clock: DynClock,
+    notifier: Option<DynNotifier>,
     cfg: Config,
 }
 
@@ -315,6 +341,17 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Where signals about new work and cancels go, and come from, so that
+    /// workers of other processes react at once instead of at their next
+    /// poll. Default: none, and only polling crosses a process boundary.
+    ///
+    /// Signals are hints: polling stays on with a notifier configured, and
+    /// correctness never depends on one arriving. See [`Notifier`].
+    pub fn notifier(mut self, notifier: impl Notifier) -> Self {
+        self.notifier = Some(Arc::new(notifier));
+        self
+    }
+
     /// Identity written into leases. Must be unique per worker process (or
     /// per `Runtime` when several share a store). Default: random.
     pub fn worker_id(mut self, id: impl Into<String>) -> Self {
@@ -329,7 +366,9 @@ impl RuntimeBuilder {
     }
 
     /// How often an idle worker polls for due runs. Default 250 ms.
-    /// `deliver`/`start` on the same `Runtime` wake local workers at once.
+    /// `deliver`/`start` on the same `Runtime` wake local workers at once, and
+    /// with a [`notifier`](Self::notifier) so do those of other processes.
+    /// Timers and retry backoffs are found by polling only.
     pub fn poll_interval(mut self, every: Duration) -> Self {
         self.cfg.poll_interval = every;
         self
@@ -369,6 +408,7 @@ impl RuntimeBuilder {
                 agents: self.agents,
                 sink: self.sink,
                 clock: self.clock,
+                notifier: self.notifier,
                 cfg: self.cfg,
                 wake: watch::channel(0).0,
                 in_flight: Mutex::default(),
@@ -381,7 +421,7 @@ impl RuntimeBuilder {
 /// observe them, and run workers that advance them.
 ///
 /// Cheap to clone; clones share everything (including the local wake-up
-/// channel). It holds no state of its own beyond configuration: everything
+/// channel and the notifier). It holds no state of its own beyond configuration: everything
 /// durable lives in the [`Store`](adam_core::Store).
 #[derive(Clone)]
 pub struct Runtime {
@@ -396,6 +436,7 @@ impl Runtime {
             agents: HashMap::new(),
             sink: Arc::new(NoopSink),
             clock: Arc::new(SystemClock),
+            notifier: None,
             cfg: Config {
                 worker_id: format!("worker-{}", uuid::Uuid::new_v4()),
                 lease_ttl: Duration::from_secs(30),
@@ -524,7 +565,7 @@ impl Runtime {
     }
 
     async fn started(&self, rec: &RunRecord) {
-        self.inner.notify_workers();
+        self.inner.announce_runnable(rec.id, &rec.agent).await;
         self.inner
             .emit_status(
                 rec.id,
@@ -581,7 +622,7 @@ impl Runtime {
             update.wake_at = wake_at;
             match self.inner.store.commit_run(run, rec.version, update).await {
                 Ok(_) => {
-                    self.inner.notify_workers();
+                    self.inner.announce_runnable(run, &rec.agent).await;
                     if woke {
                         self.inner
                             .emit_status(
@@ -609,9 +650,11 @@ impl Runtime {
     ///
     /// A step that is running at that moment is told through its
     /// [`CancelToken`] ([`Ctx::cancelled`](crate::Ctx::cancelled)): at once if
-    /// this runtime holds the run, within one poll interval if another
-    /// process does. The step is not aborted; it may stop early or run to its
-    /// end (its result is dropped either way).
+    /// this runtime holds the run, and if another process does, at once too
+    /// when both runtimes share a [`Notifier`] (a
+    /// [`Signal::Finished`]), otherwise within one poll interval. The step is
+    /// not aborted; it may stop early or run to its end (its result is
+    /// dropped either way).
     #[tracing::instrument(skip(self))]
     pub async fn cancel(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
         for _ in 0..MAX_COMMIT_RETRIES {
@@ -635,6 +678,7 @@ impl Runtime {
             match self.inner.store.commit_run(run, rec.version, update).await {
                 Ok(_) => {
                     self.inner.fire_cancel(run);
+                    self.inner.announce_finished(run).await;
                     self.inner
                         .emit_status(run, &rec.agent, RunStatus::Failed, Some(error))
                         .await;
