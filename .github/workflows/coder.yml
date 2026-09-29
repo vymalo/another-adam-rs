@@ -65,9 +65,12 @@ jobs:
       - name: Rendered chart keeps its guarantees
         run: sh deploy/coder/tests/render-check.sh
       # Schema-check the render: core kinds against the Kubernetes schemas, the
-      # CNPG Cluster and the ExternalSecret against the datreeio CRDs catalog.
-      # A kind without a schema fails (no -ignore-missing-schemas), so a new
-      # CRD in the chart has to be covered by the catalog.
+      # CNPG Cluster and the ExternalSecret against the CRD schemas vendored in
+      # deploy/coder/tests/schemas (a pinned copy of the datreeio catalog: a live
+      # catalog 500 once skipped the image job). A kind without a schema fails
+      # (no -ignore-missing-schemas), so a new CRD in the chart needs its schema
+      # there. The core schemas are still downloaded; a download failure (not a
+      # validation failure) is retried.
       - name: kubeconform
         env:
           KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
@@ -78,9 +81,20 @@ jobs:
           echo "$KUBECONFORM_SHA256  $RUNNER_TEMP/kubeconform.tgz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/kubeconform.tgz" -C "$RUNNER_TEMP" kubeconform
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
-            | "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
+            > "$RUNNER_TEMP/rendered.yaml"
+          for attempt in 1 2 3; do
+            status=0
+            "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
                 -schema-location default \
-                -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' -
+                -schema-location 'deploy/coder/tests/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                "$RUNNER_TEMP/rendered.yaml" > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
+            cat "$RUNNER_TEMP/kubeconform.out"
+            if [ "$status" -eq 0 ]; then exit 0; fi
+            if ! grep -q 'failed downloading schema' "$RUNNER_TEMP/kubeconform.out"; then exit "$status"; fi
+            echo "schema download failed (attempt $attempt of 3); retrying in 20 s"
+            sleep 20
+          done
+          exit 1
 
   dockerfile:
     name: lint Dockerfile
