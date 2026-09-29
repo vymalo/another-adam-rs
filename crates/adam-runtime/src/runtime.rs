@@ -291,6 +291,12 @@ impl RuntimeBuilder {
     /// A worker with the full [`Agent`] of the same name steps them.
     /// Registering a second starter or agent with the same name replaces the
     /// first.
+    ///
+    /// **The starter's `State` must be the [`Agent::State`] of the agent that
+    /// steps the run**, and `init` must produce what that agent's `init` would.
+    /// Nothing can check this across processes: a mismatch starts the run
+    /// successfully, then fails it as permanent on the worker's first step,
+    /// with an error naming the agent whose state did not decode.
     pub fn starter<S: AgentStarter>(self, starter: S) -> Self {
         let name = starter.name().to_owned();
         self.register(name, Registered::Starter(Arc::new(StarterOnly(starter))))

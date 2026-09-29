@@ -123,6 +123,29 @@ impl Agent for FnAgent {
     }
 }
 
+/// An agent whose state is a number, to meet a starter whose state is not.
+struct CountAgent(String);
+
+#[async_trait]
+impl Agent for CountAgent {
+    type State = u32;
+
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn init(&self, _input: Inbound) -> Result<u32, AgentError> {
+        Ok(0)
+    }
+
+    async fn step(&self, _ctx: &mut Ctx, state: u32) -> Result<Transition<u32>, AgentError> {
+        Ok(Transition::Done {
+            state,
+            output: json!(state),
+        })
+    }
+}
+
 /// A start-only registration whose state is the start payload, like
 /// [`FnAgent`].
 struct JsonStarter(String);
@@ -1541,6 +1564,29 @@ mod cases {
         let view = starter_last.view(run).await.unwrap().unwrap();
         w.stop().await;
         assert_eq!(view.status, RunStatus::Runnable);
+
+        // A starter whose State is not the agent's: the start succeeds, and the
+        // worker's first step fails the run, naming the agent and the cause.
+        let typed = uniq("starter-typed");
+        let front = Runtime::builder(store.clone())
+            .starter(JsonStarter(typed.clone()))
+            .worker_id(uniq("typed-front"))
+            .build();
+        let run = front
+            .start(&typed, Inbound::new("start", json!({"k": 1})), None)
+            .await
+            .unwrap();
+        let worker = Runtime::builder(store.clone())
+            .agent(CountAgent(typed.clone()))
+            .worker_id(uniq("typed-worker"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let w = spawn_worker(&worker);
+        let failed = wait_failed(&worker, run).await;
+        w.stop().await;
+        let error = failed.error.unwrap_or_default();
+        assert!(error.contains(&format!("{typed:?}")), "{error}");
+        assert!(error.contains("AgentStarter"), "{error}");
     }
 
     /// Events, durable artifacts, and reconstruction after a restart.

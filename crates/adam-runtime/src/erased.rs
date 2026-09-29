@@ -54,7 +54,14 @@ impl<S: AgentStarter> ErasedStarter for StarterOnly<S> {
 impl<A: Agent> ErasedAgent for Erased<A> {
     async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError> {
         let state: A::State = serde_json::from_value(state).map_err(|e| {
-            AgentError::permanent("stored agent state does not decode").with_source(e)
+            // With a start-only front, a mismatch between the starter's and this agent's
+            // `State` for the same name surfaces here, on the worker; say so.
+            AgentError::permanent(format!(
+                "stored agent state does not decode as {:?}'s state (if another process \
+                 started this run with an AgentStarter, its State must be this agent's State)",
+                self.0.name()
+            ))
+            .with_source(e)
         })?;
         Ok(match self.0.step(ctx, state).await? {
             Transition::Continue(s) => Transition::Continue(encode(&s)?),

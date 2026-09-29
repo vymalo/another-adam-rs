@@ -64,9 +64,10 @@ store.
   starter-only name stays `Runnable` until a worker with the agent takes it.
 * The last registration of a name wins, whichever kind it is, with a warning.
 * `starter.init` must return the state the agent of that name decodes; the
-  runtime stores it as JSON and cannot check the types agree.
-  `adam_llm_agent::LlmStarter` and `adam_coder::CoderStarter` are the two in
-  this workspace.
+  runtime stores it as JSON and cannot check the types agree across
+  processes. A mismatch starts the run, then fails it as permanent on the
+  worker's first step, with an error that names the agent and points at the
+  starter. `adam_llm_agent::LlmStarter` is the starter of an `LlmAgent`.
 
 ```rust
 let runtime = Runtime::builder(store)   // store: adam_core::DynStore
