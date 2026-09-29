@@ -19,7 +19,7 @@ pub(crate) struct Erased<A>(pub A);
 
 fn encode<S: serde::Serialize>(state: &S) -> Result<Value, AgentError> {
     serde_json::to_value(state)
-        .map_err(|e| AgentError::Permanent(format!("agent state is not serializable: {e}")))
+        .map_err(|e| AgentError::permanent("agent state is not serializable").with_source(e))
 }
 
 #[async_trait]
@@ -34,7 +34,7 @@ impl<A: Agent> ErasedAgent for Erased<A> {
 
     async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError> {
         let state: A::State = serde_json::from_value(state).map_err(|e| {
-            AgentError::Permanent(format!("stored agent state does not decode: {e}"))
+            AgentError::permanent("stored agent state does not decode").with_source(e)
         })?;
         Ok(match self.0.step(ctx, state).await? {
             Transition::Continue(s) => Transition::Continue(encode(&s)?),

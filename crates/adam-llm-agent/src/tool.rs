@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use adam_core::RunId;
+use adam_error::{Classify, ErrorClass};
 use adam_model::ToolSpec;
 use adam_runtime::{Artifact, CancelToken, DynEventSink, Emitter, RunEvent};
 use async_trait::async_trait;
@@ -82,8 +83,15 @@ impl ToolOutput {
 
 /// Why a tool call did not produce an output.
 ///
-/// Journaled, hence serializable.
+/// Journaled, hence serializable: the strings are the record and the serde shape is frozen, so
+/// old journals stay replayable. That is why it carries no `source`: a tool flattens its own
+/// cause into the message (with [`adam_error::report`]) before returning it.
+///
+/// Classes: `Transient` is [`ErrorClass::Transient`], `Permanent` is [`ErrorClass::Invalid`]
+/// (the model asked for something that cannot work, and is told so), and `NeedsInput` is
+/// [`ErrorClass::Rejected`] (valid, but it needs the user first).
 #[derive(Debug, Clone, PartialEq, thiserror::Error, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ToolError {
     /// Worth retrying (a timeout, a busy backend). The run's step fails with
     /// `AgentError::Transient` and the runtime retries it with backoff.
@@ -101,6 +109,16 @@ pub enum ToolError {
         /// What to ask the user.
         question: String,
     },
+}
+
+impl Classify for ToolError {
+    fn class(&self) -> ErrorClass {
+        match self {
+            Self::Transient(_) => ErrorClass::Transient,
+            Self::Permanent(_) => ErrorClass::Invalid,
+            Self::NeedsInput { .. } => ErrorClass::Rejected,
+        }
+    }
 }
 
 /// What a tool sees of the run it executes in.

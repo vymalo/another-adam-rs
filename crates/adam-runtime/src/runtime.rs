@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use adam_core::{DynStore, NewRun, RunId, RunRecord, RunStatus, RunUpdate, StoreError};
-use adam_error::ErrorClass;
+use adam_error::{BoxError, Classify, ErrorClass};
 
 use crate::agent::{Agent, AgentError, Inbound};
 use crate::cancel::CancelToken;
@@ -24,7 +24,12 @@ use crate::retry::RetryPolicy;
 pub(crate) const MAX_COMMIT_RETRIES: usize = 16;
 
 /// Why a [`Runtime`] call failed.
+///
+/// Decide from [`Classify::class`]: `UnknownAgent` is `Invalid`, `NotFound` is `NotFound`,
+/// `Finished` and `ConversationBusy` are `Rejected`, `Corrupt` is `Corrupt`, `Contended` is
+/// `Conflict`, and `Agent` and `Store` carry the class of the error they wrap.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RuntimeError {
     /// No agent with this name was registered on the builder.
     #[error("unknown agent {0:?}")]
@@ -56,6 +61,9 @@ pub enum RuntimeError {
         run: RunId,
         /// What is wrong with it.
         reason: String,
+        /// The decoder's own error, when there is one.
+        #[source]
+        source: Option<BoxError>,
     },
     /// Gave up after repeatedly losing commit races on the same run.
     #[error("too much contention on {0}, gave up retrying")]
@@ -68,19 +76,24 @@ pub enum RuntimeError {
     Store(#[from] StoreError),
 }
 
-impl RuntimeError {
-    /// Whether retrying the same call later may succeed.
-    pub fn is_retryable(&self) -> bool {
+impl Classify for RuntimeError {
+    fn class(&self) -> ErrorClass {
         match self {
-            Self::Contended(_) => true,
-            Self::Store(e) => matches!(
-                e,
-                StoreError::Backend {
-                    class: ErrorClass::Transient,
-                    ..
-                } | StoreError::Conflict { .. }
-            ),
-            _ => false,
+            Self::UnknownAgent(_) => ErrorClass::Invalid,
+            Self::NotFound(_) => ErrorClass::NotFound,
+            Self::Finished { .. } | Self::ConversationBusy { .. } => ErrorClass::Rejected,
+            Self::Corrupt { .. } => ErrorClass::Corrupt,
+            Self::Contended(_) => ErrorClass::Conflict,
+            Self::Agent(e) => e.class(),
+            Self::Store(e) => e.class(),
+        }
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Agent(e) => e.retry_after(),
+            Self::Store(e) => e.retry_after(),
+            _ => None,
         }
     }
 }
@@ -596,5 +609,93 @@ impl Runtime {
         };
         let env = Envelope::decode(run, &rec.state)?;
         Ok(Some(RunView::new(rec, env)))
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("lower")]
+    struct Lower;
+
+    /// Exhaustive: a new variant forces a class decision here.
+    fn expected(e: &RuntimeError) -> ErrorClass {
+        match e {
+            RuntimeError::UnknownAgent(_) => ErrorClass::Invalid,
+            RuntimeError::NotFound(_) => ErrorClass::NotFound,
+            RuntimeError::Finished { .. } => ErrorClass::Rejected,
+            RuntimeError::ConversationBusy { .. } => ErrorClass::Rejected,
+            RuntimeError::Corrupt { .. } => ErrorClass::Corrupt,
+            RuntimeError::Contended(_) => ErrorClass::Conflict,
+            RuntimeError::Agent(e) => e.class(),
+            RuntimeError::Store(e) => e.class(),
+        }
+    }
+
+    #[test]
+    fn class_table() {
+        let run = RunId::new();
+        let samples = [
+            RuntimeError::UnknownAgent("x".into()),
+            RuntimeError::NotFound(run),
+            RuntimeError::Finished {
+                run,
+                status: RunStatus::Done,
+            },
+            RuntimeError::ConversationBusy {
+                agent: "a".into(),
+                conversation_id: "c".into(),
+            },
+            RuntimeError::Corrupt {
+                run,
+                reason: "x".into(),
+                source: None,
+            },
+            RuntimeError::Contended("run x".into()),
+            RuntimeError::Agent(AgentError::permanent("x")),
+            RuntimeError::Agent(AgentError::transient_after("x", Duration::from_secs(3))),
+            RuntimeError::Store(StoreError::unavailable(Lower)),
+            RuntimeError::Store(StoreError::Conflict {
+                run,
+                expected: 1,
+                actual: 2,
+            }),
+            RuntimeError::Store(StoreError::NotFound(run)),
+        ];
+        for e in &samples {
+            assert_eq!(e.class(), expected(e), "{e}");
+        }
+        // One opinion on store errors, shared with AgentError: only an unavailable backend, a
+        // lost race, contention and a transient agent failure retry.
+        let retryable: Vec<bool> = samples.iter().map(Classify::is_retryable).collect();
+        assert_eq!(
+            retryable,
+            [
+                false, false, false, false, false, true, false, true, true, true, false
+            ]
+        );
+        assert_eq!(samples[7].retry_after(), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn corrupt_keeps_the_decoder_error_as_its_source() {
+        let e = Envelope::decode(
+            RunId::new(),
+            &serde_json::json!({"v": 1, "agent": null, "seq": "not a number"}),
+        )
+        .expect_err("garbage does not decode");
+        assert!(
+            matches!(
+                e,
+                RuntimeError::Corrupt {
+                    source: Some(_),
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(std::error::Error::source(&e).is_some_and(|s| s.is::<serde_json::Error>()));
     }
 }

@@ -229,6 +229,9 @@ impl Tool for Redacting {
             Err(ToolError::NeedsInput { question }) => Err(ToolError::NeedsInput {
                 question: r.scrub_string(question),
             }),
+            // `ToolError` is non_exhaustive: a variant added later must not slip past the
+            // redactor, so it is reported to the model as a scrubbed permanent error.
+            Err(other) => Err(ToolError::Permanent(r.scrub_string(report(&other)))),
         }
     }
 }

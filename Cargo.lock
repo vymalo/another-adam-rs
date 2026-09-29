@@ -215,6 +215,7 @@ name = "adam-llm-agent"
 version = "0.1.0"
 dependencies = [
  "adam-core",
+ "adam-error",
  "adam-model",
  "adam-runtime",
  "async-trait",

@@ -59,16 +59,25 @@ impl Envelope {
     }
 
     pub fn decode(run: RunId, state: &Value) -> Result<Self, RuntimeError> {
-        let corrupt = |reason: String| RuntimeError::Corrupt { run, reason };
+        let corrupt = |reason: String| RuntimeError::Corrupt {
+            run,
+            reason,
+            source: None,
+        };
         match state.get("v").and_then(Value::as_u64) {
             Some(v) if v == u64::from(VERSION) => {}
             Some(v) => return Err(corrupt(format!("unsupported envelope version {v}"))),
             None => return Err(corrupt("missing envelope version".into())),
         }
-        serde_json::from_value(state.clone()).map_err(|e| corrupt(e.to_string()))
+        serde_json::from_value(state.clone()).map_err(|e| RuntimeError::Corrupt {
+            run,
+            reason: "the envelope does not decode".into(),
+            source: Some(Box::new(e)),
+        })
     }
 
     pub fn encode(&self) -> Result<Value, StoreError> {
-        serde_json::to_value(self).map_err(|e| StoreError::InvalidInput(e.to_string()))
+        serde_json::to_value(self)
+            .map_err(|e| StoreError::InvalidInput(format!("the envelope does not serialize: {e}")))
     }
 }

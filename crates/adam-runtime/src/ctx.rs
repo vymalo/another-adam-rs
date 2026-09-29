@@ -203,7 +203,7 @@ impl Ctx {
         let result: Result<DateTime<Utc>, String> = self
             .step(NOW_STEP, || async move { Ok(clock.now()) })
             .await?;
-        result.map_err(|e| AgentError::Permanent(format!("journaled clock read failed: {e}")))
+        result.map_err(|e| AgentError::permanent(format!("journaled clock read failed: {e}")))
     }
 
     /// Journaled side effect.
@@ -251,7 +251,7 @@ impl Ctx {
         {
             Some(entry) => {
                 if entry.name != name {
-                    return Err(AgentError::NonDeterminism(format!(
+                    return Err(AgentError::non_determinism(format!(
                         "run {} step {seq}: journal has {:?}, code asked for {name:?}",
                         self.run, entry.name
                     )));
@@ -264,7 +264,8 @@ impl Ctx {
                     Err(e) => (false, serde_json::to_value(&e)),
                 };
                 let payload = payload.map_err(|e| {
-                    AgentError::Permanent(format!("step {name:?} result is not serializable: {e}"))
+                    AgentError::permanent(format!("step {name:?} result is not serializable"))
+                        .with_source(e)
                 })?;
                 let entry = if ok {
                     JournalEntry::ok(seq, name, payload)
@@ -278,10 +279,11 @@ impl Ctx {
             }
         };
         let decoded = decode::<T, E>(&entry).map_err(|e| {
-            AgentError::NonDeterminism(format!(
-                "run {} step {seq} ({name:?}): recorded result does not decode: {e}",
+            AgentError::non_determinism(format!(
+                "run {} step {seq} ({name:?}): recorded result does not decode",
                 self.run
             ))
+            .with_source(e)
         })?;
         self.seq = seq + 1;
         Ok(decoded)
@@ -339,7 +341,9 @@ impl Ctx {
 
 fn store_error(e: StoreError) -> AgentError {
     match e {
-        StoreError::NonDeterminism { .. } => AgentError::NonDeterminism(e.to_string()),
+        StoreError::NonDeterminism { .. } => {
+            AgentError::non_determinism("the journal disagrees with the code").with_source(e)
+        }
         other => AgentError::Store(other),
     }
 }

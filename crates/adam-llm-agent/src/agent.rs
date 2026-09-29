@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use adam_error::report;
 use adam_model::{
     Classify, DynModel, FinishReason, Message, ModelError, ModelRequest, ModelResponse, ToolCall,
     ToolSpec,
@@ -49,7 +50,9 @@ impl Default for Limits {
 }
 
 /// A model failure in journal form: [`ModelError`] is not serializable, but
-/// whether it is worth retrying must survive being recorded.
+/// whether it is worth retrying must survive being recorded. The journal is a
+/// persistence boundary, so the error chain is flattened here, once, with
+/// [`report`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModelFailure {
     retryable: bool,
@@ -58,20 +61,21 @@ struct ModelFailure {
     /// written before hints were honoured, which decode as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retry_after_ms: Option<u64>,
+    /// The error's [`ErrorClass`], for whoever reads the journal. Absent in
+    /// journals written before classes existed, which decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    class: Option<String>,
 }
 
 impl From<ModelError> for ModelFailure {
     fn from(e: ModelError) -> Self {
-        let retry_after_ms = match &e {
-            ModelError::RateLimited {
-                retry_after: Some(d),
-            } => Some(u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
-            _ => None,
-        };
         Self {
             retryable: e.is_retryable(),
-            message: e.to_string(),
-            retry_after_ms,
+            message: report(&e),
+            retry_after_ms: e
+                .retry_after()
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            class: Some(format!("{:?}", e.class())),
         }
     }
 }
@@ -180,7 +184,7 @@ impl LlmAgentBuilder {
 /// * Retryable model error (`ModelError::is_retryable`) or
 ///   [`ToolError::Transient`]: `AgentError::Transient`, retried by the runtime.
 ///   A `ModelError::RateLimited` that carries a `retry_after` becomes
-///   `AgentError::TransientAfter`, so the retry waits at least that long
+///   `AgentError::with_retry_after`, so the retry waits at least that long
 ///   (the runtime's backoff still applies when it is longer).
 /// * Other model error: the run fails (`model call failed: ...`).
 /// * [`ToolError::Permanent`], `ToolOutput { is_error: true }` and unknown
@@ -324,12 +328,12 @@ impl LlmAgent {
             // A recorded error is replayed forever on crash-replay, but a
             // transient retry starts at a fresh seq, so it calls again.
             Err(f) if f.retryable => {
-                let message = format!("model call failed: {}", f.message);
+                let error = AgentError::transient(format!("model call failed: {}", f.message));
                 return Err(match f.retry_after_ms {
                     // The provider said how long to wait: the runtime waits
-                    // at least that long (see `AgentError::TransientAfter`).
-                    Some(ms) => AgentError::TransientAfter(message, Duration::from_millis(ms)),
-                    None => AgentError::Transient(message),
+                    // at least that long (see `AgentError::with_retry_after`).
+                    Some(ms) => error.with_retry_after(Duration::from_millis(ms)),
+                    None => error,
                 });
             }
             Err(f) => return Ok(Flow::Fail(format!("model call failed: {}", f.message))),
@@ -497,7 +501,7 @@ impl LlmAgent {
             }
             Err(ToolError::Transient(reason)) => {
                 ctx.emit(end("transient_error")).await;
-                Err(AgentError::Transient(format!(
+                Err(AgentError::transient(format!(
                     "tool `{}` failed: {reason}",
                     call.name
                 )))
@@ -531,7 +535,7 @@ impl Agent for LlmAgent {
     /// not inspected.
     fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
         let text = parse_user_text(&input.payload)
-            .map_err(|reason| AgentError::Permanent(format!("unusable start message: {reason}")))?;
+            .map_err(|reason| AgentError::permanent(format!("unusable start message: {reason}")))?;
         Ok(Conversation::new(text))
     }
 
@@ -574,5 +578,53 @@ impl Agent for LlmAgent {
             Flow::Done(output) => Transition::Done { state, output },
             Flow::Fail(error) => Transition::Fail { state, error },
         })
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("connection reset")]
+    struct Reset;
+
+    #[test]
+    fn a_journaled_failure_keeps_the_class_the_hint_and_the_whole_chain() {
+        let limited = ModelFailure::from(ModelError::RateLimited {
+            retry_after: Some(Duration::from_secs(30)),
+        });
+        assert!(limited.retryable);
+        assert_eq!(limited.retry_after_ms, Some(30_000));
+        assert_eq!(limited.class.as_deref(), Some("RateLimited"));
+
+        // The journal is a boundary: the cause is flattened into the message, once.
+        let transient =
+            ModelFailure::from(ModelError::transient("connection failed").with_source(Reset));
+        assert!(transient.retryable);
+        assert_eq!(transient.retry_after_ms, None);
+        assert_eq!(
+            transient.message,
+            "transient model error: connection failed: connection reset"
+        );
+
+        let auth = ModelFailure::from(ModelError::Auth("bad key".into()));
+        assert!(!auth.retryable);
+        assert_eq!(auth.class.as_deref(), Some("Unauthenticated"));
+    }
+
+    /// Journals written before hints and classes existed still decode.
+    #[test]
+    fn old_journal_records_decode() {
+        let old: ModelFailure =
+            serde_json::from_value(json!({"retryable": true, "message": "boom"})).unwrap();
+        assert!(old.retryable);
+        assert_eq!(old.retry_after_ms, None);
+        assert_eq!(old.class, None);
+        // And a new record round-trips.
+        let new = ModelFailure::from(ModelError::transient("x"));
+        let back: ModelFailure =
+            serde_json::from_value(serde_json::to_value(&new).unwrap()).unwrap();
+        assert_eq!(back.class, new.class);
     }
 }

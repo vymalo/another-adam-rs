@@ -115,11 +115,22 @@ impl Agent for CoderAgent {
         // error body, so it passes through the redactor.
         let transition = match self.inner.step(ctx, state).await {
             Ok(t) => t,
-            Err(AgentError::Transient(m)) => {
-                return Err(AgentError::Transient(redactor.scrub_string(m)));
+            Err(AgentError::Transient {
+                message,
+                retry_after,
+                source,
+            }) => {
+                return Err(AgentError::Transient {
+                    message: redactor.scrub_string(message),
+                    retry_after,
+                    source,
+                });
             }
-            Err(AgentError::Permanent(m)) => {
-                return Err(AgentError::Permanent(redactor.scrub_string(m)));
+            Err(AgentError::Permanent { message, source }) => {
+                return Err(AgentError::Permanent {
+                    message: redactor.scrub_string(message),
+                    source,
+                });
             }
             Err(e) => return Err(e),
         };

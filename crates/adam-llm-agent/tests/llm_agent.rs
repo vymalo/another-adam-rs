@@ -383,7 +383,7 @@ async fn init_rejects_unreadable_start_input() {
     assert!(agent.init(Inbound::new("x", json!("bare"))).is_ok());
     assert!(matches!(
         agent.init(Inbound::new("message", json!({"nope": 1}))),
-        Err(AgentError::Permanent(_))
+        Err(AgentError::Permanent { .. })
     ));
 }
 

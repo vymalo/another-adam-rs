@@ -6,7 +6,7 @@ use std::time::Duration;
 use a2a::{Message, Task, TaskState};
 use adam_a2a::{BackendError, Caller, TaskBackend, TaskEvent};
 use adam_core::RunId;
-use adam_runtime::{BroadcastSink, RunView, Runtime, RuntimeError};
+use adam_runtime::{BroadcastSink, Classify, RunView, Runtime, RuntimeError};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use uuid::Uuid;

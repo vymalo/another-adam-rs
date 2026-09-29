@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+adam-error.workspace = true
 adam-core.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
