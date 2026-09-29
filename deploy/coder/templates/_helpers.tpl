@@ -57,3 +57,26 @@ plane starts runs without them (see docs/architecture.md, "Roles").
 {{- printf "http://%s.%s.svc.cluster.local:%d/" (include "coder.fullname" .) .Release.Namespace (int .Values.service.port) -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+topology=split: the front is its own Deployment. Its pods carry a different
+`app.kubernetes.io/name` (<name>-front) from the worker StatefulSet's, so the
+StatefulSet's selector (name + instance, immutable) never matches a front pod,
+and a helm upgrade between the two topologies keeps the StatefulSet as it is.
+*/}}
+{{- define "coder.frontName" -}}
+{{- printf "%s-front" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "coder.frontSelectorLabels" -}}
+app.kubernetes.io/name: {{ printf "%s-front" (include "coder.name" .) | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: front
+{{- end -}}
+
+{{- define "coder.frontLabels" -}}
+{{ include "coder.frontSelectorLabels" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end -}}

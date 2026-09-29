@@ -1244,6 +1244,31 @@ flowchart LR
     coder -->|"find and open pull request"| ghapi
 ```
 
+With `topology: split`:
+
+```mermaid
+flowchart LR
+    orch["Orchestrator<br/>namespace another-agentic-system"]
+    gw["OpenAI-compatible<br/>model gateway"]
+    remote["Git remote and GitHub REST API"]
+
+    subgraph k8s["Kubernetes: Helm chart deploy/coder, topology split"]
+        svc["Service<br/>ClusterIP :8080, selects the front"]
+        front["Deployment: front, front.replicas<br/>ROLE=control-plane, no volume"]
+        worker["StatefulSet: worker, 1 replica<br/>ROLE=worker, /healthz only"]
+        pvc[("PVC at /work")]
+        cnpg[("CloudNativePG cluster<br/>Postgres: runs and journal")]
+    end
+
+    orch -->|"A2A JSON-RPC + bearer token"| svc
+    svc --> front
+    front -->|"DATABASE_URL"| cnpg
+    worker -->|"DATABASE_URL"| cnpg
+    worker --- pvc
+    worker -->|"chat completions"| gw
+    worker -->|"git, pull requests"| remote
+```
+
 Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
 
 * **Image.** Two stages. The first compiles `adam-coder` on `rust:1.94-trixie`
@@ -1252,9 +1277,21 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini,
   OpenCode), pinned by an immutable tag. The last `RUN` is a smoke test as uid
   10001. The entrypoint is `tini -- adam-coder`. It listens on `0.0.0.0:8080`.
-* **One replica.** The worktrees live on a ReadWriteOnce volume and the
-  workspace layer assumes one process per workspace root. Runs are leased in
-  Postgres, so more replicas work only with a shared `/work`.
+* **Topology.** `topology: combined` (the default, the diagram above) is one StatefulSet
+  running `adam-coder` as `all`. `topology: split` deploys the two halves as separate
+  workloads (diagram below): a front `Deployment` (`ROLE=control-plane`, no volume, replicas
+  from `front.replicas`) that the Service selects, and the worker `StatefulSet`
+  (`ROLE=worker`), which keeps the combined StatefulSet's name, selector and volume claim, so
+  switching topology reuses the same PVC. The front holds only `DATABASE_URL` and the A2A
+  tokens; the worker holds the model and GitHub secrets and the volume. Deploy-only: no
+  binary changed. Verified 2026-09-29: `crates/adam-coder/src/config.rs` requires
+  `A2A_BEARER_TOKENS` and `PUBLIC_URL` only for the roles that serve A2A.
+* **One worker.** Runs move between workers at every step (`adam-runtime`'s worker), while
+  the worktrees live on a ReadWriteOnce volume. A second worker without a shared `/work`
+  would continue a run on a checkout that is not there, and fork it into a second pull
+  request. The chart therefore refuses `replicaCount > 1` in both topologies; scaling
+  workers needs workspace placement (decision 10 of ADR 0001, planned). The front scales
+  freely: it is stateless.
 * **Probes** hit `/healthz`. Graceful shutdown gets 120 seconds: on SIGTERM the
   workers finish the steps they are in. A step cut short by SIGKILL is taken
   over by the next start once its lease expires.

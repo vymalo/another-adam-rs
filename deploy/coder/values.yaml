@@ -13,9 +13,30 @@ image:
 # The image package may be private; name a pull secret here if so.
 imagePullSecrets: []
 
-# One replica for the MVP: the worktrees live on a ReadWriteOnce volume, and
-# the workspace layer assumes one process per workspace root. Runs are leased
-# in Postgres, so a second replica would work only with a shared /work.
+# How the binary is deployed.
+#   combined  one StatefulSet runs the A2A server and the workers (config.role).
+#   split     a front Deployment (ROLE=control-plane, no volume) serves A2A, and
+#             the StatefulSet below becomes the worker (ROLE=worker). The
+#             StatefulSet keeps its name, selector and volume claim, so
+#             switching either way reuses the same PVC. config.role must be
+#             empty: the chart sets ROLE itself.
+topology: combined
+
+# The front Deployment; rendered only with topology=split.
+front:
+  replicas: 1
+  terminationGracePeriodSeconds: 30
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+# The workers: the StatefulSet's replicas. Keep 1: runs move between workers at
+# every step, and the worktrees live on a ReadWriteOnce volume, so a second
+# worker without a shared /work would fork a run into a second pull request.
+# The chart refuses to render with more than 1 until workspace placement exists.
 replicaCount: 1
 
 # Environment of the binary (see crates/adam-coder/src/config.rs). Secrets are
@@ -23,8 +44,9 @@ replicaCount: 1
 config:
   # What the process runs: all, control-plane or worker (ROLE). Empty leaves ROLE
   # unset, and the binary runs `all`: the A2A server and the workers in one
-  # process. This chart still deploys one StatefulSet; a role other than `all`
-  # only changes what that pod runs, it does not split the deployment.
+  # process. With topology=combined a role other than `all` only changes what
+  # that one pod runs; leave it empty with topology=split, which sets ROLE for
+  # the front (control-plane) and the worker (worker) itself.
   # `control-plane` renders none of the model, GitHub and workspace settings
   # below (modelBaseUrl through gitAuthorEmail) and none of the two secrets
   # they need (properties.modelApiKey, properties.githubToken): it only starts,

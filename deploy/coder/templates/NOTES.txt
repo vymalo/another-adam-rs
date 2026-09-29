@@ -4,3 +4,9 @@ The coder agent is deployed and reachable only inside the cluster:
 
 Agent card: <url>/.well-known/agent-card.json (public). Everything else needs
 `Authorization: Bearer <token>` (a token from A2A_BEARER_TOKENS).
+{{- if eq .Values.topology "split" }}
+
+Topology split:
+  front   Deployment {{ include "coder.frontName" . }} x{{ .Values.front.replicas }} (control-plane: serves A2A, no volume)
+  worker  StatefulSet {{ include "coder.fullname" . }} x{{ .Values.replicaCount }} (worker: runs the steps, owns /work)
+{{- end }}
