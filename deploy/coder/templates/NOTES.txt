@@ -1,0 +1,6 @@
+The coder agent is deployed and reachable only inside the cluster:
+
+  http://{{ include "coder.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}/
+
+Agent card: <url>/.well-known/agent-card.json (public). Everything else needs
+`Authorization: Bearer <token>` (a token from A2A_BEARER_TOKENS).

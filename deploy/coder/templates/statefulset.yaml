@@ -1,0 +1,147 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "coder.fullname" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "coder.fullname" . }}
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "coder.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "coder.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: coder
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            - name: WORKSPACE_ROOT
+              value: /work
+            - name: PUBLIC_URL
+              value: {{ include "coder.publicUrl" . | quote }}
+            - name: MODEL_BASE_URL
+              value: {{ .Values.config.modelBaseUrl | quote }}
+            - name: MODEL
+              value: {{ .Values.config.model | quote }}
+            - name: OPENCODE_MODEL
+              value: {{ .Values.config.opencodeModel | quote }}
+            - name: WORKERS
+              value: {{ .Values.config.workers | quote }}
+            - name: MAX_CHECK_CYCLES
+              value: {{ .Values.config.maxCheckCycles | quote }}
+            - name: CHECK_TIMEOUT_SECS
+              value: {{ .Values.config.checkTimeoutSecs | quote }}
+            - name: PR_DRAFT
+              value: {{ .Values.config.prDraft | quote }}
+            - name: GIT_AUTHOR_NAME
+              value: {{ .Values.config.gitAuthorName | quote }}
+            - name: GIT_AUTHOR_EMAIL
+              value: {{ .Values.config.gitAuthorEmail | quote }}
+            {{- range $name, $value := .Values.config.extraEnv }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- if .Values.database.enabled }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  # Created by CloudNativePG for the app database and owner.
+                  name: {{ include "coder.dbName" . }}-app
+                  key: uri
+            {{- end }}
+            {{- if .Values.externalSecrets.enabled }}
+            - name: MODEL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coder.secretName" . }}
+                  key: MODEL_API_KEY
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coder.secretName" . }}
+                  key: GITHUB_TOKEN
+            - name: A2A_BEARER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coder.secretName" . }}
+                  key: A2A_BEARER_TOKENS
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /work
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+        labels:
+          {{- include "coder.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}

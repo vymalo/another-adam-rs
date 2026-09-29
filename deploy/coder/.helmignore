@@ -1,0 +1,5 @@
+# Not part of the packaged chart.
+tests/
+bump-tag.sh
+README.md
+.helmignore
