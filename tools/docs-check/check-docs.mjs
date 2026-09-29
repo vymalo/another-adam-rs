@@ -73,6 +73,9 @@ for (const file of markdownFiles(root)) {
     catch (e) { failures.push(`${rel}:${lineOf(src, m.index)} mermaid: ${String(e.message).split('\n')[0]}`); }
   }
 
+  // A malformed `%` in a link is reported as that link's failure instead of aborting the run.
+  const decode = (s, fn) => { try { return fn(s); } catch { return null; } };
+
   // Blank out fenced blocks and inline code spans (keeping line numbers) so
   // example links inside code are not checked.
   const blank = (code) => code.replace(/[^\n]/g, ' ');
@@ -84,13 +87,19 @@ for (const file of markdownFiles(root)) {
     if (/^[a-z][a-z0-9+.-]*:/i.test(pathPart)) continue; // http(s):, mailto:
     if (!pathPart && !fragment) continue;
     links++;
-    const target = pathPart ? path.resolve(path.dirname(file), decodeURI(pathPart)) : file;
+    const decodedPath = pathPart ? decode(pathPart, decodeURI) : '';
+    const decodedFragment = fragment ? decode(fragment, decodeURIComponent) : '';
+    if (decodedPath === null || decodedFragment === null) {
+      failures.push(`${rel}:${lineOf(src, m.index)} malformed percent-encoding: ${m[1]}`);
+      continue;
+    }
+    const target = pathPart ? path.resolve(path.dirname(file), decodedPath) : file;
     if (!fs.existsSync(target)) {
       failures.push(`${rel}:${lineOf(src, m.index)} broken link: ${m[1]}`);
       continue;
     }
     if (fragment && target.endsWith('.md') && fs.statSync(target).isFile()
-        && !anchorsOf(target).has(decodeURIComponent(fragment).toLowerCase())) {
+        && !anchorsOf(target).has(decodedFragment.toLowerCase())) {
       failures.push(`${rel}:${lineOf(src, m.index)} no such heading: ${m[1]}`);
     }
   }
