@@ -1269,6 +1269,115 @@ async fn rate_limited_model_backs_off_and_completes(store: DynStore) {
     assert!(seen.artifacts.iter().any(|(n, _)| n == "pull_request"));
 }
 
+// ------------------------------------------------------------------ cancel
+
+/// CancelTask while OpenCode is mid-turn. The task ends `canceled` at once;
+/// the step's cancel token reaches the delegate tool, which stops the ACP turn
+/// (`session/cancel`) and kills OpenCode and what it started, so nothing is
+/// left running. The model is never asked again, so nothing is committed,
+/// pushed or opened.
+async fn cancel_during_opencode_turn_cancels_without_push_or_pr(store: DynStore) {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let pid_file = agent_dir.path().join("agent.pid");
+    let child_file = agent_dir.path().join("child.pid");
+    let fx = Fixture::with("hello\n", |s| {
+        s.opencode = OpenCodeLaunch::program(common::fake_agent())
+            .env("FAKE_ACP_SCENARIO", "slow")
+            .env("FAKE_ACP_PID_FILE", pid_file.to_string_lossy())
+            .env("FAKE_ACP_CHILD_PID_FILE", child_file.to_string_lossy());
+    })
+    .await;
+    let mock = Arc::new(MockModel::new());
+    // The whole happy path is scripted: what a cancelled run must not reach
+    // (checks, commit, push, pull request) is there to be reached.
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+
+    let mut stream = server
+        .client
+        .send_streaming_message(&request(user("add hello.txt")))
+        .await
+        .unwrap();
+    let mut seen = Seen::default();
+    seen.record(stream.next().await.expect("snapshot").unwrap());
+    let worker = spawn_worker(&server.coder);
+
+    // OpenCode is mid-turn once it has started its own child.
+    let agent = common::wait_for_pid(&pid_file).await;
+    let grandchild = common::wait_for_pid(&child_file).await;
+    assert!(
+        !common::process_gone(agent, true),
+        "OpenCode should be running"
+    );
+
+    let cancelled_at = Instant::now();
+    let canceled = server
+        .client
+        .cancel_task(&a2a::CancelTaskRequest {
+            id: seen.task_id.clone(),
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream ends after the cancel")
+    {
+        seen.record(item.unwrap());
+    }
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Canceled),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(2),
+        "canceled within 2 s, took {:?}",
+        cancelled_at.elapsed()
+    );
+
+    // No orphan: OpenCode is reaped and its child is dead, within 5 s.
+    assert!(
+        common::wait_gone(agent, true, Duration::from_secs(5)).await,
+        "OpenCode (pid {agent}) is still there after the cancel"
+    );
+    assert!(
+        common::wait_gone(grandchild, false, Duration::from_secs(5)).await,
+        "OpenCode's child (pid {grandchild}) is still there after the cancel"
+    );
+
+    // The run is over for good: the step that was cancelled does not go on.
+    worker.stop().await;
+    let done = server
+        .client
+        .get_task(&a2a::GetTaskRequest {
+            id: seen.task_id.clone(),
+            history_length: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(done.status.state, TaskState::Canceled);
+    assert!(
+        !done
+            .artifacts
+            .unwrap_or_default()
+            .iter()
+            .any(|a| { matches!(a.name.as_deref(), Some("branch" | "pull_request")) }),
+        "a canceled run delivers nothing"
+    );
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "prepare and delegate, and no model turn after the cancel"
+    );
+    assert!(fx.agent_branches().is_empty(), "nothing was pushed");
+    assert!(fx.created_pulls().await.is_empty(), "no pull request");
+}
+
 // ------------------------------------------------------- concurrent tasks
 
 /// One scripted model per task, chosen by a marker in the task's text: two
@@ -1696,6 +1805,7 @@ macro_rules! coder_suite {
                 opencode_crashing_every_time_fails_the_run_with_its_stderr,
                 opencode_crashing_once_is_retried_and_completes,
                 rate_limited_model_backs_off_and_completes,
+                cancel_during_opencode_turn_cancels_without_push_or_pr,
                 two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs,
                 a_github_401_fails_the_run_with_a_clear_message,
                 secrets_in_opencode_stderr_never_reach_the_client,

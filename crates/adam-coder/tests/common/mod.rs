@@ -484,6 +484,56 @@ pub fn launches(log: &Path) -> usize {
     std::fs::read_to_string(log).map_or(0, |t| t.lines().count())
 }
 
+/// The process id a test agent wrote to `file`, once it has (polls up to 30 s).
+pub async fn wait_for_pid(file: &Path) -> u32 {
+    for _ in 0..3000 {
+        if let Some(pid) = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+        {
+            return pid;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{} never got a pid", file.display());
+}
+
+/// Whether process `pid` is gone. With `reaped` a zombie still counts as
+/// alive (its parent never collected it); without, a zombie is dead, which is
+/// all one can ask of a grandchild that an init without a reaper adopted.
+pub fn process_gone(pid: u32, reaped: bool) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) if Path::new("/proc/self/stat").exists() => true,
+        Ok(stat) => {
+            !reaped
+                && stat
+                    .rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+        }
+        // No /proc: ask the shell.
+        Err(_) => !Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success()),
+    }
+}
+
+/// Wait up to `within` for `pid` to be gone (see [`process_gone`]).
+pub async fn wait_gone(pid: u32, reaped: bool, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if process_gone(pid, reaped) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// One raw HTTP/1.1 request; `(status, whole response)`.
 pub async fn raw(
     addr: std::net::SocketAddr,

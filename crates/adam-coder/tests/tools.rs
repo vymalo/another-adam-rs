@@ -3,6 +3,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::checks::RunChecks;
@@ -11,7 +12,7 @@ use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
 use adam_coder::tools::{ToolEnv, ask::AskUser};
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
-use adam_runtime::{CollectingSink, RunEvent};
+use adam_runtime::{CancelToken, CollectingSink, RunEvent};
 use common::{Fixture, PR_URL};
 use serde_json::{Value, json};
 
@@ -473,6 +474,95 @@ async fn delegate_to_opencode_streams_updates_and_returns_the_summary() {
         progress.iter().any(|p| p.contains("turn ended (end_turn)")),
         "{progress:?}"
     );
+}
+
+/// The run is cancelled while OpenCode ignores `session/cancel` (a hung tool):
+/// the tool gives it a short grace, then kills it and what it started, waits
+/// until it is reaped, and fails as cancelled, all without help from the
+/// caller. Nothing is left running when `call` returns.
+#[tokio::test]
+async fn delegate_to_opencode_kills_a_stubborn_opencode_when_the_run_is_cancelled() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let pid_file = agent_dir.path().join("agent.pid");
+    let child_file = agent_dir.path().join("child.pid");
+    let fx = Fixture::with("hello\n", |s| {
+        s.opencode = OpenCodeLaunch::program(common::fake_agent())
+            .env("FAKE_ACP_SCENARIO", "stubborn")
+            .env("FAKE_ACP_PID_FILE", pid_file.to_string_lossy())
+            .env("FAKE_ACP_CHILD_PID_FILE", child_file.to_string_lossy());
+    })
+    .await;
+    let mut rig = Rig::from(fx);
+    let token = CancelToken::new();
+    rig.ctx = rig.ctx.with_cancel_token(token.clone());
+    rig.prepare().await;
+
+    let tool = DelegateToOpenCode::new(rig.env());
+    let cancel_when_running = async {
+        let grandchild = common::wait_for_pid(&child_file).await;
+        token.cancel();
+        grandchild
+    };
+    let started = Instant::now();
+    let (out, grandchild) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            tool.call(&rig.ctx, json!({"instructions": "never finish"})),
+            cancel_when_running
+        )
+    })
+    .await
+    .expect("the tool returns after a cancel");
+
+    assert!(
+        matches!(&out, Err(ToolError::Permanent(m)) if m.contains("cancelled")),
+        "{out:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a cancel must not wait for the agent: {:?}",
+        started.elapsed()
+    );
+    let agent = common::wait_for_pid(&pid_file).await;
+    assert!(
+        common::process_gone(agent, true),
+        "OpenCode (pid {agent}) must be reaped when the tool returns"
+    );
+    assert!(
+        common::wait_gone(grandchild, false, Duration::from_secs(5)).await,
+        "OpenCode's child (pid {grandchild}) survived"
+    );
+}
+
+/// A cancelled run must not publish, even if the model asked for several
+/// calls in one turn and a later one is next in line: the cancelled tool's
+/// result is only an error to the loop, which goes on to the next call.
+#[tokio::test]
+async fn publishing_tools_refuse_to_act_for_a_cancelled_run() {
+    let mut rig = Rig::new().await;
+    let token = CancelToken::new();
+    rig.ctx = rig.ctx.with_cancel_token(token.clone());
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+    token.cancel();
+
+    let push = CommitAndPush::new(rig.env())
+        .call(&rig.ctx, json!({"message": "feat: add a"}))
+        .await;
+    assert!(
+        matches!(&push, Err(ToolError::Permanent(m)) if m.contains("cancelled")),
+        "{push:?}"
+    );
+    let pr = OpenPullRequest::new(rig.env())
+        .call(&rig.ctx, json!({"title": "feat: add a", "body": "b"}))
+        .await;
+    assert!(
+        matches!(&pr, Err(ToolError::Permanent(m)) if m.contains("cancelled")),
+        "{pr:?}"
+    );
+    assert!(rig.fx.agent_branches().is_empty(), "nothing was pushed");
+    assert!(rig.fx.created_pulls().await.is_empty(), "no pull request");
+    let log = common::git(&rig.worktree(), &["log", "--oneline"]);
+    assert_eq!(log.lines().count(), 1, "nothing was committed: {log}");
 }
 
 #[tokio::test]
