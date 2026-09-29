@@ -1,0 +1,226 @@
+{
+  "mappings": [
+    {
+      "name": "final answer after a tool result (stream)",
+      "priority": 2,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          },
+          {
+            "matchesJsonPath": "$.messages[?(@.role == 'tool')]"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-final.sse",
+        "transformers": [
+          "response-template"
+        ],
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        },
+        "chunkedDribbleDelay": {
+          "numberOfChunks": 5,
+          "totalDuration": 250
+        }
+      }
+    },
+    {
+      "name": "final answer after a tool result",
+      "priority": 3,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": "$.messages[?(@.role == 'tool')]"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-final.json",
+        "transformers": [
+          "response-template"
+        ],
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    },
+    {
+      "name": "tool call (stream, header)",
+      "priority": 4,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "tool-call"
+          }
+        },
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-tool-call.sse",
+        "transformers": [
+          "response-template"
+        ],
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        },
+        "chunkedDribbleDelay": {
+          "numberOfChunks": 5,
+          "totalDuration": 250
+        }
+      }
+    },
+    {
+      "name": "tool call (stream, keyword)",
+      "priority": 4,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          },
+          {
+            "contains": "[mock:tool-call]"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-tool-call.sse",
+        "transformers": [
+          "response-template"
+        ],
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        },
+        "chunkedDribbleDelay": {
+          "numberOfChunks": 5,
+          "totalDuration": 250
+        }
+      }
+    },
+    {
+      "name": "tool call (header)",
+      "priority": 5,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "tool-call"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-tool-call.json",
+        "transformers": [
+          "response-template"
+        ],
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    },
+    {
+      "name": "tool call (keyword)",
+      "priority": 5,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:tool-call]"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-tool-call.json",
+        "transformers": [
+          "response-template"
+        ],
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    },
+    {
+      "name": "text answer (stream)",
+      "priority": 8,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-text.sse",
+        "transformers": [
+          "response-template"
+        ],
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        },
+        "chunkedDribbleDelay": {
+          "numberOfChunks": 5,
+          "totalDuration": 250
+        }
+      }
+    },
+    {
+      "name": "text answer",
+      "priority": 9,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions"
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "chat-text.json",
+        "transformers": [
+          "response-template"
+        ],
+        "headers": {
+          "Content-Type": "application/json"
+        }
+      }
+    }
+  ]
+}

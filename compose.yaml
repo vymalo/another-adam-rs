@@ -1,0 +1,140 @@
+# Local development stack: databases, WireMock mocks of the external systems,
+# a local git remote, and (profile `app`) the coder wired to all of them.
+# Everything binds to 127.0.0.1 only; every credential in here is a dummy.
+#
+#   docker compose up -d --wait          # postgres, mongodb and the mocks
+#   docker compose --profile app up -d --build --wait   # ... and the coder
+#   docker compose down -v               # stop and forget all state
+#
+# See "Local development" in README.md for the endpoints, the environment
+# variables that point the code at the mocks, and the scenario switches.
+
+name: adam-rs
+
+x-wiremock: &wiremock
+  # 3.13.2 is the newest 3.x release; the tag exists on Docker Hub (verified
+  # 2026-09-29 against registry-1.docker.io, library listing of wiremock/wiremock).
+  image: wiremock/wiremock:3.13.2
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/__admin/health"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+    start_period: 5s
+
+services:
+  # ------------------------------------------------------------ databases --
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres # dummy, local only
+      POSTGRES_DB: adam_test
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30
+
+  mongodb:
+    # Standalone mongod is enough: the store uses no multi-document transactions.
+    image: mongo:7
+    ports: ["127.0.0.1:${MONGODB_PORT:-27017}:27017"]
+    volumes:
+      - mongodb-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 2s
+      retries: 30
+
+  # ---------------------------------------------------------------- mocks --
+
+  # OpenAI-compatible chat completions (also `/chat/completions` without /v1):
+  # text and tool-call answers, streaming and not, and error scenarios.
+  # Base URL for clients: http://127.0.0.1:8081/v1
+  mock-openai:
+    <<: *wiremock
+    command: ["--global-response-templating"]
+    ports: ["127.0.0.1:${MOCK_OPENAI_PORT:-8081}:8080"]
+    volumes:
+      - ./dev/wiremock/mock-openai/mappings:/home/wiremock/mappings:ro
+      - ./dev/wiremock/mock-openai/__files:/home/wiremock/__files:ro
+
+  # The GitHub REST subset adam-workspace uses (list and open pull requests).
+  # API root for clients: http://127.0.0.1:8082
+  mock-github:
+    <<: *wiremock
+    command: ["--global-response-templating"]
+    ports: ["127.0.0.1:${MOCK_GITHUB_PORT:-8082}:8080"]
+    volumes:
+      - ./dev/wiremock/mock-github/mappings:/home/wiremock/mappings:ro
+      - ./dev/wiremock/mock-github/__files:/home/wiremock/__files:ro
+
+  # A git remote for the coder: bare repositories over smart HTTP, seeded with
+  # local/sandbox.git (a README and a `just check` script). No authentication.
+  # Clone URL: http://127.0.0.1:8083/local/sandbox.git
+  git-server:
+    build:
+      context: ./dev/git-server
+    restart: unless-stopped
+    ports: ["127.0.0.1:${GIT_SERVER_PORT:-8083}:8080"]
+    volumes:
+      - git-data:/srv/git
+
+  # ------------------------------------------------------------------ app --
+
+  # The coder agent (A2A server + workers), built from the repository root and
+  # wired to the mocks: model = mock-openai, pull requests = mock-github,
+  # remote = git-server (use http://git-server:8080/local/sandbox.git as the
+  # repository in a task). Needs the workspace base image of
+  # docker/coder/Dockerfile to be pullable.
+  coder:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: docker/coder/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-openai:
+        condition: service_healthy
+      mock-github:
+        condition: service_healthy
+      git-server:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/adam_test
+      MODEL_BASE_URL: http://mock-openai:8080/v1
+      MODEL_API_KEY: mock-api-key # dummy: the mock accepts anything
+      MODEL: mock-model
+      GITHUB_API_URL: http://mock-github:8080
+      # Dummy. Set MOCK_GITHUB_TOKEN=bad-token to make mock-github answer 401.
+      GITHUB_TOKEN: ${MOCK_GITHUB_TOKEN:-dev-github-token}
+      # Dummy bearer token for the A2A endpoint; never reuse it anywhere real.
+      A2A_BEARER_TOKENS: dev-token
+      PUBLIC_URL: http://127.0.0.1:${CODER_PORT:-8080}/
+      WORKSPACE_ROOT: /work
+      # Repositories may live only on git-server, and plain http is accepted:
+      # both are development-only settings, never set them in production.
+      ALLOWED_REPO_HOSTS: git-server
+      ALLOW_LOCAL_REPOS: "true"
+    ports: ["127.0.0.1:${CODER_PORT:-8080}:8080"]
+    volumes:
+      - coder-work:/work
+    healthcheck:
+      # Plain TCP connect: the image is not guaranteed to ship curl.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+volumes:
+  postgres-data:
+  mongodb-data:
+  git-data:
+  coder-work:

@@ -1,0 +1,16 @@
+{
+  "id": "chatcmpl-mock{{randomValue length=12 type='ALPHANUMERIC'}}",
+  "object": "chat.completion",
+  "created": {{now format='unix'}},
+  "model": {{{toJson (jsonPath request.body '$.model' default='mock-model')}}},
+  "system_fingerprint": "fp_mock",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "The tool finished; that is all the mock model has to say."},
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 32, "completion_tokens": 13, "total_tokens": 45}
+}

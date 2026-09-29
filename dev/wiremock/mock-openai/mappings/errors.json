@@ -1,0 +1,222 @@
+{
+  "mappings": [
+    {
+      "name": "rate-limit (header)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "rate-limit"
+          }
+        }
+      },
+      "response": {
+        "status": 429,
+        "headers": {
+          "Content-Type": "application/json",
+          "Retry-After": "2"
+        },
+        "jsonBody": {
+          "error": {
+            "message": "Rate limit reached for mock-model in organization org-mock on requests per min. Please try again in 2s.",
+            "type": "requests",
+            "param": null,
+            "code": "rate_limit_exceeded"
+          }
+        }
+      }
+    },
+    {
+      "name": "rate-limit (keyword)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:rate-limit]"
+          }
+        ]
+      },
+      "response": {
+        "status": 429,
+        "headers": {
+          "Content-Type": "application/json",
+          "Retry-After": "2"
+        },
+        "jsonBody": {
+          "error": {
+            "message": "Rate limit reached for mock-model in organization org-mock on requests per min. Please try again in 2s.",
+            "type": "requests",
+            "param": null,
+            "code": "rate_limit_exceeded"
+          }
+        }
+      }
+    },
+    {
+      "name": "server-error (header)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "server-error"
+          }
+        }
+      },
+      "response": {
+        "status": 500,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": {
+            "message": "The server had an error while processing your request. Sorry about that!",
+            "type": "server_error",
+            "param": null,
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "server-error (keyword)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:server-error]"
+          }
+        ]
+      },
+      "response": {
+        "status": 500,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": {
+            "message": "The server had an error while processing your request. Sorry about that!",
+            "type": "server_error",
+            "param": null,
+            "code": null
+          }
+        }
+      }
+    },
+    {
+      "name": "unauthorized (header)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "unauthorized"
+          }
+        }
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": {
+            "message": "Incorrect API key provided: mock-key. You can find your API key at https://platform.openai.com/account/api-keys.",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": "invalid_api_key"
+          }
+        }
+      }
+    },
+    {
+      "name": "unauthorized (keyword)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:unauthorized]"
+          }
+        ]
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": {
+            "message": "Incorrect API key provided: mock-key. You can find your API key at https://platform.openai.com/account/api-keys.",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": "invalid_api_key"
+          }
+        }
+      }
+    },
+    {
+      "name": "context-length (header)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "context-length"
+          }
+        }
+      },
+      "response": {
+        "status": 400,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": {
+            "message": "This model's maximum context length is 8192 tokens. However, your messages resulted in 9001 tokens. Please reduce the length of the messages.",
+            "type": "invalid_request_error",
+            "param": "messages",
+            "code": "context_length_exceeded"
+          }
+        }
+      }
+    },
+    {
+      "name": "context-length (keyword)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:context-length]"
+          }
+        ]
+      },
+      "response": {
+        "status": 400,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": {
+            "message": "This model's maximum context length is 8192 tokens. However, your messages resulted in 9001 tokens. Please reduce the length of the messages.",
+            "type": "invalid_request_error",
+            "param": "messages",
+            "code": "context_length_exceeded"
+          }
+        }
+      }
+    }
+  ]
+}

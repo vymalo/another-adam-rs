@@ -1,0 +1,18 @@
+{{#assign 'n'~}}{{#if (matches request.query.head '.*already-open.*')}}7{{else}}42{{/if}}{{~/assign~}}
+{{#assign 'o'~}}{{request.path.[1]}}{{~/assign~}}
+{{#assign 'r'~}}{{request.path.[2]}}{{~/assign~}}
+{{#assign 'branch'~}}{{regexExtract request.query.head '[^:]+$'}}{{~/assign~}}
+[
+  {
+    "url": "{{request.baseUrl}}/repos/{{o}}/{{r}}/pulls/{{n}}",
+    "id": 100{{n}},
+    "html_url": "{{request.baseUrl}}/{{o}}/{{r}}/pull/{{n}}",
+    "number": {{n}},
+    "state": "open",
+    "draft": false,
+    "title": "Existing pull request",
+    "user": {"login": "mock-user", "type": "User"},
+    "head": {"label": "{{o}}:{{branch}}", "ref": {{{toJson branch}}}, "sha": "0000000000000000000000000000000000000001"},
+    "base": {"label": "{{o}}:main", "ref": "main", "sha": "0000000000000000000000000000000000000000"}
+  }
+]

@@ -1,0 +1,3 @@
+# The repository's checks; `just check` is what the coder runs.
+check:
+    sh ./check.sh

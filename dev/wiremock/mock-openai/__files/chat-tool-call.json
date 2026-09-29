@@ -1,0 +1,29 @@
+{
+  "id": "chatcmpl-mock{{randomValue length=12 type='ALPHANUMERIC'}}",
+  "object": "chat.completion",
+  "created": {{now format='unix'}},
+  "model": {{{toJson (jsonPath request.body '$.model' default='mock-model')}}},
+  "system_fingerprint": "fp_mock",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_mock{{randomValue length=8 type='ALPHANUMERIC'}}",
+            "type": "function",
+            "function": {
+              "name": {{{toJson (jsonPath request.body '$.tools[0].function.name' default='mock_tool')}}},
+              "arguments": "{}"
+            }
+          }
+        ]
+      },
+      "logprobs": null,
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {"prompt_tokens": 20, "completion_tokens": 8, "total_tokens": 28}
+}

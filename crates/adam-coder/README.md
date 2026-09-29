@@ -108,7 +108,7 @@ reported at once at startup):
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
 | `GITHUB_TOKEN` | push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them | `github.com` |
-| `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
+| `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, worktrees, run notes | `/work` |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required |
@@ -222,7 +222,7 @@ you can push branches to and open pull requests in (for example
 call tools, and `opencode` on `PATH`.
 
 ```sh
-docker compose up -d postgres            # from the repository root
+docker compose up -d --wait postgres     # from the repository root
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/adam_test
 export MODEL_BASE_URL=https://your-gateway.example/v1
 export MODEL_API_KEY=...
@@ -258,6 +258,10 @@ then `TASK_STATE_COMPLETED`. Verify:
 * re-run with a task whose check cannot pass (`... and make `false` pass`) and
   `MAX_CHECK_CYCLES=2`: the task ends `TASK_STATE_FAILED` with the findings and
   opens nothing.
+
+For a run without a real gateway or GitHub, `compose.yaml` provides a mock
+model, a mock GitHub API and a local git remote; see "Local development" in the
+repository README (the mock model is canned, so it cannot complete a change).
 
 Record the pull request URL and the log excerpts in the pull request that lands
 this change. (Not run by the author of this crate: no gateway or GitHub access

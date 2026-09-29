@@ -1,0 +1,17 @@
+{{#assign 'cid'~}}chatcmpl-mock{{randomValue length=12 type='ALPHANUMERIC'}}{{~/assign}}
+{{~#assign 'call'~}}call_mock{{randomValue length=8 type='ALPHANUMERIC'}}{{~/assign}}
+{{~#assign 'model'~}}{{{toJson (jsonPath request.body '$.model' default='mock-model')}}}{{~/assign}}
+{{~#assign 'tool'~}}{{{toJson (jsonPath request.body '$.tools[0].function.name' default='mock_tool')}}}{{~/assign}}
+{{~#assign 'ts'~}}{{now format='unix'}}{{~/assign~}}
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"{{call}}","type":"function","function":{"name":{{{tool}}},"arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]},"finish_reason":null}]}
+
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"finish_reason":null}]}
+
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"{{cid}}","object":"chat.completion.chunk","created":{{ts}},"model":{{{model}}},"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}}
+
+data: [DONE]
+
