@@ -70,6 +70,7 @@ flowchart TB
     end
 
     coder --> a2a
+    coder --> adam
     coder --> a2art
     coder --> acp
     coder --> core
@@ -127,7 +128,7 @@ flowchart TB
     host --> err
     pgn --> err
 
-    linkStyle 40,41,42,43,44,45,46,47,48,49,50,51,52,53,54 stroke:#999,stroke-width:1px
+    linkStyle 41,42,43,44,45,46,47,48,49,50,51,52,53,54,55 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:

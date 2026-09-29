@@ -440,7 +440,7 @@ type already sets the pattern).
 | S0 | this document | this change |
 | S1 | typed tool helpers in `adam-llm-agent` (feature `schema` for the schema part) | built |
 | S2 | `#[tool]` and the `adam` facade | built |
-| S3 | `adam-coder` tools through `#[tool]`, no behaviour change | planned |
+| S3 | `adam-coder` tools through `#[tool]`, no behaviour change | built |
 | S4 to S6 | `adam-agent-fs` (parse, validate), `build.rs` codegen, `adam-assembly` | planned |
 | S7 | skills | planned |
 | S8, S9 | child runs and subagents | planned; S8 needs a review of the design above first |

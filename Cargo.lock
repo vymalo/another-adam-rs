@@ -179,6 +179,7 @@ version = "0.1.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
+ "adam",
  "adam-a2a",
  "adam-a2a-runtime",
  "adam-acp",

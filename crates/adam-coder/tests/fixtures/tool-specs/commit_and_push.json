@@ -1,0 +1,16 @@
+{
+  "name": "commit_and_push",
+  "description": "Commit every change in the worktree with the given message and push the branch. Use a Conventional Commit message (feat(scope): ..., fix: ...). Make small, focused commits: call it after each coherent piece of work.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "message": {
+        "type": "string",
+        "description": "Commit message"
+      }
+    },
+    "required": [
+      "message"
+    ]
+  }
+}

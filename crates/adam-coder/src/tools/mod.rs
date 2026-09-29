@@ -35,8 +35,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use adam::prelude::*;
+use adam::{DynTool, StateKey};
 use adam_error::{Classify, report};
-use adam_llm_agent::{DynTool, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
 use adam_workspace::{DynCodeHost, GitIdentity, WorkspaceError, Workspaces, Worktree};
 use serde_json::Value;
@@ -178,28 +179,23 @@ impl ToolEnv {
     }
 }
 
-/// Every coder tool over `env`, in the order they are offered to the model.
+/// Every coder tool, in the order they are offered to the model.
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
-/// [`ToolEnv::redactor`] first.
-pub fn coder_tools(env: &Arc<ToolEnv>) -> Vec<DynTool> {
-    let tools: Vec<DynTool> = vec![
-        Arc::new(prepare::PrepareWorkspace::new(env.clone())),
-        Arc::new(delegate::DelegateToOpenCode::new(env.clone())),
-        Arc::new(checks::RunChecks::new(env.clone())),
-        Arc::new(publish::CommitAndPush::new(env.clone())),
-        Arc::new(publish::OpenPullRequest::new(env.clone())),
-        Arc::new(ask::AskUser),
-    ];
-    tools
-        .into_iter()
-        .map(|inner| -> DynTool {
-            Arc::new(Redacting {
-                inner,
-                redactor: env.redactor.clone(),
-            })
-        })
-        .collect()
+/// [`ToolEnv::redactor`] first. The tools read `env` from the agent's state:
+/// give it to the agent that gets these tools
+/// (`LlmAgentBuilder::state(env.clone())`), or they refuse every call. The
+/// argument only names the redactor to wrap them with.
+pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
+    tools![
+        prepare::PrepareWorkspace,
+        delegate::DelegateToOpenCode,
+        checks::RunChecks,
+        publish::CommitAndPush,
+        publish::OpenPullRequest,
+        ask::AskUser,
+    ]
+    .wrap(Redacting::layer(env.redactor.clone()))
 }
 
 /// A tool whose results and errors are scrubbed by a [`Redactor`].
@@ -208,10 +204,26 @@ struct Redacting {
     redactor: Redactor,
 }
 
+impl Redacting {
+    /// The wrapper for [`ToolSet::wrap`](adam::ToolSet::wrap).
+    fn layer(redactor: Redactor) -> impl FnMut(DynTool) -> DynTool {
+        move |inner| {
+            Arc::new(Self {
+                inner,
+                redactor: redactor.clone(),
+            })
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for Redacting {
     fn spec(&self) -> ToolSpec {
         self.inner.spec()
+    }
+
+    fn required_state(&self) -> Vec<StateKey> {
+        self.inner.required_state()
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
@@ -236,12 +248,9 @@ impl Tool for Redacting {
     }
 }
 
-/// A non-empty string argument.
-pub(crate) fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+/// `text` trimmed, unless nothing is left: what the model wrote in a required argument.
+pub(crate) fn non_empty(text: &str) -> Option<&str> {
+    Some(text.trim()).filter(|s| !s.is_empty())
 }
 
 /// A workspace failure as a tool error: worth retrying, or a report to the

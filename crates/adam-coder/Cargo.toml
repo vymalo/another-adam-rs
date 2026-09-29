@@ -17,6 +17,7 @@ name = "adam-coder"
 path = "src/main.rs"
 
 [dependencies]
+adam = { path = "../adam", version = "0.1.0" }
 adam-a2a = { path = "../adam-a2a", version = "0.1.0" }
 adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0" }
 adam-acp = { path = "../adam-acp", version = "0.1.0" }

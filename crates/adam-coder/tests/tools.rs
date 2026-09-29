@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adam_coder::opencode::OpenCodeLaunch;
+use adam_coder::tools::ask::AskUser;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::delegate::DelegateToOpenCode;
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
-use adam_coder::tools::{ToolEnv, ask::AskUser};
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
 use adam_runtime::{CancelToken, CollectingSink, RunEvent};
 use common::{Fixture, PR_URL};
@@ -30,16 +30,13 @@ impl Rig {
 
     fn from(fx: Fixture) -> Self {
         let sink = CollectingSink::new();
-        let ctx = ToolCtx::detached("tool", "call-1", Arc::new(sink.clone()));
+        let ctx =
+            ToolCtx::detached("tool", "call-1", Arc::new(sink.clone())).with_state(fx.env.clone());
         Self { fx, sink, ctx }
     }
 
-    fn env(&self) -> Arc<ToolEnv> {
-        self.fx.env.clone()
-    }
-
     async fn prepare(&self) -> ToolOutput {
-        PrepareWorkspace::new(self.env())
+        PrepareWorkspace
             .call(
                 &self.ctx,
                 json!({"repo_url": self.fx.remote_url(), "base_branch": "main"}),
@@ -99,12 +96,12 @@ async fn prepare_workspace_is_idempotent_per_run_and_keeps_changes() {
 #[tokio::test]
 async fn prepare_workspace_reports_a_bad_repository_to_the_model() {
     let rig = Rig::new().await;
-    let out = PrepareWorkspace::new(rig.env())
+    let out = PrepareWorkspace
         .call(&rig.ctx, json!({"repo_url": "", "base_branch": "main"}))
         .await;
     assert!(is_error(&out), "{out:?}");
 
-    let out = PrepareWorkspace::new(rig.env())
+    let out = PrepareWorkspace
         .call(
             &rig.ctx,
             json!({"repo_url": rig.fx.remote_url(), "base_branch": "no-such-branch"}),
@@ -130,7 +127,8 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
         .respond_with(ResponseTemplate::new(404))
         .mount(&evil)
         .await;
-    let env = rig.fx.production_env();
+    // The same run, with the production policy as the tools' state.
+    let ctx = rig.ctx.clone().with_state(rig.fx.production_env());
     let hostile = [
         // Another host, the honest way and with look-alike names.
         format!("{}/octo/widgets.git", evil.uri()),
@@ -151,8 +149,8 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
         "--upload-pack=touch /tmp/pwned".to_owned(),
     ];
     for url in &hostile {
-        let out = PrepareWorkspace::new(env.clone())
-            .call(&rig.ctx, json!({"repo_url": url, "base_branch": "main"}))
+        let out = PrepareWorkspace
+            .call(&ctx, json!({"repo_url": url, "base_branch": "main"}))
             .await;
         assert!(
             is_error(&out),
@@ -172,9 +170,9 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
     );
 
     // Whatever the reason, the model gets the reason as text to act on.
-    let out = PrepareWorkspace::new(env.clone())
+    let out = PrepareWorkspace
         .call(
-            &rig.ctx,
+            &ctx,
             json!({"repo_url": "https://evil.example/o/r.git", "base_branch": "main"}),
         )
         .await;
@@ -183,9 +181,9 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
         message.contains("not allowed") && message.contains("github.com"),
         "{message}"
     );
-    let out = PrepareWorkspace::new(env)
+    let out = PrepareWorkspace
         .call(
-            &rig.ctx,
+            &ctx,
             json!({"repo_url": rig.fx.remote_url(), "base_branch": "main"}),
         )
         .await;
@@ -195,29 +193,24 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
 #[tokio::test]
 async fn tools_that_need_a_workspace_say_so() {
     let rig = Rig::new().await;
-    let env = rig.env();
     let cases: Vec<(&str, Result<ToolOutput, ToolError>)> = vec![
         (
             "delegate",
-            DelegateToOpenCode::new(env.clone())
+            DelegateToOpenCode
                 .call(&rig.ctx, json!({"instructions": "x"}))
                 .await,
         ),
         (
             "checks",
-            RunChecks::new(env.clone())
-                .call(&rig.ctx, json!({"command": "true"}))
-                .await,
+            RunChecks.call(&rig.ctx, json!({"command": "true"})).await,
         ),
         (
             "commit",
-            CommitAndPush::new(env.clone())
-                .call(&rig.ctx, json!({"message": "m"}))
-                .await,
+            CommitAndPush.call(&rig.ctx, json!({"message": "m"})).await,
         ),
         (
             "pr",
-            OpenPullRequest::new(env)
+            OpenPullRequest
                 .call(&rig.ctx, json!({"title": "t", "body": "b"}))
                 .await,
         ),
@@ -232,7 +225,7 @@ async fn tools_that_need_a_workspace_say_so() {
 async fn run_checks_runs_in_the_worktree_and_never_outside_it() {
     let rig = Rig::new().await;
     rig.prepare().await;
-    let tool = RunChecks::new(rig.env());
+    let tool = RunChecks;
 
     let ok = tool
         .call(&rig.ctx, json!({"command": "cat README.md"}))
@@ -267,7 +260,7 @@ async fn run_checks_times_out_and_caps_its_output() {
     .await;
     let rig = Rig::from(fx);
     rig.prepare().await;
-    let tool = RunChecks::new(rig.env());
+    let tool = RunChecks;
 
     let out = tool
         .call(&rig.ctx, json!({"command": "echo before; sleep 30"}))
@@ -300,7 +293,7 @@ async fn run_checks_times_out_and_caps_its_output() {
 async fn a_replayed_failing_check_counts_one_cycle() {
     let rig = Rig::new().await;
     rig.prepare().await;
-    let tool = RunChecks::new(rig.env());
+    let tool = RunChecks;
     for _ in 0..3 {
         let out = tool
             .call(&rig.ctx, json!({"command": "exit 2"}))
@@ -319,7 +312,7 @@ async fn a_replayed_failing_check_counts_one_cycle() {
 async fn commit_and_push_is_idempotent_and_refuses_an_empty_branch() {
     let rig = Rig::new().await;
     rig.prepare().await;
-    let tool = CommitAndPush::new(rig.env());
+    let tool = CommitAndPush;
 
     let nothing = tool.call(&rig.ctx, json!({"message": "feat: x"})).await;
     assert!(is_error(&nothing), "{nothing:?}");
@@ -366,14 +359,14 @@ async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
     let rig = Rig::new().await;
     rig.prepare().await;
     std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
-    let pr = OpenPullRequest::new(rig.env());
+    let pr = OpenPullRequest;
     let args = json!({"title": "feat: a", "body": "Adds a.\n\n## Verification\n- ok"});
 
     let unpushed = pr.call(&rig.ctx, args.clone()).await;
     assert!(is_error(&unpushed));
     assert!(text(unpushed).contains("not pushed"));
 
-    CommitAndPush::new(rig.env())
+    CommitAndPush
         .call(&rig.ctx, json!({"message": "feat: add a"}))
         .await
         .unwrap();
@@ -388,7 +381,7 @@ async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
 
     // Checks pass on this code; then more code is committed and pushed
     // without re-running them: the pull request would contain unverified code.
-    let checks = RunChecks::new(rig.env());
+    let checks = RunChecks;
     assert!(
         !checks
             .call(&rig.ctx, json!({"command": "true"}))
@@ -397,7 +390,7 @@ async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
             .is_error
     );
     std::fs::write(rig.worktree().join("b.txt"), "b\n").unwrap();
-    CommitAndPush::new(rig.env())
+    CommitAndPush
         .call(&rig.ctx, json!({"message": "feat: add b"}))
         .await
         .unwrap();
@@ -435,7 +428,7 @@ async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
 async fn delegate_to_opencode_streams_updates_and_returns_the_summary() {
     let rig = Rig::new().await;
     rig.prepare().await;
-    let out = DelegateToOpenCode::new(rig.env())
+    let out = DelegateToOpenCode
         .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
         .await
         .unwrap();
@@ -498,7 +491,7 @@ async fn delegate_to_opencode_kills_a_stubborn_opencode_when_the_run_is_cancelle
     rig.ctx = rig.ctx.with_cancel_token(token.clone());
     rig.prepare().await;
 
-    let tool = DelegateToOpenCode::new(rig.env());
+    let tool = DelegateToOpenCode;
     let cancel_when_running = async {
         let grandchild = common::wait_for_pid(&child_file).await;
         token.cancel();
@@ -546,14 +539,14 @@ async fn publishing_tools_refuse_to_act_for_a_cancelled_run() {
     std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
     token.cancel();
 
-    let push = CommitAndPush::new(rig.env())
+    let push = CommitAndPush
         .call(&rig.ctx, json!({"message": "feat: add a"}))
         .await;
     assert!(
         matches!(&push, Err(ToolError::Permanent(m)) if m.contains("cancelled")),
         "{push:?}"
     );
-    let pr = OpenPullRequest::new(rig.env())
+    let pr = OpenPullRequest
         .call(&rig.ctx, json!({"title": "feat: add a", "body": "b"}))
         .await;
     assert!(
@@ -577,7 +570,7 @@ async fn opencode_cannot_write_outside_the_worktree() {
     .await;
     let rig = Rig::from(fx);
     rig.prepare().await;
-    let out = DelegateToOpenCode::new(rig.env())
+    let out = DelegateToOpenCode
         .call(&rig.ctx, json!({"instructions": "write outside"}))
         .await
         .unwrap();
@@ -600,7 +593,7 @@ async fn a_crashing_opencode_is_a_transient_error_and_a_missing_one_is_permanent
     .await;
     let rig = Rig::from(fx);
     rig.prepare().await;
-    let out = DelegateToOpenCode::new(rig.env())
+    let out = DelegateToOpenCode
         .call(&rig.ctx, json!({"instructions": "x"}))
         .await;
     assert!(matches!(out, Err(ToolError::Transient(_))), "{out:?}");
@@ -611,7 +604,7 @@ async fn a_crashing_opencode_is_a_transient_error_and_a_missing_one_is_permanent
     .await;
     let rig = Rig::from(fx);
     rig.prepare().await;
-    let out = DelegateToOpenCode::new(rig.env())
+    let out = DelegateToOpenCode
         .call(&rig.ctx, json!({"instructions": "x"}))
         .await;
     assert!(matches!(out, Err(ToolError::Permanent(_))), "{out:?}");
@@ -630,4 +623,26 @@ async fn ask_user_needs_input_with_the_question() {
         })
     );
     assert!(is_error(&AskUser.call(&rig.ctx, Value::Null).await));
+}
+
+/// Arguments the schema does not allow are the model's mistake, not the run's: it gets the reason
+/// as a tool result and can correct itself (the `#[tool]` contract; the hand-written tools said
+/// "X is required" for the same input).
+#[tokio::test]
+async fn malformed_arguments_are_reported_to_the_model() {
+    let rig = Rig::new().await;
+    for (tool, args) in [
+        (&RunChecks as &dyn Tool, json!({})),
+        (&RunChecks, json!({"command": 5})),
+        (&CommitAndPush, json!({"message": ["a"]})),
+        (&OpenPullRequest, json!({"title": "t"})),
+        (&PrepareWorkspace, json!({"base_branch": "main"})),
+        (&DelegateToOpenCode, Value::Null),
+    ] {
+        let out = tool.call(&rig.ctx, args.clone()).await;
+        assert!(is_error(&out), "{args}: {out:?}");
+        assert!(text(out).contains("invalid arguments"), "{args}");
+    }
+    // Nothing ran: there is still no worktree.
+    assert!(!rig.worktree().exists());
 }

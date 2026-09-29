@@ -48,6 +48,18 @@ sequenceDiagram
 | `open_pull_request { title, body, accept_red_checks? }` | `CodeHost::open_pull_request`; artifact `pull_request` (`url`, `number` as a string, `branch`, `repository`) |
 | `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question |
 
+Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../adam/README.md#tool)) in
+`src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
+argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
+`tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
+`CoderAgent` gives the agent the `ToolEnv` as state (`LlmAgentBuilder::state`), which is where the tools read it.
+The specs the model sees are pinned by `tests/fixtures/tool-specs/*.json` (see [Tests](#tests)); tool names and the
+journal's `tool:<call id>` step names are unchanged, so a run started before the port replays.
+
+Arguments the schema does not allow (a missing `command`, a number where a string belongs) come back to the model
+as a tool result, `invalid arguments for `run_checks`: ...`; an empty or blank required value still says
+`<argument> is required`.
+
 ### The rules, in code
 
 The system prompt (`src/instructions.md`, templated with `MAX_CHECK_CYCLES`)
@@ -328,7 +340,12 @@ database of its own, so the role needs `CREATEDB`):
   (`preparing a worktree of ...`), which exists only as a live event and so proves events
   crossed the two processes over `NOTIFY`. Both processes log `listening for notifications`.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
-  `repo_url` shapes against the production repository policy.
+  `repo_url` shapes against the production repository policy, and malformed arguments.
+* `tests/tool_specs.rs`: each tool's `ToolSpec` equals `tests/fixtures/tool-specs/<tool>.json`, the JSON of
+  the hand-written tools, so a change to what the model is told is a reviewed diff. The one expected difference
+  is normalised: an optional argument is `"type": ["string", "null"]` in a derived schema. Regenerate with
+  `ADAM_UPDATE_SNAPSHOTS=1 cargo test -p adam-coder --test tool_specs`. The same file checks that the
+  agent refuses to build without the `ToolEnv` as state.
 * `adam-workspace/tests/workspace.rs`: the host allowlist, local paths, scoped
   tokens, and a wiremock "evil" git host that must never be contacted.
 * unit tests: configuration (including `ROLE`: the default, each value, an unknown one, the

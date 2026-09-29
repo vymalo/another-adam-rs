@@ -1,0 +1,16 @@
+{
+  "name": "delegate_to_opencode",
+  "description": "Have OpenCode, a coding agent working inside your worktree, make a change. Give precise instructions: what to change, where, and how it will be verified. One concern per call. It reads and edits files itself; do not ask it to commit, push or open pull requests. Returns its summary and the files that changed.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "instructions": {
+        "type": "string",
+        "description": "What OpenCode should do"
+      }
+    },
+    "required": [
+      "instructions"
+    ]
+  }
+}

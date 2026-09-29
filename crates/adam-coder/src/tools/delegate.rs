@@ -1,20 +1,16 @@
 //! `delegate_to_opencode { instructions }`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
+use adam::prelude::*;
 use adam_acp::{AcpClient, AcpError, AcpUpdate, ClientPolicy, Session};
 use adam_error::{Classify, report};
-use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
-use adam_model::ToolSpec;
-use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use serde_json::{Value, json};
 
 use crate::redact::Redactor;
 
-use super::{Outcome, ToolEnv, cancelled, str_arg};
+use super::{Outcome, ToolEnv, cancelled, non_empty};
 
 /// Most of the agent's reply kept for the summary.
 const SUMMARY_CAP: usize = 8 * 1024;
@@ -25,31 +21,6 @@ const MAX_LISTED_FILES: usize = 40;
 /// How long OpenCode gets to end its turn after `session/cancel` before it is
 /// killed.
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
-
-/// Has OpenCode make a change in the worktree, over ACP.
-///
-/// Starts the configured ACP program in the worktree, opens a session there and
-/// sends `instructions` as one prompt. What the agent reports while it works
-/// (tool calls, plan, text) becomes progress events; the result is its own
-/// summary plus the files that changed. The agent may read and write files only
-/// under the worktree (`ClientPolicy::fs_root`), and its permission requests
-/// are answered by `PermissionMode::AllowWithinRoot`.
-///
-/// **Cancellation.** When the run is cancelled ([`ToolCtx::cancelled`]) while
-/// OpenCode works, the tool sends ACP `session/cancel`, gives OpenCode a couple
-/// of seconds to end its turn, then kills it and everything it started (its
-/// process group) and waits until it is reaped, before returning. Nothing is
-/// left running once the tool has returned.
-pub struct DelegateToOpenCode {
-    env: Arc<ToolEnv>,
-}
-
-impl DelegateToOpenCode {
-    /// The tool over `env`.
-    pub fn new(env: Arc<ToolEnv>) -> Self {
-        Self { env }
-    }
-}
 
 fn acp_error(e: &AcpError) -> ToolError {
     // Journaled and shown to the model: a boundary, so the chain is flattened here, once.
@@ -109,139 +80,139 @@ fn tail(text: &str, cap: usize) -> &str {
     &text[start..]
 }
 
-#[async_trait]
-impl Tool for DelegateToOpenCode {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "delegate_to_opencode".into(),
-            description: "Have OpenCode, a coding agent working inside your worktree, make a change. \
-                          Give precise instructions: what to change, where, and how it will be \
-                          verified. One concern per call. It reads and edits files itself; do not \
-                          ask it to commit, push or open pull requests. Returns its summary and the \
-                          files that changed."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "instructions": {
-                        "type": "string",
-                        "description": "What OpenCode should do"
-                    }
-                },
-                "required": ["instructions"]
-            }),
-        }
+// Has OpenCode make a change in the worktree, over ACP.
+//
+// Starts the configured ACP program in the worktree, opens a session there and
+// sends `instructions` as one prompt. What the agent reports while it works
+// (tool calls, plan, text) becomes progress events; the result is its own
+// summary plus the files that changed. The agent may read and write files only
+// under the worktree (`ClientPolicy::fs_root`), and its permission requests
+// are answered by `PermissionMode::AllowWithinRoot`.
+//
+// **Cancellation.** When the run is cancelled ([`ToolCtx::cancelled`]) while
+// OpenCode works, the tool sends ACP `session/cancel`, gives OpenCode a couple
+// of seconds to end its turn, then kills it and everything it started (its
+// process group) and waits until it is reaped, before returning. Nothing is
+// left running once the tool has returned.
+
+/// Have OpenCode, a coding agent working inside your worktree, make a change.
+/// Give precise instructions: what to change, where, and how it will be
+/// verified. One concern per call. It reads and edits files itself; do not ask
+/// it to commit, push or open pull requests. Returns its summary and the files
+/// that changed.
+#[tool(type = DelegateToOpenCode)]
+pub async fn delegate_to_opencode(
+    env: State<ToolEnv>,
+    ctx: &ToolCtx,
+    /// What OpenCode should do
+    instructions: String,
+) -> Outcome {
+    let Some(instructions) = non_empty(&instructions) else {
+        return Ok(ToolOutput::error("instructions is required"));
+    };
+    let wt = match env.worktree(ctx).await {
+        Ok(wt) => wt,
+        Err(outcome) => return outcome,
+    };
+    let dir = wt.path().to_path_buf();
+
+    ctx.emit_progress("starting OpenCode").await;
+    let command = env.settings.opencode.command(&dir);
+    // A cancel before the process is up needs no cleanup here: the spawn
+    // future kills what it started when it is dropped.
+    let client = tokio::select! {
+        biased;
+        () = ctx.cancelled() => return Err(cancelled("OpenCode was stopped")),
+        client = AcpClient::spawn(command, ClientPolicy::new(&dir)) => client,
     }
-
-    async fn call(&self, ctx: &ToolCtx, args: Value) -> Outcome {
-        let Some(instructions) = str_arg(&args, "instructions") else {
-            return Ok(ToolOutput::error("instructions is required"));
-        };
-        let wt = match self.env.worktree(ctx).await {
-            Ok(wt) => wt,
-            Err(outcome) => return outcome,
-        };
-        let dir = wt.path().to_path_buf();
-
-        ctx.emit_progress("starting OpenCode").await;
-        let command = self.env.settings.opencode.command(&dir);
-        // A cancel before the process is up needs no cleanup here: the spawn
-        // future kills what it started when it is dropped.
-        let client = tokio::select! {
-            biased;
-            () = ctx.cancelled() => return Err(cancelled("OpenCode was stopped")),
-            client = AcpClient::spawn(command, ClientPolicy::new(&dir)) => client,
+    .map_err(|e| acp_error(&e))?;
+    let session = tokio::select! {
+        biased;
+        () = ctx.cancelled() => {
+            stop(client, None, None).await;
+            return Err(cancelled("OpenCode was stopped"));
         }
-        .map_err(|e| acp_error(&e))?;
-        let session = tokio::select! {
+        session = client.new_session(&dir, Vec::new()) => session,
+    }
+    .map_err(|e| acp_error(&e))?;
+
+    let mut turn = session.prompt(instructions.to_owned());
+    let mut reply = String::new();
+    let mut line = String::new();
+    let mut stop_reason = None;
+    loop {
+        let update = tokio::select! {
             biased;
             () = ctx.cancelled() => {
-                stop(client, None, None).await;
+                stop(client, Some(&session), Some(turn)).await;
                 return Err(cancelled("OpenCode was stopped"));
             }
-            session = client.new_session(&dir, Vec::new()) => session,
-        }
-        .map_err(|e| acp_error(&e))?;
-
-        let mut turn = session.prompt(instructions.to_owned());
-        let mut reply = String::new();
-        let mut line = String::new();
-        let mut stop_reason = None;
-        loop {
-            let update = tokio::select! {
-                biased;
-                () = ctx.cancelled() => {
-                    stop(client, Some(&session), Some(turn)).await;
-                    return Err(cancelled("OpenCode was stopped"));
-                }
-                update = turn.next() => update,
-            };
-            let Some(update) = update else { break };
-            let update = update.map_err(|e| acp_error(&e))?;
-            match update {
-                AcpUpdate::AgentText(chunk) => {
-                    reply.push_str(&chunk);
-                    line.push_str(&chunk);
-                    if line.contains('\n') || line.len() >= PROGRESS_CAP {
-                        flush(ctx, &self.env.redactor, &mut line).await;
-                    }
-                }
-                AcpUpdate::Thought(_) => {}
-                other => {
-                    flush(ctx, &self.env.redactor, &mut line).await;
-                    if let Some(message) = describe(&other) {
-                        ctx.emit_progress(self.env.redactor.scrub_string(message))
-                            .await;
-                    }
-                    if let AcpUpdate::TurnEnded {
-                        stop_reason: reason,
-                    } = other
-                    {
-                        stop_reason = Some(reason);
-                    }
-                }
-            }
-        }
-        flush(ctx, &self.env.redactor, &mut line).await;
-        drop(turn);
-        if let Err(e) = client.shutdown().await {
-            tracing::debug!(error = %e, "OpenCode did not shut down cleanly");
-        }
-
-        let stop_reason = stop_reason.unwrap_or_else(|| "unknown".to_owned());
-        let changed = match wt.status().await {
-            Ok(files) => files,
-            Err(e) => return Err(super::workspace_error(&e)),
+            update = turn.next() => update,
         };
-        let mut text = format!("OpenCode finished (stop reason: {stop_reason}).\n");
-        let summary = tail(reply.trim(), SUMMARY_CAP);
-        if summary.is_empty() {
-            text.push_str("\nIt gave no summary.\n");
-        } else {
-            text.push_str("\nSummary from OpenCode:\n");
-            text.push_str(summary);
-            text.push('\n');
-        }
-        if changed.is_empty() {
-            text.push_str("\nNo files are changed in the worktree.\n");
-        } else {
-            text.push_str(&format!("\nChanged files ({}):\n", changed.len()));
-            for file in changed.iter().take(MAX_LISTED_FILES) {
-                text.push_str(&format!("- {} ({:?})\n", file.path, file.status));
+        let Some(update) = update else { break };
+        let update = update.map_err(|e| acp_error(&e))?;
+        match update {
+            AcpUpdate::AgentText(chunk) => {
+                reply.push_str(&chunk);
+                line.push_str(&chunk);
+                if line.contains('\n') || line.len() >= PROGRESS_CAP {
+                    flush(ctx, &env.redactor, &mut line).await;
+                }
             }
-            if changed.len() > MAX_LISTED_FILES {
-                text.push_str(&format!(
-                    "- ... and {} more\n",
-                    changed.len() - MAX_LISTED_FILES
-                ));
+            AcpUpdate::Thought(_) => {}
+            other => {
+                flush(ctx, &env.redactor, &mut line).await;
+                if let Some(message) = describe(&other) {
+                    ctx.emit_progress(env.redactor.scrub_string(message)).await;
+                }
+                if let AcpUpdate::TurnEnded {
+                    stop_reason: reason,
+                } = other
+                {
+                    stop_reason = Some(reason);
+                }
             }
         }
-        Ok(if stop_reason == "end_turn" {
-            ToolOutput::text(text)
-        } else {
-            ToolOutput::error(text)
-        })
     }
+    flush(ctx, &env.redactor, &mut line).await;
+    drop(turn);
+    if let Err(e) = client.shutdown().await {
+        tracing::debug!(error = %e, "OpenCode did not shut down cleanly");
+    }
+
+    let stop_reason = stop_reason.unwrap_or_else(|| "unknown".to_owned());
+    let changed = match wt.status().await {
+        Ok(files) => files,
+        Err(e) => return Err(super::workspace_error(&e)),
+    };
+    let mut text = format!("OpenCode finished (stop reason: {stop_reason}).\n");
+    let summary = tail(reply.trim(), SUMMARY_CAP);
+    if summary.is_empty() {
+        text.push_str("\nIt gave no summary.\n");
+    } else {
+        text.push_str("\nSummary from OpenCode:\n");
+        text.push_str(summary);
+        text.push('\n');
+    }
+    if changed.is_empty() {
+        text.push_str("\nNo files are changed in the worktree.\n");
+    } else {
+        text.push_str(&format!("\nChanged files ({}):\n", changed.len()));
+        for file in changed.iter().take(MAX_LISTED_FILES) {
+            text.push_str(&format!("- {} ({:?})\n", file.path, file.status));
+        }
+        if changed.len() > MAX_LISTED_FILES {
+            text.push_str(&format!(
+                "- ... and {} more\n",
+                changed.len() - MAX_LISTED_FILES
+            ));
+        }
+    }
+    Ok(if stop_reason == "end_turn" {
+        ToolOutput::text(text)
+    } else {
+        ToolOutput::error(text)
+    })
 }
 
 async fn flush(ctx: &ToolCtx, redactor: &Redactor, line: &mut String) {
