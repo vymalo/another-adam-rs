@@ -1116,7 +1116,9 @@ mod cases {
                     let calls = calls.clone();
                     async move {
                         calls.fetch_add(1, SeqCst);
-                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        // Three lease periods: without renewal the run would be
+                        // taken over at least twice.
+                        tokio::time::sleep(Duration::from_millis(3000)).await;
                         Ok(Transition::Done {
                             state,
                             output: json!("slow but ours"),
@@ -1126,9 +1128,12 @@ mod cases {
                 }
             }),
         );
+        // Renewal runs every ttl/3 (~333 ms), leaving ~667 ms for a slow store
+        // round trip before the lease could lapse. A 300 ms lease left ~200 ms
+        // and flaked on loaded CI runners.
         let short = |w: &str| {
             builder(&store, w, &agent)
-                .lease_ttl(Duration::from_millis(300))
+                .lease_ttl(Duration::from_millis(1000))
                 .build()
         };
         let (a, b) = (short("renew-a"), short("renew-b"));
