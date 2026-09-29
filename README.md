@@ -13,6 +13,8 @@ trait, a shared conformance suite, and two production adapters.
 | `adam-store-testkit` | Conformance suite every store must pass (`store_conformance!`) |
 | `adam-store-postgres` | PostgreSQL 12+ via `sqlx` 0.9 |
 | `adam-store-mongodb` | MongoDB 5.0+ via the official driver; standalone `mongod` is enough |
+| `adam-model` | `ModelClient` trait (`complete` + streaming, tool calling), request/response types, `MockModel` test double |
+| `adam-model-openai` | `OpenAiCompatible`: any OpenAI-compatible chat-completions endpoint (gateway or provider) via `reqwest` + rustls |
 
 ## The model
 
