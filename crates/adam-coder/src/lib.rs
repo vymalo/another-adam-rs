@@ -25,7 +25,7 @@
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
 //! | [`app`] | [`Coder`]: runtime + A2A backend + router |
 //! | [`config`] | the binary's environment variables |
-//! | [`serve()`] | the whole process: store, model, GitHub, A2A server and workers, until a shutdown future resolves |
+//! | [`serve()`] | the whole process: store, model, GitHub, and the A2A server and workers its `ROLE` runs (through `adam_host::Host`), until a shutdown future resolves |
 //!
 //! # Composition
 //!
@@ -50,7 +50,9 @@
 //! Every infrastructure piece is a trait object handed in from outside: the
 //! store, the model, the code host and the git credentials. The binary
 //! (`adam-coder`) is only [`serve`] over [`Config::from_env`]: a composition
-//! of the Postgres store, the OpenAI-compatible model and GitHub.
+//! of the Postgres store, the OpenAI-compatible model and GitHub. Which halves
+//! it runs (`all`, `control-plane` or `worker`) is the `ROLE` variable, an
+//! [`adam_host::Role`]; see [`config`].
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -69,7 +71,7 @@ pub mod tools;
 pub use agent::{AGENT_NAME, CoderAgent, coder_limits};
 pub use app::{Coder, RuntimeOptions, agent_card};
 pub use config::{Config, ConfigError};
-pub use exit::{StoppedUnexpectedly, exit_code};
+pub use exit::exit_code;
 pub use instructions::instructions;
 pub use redact::Redactor;
 pub use repos::workspaces_for;

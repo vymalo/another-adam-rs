@@ -166,6 +166,7 @@ dependencies = [
  "adam-acp",
  "adam-core",
  "adam-error",
+ "adam-host",
  "adam-llm-agent",
  "adam-model",
  "adam-model-openai",

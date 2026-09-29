@@ -57,6 +57,7 @@ flowchart TB
         core["adam-core"]
         model["adam-model"]
         err["adam-error"]
+        host["adam-host"]
     end
     subgraph kits["Test kits"]
         testkit["adam-store-testkit"]
@@ -72,6 +73,7 @@ flowchart TB
     coder --> rt
     coder --> pg
     coder --> ws
+    coder --> host
     a2art --> a2a
     a2art --> core
     a2art --> rt
@@ -103,8 +105,9 @@ flowchart TB
     mongo --> err
     pg --> err
     ws --> err
+    host --> err
 
-    linkStyle 27,28,29,30,31,32,33,34,35,36,37,38 stroke:#999,stroke-width:1px
+    linkStyle 28,29,30,31,32,33,34,35,36,37,38,39,40 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -121,6 +124,10 @@ The layers, from the bottom:
   * [`adam-a2a`](../crates/adam-a2a/README.md): the `TaskBackend` seam, and
     the axum server that exposes any backend as an A2A 1.0 agent. It knows
     nothing about the runtime.
+  * [`adam-host`](../crates/adam-host/README.md): the closed process `Role`
+    (`all`, `control-plane`, `worker`) and `Host`, a small supervisor that runs
+    only the components a role asks for and stops them in a fixed order. A
+    host app such as `adam-coder` reads the role from its own variable.
 * **Implementations.** Each one is a separate crate, so a binary links only what
   it uses.
   * `adam-store-postgres` and `adam-store-mongodb` implement `Store`.
@@ -352,9 +359,13 @@ Rules the code follows, from the crate docs:
 `serve(Config::from_env(), sigterm)`. To use MongoDB, another model client or
 another code host, write another root that builds the same pieces.
 
+`serve` does not supervise anything by hand. It builds the pieces, registers what
+the process runs as components of an `adam_host::Host`, and calls `run`. The
+`ROLE` variable, parsed with `adam_host::Role`, decides which components run.
+
 ```mermaid
 flowchart LR
-    env["Config::from_env()<br/>environment variables"] --> serve
+    env["Config::from_env()<br/>environment variables, ROLE included"] --> serve
 
     subgraph serve["adam-coder: serve()"]
         direction LR
@@ -369,8 +380,10 @@ flowchart LR
         rtm["Runtime<br/>BroadcastSink as EventSink"]
         bk["RuntimeTaskBackend"]
         router["A2aServer::router<br/>card + backend + AuthConfig"]
-        http["axum::serve"]
-        wrk["Runtime::run_worker"]
+        cp["control-plane component a2a-server<br/>axum::serve"]
+        wrk["worker component worker<br/>Runtime::run_worker"]
+        hlt["worker component health<br/>A2aServer::health_router<br/>(role worker only)"]
+        host["Host::new(role)<br/>.run(shutdown)"]
 
         creds --> wsp
         creds --> gh
@@ -383,15 +396,35 @@ flowchart LR
         coder --> rtm
         coder --> bk
         bk --> router
-        router --> http
+        router --> cp
         rtm --> wrk
+        cp --> host
+        wrk --> host
+        hlt --> host
     end
 ```
 
-Two tasks run side by side: the HTTP server and the worker loop. On SIGTERM the
-server stops taking connections (open streams get 10 seconds), and the workers
-finish and commit the steps they are in. If either half stops on its own, the
-other is stopped and the process exits with an error.
+| `ROLE` | Components that run | Needs |
+|---|---|---|
+| `all` (default) | `a2a-server` and `worker`: one process, as before | every variable |
+| `control-plane` | `a2a-server` over a `Runtime` that only starts, delivers, cancels and views runs; `run_worker` is never called | every variable, and no workspace root is created |
+| `worker` | `worker` (`run_worker`) and `health` (`GET /healthz` on `LISTEN_ADDR`, no A2A) | everything except `A2A_BEARER_TOKENS` and `PUBLIC_URL` |
+
+The control plane still needs the model and GitHub variables. `Runtime::start`
+looks the agent up by name and calls its `init`, so every process registers the
+complete `CoderAgent`, and its model and GitHub clients are built (never called)
+in the control plane too. A later change, agent starters, is meant to lift that.
+The two roles meet only in the Postgres store: the run record with its version
+compare-and-swap, and leases. Until a cross-process event path exists (ADR 0001,
+*Open questions*), a control plane in another process learns what a worker did by
+polling the run, so the stream reaches the client a poll interval late, and a
+cancel reaches the worker on its next poll.
+
+On SIGTERM `Host` stops the control plane first: the server stops taking
+connections and open streams get 10 seconds. It then stops the workers, with no
+bound, so they finish and commit the steps they are in. If a component stops on
+its own the others are stopped in the same order and the process exits with the
+component named in the error (`HostError`, exit code 70).
 
 ## The path of a task
 
@@ -493,8 +526,9 @@ What the diagram cannot say:
 ### The worker: claim, step, journal, commit
 
 The worker loop is `Runtime::run_worker` in
-`crates/adam-runtime/src/worker.rs`. It runs in the same process as the A2A
-server, and any number of processes can share one database.
+`crates/adam-runtime/src/worker.rs`. In the default role (`all`) it runs in the same
+process as the A2A server; with `ROLE=worker` it runs alone. Any number of
+processes can share one database.
 
 ```mermaid
 sequenceDiagram

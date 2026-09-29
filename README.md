@@ -27,7 +27,7 @@ trait, a shared conformance suite, and two production adapters.
 | [`adam-acp`](crates/adam-acp/README.md) | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
 | [`adam-llm-agent`](crates/adam-llm-agent/README.md) | `LlmAgent`: the durable model/tool-calling loop (`Tool` trait, `NeedsInput` parking, limits, history truncation) on top of `adam-runtime` |
 | [`adam-a2a-runtime`](crates/adam-a2a-runtime/README.md) | `RuntimeTaskBackend`: the A2A `TaskBackend` over `adam-runtime` (task = run, ownership per caller, `input-required` from parked runs); subscriptions are rebuilt from the store, so they survive restarts. Reusable by any agent |
-| [`adam-coder`](crates/adam-coder/README.md) | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary; image in `docker/coder`, chart in `deploy/coder` |
+| [`adam-coder`](crates/adam-coder/README.md) | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary, which runs the A2A server, the workers or both (`ROLE`); image in `docker/coder`, chart in `deploy/coder` |
 
 ## The model
 
@@ -146,6 +146,8 @@ export DATABASE_URL=$ADAM_TEST_POSTGRES_URL
 export MODEL_BASE_URL=http://127.0.0.1:8081/v1 MODEL_API_KEY=mock-api-key MODEL=mock-model
 export GITHUB_API_URL=http://127.0.0.1:8082 GITHUB_TOKEN=dev-github-token
 export A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/
+# optional: ROLE=control-plane or ROLE=worker instead of the default `all`. Run one of each
+# over the same DATABASE_URL (different LISTEN_ADDR) to split the halves; see the crate README.
 ```
 
 OpenCode (which the coder runs) reaches the mock model through the same
