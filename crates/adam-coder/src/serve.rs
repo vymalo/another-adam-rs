@@ -119,8 +119,8 @@ fn claim_scope_for(placement: Placement) -> ClaimScope {
 /// Run the coder until `shutdown` resolves (SIGTERM in the binary).
 ///
 /// Which components run depends on [`Config::role`]; see the module docs. On
-/// shutdown the server stops taking connections (open ones get
-/// [`SERVER_DRAIN`]), and the workers finish and commit the steps they are in
+/// shutdown the server stops taking connections (open ones get ten seconds
+/// to finish), and the workers finish and commit the steps they are in
 /// before this returns; a step cut short by a hard kill is picked up by
 /// another replica when its lease expires. If a component stops on its own the
 /// others are stopped the same way and the error is returned.

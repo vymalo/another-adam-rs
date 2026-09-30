@@ -55,6 +55,11 @@ jobs:
       # nextest does not run doctests; the database suites are not needed here.
       - run: cargo test --workspace --doc --locked
       - run: cargo test --workspace --doc --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
+      # Broken or redundant intra-doc links, with every feature on (the documented build; some
+      # docs link to items that exist only behind a feature).
+      - run: cargo doc --workspace --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # The oldest toolchain the workspace promises to build with (`rust-version`
   # in Cargo.toml; keep the two in step).
