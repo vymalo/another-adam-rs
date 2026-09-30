@@ -238,6 +238,13 @@ impl GitCmd {
             .env("GIT_ASKPASS", "false")
             .env("SSH_ASKPASS", "false")
             .env("LC_ALL", "C");
+        // No global configuration, unless the operator of this process named one in its own
+        // environment (`GIT_CONFIG_GLOBAL`): `$HOME/.gitconfig` is a file that code running in a
+        // worktree can write, and a `url.*.insteadOf` in it would redirect what carries the token.
+        cmd.env(
+            "GIT_CONFIG_GLOBAL",
+            std::env::var_os("GIT_CONFIG_GLOBAL").unwrap_or_else(|| "/dev/null".into()),
+        );
         if let Some(ceiling) = &self.ceiling {
             cmd.env("GIT_CEILING_DIRECTORIES", ceiling);
         }

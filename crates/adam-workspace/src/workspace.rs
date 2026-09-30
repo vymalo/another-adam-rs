@@ -556,6 +556,29 @@ impl Workspaces {
     }
 }
 
+/// Whether the (lowercased-section) configuration `key` is one the mirror must not carry into a
+/// credentialed command (see [`Inner::sanitize_mirror_config`]).
+fn is_unwanted_config(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    if key == "remote.origin.url" || key == "remote.origin.fetch" {
+        return false;
+    }
+    const PREFIXES: &[&str] = &[
+        "url.",
+        "remote.",
+        "include.",
+        "includeif.",
+        "http.",
+        "credential.",
+        "core.sshcommand",
+        "core.gitproxy",
+        "core.fsmonitor",
+        "core.hookspath",
+        "core.askpass",
+    ];
+    PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
 /// The branch in the first line of `git ls-remote --symref origin HEAD`:
 /// `ref: refs/heads/<branch>\tHEAD`.
 fn parse_symref_head(output: &str) -> Option<String> {
@@ -791,6 +814,59 @@ impl Inner {
             ])
             .run()
             .await?;
+        self.sanitize_mirror_config(mirror, url).await
+    }
+
+    /// Remove from the mirror's configuration whatever is not what [`ensure_mirror`](Self::ensure_mirror)
+    /// writes and could change where a credentialed command goes or how it connects: any `url.*`
+    /// rewrite (`insteadOf` and `pushInsteadOf` rewrite the URLs given on the command line too), any
+    /// `remote.*` key but the two `ensure_mirror` writes, `include`s, `http.*`, `credential.*`, `core.sshCommand`,
+    /// `core.gitProxy`, `core.fsmonitor`, `core.hooksPath` and `core.askPass`; and puts the two
+    /// `remote.origin` keys back to what was approved (`url`: the URL the credentials are for).
+    ///
+    /// Call it **under the mirror lock, before every command that carries a token** (fetch,
+    /// ls-remote, push, publish): the configuration is shared by every run and written by more than
+    /// this crate (a model's command, OpenCode, a repository's own scripts run in a worktree), so
+    /// the guard is at the credentialed call and not at whoever wrote the key. Keys the crate
+    /// itself writes (`branch.*`, the two `remote.origin.*`) are left.
+    pub(crate) async fn sanitize_mirror_config(
+        &self,
+        mirror: &Path,
+        url: &str,
+    ) -> WorkspaceResult<()> {
+        let listed = self
+            .mirror_git(mirror)
+            .args(["config", "--local", "--list", "-z"])
+            .run()
+            .await?;
+        let mut keys: Vec<String> = listed
+            .stdout_text()
+            .split('\0')
+            .filter_map(|entry| entry.split('\n').next())
+            .filter(|key| is_unwanted_config(key))
+            .map(str::to_owned)
+            .collect();
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            tracing::warn!(%key, "removing a git configuration key that was not written by the workspace");
+            self.mirror_git(mirror)
+                .args(["config", "--local", "--unset-all", &key])
+                .run_status()
+                .await?;
+        }
+        // The two keys that stay are what the workspace approved, whatever they say now.
+        let set = |key: &str, value: &str| {
+            self.mirror_git(mirror)
+                .args(["config", "--local", key, value])
+                .run()
+        };
+        set("remote.origin.url", url).await?;
+        set(
+            "remote.origin.fetch",
+            &format!("+refs/heads/*:{REMOTE_TRACKING_PREFIX}*"),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1019,6 +1095,38 @@ mod tests {
         }
         for bad in ["", ".hidden", "..", "a/b", "a b", "a\nb", &"x".repeat(129)] {
             assert!(validate_run(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_keys_that_can_redirect_a_credentialed_command_are_unwanted() {
+        for key in [
+            "url.https://evil.example/.insteadof",
+            "url.file:///evil.git.pushinsteadof",
+            "remote.origin.pushurl",
+            "remote.evil.url",
+            "remote.origin.proxy",
+            "include.path",
+            "includeif.gitdir:/x.path",
+            "http.proxy",
+            "http.https://github.com/.extraheader",
+            "credential.helper",
+            "core.sshcommand",
+            "core.fsmonitor",
+            "core.hookspath",
+        ] {
+            assert!(is_unwanted_config(key), "{key}");
+        }
+        for key in [
+            "remote.origin.url",
+            "remote.origin.fetch",
+            "core.bare",
+            "core.repositoryformatversion",
+            "branch.agent/abc.adam-run",
+            "branch.agent/abc.remote",
+            "user.name",
+        ] {
+            assert!(!is_unwanted_config(key), "{key}");
         }
     }
 

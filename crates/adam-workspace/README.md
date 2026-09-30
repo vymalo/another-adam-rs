@@ -19,7 +19,7 @@ authentication behave like the real tool.
 |---|---|
 | `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `default_branch(url)`, `open_existing(run)`, `remove(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
-| `Worktree` | `path`, `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` (the run's own branch), `publish` (moves the continued branch) |
+| `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` (the run's own branch), `publish` (moves the continued branch) |
 | `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files |
 | `GitCredentials` (trait), `DynGitCredentials` | `token_for(&RepoRef) -> SecretString` |
 | `StaticToken`, `ScopedToken` | one token for any host, or bound to named hosts (`from_env(..)` for both) |
@@ -72,13 +72,19 @@ if wt.commit_all("fix the thing", &me).await?.is_some() {
 
 Security posture: `Workspaces::allow_hosts` and `allow_local` decide which
 repository URLs are accepted at all, so a token only goes to a host the
-operator named. The commands that carry the token (`fetch`, `ls-remote`, `push`) name that URL
-(the canonical one for an http(s) remote) and the refspec, instead of the remote called `origin`,
-so a `remote.origin.url` or `pushurl` changed in the shared mirror's configuration does not
-redirect them; `core.fsmonitor` is pinned off for every command. A `url.<base>.insteadOf` rule in
-that configuration still rewrites a URL git is given: the coder keeps a command of the model from
-writing one (see its `run_command`), but a caller that lets other code write to the mirror's
-configuration owns that. The token reaches `git` only through the environment of one
+operator named. The commands that carry the token (`fetch`, `ls-remote`, `push`, `publish`) name that URL
+(the canonical one for an http(s) remote) and the refspec, instead of the remote called `origin`;
+`core.fsmonitor` is pinned off for every command and `GIT_CONFIG_GLOBAL` is `/dev/null` next to
+`GIT_CONFIG_NOSYSTEM` unless the operator set `GIT_CONFIG_GLOBAL` in the process's own environment (a global file the
+operator chose is theirs; `$HOME/.gitconfig` is not read, since code in a worktree can write it). That is not enough alone: `url.<base>.insteadOf` and `pushInsteadOf` rewrite the
+URLs given on the command line too, and the mirror's configuration is shared by every run and
+written by more than this crate (a model's command, OpenCode and a repository's scripts all run in
+a worktree of it). So **the guard is at the credentialed call**: under the mirror lock, right before
+each of those commands, the crate removes from the mirror's configuration every `url.*`, every
+`remote.*` key but the two it writes, `include`s, `http.*`, `credential.*`, `core.sshCommand`,
+`core.gitProxy`, `core.fsmonitor`, `core.hooksPath` and `core.askPass`, and puts `remote.origin.url` and
+`remote.origin.fetch` back to what was approved. Who wrote the key does not matter. (A tool such as the coder's
+`run_command` also undoes such writes when it sees them, but nothing relies on that.) The token reaches `git` only through the environment of one
 invocation: never in a remote URL, `.git/config`, logs or error messages.
 URLs with embedded credentials and ssh/scp forms are refused.
 
@@ -86,7 +92,7 @@ URLs with embedded credentials and ssh/scp forms are refused.
 
 Several worker processes may use one root (the `shared` placement of
 [ADR 0002](../../docs/decisions/0002-workspace-placement.md): one RWX volume mounted by every
-worker). `prepare`, `remove` and `Worktree::push` change a mirror (`fetch`, `worktree add` and
+worker). `prepare`, `remove`, `Worktree::push` and `Worktree::publish` change a mirror (`fetch`, `worktree add` and
 `remove`, config writes), and git's own lock files make a second process fail with "could not
 lock". So each of them takes two locks on the mirror, in this order:
 
@@ -145,7 +151,9 @@ The only environment variable the crate reads is the one you name in
 
 Offline. The `git` CLI must be on `PATH`.
 
-* `tests/workspace.rs`: worktrees against local bare repositories (including a run that continues a pushed
+* `tests/workspace.rs`: worktrees against local bare repositories (including the configuration planted in the
+  mirror, `insteadOf`, `pushInsteadOf`, `pushurl`, a second remote, a proxy and an fsmonitor, which neither the
+  push, the fetch of a later run, the default branch nor `publish` follows, and which is removed; a run that continues a pushed
   branch: its files, its pushes to its own branch and the separate, fast-forward-only `publish` to the continued
   one, the names it refuses, idempotency and a restart, a branch that moved; the default branch of the remote
   and the list of branches in the error for a missing one), the host

@@ -333,21 +333,55 @@ async fn a_run_can_continue_a_pushed_branch_and_publishes_to_it_only_on_request(
     assert!(!first.path().join("second.txt").exists());
 }
 
-/// What carries the credentials names the URL it was prepared for: a `remote.origin.url` or
-/// `pushurl` that was changed in the shared mirror's configuration afterwards redirects neither the
-/// fetch of a later run nor a push.
+/// What carries the credentials goes where the workspace was prepared for, whatever was written in
+/// the shared mirror's configuration afterwards: a `remote.origin.url` or `pushurl`, and the URL
+/// rewrites (`insteadOf` and `pushInsteadOf` rewrite the URLs given on the command line too) that
+/// a model's command, OpenCode or a repository script could plant. The configuration is made safe
+/// under the mirror lock right before each credentialed command.
 #[tokio::test]
-async fn fetch_and_push_do_not_follow_the_mirrors_origin_configuration() {
+async fn fetch_and_push_do_not_follow_the_mirrors_configuration() {
     let env = Env::new();
     let first = env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
     let bogus = env._tmp.path().join("nowhere.git");
+    let evil = env._tmp.path().join("evil.git");
+    std::fs::create_dir_all(&evil).unwrap();
+    git(
+        &evil,
+        &["init", "--bare", "--quiet", "--initial-branch=main"],
+    );
     let mirror = env.mirror();
-    for (key, value) in [
-        ("remote.origin.url", bogus.to_str().unwrap()),
-        ("remote.origin.pushurl", bogus.to_str().unwrap()),
-    ] {
-        git(&mirror, &["config", key, value]);
-    }
+    let remote = env.remote.to_str().unwrap().to_owned();
+    let plant = |mirror: &std::path::Path| {
+        for (key, value) in [
+            ("remote.origin.url", bogus.to_str().unwrap()),
+            ("remote.origin.pushurl", bogus.to_str().unwrap()),
+            ("remote.evil.url", evil.to_str().unwrap()),
+        ] {
+            git(mirror, &["config", key, value]);
+        }
+        git(
+            mirror,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", evil.display()),
+                &remote,
+            ],
+        );
+        git(
+            mirror,
+            &[
+                "config",
+                &format!("url.{}.pushInsteadOf", evil.display()),
+                &remote,
+            ],
+        );
+        git(mirror, &["config", "http.proxy", "http://127.0.0.1:9/"]);
+        git(
+            mirror,
+            &["config", "core.fsmonitor", "touch /nonexistent/ran"],
+        );
+    };
+    plant(&mirror);
     std::fs::write(first.path().join("f.txt"), "f\n").unwrap();
     first.commit_all("f", &me()).await.unwrap().unwrap();
     first.push().await.unwrap();
@@ -356,10 +390,57 @@ async fn fetch_and_push_do_not_follow_the_mirrors_origin_configuration() {
         [first.branch().to_owned(), "main".to_owned()],
         "the push reached the real remote"
     );
-    // A second run's fetch comes from the real remote too (it sees `main`, which only it has).
+    assert_eq!(
+        git(&evil, &["for-each-ref"]),
+        "",
+        "nothing was sent to the rewritten URL"
+    );
+    // The keys are gone, what the workspace itself writes stays.
+    let config = git(&mirror, &["config", "--local", "--list"]);
+    for gone in [
+        "insteadof",
+        "pushinsteadof",
+        "pushurl",
+        "remote.evil",
+        "http.proxy",
+        "fsmonitor",
+    ] {
+        assert!(!config.to_lowercase().contains(gone), "{gone} in {config}");
+    }
+    assert!(
+        config.contains(&format!("remote.origin.url={remote}")),
+        "{config}"
+    );
+    assert!(config.contains("remote.origin.fetch="), "{config}");
+    assert!(
+        config.contains(&format!("branch.{}.remote=origin", first.branch())),
+        "{config}"
+    );
+
+    // A second run's fetch comes from the real remote too, and so does the default branch.
+    plant(&mirror);
     env.advance_remote("later.txt");
     let second = env.ws.prepare(&env.repo, "run-second-002").await.unwrap();
     assert!(second.path().join("later.txt").exists());
+    plant(&mirror);
+    assert_eq!(env.ws.default_branch(&env.repo.url).await.unwrap(), "main");
+
+    // And a continuing run's publish.
+    let third = env
+        .ws
+        .prepare_continuing(&env.repo, "run-third-0003", first.branch())
+        .await
+        .unwrap();
+    std::fs::write(third.path().join("g.txt"), "g\n").unwrap();
+    third.commit_all("g", &me()).await.unwrap().unwrap();
+    third.push().await.unwrap();
+    plant(&mirror);
+    third.publish().await.unwrap();
+    assert_eq!(
+        git(&env.remote, &["show", &format!("{}:g.txt", first.branch())]),
+        "g"
+    );
+    assert_eq!(git(&evil, &["for-each-ref"]), "");
 }
 
 #[tokio::test]

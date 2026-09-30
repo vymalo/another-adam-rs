@@ -135,8 +135,11 @@ A tool that the **project** brings itself is different (`jest`, `vitest`, `tsc`
 under `node_modules`, `pytest` in a virtual environment): it is missing because
 the project's dependencies are not installed yet, and the result says so. Install
 them with the project's own command (`pnpm install`, `npm ci`, `pip install -r
-requirements.txt`), through `delegate_to_opencode` or `run_checks`, and run the
-check again. Tell the person only if that fails.
+requirements.txt`), through `delegate_to_opencode` only (`run_checks` is for the
+project's real checks: an install that passes is not a check of the code, and
+running it would only spend a cycle or pass the gate on nothing), and run the
+check again. Tell the person if that fails, or if the same tool is reported
+missing again.
 
 # Questions and conversation
 

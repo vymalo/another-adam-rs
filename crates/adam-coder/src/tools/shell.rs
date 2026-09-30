@@ -199,14 +199,21 @@ pub fn missing_tool(outcome: &ShellOutcome, command: &str) -> Option<MissingTool
             who.rsplit('/').next(),
             Some("sh" | "bash" | "dash" | "zsh" | "ash")
         );
-        let own_script =
-            !who.is_empty() && !who.contains(char::is_whitespace) && command.contains(who);
+        let own_script = !who.is_empty() && command_words(command).any(|word| word == who);
         let plausible =
             !word.is_empty() && word.len() <= 128 && !word.contains(char::is_whitespace);
         (plausible && (shell || own_script)).then(|| MissingTool {
             name: word.to_owned(),
         })
     })
+}
+
+/// The words of a shell command line, split at whitespace and at the characters that separate
+/// commands and quote: `sh ./check.sh && echo 'x'` has `sh`, `./check.sh`, `echo` and `x`.
+fn command_words(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split(|c: char| c.is_whitespace() || ";&|()<>`'\"".contains(c))
+        .filter(|word| !word.is_empty())
 }
 
 /// What the workspace is missing, if the project brings it itself: the tool `name` is one the
@@ -617,6 +624,16 @@ mod tests {
             None
         );
         assert_eq!(m(127, "sh: 1: the thing you wanted: not found", "x"), None);
+        // A name that is only part of a word of the command is not the command's script.
+        assert_eq!(m(127, "check: 1: mvn: not found", "sh ./check.sh"), None);
+        assert_eq!(
+            m(
+                127,
+                "check.sh: 1: mvn: not found",
+                "echo check.sh-is-fine; exit 127"
+            ),
+            None
+        );
         // A line from a tool the command does not run (it could be anything in the output).
         assert_eq!(
             m(127, "other: 1: mvn: not found", "echo hi; exit 127"),

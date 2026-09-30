@@ -1526,10 +1526,11 @@ async fn run_command_undoes_changes_to_the_git_configuration_and_to_refs() {
         )
     };
     let (config_before, refs_before) = (config(&dir), refs(&dir));
+    let ran = rig.fx.tmp.path().join("fsmonitor-ran");
 
     for command in [
         // A program git runs on every `status`.
-        "git config core.fsmonitor 'touch /tmp/adam-fsmonitor-ran'",
+        &format!("git config core.fsmonitor 'touch {}'", ran.display()),
         // Where the credentials would go.
         "git config remote.origin.pushurl https://evil.example/octo/widgets.git",
         "git config url.https://evil.example/.insteadOf https://github.com/",
@@ -1537,7 +1538,6 @@ async fn run_command_undoes_changes_to_the_git_configuration_and_to_refs() {
         "git config --unset remote.origin.url",
         // Refs outside the run's own branch.
         "git branch created",
-        "git tag v1",
         "git update-ref refs/heads/zzz HEAD",
         "git branch -D keep",
         "git update-ref -d refs/heads/keep && git branch keep2",
@@ -1566,7 +1566,7 @@ async fn run_command_undoes_changes_to_the_git_configuration_and_to_refs() {
         .await
         .unwrap();
     assert!(!read.is_error, "{}", read.content);
-    assert!(!std::path::Path::new("/tmp/adam-fsmonitor-ran").exists());
+    assert!(!ran.exists(), "the fsmonitor program never ran");
 }
 
 /// An embedded repository with no commit makes `git add -A` fail, so there is no tree id: the
@@ -1605,6 +1605,92 @@ async fn run_command_still_works_when_the_tree_cannot_be_computed() {
             && changed.content.contains("could not be fully undone"),
         "{}",
         changed.content
+    );
+}
+
+/// Refs and configuration are shared by every run on the mirror: what another run (or a fetch, or
+/// a `git stash` in another worktree) writes while a command runs is not this command's change, so
+/// it is neither refused nor undone. A rewritten `.git` file is put right.
+#[tokio::test]
+async fn run_command_leaves_what_other_runs_write_meanwhile_alone() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    let concurrent = async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        common::git(&dir, &["tag", "fetched-tag"]);
+        common::git(&dir, &["update-ref", "refs/stash", "HEAD"]);
+        common::git(&dir, &["branch", "agent/other-run"]);
+        common::git(
+            &dir,
+            &["config", "branch.agent/other-run.adam-run", "other"],
+        );
+    };
+    let (out, ()) = tokio::join!(
+        async {
+            RunCommand
+                .call(&rig.ctx, json!({"command": "sleep 1; echo looked"}))
+                .await
+                .unwrap()
+        },
+        concurrent
+    );
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("looked"));
+    let refs = common::git(&dir, &["for-each-ref", "--format=%(refname)"]);
+    for kept in [
+        "refs/tags/fetched-tag",
+        "refs/stash",
+        "refs/heads/agent/other-run",
+    ] {
+        assert!(refs.contains(kept), "{kept} was deleted: {refs}");
+    }
+    assert!(
+        common::git(&dir, &["config", "--local", "--list"])
+            .contains("branch.agent/other-run.adam-run=other")
+    );
+
+    // A command that rewrites the `.git` file would point every later git call elsewhere: it is
+    // refused, the file is put back, and the worktree works.
+    let dot_git = std::fs::read_to_string(dir.join(".git")).unwrap();
+    let out = RunCommand
+        .call(
+            &rig.ctx,
+            json!({"command": "echo 'gitdir: /nonexistent' > .git"}),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert_eq!(std::fs::read_to_string(dir.join(".git")).unwrap(), dot_git);
+    let status = RunCommand
+        .call(&rig.ctx, json!({"command": "git status --short"}))
+        .await
+        .unwrap();
+    assert!(!status.is_error, "{}", status.content);
+}
+
+/// A continued branch's base is the base of its pull request: when that base is gone upstream, the
+/// error says it is fixed and to ask, not to pick another.
+#[tokio::test]
+async fn a_recorded_base_that_is_gone_is_not_to_be_replaced() {
+    let rig = Rig::new().await;
+    let remote = rig.fx.remote_url();
+    let (_two, _worktree, branch, _tip) = rework_of_an_open_pull_request(&rig).await;
+    let three = next_task_with_base(&rig.fx, &remote, &[(&remote, &branch)], Some("gone")).await;
+    let out = PrepareWorkspace
+        .call(
+            &three,
+            json!({"repo_url": remote, "base_branch": "main", "branch": branch}),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("branch gone does not exist")
+            && out.content.contains("fixed by that pull request")
+            && out.content.contains("ask_user"),
+        "{}",
+        out.content
     );
 }
 
@@ -1709,28 +1795,64 @@ async fn a_project_dependency_is_to_be_installed_and_a_nested_not_found_is_a_fai
     )
     .unwrap();
     std::fs::write(dir.join("pnpm-lock.yaml"), "").unwrap();
-    for out in [
-        RunChecks
-            .call(&rig.ctx, json!({"command": "zzz-local-tool --run"}))
+    // The first time: install the project's dependencies, through OpenCode and not run_checks.
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": "zzz-local-tool --run"}))
+        .await
+        .unwrap();
+    assert!(first.is_error, "{}", first.content);
+    let said = &first.content;
+    assert!(
+        said.contains("`zzz-local-tool` is not on the PATH")
+            && said.contains("this project's own dependencies")
+            && said.contains("`pnpm install`")
+            && said.contains("with delegate_to_opencode (not run_checks")
+            && said.contains("no check cycle was used")
+            && !said.contains("missing toolchain, not a failing check"),
+        "{said}"
+    );
+    assert!(first.artifacts.is_empty());
+    // The same call again (a replay of it) gets the same answer and counts once.
+    let replay = RunChecks
+        .call(&rig.ctx, json!({"command": "zzz-local-tool --run"}))
+        .await
+        .unwrap();
+    assert_eq!(replay.content, first.content);
+    let run = rig.ctx.run_id().to_string();
+    assert_eq!(
+        rig.fx
+            .env
+            .notes
+            .load(&run)
             .await
-            .unwrap(),
-        RunCommand
-            .call(&rig.ctx, json!({"command": "zzz-local-tool --run"}))
-            .await
-            .unwrap(),
-    ] {
-        assert!(out.is_error, "{}", out.content);
-        let said = &out.content;
-        assert!(
-            said.contains("`zzz-local-tool` is not on the PATH")
-                && said.contains("this project's own dependencies")
-                && said.contains("`pnpm install`")
-                && said.contains("no check cycle was used")
-                && !said.contains("missing toolchain, not a failing check"),
-            "{said}"
-        );
-        assert!(out.artifacts.is_empty());
-    }
+            .unwrap()
+            .missing_tools
+            .len(),
+        1
+    );
+
+    // When an earlier call of the run already found the same tool missing, installing did not
+    // help: the answer is to ask the person (the call that comes after it is another call id).
+    let mut notes = rig.fx.env.notes.load(&run).await.unwrap();
+    notes.missing_tools.clear();
+    notes.record_missing_tool("an-earlier-call", "zzz-local-tool");
+    rig.fx.env.notes.save(&run, &notes).await.unwrap();
+    let second = RunCommand
+        .call(&rig.ctx, json!({"command": "zzz-local-tool --again"}))
+        .await
+        .unwrap();
+    assert!(second.is_error, "{}", second.content);
+    assert!(
+        second
+            .content
+            .contains("The workspace has no `zzz-local-tool`")
+            && second.content.contains("still missing")
+            && second.content.contains("ask_user")
+            && !second.content.contains("pnpm install"),
+        "{}",
+        second.content
+    );
+    assert!(second.artifacts.is_empty());
     assert_eq!(failures(&rig).await, 0);
 
     // A nested shell says "not found", and the run fails on its own terms: a failed check.

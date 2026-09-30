@@ -120,7 +120,22 @@ pub async fn prepare_workspace(
             | adam_workspace::WorkspaceError::Conflict(_)),
         ) => {
             // The model gave a bad repository or branch: tell it, do not fail.
-            return Ok(ToolOutput::error(e.to_string()));
+            // The base of a continued branch is the base of its pull request: when that branch is
+            // gone upstream, choosing another is not the way out.
+            let fixed = match (&recorded_base, &e) {
+                (Some(base), adam_workspace::WorkspaceError::NotFound(_))
+                    if e.to_string()
+                        .contains(&format!("branch {base} does not exist")) =>
+                {
+                    format!(
+                        " {base} is the base of the pull request of {}: it is fixed by that pull \
+                         request, so do not pick another base. Tell the person with ask_user.",
+                        continuing.unwrap_or("the branch")
+                    )
+                }
+                _ => String::new(),
+            };
+            return Ok(ToolOutput::error(format!("{e}{fixed}")));
         }
         Err(e) => return Err(env.delivery_error(ctx, &e).await),
     };

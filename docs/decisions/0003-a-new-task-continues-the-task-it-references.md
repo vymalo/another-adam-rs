@@ -30,6 +30,15 @@ the verdict say the pull request was not updated (`RunNotes::published`), and is
 commit; the commands that carry the token name the repository's URL and not `origin`, and
 `core.fsmonitor` is pinned off.
 
+*Amended 2026-09-30, fourth review (credentialed calls):* `url.*.insteadOf` rewrites command-line URLs
+too, so naming the URL was not enough: before every command that carries a token the workspace removes
+from the shared mirror's configuration every key that could redirect or reconfigure it, under the mirror
+lock, and `GIT_CONFIG_GLOBAL` is `/dev/null`; `run_command`'s snapshot no longer compares refs and
+configuration that other runs write (tags, `refs/stash`, other runs' `agent/*` keys), holds the mirror
+lock to restore, and is documented as a guard against accidents; the advice to install a project's own
+dependencies goes through `delegate_to_opencode` only, and the second report of the same missing tool asks
+the person.
+
 *Amended 2026-09-30, second review (branch continuation):* a continued branch is reached only
 through the checks gate. The first version pushed a continuing run's commits straight to the
 branch that already had a pull request, so a rework whose checks never went green left unverified

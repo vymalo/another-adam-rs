@@ -96,20 +96,53 @@ pub(crate) async fn status_text(dir: &Path) -> Option<String> {
 }
 
 /// The parts of the repository that are shared with every run and that a model's command could
-/// change without touching a file of the worktree: refs outside the namespaces the agent itself
-/// keeps moving, and the local configuration.
+/// change without touching a file of the worktree: refs outside the namespaces that other runs
+/// and git itself move, the local configuration, and `info/exclude`.
 ///
-/// Left out, because other runs change them while a command runs and a restore would undo
-/// their work: `refs/heads/agent/*` (runs commit to them), `refs/remotes/*` (fetches write
-/// them) and the `branch.*` keys of the configuration (`prepare` writes them). Everything else
-/// is compared: a new branch or tag, a moved or deleted ref, `core.fsmonitor`, a
-/// `remote.origin.pushurl`, a `url.*.insteadOf`, an alias.
+/// This is **a guard against accidents, not isolation**: the refs and the configuration are
+/// shared by every run on the mirror, and other runs change them while a command runs, so what
+/// they change is left out (a restore would undo their work). Not compared:
+/// * `refs/heads/agent/*` (runs commit to them: so a command can still move or delete another
+///   run's branch), `refs/remotes/*` (fetches write them), `refs/tags/*` (a fetch follows tags)
+///   and `refs/stash` (a `git stash` in another worktree writes it);
+/// * the configuration keys `branch.agent/*.adam-run`, `.remote` and `.merge`, which `prepare`
+///   and `push` write for each run.
+///
+/// Compared, and undone when a command changed them: any other ref (a new branch, `refs/notes`,
+/// a moved `main`), every other configuration key (`core.fsmonitor`, a `remote.origin.pushurl`, a
+/// `url.*.insteadOf`, an alias) and `info/exclude` (which would hide files from what
+/// `commit_and_push` commits). The credentialed commands of the workspace do not rely on this: they
+/// clean the configuration themselves under the mirror lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoState {
     /// `(refname, object id)`.
     refs: Vec<(String, String)>,
     /// `(key, value)` of `git config --local`, by key, multi-valued keys repeated.
     config: Vec<(String, String)>,
+    /// The content of `<common dir>/info/exclude`, `None` when there is no such file.
+    exclude: Option<String>,
+}
+
+/// Whether a run other than this one changes `refname` as a matter of course.
+fn moved_by_others(refname: &str) -> bool {
+    refname.starts_with("refs/heads/agent/")
+        || refname.starts_with("refs/remotes/")
+        || refname.starts_with("refs/tags/")
+        || refname == "refs/stash"
+}
+
+/// Whether `key` is one that `prepare` and `push` write for a run's own branch.
+fn written_per_run(key: &str) -> bool {
+    key.starts_with("branch.agent/")
+        && [".adam-run", ".remote", ".merge"]
+            .iter()
+            .any(|suffix| key.ends_with(suffix))
+}
+
+/// `<common dir>/info/exclude`, where the repository's local ignore rules live.
+async fn exclude_path(dir: &Path) -> Option<std::path::PathBuf> {
+    let common = git_stdout(dir, &["rev-parse", "--git-common-dir"]).await?;
+    Some(dir.join(common).join("info/exclude"))
 }
 
 /// [`RepoState`] now, `None` when it cannot be read.
@@ -118,9 +151,7 @@ pub(crate) async fn repo_state(dir: &Path) -> Option<RepoState> {
     let refs = refs
         .lines()
         .filter_map(|l| l.split_once(' '))
-        .filter(|(name, _)| {
-            !name.starts_with("refs/heads/agent/") && !name.starts_with("refs/remotes/")
-        })
+        .filter(|(name, _)| !moved_by_others(name))
         .map(|(n, id)| (n.to_owned(), id.to_owned()))
         .collect();
     let config = git_stdout(dir, &["config", "--local", "--list", "-z"]).await?;
@@ -131,29 +162,45 @@ pub(crate) async fn repo_state(dir: &Path) -> Option<RepoState> {
             Some((k, v)) => (k.to_owned(), v.to_owned()),
             None => (e.to_owned(), String::new()),
         })
-        .filter(|(k, _)| !k.starts_with("branch."))
+        .filter(|(k, _)| !written_per_run(k))
         .collect();
     // Where a key sits in the file does not matter (restoring it appends), what it says does; the
     // values of one key keep their order (the sort is stable).
     config.sort_by(|a, b| a.0.cmp(&b.0));
-    Some(RepoState { refs, config })
+    let exclude = match tokio::fs::read_to_string(exclude_path(dir).await?).await {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
+    Some(RepoState {
+        refs,
+        config,
+        exclude,
+    })
 }
 
-/// Put the refs and the configuration that [`repo_state`] reads back as `before` had them.
-/// `true` when every step succeeded.
+/// Put the refs, the configuration and `info/exclude` that [`repo_state`] reads back as `before`
+/// had them. `true` when every step succeeded. The caller holds the mirror lock
+/// (`Worktree::lock_mirror`): the configuration is written by one at a time.
 pub(crate) async fn restore_repo_state(dir: &Path, before: &RepoState) -> bool {
     let Some(now) = repo_state(dir).await else {
         return false;
     };
     let mut ok = true;
+    // `--no-deref`: a ref that is a symbolic ref is itself what is deleted or set, never what it
+    // points at.
     for (name, _) in &now.refs {
         if !before.refs.iter().any(|(n, _)| n == name) {
-            ok &= git_stdout(dir, &["update-ref", "-d", name]).await.is_some();
+            ok &= git_stdout(dir, &["update-ref", "--no-deref", "-d", name])
+                .await
+                .is_some();
         }
     }
     for (name, id) in &before.refs {
         if !now.refs.iter().any(|r| r == &(name.clone(), id.clone())) {
-            ok &= git_stdout(dir, &["update-ref", name, id]).await.is_some();
+            ok &= git_stdout(dir, &["update-ref", "--no-deref", name, id])
+                .await
+                .is_some();
         }
     }
     if now.config != before.config {
@@ -189,6 +236,15 @@ pub(crate) async fn restore_repo_state(dir: &Path, before: &RepoState) -> bool {
                     .is_some();
             }
         }
+    }
+    if now.exclude != before.exclude {
+        let Some(path) = exclude_path(dir).await else {
+            return false;
+        };
+        ok &= match &before.exclude {
+            Some(text) => tokio::fs::write(&path, text).await.is_ok(),
+            None => tokio::fs::remove_file(&path).await.is_ok(),
+        };
     }
     ok && repo_state(dir).await.as_ref() == Some(before)
 }
@@ -356,5 +412,45 @@ mod tests {
         // second than the entry's to look older than it.
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
         assert_eq!(working_tree_id(dir).await.unwrap(), expected);
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn what_other_runs_move_is_not_compared() {
+        for moved in [
+            "refs/heads/agent/abc",
+            "refs/remotes/origin/main",
+            "refs/tags/v1",
+            "refs/stash",
+        ] {
+            assert!(moved_by_others(moved), "{moved}");
+        }
+        for ours in [
+            "refs/heads/main",
+            "refs/heads/keep",
+            "refs/notes/x",
+            "refs/stash2",
+        ] {
+            assert!(!moved_by_others(ours), "{ours}");
+        }
+        for key in [
+            "branch.agent/01a0.adam-run",
+            "branch.agent/01a0.remote",
+            "branch.agent/01a0.merge",
+        ] {
+            assert!(written_per_run(key), "{key}");
+        }
+        // Another branch's keys are compared: a model can point `main` at another remote.
+        for key in [
+            "branch.main.remote",
+            "branch.agent/x.pushremote",
+            "remote.origin.pushurl",
+        ] {
+            assert!(!written_per_run(key), "{key}");
+        }
     }
 }

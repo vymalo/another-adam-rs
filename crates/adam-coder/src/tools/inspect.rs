@@ -20,12 +20,12 @@
 
 use adam::prelude::*;
 
-use super::checks::missing_tool_text;
+use super::checks::missing_tool_answer;
 use super::gitcli::{
     RepoState, git_stdout, head_ref, head_sha, repo_state, restore_repo_state, restore_worktree,
     status_text, working_tree_id,
 };
-use super::shell::{ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, run_shell};
+use super::shell::{ShellOutcome, missing_tool, resolve_cwd, run_shell};
 use super::{Outcome, ToolEnv, non_empty};
 
 /// Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`,
@@ -78,7 +78,7 @@ pub async fn run_command(
     // Did it change anything it should not have?
     let after = Snapshot::take(wt.path()).await;
     if after.as_ref() != Some(&before) {
-        let restored = before.restore(wt.path()).await;
+        let restored = before.restore(&wt).await;
         ctx.emit_progress(format!("undid a change made by: {shown}"))
             .await;
         return Ok(ToolOutput::error(changed_the_worktree(
@@ -89,11 +89,8 @@ pub async fn run_command(
     if let Some(missing) = missing_tool(&outcome, command) {
         ctx.emit_progress("the workspace lacks a tool".to_owned())
             .await;
-        let install = project_dependency_hint(&[dir.as_path(), wt.path()], &missing.name);
-        return Ok(ToolOutput::error(missing_tool_text(
-            &missing,
-            install.as_deref(),
-        )));
+        let said = missing_tool_answer(&env, ctx, &missing, &[dir.as_path(), wt.path()]).await?;
+        return Ok(ToolOutput::error(said));
     }
     Ok(ToolOutput::text(render(&shown, &outcome)))
 }
@@ -109,6 +106,12 @@ pub async fn run_command(
 /// could write back would be exact.
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
+    /// The git directory of this worktree: a command that replaced the `.git` file would point
+    /// every later git call somewhere else, and nothing may be restored through it.
+    git_dir: String,
+    /// What the `.git` file of the worktree says (it points at `git_dir`); a command that rewrote
+    /// it is put right before anything else, since git would act on wherever it points now.
+    dot_git: Option<String>,
     head: String,
     branch: Option<String>,
     tree: Option<String>,
@@ -119,6 +122,8 @@ struct Snapshot {
 
 impl Snapshot {
     async fn take(dir: &std::path::Path) -> Option<Self> {
+        let git_dir = git_stdout(dir, &["rev-parse", "--absolute-git-dir"]).await?;
+        let dot_git = tokio::fs::read_to_string(dir.join(".git")).await.ok();
         let head = head_sha(dir).await?;
         let tree = working_tree_id(dir).await;
         let status = match tree {
@@ -126,6 +131,8 @@ impl Snapshot {
             None => Some(status_text(dir).await?),
         };
         Some(Self {
+            git_dir,
+            dot_git,
             head,
             branch: head_ref(dir).await,
             tree,
@@ -135,7 +142,30 @@ impl Snapshot {
     }
 
     /// Put it all back; `true` when the worktree is exactly as it was.
-    async fn restore(&self, dir: &std::path::Path) -> bool {
+    async fn restore(&self, wt: &adam_workspace::Worktree) -> bool {
+        let dir = wt.path();
+        if let Some(text) = &self.dot_git
+            && tokio::fs::read_to_string(dir.join(".git"))
+                .await
+                .ok()
+                .as_deref()
+                != Some(text)
+        {
+            let _ = tokio::fs::write(dir.join(".git"), text).await;
+        }
+        // Still this run's git directory? Otherwise git would act on another repository.
+        if git_stdout(dir, &["rev-parse", "--absolute-git-dir"])
+            .await
+            .as_deref()
+            != Some(self.git_dir.as_str())
+        {
+            return false;
+        }
+        // The configuration and the refs are the mirror's, shared by every run: written by one at
+        // a time.
+        let Ok(_lock) = wt.lock_mirror().await else {
+            return false;
+        };
         let repo = restore_repo_state(dir, &self.repo).await;
         let Some(tree) = &self.tree else {
             // No tree to write back: point `HEAD` where it was and keep the files as they are.

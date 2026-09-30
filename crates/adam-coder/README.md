@@ -192,7 +192,10 @@ make them hold:
   one of the well-known node tools, `pytest` with a Python project file; `project_dependency_hint`) is a
   dependency that is not installed yet, and the answer says to install the project's dependencies with its own
   command (`pnpm install`, `npm ci`, `pip install -r requirements.txt`, picked from the lock files) through
-  `delegate_to_opencode` or `run_checks`; it also costs no cycle.
+  `delegate_to_opencode` **only** (an install that passes under `run_checks` would be a green check on code
+  nobody tested); it also costs no cycle. The second time the same tool is reported missing in a run
+  (`RunNotes::missing_tools`, one entry per call id so a replay counts once) the answer is to ask the person,
+  whatever the project says.
 * **A question is answered, not worked on.** The prompt says that a greeting or a question about the
   repository ("List all branches") gets a direct answer (after `prepare_workspace`, with `run_command`) and ends
   the turn; the run then parks as a question like any stop without a pull request, and the chat goes on.
@@ -256,9 +259,15 @@ touching a file and that later git calls of the coder would act on: the refs out
 namespaces (`refs/heads/agent/*` and `refs/remotes/*` are other runs' and fetches', and move while a
 command runs) and the local git configuration (without `branch.*`, which `prepare` writes), so a
 `core.fsmonitor`, a `remote.origin.pushurl`, a `url.*.insteadOf`, an alias, a new branch or tag is undone too.
-It is not a sandbox: a command can still read everything the process can, use the network, and write
-outside the worktree. What it cannot do is leave its mark on the repository the coder then commits and pushes
-from. Where the tree cannot be computed (an embedded repository without a commit), the record falls back to
+**This is a guard against accidents, not isolation**, and not what the credentials rely on (the workspace
+cleans the mirror's configuration itself, under its lock, before every credentialed command). A command can
+still read everything the process can, use the network and write outside the worktree. The refs and the
+configuration are shared by every run on the mirror and other runs change them while a command runs, so
+these are **not** compared, and a command can change them unseen: `refs/heads/agent/*` (another run's
+branch), `refs/remotes/*`, `refs/tags/*` (a fetch follows tags) and `refs/stash` (a `git stash` elsewhere),
+and the configuration keys `branch.agent/*.adam-run`, `.remote` and `.merge`. `info/exclude` is compared.
+The restore holds the mirror lock, refuses to touch anything if the worktree's `.git` no longer points at this
+run's git directory (and puts that file back first), and deletes and sets refs with `--no-deref`. Where the tree cannot be computed (an embedded repository without a commit), the record falls back to
 `git status`: a change is still seen and refused, but only `HEAD` and the branch are put back, and the model
 is told the files may differ.
 

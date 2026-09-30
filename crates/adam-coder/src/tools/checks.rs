@@ -324,31 +324,69 @@ fn human(d: std::time::Duration) -> String {
     }
 }
 
-/// What the model is told when a command failed because the workspace lacks a tool (see
-/// [`missing_tool`]): what is missing, that no check cycle was used, and that the way on is to tell
-/// the person and wait. It must not retry variants, hunt the filesystem, or install a system
-/// toolchain. A tool the **project** brings itself (`jest`, `vitest`, `tsc` with a `package.json`:
-/// `install` is the project's own install command, from [`project_dependency_hint`]) is another
-/// story: the project's dependencies are installed with the project's own command.
-pub(crate) fn missing_tool_text(missing: &MissingTool, install: Option<&str>) -> String {
+/// The answer to a command that failed because the workspace lacks a tool (see [`missing_tool`]),
+/// and the record of it: the first time a tool is reported missing in the run, a tool that the
+/// **project** brings (see [`project_dependency_hint`]) is answered with the project's install
+/// command; every other case, and the second time the same tool is reported, with the ask-the-person
+/// text. `dirs` are where the project's files are looked for.
+pub(crate) async fn missing_tool_answer(
+    env: &ToolEnv,
+    ctx: &ToolCtx,
+    missing: &MissingTool,
+    dirs: &[&std::path::Path],
+) -> Result<String, ToolError> {
+    let run = ctx.run_id().to_string();
+    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    let earlier = notes.record_missing_tool(ctx.call_id(), &missing.name);
+    env.notes
+        .save(&run, &notes)
+        .await
+        .map_err(|e| notes_error(&e))?;
+    let install = if earlier == 0 {
+        project_dependency_hint(dirs, &missing.name)
+    } else {
+        None
+    };
+    Ok(missing_tool_text(missing, install.as_deref(), earlier > 0))
+}
+
+/// What the model is told when a command failed because the workspace lacks a tool: what is
+/// missing, that no check cycle was used, and that the way on is to tell the person and wait. It
+/// must not retry variants, hunt the filesystem, or install a system toolchain. A tool the
+/// **project** brings itself (`install` is the project's own install command) is another story: the
+/// project's dependencies are installed with the project's own command, **through
+/// `delegate_to_opencode` and not `run_checks`** (an install that passes is a green check on code
+/// nobody tested, and `run_checks` is for the project's real checks). `repeated`: the same tool was
+/// already reported, so whatever was tried did not work, and the person decides.
+pub(crate) fn missing_tool_text(
+    missing: &MissingTool,
+    install: Option<&str>,
+    repeated: bool,
+) -> String {
     let name = &missing.name;
     if let Some(install) = install {
         return format!(
             "`{name}` is not on the PATH, but it is one of this project's own dependencies, which \
              are not installed in the workspace yet: that is not a missing toolchain and not a \
-             failing check (no check cycle was used, nothing was recorded as a check). Install \
-             the project's dependencies with its own command (`{install}`), with \
-             delegate_to_opencode or run_checks, then run this again. Only if that fails, tell the \
-             person with ask_user."
+             failing check (no check cycle was used, nothing was recorded as a check). Have \
+             OpenCode install the project's dependencies with its own command (`{install}`), with \
+             delegate_to_opencode (not run_checks: that is only for the project's real checks), \
+             then run this again. Only if that fails, tell the person with ask_user."
         );
     }
+    let again = if repeated {
+        " You were told about this tool before and it is still missing: whatever was tried did \
+         not provide it, so stop and ask."
+    } else {
+        ""
+    };
     format!(
         "The workspace has no `{name}`: the shell could not find it (exit code 127). That is a \
          missing toolchain, not a failing check: no check cycle was used and nothing was \
          recorded as a check. Do not retry variants of the command, do not search the \
          filesystem for the tool and do not try to install it (system toolchains are not yours to \
          install). Tell the person which toolchain is missing (`{name}`) with ask_user, and wait \
-         for their answer."
+         for their answer.{again}"
     )
 }
 
@@ -461,11 +499,8 @@ pub async fn run_checks(
     if let Some(missing) = missing_tool(&outcome, command) {
         ctx.emit_progress(format!("the workspace lacks a tool: {shown}"))
             .await;
-        let install = project_dependency_hint(&[dir.as_path(), wt.path()], &missing.name);
-        return Ok(ToolOutput::error(missing_tool_text(
-            &missing,
-            install.as_deref(),
-        )));
+        let said = missing_tool_answer(&env, ctx, &missing, &[dir.as_path(), wt.path()]).await?;
+        return Ok(ToolOutput::error(said));
     }
 
     // The code the command just ran on, so a pull request can be tied to

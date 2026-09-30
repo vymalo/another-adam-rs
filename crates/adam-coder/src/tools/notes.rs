@@ -68,6 +68,37 @@ pub struct PullRequestNote {
     pub commented_sha: Option<String>,
 }
 
+/// A call that found a tool missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissingHit {
+    /// The tool call.
+    pub call_id: String,
+    /// The command word the shell could not find.
+    pub tool: String,
+}
+
+impl RunNotes {
+    /// Record that call `call_id` found `tool` missing and return how many **earlier** calls found
+    /// the same tool missing. Recording the same call again changes nothing and returns the same
+    /// count, so a replayed call gets the answer it got.
+    pub fn record_missing_tool(&mut self, call_id: &str, tool: &str) -> usize {
+        let at = match self.missing_tools.iter().position(|h| h.call_id == call_id) {
+            Some(at) => at,
+            None => {
+                self.missing_tools.push(MissingHit {
+                    call_id: call_id.to_owned(),
+                    tool: tool.to_owned(),
+                });
+                self.missing_tools.len() - 1
+            }
+        };
+        self.missing_tools[..at]
+            .iter()
+            .filter(|h| h.tool == tool)
+            .count()
+    }
+}
+
 /// A branch that work of this conversation was pushed for: the branch a pull request for that work
 /// is (or will be) opened from, and what a later task may continue. For a run that continued a
 /// branch it is that branch (the line of work), not the run's own `agent/<run>` the commits were
@@ -123,6 +154,11 @@ pub struct RunNotes {
     /// says that this branch (and so its pull request) was not updated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continues: Option<String>,
+    /// Which tool each `run_checks` or `run_command` call found missing, in order (one entry per
+    /// call id, so a replay counts once): the second time the same tool is reported missing the
+    /// answer is to ask the person, whatever the project says.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_tools: Vec<MissingHit>,
     /// `open_pull_request` moved the continued branch to the pushed commit. From then on the
     /// branch has the run's commits, whether or not the pull request could be reported.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
