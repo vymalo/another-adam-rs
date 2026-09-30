@@ -1627,3 +1627,329 @@ async fn the_model_of_a_continued_task_sees_the_earlier_messages_in_postgres() {
     adam_core::Store::migrate(&store).await.expect("migrate");
     llm_continuation_scenario(Arc::new(store)).await;
 }
+
+// --------------------------------------------- what a reference can and cannot do to a request
+
+/// A terminal record of `AGENT` in `subject`'s conversation `context` whose state is not a valid
+/// envelope (a version this build does not know), written straight into the store.
+async fn unreadable_record(rig: &Rig, subject: &str, context: &str) -> RunId {
+    let id = RunId::new();
+    rig.store
+        .create_run(
+            adam_core::NewRun::new(AGENT, json!({"v": 99, "agent": null}))
+                .with_id(id)
+                .conversation(format!("{subject}:{context}"))
+                .status(adam_core::RunStatus::Done),
+        )
+        .await
+        .expect("create");
+    id
+}
+
+/// A record the caller does not own is not even decoded, so it cannot fail the request or tell the
+/// caller it exists; one of the caller's own that cannot be read is skipped. Neither is an error,
+/// and neither blocks a reference that can be continued.
+#[tokio::test]
+async fn an_unreadable_referenced_record_is_skipped_not_an_error() {
+    let rig = Rig::new();
+    let worker = rig.worker();
+    let good = run_to(&rig, &alice(), "one", "c1", &[], TaskState::Completed).await;
+    let foreign = unreadable_record(&rig, "token-1", "c1").await.to_string();
+    let own = unreadable_record(&rig, "token-0", "c1").await.to_string();
+    let unknown = RunId::new().to_string();
+
+    // Bob's unreadable record looks exactly like an id that never existed.
+    let t = send(&rig, &alice(), "two", Some("c1"), &[foreign.as_str()]).await;
+    assert_eq!(earlier(&rig, &t).await, Vec::<String>::new());
+    wait_state(&rig, &alice(), &t.id, TaskState::Completed).await;
+    let t = send(&rig, &alice(), "three", Some("c1"), &[unknown.as_str()]).await;
+    assert_eq!(earlier(&rig, &t).await, Vec::<String>::new());
+    wait_state(&rig, &alice(), &t.id, TaskState::Completed).await;
+
+    // Her own, alone: a fresh task, not a -32603.
+    let t = send(&rig, &alice(), "four", Some("c1"), &[own.as_str()]).await;
+    assert_eq!(earlier(&rig, &t).await, Vec::<String>::new());
+    wait_state(&rig, &alice(), &t.id, TaskState::Completed).await;
+
+    // In front of one that can be continued, it is skipped and the next one is taken.
+    let t = send(
+        &rig,
+        &alice(),
+        "five",
+        Some("c1"),
+        &[foreign.as_str(), own.as_str(), good.id.as_str()],
+    )
+    .await;
+    assert_eq!(earlier(&rig, &t).await, ["one"]);
+    wait_state(&rig, &alice(), &t.id, TaskState::Completed).await;
+
+    // The same for a request without a message id.
+    let mut message = user_refs("six", &[own.as_str(), good.id.as_str()]);
+    message.message_id = String::new();
+    let t = rig
+        .backend
+        .submit(alice(), message, None, Some("c1".into()))
+        .await
+        .unwrap();
+    assert_eq!(earlier(&rig, &t).await, ["one"]);
+    worker.stop().await;
+}
+
+/// The anonymous caller is every client of an unauthenticated server at once, so what one of them
+/// said is not another's history: it continues nothing, and gets a fresh task.
+#[tokio::test]
+async fn the_anonymous_caller_continues_nothing() {
+    let rig = Rig::new();
+    let worker = rig.worker();
+    let anonymous = Caller::anonymous();
+    let first = run_to(&rig, &anonymous, "one", "c1", &[], TaskState::Completed).await;
+    let second = send(&rig, &anonymous, "two", Some("c1"), &[first.id.as_str()]).await;
+    assert_ne!(second.id, first.id);
+    assert_eq!(earlier(&rig, &second).await, Vec::<String>::new());
+    wait_state(&rig, &anonymous, &second.id, TaskState::Completed).await;
+
+    // The same request from an authenticated subject is continued, so it is the caller, and not
+    // the shape of the request, that decides.
+    let first = run_to(&rig, &alice(), "one", "c2", &[], TaskState::Completed).await;
+    let second = send(&rig, &alice(), "two", Some("c2"), &[first.id.as_str()]).await;
+    assert_eq!(earlier(&rig, &second).await, ["one"]);
+    worker.stop().await;
+}
+
+/// Two messages that both continue the same finished task at once: one run is created, and the
+/// other message is delivered to it, as two messages to an open context always were.
+async fn concurrent_continuations_scenario(store: DynStore) {
+    let unique = uuid_like();
+    let agent = format!("scripted-{unique}");
+    let who = Caller::new(format!("token-{unique}"));
+    for round in 0..8 {
+        let context = format!("ctx-{unique}-{round}");
+        let rig = Rig::over_as(store.clone(), &agent);
+        let worker = rig.worker();
+        let first = run_to(&rig, &who, "one", &context, &[], TaskState::Completed).await;
+        // Nothing steps what starts from here on, so the created task stays open.
+        worker.stop().await;
+
+        let submit = |text: &'static str, id: &str| {
+            let mut message = user_refs(text, &[first.id.as_str()]);
+            message.message_id = id.to_owned();
+            let backend = rig.backend.clone();
+            let (who, context) = (who.clone(), context.clone());
+            tokio::spawn(async move { backend.submit(who, message, None, Some(context)).await })
+        };
+        let (a, b) = (submit("two-a", "m-a"), submit("two-b", "m-b"));
+        let (a, b) = (a.await.unwrap().unwrap(), b.await.unwrap().unwrap());
+
+        assert_eq!(a.id, b.id, "round {round}: one task took both messages");
+        let derived = |message_id: &str| {
+            adam_a2a_runtime::task_id_for(&agent, &who.subject, Some(&context), message_id)
+                .to_string()
+        };
+        let (from_a, from_b) = (derived("m-a"), derived("m-b"));
+        assert!(a.id == from_a || a.id == from_b, "round {round}");
+        let other = if a.id == from_a { &from_b } else { &from_a };
+        assert!(
+            rig.backend.get(&who, other).await.unwrap().is_none(),
+            "round {round}: the losing message made no task of its own"
+        );
+        // The task that won continued the finished one, and the other message is in its inbox.
+        assert_eq!(earlier(&rig, &a).await, ["one"], "round {round}");
+        assert_eq!(pending(&rig, &a).await, 1, "round {round}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_continuing_submissions_make_one_task_and_the_other_joins() {
+    concurrent_continuations_scenario(Arc::new(MemoryStore::new())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_continuing_submissions_make_one_task_in_postgres() {
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let store = adam_store_postgres::PgStore::connect(&url)
+        .await
+        .expect("connect to postgres");
+    adam_core::Store::migrate(&store).await.expect("migrate");
+    concurrent_continuations_scenario(Arc::new(store)).await;
+}
+
+/// The wire: `referenceTaskIds` in a JSON-RPC `SendMessage` reaches the backend and continues the
+/// task, through the official client and the server's own (de)serialisation.
+#[tokio::test]
+async fn reference_task_ids_travel_over_http_and_continue() {
+    use a2a::{SendMessageRequest, SendMessageResponse};
+    use a2a_client::A2AClientFactory;
+    use a2a_client::agent_card::AgentCardResolver;
+    use a2a_client::auth::AuthInterceptor;
+    use secrecy::SecretString;
+
+    let rig = Rig::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let card = AgentCardConfig::new(
+        "scripted",
+        "Scripted test agent",
+        format!("http://{addr}/").parse().unwrap(),
+        "0.1.0",
+    );
+    let app = A2aServer::router(
+        card,
+        Arc::new(rig.backend.clone()),
+        AuthConfig::BearerTokens(vec![SecretString::from("t0")]),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let worker = rig.worker();
+    let base = format!("http://{addr}");
+    let card = AgentCardResolver::new(None).resolve(&base).await.unwrap();
+    let client = A2AClientFactory::builder()
+        .with_interceptor(Arc::new(AuthInterceptor::bearer("t0")))
+        .build()
+        .create_from_card(&card)
+        .await
+        .unwrap();
+    let send = |message: Message| {
+        let client = &client;
+        async move {
+            let response = client
+                .send_message(&SendMessageRequest {
+                    message,
+                    configuration: None,
+                    metadata: None,
+                    tenant: None,
+                })
+                .await
+                .unwrap();
+            let SendMessageResponse::Task(task) = response else {
+                panic!("expected a task")
+            };
+            task
+        }
+    };
+    let in_context = |text: &str, references: &[&str]| {
+        let mut message = user_refs(text, references);
+        message.context_id = Some("c-http".into());
+        message
+    };
+
+    let first = send(in_context("one", &[])).await;
+    // The server subject of the bearer token is "token-0".
+    wait_state(&rig, &alice(), &first.id, TaskState::Completed).await;
+    assert_eq!(earlier(&rig, &first).await, Vec::<String>::new());
+
+    let second = send(in_context("two", &[first.id.as_str()])).await;
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.context_id, "c-http");
+    assert_eq!(earlier(&rig, &second).await, ["one"]);
+    wait_state(&rig, &alice(), &second.id, TaskState::Completed).await;
+
+    // Over the same wire, no reference is a fresh task.
+    let third = send(in_context("three", &[])).await;
+    assert_eq!(earlier(&rig, &third).await, Vec::<String>::new());
+    worker.stop().await;
+}
+
+// ------------------------------------------------------------------ what the operator sees
+
+/// Log lines of the test's thread, as text.
+#[derive(Clone, Default)]
+struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Logs;
+    fn make_writer(&'a self) -> Logs {
+        self.clone()
+    }
+}
+
+impl Logs {
+    fn capture(level: tracing::Level) -> (Self, tracing::subscriber::DefaultGuard) {
+        let logs = Self::default();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_ansi(false)
+                .with_writer(logs.clone())
+                .finish(),
+        );
+        (logs, guard)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// A request that named references and got no continuation from any leaves one line at the
+/// default level with a count per reason, and not one id of another caller's task; at debug the
+/// references are shown escaped and cut short.
+#[tokio::test]
+async fn references_that_all_miss_leave_one_line_with_counts_and_no_foreign_ids() {
+    let rig = Rig::new();
+    let worker = rig.worker();
+    let bobs = run_to(&rig, &bob(), "secret", "c1", &[], TaskState::Completed).await;
+    let elsewhere = run_to(&rig, &alice(), "there", "c9", &[], TaskState::Completed).await;
+    let own_unreadable = unreadable_record(&rig, "token-0", "c1").await.to_string();
+    let hostile = format!("line one\nline two {}", "z".repeat(200));
+    let references = [
+        RunId::new().to_string(),
+        "not-a-task-id".to_owned(),
+        bobs.id.clone(),
+        elsewhere.id.clone(),
+        own_unreadable,
+        hostile.clone(),
+    ];
+    let refs: Vec<&str> = references.iter().map(String::as_str).collect();
+
+    let (info, guard) = Logs::capture(tracing::Level::INFO);
+    let t = send(&rig, &alice(), "next", Some("c1"), &refs).await;
+    drop(guard);
+    assert_eq!(earlier(&rig, &t).await, Vec::<String>::new());
+    let text = info.text();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("none of the referenceTaskIds could be continued"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{text}");
+    for count in [
+        "given=6",
+        "malformed=2",
+        "unknown=1",
+        "not_the_callers=1",
+        "other_context=1",
+        "unreadable=1",
+    ] {
+        assert!(lines[0].contains(count), "{count} in {}", lines[0]);
+    }
+    assert!(
+        !text.contains(&bobs.id),
+        "no id of another caller's task: {text}"
+    );
+    // The unreadable record of the caller's own is worth a warning of its own.
+    assert!(text.contains("unreadable state"), "{text}");
+    wait_state(&rig, &alice(), &t.id, TaskState::Completed).await;
+
+    // At debug each one is shown, escaped and cut short (what a client sends is not trusted).
+    let (debug, guard) = Logs::capture(tracing::Level::DEBUG);
+    let t = send(&rig, &alice(), "again", Some("c1"), &[hostile.as_str()]).await;
+    drop(guard);
+    let text = debug.text();
+    assert!(text.contains(r"line one\nline two"), "{text}");
+    assert!(!text.contains(&hostile), "cut short: {text}");
+    assert!(text.contains("..."), "{text}");
+    wait_state(&rig, &alice(), &t.id, TaskState::Completed).await;
+    worker.stop().await;
+}

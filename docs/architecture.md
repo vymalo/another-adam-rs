@@ -748,16 +748,19 @@ sequenceDiagram
     participant A as AgentStarter or Agent<br/>LlmStarter, LlmAgent
 
     C->>B: submit(caller, message with referenceTaskIds [t1], no taskId, contextId c1)
-    loop each reference, at most MAX_REFERENCES (8), in order
-        B->>R: view(reference)
-        R->>DB: load_run
-        B->>B: this agent's, this caller's (owned), in c1, terminal?<br/>if not: debug log and next reference
+    loop each reference, at most MAX_REFERENCES (8), in order (none at all for the anonymous caller)
+        B->>DB: load_run(reference), the raw record
+        B->>B: this agent's, this caller's, in c1, terminal?<br/>if not: debug log and next reference
+        B->>R: view(reference), only for one that passed
+        Note over B,R: a state that does not decode: warn, next reference
     end
+    Note over B: none qualified, some given: one info line with counts
     alt a reference qualifies (t1)
         B->>R: start_with_id_continuing(task_id_for(...), agent, inbound, conversation, t1)
+        R->>DB: load_run(run id): a repeat answers false here
         R->>DB: load_run(t1), and the envelope's agent state
         R->>A: init_continuing(inbound, prior state, t1)
-        Note over A: LlmAgent: carry the history, drop a tool call<br/>that never got its result, reset the counters,<br/>cap the history at 256 KiB
+        Note over A: LlmAgent: carry the history, drop a tool call<br/>that never got its result, reset the counters,<br/>cap the history at 256 KiB (tool output first),<br/>keep the roles alternating
         A-->>R: the new run's state
         R->>DB: create_run (Runnable, version 1)
     else none, or the conversation has an open task
@@ -768,21 +771,29 @@ sequenceDiagram
 
 What the diagram cannot say:
 
-* **The reference is checked like every task id.** It must be this agent's and the caller's (the
-  caller's subject is part of the run's conversation id), in the same context as the new task, and
-  terminal (`completed`, `failed` or `canceled`). One that is unknown, someone else's, in another
-  context or still open is skipped, and the client gets the fresh task it would for an id that never
-  existed, so it learns nothing about other callers' tasks. A message without a `contextId` gets a
-  context of its own and continues nothing. Without a reference nothing is carried: the backend never
-  guesses "the latest task of the context".
+* **The reference is checked like every task id, from the raw record.** It must be this agent's and the
+  caller's (the caller's subject is part of the run's conversation id), in the same context as the new
+  task, and terminal (`completed`, `failed` or `canceled`), and all of that is read from the stored record
+  before any state is decoded, so a record the caller does not own is never decoded and cannot fail the
+  request. One that is malformed, unknown, someone else's, in another context, still open or (the caller's
+  own) unreadable is skipped, and the client gets the fresh task it would for an id that never existed, so
+  it learns nothing about other callers' tasks. A message without a `contextId` gets a context of its own
+  and continues nothing. Without a reference nothing is carried: the backend never guesses "the latest
+  task of the context". The operator gets one `info` line, with a count per reason, when references were
+  given and none qualified.
+* **"Caller" is the authenticated subject.** With token authentication that is `token-<index>`, so
+  reordering or replacing the configured tokens hands the history of an index to whoever holds it next;
+  and the anonymous caller is every client at once, so it continues nothing.
 * **It works on a front that holds only the starter.** The prior state is read from the store and
   decoded as the starter's `State`, so the split control plane needs no model or credentials.
   `Agent::init_continuing` and `AgentStarter::init_continuing` default to `init`, and a state that
   does not decode falls back to `init` with a warning. An agent that wraps another must forward
   `init_continuing`, as it forwards `init`.
-* **The history is bounded.** `Conversation::continued` drops the oldest whole turns beyond
-  `MAX_CARRIED_BYTES` (256 KiB of JSON) and puts one marker message where they were. The newest turn
-  is always kept.
+* **The history is bounded, and the task is not what gives.** `Conversation::continued` shortens old
+  tool outputs first (the truncation the loop already applies to what it sends), and only if that is not
+  enough drops the oldest whole turns beyond `MAX_CARRIED_BYTES` (256 KiB of JSON), saying so in a marker
+  text and in `omitted_turns`. The first user message of the chain and the newest prior turn are always
+  kept. Adjacent user messages become one message with several text parts, so the roles alternate.
 * **The new run is an ordinary run**: a new id, its own journal and limits, its own worktree. Only its
   first state comes from the old run.
 

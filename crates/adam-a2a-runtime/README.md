@@ -74,19 +74,32 @@ The backend takes the **first** of the first `MAX_REFERENCES` (8) references tha
 * in the **same context** as the new task (the message's `contextId`; a message without one gets a context of
   its own, so it continues nothing);
 * **terminal**: `completed`, `failed` or `canceled`. A task that is `input-required` or `working` is open: a
-  message for the context goes to its open task as before, reference or not.
+  message for the context goes to its open task as before, reference or not (and if that task finishes
+  between the two steps the reference is judged again, instead of starting fresh).
 
-A reference that is unknown, malformed, someone else's, in another context or still open is skipped, with a
-debug log the client never sees. The client gets the fresh task it would for an id that never existed, so a
-reference is no way to find out whether another caller's task exists. No reference, no continuation: the
-backend never guesses "the latest task of the context". `task_id_for` does not depend on the references, so a
-repeated request is idempotent, continuing or not. The decision, the rejected alternatives and the state
-diagram are in
-[ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md).
+A reference that is malformed, unknown, someone else's, in another context, still open or unreadable is
+skipped. The client cannot tell why: it gets the fresh task it would for an id that never existed, so a
+reference is no way to find out whether another caller's task exists. A reference is **judged from the raw
+record** (agent, conversation, status: `Store::load_run`) **before any state is decoded**: a record the caller
+does not own is never decoded and cannot fail the request, and one of the caller's own that does not decode
+is skipped with a `warn`. No reference, no continuation: the backend never guesses "the latest task of the
+context". `task_id_for` does not depend on the references, so a repeated request is idempotent, continuing or
+not.
+
+* **"Caller" is the authenticated subject** (`Caller::subject`). With token authentication that is
+  `token-<index>` of the token in the configured list, so **reordering or replacing tokens hands the history of
+  an index to whoever holds it next**: keep the list append-only, or drop the contexts, when a holder changes.
+  The **anonymous** caller (`Caller::ANONYMOUS`, authentication off) is every client at once, so a message from
+  it **never continues anything**: references are ignored (debug log) and the task starts fresh.
+* **What the operator sees.** A request that named references and got no continuation from any leaves one
+  `info` line (`none of the referenceTaskIds could be continued`) with `given` and a count per reason
+  (`malformed`, `unknown`, `not_the_callers`, `other_context`, `open`, `unreadable`, `over_limit`), and never an
+  id of another caller's task. At `debug` each reference is shown escaped (`{:?}`) and cut to 48 characters.
 
 An agent only continues if it overrides `init_continuing` (`LlmAgent` and `LlmStarter` do); the default is
 `init`, and a wrapper must forward it. `adam-coder` does not yet, so a coder task that references another
-starts fresh until it does.
+starts fresh until it does. The decision, the rejected alternatives and the state diagram are in
+[ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md).
 
 ## Stable ids
 
@@ -152,7 +165,11 @@ subscription from the store, and the repeated-`messageId` cases. The continuatio
 new task that references a finished one continues it (and a failed or canceled one), no reference means a fresh
 task, another caller's, another context's, unknown and malformed references are ignored without a difference the
 caller can see, an open referenced task keeps the old semantics, the first qualifying reference wins and the list is
-bounded, a repeated continuing request starts one task, a front that holds only the starter continues what a
+bounded, a repeated continuing request starts one task, two concurrent continuing messages make one task and
+the other joins it (memory and PostgreSQL, eight rounds each), an unreadable referenced record (foreign or
+own) is skipped and is never an error, the anonymous caller continues nothing, `referenceTaskIds` over the
+wire through the official client, one `info` line with counts and no foreign id (and the escaped, cut debug
+form), a front that holds only the starter continues what a
 separate worker finished, a continuation after a restart (memory and PostgreSQL), and a real `LlmAgent` behind
 the backend whose model is shown the earlier messages (memory and PostgreSQL). Unit tests in `src/backend.rs`
 (`runtime_errors_map_by_class`,
