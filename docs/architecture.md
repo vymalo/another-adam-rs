@@ -1560,6 +1560,13 @@ What the diagrams cannot say (`crates/adam-coder/src/`):
   * A completed run with no pull request fails, if its last check was red or
     the credentials were rejected (`CoderAgent::verdict`). "The model said it
     is done" is not the same as "delivered".
+  * Any other stop without a pull request is a question, not a completion: the
+    run parks as `ask_user` would (`input-required`, the model's text as the
+    question) and the person's answer resumes it.
+  * `prepare_workspace` refuses a repository the person did not name in their
+    own messages of the run (recorded in the run notes before each step from the
+    conversation, never from the model's argument alone), with a tool error
+    that sends the model to `ask_user`.
 * **Safe to repeat.** A tool call that dies before its result is journaled
   runs again, so each tool is safe to repeat. `prepare_workspace` reuses the
   run's worktree, `commit_and_push` does nothing when there is nothing new,

@@ -510,7 +510,10 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
 
     let mut stream = server
         .client
-        .send_streaming_message(&request(user("add hello.txt")))
+        .send_streaming_message(&request(user(&format!(
+            "add hello.txt in {}",
+            fx.remote_url()
+        ))))
         .await
         .unwrap();
     let mut seen = Seen::default();
@@ -546,7 +549,8 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
         panic!("a task expected")
     };
     worker.stop().await;
-    assert_eq!(task.status.state, TaskState::Completed);
+    // The model's last reply is text and nothing was delivered, so it is a question again.
+    assert_eq!(task.status.state, TaskState::InputRequired);
     assert_eq!(
         task.status.message.as_ref().and_then(|m| m.text()),
         Some("Understood: main.")
@@ -557,6 +561,293 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
         "{:?}",
         second.messages
     );
+}
+
+// ----------------------------------------------- a stop with nothing delivered
+
+/// The owner's report: the person typed "Hi", the model answered in plain text without calling
+/// `ask_user`. That text is a question, not a completion: the task is `input-required` with the
+/// text as the question, the run waits with no timer, and the answer resumes it (the model sees
+/// it, names the repository, and the run goes on to a pull request).
+async fn a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    let greeting =
+        "Hi! I'm ready to help. I need: 1. the repository 2. the base branch 3. the task.";
+    mock.push_text(greeting);
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "Hi").await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        seen.saw_message(greeting),
+        "the model's text is the question: {:#?}",
+        seen.messages
+    );
+    assert!(
+        !seen.labels.iter().any(|l| l.contains("Completed")),
+        "{:?}",
+        seen.labels
+    );
+    let run = run_id(&seen.task_id);
+    let view = server.coder.runtime.view(run).await.unwrap().unwrap();
+    assert!(view.waiting, "parked with no timer");
+    assert_eq!(view.status, RunStatus::Parked);
+    assert_eq!(mock.requests().len(), 1, "the model is not asked again");
+    assert!(fx.created_pulls().await.is_empty());
+
+    // The answer resumes the run; it reaches the model; the run goes on.
+    let answer = format!(
+        "In {} (base branch main) add hello.txt containing hello",
+        fx.remote_url()
+    );
+    let mut follow = user(&answer);
+    follow.task_id = Some(seen.task_id.clone());
+    let response = server.client.send_message(&request(follow)).await.unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task expected")
+    };
+    assert_ne!(task.status.state, TaskState::Failed, "resumed");
+    let done = wait_for(&server.coder.runtime, run, "the run to finish", |v| {
+        v.status.is_terminal()
+    })
+    .await;
+    worker.stop().await;
+    assert_eq!(done.status, RunStatus::Done, "{:?}", done.error);
+
+    let second = mock.requests()[1].clone();
+    let shape: Vec<String> = second
+        .messages
+        .iter()
+        .map(|m| match m {
+            adam_model::Message::User { .. } => format!("user:{}", m.text()),
+            adam_model::Message::Assistant { tool_calls, .. } => format!(
+                "assistant:{}:{}",
+                m.text(),
+                tool_calls
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            adam_model::Message::Tool { content, .. } => format!("tool:{content}"),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "user:Hi".to_owned(),
+            format!("assistant:{greeting}:ask_user"),
+            format!("tool:{answer}"),
+        ],
+        "the model sees its own stop as the question it was, then the answer"
+    );
+    assert_eq!(fx.created_pulls().await.len(), 1);
+    assert_eq!(fx.agent_branches().len(), 1);
+}
+
+/// A model that stops with no text at all still parks the run, with a fixed question.
+async fn a_stop_without_text_asks_what_to_do(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("  \n ");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(&server, "Hi").await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        seen.saw_message("Which repository should I work on"),
+        "{:#?}",
+        seen.messages
+    );
+}
+
+/// The shape of the second report: the model ran a check on the repository (green, here a
+/// `git status`), opened no pull request and ended with text. Nothing was delivered: the task
+/// waits for the person instead of completing.
+async fn checks_without_a_pull_request_then_text_is_a_question(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "c1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c2",
+        "run_checks",
+        json!({"command": "git status && git diff --stat"}),
+    )])
+    .push_text("Nothing to change: the worktree is clean. Should I do anything else?");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(&server, &format!("Check {} and report", fx.remote_url())).await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        seen.saw_message("Should I do anything else?"),
+        "{:#?}",
+        seen.messages
+    );
+    assert!(
+        !seen.labels.iter().any(|l| l == "artifact:pull_request"),
+        "{:?}",
+        seen.labels
+    );
+    assert!(fx.created_pulls().await.is_empty());
+}
+
+/// The weak model invents a repository when it was given none. The tool refuses, telling it to
+/// ask; the refusal is a tool result, not a failure; nothing is fetched or created; and once the
+/// model asks, the person's answer is what names the repository.
+async fn an_invented_repository_is_refused_and_the_model_must_ask(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "c1",
+        "prepare_workspace",
+        json!({"repo_url": "https://github.com/rust-lang/rust-clippy", "base_branch": "master"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c2",
+        "ask_user",
+        json!({"question": "Which repository should I work on?"}),
+    )]);
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "Hi").await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        seen.saw_message("Which repository should I work on?"),
+        "{:#?}",
+        seen.messages
+    );
+    let refusal = tool_results(&mock.requests()[1].messages);
+    assert_eq!(refusal.len(), 1, "{refusal:?}");
+    let (id, text, is_error) = &refusal[0];
+    assert_eq!(id, "c1");
+    assert!(*is_error && text.contains("ask_user"), "{text}");
+    assert!(
+        !fx.root.join("git").exists() && !fx.root.join("worktrees").exists(),
+        "nothing was fetched or created for the invented repository"
+    );
+
+    // The person names the repository; now the tool works on it.
+    let mut follow = user(&fx.remote_url());
+    follow.task_id = Some(seen.task_id.clone());
+    server.client.send_message(&request(follow)).await.unwrap();
+    let run = run_id(&seen.task_id);
+    let done = wait_for(&server.coder.runtime, run, "the run to finish", |v| {
+        v.status.is_terminal()
+    })
+    .await;
+    worker.stop().await;
+    assert_eq!(done.status, RunStatus::Done, "{:?}", done.error);
+    assert_eq!(fx.created_pulls().await.len(), 1);
+}
+
+/// What the orchestrator's rework looks like at the coder when the run is parked: a message in
+/// the same context, without a task id, is delivered to the open task (the runtime allows one
+/// open run per conversation), so it continues the same conversation and a repository named in
+/// the original request still counts, although the rework text does not repeat it.
+async fn a_message_in_the_context_of_a_parked_run_continues_it(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Which base branch should I use?");
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let owner = Caller::new("token-0");
+    let first = server
+        .coder
+        .backend
+        .submit(
+            owner.clone(),
+            user(&format!(
+                "In {} add hello.txt containing hello",
+                fx.remote_url()
+            )),
+            None,
+            Some("ctx-1".into()),
+        )
+        .await
+        .unwrap();
+    let run = run_id(&first.id);
+    wait_for(&server.coder.runtime, run, "the run to wait", |v| v.waiting).await;
+
+    // Does not name the repository again, and carries no task id.
+    let again = server
+        .coder
+        .backend
+        .submit(owner.clone(), user("use main"), None, Some("ctx-1".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        again.id, first.id,
+        "delivered to the open task, not a new one"
+    );
+    let done = wait_for(&server.coder.runtime, run, "the run to finish", |v| {
+        v.status.is_terminal()
+    })
+    .await;
+    worker.stop().await;
+    assert_eq!(done.status, RunStatus::Done, "{:?}", done.error);
+    assert_eq!(fx.created_pulls().await.len(), 1);
+}
+
+/// CancelTask on a run parked by a plain-text stop: the task ends `canceled`, like any waiting
+/// task, and nothing is delivered.
+async fn a_run_parked_by_a_plain_text_stop_can_be_canceled(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("What should I do?");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = run_to_end(&server, "Hi").await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    let canceled = server
+        .client
+        .cancel_task(&a2a::CancelTaskRequest {
+            id: seen.task_id.clone(),
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    worker.stop().await;
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+    assert_eq!(mock.requests().len(), 1);
+    assert!(fx.created_pulls().await.is_empty());
 }
 
 // ------------------------------------------------------------------- red checks
@@ -605,7 +896,10 @@ async fn red_checks_n_times_fail_the_run_with_the_findings_and_no_pr(store: DynS
 
     let mut stream = server
         .client
-        .send_streaming_message(&request(user("add hello.txt")))
+        .send_streaming_message(&request(user(&format!(
+            "add hello.txt in {}",
+            fx.remote_url()
+        ))))
         .await
         .unwrap();
     let mut seen = Seen::default();
@@ -736,7 +1030,10 @@ async fn a_pull_request_with_red_checks_needs_explicit_acceptance(store: DynStor
 
     let mut stream = server
         .client
-        .send_streaming_message(&request(user("add hello.txt")))
+        .send_streaming_message(&request(user(&format!(
+            "add hello.txt in {}",
+            fx.remote_url()
+        ))))
         .await
         .unwrap();
     let mut seen = Seen::default();
@@ -925,7 +1222,12 @@ async fn crash_at(point: CrashPoint, store: DynStore) {
     let owner = Caller::new("token-0");
     let task = doomed
         .backend
-        .submit(owner.clone(), user("add hello.txt"), None, None)
+        .submit(
+            owner.clone(),
+            user(&format!("add hello.txt in {}", fx.remote_url())),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let run = run_id(&task.id);
@@ -1153,7 +1455,7 @@ async fn opencode_crashing_every_time_fails_the_run_with_its_stderr(store: DynSt
     let server = Server::start(coder).await;
     let worker = spawn_worker(&server.coder);
 
-    let seen = run_to_end(&server, "add hello.txt").await;
+    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
     worker.stop().await;
 
     assert_eq!(
@@ -1229,7 +1531,7 @@ async fn opencode_crashing_once_is_retried_and_completes(store: DynStore) {
     let server = Server::start(coder_retrying(&fx, mock.clone(), store, 2)).await;
     let worker = spawn_worker(&server.coder);
 
-    let seen = run_to_end(&server, "add hello.txt").await;
+    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
     worker.stop().await;
 
     assert_eq!(
@@ -1356,7 +1658,7 @@ async fn rate_limited_model_backs_off_and_completes(store: DynStore) {
     let server = Server::start(coder_retrying(&fx, model, store, 3)).await;
     let worker = spawn_worker(&server.coder);
 
-    let seen = run_to_end(&server, "add hello.txt").await;
+    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
     worker.stop().await;
 
     assert_eq!(
@@ -1419,7 +1721,10 @@ async fn cancel_during_opencode_turn_cancels_without_push_or_pr(store: DynStore)
 
     let mut stream = server
         .client
-        .send_streaming_message(&request(user("add hello.txt")))
+        .send_streaming_message(&request(user(&format!(
+            "add hello.txt in {}",
+            fx.remote_url()
+        ))))
         .await
         .unwrap();
     let mut seen = Seen::default();
@@ -1555,12 +1860,22 @@ async fn two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs(store: Dy
     let owner = Caller::new("token-0");
     let a = coder
         .backend
-        .submit(owner.clone(), user("task-alpha: add hello.txt"), None, None)
+        .submit(
+            owner.clone(),
+            user(&format!("task-alpha: add hello.txt in {}", fx.remote_url())),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let b = coder
         .backend
-        .submit(owner.clone(), user("task-beta: add hello.txt"), None, None)
+        .submit(
+            owner.clone(),
+            user(&format!("task-beta: add hello.txt in {}", fx.remote_url())),
+            None,
+            None,
+        )
         .await
         .unwrap();
     assert_ne!(a.id, b.id);
@@ -1645,7 +1960,7 @@ async fn a_github_401_fails_the_run_with_a_clear_message(store: DynStore) {
     let server = Server::start(coder_with(&fx, &mock, store)).await;
     let worker = spawn_worker(&server.coder);
 
-    let seen = run_to_end(&server, "add hello.txt").await;
+    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
     worker.stop().await;
 
     assert_eq!(
@@ -1794,7 +2109,7 @@ async fn secrets_in_opencode_stderr_never_reach_the_client(store: DynStore) {
     let server = Server::start(coder_retrying(&fx, mock.clone(), store, 1)).await;
     let worker = spawn_worker(&server.coder);
 
-    let seen = run_to_end(&server, "add hello.txt").await;
+    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
     worker.stop().await;
 
     assert_eq!(
@@ -1847,7 +2162,7 @@ async fn secrets_in_check_output_never_reach_the_client(store: DynStore) {
     let server = Server::start(coder_with(&fx, &mock, store)).await;
     let worker = spawn_worker(&server.coder);
 
-    let seen = run_to_end(&server, "add hello.txt").await;
+    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
     worker.stop().await;
 
     assert_eq!(
@@ -1927,6 +2242,12 @@ macro_rules! coder_suite {
             coder_suite!(@cases $make;
                 add_hello_txt_streams_working_progress_checks_artifact_completed,
                 ask_user_parks_and_an_a2a_follow_up_resumes,
+                a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,
+                a_stop_without_text_asks_what_to_do,
+                checks_without_a_pull_request_then_text_is_a_question,
+                an_invented_repository_is_refused_and_the_model_must_ask,
+                a_message_in_the_context_of_a_parked_run_continues_it,
+                a_run_parked_by_a_plain_text_stop_can_be_canceled,
                 red_checks_n_times_fail_the_run_with_the_findings_and_no_pr,
                 a_pull_request_with_red_checks_needs_explicit_acceptance,
                 crash_after_commit_and_push_was_journaled_repeats_nothing,

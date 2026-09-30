@@ -6,13 +6,17 @@ use std::sync::Arc;
 use adam::{AgentDef, Assembly, AssemblyError};
 use adam_error::report;
 use adam_llm_agent::{Conversation, DynTool, LlmStarter, ToolSet};
-use adam_model::DynModel;
-use adam_runtime::{Agent, AgentError, AgentStarter, Ctx, Inbound, Transition};
+use adam_model::{DynModel, Message, ToolCall};
+use adam_runtime::{
+    Agent, AgentError, AgentStarter, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent, Transition,
+};
 use async_trait::async_trait;
+use serde_json::{Value, json};
 
 use crate::redact::Redactor;
+use crate::tools::named::named_in;
 use crate::tools::notes::RunNotes;
-use crate::tools::{ToolEnv, coder_tools};
+use crate::tools::{ToolEnv, ask, coder_tools};
 
 /// The agent's name, as stored in `RunRecord::agent`. It is the `name` in `agent/instructions.md`
 /// (the two are checked against each other by a unit test).
@@ -56,15 +60,24 @@ impl AgentStarter for CoderStarter {
 /// `max_check_cycles` var) and the [`coder_tools`]; this type adds the one thing files cannot say,
 /// the policy below (see the README, "Where the prompt and the card live").
 ///
-/// When the model stops (a turn without tool calls) the run normally
-/// completes. But a run that ends with the last check run red and no pull
-/// request has not delivered: it fails, with the findings as the error. That is
-/// what "at most N check/fix cycles, then report the findings and stop" turns
-/// into: the model reports, the run is `failed`, and nothing was opened.
+/// When the model stops (a turn without tool calls) the run completes only if it
+/// delivered: it opened a pull request. Otherwise:
 ///
-/// The same goes for a run whose credentials were rejected (GitHub or git
-/// answered 401/403): the model cannot fix a bad token, so ending without a
-/// pull request is a failure that names the token, not a completed task.
+/// * A run that ends with the last check run red and no pull request fails, with
+///   the findings as the error. That is what "at most N check/fix cycles, then
+///   report the findings and stop" turns into: the model reports, the run is
+///   `failed`, and nothing was opened.
+/// * The same goes for a run whose credentials were rejected (GitHub or git
+///   answered 401/403): the model cannot fix a bad token, so ending without a
+///   pull request is a failure that names the token, not a completed task.
+/// * Anything else is a question, not a completion: a model that answers "Hi! I
+///   need a repository and a task" in plain text asked something, and the run
+///   parks exactly as if it had called `ask_user` (see `stop_as_question`). The
+///   person's answer resumes the run.
+///
+/// Before every step the agent also records which repositories the person named
+/// (the task and every answer) in the run notes, because `prepare_workspace`
+/// works on no other (see [`tools::prepare`](crate::tools::prepare)).
 pub struct CoderAgent {
     assembly: Assembly,
     env: Arc<ToolEnv>,
@@ -145,6 +158,34 @@ impl CoderAgent {
         &self.assembly
     }
 
+    /// Note the repositories the person has named so far, for `prepare_workspace`.
+    ///
+    /// The person's words are the user messages of the conversation, the answers to `ask_user`
+    /// (tool results of that tool) and what is waiting in the inbox, which the step takes next.
+    /// What the model or a tool said is never read: a repository found in a README is not one the
+    /// person asked for.
+    async fn record_named_repos(
+        &self,
+        ctx: &Ctx,
+        state: &Conversation,
+        run: &str,
+    ) -> Result<(), AgentError> {
+        let notes_error = |e| AgentError::transient("cannot read the run notes").with_source(e);
+        let named: Vec<String> = person_texts(state, ctx.peek_inbox())
+            .iter()
+            .flat_map(|text| named_in(text))
+            .collect();
+        let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
+        if notes.name_repos(named) {
+            self.env
+                .notes
+                .save(run, &notes)
+                .await
+                .map_err(|e| AgentError::transient("cannot write the run notes").with_source(e))?;
+        }
+        Ok(())
+    }
+
     /// Why the run must fail instead of completing, if it must.
     fn verdict(&self, notes: &RunNotes) -> Option<String> {
         if notes.pull_request.is_some() {
@@ -163,6 +204,103 @@ impl CoderAgent {
              Findings from `{}` (exit code {:?}):\n{}",
             notes.checks.failures, last.command, last.exit_code, last.tail
         ))
+    }
+}
+
+/// What the person said in `state` and `inbox`, oldest first: their messages, and their answers
+/// to `ask_user` (which reach the model as that tool's results).
+fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
+    let asks: Vec<&str> = state
+        .messages
+        .iter()
+        .flat_map(Message::tool_calls)
+        .filter(|call| call.name == ask::TOOL_NAME)
+        .map(|call| call.id.as_str())
+        .collect();
+    let mut texts: Vec<String> = state
+        .messages
+        .iter()
+        .chain(&state.deferred)
+        .filter_map(|message| match message {
+            Message::User { .. } => Some(message.text()),
+            Message::Tool { call_id, .. } if asks.contains(&call_id.as_str()) => {
+                Some(message.text())
+            }
+            _ => None,
+        })
+        .collect();
+    texts.extend(
+        inbox
+            .iter()
+            .filter(|inbound| inbound.kind != RUN_FINISHED_KIND)
+            .filter_map(|inbound| match &inbound.payload {
+                Value::String(text) => Some(text.clone()),
+                payload => payload
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }),
+    );
+    texts
+}
+
+/// What the run asks when the model stopped with nothing to say.
+const EMPTY_STOP_QUESTION: &str = "I stopped without delivering anything. Which repository should I work on, and what should I do?";
+
+/// A model that stopped without opening a pull request and without a failure to report asked
+/// something (or has nothing to offer): park the run as `ask_user` would, with the model's text
+/// as the question.
+///
+/// The conversation is made to say what happened: the model's last message gets an `ask_user`
+/// call with its text as the question, which the parked run owes an answer to. The person's
+/// answer is that call's result, exactly as for a real `ask_user`, so the history stays valid
+/// for every provider (a result without a call, or two user turns in a row, is not) and the
+/// model sees its own stop as the question it was. The A2A backend reads `input-required` and the
+/// question from the same place as for `ask_user` (`pending_wait`), and the run waits with no
+/// timer until a message is delivered.
+///
+/// When the last message is not a plain assistant reply (it cannot be, after a `Done`), the run
+/// completes as the model left it.
+async fn stop_as_question(
+    ctx: &Ctx,
+    mut state: Conversation,
+    output: Value,
+) -> Transition<Conversation> {
+    let text = output
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let question = match text.trim() {
+        "" => EMPTY_STOP_QUESTION.to_owned(),
+        said => said.to_owned(),
+    };
+    let call = ToolCall {
+        id: format!("stop-{}", state.turns),
+        name: ask::TOOL_NAME.to_owned(),
+        arguments: json!({ "question": question }),
+    };
+    match state.messages.last_mut() {
+        Some(Message::Assistant { tool_calls, .. }) if tool_calls.is_empty() => {
+            tool_calls.push(call.clone());
+        }
+        _ => return Transition::Done { state, output },
+    }
+    ctx.emit(RunEvent::Custom {
+        kind: "input_required".into(),
+        payload: json!({ "question": question, "call_id": call.id }),
+    })
+    .await;
+    state.pending_wait = Some(adam_llm_agent::PendingWait::Question(
+        adam_llm_agent::PendingQuestion {
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            question,
+        },
+    ));
+    state.pending_calls = vec![call];
+    Transition::Park {
+        state,
+        wake_at: None,
     }
 }
 
@@ -191,6 +329,7 @@ impl Agent for CoderAgent {
     ) -> Result<Transition<Conversation>, AgentError> {
         let run = ctx.run_id().to_string();
         let redactor = &self.env.redactor;
+        self.record_named_repos(ctx, &state, &run).await?;
         // Whatever leaves this step as a failure, a retry note or the final
         // answer may quote OpenCode's stderr, a check's output or a provider's
         // error body, so it passes through the redactor.
@@ -213,7 +352,8 @@ impl Agent for CoderAgent {
                         state,
                         error: redactor.failure_text(error),
                     },
-                    None => Transition::Done { state, output },
+                    None if notes.pull_request.is_some() => Transition::Done { state, output },
+                    None => stop_as_question(ctx, state, output).await,
                 })
             }
             other => Ok(other),

@@ -2,7 +2,9 @@
 //! authoring layer), not in Rust. These tests pin what the files must keep producing:
 //!
 //! * `fixtures/agent/prompt.txt` is the system prompt as it was when it was a Rust constant
-//!   (`instructions.rs`), with its one placeholder spelled `{{max_check_cycles}}`;
+//!   (`instructions.rs`), with its one placeholder spelled `{{max_check_cycles}}`; it follows
+//!   `agent/instructions.md` whenever the prompt is changed on purpose (the body of that file,
+//!   after the front matter, is this file);
 //! * the limits, the tool order, the step names and what the model is sent are the ones the
 //!   hand-written agent had, so a run journaled by the previous version replays;
 //! * the card is the one `agent_card()` used to build (`fixtures/agent/card.json`, pinned by a
@@ -198,7 +200,10 @@ async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
     loop {
         let view = rt.view(run).await.unwrap().expect("run exists");
         match view.status {
-            RunStatus::Done => break,
+            // The model stopped with text and nothing delivered: that is a question, so the run
+            // waits for the person instead of completing.
+            RunStatus::Parked if view.waiting => break,
+            RunStatus::Done => panic!("a stop that delivered nothing completed: {view:#?}"),
             RunStatus::Failed => panic!("the run failed: {view:#?}"),
             _ => {}
         }

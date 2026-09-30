@@ -81,6 +81,11 @@ pub struct RunNotes {
     /// (see `CoderAgent`) instead of completing.
     #[serde(default)]
     pub blocker: Option<String>,
+    /// The repositories the person named in their own messages of this run (the task and every
+    /// answer), as [`named`](super::named) keys. `prepare_workspace` works on no other. Filled by
+    /// the agent before each step from the conversation, never from what the model says.
+    #[serde(default)]
+    pub named_repos: Vec<String>,
 }
 
 impl RunNotes {
@@ -91,6 +96,18 @@ impl RunNotes {
             (Some(last), Some(tree)) => last.passed && last.tree.as_deref() == Some(tree),
             _ => false,
         }
+    }
+
+    /// Remember the repositories `keys` names; returns whether anything was new.
+    pub fn name_repos(&mut self, keys: impl IntoIterator<Item = String>) -> bool {
+        let mut added = false;
+        for key in keys {
+            if !self.named_repos.contains(&key) {
+                self.named_repos.push(key);
+                added = true;
+            }
+        }
+        added
     }
 
     /// Whether the most recent check run failed.

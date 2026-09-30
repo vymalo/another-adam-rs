@@ -25,7 +25,9 @@
 //!
 //! # The rules, in code
 //!
-//! The prompt tells the model the rules; these make them hold: after
+//! The prompt tells the model the rules; these make them hold: `prepare_workspace` refuses a
+//! repository the person did not name ([`named`]; the agent records the repositories of the
+//! person's own messages in the run notes before each step), after
 //! `MAX_CHECK_CYCLES` failed check runs `run_checks` refuses to run, and
 //! `open_pull_request` refuses unless the last check run passed on exactly the
 //! code the pull request contains (the tree of the pushed `HEAD`) or the model
@@ -49,6 +51,7 @@ pub mod ask;
 pub mod checks;
 pub mod delegate;
 mod gitcli;
+pub mod named;
 pub mod notes;
 pub mod prepare;
 pub mod publish;

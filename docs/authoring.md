@@ -1088,7 +1088,7 @@ AgentDef::from_manifest(AGENT)?
 ```
 
 `CoderAgent` wraps the root `LlmAgent` of that assembly and adds the completion policy (a run with red
-checks and no pull request fails). That is the escape hatch in practice: **files for the common case, a Rust
+checks and no pull request fails; any other stop without one parks as a question). That is the escape hatch in practice: **files for the common case, a Rust
 wrapper around the assembled agent for policy**. The A2A card comes from the same file: `Assembly::card` for a
 process that has the assembly, `AgentDef::card` (added for this slice) for a control plane, which has no
 model or tools and serves the same card.

@@ -6,10 +6,12 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use adam_coder::ToolEnv;
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::ask::AskUser;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::delegate::DelegateToOpenCode;
+use adam_coder::tools::named::named_in;
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
@@ -35,7 +37,13 @@ impl Rig {
         Self { fx, sink, ctx }
     }
 
+    /// The person says `text` (what the agent records in the run notes before each step).
+    async fn say(&self, text: &str) {
+        say(&self.fx.env, &self.ctx, text).await;
+    }
+
     async fn prepare(&self) -> ToolOutput {
+        self.say(&self.fx.remote_url()).await;
         PrepareWorkspace
             .call(
                 &self.ctx,
@@ -62,6 +70,15 @@ impl Rig {
             })
             .collect()
     }
+}
+
+/// The person says `text` in the run of `ctx`: what the agent records in `env`'s run notes before
+/// each step.
+async fn say(env: &ToolEnv, ctx: &ToolCtx, text: &str) {
+    let run = ctx.run_id().to_string();
+    let mut notes = env.notes.load(&run).await.unwrap();
+    notes.name_repos(named_in(text));
+    env.notes.save(&run, &notes).await.unwrap();
 }
 
 fn is_error(out: &Result<ToolOutput, ToolError>) -> bool {
@@ -101,6 +118,7 @@ async fn prepare_workspace_reports_a_bad_repository_to_the_model() {
         .await;
     assert!(is_error(&out), "{out:?}");
 
+    rig.say(&rig.fx.remote_url()).await;
     let out = PrepareWorkspace
         .call(
             &rig.ctx,
@@ -128,7 +146,8 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
         .mount(&evil)
         .await;
     // The same run, with the production policy as the tools' state.
-    let ctx = rig.ctx.clone().with_state(rig.fx.production_env());
+    let production = rig.fx.production_env();
+    let ctx = rig.ctx.clone().with_state(production.clone());
     let hostile = [
         // Another host, the honest way and with look-alike names.
         format!("{}/octo/widgets.git", evil.uri()),
@@ -148,6 +167,8 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
         "ext::sh -c 'touch /tmp/pwned'".to_owned(),
         "--upload-pack=touch /tmp/pwned".to_owned(),
     ];
+    // The person named every one of them: what is refused here is the policy's to refuse.
+    say(&production, &ctx, &hostile.join(" ")).await;
     for url in &hostile {
         let out = PrepareWorkspace
             .call(&ctx, json!({"repo_url": url, "base_branch": "main"}))
@@ -170,6 +191,7 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
     );
 
     // Whatever the reason, the model gets the reason as text to act on.
+    say(&production, &ctx, "https://evil.example/o/r.git").await;
     let out = PrepareWorkspace
         .call(
             &ctx,
@@ -188,6 +210,131 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
         )
         .await;
     assert!(text(out).contains("local"), "the reason names local paths");
+}
+
+/// The owner's report: given only "Hi" the model invented `rust-lang/rust-clippy`. A repository the
+/// person did not name is refused as a tool error (not a failure of the run) that sends the model
+/// to `ask_user`, before anything is fetched or created; one the person named is accepted, and
+/// naming another later does not unlock the first.
+#[tokio::test]
+async fn prepare_workspace_refuses_a_repository_the_person_did_not_name() {
+    let rig = Rig::new().await;
+    let invented =
+        json!({"repo_url": "https://github.com/rust-lang/rust-clippy", "base_branch": "master"});
+
+    // Nobody named anything yet.
+    let out = PrepareWorkspace.call(&rig.ctx, invented.clone()).await;
+    assert!(
+        is_error(&out),
+        "a tool error for the model, not a failed run: {out:?}"
+    );
+    let message = text(out);
+    assert!(message.contains("ask_user"), "{message}");
+    assert!(message.contains("rust-clippy"), "{message}");
+    assert!(
+        message.contains("has not named any repository"),
+        "{message}"
+    );
+    assert!(
+        !rig.fx.root.join("git").exists() && !rig.worktree().exists(),
+        "nothing was fetched or created"
+    );
+
+    // The local remote, unnamed, is refused too (the fixture policy allows local paths).
+    let local = json!({"repo_url": rig.fx.remote_url(), "base_branch": "main"});
+    let out = PrepareWorkspace.call(&rig.ctx, local.clone()).await;
+    assert!(is_error(&out) && text(out).contains("ask_user"));
+
+    // The person names a different repository: the invented one is still refused, and the
+    // refusal says what was named.
+    rig.say("please work on acme/widgets").await;
+    let message = text(PrepareWorkspace.call(&rig.ctx, invented.clone()).await);
+    assert!(
+        message.contains("ask_user") && message.contains("github.com/acme/widgets"),
+        "{message}"
+    );
+
+    // A repository that merely shares a name with a named one is another repository.
+    let lookalike = json!({"repo_url": "https://github.com/evil/widgets", "base_branch": "main"});
+    assert!(text(PrepareWorkspace.call(&rig.ctx, lookalike).await).contains("ask_user"));
+
+    // The person names the local remote: accepted, and the worktree exists.
+    rig.say(&format!(
+        "In {} (base branch main) add a file",
+        rig.fx.remote_url()
+    ))
+    .await;
+    let out = PrepareWorkspace.call(&rig.ctx, local).await;
+    assert!(!is_error(&Ok(out.clone().expect("prepare"))), "{out:?}");
+    assert!(rig.worktree().join("README.md").is_file());
+    // And still not the invented one.
+    let out = PrepareWorkspace.call(&rig.ctx, invented).await;
+    assert!(is_error(&out) && text(out).contains("ask_user"));
+}
+
+/// Every way of writing a repository the person named opens the gate for it (and only it): the
+/// URL with or without `.git`, a trailing slash and another case, and `host/owner/name`. The
+/// host is a local mock, so a request reaching it proves the tool went past the gate; the
+/// `owner/name` form (default host `github.com`) and the vendored e2e mocks' sandbox address have
+/// the same key, which `tools::named`'s unit tests pin.
+#[tokio::test]
+async fn every_written_form_of_a_named_repository_passes_the_gate() {
+    use adam_workspace::{ScopedToken, Workspaces};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let rig = Rig::new().await;
+    let mirror = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mirror)
+        .await;
+    let host = format!("127.0.0.1:{}", mirror.address().port());
+    let env = Arc::new(ToolEnv::new(
+        Workspaces::new(
+            rig.fx.tmp.path().join("forms-work"),
+            Arc::new(ScopedToken::new(host.as_str(), common::GITHUB_TOKEN)),
+        )
+        .allow_hosts([host.clone()])
+        .allow_local(true),
+        rig.fx.env.code_host.clone(),
+        rig.fx.env.settings.clone(),
+    ));
+    let argument =
+        json!({"repo_url": format!("http://{host}/octo/widgets.git"), "base_branch": "main"});
+
+    // Unnamed: refused, the mirror is not contacted.
+    let ctx = ToolCtx::detached("tool", "call-x", Arc::new(CollectingSink::new()))
+        .with_state(env.clone());
+    let out = PrepareWorkspace.call(&ctx, argument.clone()).await;
+    assert!(text(out).contains("ask_user"));
+    assert!(mirror.received_requests().await.unwrap().is_empty());
+
+    for (i, written) in [
+        format!("http://{host}/octo/widgets.git"),
+        format!("http://{host}/octo/widgets"),
+        format!("http://{host}/OCTO/Widgets/"),
+        format!("{host}/octo/widgets"),
+        format!("{host}/octo/widgets.git"),
+        format!("In {host}/octo/widgets, add hello.txt."),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let ctx = ToolCtx::detached("tool", "call-x", Arc::new(CollectingSink::new()))
+            .with_state(env.clone());
+        say(&env, &ctx, written).await;
+        let out = PrepareWorkspace.call(&ctx, argument.clone()).await;
+        let message = text(out);
+        assert!(
+            !message.contains("ask_user"),
+            "{written:?} names the repository: {message}"
+        );
+        assert!(
+            mirror.received_requests().await.unwrap().len() > i,
+            "{written:?}: the mirror was not contacted; the tool said: {message}"
+        );
+    }
 }
 
 #[tokio::test]

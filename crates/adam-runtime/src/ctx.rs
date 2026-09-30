@@ -309,6 +309,16 @@ impl Ctx {
         taken
     }
 
+    /// The inbound messages [`take_inbox`](Self::take_inbox) would return, left in place.
+    ///
+    /// For an agent that has to know what the person has said before a step decides what to do
+    /// with it, for example one that checks a tool's argument against the person's own words: the
+    /// messages stay in the inbox, so whatever steps next (a wrapped agent, say) still takes them.
+    /// Reading is not consuming: nothing is committed for a peek.
+    pub fn peek_inbox(&self) -> &[Inbound] {
+        &self.inbox
+    }
+
     /// Where the child run `run` stands now, read from the store.
     ///
     /// This is the fallback of the [`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND) message: a parent
@@ -424,6 +434,22 @@ mod tests {
             cancel: CancelToken::new(),
             runtime,
         })
+    }
+
+    #[tokio::test]
+    async fn peeking_the_inbox_leaves_it_for_the_step_that_takes_it() {
+        let sink = CollectingSink::new();
+        let mut ctx = ctx(&sink).await;
+        assert!(ctx.peek_inbox().is_empty());
+        ctx.inbox = vec![
+            Inbound::new("message", serde_json::json!({"text": "a"})),
+            Inbound::new("message", serde_json::json!({"text": "b"})),
+        ];
+        assert_eq!(ctx.peek_inbox().len(), 2);
+        assert_eq!(ctx.peek_inbox().len(), 2, "a peek consumes nothing");
+        assert_eq!(ctx.take_inbox().len(), 2);
+        assert!(ctx.peek_inbox().is_empty());
+        assert_eq!(ctx.into_outcome().consumed, 2, "only the take is committed");
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 {
   "name": "prepare_workspace",
-  "description": "Check the repository out into your private worktree, on a fresh branch created from origin/<base_branch>. Call it once, first. Calling it again for the same repository is harmless and keeps your changes.",
+  "description": "Check the repository out into your private worktree, on a fresh branch created from origin/<base_branch>. Call it once, first. Calling it again for the same repository is harmless and keeps your changes. It works only on a repository the person named in their messages: otherwise it refuses, and you ask the person which one with ask_user.",
   "parameters": {
     "type": "object",
     "properties": {
