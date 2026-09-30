@@ -17,9 +17,19 @@ authentication behave like the real tool.
 
 | Item | What |
 |---|---|
-| `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, `prepare(&RepoRef, run)`, `open_existing(run)`, `remove(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>` |
+| `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `open_existing(run)`, `remove(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>` |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
-| `Worktree` | `path`, `branch`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` |
+| `Worktree` | `path`, `branch` (the branch the work is published on, see below), `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` |
+
+**Continuing a pushed branch.** `prepare_continuing(repo, run, "agent/abc")` makes the run's worktree start from
+`origin/agent/abc` (which must exist on the remote) instead of the base, and `Worktree::push` then publishes to
+`agent/abc`, so a pull request from that branch is updated by the run's commits. The run still has its own
+local branch `agent/<run>` checked out (so the worktree never collides with the one of the run that pushed
+`agent/abc`, and a finished run's worktree need not be removed first); `Worktree::branch()` is the published
+name, `agent/abc`. Only `agent/*` names can be continued (never `main`, never a person's branch), a run that
+already has a branch of its own or another continued one is a `Conflict`, the push never forces, and a
+branch that moved on the remote is refused like any diverged branch. `diff_stat` and the pull request base
+are unchanged: the diff spans every run's work on the branch.
 | `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files |
 | `GitCredentials` (trait), `DynGitCredentials` | `token_for(&RepoRef) -> SecretString` |
 | `StaticToken`, `ScopedToken` | one token for any host, or bound to named hosts (`from_env(..)` for both) |
@@ -123,7 +133,9 @@ The only environment variable the crate reads is the one you name in
 
 Offline. The `git` CLI must be on `PATH`.
 
-* `tests/workspace.rs`: worktrees against local bare repositories, the host
+* `tests/workspace.rs`: worktrees against local bare repositories (including a run that continues a pushed
+  branch: its files, its pushes to that branch and to no other, the names it refuses, idempotency and a restart,
+  a branch that moved), the host
   allowlist, local-path policy, scoped tokens, and a `wiremock` "evil" git
   host that must never be contacted. Two cases cover the file lock:
   `two_workspaces_on_one_root_do_not_trip_over_each_others_git_locks` (two `Workspaces` on one

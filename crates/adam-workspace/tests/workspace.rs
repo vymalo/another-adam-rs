@@ -241,6 +241,248 @@ async fn diverged_remote_branch_is_rejected_without_force() {
     assert!(!err.is_retryable());
 }
 
+/// The remote's branch names, sorted.
+fn remote_branches(env: &Env) -> Vec<String> {
+    let mut names: Vec<String> = git(
+        &env.remote,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    names.sort();
+    names
+}
+
+/// A second run continues the branch a first one pushed: it starts from it, its own commits go to
+/// that very branch (so a pull request from it is updated), and no second branch appears.
+#[tokio::test]
+async fn a_run_can_continue_a_pushed_branch_and_publishes_to_it() {
+    let env = Env::new();
+    let first = env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
+    std::fs::write(first.path().join("first.txt"), "one\n").unwrap();
+    first.commit_all("first", &me()).await.unwrap().unwrap();
+    first.push().await.unwrap();
+    let pushed = first.branch().to_owned();
+    assert_eq!(pushed, "agent/run-firs");
+
+    let second = env
+        .ws
+        .prepare_continuing(&env.repo, "run-second-002", &pushed)
+        .await
+        .unwrap();
+    // It is the branch the pull request is opened from, and the work so far is in the worktree.
+    assert_eq!(second.branch(), pushed);
+    assert_ne!(second.path(), first.path());
+    assert_eq!(
+        std::fs::read_to_string(second.path().join("first.txt")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(
+        git(second.path(), &["rev-parse", "HEAD"]),
+        git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")])
+    );
+    // What is checked out is the run's own branch: it cannot collide with the first worktree.
+    assert_eq!(
+        git(second.path(), &["symbolic-ref", "--short", "HEAD"]),
+        "agent/run-seco"
+    );
+    // The diff against the base spans both runs' work.
+    assert!(second.diff_stat().await.unwrap().contains("first.txt"));
+
+    std::fs::write(second.path().join("second.txt"), "two\n").unwrap();
+    let sha = second.commit_all("second", &me()).await.unwrap().unwrap();
+    second.push().await.unwrap();
+    assert_eq!(
+        git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")]),
+        sha,
+        "the pushed branch moved"
+    );
+    assert_eq!(
+        remote_branches(&env),
+        ["agent/run-firs", "main"],
+        "no branch of the second run's own was published"
+    );
+    // Pushing again is a no-op, and the upstream is the published branch.
+    second.push().await.unwrap();
+    assert_eq!(
+        git(second.path(), &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+        format!("origin/{pushed}")
+    );
+    // The first worktree is untouched.
+    assert!(!first.path().join("second.txt").exists());
+}
+
+#[tokio::test]
+async fn only_an_agent_branch_that_exists_can_be_continued() {
+    let env = Env::new();
+    let first = env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
+    std::fs::write(first.path().join("f.txt"), "f\n").unwrap();
+    first.commit_all("f", &me()).await.unwrap().unwrap();
+    first.push().await.unwrap();
+    let main_before = git(&env.remote, &["rev-parse", "refs/heads/main"]);
+
+    // Somebody's branch, the base and a malformed name are refused before anything is fetched.
+    git(
+        &env.remote,
+        &["branch", "people/feature", "refs/heads/main"],
+    );
+    for bad in [
+        "main",
+        "people/feature",
+        "agent/",
+        "agent",
+        "agent/../main",
+        "agent/a b",
+        "agent/x..y",
+        "-agent/x",
+        "",
+    ] {
+        let err = env
+            .ws
+            .prepare_continuing(&env.repo, "run-bad-00001", bad)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::Invalid(_)),
+            "{bad:?}: {err:?}"
+        );
+        assert!(!err.is_retryable());
+    }
+    // A well-formed agent branch that was never pushed is not found.
+    let err = env
+        .ws
+        .prepare_continuing(&env.repo, "run-bad-00001", "agent/never-pushed")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::NotFound(_)), "{err:?}");
+    assert!(err.to_string().contains("agent/never-pushed"), "{err}");
+    // Nothing was left behind by the refusals.
+    assert!(
+        env.ws
+            .open_existing("run-bad-00001")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        git(&env.remote, &["rev-parse", "refs/heads/main"]),
+        main_before
+    );
+}
+
+#[tokio::test]
+async fn continuing_is_idempotent_survives_a_restart_and_does_not_change_its_mind() {
+    let env = Env::new();
+    let first = env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
+    std::fs::write(first.path().join("f.txt"), "f\n").unwrap();
+    first.commit_all("f", &me()).await.unwrap().unwrap();
+    first.push().await.unwrap();
+    let pushed = first.branch().to_owned();
+    // A second pushed branch, to ask for another one.
+    let other = env.ws.prepare(&env.repo, "run-other-0003").await.unwrap();
+    std::fs::write(other.path().join("o.txt"), "o\n").unwrap();
+    other.commit_all("o", &me()).await.unwrap().unwrap();
+    other.push().await.unwrap();
+
+    let a = env
+        .ws
+        .prepare_continuing(&env.repo, "run-second-002", &pushed)
+        .await
+        .unwrap();
+    std::fs::write(a.path().join("wip.txt"), "uncommitted\n").unwrap();
+    // Again: the same worktree, uncommitted work kept. A plain `prepare` finds it too.
+    let again = env
+        .ws
+        .prepare_continuing(&env.repo, "run-second-002", &pushed)
+        .await
+        .unwrap();
+    assert_eq!(again.path(), a.path());
+    assert_eq!(again.branch(), pushed);
+    assert!(again.path().join("wip.txt").exists());
+    let plain = env.ws.prepare(&env.repo, "run-second-002").await.unwrap();
+    assert_eq!(plain.branch(), pushed);
+
+    // A new process finds it again, still publishing where it should.
+    let restarted = Workspaces::new(env.root.clone(), Arc::new(StaticToken::new(TOKEN)));
+    let found = restarted
+        .open_existing("run-second-002")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.branch(), pushed);
+    found.commit_all("wip", &me()).await.unwrap().unwrap();
+    found.push().await.unwrap();
+
+    // Another branch for the same run is a conflict, and so is continuing on a run that has a
+    // branch of its own.
+    let err = env
+        .ws
+        .prepare_continuing(&env.repo, "run-second-002", other.branch())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::Conflict(_)), "{err:?}");
+    env.ws.prepare(&env.repo, "run-own-000004").await.unwrap();
+    let err = env
+        .ws
+        .prepare_continuing(&env.repo, "run-own-000004", &pushed)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::Conflict(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_continued_branch_that_moved_on_the_remote_is_not_overwritten() {
+    let env = Env::new();
+    let first = env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
+    std::fs::write(first.path().join("f.txt"), "f\n").unwrap();
+    first.commit_all("f", &me()).await.unwrap().unwrap();
+    first.push().await.unwrap();
+    let pushed = first.branch().to_owned();
+
+    let second = env
+        .ws
+        .prepare_continuing(&env.repo, "run-second-002", &pushed)
+        .await
+        .unwrap();
+    // Someone rewrites the branch on the remote meanwhile.
+    let other = env._tmp.path().join("other");
+    git(
+        env._tmp.path(),
+        &[
+            "clone",
+            "--quiet",
+            env.remote.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    git(&other, &["checkout", "--quiet", "-b", "tmp", "origin/main"]);
+    std::fs::write(other.join("b.txt"), "b\n").unwrap();
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "--quiet", "-m", "b"]);
+    git(
+        &other,
+        &[
+            "push",
+            "--quiet",
+            "--force",
+            "origin",
+            &format!("tmp:refs/heads/{pushed}"),
+        ],
+    );
+    let theirs = git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")]);
+
+    std::fs::write(second.path().join("c.txt"), "c\n").unwrap();
+    second.commit_all("c", &me()).await.unwrap().unwrap();
+    let err = second.push().await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert_eq!(
+        git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")]),
+        theirs,
+        "never forced"
+    );
+}
+
 #[tokio::test]
 async fn prepare_is_idempotent_and_keeps_uncommitted_work() {
     let env = Env::new();

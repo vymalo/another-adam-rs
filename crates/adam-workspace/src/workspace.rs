@@ -16,6 +16,9 @@ use crate::repo::{RepoLocation, RepoRef, fnv1a};
 use crate::worktree::Worktree;
 
 pub(crate) const REMOTE_TRACKING_PREFIX: &str = "refs/remotes/origin/";
+/// The namespace of the branches worktrees are checked out on, and the only one that can be
+/// continued ([`Workspaces::prepare_continuing`]).
+const AGENT_BRANCH_PREFIX: &str = "agent/";
 const META_VERSION: u32 = 1;
 const MAX_RUN_ID: usize = 128;
 
@@ -158,7 +161,12 @@ struct Meta {
     run: String,
     url: String,
     base_branch: String,
+    /// The local branch the worktree has checked out (`agent/<run-short-id>`).
     branch: String,
+    /// The pushed branch this run continues, if it does: the name its commits are published
+    /// under. Absent for a run on a branch of its own (and in metadata written before it existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_branch: Option<String>,
 }
 
 impl Workspaces {
@@ -265,12 +273,59 @@ impl Workspaces {
     ///   [`Classify::is_retryable`](adam_error::Classify::is_retryable)).
     #[tracing::instrument(skip(self, repo), fields(repo = %repo.url, run = %run))]
     pub async fn prepare(&self, repo: &RepoRef, run: &str) -> WorkspaceResult<Worktree> {
+        self.prepare_on(repo, run, None).await
+    }
+
+    /// Like [`prepare`](Self::prepare), but the worktree **continues a branch that was pushed
+    /// before** (by an earlier run, say): it starts from `origin/<existing>` instead of
+    /// `origin/<base_branch>`, and [`Worktree::push`] publishes its commits to `existing`, so a
+    /// pull request from that branch is updated by them. [`Worktree::branch`] is `existing`.
+    ///
+    /// The run still has a local branch of its own (`agent/<run-short-id>`), which is what is
+    /// checked out, so the worktree never collides with the one of the run that pushed `existing`,
+    /// and the pushes stay fast-forwards (never forced): if `existing` has moved on the remote in
+    /// a way that is not a fast-forward of this run's work, the push is refused as with any other
+    /// branch.
+    ///
+    /// `existing` must be one of this crate's own branches, `agent/<...>`, so that a caller that
+    /// takes the name from somebody else can never publish onto `main` or onto a person's branch,
+    /// and it must exist on the remote (it is whatever the fetch found).
+    ///
+    /// Idempotent like `prepare`; a run that is already bound to a different branch (or to a
+    /// branch of its own) is a [`WorkspaceError::Conflict`].
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare`](Self::prepare), and: [`WorkspaceError::Invalid`] when `existing` is not an
+    /// `agent/*` branch name or is the base branch, [`WorkspaceError::NotFound`] when it does not
+    /// exist on the remote, [`WorkspaceError::Conflict`] as above.
+    #[tracing::instrument(skip(self, repo), fields(repo = %repo.url, run = %run, existing = %existing))]
+    pub async fn prepare_continuing(
+        &self,
+        repo: &RepoRef,
+        run: &str,
+        existing: &str,
+    ) -> WorkspaceResult<Worktree> {
+        self.prepare_on(repo, run, Some(existing)).await
+    }
+
+    async fn prepare_on(
+        &self,
+        repo: &RepoRef,
+        run: &str,
+        existing: Option<&str>,
+    ) -> WorkspaceResult<Worktree> {
         validate_run(run)?;
         // The URL is checked before anything else runs: a refused repository
         // costs no process, no request and no credential.
         let loc = repo.locate()?;
         self.inner.policy.check(&loc)?;
         self.inner.validate_base(&repo.base_branch).await?;
+        if let Some(existing) = existing {
+            self.inner
+                .validate_continued(existing, &repo.base_branch)
+                .await?;
+        }
         let mirror = self.inner.root.join(loc.mirror_relative());
 
         let _guard = self.inner.lock_mirror(&mirror).await?;
@@ -283,6 +338,19 @@ impl Workspaces {
                     "run {run} is already bound to {}, not {}",
                     m.url, repo.url
                 )));
+            }
+            // Asking again for what the run has is fine; asking for another branch is not. A
+            // plain `prepare` of a run that continues a branch just finds its worktree.
+            if let Some(existing) = existing
+                && m.remote_branch.as_deref() != Some(existing)
+            {
+                return Err(WorkspaceError::Conflict(match &m.remote_branch {
+                    Some(bound) => format!("run {run} already continues {bound}, not {existing}"),
+                    None => format!(
+                        "run {run} already has a branch of its own ({}) and cannot continue {existing}",
+                        m.branch
+                    ),
+                }));
             }
             if self.inner.is_valid_worktree(&path, &mirror).await {
                 return Ok(self.inner.worktree(m, path, mirror));
@@ -306,20 +374,26 @@ impl Workspaces {
             .await?;
 
         let base_ref = format!("{REMOTE_TRACKING_PREFIX}{}", repo.base_branch);
-        let base_exists = self
-            .inner
-            .mirror_git(&mirror)
-            .args(["rev-parse", "--verify", "--quiet"])
-            .arg(format!("{base_ref}^{{commit}}"))
-            .run_status()
-            .await?
-            .success;
-        if !base_exists {
+        if !self.inner.has_commit(&mirror, &base_ref).await? {
             return Err(WorkspaceError::NotFound(format!(
                 "branch {} does not exist on {}",
                 repo.base_branch, repo.url
             )));
         }
+        // What the worktree starts from: the base, or the branch it continues.
+        let start_ref = match existing {
+            Some(existing) => {
+                let continued = format!("{REMOTE_TRACKING_PREFIX}{existing}");
+                if !self.inner.has_commit(&mirror, &continued).await? {
+                    return Err(WorkspaceError::NotFound(format!(
+                        "branch {existing} does not exist on {}: it was never pushed there",
+                        repo.url
+                    )));
+                }
+                continued
+            }
+            None => base_ref,
+        };
 
         let (meta, fresh) = match meta {
             Some(m) => (m, false),
@@ -332,6 +406,7 @@ impl Workspaces {
                         url: repo.url.clone(),
                         base_branch: repo.base_branch.clone(),
                         branch,
+                        remote_branch: existing.map(str::to_owned),
                     },
                     true,
                 )
@@ -349,7 +424,7 @@ impl Workspaces {
 
         let added = self
             .inner
-            .add_worktree(&mirror, &path, &meta, &base_ref)
+            .add_worktree(&mirror, &path, &meta, &start_ref)
             .await;
         if let Err(e) = added {
             if fresh {
@@ -519,8 +594,44 @@ impl Inner {
             RepoRef::new(&meta.url, &meta.base_branch),
             path,
             meta.branch.clone(),
+            meta.remote_branch.clone(),
             mirror,
         )
+    }
+
+    /// `rev` names a commit in `mirror`.
+    async fn has_commit(&self, mirror: &Path, rev: &str) -> WorkspaceResult<bool> {
+        Ok(self
+            .mirror_git(mirror)
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("{rev}^{{commit}}"))
+            .run_status()
+            .await?
+            .success)
+    }
+
+    /// `existing` may be continued: one of this crate's own `agent/*` branches, well formed, and
+    /// not the base.
+    async fn validate_continued(&self, existing: &str, base: &str) -> WorkspaceResult<()> {
+        let own = existing
+            .strip_prefix(AGENT_BRANCH_PREFIX)
+            .is_some_and(|rest| !rest.is_empty());
+        let well_formed = own
+            && existing != base
+            && self
+                .git()
+                .args(["check-ref-format"])
+                .arg(format!("refs/heads/{existing}"))
+                .run_status()
+                .await?
+                .success;
+        if well_formed {
+            Ok(())
+        } else {
+            Err(WorkspaceError::Invalid(format!(
+                "{existing:?} is not a branch that can be continued: only branches named                  {AGENT_BRANCH_PREFIX}<...> that an agent pushed are"
+            )))
+        }
     }
 
     async fn validate_base(&self, base: &str) -> WorkspaceResult<()> {
@@ -642,7 +753,7 @@ impl Inner {
         mirror: &Path,
         path: &Path,
         meta: &Meta,
-        base_ref: &str,
+        start_ref: &str,
     ) -> WorkspaceResult<()> {
         // Forget worktrees whose directories vanished, so their branches are
         // not considered checked out.
@@ -665,7 +776,7 @@ impl Inner {
         } else {
             cmd.args(["--no-track", "-b", &meta.branch])
                 .arg(path)
-                .arg(base_ref)
+                .arg(start_ref)
         };
         cmd.run().await?;
         Ok(())

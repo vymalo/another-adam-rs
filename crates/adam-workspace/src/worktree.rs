@@ -21,7 +21,11 @@ pub struct Worktree {
     run: String,
     repo: RepoRef,
     path: PathBuf,
+    /// The name the work is published under: the run's own branch, or the pushed branch this
+    /// worktree continues.
     branch: String,
+    /// The local branch that is checked out, always the run's own.
+    local: String,
     mirror: PathBuf,
 }
 
@@ -103,6 +107,7 @@ impl Worktree {
         repo: RepoRef,
         path: PathBuf,
         branch: String,
+        continued: Option<String>,
         mirror: PathBuf,
     ) -> Self {
         Self {
@@ -110,7 +115,8 @@ impl Worktree {
             run,
             repo,
             path,
-            branch,
+            branch: continued.unwrap_or_else(|| branch.clone()),
+            local: branch,
             mirror,
         }
     }
@@ -120,7 +126,10 @@ impl Worktree {
         &self.path
     }
 
-    /// The branch checked out here: `agent/<run-short-id>`.
+    /// The branch this worktree's work is published on, which is what a pull request is opened
+    /// from: `agent/<run-short-id>`, or, for a worktree made by
+    /// [`Workspaces::prepare_continuing`](crate::Workspaces::prepare_continuing), the pushed branch it continues. (The branch checked out
+    /// is always the run's own `agent/<run-short-id>`.)
     pub fn branch(&self) -> &str {
         &self.branch
     }
@@ -190,6 +199,27 @@ impl Worktree {
         tokio::fs::copy(&index, &tmp)
             .await
             .map_err(|e| WorkspaceError::io("cannot copy the index", e))?;
+        // The copy keeps the index's modification time: git re-reads an entry that is as new as
+        // the index file ("racily clean"), and a copy stamped with the time it was made would
+        // make every entry look old, so a file rewritten with the same size right after the
+        // checkout would be counted with its old content.
+        let keep = async {
+            let modified = tokio::fs::metadata(&index).await?.modified()?;
+            let copy = tmp.clone();
+            tokio::task::spawn_blocking(move || {
+                std::fs::File::options()
+                    .write(true)
+                    .open(copy)?
+                    .set_modified(modified)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        }
+        .await;
+        if let Err(e) = keep {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(WorkspaceError::io("cannot copy the index's timestamp", e));
+        }
 
         let result = async {
             self.git()
@@ -258,8 +288,8 @@ impl Worktree {
         Ok(Some(sha.stdout_text()))
     }
 
-    /// Push the branch to `origin` (`refs/heads/<branch>`) and set it as the
-    /// branch's upstream.
+    /// Push the branch to `origin` (`refs/heads/<branch>`, see [`branch`](Self::branch)) and set
+    /// it as the branch's upstream.
     ///
     /// Never forces: pushing a commit the remote already has is a no-op, so
     /// retrying after a lost response is safe. A remote that has diverged is
@@ -270,7 +300,10 @@ impl Worktree {
         let auth = self.ws.authorize(&self.repo, &loc).await?;
         self.git()
             .args(["push", "--quiet", "origin"])
-            .arg(format!("refs/heads/{0}:refs/heads/{0}", self.branch))
+            .arg(format!(
+                "refs/heads/{}:refs/heads/{}",
+                self.local, self.branch
+            ))
             .maybe_auth(auth)
             .run()
             .await?;
@@ -279,7 +312,7 @@ impl Worktree {
         // because the branch config lives in the mirror's shared config file,
         // which concurrent pushes of different runs would otherwise race on.
         let _guard = self.ws.lock_mirror(&self.mirror).await?;
-        let key = |k: &str| format!("branch.{}.{k}", self.branch);
+        let key = |k: &str| format!("branch.{}.{k}", self.local);
         self.ws
             .mirror_git(&self.mirror)
             .args(["config", &key("remote"), "origin"])
