@@ -67,6 +67,7 @@ pub(crate) async fn working_tree_id(dir: &Path) -> Option<String> {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     tokio::fs::copy(&index, &tmp).await.ok()?;
+    keep_mtime(&index, &tmp).await?;
     let tree = async {
         let run = |args: &'static [&'static str]| {
             let tmp = tmp.clone();
@@ -96,4 +97,110 @@ pub(crate) async fn working_tree_id(dir: &Path) -> Option<String> {
     .await;
     let _ = tokio::fs::remove_file(&tmp).await;
     tree
+}
+
+/// Give `copy` the modification time of `original`, an index file.
+///
+/// Git takes an index entry whose file looks unchanged (same size, same mtime) as unchanged,
+/// except when the entry is as new as the index file itself: then it reads the file again
+/// ("racily clean"), because the file may have been rewritten within one timestamp tick of the
+/// index being written. A copy that is stamped with the time it was made makes every entry look
+/// older than the index, so a file rewritten with the same size right after the checkout would
+/// keep its old content in the tree computed from the copy. Keeping the original's mtime keeps
+/// the protection. `None` when it cannot be done (the caller then has no tree id, which is
+/// "unknown" and never a wrong one).
+pub(crate) async fn keep_mtime(original: &Path, copy: &Path) -> Option<()> {
+    let modified = tokio::fs::metadata(original).await.ok()?.modified().ok()?;
+    let copy = copy.to_owned();
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::options()
+            .write(true)
+            .open(copy)?
+            .set_modified(modified)
+    })
+    .await
+    .ok()?
+    .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+    use std::time::SystemTime;
+
+    use super::*;
+
+    /// Run `git` in `dir` with the index at `index` (if any); panic with its stderr on failure.
+    fn git(dir: &Path, index: Option<&Path>, args: &[&str]) -> String {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com");
+        if let Some(index) = index {
+            cmd.env("GIT_INDEX_FILE", index);
+        }
+        let out = cmd.output().expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    fn set_mtime(path: &Path, at: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    /// A file rewritten with the same size in the same clock tick as the index was written looks
+    /// unchanged by its stat data. Git protects against that ("racily clean": an entry as new as
+    /// the index is read again), and the copy of the index the tree id is computed in must keep
+    /// the protection: stamped with the time it was made it would make the entry look old, and
+    /// the tree would hold the old content. (Seen as a flaky test under load: the coarse clock of
+    /// a busy machine makes the two writes share a tick.)
+    #[tokio::test]
+    async fn a_same_size_rewrite_within_the_index_tick_is_in_the_tree_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, None, &["init", "--quiet", "--initial-branch=main"]);
+        // The stat data of the ctime changes whatever we do; only mtime, size and the rest are
+        // what a coarse clock leaves equal.
+        git(dir, None, &["config", "core.trustctime", "false"]);
+        std::fs::write(dir.join("README.md"), "widgets\n").unwrap();
+        git(dir, None, &["add", "-A"]);
+        git(dir, None, &["commit", "--quiet", "-m", "seed"]);
+
+        // The index entry has the file's mtime of that moment. Rewrite the file with the same
+        // size and put that mtime back, and let the index be as old as the entry.
+        let tick = std::fs::metadata(dir.join("README.md"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::fs::write(dir.join("README.md"), "changed\n").unwrap();
+        set_mtime(&dir.join("README.md"), tick);
+        set_mtime(&dir.join(".git/index"), tick);
+
+        // What `git add -A` would record, from an index that has no stat data to trust.
+        let fresh = dir.join(".git/index.fresh");
+        git(dir, Some(&fresh), &["read-tree", "HEAD"]);
+        git(dir, Some(&fresh), &["add", "-A"]);
+        let expected = git(dir, Some(&fresh), &["write-tree"]);
+        let head = head_tree(dir).await.unwrap();
+        assert_ne!(expected, head, "the rewrite is a change");
+
+        // Git compares these timestamps in whole seconds, so the copy has to be made in a later
+        // second than the entry's to look older than it.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        assert_eq!(working_tree_id(dir).await.unwrap(), expected);
+    }
 }
