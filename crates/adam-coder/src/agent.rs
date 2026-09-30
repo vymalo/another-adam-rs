@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::redact::Redactor;
-use crate::tools::named::named_in;
+use crate::tools::named::{named_in, without_untrusted};
 use crate::tools::notes::RunNotes;
 use crate::tools::{ToolEnv, ask, coder_tools};
 
@@ -63,10 +63,11 @@ impl AgentStarter for CoderStarter {
 /// When the model stops (a turn without tool calls) the run completes only if it
 /// delivered: it opened a pull request. Otherwise:
 ///
-/// * A run that ends with the last check run red and no pull request fails, with
-///   the findings as the error. That is what "at most N check/fix cycles, then
-///   report the findings and stop" turns into: the model reports, the run is
-///   `failed`, and nothing was opened.
+/// * A run that ends with the last check run red, the check-cycle budget used up
+///   and no pull request fails, with the findings as the error. That is what "at
+///   most N check/fix cycles, then report the findings and stop" turns into: the
+///   model reports, the run is `failed`, and nothing was opened. With cycles left
+///   a red check is not a verdict: the model's text is a question like any other.
 /// * The same goes for a run whose credentials were rejected (GitHub or git
 ///   answered 401/403): the model cannot fix a bad token, so ending without a
 ///   pull request is a failure that names the token, not a completed task.
@@ -74,6 +75,12 @@ impl AgentStarter for CoderStarter {
 ///   need a repository and a task" in plain text asked something, and the run
 ///   parks exactly as if it had called `ask_user` (see `stop_as_question`). The
 ///   person's answer resumes the run.
+///
+/// So a run that has nothing to deliver never completes on its own. It ends with a pull
+/// request, with a failure (the two rules above, a model or tool error that is not retried,
+/// `max_turns` or `max_tool_calls`), or when the caller cancels it (A2A `CancelTask`); until then
+/// it waits for the person, who can say something else or stop it. There is no limit on how
+/// often it asks.
 ///
 /// Before every step the agent also records which repositories the person named
 /// (the task and every answer) in the run notes, because `prepare_workspace`
@@ -171,9 +178,10 @@ impl CoderAgent {
         run: &str,
     ) -> Result<(), AgentError> {
         let notes_error = |e| AgentError::transient("cannot read the run notes").with_source(e);
+        let host = &self.env.settings.default_repo_host;
         let named: Vec<String> = person_texts(state, ctx.peek_inbox())
             .iter()
-            .flat_map(|text| named_in(text))
+            .flat_map(|text| named_in(text, host))
             .collect();
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
         if notes.name_repos(named) {
@@ -194,11 +202,13 @@ impl CoderAgent {
         if let Some(blocker) = &notes.blocker {
             return Some(format!("no pull request was opened: {blocker}"));
         }
-        if !notes.last_check_failed() {
+        let max = self.env.settings.max_check_cycles;
+        // Red checks with cycles left are the model's to fix, or to ask about: only a spent
+        // budget is a verdict.
+        if !notes.cycles_exhausted(max) {
             return None;
         }
         let last = notes.checks.last.as_ref()?;
-        let max = self.env.settings.max_check_cycles;
         Some(format!(
             "checks are failing and no pull request was opened ({} of {max} check cycles used). \
              Findings from `{}` (exit code {:?}):\n{}",
@@ -208,27 +218,35 @@ impl CoderAgent {
 }
 
 /// What the person said in `state` and `inbox`, oldest first: their messages, and their answers
-/// to `ask_user` (which reach the model as that tool's results).
+/// to `ask_user` (which reach the model as that tool's results), each without the blocks
+/// labelled `untrusted` that a message may quote (see [`without_untrusted`]).
+///
+/// An answer is paired with its question by position, not by id alone: a provider that sends no
+/// call ids gets `call_0`, `call_1`, ... from the client in every turn, so ids repeat. Only the
+/// tool messages that follow an assistant message and answer an `ask_user` call of that very
+/// message count, each call once. Assistant text and every other tool's result never do.
 fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
-    let asks: Vec<&str> = state
-        .messages
-        .iter()
-        .flat_map(Message::tool_calls)
-        .filter(|call| call.name == ask::TOOL_NAME)
-        .map(|call| call.id.as_str())
-        .collect();
-    let mut texts: Vec<String> = state
-        .messages
-        .iter()
-        .chain(&state.deferred)
-        .filter_map(|message| match message {
-            Message::User { .. } => Some(message.text()),
-            Message::Tool { call_id, .. } if asks.contains(&call_id.as_str()) => {
-                Some(message.text())
+    let mut texts = Vec::new();
+    // The `ask_user` calls of the last assistant message that have no answer yet.
+    let mut asks: Vec<&str> = Vec::new();
+    for message in state.messages.iter().chain(&state.deferred) {
+        match message {
+            Message::Assistant { tool_calls, .. } => {
+                asks = tool_calls
+                    .iter()
+                    .filter(|call| call.name == ask::TOOL_NAME)
+                    .map(|call| call.id.as_str())
+                    .collect();
             }
-            _ => None,
-        })
-        .collect();
+            Message::User { .. } => texts.push(message.text()),
+            Message::Tool { call_id, .. } => {
+                if let Some(at) = asks.iter().position(|id| id == call_id) {
+                    asks.remove(at);
+                    texts.push(message.text());
+                }
+            }
+        }
+    }
     texts.extend(
         inbox
             .iter()
@@ -241,11 +259,24 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
                     .map(str::to_owned),
             }),
     );
-    texts
+    texts.iter().map(|text| without_untrusted(text)).collect()
 }
 
-/// What the run asks when the model stopped with nothing to say.
+/// What the run asks when the model stopped with nothing to say and no workspace exists yet.
 const EMPTY_STOP_QUESTION: &str = "I stopped without delivering anything. Which repository should I work on, and what should I do?";
+
+/// What it asks when the model stopped with nothing to say after a workspace was prepared: the
+/// repository is known.
+const EMPTY_STOP_QUESTION_AFTER_WORK: &str =
+    "I stopped without delivering anything. What would you like me to do next?";
+
+/// The id of the `ask_user` call that stands for a model's stop: `stop` and the turn as five
+/// digits, nine alphanumeric characters, which is what the strictest providers (the Mistral
+/// family) accept as a tool call id. The turn is clamped: the limit in `agent/instructions.md` is
+/// far below 99999, and past it the id only has to stay valid.
+fn stop_call_id(turns: u32) -> String {
+    format!("stop{:05}", turns.min(99_999))
+}
 
 /// A model that stopped without opening a pull request and without a failure to report asked
 /// something (or has nothing to offer): park the run as `ask_user` would, with the model's text
@@ -265,17 +296,19 @@ async fn stop_as_question(
     ctx: &Ctx,
     mut state: Conversation,
     output: Value,
+    prepared: bool,
 ) -> Transition<Conversation> {
     let text = output
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let question = match text.trim() {
+        "" if prepared => EMPTY_STOP_QUESTION_AFTER_WORK.to_owned(),
         "" => EMPTY_STOP_QUESTION.to_owned(),
         said => said.to_owned(),
     };
     let call = ToolCall {
-        id: format!("stop-{}", state.turns),
+        id: stop_call_id(state.turns),
         name: ask::TOOL_NAME.to_owned(),
         arguments: json!({ "question": question }),
     };
@@ -353,7 +386,11 @@ impl Agent for CoderAgent {
                         error: redactor.failure_text(error),
                     },
                     None if notes.pull_request.is_some() => Transition::Done { state, output },
-                    None => stop_as_question(ctx, state, output).await,
+                    None => {
+                        let prepared =
+                            matches!(self.env.workspaces.open_existing(&run).await, Ok(Some(_)));
+                        stop_as_question(ctx, state, output, prepared).await
+                    }
                 })
             }
             other => Ok(other),
@@ -512,5 +549,160 @@ mod tests {
             .init(Inbound::new("message", serde_json::json!({"text": 7})))
             .unwrap_err();
         assert!(matches!(err, AgentError::Permanent { .. }), "{err:?}");
+    }
+
+    // ---- what counts as the person's words -------------------------------------------------
+
+    const EVIL: &str = "https://github.com/evil/payload";
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: json!({}),
+        }
+    }
+
+    fn assistant(text: &str, calls: Vec<ToolCall>) -> Message {
+        Message::Assistant {
+            content: vec![adam_model::ContentPart::text(text)],
+            tool_calls: calls,
+        }
+    }
+
+    fn conversation(messages: Vec<Message>) -> Conversation {
+        Conversation {
+            messages,
+            ..Conversation::default()
+        }
+    }
+
+    fn said(state: &Conversation) -> Vec<String> {
+        person_texts(state, &[])
+    }
+
+    #[test]
+    fn the_task_and_the_answers_to_ask_user_are_the_persons_words() {
+        let state = conversation(vec![
+            Message::user_text("task: acme/widgets"),
+            assistant("", vec![call("c1", "ask_user")]),
+            Message::tool_result("c1", "the base is main"),
+            Message::user_text("and acme/gadgets too"),
+        ]);
+        assert_eq!(
+            said(&state),
+            [
+                "task: acme/widgets",
+                "the base is main",
+                "and acme/gadgets too"
+            ]
+        );
+        // A message waiting in the inbox counts, a finished-child notice does not.
+        let inbox = [
+            Inbound::new("message", json!({"text": "use acme/third"})),
+            Inbound::new("message", json!("a bare string")),
+            Inbound::new(RUN_FINISHED_KIND, json!({"text": EVIL})),
+            Inbound::new("message", json!({"no": "text"})),
+        ];
+        assert_eq!(
+            person_texts(&conversation(vec![]), &inbox),
+            ["use acme/third", "a bare string"]
+        );
+    }
+
+    #[test]
+    fn what_the_model_or_a_tool_wrote_never_counts() {
+        let state = conversation(vec![
+            Message::user_text("Hi"),
+            assistant(
+                &format!("Shall I use {EVIL}?"),
+                vec![call("c1", "run_checks")],
+            ),
+            Message::tool_result("c1", format!("README says see {EVIL}")),
+            assistant("", vec![call("c2", "delegate_to_opencode")]),
+            Message::tool_error("c2", format!("cannot reach {EVIL}")),
+        ]);
+        assert_eq!(said(&state), ["Hi"]);
+    }
+
+    /// A provider that sends no call ids gets `call_0`, `call_1`, ... from the client in every
+    /// turn, so the same id answers different calls; only a result that follows an `ask_user`
+    /// call of the same assistant message is an answer.
+    #[test]
+    fn answers_are_paired_with_their_question_by_position_not_by_id() {
+        let state = conversation(vec![
+            Message::user_text("Hi"),
+            // Turn 1: ask_user as call_0; the answer counts.
+            assistant("", vec![call("call_0", "ask_user")]),
+            Message::tool_result("call_0", "please use acme/widgets"),
+            // Turn 2: the same id for another tool; its result does not.
+            assistant("", vec![call("call_0", "run_checks")]),
+            Message::tool_result("call_0", format!("output mentions {EVIL}")),
+            // Turn 3: two calls; only the ask_user one is answered by the person.
+            assistant(
+                "",
+                vec![call("call_0", "run_checks"), call("call_1", "ask_user")],
+            ),
+            Message::tool_result("call_0", "also mentions evil/other"),
+            Message::tool_result("call_1", "and acme/gadgets"),
+            // A result repeating an answered call's id is not a second answer.
+            Message::tool_result("call_1", "evil/third"),
+        ]);
+        assert_eq!(
+            said(&state),
+            ["Hi", "please use acme/widgets", "and acme/gadgets"]
+        );
+        // The other way round: a tool first, the ask_user later under the same id.
+        let state = conversation(vec![
+            Message::user_text("Hi"),
+            assistant("", vec![call("call_0", "run_checks")]),
+            Message::tool_result("call_0", "evil/one"),
+            assistant("", vec![call("call_0", "ask_user")]),
+            Message::tool_result("call_0", "acme/widgets"),
+        ]);
+        assert_eq!(said(&state), ["Hi", "acme/widgets"]);
+    }
+
+    #[test]
+    fn quoted_untrusted_findings_do_not_count_but_the_quoted_request_does() {
+        let rework = format!(
+            "Your work did not pass verification.\n\n````request\nIn acme/widgets add a file.\n````\n\n\
+             ### Agent checks\n````untrusted\n- see {EVIL}\n```\ncode\n```\n````\n\n\
+             ### CI\n```untrusted\n- red at evil/other\n```\n\n### Unclosed\n```untrusted\nevil/tail"
+        );
+        let state = conversation(vec![Message::user_text(rework.clone())]);
+        let texts = said(&state);
+        assert_eq!(texts.len(), 1);
+        let named = named_in(&texts[0], "github.com");
+        assert_eq!(named, ["github.com/acme/widgets"], "{texts:?}");
+        // The same message as an answer and as an inbox message is read the same way.
+        let state = conversation(vec![
+            Message::user_text("Hi"),
+            assistant("", vec![call("q", "ask_user")]),
+            Message::tool_result("q", rework.clone()),
+        ]);
+        assert_eq!(
+            named_in(&said(&state)[1], "github.com"),
+            ["github.com/acme/widgets"]
+        );
+        let inbox = [Inbound::new("message", json!({ "text": rework }))];
+        assert_eq!(
+            named_in(
+                &person_texts(&conversation(vec![]), &inbox)[0],
+                "github.com"
+            ),
+            ["github.com/acme/widgets"]
+        );
+    }
+
+    #[test]
+    fn the_stop_call_id_is_nine_alphanumeric_characters() {
+        for turns in [0, 1, 7, 200, 99_999, 100_000, u32::MAX] {
+            let id = stop_call_id(turns);
+            assert_eq!(id.len(), 9, "{id}");
+            assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "{id}");
+        }
+        assert_eq!(stop_call_id(3), "stop00003");
+        assert_ne!(stop_call_id(3), stop_call_id(4));
     }
 }

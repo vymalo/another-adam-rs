@@ -135,10 +135,12 @@ make them hold:
   cycle budget (a deliberate hardening: after the limit the run must stop).
 * **Completion policy.** When the model stops (a turn without tool calls) the
   run completes only if it opened a pull request. A run that ends with red
-  checks and no pull request fails instead of completing, whatever the model
-  says. So does a run that ends without a pull request because GitHub or git
-  rejected the credentials (the model cannot fix a bad token): the error names
-  `GITHUB_TOKEN`. Anything else is a **question, not a completion**: the model
+  checks, the check-cycle budget used up and no pull request fails instead of
+  completing, whatever the model says. So does a run that ends without a pull
+  request because GitHub or git rejected the credentials (the model cannot fix a
+  bad token): the error names `GITHUB_TOKEN`. Anything else is a **question,
+  not a completion** (red checks with cycles left included: fixing or asking is
+  the model's call): the model
   that answers "Hi! I need a repository and a task" in plain text asked
   something, and the run parks exactly as if it had called `ask_user`: A2A
   reports `input-required` with the model's text (trimmed; a fixed sentence when
@@ -146,23 +148,39 @@ make them hold:
   delivered message resumes it. The conversation is made to say what happened:
   the model's last message gets an `ask_user` call carrying that text, and the
   person's answer is that call's result, as for a real `ask_user`, so the
-  history stays valid for every provider. The turn and check-cycle limits and
-  CancelTask apply to a parked run as to any other.
+  history stays valid for every provider; its id is `stop` and the turn as five
+  digits, nine alphanumeric characters, which the strictest providers accept. The
+  turn and check-cycle limits and CancelTask apply to a parked run as to any other.
+  **A run with nothing to deliver never completes on its own**, and there is no
+  limit on how often it asks: it is a chat, and the person can answer, say
+  something else or stop it. The exits are a pull request, a failure (the rules
+  above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
+  and CancelTask (a chat's Stop).
 * **Only a repository the person named.** `prepare_workspace` refuses a
   repository that is not named in the person's own messages of the run: the
   task, and every answer delivered to it (user messages and the results of
-  `ask_user`; what the model or a tool wrote never counts). Before every step
+  `ask_user`, paired with the question by position in the history, because
+  providers that send no call ids get `call_0`, `call_1` again in every turn; what
+  the model or a tool wrote never counts, and neither does text quoted in a
+  fence labelled `untrusted`, which is how the orchestrator's message that sends
+  a job back quotes findings of checks and reviewers: its `request` fence, the
+  person's own words, does count). Before every step
   `CoderAgent` reads those messages (and the inbox, without consuming it:
   `Ctx::peek_inbox`) and records the repositories they name in the run notes
   (`RunNotes::named_repos`); the tool compares the argument with them and never
   trusts the model alone. Repositories are compared as normalised
   `host/owner/name` ([`tools::named`](src/tools/named.rs)): case-insensitive,
   without scheme, credentials, `.git` or a trailing slash; `https://host/owner/name(.git)`,
-  `host/owner/name`, `git@host:owner/name`, `owner/name` (host `github.com`) and, for local
-  remotes, the absolute path or `file://` URL all name the same repository, and
-  a port stays part of the host (`http://git-server:8080/local/sandbox.git`). The
-  refusal is a tool result that says which repositories were named and tells the
-  model to ask the person with `ask_user`; it is not a run failure.
+  `host/owner/name`, `git@host:owner/name`, `owner/name` (the host is the first
+  of `ALLOWED_REPO_HOSTS`, `CoderSettings::default_repo_host`) and, for local
+  remotes, the absolute path or `file://` URL all name the same repository, a
+  port stays part of the host (`http://git-server:8080/local/sandbox.git`) unless
+  it is the scheme's default, and `www.github.com` is `github.com`. The
+  refusal is a tool result that says which repositories were named (only what
+  the person wrote, and not words that are files such as `src/main.rs`) and tells
+  the model to ask the person with `ask_user`; it is not a run failure. The tools
+  read what `CoderAgent` records, so `coder_tools` under another agent refuses
+  every repository.
   A message that continues a parked run (same `contextId`, no `taskId`, while the
   task is `input-required`) is delivered to that run, so a repository named in the
   original request still counts on it. A message after the task ended starts a new
@@ -174,7 +192,7 @@ stateDiagram-v2
   Stepping --> Stepping: tool calls
   Stepping --> Stopped: the model stops (a turn without tool calls)
   Stopped --> Completed: a pull request was opened
-  Stopped --> Failed: red checks, or the credentials were rejected
+  Stopped --> Failed: red checks with no cycles left, or the credentials were rejected
   Stopped --> InputRequired: anything else, the model's text is the question
   Stepping --> InputRequired: ask_user
   InputRequired --> Stepping: the person answers
@@ -220,7 +238,7 @@ prompt is changed on purpose (see [Tests](#tests)). The limit in the prompt foll
 applies to a caller that does not.
 
 What stays in Rust is what a file cannot say: the tools, the completion policy (`CoderAgent`
-wraps the assembled `LlmAgent`, fails a run that ends on red checks without a pull request and turns any
+wraps the assembled `LlmAgent`, fails a run that ends on red checks with no cycles left and no pull request and turns any
 other stop without one into a question), the record of the repositories the person named, and the
 redaction. `CoderAgent::new` and `with_tools` panic if the agent cannot be assembled, which only a model alias that
 is empty or has whitespace can cause; `try_new` and `try_with_tools` return the error, and the binary uses those,
@@ -270,7 +288,7 @@ reported at once at startup):
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
 | `GITHUB_TOKEN` | push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required by `all` and `worker` |
-| `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them | `github.com` |
+| `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, worktrees, run notes | `/work` |
@@ -395,8 +413,12 @@ own stops the others and ends the process with a `HostError`, exit 70.
 
 The repository URL comes from the model, which took it from the user, so it
 is treated as hostile input. `GITHUB_TOKEN` is bound to `ALLOWED_REPO_HOSTS`
-twice over:
+twice over, and a third layer decides whether the repository may be used at all:
 
+0. **Only a repository the person named.** `prepare_workspace` refuses, before
+   anything else, a repository that is not named in the person's own messages
+   of the run (see [the rules](#the-rules-in-code)); quoted findings do not name
+   one.
 1. `Workspaces::allow_hosts` refuses any other host before a process is
    spawned, a request is made or a credential is asked for (the model gets the
    reason as a tool error). URLs with embedded credentials, ssh/scp forms, and
@@ -484,7 +506,9 @@ database of its own, so the role needs `CREATEDB`):
   owner's "Hi": `input-required` with the text as the question, the answer reaches the
   model and the run goes on to a pull request; no text at all; checks then text;
   a message in the context of a parked run continues it; cancel while parked), an invented
-  repository refused and the model sent to `ask_user`, red checks N times (failed, findings, no PR),
+  repository refused and the model sent to `ask_user`, a repository quoted in `untrusted` findings not
+  named while the one in the `request` fence is, an empty stop after work asking what to do next, red checks
+  with cycles left then text (a question, not a failure), red checks N times (failed, findings, no PR),
   the explicit-acceptance path, ownership, the wrong bearer token (401 at the
   coder's own router; card and `/healthz` open), five crash points (inside
   `run_checks`, inside `commit_and_push`, after it was journaled, inside
@@ -531,7 +555,11 @@ database of its own, so the role needs `CREATEDB`):
   `prepare_workspace` refusing a repository the person did not name (the refusal names
   `ask_user`, nothing is created) and accepting each written form of a named one.
   The unit tests of `src/tools/named.rs` pin the normalisation (every spelling, the
-  sandbox address of the vendored e2e mocks, local paths).
+  sandbox address of the vendored e2e mocks, local paths, default ports, `www.github.com`,
+  the configured default host) and the removal of `untrusted` fences (3 and 4 backticks, tildes,
+  unclosed, the exact shape of the orchestrator's rework prompt); those of `src/agent.rs` pin what
+  counts as the person's words (assistant text, other tools' results and colliding call ids do not)
+  and the format of the stop's call id.
 * `tests/tool_specs.rs`: each tool's `ToolSpec` equals `tests/fixtures/tool-specs/<tool>.json`, the JSON of
   the hand-written tools, so a change to what the model is told is a reviewed diff. The one expected difference
   is normalised: an optional argument is `"type": ["string", "null"]` in a derived schema. Regenerate with

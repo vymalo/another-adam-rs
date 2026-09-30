@@ -76,7 +76,10 @@ A reply without a tool call ends your turn. Two ways of ending are right:
 
 Anything else (a summary without a pull request, "done" without one) does not
 complete the run: it waits for the person as well, so do not end your turn
-without one of the two.
+without one of the two. A run with nothing to deliver never finishes by itself:
+it ends with a pull request, with a failure (the check limit below, for
+example), or when the person stops it. Until then it waits, and the person may
+answer or say something else.
 
 # Rules you must not break
 

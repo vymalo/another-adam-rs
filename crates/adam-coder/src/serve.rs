@@ -81,6 +81,9 @@ async fn build_agent(worker: &WorkerConfig, redactor: Redactor) -> anyhow::Resul
         &worker.opencode_model,
     ));
     settings.max_check_cycles = worker.max_check_cycles;
+    if let Some(host) = worker.allowed_repo_hosts.first() {
+        settings.default_repo_host.clone_from(host);
+    }
     settings.check_timeout = worker.check_timeout;
     settings.check_output_tail = worker.check_output_tail;
     settings.draft_pull_requests = worker.pr_draft;

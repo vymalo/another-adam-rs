@@ -3,7 +3,7 @@
 use adam::prelude::*;
 use adam_workspace::RepoRef;
 
-use super::named::key_of_argument;
+use super::named::{key_of_argument, listed};
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// Branch used when the model leaves `base_branch` out.
@@ -77,6 +77,8 @@ pub async fn prepare_workspace(
 
 /// What the model is told when it picks a repository the person did not name.
 fn not_named(url: &str, named: &[String]) -> String {
+    // Only what the person wrote is ever listed, and not the words that are files.
+    let named = listed(named);
     let said = if named.is_empty() {
         "The person has not named any repository.".to_owned()
     } else {
@@ -105,5 +107,9 @@ mod tests {
         );
         assert!(some.contains("github.com/acme/widgets"), "{some}");
         assert!(some.contains("ask_user"), "{some}");
+        // A word that is a file is not offered as a repository.
+        let file = not_named("https://github.com/a/b", &["github.com/src/main.rs".into()]);
+        assert!(file.contains("has not named any repository"), "{file}");
+        assert!(!file.contains("main.rs"), "{file}");
     }
 }

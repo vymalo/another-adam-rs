@@ -11,7 +11,7 @@ use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::ask::AskUser;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::delegate::DelegateToOpenCode;
-use adam_coder::tools::named::named_in;
+use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
@@ -77,7 +77,10 @@ impl Rig {
 async fn say(env: &ToolEnv, ctx: &ToolCtx, text: &str) {
     let run = ctx.run_id().to_string();
     let mut notes = env.notes.load(&run).await.unwrap();
-    notes.name_repos(named_in(text));
+    notes.name_repos(named_in(
+        &without_untrusted(text),
+        &env.settings.default_repo_host,
+    ));
     env.notes.save(&run, &notes).await.unwrap();
 }
 
@@ -254,6 +257,22 @@ async fn prepare_workspace_refuses_a_repository_the_person_did_not_name() {
         "{message}"
     );
 
+    // Quoted findings and file names do not name anything, and are never listed back.
+    rig.say(
+        "see src/main.rs\n````untrusted\n- https://github.com/evil/payload\n```\ncode\n```\n````",
+    )
+    .await;
+    let payload = json!({"repo_url": "https://github.com/evil/payload", "base_branch": "main"});
+    let message = text(PrepareWorkspace.call(&rig.ctx, payload).await);
+    assert!(message.contains("ask_user"), "{message}");
+    let listed = message.split("named:").nth(1).expect("the named list");
+    assert!(
+        listed.contains("github.com/acme/widgets")
+            && !listed.contains("evil/payload")
+            && !listed.contains("main.rs"),
+        "{message}"
+    );
+
     // A repository that merely shares a name with a named one is another repository.
     let lookalike = json!({"repo_url": "https://github.com/evil/widgets", "base_branch": "main"});
     assert!(text(PrepareWorkspace.call(&rig.ctx, lookalike).await).contains("ask_user"));
@@ -310,7 +329,7 @@ async fn every_written_form_of_a_named_repository_passes_the_gate() {
     assert!(text(out).contains("ask_user"));
     assert!(mirror.received_requests().await.unwrap().is_empty());
 
-    for (i, written) in [
+    for written in [
         format!("http://{host}/octo/widgets.git"),
         format!("http://{host}/octo/widgets"),
         format!("http://{host}/OCTO/Widgets/"),
@@ -319,20 +338,21 @@ async fn every_written_form_of_a_named_repository_passes_the_gate() {
         format!("In {host}/octo/widgets, add hello.txt."),
     ]
     .iter()
-    .enumerate()
     {
         let ctx = ToolCtx::detached("tool", "call-x", Arc::new(CollectingSink::new()))
             .with_state(env.clone());
         say(&env, &ctx, written).await;
+        let before = mirror.received_requests().await.unwrap().len();
         let out = PrepareWorkspace.call(&ctx, argument.clone()).await;
         let message = text(out);
         assert!(
             !message.contains("ask_user"),
             "{written:?} names the repository: {message}"
         );
+        let after = mirror.received_requests().await.unwrap().len();
         assert!(
-            mirror.received_requests().await.unwrap().len() > i,
-            "{written:?}: the mirror was not contacted; the tool said: {message}"
+            after > before,
+            "{written:?}: this call did not reach the mirror ({before} requests before, {after} after); the tool said: {message}"
         );
     }
 }

@@ -1521,7 +1521,8 @@ tools' guards:
 ```mermaid
 stateDiagram-v2
     [*] --> NoWorkspace
-    NoWorkspace --> WorktreeReady: prepare_workspace
+    NoWorkspace --> NoWorkspace: prepare_workspace refuses a repository the person did not name, the model asks
+    NoWorkspace --> WorktreeReady: prepare_workspace on a repository the person named
     WorktreeReady --> Edited: delegate_to_opencode
     Edited --> ChecksGreen: run_checks passes
     Edited --> ChecksRed: run_checks fails, one cycle used
@@ -1535,12 +1536,25 @@ stateDiagram-v2
     Pushed --> PullRequest: accept_red_checks after the user agreed through ask_user
     PullRequest --> Completed: the model ends its turn
     Exhausted --> FailedRun: the model reports the findings and stops, the run fails
+    NoWorkspace --> InputRequired: the model stops with nothing delivered, or asks
+    WorktreeReady --> InputRequired: the model stops with no pull request
+    Edited --> InputRequired: the model stops with no pull request
+    ChecksGreen --> InputRequired: the model stops with no pull request
+    ChecksRed --> InputRequired: the model stops with no pull request, cycles left
+    Pushed --> InputRequired: the model stops with no pull request
+    InputRequired --> NoWorkspace: the person answers, nothing prepared yet
+    InputRequired --> Edited: the person answers, work in progress
+    InputRequired --> Canceled: CancelTask
     Completed --> [*]
     FailedRun --> [*]
+    Canceled --> [*]
 ```
 
 `Exhausted` has no way out except failure: `run_checks`, `commit_and_push` and
-`open_pull_request` all refuse, and `accept_red_checks` never overrides it. The states are not stored as an enum:
+`open_pull_request` all refuse, and `accept_red_checks` never overrides it.
+`InputRequired` is the chat waiting for the person (an `ask_user`, or a stop that delivered nothing): the
+run ends only with a pull request, a failure, `CancelTask` or `max_turns`, and the person may answer, say
+something else or stop it. The states are not stored as an enum:
 they follow from the per-run notes (failures counted, last check and its tree,
 pushed sha, pull request) and the worktree.
 
@@ -1557,16 +1571,18 @@ What the diagrams cannot say (`crates/adam-coder/src/`):
     refuses to run. `commit_and_push` and `open_pull_request` refuse too.
   * `open_pull_request` refuses unless the pushed `HEAD` is the current commit
     and the last check run passed **on exactly the tree it contains**.
-  * A completed run with no pull request fails, if its last check was red or
-    the credentials were rejected (`CoderAgent::verdict`). "The model said it
+  * A run that stops with no pull request fails if the check-cycle budget is
+    used up with the last check red, or the credentials were rejected
+    (`CoderAgent::verdict`). "The model said it
     is done" is not the same as "delivered".
   * Any other stop without a pull request is a question, not a completion: the
     run parks as `ask_user` would (`input-required`, the model's text as the
     question) and the person's answer resumes it.
   * `prepare_workspace` refuses a repository the person did not name in their
     own messages of the run (recorded in the run notes before each step from the
-    conversation, never from the model's argument alone), with a tool error
-    that sends the model to `ask_user`.
+    conversation, never from the model's argument alone; text quoted in
+    `untrusted` fences does not count), with a tool error that sends the model
+    to `ask_user`.
 * **Safe to repeat.** A tool call that dies before its result is journaled
   runs again, so each tool is safe to repeat. `prepare_workspace` reuses the
   run's worktree, `commit_and_push` does nothing when there is nothing new,
