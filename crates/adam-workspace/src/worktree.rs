@@ -320,11 +320,14 @@ impl Worktree {
         let loc = self.repo.locate()?;
         let auth = self.ws.authorize(&self.repo, &loc).await?;
         self.git()
-            .args(["push", "--quiet", "origin"])
+            .args(["push", "--quiet"])
+            .arg(loc.remote_url(&self.repo.url))
             .arg(format!("refs/heads/{0}:refs/heads/{0}", self.local))
             .maybe_auth(auth)
             .run()
             .await?;
+
+        self.record_pushed(&self.local).await?;
 
         // Equivalent of `--set-upstream`. Done by hand and under the repo lock
         // because the branch config lives in the mirror's shared config file,
@@ -370,7 +373,8 @@ impl Worktree {
         let auth = self.ws.authorize(&self.repo, &loc).await?;
         let pushed = self
             .git()
-            .args(["push", "--quiet", "origin"])
+            .args(["push", "--quiet"])
+            .arg(loc.remote_url(&self.repo.url))
             .arg(format!(
                 "refs/heads/{}:refs/heads/{}",
                 self.local, self.branch
@@ -389,8 +393,30 @@ impl Worktree {
                     self.branch
                 )))
             }
-            other => other.map(|_| ()),
+            Err(e) => Err(e),
+            Ok(_) => self.record_pushed(&self.branch).await,
         }
+    }
+
+    /// Note in the mirror that `origin/<branch>` is now the run's branch tip, as `git push origin`
+    /// would have: the pushes name the URL and not the remote called `origin`, which does not
+    /// update the remote-tracking ref by itself, and `@{upstream}` and the next `prepare` read it.
+    async fn record_pushed(&self, branch: &str) -> WorkspaceResult<()> {
+        let tip = self
+            .git()
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{}^{{commit}}", self.local))
+            .run()
+            .await?
+            .stdout_text();
+        self.ws
+            .mirror_git(&self.mirror)
+            .args(["update-ref"])
+            .arg(format!("{REMOTE_TRACKING_PREFIX}{branch}"))
+            .arg(tip)
+            .run()
+            .await?;
+        Ok(())
     }
 }
 

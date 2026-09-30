@@ -333,6 +333,35 @@ async fn a_run_can_continue_a_pushed_branch_and_publishes_to_it_only_on_request(
     assert!(!first.path().join("second.txt").exists());
 }
 
+/// What carries the credentials names the URL it was prepared for: a `remote.origin.url` or
+/// `pushurl` that was changed in the shared mirror's configuration afterwards redirects neither the
+/// fetch of a later run nor a push.
+#[tokio::test]
+async fn fetch_and_push_do_not_follow_the_mirrors_origin_configuration() {
+    let env = Env::new();
+    let first = env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
+    let bogus = env._tmp.path().join("nowhere.git");
+    let mirror = env.mirror();
+    for (key, value) in [
+        ("remote.origin.url", bogus.to_str().unwrap()),
+        ("remote.origin.pushurl", bogus.to_str().unwrap()),
+    ] {
+        git(&mirror, &["config", key, value]);
+    }
+    std::fs::write(first.path().join("f.txt"), "f\n").unwrap();
+    first.commit_all("f", &me()).await.unwrap().unwrap();
+    first.push().await.unwrap();
+    assert_eq!(
+        remote_branches(&env),
+        [first.branch().to_owned(), "main".to_owned()],
+        "the push reached the real remote"
+    );
+    // A second run's fetch comes from the real remote too (it sees `main`, which only it has).
+    env.advance_remote("later.txt");
+    let second = env.ws.prepare(&env.repo, "run-second-002").await.unwrap();
+    assert!(second.path().join("later.txt").exists());
+}
+
 #[tokio::test]
 async fn only_an_agent_branch_that_exists_can_be_continued() {
     let env = Env::new();

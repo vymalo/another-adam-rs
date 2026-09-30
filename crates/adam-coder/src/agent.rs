@@ -251,6 +251,9 @@ fn verdict_of(notes: &RunNotes, max: u32) -> Option<String> {
         // nothing was pushed to that branch (only to the run's own), so it says that, not that no
         // pull request exists.
         let not_delivered = match &notes.continues {
+            Some(line) if notes.published => {
+                format!("the branch {line} was updated, but its pull request could not be reported")
+            }
             Some(line) => format!("the pull request for {line} was not updated"),
             None => "no pull request was opened".to_owned(),
         };
@@ -383,7 +386,12 @@ fn pushed_branches(state: &Conversation) -> Vec<PushedBranch> {
                     && branch.starts_with("agent/")
                     && let Some(repo) = key_of_argument(&url)
                 {
-                    pushed.push(PushedBranch { repo, branch });
+                    // The text carries no base: the tool's own notes do.
+                    pushed.push(PushedBranch {
+                        repo,
+                        branch,
+                        base: None,
+                    });
                 }
             }
             Message::Tool { .. } => {
@@ -974,7 +982,8 @@ mod tests {
             pushed_branches(&state),
             [PushedBranch {
                 repo: "github.com/acme/widgets".into(),
-                branch: "agent/one".into()
+                branch: "agent/one".into(),
+                base: None,
             }]
         );
     }
@@ -1041,7 +1050,8 @@ mod tests {
             pushed_branches(&state),
             [PushedBranch {
                 repo: "github.com/acme/widgets".into(),
-                branch: "agent/two".into()
+                branch: "agent/two".into(),
+                base: None,
             }],
             "the second result is the push's, the first is run_checks's"
         );
@@ -1110,6 +1120,7 @@ mod tests {
             url: "https://github.com/a/b/pull/1".into(),
             number: 1,
             red_checks_accepted: false,
+            commented_sha: None,
         });
         assert_eq!(verdict_of(&blocked, 2), None);
     }

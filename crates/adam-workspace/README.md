@@ -17,13 +17,13 @@ authentication behave like the real tool.
 
 | Item | What |
 |---|---|
-| `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `default_branch(url)`, `open_existing(run)`, `remove(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref origin HEAD`). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
+| `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `default_branch(url)`, `open_existing(run)`, `remove(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
 | `Worktree` | `path`, `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` (the run's own branch), `publish` (moves the continued branch) |
 | `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files |
 | `GitCredentials` (trait), `DynGitCredentials` | `token_for(&RepoRef) -> SecretString` |
 | `StaticToken`, `ScopedToken` | one token for any host, or bound to named hosts (`from_env(..)` for both) |
-| `CodeHost` (trait), `DynCodeHost` | `open_pull_request`, `find_pull_request` (matches the head **and** `repo.base_branch`), `comment_on_pull_request`; `NewPullRequest`, `PullRequest` |
+| `CodeHost` (trait), `DynCodeHost` | `open_pull_request`, `find_pull_request` (matches the head **and** `repo.base_branch`), `find_pull_request_on_head` (the head alone, whatever the base: for a continued branch), `comment_on_pull_request`; `NewPullRequest`, `PullRequest` |
 | `GitHub` | GitHub REST `CodeHost`: `new(creds)`, `with_api_base(url)`; idempotent (returns the open pull request of the same head and base) |
 | `MemoryCodeHost` | in-memory `CodeHost` that records pull requests and comments (`comments()`), feature `test-util` |
 | `WorkspaceError`, `WorkspaceResult` | `Auth`, `NotFound`, `Invalid`, `Transient`, `RateLimited { retry_after }`, `Conflict`, `Corrupt`, `Git { .. }`, `Http { .. }`, `Io { .. }`; `#[non_exhaustive]`, see *Errors* |
@@ -33,7 +33,7 @@ authentication behave like the real tool.
 `agent/<run>` checked out (so the worktree never collides with the one of the run that pushed `agent/abc`, and
 a finished run's worktree need not be removed first), and **`Worktree::push` publishes that branch under its own
 name**, also for a run that continues another: the continued branch is not moved by a push. `Worktree::publish`
-does that, separately and on the caller's decision: `git push origin agent/<run>:agent/abc`, never forced, so a
+does that, separately and on the caller's decision: `git push <url> agent/<run>:agent/abc`, never forced, so a
 pull request from `agent/abc` is updated only when the caller lets the run's commits in (the coder does it
 after its checks gate). `publish` on a worktree that continues nothing does nothing, and repeating it is a
 no-op. `Worktree::branch()` is `agent/abc` (what a pull request is opened from), `local_branch()` is
@@ -72,7 +72,13 @@ if wt.commit_all("fix the thing", &me).await?.is_some() {
 
 Security posture: `Workspaces::allow_hosts` and `allow_local` decide which
 repository URLs are accepted at all, so a token only goes to a host the
-operator named. The token reaches `git` only through the environment of one
+operator named. The commands that carry the token (`fetch`, `ls-remote`, `push`) name that URL
+(the canonical one for an http(s) remote) and the refspec, instead of the remote called `origin`,
+so a `remote.origin.url` or `pushurl` changed in the shared mirror's configuration does not
+redirect them; `core.fsmonitor` is pinned off for every command. A `url.<base>.insteadOf` rule in
+that configuration still rewrites a URL git is given: the coder keeps a command of the model from
+writing one (see its `run_command`), but a caller that lets other code write to the mirror's
+configuration owns that. The token reaches `git` only through the environment of one
 invocation: never in a remote URL, `.git/config`, logs or error messages.
 URLs with embedded credentials and ssh/scp forms are refused.
 

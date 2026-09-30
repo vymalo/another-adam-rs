@@ -1644,7 +1644,7 @@ pushed sha, pull request) and the worktree.
 What the diagrams cannot say (`crates/adam-coder/src/`):
 
 * **The tools** (`tools/`): `prepare_workspace`, `run_command` (looking around: no check, no cycle,
-  read-only, a change is undone), `delegate_to_opencode`, `run_checks` (the project's own checks only),
+  changes to HEAD, the branch, the working tree, refs and git configuration are undone), `delegate_to_opencode`, `run_checks` (the project's own checks only),
   `commit_and_push`, `open_pull_request` and `ask_user`.
 * **The prompt and the card** (`agent/instructions.md`, embedded by `build.rs`): the system prompt with its
   `{{max_check_cycles}}`, the loop's limits and the A2A card are a file, not Rust; `CoderAgent::new` puts

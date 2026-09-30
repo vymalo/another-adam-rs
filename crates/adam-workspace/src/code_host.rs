@@ -30,6 +30,15 @@ pub trait CodeHost: Send + Sync + 'static {
         head: &str,
     ) -> Result<Option<PullRequest>, WorkspaceError>;
 
+    /// The open pull request whose head branch is `head`, **whatever its base branch**. For a
+    /// caller that continues a branch: the pull request of that branch is the one to update, even
+    /// when the caller does not know (or disagrees about) the base it was opened against.
+    async fn find_pull_request_on_head(
+        &self,
+        repo: &RepoRef,
+        head: &str,
+    ) -> Result<Option<PullRequest>, WorkspaceError>;
+
     /// Add a comment to pull request `number` of `repo` (Markdown). Not idempotent: calling it
     /// twice posts twice.
     async fn comment_on_pull_request(
@@ -169,6 +178,18 @@ mod memory {
                 .map(|(_, pr)| pr.clone()))
         }
 
+        async fn find_pull_request_on_head(
+            &self,
+            repo: &RepoRef,
+            head: &str,
+        ) -> Result<Option<PullRequest>, WorkspaceError> {
+            Ok(self
+                .lock()
+                .iter()
+                .find(|(req, _)| req.repo.url == repo.url && req.head == head)
+                .map(|(_, pr)| pr.clone()))
+        }
+
         async fn comment_on_pull_request(
             &self,
             repo: &RepoRef,
@@ -255,12 +276,25 @@ mod memory {
             );
             let against_dev = host
                 .open_pull_request(NewPullRequest {
-                    repo: dev,
+                    repo: dev.clone(),
                     ..new_pr("agent/a")
                 })
                 .await
                 .unwrap();
             assert_ne!(against_dev.number, a.number);
+            // By head alone, either is "the" pull request of the branch: the first one.
+            assert_eq!(
+                host.find_pull_request_on_head(&dev, "agent/a")
+                    .await
+                    .unwrap(),
+                Some(a)
+            );
+            assert_eq!(
+                host.find_pull_request_on_head(&dev, "agent/none")
+                    .await
+                    .unwrap(),
+                None
+            );
         }
 
         #[tokio::test]

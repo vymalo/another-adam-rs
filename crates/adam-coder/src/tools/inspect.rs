@@ -10,7 +10,8 @@
 //! * it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a result,
 //!   not a failure;
 //! * it is **not an editing path**: the worktree is snapshotted before the command (`HEAD`, the
-//!   branch, and the tree of the files as `commit_and_push` would commit them), and a command after
+//!   branch, the tree of the files as `commit_and_push` would commit them, and the refs and local
+//!   git configuration a command could change without touching a file), and a command after
 //!   which any of them differs is undone and refused. Changes are made by `delegate_to_opencode`, so
 //!   that they are the work of the tool that commits, checks and reports them.
 //!
@@ -20,15 +21,18 @@
 use adam::prelude::*;
 
 use super::checks::missing_tool_text;
-use super::gitcli::{head_ref, head_sha, restore_worktree, working_tree_id};
-use super::shell::{ShellOutcome, missing_tool, resolve_cwd, run_shell};
+use super::gitcli::{
+    RepoState, git_stdout, head_ref, head_sha, repo_state, restore_repo_state, restore_worktree,
+    status_text, working_tree_id,
+};
+use super::shell::{ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, run_shell};
 use super::{Outcome, ToolEnv, non_empty};
 
 /// Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`,
 /// `ls`, `cat README.md`, `grep -rn name src`. You get the exit code and the tail of the output.
-/// It costs no check cycle and reports no checks, and it is read-only: a command that changes
-/// the worktree or HEAD is undone and refused (make changes with delegate_to_opencode). Use it
-/// to explore; use run_checks only for the project's real checks.
+/// It costs no check cycle and reports no checks, and it is for looking: changes it makes to
+/// HEAD, the branch and the working tree are undone and refused (make changes with
+/// delegate_to_opencode). Use it to explore; use run_checks only for the project's real checks.
 #[tool]
 pub async fn run_command(
     env: State<ToolEnv>,
@@ -51,12 +55,7 @@ pub async fn run_command(
     };
 
     // What the worktree is before the command: nothing it does may change it.
-    let (head, branch, tree) = (
-        head_sha(wt.path()).await,
-        head_ref(wt.path()).await,
-        working_tree_id(wt.path()).await,
-    );
-    let (Some(head), Some(tree)) = (head, tree) else {
+    let Some(before) = Snapshot::take(wt.path()).await else {
         return Ok(ToolOutput::error(
             "Cannot read the state of the worktree, so nothing was run (a command that might \
              change it cannot be undone). Try again; if it persists, tell the person.",
@@ -77,18 +76,9 @@ pub async fn run_command(
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
 
     // Did it change anything it should not have?
-    let now = (
-        head_sha(wt.path()).await,
-        head_ref(wt.path()).await,
-        working_tree_id(wt.path()).await,
-    );
-    let unchanged = now.0.as_deref() == Some(head.as_str())
-        && now.1 == branch
-        && now.2.as_deref() == Some(tree.as_str());
-    if !unchanged {
-        let restored = restore_worktree(wt.path(), &head, branch.as_deref(), &tree).await
-            && head_sha(wt.path()).await.as_deref() == Some(head.as_str())
-            && working_tree_id(wt.path()).await.as_deref() == Some(tree.as_str());
+    let after = Snapshot::take(wt.path()).await;
+    if after.as_ref() != Some(&before) {
+        let restored = before.restore(wt.path()).await;
         ctx.emit_progress(format!("undid a change made by: {shown}"))
             .await;
         return Ok(ToolOutput::error(changed_the_worktree(
@@ -96,12 +86,71 @@ pub async fn run_command(
         )));
     }
 
-    if let Some(missing) = missing_tool(&outcome) {
+    if let Some(missing) = missing_tool(&outcome, command) {
         ctx.emit_progress("the workspace lacks a tool".to_owned())
             .await;
-        return Ok(ToolOutput::error(missing_tool_text(&missing)));
+        let install = project_dependency_hint(&[dir.as_path(), wt.path()], &missing.name);
+        return Ok(ToolOutput::error(missing_tool_text(
+            &missing,
+            install.as_deref(),
+        )));
     }
     Ok(ToolOutput::text(render(&shown, &outcome)))
+}
+
+/// What a command must leave as it found it: `HEAD` and the branch, the files of the worktree,
+/// and the shared repository state a command could change without touching a file (see
+/// [`RepoState`]).
+///
+/// The files are the **tree** as `commit_and_push` would commit it, which is what a restore can
+/// write back. Where that cannot be computed (an embedded repository without a commit makes `git
+/// add -A` fail), the snapshot falls back to what `git status` says: a change is still seen, and a
+/// restore then only puts `HEAD` and the branch back and leaves the files alone, since nothing it
+/// could write back would be exact.
+#[derive(Debug, PartialEq, Eq)]
+struct Snapshot {
+    head: String,
+    branch: Option<String>,
+    tree: Option<String>,
+    /// `git status`, for the worktree that has no tree id.
+    status: Option<String>,
+    repo: RepoState,
+}
+
+impl Snapshot {
+    async fn take(dir: &std::path::Path) -> Option<Self> {
+        let head = head_sha(dir).await?;
+        let tree = working_tree_id(dir).await;
+        let status = match tree {
+            Some(_) => None,
+            None => Some(status_text(dir).await?),
+        };
+        Some(Self {
+            head,
+            branch: head_ref(dir).await,
+            tree,
+            status,
+            repo: repo_state(dir).await?,
+        })
+    }
+
+    /// Put it all back; `true` when the worktree is exactly as it was.
+    async fn restore(&self, dir: &std::path::Path) -> bool {
+        let repo = restore_repo_state(dir, &self.repo).await;
+        let Some(tree) = &self.tree else {
+            // No tree to write back: point `HEAD` where it was and keep the files as they are.
+            // (Whether these work or not, the files are not known to be as they were.)
+            let _ = match &self.branch {
+                Some(branch) => git_stdout(dir, &["symbolic-ref", "HEAD", branch]).await,
+                None => git_stdout(dir, &["update-ref", "--no-deref", "HEAD", &self.head]).await,
+            };
+            let _ = git_stdout(dir, &["reset", "--soft", "--quiet", &self.head]).await;
+            let _ = repo;
+            return false;
+        };
+        repo && restore_worktree(dir, &self.head, self.branch.as_deref(), tree).await
+            && Self::take(dir).await.as_ref() == Some(self)
+    }
 }
 
 /// What the model is told when its command changed the worktree.
@@ -109,12 +158,12 @@ fn changed_the_worktree(command: &str, outcome: &ShellOutcome, restored: bool) -
     let what = if restored {
         "The change was undone: the worktree is exactly as it was."
     } else {
-        "The change could not be fully undone: run `git status` with run_command to see the \
-         worktree before you go on."
+        "The change could not be fully undone (HEAD and the branch are back, but the files \
+         may differ): run `git status` with run_command to see the worktree before you go on."
     };
     format!(
-        "`{command}` changed the worktree (files, HEAD or the branch), and run_command is for \
-         looking around only. {what} Changes go through delegate_to_opencode. Output of the \
+        "`{command}` changed the worktree (files, HEAD, the branch, a ref or the git \
+         configuration), and run_command is for looking around only. {what} Changes go through delegate_to_opencode. Output of the \
          command, for what it is worth:\n{}",
         outcome.tail
     )

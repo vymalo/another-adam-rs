@@ -155,45 +155,129 @@ fn on_path(name: &str) -> bool {
 /// A command the shell could not find, as a run's output says it: the workspace lacks a tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingTool {
-    /// The command word, when the output names it (`mvn`); `None` when the shell only exited 127.
-    pub name: Option<String>,
+    /// The command word the shell could not find (`mvn`).
+    pub name: String,
 }
 
-/// Whether `outcome` is the shell saying it could not find a command.
+/// Whether `outcome` is the shell saying it could not find a command: the run **exited 127** and
+/// says so in the way a shell does.
 ///
-/// Two shapes: `sh: 1: mvn: not found` (dash) and `bash: line 1: mvn: command not found` (also
-/// `bash: mvn: command not found`), and the exit code 127 they come with. A line of that shape
-/// counts when the run failed and it starts with a shell's name, or whatever it starts with when
-/// the exit code is 127 (a script that calls a missing command names itself first). A run that
-/// only exited 127 is a missing command too, with no name. So `cat: CLAUDE.md: No such file or
-/// directory` (a missing file), a test that prints "resource not found" and exits 1, and a
-/// timeout are not.
-pub fn missing_tool(outcome: &ShellOutcome) -> Option<MissingTool> {
-    let code = outcome.exit_code.filter(|c| *c != 0)?;
-    if outcome.timed_out {
+/// The exit code is 127 *and* a line names the command: `sh: 1: mvn: not found` (dash), `bash: line
+/// 1: mvn: command not found` (also `bash: mvn: command not found`), printed by the shell that ran
+/// the command, or by a script the command itself runs (`./check.sh: line 4: cargo: command not
+/// found`: the line starts with a word that the command contains). Neither alone is enough. A
+/// nested `sh: 1: gti: not found` in the output of a test run that exits 101 is the project's
+/// business, not the workspace's, and a bare 127 (a `exit 127` of a script) names nothing the
+/// person could install. A missing file (`cat: CLAUDE.md: No such file or directory`), a test
+/// that prints "resource not found" and a timeout are not it either.
+pub fn missing_tool(outcome: &ShellOutcome, command: &str) -> Option<MissingTool> {
+    if outcome.timed_out || outcome.exit_code != Some(127) {
         return None;
     }
-    let found = outcome.tail.lines().find_map(|line| {
+    outcome.tail.lines().find_map(|line| {
         let line = line.trim();
         let before = line
             .strip_suffix(": command not found")
             .or_else(|| line.strip_suffix(": not found"))?;
-        let word = before.rsplit(": ").next()?.trim();
-        // The first thing such a line names is the shell that printed it (`sh`, `/bin/sh`).
-        let shell = before.split(": ").next().unwrap_or_default();
-        let shell_said_it = matches!(
-            shell.rsplit('/').next(),
+        // `<who>: [line ]<n>: <word>` or `<who>: <word>`.
+        let mut parts = before.split(": ");
+        let who = parts.next()?;
+        let rest: Vec<&str> = parts.collect();
+        let (position, word) = match rest.as_slice() {
+            [word] => (None, *word),
+            [position, word] => (Some(*position), *word),
+            _ => return None,
+        };
+        if let Some(position) = position {
+            let digits = position.strip_prefix("line ").unwrap_or(position);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        }
+        // Said by a shell (`sh`, `/bin/sh`, `bash`), or by a script the command runs.
+        let shell = matches!(
+            who.rsplit('/').next(),
             Some("sh" | "bash" | "dash" | "zsh" | "ash")
         );
+        let own_script =
+            !who.is_empty() && !who.contains(char::is_whitespace) && command.contains(who);
         let plausible =
             !word.is_empty() && word.len() <= 128 && !word.contains(char::is_whitespace);
-        (plausible && (code == 127 || shell_said_it)).then(|| word.to_owned())
-    });
-    match (found, code) {
-        (Some(name), _) => Some(MissingTool { name: Some(name) }),
-        (None, 127) => Some(MissingTool { name: None }),
-        _ => None,
+        (plausible && (shell || own_script)).then(|| MissingTool {
+            name: word.to_owned(),
+        })
+    })
+}
+
+/// What the workspace is missing, if the project brings it itself: the tool `name` is one the
+/// project's own dependencies provide (`jest` under `node_modules/.bin`, `pytest` in a virtual
+/// environment), which is not a system toolchain the workspace lacks but a dependency nobody
+/// installed yet. The project's own install command is the way on. Looks in `dirs` (the directory
+/// the command ran in, then the worktree root) for the files that say so.
+pub fn project_dependency_hint(dirs: &[&Path], name: &str) -> Option<String> {
+    const NODE_TOOLS: &[&str] = &[
+        "jest",
+        "vitest",
+        "tsc",
+        "eslint",
+        "prettier",
+        "webpack",
+        "vite",
+        "mocha",
+        "ts-node",
+        "next",
+        "nx",
+        "turbo",
+        "playwright",
+        "cypress",
+        "rollup",
+        "esbuild",
+        "babel",
+        "tsx",
+        "biome",
+        "karma",
+        "ng",
+    ];
+    const PYTHON_TOOLS: &[&str] = &[
+        "pytest", "tox", "flake8", "black", "mypy", "ruff", "nox", "isort",
+    ];
+    for dir in dirs {
+        if let Ok(text) = std::fs::read_to_string(dir.join("package.json")) {
+            let declared = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .is_some_and(|json| {
+                    ["dependencies", "devDependencies"]
+                        .iter()
+                        .any(|key| json.get(key).and_then(|d| d.get(name)).is_some())
+                });
+            if declared || NODE_TOOLS.contains(&name) {
+                let install = if dir.join("pnpm-lock.yaml").exists() {
+                    "pnpm install"
+                } else if dir.join("yarn.lock").exists() {
+                    "yarn install"
+                } else if dir.join("package-lock.json").exists() {
+                    "npm ci"
+                } else {
+                    "npm install"
+                };
+                return Some(install.to_owned());
+            }
+        }
+        let python = ["pyproject.toml", "requirements.txt", "setup.py", "tox.ini"]
+            .iter()
+            .any(|f| dir.join(f).exists());
+        if python && PYTHON_TOOLS.contains(&name) {
+            let install = if dir.join("poetry.lock").exists() {
+                "poetry install"
+            } else if dir.join("requirements.txt").exists() {
+                "pip install -r requirements.txt (in a virtual environment)"
+            } else {
+                "pip install -e . (in a virtual environment)"
+            };
+            return Some(install.to_owned());
+        }
     }
+    None
 }
 
 /// Run `<login shell> -lc <command>` in `dir` (see [`login_shell`]; agent tool `PATH`s are set
@@ -455,109 +539,181 @@ mod tests {
         }
     }
 
+    fn named(name: &str) -> Option<MissingTool> {
+        Some(MissingTool {
+            name: name.to_owned(),
+        })
+    }
+
     #[test]
     fn a_command_the_shell_cannot_find_is_a_missing_tool() {
-        let named = |name: &str| {
-            Some(MissingTool {
-                name: Some(name.to_owned()),
-            })
-        };
         // What dash, bash as `bash -c`, and a script under bash print, each with exit 127.
+        let m = |tail: &str, command: &str| missing_tool(&failed(127, tail), command);
+        assert_eq!(m("sh: 1: mvn: not found\n", "mvn package"), named("mvn"));
         assert_eq!(
-            missing_tool(&failed(127, "sh: 1: mvn: not found\n")),
+            m("bash: line 1: mvn: command not found\n", "mvn package"),
             named("mvn")
         );
         assert_eq!(
-            missing_tool(&failed(127, "bash: line 1: mvn: command not found\n")),
+            m("bash: mvn: command not found", "mvn package"),
             named("mvn")
         );
         assert_eq!(
-            missing_tool(&failed(127, "bash: mvn: command not found")),
-            named("mvn")
-        );
-        assert_eq!(
-            missing_tool(&failed(
-                127,
-                "ls: fine\n./check.sh: line 4: cargo: command not found\n"
-            )),
-            named("cargo"),
-            "a script names itself first, the exit code is what says it"
-        );
-        assert_eq!(
-            missing_tool(&failed(127, "/bin/sh: 1: ./gradlew: not found")),
+            m("/bin/sh: 1: ./gradlew: not found", "./gradlew build"),
             named("./gradlew")
         );
-        // A shell line with another exit code (a pipeline, `|| exit 1`) still counts.
+        // After output of its own.
         assert_eq!(
-            missing_tool(&failed(1, "sh: 1: mvn: not found")),
+            m(
+                "building\nsh: 1: mvn: not found\n",
+                "echo building; mvn verify"
+            ),
             named("mvn")
         );
-        // Exit 127 and nothing it names.
+        // A script the command runs names itself first.
         assert_eq!(
-            missing_tool(&failed(127, "something went wrong")),
-            Some(MissingTool { name: None })
+            m(
+                "ls: fine\n./check.sh: line 4: cargo: command not found\n",
+                "sh ./check.sh"
+            ),
+            named("cargo")
+        );
+        assert_eq!(
+            m("check.sh: 3: mvn: not found", "sh check.sh"),
+            named("mvn")
         );
         // The first one is the one that is missing.
         assert_eq!(
-            missing_tool(&failed(
-                127,
-                "sh: 1: mvn: not found\nsh: 2: gradle: not found"
-            )),
+            m(
+                "sh: 1: mvn: not found\nsh: 2: gradle: not found",
+                "mvn; gradle"
+            ),
             named("mvn")
         );
     }
 
     #[test]
     fn a_failure_that_is_not_a_missing_command_is_not_one() {
-        // A missing file, a failing test that says "not found", a pass, a timeout, a signal.
+        let m = |code: i32, tail: &str, command: &str| missing_tool(&failed(code, tail), command);
+        // A nested shell's "not found" in the output of a run that failed on its own terms (a test
+        // suite, cargo's 101) is the project's business: only exit 127 says the command itself
+        // could not be found.
+        assert_eq!(m(101, "sh: 1: gti: not found", "cargo test"), None);
+        assert_eq!(m(1, "sh: 1: mvn: not found", "mvn package || exit 1"), None);
         assert_eq!(
-            missing_tool(&failed(1, "cat: CLAUDE.md: No such file or directory")),
+            m(2, "bash: line 3: jq: command not found", "make test"),
             None
         );
+        // A bare 127 names nothing.
+        assert_eq!(m(127, "something went wrong", "./run.sh"), None);
+        // A line in another shape, from something else that happens to print "not found".
+        assert_eq!(m(127, "FAILED: user 7: resource not found", "x"), None);
         assert_eq!(
-            missing_tool(&failed(1, "FAILED: user 7: resource not found")),
-            None,
-            "not a shell's line, and not exit 127"
+            m(
+                127,
+                "cat: CLAUDE.md: No such file or directory",
+                "cat CLAUDE.md"
+            ),
+            None
         );
+        assert_eq!(m(127, "sh: 1: the thing you wanted: not found", "x"), None);
+        // A line from a tool the command does not run (it could be anything in the output).
         assert_eq!(
-            missing_tool(&failed(0, "sh: 1: mvn: not found")),
-            None,
-            "it passed"
+            m(127, "other: 1: mvn: not found", "echo hi; exit 127"),
+            None
         );
+        // A pass, a timeout, a signal.
+        assert_eq!(m(0, "sh: 1: mvn: not found", "true"), None);
         let mut timed_out = failed(127, "sh: 1: mvn: not found");
         timed_out.timed_out = true;
-        assert_eq!(missing_tool(&timed_out), None);
+        assert_eq!(missing_tool(&timed_out, "mvn"), None);
         let mut signalled = failed(1, "");
         signalled.exit_code = None;
-        assert_eq!(missing_tool(&signalled), None);
-        // A "word" that is a sentence is not a command.
-        assert_eq!(
-            missing_tool(&failed(1, "sh: 1: the thing you wanted: not found")),
-            None
-        );
+        assert_eq!(missing_tool(&signalled, "x"), None);
     }
 
     #[tokio::test]
     async fn a_real_missing_command_is_recognised_in_the_shell_that_runs_it() {
         let dir = tempfile::tempdir().unwrap();
-        let out = run_shell(dir.path(), "no-such-toolchain --version", LONG, 1024)
-            .await
-            .unwrap();
+        let command = "no-such-toolchain --version";
+        let out = run_shell(dir.path(), command, LONG, 1024).await.unwrap();
         assert_eq!(out.exit_code, Some(127), "{out:?}");
         assert_eq!(
-            missing_tool(&out),
-            Some(MissingTool {
-                name: Some("no-such-toolchain".to_owned())
-            }),
+            missing_tool(&out, command),
+            named("no-such-toolchain"),
             "{:?}",
             out.tail
         );
         // A command that exists and fails is not.
-        let out = run_shell(dir.path(), "ls /no/such/dir", LONG, 1024)
-            .await
-            .unwrap();
+        let command = "ls /no/such/dir";
+        let out = run_shell(dir.path(), command, LONG, 1024).await.unwrap();
         assert!(!out.passed());
-        assert_eq!(missing_tool(&out), None, "{:?}", out.tail);
+        assert_eq!(missing_tool(&out, command), None, "{:?}", out.tail);
+        // The nested case for real: a script that fails on its own after a nested shell said it.
+        let command = "sh -c 'no-such-inner-tool' ; exit 101";
+        let out = run_shell(dir.path(), command, LONG, 1024).await.unwrap();
+        assert_eq!(out.exit_code, Some(101));
+        assert_eq!(missing_tool(&out, command), None, "{:?}", out.tail);
+    }
+
+    #[test]
+    fn a_tool_the_project_brings_is_a_dependency_to_install_not_a_toolchain_to_wait_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = [dir.path()];
+        // Nothing says the project has it.
+        assert_eq!(project_dependency_hint(&here, "jest"), None);
+        assert_eq!(project_dependency_hint(&here, "mvn"), None);
+        // A package.json: a dev dependency (any name), or a well-known node tool.
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"devDependencies": {"my-lint": "1"}, "dependencies": {"left-pad": "1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            project_dependency_hint(&here, "jest").as_deref(),
+            Some("npm install")
+        );
+        assert_eq!(
+            project_dependency_hint(&here, "my-lint").as_deref(),
+            Some("npm install")
+        );
+        assert_eq!(
+            project_dependency_hint(&here, "left-pad").as_deref(),
+            Some("npm install")
+        );
+        assert_eq!(
+            project_dependency_hint(&here, "mvn"),
+            None,
+            "a system toolchain"
+        );
+        // The lock file picks the project's own installer.
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(
+            project_dependency_hint(&here, "vitest").as_deref(),
+            Some("pnpm install")
+        );
+        std::fs::remove_file(dir.path().join("pnpm-lock.yaml")).unwrap();
+        std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        assert_eq!(
+            project_dependency_hint(&here, "tsc").as_deref(),
+            Some("npm ci")
+        );
+        // Python, only with a file that says it is a Python project.
+        let py = tempfile::tempdir().unwrap();
+        assert_eq!(project_dependency_hint(&[py.path()], "pytest"), None);
+        std::fs::write(py.path().join("requirements.txt"), "pytest\n").unwrap();
+        assert!(
+            project_dependency_hint(&[py.path()], "pytest")
+                .unwrap()
+                .contains("pip install -r requirements.txt")
+        );
+        // The directory the command ran in, then the worktree root.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(
+            project_dependency_hint(&[sub.as_path(), dir.path()], "eslint").as_deref(),
+            Some("npm ci")
+        );
     }
 
     #[test]

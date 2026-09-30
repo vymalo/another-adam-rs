@@ -1,6 +1,6 @@
 {
   "name": "run_command",
-  "description": "Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`, `ls`, `cat README.md`, `grep -rn name src`. You get the exit code and the tail of the output. It costs no check cycle and reports no checks, and it is read-only: a command that changes the worktree or HEAD is undone and refused (make changes with delegate_to_opencode). Use it to explore; use run_checks only for the project's real checks.",
+  "description": "Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`, `ls`, `cat README.md`, `grep -rn name src`. You get the exit code and the tail of the output. It costs no check cycle and reports no checks, and it is for looking: changes it makes to HEAD, the branch and the working tree are undone and refused (make changes with delegate_to_opencode). Use it to explore; use run_checks only for the project's real checks.",
   "parameters": {
     "type": "object",
     "properties": {

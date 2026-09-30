@@ -117,6 +117,7 @@ pub async fn commit_and_push(
         notes.name_pushed_branches([PushedBranch {
             repo,
             branch: wt.branch().to_owned(),
+            base: Some(wt.repo().base_branch.clone()),
         }]);
     }
     env.notes
@@ -329,6 +330,13 @@ pub async fn open_pull_request(
                 e => Err(env.delivery_error(ctx, &e).await),
             };
         }
+        // From here on the branch carries the commits: whatever goes wrong next, the verdict must
+        // not say that it was not updated.
+        notes.published = true;
+        env.notes
+            .save(&run, &notes)
+            .await
+            .map_err(|e| notes_error(&e))?;
     }
 
     let mut body = body.to_owned();
@@ -337,12 +345,19 @@ pub async fn open_pull_request(
     }
     // A pull request that already exists for the branch (the run continues a branch an earlier
     // task opened it for) is what this call reports: the branch now carries this run's commits,
-    // and nothing else is to be opened.
-    let existing = match env
-        .code_host
-        .find_pull_request(wt.repo(), wt.branch())
-        .await
-    {
+    // and nothing else is to be opened. For a continued branch the pull request is the one of that
+    // branch whatever base it was opened against (a run that disagrees about the base must not
+    // get a second pull request); otherwise it is the one from this head against this base.
+    let found = if wt.continues().is_some() {
+        env.code_host
+            .find_pull_request_on_head(wt.repo(), wt.branch())
+            .await
+    } else {
+        env.code_host
+            .find_pull_request(wt.repo(), wt.branch())
+            .await
+    };
+    let existing = match found {
         Ok(found) => found,
         Err(e) => return Err(env.delivery_error(ctx, &e).await),
     };
@@ -368,28 +383,49 @@ pub async fn open_pull_request(
             }
         }
     };
-    // The body of a pull request that was already open is not ours to rewrite, so the note that
-    // the update was not verified goes into a comment. (A crash between the comment and the
-    // journaling of this call would post it again when the call repeats.)
-    if reused
-        && red
-        && let Err(e) = env
-            .code_host
-            .comment_on_pull_request(wt.repo(), pr.number, RED_NOTE_IN_COMMENT)
-            .await
-    {
-        return Err(env.delivery_error(ctx, &e).await);
-    }
-
+    // The pull request is recorded before anything else is done for it: it is delivered.
+    let already_noted = notes.pull_request.as_ref().is_some_and(|p| {
+        p.number == pr.number
+            && p.red_checks_accepted
+            && p.commented_sha.as_deref() == Some(head.as_str())
+    });
     notes.pull_request = Some(PullRequestNote {
         url: pr.url.clone(),
         number: pr.number,
         red_checks_accepted: red,
+        commented_sha: already_noted.then(|| head.clone()),
     });
     env.notes
         .save(&run, &notes)
         .await
         .map_err(|e| notes_error(&e))?;
+    // The body of a pull request that was already open is not ours to rewrite, so the note that
+    // the update was not verified goes into a comment, once per pushed commit (a call that
+    // repeats finds it in the notes). A comment that cannot be posted does not undo the update
+    // (the branch has the commits and the pull request is reported): the model is told, so that
+    // it says so to the person.
+    let mut comment_failed = None;
+    if reused && red && !already_noted {
+        match env
+            .code_host
+            .comment_on_pull_request(wt.repo(), pr.number, RED_NOTE_IN_COMMENT)
+            .await
+        {
+            Ok(()) => {
+                if let Some(note) = notes.pull_request.as_mut() {
+                    note.commented_sha = Some(head.clone());
+                }
+                env.notes
+                    .save(&run, &notes)
+                    .await
+                    .map_err(|e| notes_error(&e))?;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot comment on the pull request");
+                comment_failed = Some(e.to_string());
+            }
+        }
+    }
 
     let mut text = if reused {
         let mut text = format!(
@@ -400,7 +436,13 @@ pub async fn open_pull_request(
             pr.url
         );
         if red {
-            text.push_str(" A comment says the update was not verified.");
+            match &comment_failed {
+                None => text.push_str(" A comment says the update was not verified."),
+                Some(why) => text.push_str(&format!(
+                    " The comment that says the update was not verified could not be posted \
+                     ({why}): tell the person."
+                )),
+            }
         }
         text
     } else {

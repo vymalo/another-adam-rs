@@ -232,6 +232,20 @@ pub async fn github_fails_with(github: &MockServer, status: u16, message: &str) 
         .await;
 }
 
+/// Make the mock GitHub refuse every comment on a pull request with `status` from now on.
+pub async fn comments_fail_with(github: &MockServer, status: u16) {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(
+            r"^/repos/octo/widgets/issues/\d+/comments$",
+        ))
+        .respond_with(
+            ResponseTemplate::new(status).set_body_json(json!({"message": "comments are closed"})),
+        )
+        .with_priority(1)
+        .mount(github)
+        .await;
+}
+
 /// The real [`GitHub`] client pointed at the mock, but answering for a
 /// `github.com` repository slug: `GitHub` refuses local paths, and the test
 /// remote is one.
@@ -259,6 +273,15 @@ impl CodeHost for GithubBehindMock {
         // for the repository only.
         let repo = RepoRef::new(self.slug.url.clone(), repo.base_branch.clone());
         self.inner.find_pull_request(&repo, head).await
+    }
+
+    async fn find_pull_request_on_head(
+        &self,
+        repo: &RepoRef,
+        head: &str,
+    ) -> Result<Option<PullRequest>, WorkspaceError> {
+        let repo = RepoRef::new(self.slug.url.clone(), repo.base_branch.clone());
+        self.inner.find_pull_request_on_head(&repo, head).await
     }
 
     async fn comment_on_pull_request(

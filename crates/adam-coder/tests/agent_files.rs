@@ -85,6 +85,7 @@ async fn the_prompt_carries_the_rules_the_code_relies_on() {
         "that is not a failing check",
         "toolchain is missing and what you needed it for",
         "and do not try to install it",
+        "A tool that the **project** brings itself",
         "Do not start the coding workflow",
         "`base_branch` out to start from the repository's default branch",
     ] {

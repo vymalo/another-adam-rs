@@ -23,6 +23,13 @@ operator's `info` line about references that continued nothing is said once per 
 outcome it really had (it was said on every pick, and for messages delivered to an open task, where a
 reference means nothing).
 
+*Amended 2026-09-30, third review (continuation hardening):* `prepare_workspace` asks the remote for the
+default branch only after the named-repository check; a continued branch's base is recorded and
+inherited and its pull request is found by head alone; a comment that cannot be posted no longer makes
+the verdict say the pull request was not updated (`RunNotes::published`), and is posted once per pushed
+commit; the commands that carry the token name the repository's URL and not `origin`, and
+`core.fsmonitor` is pinned off.
+
 *Amended 2026-09-30, second review (branch continuation):* a continued branch is reached only
 through the checks gate. The first version pushed a continuing run's commits straight to the
 branch that already had a pull request, so a rework whose checks never went green left unverified
@@ -299,6 +306,23 @@ stateDiagram-v2
     Failed --> [*]: the pull request was not updated
 ```
 
+* **The run's own branch is left on the remote.** A continuing run pushes to `agent/<run>` and the
+  gate moves the continued branch to that commit; `agent/<run>` stays on the remote (and in the
+  mirror) after a successful publish. It is not recorded as a branch to continue (only the
+  continued branch is: `RunNotes::pushed_branches` holds the line of work, with the base branch its
+  pull request is against), so the model is never offered it, and it is harmless (an ancestor of the
+  continued branch once published; the only copy of the work when the gate refused or the branch moved).
+  Deleting it is deliberately not done here: nothing removes finished runs' worktrees or branches
+  yet, and deleting the copy that is the only record of refused work would be the wrong default. A
+  cleanup, if wanted, belongs with the removal of finished runs' workspaces.
+* **The base of a continued pull request is part of what is continued.** `commit_and_push` records the
+  base branch with the branch, a continuing run inherits it and works against it whatever
+  `base_branch` the model says, and the pull request of a continued branch is found by its head
+  alone (`CodeHost::find_pull_request_on_head`), so a run that disagrees about the base, or
+  whose branch came from the result text, which carries none, does not open a second pull request.
+  `prepare_workspace` checks that the repository was named before it asks the remote for a default
+  branch: the default branch is an authenticated request, and leaving `base_branch` out must not let
+  the model probe repositories nobody named.
 * **Which branches may be continued is state, not text.** `commit_and_push` records the line of
   work it pushed for (the continued branch, or the run's own) in the notes of its run
   (`RunNotes::pushed_branches`), and a run that continues another adds, before every step, the

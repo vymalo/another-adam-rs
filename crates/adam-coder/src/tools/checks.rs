@@ -26,7 +26,9 @@ use serde_json::Value;
 use crate::redact::Redactor;
 
 use super::notes::CheckRecord;
-use super::shell::{MissingTool, ShellOutcome, missing_tool, resolve_cwd, run_shell};
+use super::shell::{
+    MissingTool, ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, run_shell,
+};
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// The name of the artifact `run_checks` emits.
@@ -324,27 +326,29 @@ fn human(d: std::time::Duration) -> String {
 
 /// What the model is told when a command failed because the workspace lacks a tool (see
 /// [`missing_tool`]): what is missing, that no check cycle was used, and that the way on is to tell
-/// the person and wait. It must not retry variants, hunt the filesystem, or install anything.
-pub(crate) fn missing_tool_text(missing: &MissingTool) -> String {
-    let what = match &missing.name {
-        Some(name) => {
-            format!("The workspace has no `{name}`: the shell could not find it (exit code 127).")
-        }
-        None => {
-            "The shell could not find a command the workspace needs (exit code 127).".to_owned()
-        }
-    };
-    let which = missing
-        .name
-        .as_deref()
-        .map_or("the toolchain this project needs".to_owned(), |n| {
-            format!("which toolchain is missing (`{n}`)")
-        });
+/// the person and wait. It must not retry variants, hunt the filesystem, or install a system
+/// toolchain. A tool the **project** brings itself (`jest`, `vitest`, `tsc` with a `package.json`:
+/// `install` is the project's own install command, from [`project_dependency_hint`]) is another
+/// story: the project's dependencies are installed with the project's own command.
+pub(crate) fn missing_tool_text(missing: &MissingTool, install: Option<&str>) -> String {
+    let name = &missing.name;
+    if let Some(install) = install {
+        return format!(
+            "`{name}` is not on the PATH, but it is one of this project's own dependencies, which \
+             are not installed in the workspace yet: that is not a missing toolchain and not a \
+             failing check (no check cycle was used, nothing was recorded as a check). Install \
+             the project's dependencies with its own command (`{install}`), with \
+             delegate_to_opencode or run_checks, then run this again. Only if that fails, tell the \
+             person with ask_user."
+        );
+    }
     format!(
-        "{what} That is a missing toolchain, not a failing check: no check cycle was used and \
-         nothing was recorded as a check. Do not retry variants of the command, do not search the \
-         filesystem for the tool and do not try to install it (you cannot). Tell the person {which} \
-         with ask_user, and wait for their answer."
+        "The workspace has no `{name}`: the shell could not find it (exit code 127). That is a \
+         missing toolchain, not a failing check: no check cycle was used and nothing was \
+         recorded as a check. Do not retry variants of the command, do not search the \
+         filesystem for the tool and do not try to install it (system toolchains are not yours to \
+         install). Tell the person which toolchain is missing (`{name}`) with ask_user, and wait \
+         for their answer."
     )
 }
 
@@ -454,10 +458,14 @@ pub async fn run_checks(
     // workspace lacks the tool, and no change to the code would make the check pass. So it is not
     // recorded (no cycle used, no `checks` artifact, nothing for the gate to see), and the model
     // is told to report it and wait, which is all it can do: nothing is installed here.
-    if let Some(missing) = missing_tool(&outcome) {
+    if let Some(missing) = missing_tool(&outcome, command) {
         ctx.emit_progress(format!("the workspace lacks a tool: {shown}"))
             .await;
-        return Ok(ToolOutput::error(missing_tool_text(&missing)));
+        let install = project_dependency_hint(&[dir.as_path(), wt.path()], &missing.name);
+        return Ok(ToolOutput::error(missing_tool_text(
+            &missing,
+            install.as_deref(),
+        )));
     }
 
     // The code the command just ran on, so a pull request can be tied to

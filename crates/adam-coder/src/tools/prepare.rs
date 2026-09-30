@@ -53,18 +53,14 @@ pub async fn prepare_workspace(
         return Ok(ToolOutput::error("repo_url is required"));
     };
     let run = ctx.run_id().to_string();
-    let base = match base_branch.as_deref().and_then(non_empty) {
-        Some(base) => base.to_owned(),
-        None => match default_base(&env, ctx, url).await {
-            Ok(base) => base,
-            Err(outcome) => return outcome,
-        },
-    };
-    let base = base.as_str();
     let continuing = branch.as_deref().and_then(non_empty);
     // An argument the workspace cannot read (not a URL or an absolute path) is its error to
-    // report, below; every other one must be a repository of the person's.
+    // report, below; every other one must be a repository of the person's. This comes **before**
+    // anything that talks to a remote (the default branch is asked of the remote with the
+    // credentials): a repository nobody named costs no request, no credential and no mirror, and
+    // cannot be probed by leaving `base_branch` out.
     let key = key_of_argument(url);
+    let mut recorded_base = None;
     if key.is_some() || continuing.is_some() {
         let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
         if let Some(key) = &key
@@ -72,17 +68,32 @@ pub async fn prepare_workspace(
         {
             return Ok(ToolOutput::error(not_named(url, &notes.named_repos)));
         }
-        if let Some(branch) = continuing
-            && !key.as_deref().is_some_and(|k| notes.has_pushed(k, branch))
-        {
-            return Ok(ToolOutput::error(not_pushed(
-                branch,
-                url,
-                &notes,
-                key.as_deref(),
-            )));
+        if let Some(branch) = continuing {
+            if !key.as_deref().is_some_and(|k| notes.has_pushed(k, branch)) {
+                return Ok(ToolOutput::error(not_pushed(
+                    branch,
+                    url,
+                    &notes,
+                    key.as_deref(),
+                )));
+            }
+            // The pull request of that branch is against the base it was opened with: a
+            // continuing run works against the same one, whatever the model says now.
+            recorded_base = key
+                .as_deref()
+                .and_then(|k| notes.pushed_base(k, branch))
+                .map(str::to_owned);
         }
     }
+    let base = match (&recorded_base, base_branch.as_deref().and_then(non_empty)) {
+        (Some(recorded), _) => recorded.clone(),
+        (None, Some(base)) => base.to_owned(),
+        (None, None) => match default_base(&env, ctx, url).await {
+            Ok(base) => base,
+            Err(outcome) => return outcome,
+        },
+    };
+    let base = base.as_str();
     match continuing {
         Some(branch) => {
             ctx.emit_progress(format!(
@@ -220,10 +231,12 @@ mod tests {
             PushedBranch {
                 repo: "github.com/a/b".into(),
                 branch: "agent/one".into(),
+                base: None,
             },
             PushedBranch {
                 repo: "github.com/c/d".into(),
                 branch: "agent/other".into(),
+                base: None,
             },
         ]);
         let some = not_pushed("agent/x", "https://github.com/a/b", &notes, a_b);

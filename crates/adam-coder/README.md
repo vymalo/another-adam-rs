@@ -42,7 +42,7 @@ sequenceDiagram
 | Tool | Does |
 |---|---|
 | `prepare_workspace { repo_url, base_branch?, branch? }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
-| `run_command { command, cwd? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. The same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch and the tree of the worktree (what `commit_and_push` would commit) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
+| `run_command { command, cwd? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. The same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
 | `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), streams its updates as progress, returns its summary and the changed files |
 | `run_checks { command, cwd? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
 | `commit_and_push { message }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
@@ -141,7 +141,13 @@ make them hold:
   above has passed (or been accepted), moves it to the pushed commit, as a fast-forward
   that is never forced. So a pull request that is open for the branch never carries commits that
   nobody verified, and a rework whose checks stay red leaves the branch and its pull request
-  exactly as the last verified task left them. If the branch moved on the remote since the task
+  exactly as the last verified task left them. The pull request of a continued branch is found by its head
+  alone (`find_pull_request_on_head`), and the base branch is recorded with the branch (`PushedBranch::base`,
+  inherited with the notes), so a continuing run works against the same base and never opens a second pull
+  request. A comment that cannot be posted (accepted red checks on an open pull request) does not undo the
+  update: the tool reports the pull request with a warning, records it (`RunNotes::published`, so the verdict
+  of a run that ends anyway does not say the pull request was not updated), and posts the note once per
+  pushed commit. If the branch moved on the remote since the task
   started (someone pushed to it), it is not overwritten: the tool says so, names the run's own
   branch where the commits are, and tells the model to ask the person.
 * **Completion policy.** When the model stops (a turn without tool calls) the
@@ -172,15 +178,21 @@ make them hold:
   verifying it: in the owner's live thread the model explored with `run_checks` (`ls`, `cat README.md
   CLAUDE.md` with exit 1 because `CLAUDE.md` was missing, `mvn package`, `ls /usr/lib/jvm`) and every
   exploration was a check cycle, so three "failures" failed a run that had checked nothing. Now exploration
-  has no artifact and no cycle, cannot edit, and the prompt says to use `run_checks` only for the
+  has no artifact and no cycle, has its changes to `HEAD`, the branch and the working tree undone, and the prompt says to use `run_checks` only for the
   project's own checks.
-* **A missing toolchain is reported, and the coder waits.** When a command exits 127, or the shell says
-  `sh: 1: mvn: not found` / `bash: line 1: mvn: command not found` for a failed command (`missing_tool`; a
-  missing file, a test that prints "not found" and exits 1, a timeout are not), both tools answer that the
-  workspace has no `mvn`: **no check cycle is used, no `checks` artifact is emitted, nothing is recorded for
-  the gate**, and the model is told not to retry variants, not to search the filesystem and not to install
-  anything, but to tell the person which toolchain is missing with `ask_user` and wait (the owner's decision:
-  the workspace image carries the toolchains it carries, no Java for now, and the coder installs nothing).
+* **A missing toolchain is reported, and the coder waits.** When a command **exits 127 and says so as a
+  shell does** (`sh: 1: mvn: not found`, `bash: line 1: mvn: command not found`, printed by the shell that ran it
+  or by a script the command runs; `missing_tool`; both are required, so a nested `sh: 1: gti: not found` in the
+  output of a run that exits 101, a bare 127, a missing file or a test that prints "not found" is not one), both
+  tools answer that the workspace has no `mvn`: **no check cycle is used, no `checks` artifact is emitted,
+  nothing is recorded for the gate**, and the model is told not to retry variants, not to search the filesystem
+  and not to install a system toolchain, but to tell the person which toolchain is missing with `ask_user` and
+  wait (the owner's decision: the workspace image carries the toolchains it carries, no Java for now). A tool
+  that **the project brings itself** (`jest`, `vitest`, `tsc` with a `package.json` that declares it or is
+  one of the well-known node tools, `pytest` with a Python project file; `project_dependency_hint`) is a
+  dependency that is not installed yet, and the answer says to install the project's dependencies with its own
+  command (`pnpm install`, `npm ci`, `pip install -r requirements.txt`, picked from the lock files) through
+  `delegate_to_opencode` or `run_checks`; it also costs no cycle.
 * **A question is answered, not worked on.** The prompt says that a greeting or a question about the
   repository ("List all branches") gets a direct answer (after `prepare_workspace`, with `run_command`) and ends
   the turn; the run then parks as a question like any stop without a pull request, and the chat goes on.
@@ -237,9 +249,18 @@ conversation pushed) lives in
 
 ### Looking around, and what it may not do
 
-`run_command` is the only tool that runs a model's command outside the check gate, so it is made
-unable to edit: the worktree is recorded, the command runs, and the worktree is compared with what
-was recorded.
+`run_command` is the only tool that runs a model's command outside the check gate, so changes it makes
+to `HEAD`, the branch and the working tree are undone: the worktree is recorded, the command runs, and the
+worktree is compared with what was recorded. The record also covers what a command could change without
+touching a file and that later git calls of the coder would act on: the refs outside the agent's own
+namespaces (`refs/heads/agent/*` and `refs/remotes/*` are other runs' and fetches', and move while a
+command runs) and the local git configuration (without `branch.*`, which `prepare` writes), so a
+`core.fsmonitor`, a `remote.origin.pushurl`, a `url.*.insteadOf`, an alias, a new branch or tag is undone too.
+It is not a sandbox: a command can still read everything the process can, use the network, and write
+outside the worktree. What it cannot do is leave its mark on the repository the coder then commits and pushes
+from. Where the tree cannot be computed (an embedded repository without a commit), the record falls back to
+`git status`: a change is still seen and refused, but only `HEAD` and the branch are put back, and the model
+is told the files may differ.
 
 ```mermaid
 sequenceDiagram
@@ -734,6 +755,12 @@ database of its own, so the role needs `CREATEDB`):
   pins the fix of a flaky `checks_then_commit_binds_a_passing_verdict_to_the_pushed_commit`: the copy of
   the index that the tree id is computed in keeps the index's mtime, or git trusts the stat data of a file
   rewritten with the same size in the same clock tick and the tree holds its old content.
+* `an_unnamed_repository_is_not_probed_for_its_default_branch` (no request, no mirror, for an unnamed
+  repository with `base_branch` left out), `a_continued_branch_keeps_the_base_of_its_pull_request`,
+  `a_comment_that_fails_leaves_the_update_delivered_and_the_note_is_posted_once`,
+  `run_command_undoes_changes_to_the_git_configuration_and_to_refs`,
+  `run_command_still_works_when_the_tree_cannot_be_computed` and
+  `a_project_dependency_is_to_be_installed_and_a_nested_not_found_is_a_failed_check` are in `tests/tools.rs` too.
 * `run_command`, the shell and the missing toolchain are tested in `tests/tools.rs`
   (`run_command_looks_around_without_reporting_checks_or_using_cycles`: no artifact, no cycle, `cat` of a
   missing file five times with a budget of three; `run_command_undoes_a_change_and_says_where_changes_go`: a new

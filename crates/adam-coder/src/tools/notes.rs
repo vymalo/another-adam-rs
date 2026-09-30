@@ -62,6 +62,10 @@ pub struct PullRequestNote {
     pub number: u64,
     /// The checks were red and the user accepted that.
     pub red_checks_accepted: bool,
+    /// The pushed commit for which the comment that says so was posted on an already open pull
+    /// request: a repeated call does not post it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commented_sha: Option<String>,
 }
 
 /// A branch that work of this conversation was pushed for: the branch a pull request for that work
@@ -77,6 +81,11 @@ pub struct PushedBranch {
     pub repo: String,
     /// The branch name, `agent/...`.
     pub branch: String,
+    /// The base branch its pull request is (or will be) against, when it was known: a run that
+    /// continues the branch works against the same one, so it finds that pull request and does
+    /// not open a second against another base. Absent in notes written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// Everything remembered about one run.
@@ -114,6 +123,10 @@ pub struct RunNotes {
     /// says that this branch (and so its pull request) was not updated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continues: Option<String>,
+    /// `open_pull_request` moved the continued branch to the pushed commit. From then on the
+    /// branch has the run's commits, whether or not the pull request could be reported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub published: bool,
 }
 
 impl RunNotes {
@@ -142,12 +155,32 @@ impl RunNotes {
     pub fn name_pushed_branches(&mut self, pushed: impl IntoIterator<Item = PushedBranch>) -> bool {
         let mut added = false;
         for one in pushed {
-            if !self.pushed_branches.contains(&one) {
-                self.pushed_branches.push(one);
-                added = true;
+            match self
+                .pushed_branches
+                .iter_mut()
+                .find(|p| p.repo == one.repo && p.branch == one.branch)
+            {
+                // Known: only a base it did not have yet is new.
+                Some(known) if known.base.is_none() && one.base.is_some() => {
+                    known.base = one.base;
+                    added = true;
+                }
+                Some(_) => {}
+                None => {
+                    self.pushed_branches.push(one);
+                    added = true;
+                }
             }
         }
         added
+    }
+
+    /// The base branch recorded for `branch` of `repo`, if one was.
+    pub fn pushed_base(&self, repo: &str, branch: &str) -> Option<&str> {
+        self.pushed_branches
+            .iter()
+            .find(|p| p.repo == repo && p.branch == branch && p.base.is_some())
+            .and_then(|p| p.base.as_deref())
     }
 
     /// Whether an earlier task of the conversation pushed `branch` of the repository `repo`.

@@ -10,7 +10,12 @@ use tokio::process::Command;
 /// Run `git <args>` in `dir`; `Some(stdout)` (trimmed) on exit 0.
 pub(crate) async fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
-        .args(["-c", "core.hooksPath=/dev/null"])
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -55,7 +60,7 @@ pub(crate) async fn head_ref(dir: &Path) -> Option<String> {
 /// `head`, the files exactly as `tree` holds them (what [`working_tree_id`] returned: tracked
 /// changes and untracked files, minus what `.gitignore` excludes), and the index as `HEAD`'s.
 ///
-/// Used after a read-only command changed something it should not have. `reset --hard` undoes
+/// Used after a command that is for looking changed something it should not have. `reset --hard` undoes
 /// what it did to tracked files and to `HEAD`, `clean` removes what it created, and `read-tree
 /// --reset -u` writes back what the worktree held before (uncommitted work included, files that
 /// were untracked included). `true` when every step succeeded.
@@ -78,6 +83,114 @@ pub(crate) async fn restore_worktree(
             .await
             .is_some()
         && git_stdout(dir, &["reset", "--quiet", head]).await.is_some()
+}
+
+/// What `git status` says, as it says it (`--porcelain=v1 -z`, every untracked file): a cheap
+/// picture of the worktree that needs no commit and no index copy.
+pub(crate) async fn status_text(dir: &Path) -> Option<String> {
+    git_stdout(
+        dir,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .await
+}
+
+/// The parts of the repository that are shared with every run and that a model's command could
+/// change without touching a file of the worktree: refs outside the namespaces the agent itself
+/// keeps moving, and the local configuration.
+///
+/// Left out, because other runs change them while a command runs and a restore would undo
+/// their work: `refs/heads/agent/*` (runs commit to them), `refs/remotes/*` (fetches write
+/// them) and the `branch.*` keys of the configuration (`prepare` writes them). Everything else
+/// is compared: a new branch or tag, a moved or deleted ref, `core.fsmonitor`, a
+/// `remote.origin.pushurl`, a `url.*.insteadOf`, an alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepoState {
+    /// `(refname, object id)`.
+    refs: Vec<(String, String)>,
+    /// `(key, value)` of `git config --local`, by key, multi-valued keys repeated.
+    config: Vec<(String, String)>,
+}
+
+/// [`RepoState`] now, `None` when it cannot be read.
+pub(crate) async fn repo_state(dir: &Path) -> Option<RepoState> {
+    let refs = git_stdout(dir, &["for-each-ref", "--format=%(refname) %(objectname)"]).await?;
+    let refs = refs
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(name, _)| {
+            !name.starts_with("refs/heads/agent/") && !name.starts_with("refs/remotes/")
+        })
+        .map(|(n, id)| (n.to_owned(), id.to_owned()))
+        .collect();
+    let config = git_stdout(dir, &["config", "--local", "--list", "-z"]).await?;
+    let mut config: Vec<(String, String)> = config
+        .split('\0')
+        .filter(|e| !e.is_empty())
+        .map(|e| match e.split_once('\n') {
+            Some((k, v)) => (k.to_owned(), v.to_owned()),
+            None => (e.to_owned(), String::new()),
+        })
+        .filter(|(k, _)| !k.starts_with("branch."))
+        .collect();
+    // Where a key sits in the file does not matter (restoring it appends), what it says does; the
+    // values of one key keep their order (the sort is stable).
+    config.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(RepoState { refs, config })
+}
+
+/// Put the refs and the configuration that [`repo_state`] reads back as `before` had them.
+/// `true` when every step succeeded.
+pub(crate) async fn restore_repo_state(dir: &Path, before: &RepoState) -> bool {
+    let Some(now) = repo_state(dir).await else {
+        return false;
+    };
+    let mut ok = true;
+    for (name, _) in &now.refs {
+        if !before.refs.iter().any(|(n, _)| n == name) {
+            ok &= git_stdout(dir, &["update-ref", "-d", name]).await.is_some();
+        }
+    }
+    for (name, id) in &before.refs {
+        if !now.refs.iter().any(|r| r == &(name.clone(), id.clone())) {
+            ok &= git_stdout(dir, &["update-ref", name, id]).await.is_some();
+        }
+    }
+    if now.config != before.config {
+        let mut keys: Vec<&String> = now
+            .config
+            .iter()
+            .chain(&before.config)
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            let was: Vec<&String> = before
+                .config
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .collect();
+            let is: Vec<&String> = now
+                .config
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .collect();
+            if was == is {
+                continue;
+            }
+            // `--unset-all` fails when the key is not there, which is fine.
+            let _ = git_stdout(dir, &["config", "--local", "--unset-all", key]).await;
+            for value in was {
+                ok &= git_stdout(dir, &["config", "--local", "--add", key, value])
+                    .await
+                    .is_some();
+            }
+        }
+    }
+    ok && repo_state(dir).await.as_ref() == Some(before)
 }
 
 /// The tree id of `HEAD`: the code a pull request from this branch contains.
@@ -109,7 +222,12 @@ pub(crate) async fn working_tree_id(dir: &Path) -> Option<String> {
             let tmp = tmp.clone();
             async move {
                 let out = Command::new("git")
-                    .args(["-c", "core.hooksPath=/dev/null"])
+                    .args([
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "core.fsmonitor=false",
+                    ])
                     .args(args)
                     .current_dir(dir)
                     .env("GIT_INDEX_FILE", &tmp)

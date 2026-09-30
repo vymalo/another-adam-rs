@@ -317,6 +317,49 @@
           "response-template"
         ]
       }
+    },
+    {
+      "name": "comment on a pull request: 401 (bad token)",
+      "priority": 1,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/issues/[0-9]+/comments",
+        "method": "POST",
+        "headers": {
+          "Authorization": {
+            "equalTo": "Bearer bad-token"
+          }
+        }
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "jsonBody": {
+          "message": "Bad credentials",
+          "documentation_url": "https://docs.github.com/rest/issues/comments"
+        }
+      }
+    },
+    {
+      "name": "comment on a pull request",
+      "priority": 10,
+      "request": {
+        "urlPathPattern": "/repos/[^/]+/[^/]+/issues/[0-9]+/comments",
+        "method": "POST"
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json",
+          "x-ratelimit-limit": "5000",
+          "x-ratelimit-remaining": "4999"
+        },
+        "jsonBody": {
+          "id": 1
+        }
+      }
     }
   ]
 }

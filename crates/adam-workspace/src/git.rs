@@ -223,6 +223,8 @@ impl GitCmd {
             .args(["-c", "gc.auto=0"])
             .args(["-c", "maintenance.auto=false"])
             .args(["-c", "credential.helper="])
+            // A configured fsmonitor is a program git runs on every status.
+            .args(["-c", "core.fsmonitor=false"])
             .args(["-c", "commit.gpgsign=false"]);
         for (k, v) in &self.config {
             cmd.arg("-c").arg(format!("{k}={v}"));

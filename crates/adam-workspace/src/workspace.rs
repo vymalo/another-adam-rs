@@ -280,14 +280,16 @@ impl Workspaces {
 
     /// Like [`prepare`](Self::prepare), but the worktree **continues a branch that was pushed
     /// before** (by an earlier run, say): it starts from `origin/<existing>` instead of
-    /// `origin/<base_branch>`, and [`Worktree::push`] publishes its commits to `existing`, so a
-    /// pull request from that branch is updated by them. [`Worktree::branch`] is `existing`.
+    /// `origin/<base_branch>`. [`Worktree::push`] publishes its commits to the run's own branch,
+    /// and only [`Worktree::publish`] moves `existing` to them (a pull request from `existing` is
+    /// updated by that, when the caller decides the work may be published there).
+    /// [`Worktree::branch`] is `existing`.
     ///
     /// The run still has a local branch of its own (`agent/<run-short-id>`), which is what is
-    /// checked out, so the worktree never collides with the one of the run that pushed `existing`,
-    /// and the pushes stay fast-forwards (never forced): if `existing` has moved on the remote in
-    /// a way that is not a fast-forward of this run's work, the push is refused as with any other
-    /// branch.
+    /// checked out and pushed, so the worktree never collides with the one of the run that pushed
+    /// `existing`, and `publish` stays a fast-forward (never forced): if `existing` has moved on
+    /// the remote in a way that is not a fast-forward of this run's work, `publish` refuses
+    /// ([`WorkspaceError::Conflict`]) and `existing` is untouched.
     ///
     /// `existing` must be one of this crate's own branches, `agent/<...>`, so that a caller that
     /// takes the name from somebody else can never publish onto `main` or onto a person's branch,
@@ -368,9 +370,13 @@ impl Workspaces {
 
         self.inner.ensure_mirror(repo, &loc, &mirror).await?;
         let auth = self.inner.authorize(repo, &loc).await?;
+        // The URL and the refspec are named, not read from the remote called `origin`: what
+        // carries the credentials does not depend on the mirror's config.
         self.inner
             .mirror_git(&mirror)
-            .args(["fetch", "--prune", "--quiet", "origin"])
+            .args(["fetch", "--prune", "--quiet"])
+            .arg(loc.remote_url(&repo.url))
+            .arg(format!("+refs/heads/*:{REMOTE_TRACKING_PREFIX}*"))
             .maybe_auth(auth)
             .run()
             .await?;
@@ -462,7 +468,9 @@ impl Workspaces {
         let out = self
             .inner
             .mirror_git(&mirror)
-            .args(["ls-remote", "--symref", "origin", "HEAD"])
+            .args(["ls-remote", "--symref"])
+            .arg(loc.remote_url(&repo.url))
+            .arg("HEAD")
             .maybe_auth(auth)
             .run()
             .await?;
