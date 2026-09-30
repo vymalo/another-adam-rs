@@ -1,4 +1,4 @@
-//! The [`TestServer`](adam_mcp_testkit::TestServer) on stdio, for the tests of clients that start
+//! The [`TestServer`] on stdio, for the tests of clients that start
 //! MCP servers as child processes.
 //!
 //! Anything on stdout is protocol. It writes one line to stderr when it starts, and, when

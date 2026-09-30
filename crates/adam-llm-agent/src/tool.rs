@@ -193,8 +193,9 @@ pub enum ToolError {
         run: RunId,
     },
     /// The answer is the outcome of a task the tool started on another system (an A2A agent, a
-    /// job queue). The agent parks with a timer ([`LlmAgentBuilder::wait_poll`]
-    /// (crate::LlmAgentBuilder::wait_poll)) and, each time it fires, asks the tool how the task
+    /// job queue). The agent parks with a timer
+    /// ([`LlmAgentBuilder::wait_poll`](crate::LlmAgentBuilder::wait_poll)) and, each time it
+    /// fires, asks the tool how the task
     /// stands with [`Tool::poll_remote`], as a journaled step. The tool's answer becomes this
     /// call's result.
     ///

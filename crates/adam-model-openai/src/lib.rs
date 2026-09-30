@@ -1,4 +1,4 @@
-//! An OpenAI-compatible [`ModelClient`](adam_model::ModelClient).
+//! An OpenAI-compatible [`ModelClient`].
 //!
 //! [`OpenAiCompatible`] speaks the chat-completions protocol
 //! (`POST {base_url}/chat/completions`) and so works against OpenAI itself and
@@ -27,9 +27,9 @@
 //!
 //! * **No retries.** Failures are mapped onto [`adam_model::ModelError`] and
 //!   returned; the runtime decides whether to retry
-//!   ([`Classify::is_retryable`](adam_model::Classify::is_retryable)).
+//!   ([`Classify::is_retryable`]).
 //!   `Retry-After` (seconds or HTTP-date) is surfaced in
-//!   [`ModelError::RateLimited`](adam_model::ModelError::RateLimited).
+//!   [`ModelError::RateLimited`].
 //! * **Timeouts.** [`OpenAiConfig::timeout`] bounds a whole `complete` call.
 //!   For `stream` it bounds the wait for the response headers and then the
 //!   silence between chunks, so a long generation is never cut off while

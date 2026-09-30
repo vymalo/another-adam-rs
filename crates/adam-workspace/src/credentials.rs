@@ -27,8 +27,9 @@ pub type DynGitCredentials = Arc<dyn GitCredentials>;
 ///
 /// **It hands the token out for any host.** Whoever chooses the repository
 /// URL therefore chooses where the token is sent; use it only when the URL is
-/// trusted, or restrict the hosts with [`Workspaces::allow_hosts`]
-/// (crate::Workspaces::allow_hosts). For a token that belongs to one host use
+/// trusted, or restrict the hosts with
+/// [`Workspaces::allow_hosts`](crate::Workspaces::allow_hosts). For a token
+/// that belongs to one host use
 /// [`ScopedToken`], which refuses every other.
 ///
 /// Also serves as the test double for [`GitCredentials`].
