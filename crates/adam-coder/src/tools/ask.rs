@@ -4,6 +4,10 @@ use adam::prelude::*;
 
 use super::{Outcome, non_empty};
 
+/// The tool's name, which `CoderAgent` also uses for the question it asks on the model's behalf
+/// when the model ends its turn with a question instead of calling this tool.
+pub(crate) const TOOL_NAME: &str = "ask_user";
+
 // Parks the run until the user answers.
 //
 // `ToolError::NeedsInput` makes the agent emit the question and park with no

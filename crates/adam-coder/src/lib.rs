@@ -19,7 +19,7 @@
 //!
 //! | Module | What |
 //! |---|---|
-//! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks and no PR = failed); [`CoderStarter`]: its start-only half |
+//! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks or rejected credentials and no PR = failed; any other stop without a PR = a question, `input-required`) and the record of the repositories the person named; [`CoderStarter`]: its start-only half |
 //! | [`tools`] | the six tools (`#[tool]` functions reading [`ToolEnv`] from the agent's state) and [`CoderSettings`] |
 //! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`) |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |

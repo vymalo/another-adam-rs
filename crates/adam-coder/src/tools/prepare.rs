@@ -3,7 +3,8 @@
 use adam::prelude::*;
 use adam_workspace::RepoRef;
 
-use super::{Outcome, ToolEnv, non_empty};
+use super::named::{key_of_argument, listed};
+use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// Branch used when the model leaves `base_branch` out.
 const DEFAULT_BASE_BRANCH: &str = "main";
@@ -13,10 +14,17 @@ const DEFAULT_BASE_BRANCH: &str = "main";
 // The run id is the workspace's run key, so a restarted or retried call finds
 // the worktree it already made (`Workspaces::prepare` is idempotent per run)
 // and keeps whatever is in it.
+//
+// The repository must be one the person named. The agent records the repositories of the
+// person's own messages in the run notes (`RunNotes::named_repos`) before every step, and the
+// argument is compared with those, never trusted on its own: a model that was given too little
+// (a greeting, a vague task) must ask, not pick a repository.
 
 /// Check the repository out into your private worktree, on a fresh branch
 /// created from origin/<base_branch>. Call it once, first. Calling it again
-/// for the same repository is harmless and keeps your changes.
+/// for the same repository is harmless and keeps your changes. It works only on
+/// a repository the person named in their messages: otherwise it refuses, and
+/// you ask the person which one with ask_user.
 #[tool]
 pub async fn prepare_workspace(
     env: State<ToolEnv>,
@@ -37,6 +45,14 @@ pub async fn prepare_workspace(
         .and_then(non_empty)
         .unwrap_or(DEFAULT_BASE_BRANCH);
     let run = ctx.run_id().to_string();
+    // An argument the workspace cannot read (not a URL or an absolute path) is its error to
+    // report, below; every other one must be a repository of the person's.
+    if let Some(key) = key_of_argument(url) {
+        let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+        if !notes.named_repos.contains(&key) {
+            return Ok(ToolOutput::error(not_named(url, &notes.named_repos)));
+        }
+    }
     ctx.emit_progress(format!("preparing a worktree of {url} ({base})"))
         .await;
     let repo = RepoRef::new(url, base);
@@ -57,4 +73,43 @@ pub async fn prepare_workspace(
         wt.branch(),
         wt.path().display()
     )))
+}
+
+/// What the model is told when it picks a repository the person did not name.
+fn not_named(url: &str, named: &[String]) -> String {
+    // Only what the person wrote is ever listed, and not the words that are files.
+    let named = listed(named);
+    let said = if named.is_empty() {
+        "The person has not named any repository.".to_owned()
+    } else {
+        format!("The repositories the person named: {}.", named.join(", "))
+    };
+    format!(
+        "Refused: {url} is not a repository the person named in their messages. {said} Do not \
+         choose or guess a repository. Ask the person with ask_user which repository to work on \
+         (and which base branch), then call prepare_workspace with the one they name."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_refusal_names_the_way_out() {
+        let none = not_named("https://github.com/rust-lang/rust-clippy", &[]);
+        assert!(none.contains("ask_user"), "{none}");
+        assert!(none.contains("has not named any repository"), "{none}");
+        assert!(none.contains("rust-clippy"), "{none}");
+        let some = not_named(
+            "https://github.com/a/b",
+            &["github.com/acme/widgets".into()],
+        );
+        assert!(some.contains("github.com/acme/widgets"), "{some}");
+        assert!(some.contains("ask_user"), "{some}");
+        // A word that is a file is not offered as a repository.
+        let file = not_named("https://github.com/a/b", &["github.com/src/main.rs".into()]);
+        assert!(file.contains("has not named any repository"), "{file}");
+        assert!(!file.contains("main.rs"), "{file}");
+    }
 }

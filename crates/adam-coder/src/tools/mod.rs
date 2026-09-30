@@ -25,7 +25,9 @@
 //!
 //! # The rules, in code
 //!
-//! The prompt tells the model the rules; these make them hold: after
+//! The prompt tells the model the rules; these make them hold: `prepare_workspace` refuses a
+//! repository the person did not name ([`named`]; the agent records the repositories of the
+//! person's own messages in the run notes before each step), after
 //! `MAX_CHECK_CYCLES` failed check runs `run_checks` refuses to run, and
 //! `open_pull_request` refuses unless the last check run passed on exactly the
 //! code the pull request contains (the tree of the pushed `HEAD`) or the model
@@ -49,6 +51,7 @@ pub mod ask;
 pub mod checks;
 pub mod delegate;
 mod gitcli;
+pub mod named;
 pub mod notes;
 pub mod prepare;
 pub mod publish;
@@ -85,11 +88,14 @@ pub struct CoderSettings {
     pub draft_pull_requests: bool,
     /// How to start OpenCode.
     pub opencode: OpenCodeLaunch,
+    /// The host `owner/name` stands for when the person writes a repository that way: the first
+    /// of `ALLOWED_REPO_HOSTS` in the binary.
+    pub default_repo_host: String,
 }
 
 impl CoderSettings {
     /// Defaults: 3 cycles, 15 minutes and 16 KiB per check run, the
-    /// `adam-coder` identity, ready-for-review pull requests.
+    /// `adam-coder` identity, ready-for-review pull requests, `github.com` for `owner/name`.
     pub fn new(opencode: OpenCodeLaunch) -> Self {
         Self {
             max_check_cycles: 3,
@@ -98,6 +104,7 @@ impl CoderSettings {
             identity: GitIdentity::new("adam-coder", "adam-coder@users.noreply.github.com"),
             draft_pull_requests: false,
             opencode,
+            default_repo_host: named::DEFAULT_HOST.to_owned(),
         }
     }
 }
@@ -186,6 +193,12 @@ impl ToolEnv {
 /// give it to the agent that gets these tools
 /// (`LlmAgentBuilder::state(env.clone())`), or they refuse every call. The
 /// argument only names the redactor to wrap them with.
+///
+/// `prepare_workspace` works only on a repository the person named, and what the person named is
+/// recorded in the run notes by [`CoderAgent`](crate::CoderAgent) before each step. Tools used
+/// under another agent see no named repository, so `prepare_workspace` refuses every one there
+/// (a caller that composes its own agent records them with
+/// [`RunNotes::name_repos`](notes::RunNotes::name_repos) and [`named::named_in`]).
 pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
     tools![
         prepare::PrepareWorkspace,

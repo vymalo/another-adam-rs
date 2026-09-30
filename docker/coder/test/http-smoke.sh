@@ -1,12 +1,15 @@
 #!/bin/sh
 # HTTP-level smoke test of a running adam-coder: liveness, the public agent
-# card, fail-closed authentication and one text-only task. Works against the
+# card, fail-closed authentication and one task whose model answers in text. Works against the
 # container (container-smoke.sh) or a locally started binary.
 #
 #   http-smoke.sh <base-url> <bearer-token>
 #
 # The model behind the coder must be docker/coder/test/fake-model.py, which
-# answers "Nothing to do." without calling a tool. Needs curl and jq.
+# answers "Nothing to do." without calling a tool. A run that stops with text and
+# no pull request has delivered nothing, so the task waits for the person
+# (input-required) with that text as the question; it does not complete.
+# Needs curl and jq.
 set -eu
 
 if [ "$#" -ne 2 ]; then
@@ -66,17 +69,17 @@ if [ "$code" = 401 ]; then ok "POST / with a token prefix is 401"; else bad "POS
 code=$(status "$base/some/other/path")
 if [ "$code" = 401 ] || [ "$code" = 404 ]; then ok "an unknown route is not served ($code)"; else bad "an unknown route is $code"; fi
 
-# A task with the token: the text-only model completes it.
+# A task with the token: the text-only model stops with nothing delivered, so the task asks.
 code=$(status -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $token" -d "$rpc" "$base/")
 state=$(jq -r '.result.task.status.state // .result.status.state // empty' "$body" 2>/dev/null || true)
 text=$(jq -r '[.. | .text? // empty] | join(" ")' "$body" 2>/dev/null || true)
-if [ "$code" = 200 ] && [ "$state" = TASK_STATE_COMPLETED ]; then
-  ok "SendMessage completes the task"
+if [ "$code" = 200 ] && [ "$state" = TASK_STATE_INPUT_REQUIRED ]; then
+  ok "SendMessage leaves the task waiting for the person (input-required), not completed"
 else
   bad "SendMessage: status $code, state '$state', body: $(head -c 400 "$body")"
 fi
 case "$text" in
-  *"Nothing to do."*) ok "the task reports the model's text" ;;
+  *"Nothing to do."*) ok "the task asks with the model's text" ;;
   *) bad "the task does not carry the model's text: '$text'" ;;
 esac
 
