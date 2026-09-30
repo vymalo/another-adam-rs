@@ -5,6 +5,7 @@ use adam::prelude::*;
 use adam_workspace::NewPullRequest;
 use serde_json::json;
 
+use super::checks::ChecksReport;
 use super::gitcli::{commits_ahead, head_sha, head_tree};
 use super::notes::PullRequestNote;
 use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, workspace_error};
@@ -15,6 +16,11 @@ use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, workspace_error
 // reported commit is `HEAD`, and pushing a commit the remote already has is a
 // no-op. So running it twice (a crash before the result was journaled) neither
 // duplicates a commit nor a push.
+//
+// It also gives the pushed commit its verdict: a `checks` artifact bound to the pushed
+// SHA (see `checks_for_pushed`), emitted before `branch`. The verdict is a pure function
+// of the run's notes, the SHA and its tree, so the second run of a step emits the same
+// artifact, with the same content-derived id.
 
 /// Commit every change in the worktree with the given message and push the
 /// branch. Use a Conventional Commit message (feat(scope): ..., fix: ...).
@@ -82,6 +88,11 @@ pub async fn commit_and_push(
         .await
         .map_err(|e| notes_error(&e))?;
 
+    // The verdict on exactly what was pushed, before the branch that names it.
+    let pushed_tree = head_tree(wt.path()).await;
+    let checks =
+        checks_for_pushed(&notes, &sha, pushed_tree.as_deref()).into_artifact(&env.redactor);
+
     let summary = match &committed {
         Some(_) => format!("Committed {sha} and pushed branch {}.", wt.branch()),
         None => format!(
@@ -89,16 +100,55 @@ pub async fn commit_and_push(
             wt.branch()
         ),
     };
-    Ok(ToolOutput::text(summary).with_artifact(Artifact {
-        name: "branch".into(),
-        mime_type: Some("application/json".into()),
-        data: json!({
-            "repository": wt.repo().url,
-            "branch": wt.branch(),
-            "base_branch": base,
-            "commit": sha,
-        }),
-    }))
+    Ok(ToolOutput::text(summary)
+        .with_artifact(checks)
+        .with_artifact(Artifact {
+            name: "branch".into(),
+            mime_type: Some("application/json".into()),
+            data: json!({
+                "repository": wt.repo().url,
+                "branch": wt.branch(),
+                "base_branch": base,
+                "commit": sha,
+            }),
+        }))
+}
+
+/// The `checks` verdict on the pushed commit `sha`, whose tree is `tree`.
+///
+/// If the last `run_checks` of the run ran on that very tree (the worktree as `git add -A` would
+/// commit it, which is what `commit_all` stages), its report is bound to `sha`. Otherwise the
+/// commit was not checked: `passed: false` and a finding saying which trees differ. So a green
+/// report for a commit always means the code in that commit was checked.
+fn checks_for_pushed(
+    notes: &super::notes::RunNotes,
+    sha: &str,
+    tree: Option<&str>,
+) -> ChecksReport {
+    let last = notes.checks.last.as_ref();
+    match (last, tree) {
+        (Some(last), Some(tree)) if last.tree.as_deref() == Some(tree) => match &last.report {
+            Some(report) => report.bound_to(sha, tree, last.passed),
+            // Notes written before reports were kept: the verdict without the findings.
+            None => ChecksReport {
+                passed: last.passed,
+                commit: sha.to_owned(),
+                tree: Some(tree.to_owned()),
+                summary: Some(format!(
+                    "`{}` {}; checked on the identical tree before it was committed",
+                    last.command,
+                    if last.passed { "passed" } else { "failed" }
+                )),
+                findings: Vec::new(),
+            },
+        },
+        _ => ChecksReport::unchecked(
+            sha,
+            tree,
+            last.and_then(|l| l.tree.as_deref()),
+            last.is_some(),
+        ),
+    }
 }
 
 // Opens the pull request for the pushed branch.

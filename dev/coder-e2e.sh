@@ -14,7 +14,9 @@
 # The script resets mock-github's request journal, sends the task with
 # SendStreamingMessage, reads the stream until the task ends, and checks:
 #   * the task is TASK_STATE_COMPLETED (not FAILED, and it ends within TIMEOUT);
-#   * the `branch` and `pull_request` artifacts are there;
+#   * the `checks`, `branch` and `pull_request` artifacts are there, and the last `checks`
+#     (bound to the pushed commit, emitted before `branch`) passed on exactly the
+#     branch artifact's commit, with a 40-hex tree;
 #   * mock-github saw exactly one POST /repos/local/sandbox/pulls, head = the
 #     branch, base = main;
 #   * git-server has the branch, and hello.txt on it is `hello`.
@@ -110,10 +112,17 @@ esac
 artifact() { # artifact <name> <jq path under .parts[0].data> -> value ("" if absent)
   jq -r --arg n "$1" "select(.result.artifactUpdate.artifact.name == \$n) | .result.artifactUpdate.artifact.parts[0].data | $2 // empty" "$events" | tail -n 1
 }
+checks_passed=$(artifact checks '.passed | tostring')
+checks_commit=$(artifact checks .commit)
+checks_tree=$(artifact checks .tree)
 branch=$(artifact branch .branch)
 commit=$(artifact branch .commit)
 pr_url=$(artifact pull_request .url)
 pr_branch=$(artifact pull_request .branch)
+if [ "$checks_passed" = true ]; then ok "checks artifact: passed"; else bad "checks artifact: passed is '${checks_passed:-absent}', want true"; fi
+# The last checks artifact is the one bound to the pushed commit.
+if printf '%s' "$checks_commit" | grep -Eq '^[0-9a-f]{40}$' && [ "$checks_commit" = "$commit" ]; then ok "the last checks artifact is bound to the pushed commit $(printf '%s' "$checks_commit" | cut -c1-10)"; else bad "the last checks artifact commit '$checks_commit' is not the pushed commit '$commit'"; fi
+if printf '%s' "$checks_tree" | grep -Eq '^[0-9a-f]{40}$'; then ok "checks artifact names the tree $(printf '%s' "$checks_tree" | cut -c1-10)"; else bad "checks artifact tree '$checks_tree' is not a 40-hex tree id"; fi
 if [ -n "$branch" ] && [ -n "$commit" ]; then ok "branch artifact: $branch at $(printf '%s' "$commit" | cut -c1-10)"; else bad "no branch artifact (with a commit)"; fi
 if [ -n "$pr_url" ]; then ok "pull_request artifact: $pr_url"; else bad "no pull_request artifact (with a url)"; fi
 if [ -n "$branch" ] && [ "$pr_branch" = "$branch" ]; then ok "the pull request is for the pushed branch"; else bad "pull_request branch '$pr_branch' is not the pushed branch '$branch'"; fi

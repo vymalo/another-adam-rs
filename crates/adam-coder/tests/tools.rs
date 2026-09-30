@@ -308,6 +308,361 @@ async fn a_replayed_failing_check_counts_one_cycle() {
     }
 }
 
+/// The `checks` artifact of a tool result: its data.
+fn checks_of(out: &ToolOutput) -> Value {
+    let artifacts: Vec<_> = out
+        .artifacts
+        .iter()
+        .filter(|a| a.name == "checks")
+        .collect();
+    assert_eq!(artifacts.len(), 1, "one checks artifact per run: {out:?}");
+    assert_eq!(artifacts[0].mime_type.as_deref(), Some("application/json"));
+    artifacts[0].data.clone()
+}
+
+fn head_of(dir: &std::path::Path) -> String {
+    common::git(dir, &["rev-parse", "HEAD"])
+}
+
+#[tokio::test]
+async fn a_passing_check_emits_a_passing_checks_artifact_for_head() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": "cat README.md"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let data = checks_of(&out);
+    let head = head_of(&rig.worktree());
+    assert_eq!(head.len(), 40);
+    assert_eq!(data["passed"], true);
+    assert_eq!(data["commit"], head.as_str());
+    assert_eq!(data["summary"], "`cat README.md` passed");
+    assert!(data.get("findings").is_none(), "{data}");
+    // Nothing changed: the tree checked is the tree of HEAD.
+    let tree = common::git(&rig.worktree(), &["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(data["tree"], tree.as_str());
+}
+
+#[tokio::test]
+async fn a_failing_check_emits_findings_with_its_name_and_output_tail() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let command = "echo compiling; echo 'error[E0432]: unresolved import' >&2; exit 3";
+    let out = RunChecks
+        .call(&rig.ctx, json!({ "command": command }))
+        .await
+        .unwrap();
+    assert!(out.is_error);
+    let data = checks_of(&out);
+    assert_eq!(data["passed"], false);
+    assert_eq!(data["commit"], head_of(&rig.worktree()).as_str());
+    assert!(data["summary"].as_str().unwrap().contains("exit code 3"));
+    let findings = data["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{data}");
+    assert_eq!(findings[0]["check"], command);
+    let message = findings[0]["message"].as_str().unwrap();
+    assert!(message.starts_with("exit code 3\n"), "{message}");
+    assert!(message.contains("compiling") && message.contains("unresolved import"));
+}
+
+#[tokio::test]
+async fn a_long_failing_output_is_capped_and_the_cut_is_marked() {
+    let fx = Fixture::with("hello\n", |s| {
+        s.check_output_tail = 64 * 1024;
+    })
+    .await;
+    let rig = Rig::from(fx);
+    rig.prepare().await;
+    let out = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "i=0; while [ $i -lt 6000 ]; do echo line-$i-padding; i=$((i+1)); done; exit 1"}),
+        )
+        .await
+        .unwrap();
+    let data = checks_of(&out);
+    let findings = data["findings"].as_array().unwrap();
+    assert!(findings.len() <= 20);
+    let total: usize = findings
+        .iter()
+        .map(|f| f["check"].as_str().unwrap().len() + f["message"].as_str().unwrap().len())
+        .sum();
+    assert!(total <= 16 * 1024, "{total}");
+    let message = findings[0]["message"].as_str().unwrap();
+    assert!(message.starts_with("[cut: the last "), "{}", &message[..60]);
+    assert!(
+        message.trim_end().ends_with("line-5999-padding"),
+        "the end is kept"
+    );
+}
+
+#[tokio::test]
+async fn no_commit_is_reported_as_a_failed_check_not_a_missing_artifact() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    // The branch is gone: HEAD points at nothing.
+    common::git(&rig.worktree(), &["update-ref", "-d", "HEAD"]);
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": "true"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "the command itself passed: {}", out.content);
+    let data = checks_of(&out);
+    assert_eq!(data["passed"], false);
+    assert_eq!(data["commit"], "");
+    let findings = data["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{data}");
+    assert_eq!(findings[0]["check"], "commit");
+    assert!(
+        findings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot determine the commit")
+    );
+}
+
+#[tokio::test]
+async fn secrets_in_the_output_are_not_in_the_checks_artifact() {
+    use base64::Engine as _;
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(common::GITHUB_TOKEN);
+    let command = format!(
+        "echo token={} key={} b64={encoded}; exit 1",
+        common::GITHUB_TOKEN,
+        common::MODEL_KEY
+    );
+    let out = RunChecks
+        .call(&rig.ctx, json!({ "command": command }))
+        .await
+        .unwrap();
+    let artifact = checks_of(&out).to_string();
+    for secret in [common::GITHUB_TOKEN, common::MODEL_KEY, encoded.as_str()] {
+        assert!(!artifact.contains(secret), "{secret} leaked: {artifact}");
+        assert!(
+            !out.content.contains(secret),
+            "{secret} leaked to the model"
+        );
+    }
+    assert!(artifact.contains("[redacted]"), "{artifact}");
+}
+
+/// A journaled step that is replayed returns the same result, so the artifact it emits is the
+/// same one: same content, hence the same content-derived id, which a subscriber sees once. A call
+/// that ran again (its result was never journaled) emits one artifact, not a second with another
+/// id, because the run's own state did not change.
+#[tokio::test]
+async fn a_replayed_check_emits_the_same_artifact_id() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let mut ids = Vec::new();
+    let mut first = None;
+    for _ in 0..3 {
+        let out = RunChecks
+            .call(&rig.ctx, json!({"command": "exit 2"}))
+            .await
+            .unwrap();
+        assert_eq!(out.artifacts.len(), 1);
+        ids.push(adam_a2a_runtime::artifact_id(&out.artifacts[0]));
+        let data = checks_of(&out);
+        assert_eq!(*first.get_or_insert(data.clone()), data);
+    }
+    assert_eq!(ids[0], ids[1]);
+    assert_eq!(ids[1], ids[2]);
+    assert!(ids[0].starts_with("checks-"), "{}", ids[0]);
+}
+
+#[tokio::test]
+async fn a_refused_check_run_emits_no_checks_artifact() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": "true", "cwd": ".."}))
+        .await
+        .unwrap();
+    assert!(out.is_error);
+    assert!(out.artifacts.is_empty(), "nothing ran: {out:?}");
+}
+
+/// The two artifacts of a `commit_and_push` result: the bound `checks` and `branch`.
+fn commit_artifacts(out: &ToolOutput) -> (Value, Value) {
+    let names: Vec<_> = out.artifacts.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["checks", "branch"], "{out:?}");
+    (out.artifacts[0].data.clone(), out.artifacts[1].data.clone())
+}
+
+fn tree_of(dir: &std::path::Path, commit: &str) -> String {
+    common::git(dir, &["rev-parse", &format!("{commit}^{{tree}}")])
+}
+
+/// The verdict is bound to what was pushed: the run checked the worktree as it would be committed
+/// (tracked changes, untracked files, not the ignored ones), and the commit has that tree.
+#[tokio::test]
+async fn checks_then_commit_binds_a_passing_verdict_to_the_pushed_commit() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join(".gitignore"), "ignored.log\n").unwrap();
+    std::fs::write(wt.join("ignored.log"), "noise\n").unwrap();
+    std::fs::write(wt.join("new.txt"), "new\n").unwrap();
+    std::fs::write(wt.join("README.md"), "changed\n").unwrap();
+
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "test -f new.txt"}))
+        .await
+        .unwrap();
+    let on_head = checks_of(&checked);
+    assert_eq!(on_head["passed"], true);
+    assert_eq!(
+        on_head["commit"],
+        head_of(&wt).as_str(),
+        "still the old HEAD"
+    );
+
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: add new"}))
+        .await
+        .unwrap();
+    let (bound, branch) = commit_artifacts(&out);
+    let pushed = branch["commit"].as_str().unwrap();
+    assert_ne!(pushed, on_head["commit"].as_str().unwrap());
+    assert_eq!(bound["passed"], true, "{bound}");
+    assert_eq!(bound["commit"], pushed);
+    assert_eq!(bound["tree"], tree_of(&wt, pushed).as_str());
+    assert_eq!(
+        bound["tree"], on_head["tree"],
+        "the tree run_checks recorded is the tree commit_all committed"
+    );
+    assert!(
+        bound["summary"]
+            .as_str()
+            .unwrap()
+            .contains("checked on the identical tree before it was committed"),
+        "{bound}"
+    );
+    assert!(!bound["summary"].as_str().unwrap().contains("uncommitted"));
+    assert!(
+        !common::git(&wt, &["ls-tree", "--name-only", pushed]).contains("ignored.log"),
+        "ignored files are not committed"
+    );
+    assert_eq!(bound["commit"], branch["commit"]);
+}
+
+/// Checks on a clean tree, then a commit step that has nothing new to commit (the tree is
+/// already the pushed one): still a bound, passing verdict.
+#[tokio::test]
+async fn checks_then_a_commit_with_no_changes_binds_to_the_pushed_head() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("a.txt"), "a\n").unwrap();
+    CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: add a"}))
+        .await
+        .unwrap();
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "test -f a.txt"}))
+        .await
+        .unwrap();
+    assert_eq!(checks_of(&checked)["commit"], head_of(&wt).as_str());
+
+    let again = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: add a"}))
+        .await
+        .unwrap();
+    assert!(again.content.contains("Nothing new to commit"));
+    let (bound, branch) = commit_artifacts(&again);
+    assert_eq!(bound["passed"], true, "{bound}");
+    assert_eq!(bound["commit"], head_of(&wt).as_str());
+    assert_eq!(bound["commit"], branch["commit"]);
+    assert_eq!(bound["tree"], tree_of(&wt, "HEAD").as_str());
+}
+
+#[tokio::test]
+async fn edits_after_the_checks_leave_the_pushed_commit_unchecked() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("a.txt"), "a\n").unwrap();
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "true"}))
+        .await
+        .unwrap();
+    let checked_tree = checks_of(&checked)["tree"].as_str().unwrap().to_owned();
+    std::fs::write(wt.join("a.txt"), "a, edited after the checks\n").unwrap();
+
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: add a"}))
+        .await
+        .unwrap();
+    let (bound, branch) = commit_artifacts(&out);
+    let pushed_tree = tree_of(&wt, "HEAD");
+    assert_eq!(bound["passed"], false, "{bound}");
+    assert_eq!(bound["commit"], branch["commit"]);
+    assert_eq!(bound["tree"], pushed_tree.as_str());
+    let findings = bound["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["check"], "checks");
+    assert_eq!(
+        findings[0]["message"],
+        format!(
+            "the pushed tree was not checked: the last checks ran on {}, the commit has {}",
+            &checked_tree[..10],
+            &pushed_tree[..10]
+        )
+        .as_str()
+    );
+}
+
+#[tokio::test]
+async fn a_commit_without_any_checks_is_unchecked() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: add a"}))
+        .await
+        .unwrap();
+    let (bound, branch) = commit_artifacts(&out);
+    assert_eq!(bound["passed"], false, "{bound}");
+    assert_eq!(bound["commit"], branch["commit"]);
+    let message = bound["findings"][0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(
+            "the pushed tree was not checked: no check ran in this run, the commit has "
+        ),
+        "{message}"
+    );
+}
+
+/// Red checks on the tree that was pushed: bound, and still red, with the findings.
+#[tokio::test]
+async fn a_failed_check_on_the_pushed_tree_stays_failed_when_bound() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+    RunChecks
+        .call(&rig.ctx, json!({"command": "echo lint failed; exit 1"}))
+        .await
+        .unwrap();
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: add a"}))
+        .await
+        .unwrap();
+    let (bound, branch) = commit_artifacts(&out);
+    assert_eq!(bound["passed"], false);
+    assert_eq!(bound["commit"], branch["commit"]);
+    assert_eq!(bound["findings"][0]["check"], "echo lint failed; exit 1");
+    assert!(
+        bound["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("lint failed")
+    );
+}
+
 #[tokio::test]
 async fn commit_and_push_is_idempotent_and_refuses_an_empty_branch() {
     let rig = Rig::new().await;
@@ -325,12 +680,13 @@ async fn commit_and_push_is_idempotent_and_refuses_an_empty_branch() {
         .unwrap();
     assert!(!first.is_error, "{}", first.content);
     assert!(first.content.starts_with("Committed "));
-    assert_eq!(first.artifacts[0].name, "branch");
-    let branch = first.artifacts[0].data["branch"]
+    let names: Vec<_> = first.artifacts.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["checks", "branch"], "the verdict comes first");
+    let branch = first.artifacts[1].data["branch"]
         .as_str()
         .unwrap()
         .to_owned();
-    let sha = first.artifacts[0].data["commit"]
+    let sha = first.artifacts[1].data["commit"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -345,7 +701,11 @@ async fn commit_and_push_is_idempotent_and_refuses_an_empty_branch() {
         "{}",
         again.content
     );
-    assert_eq!(again.artifacts[0].data["commit"], sha.as_str());
+    assert_eq!(again.artifacts[1].data["commit"], sha.as_str());
+    assert_eq!(
+        again.artifacts, first.artifacts,
+        "a repeated step emits the same artifacts"
+    );
     assert_eq!(rig.fx.commits_ahead(&branch), 1);
     assert_eq!(rig.fx.ref_updates(&branch), 1);
     assert_eq!(rig.fx.file_on(&branch, "a.txt"), "a");

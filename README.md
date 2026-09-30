@@ -242,7 +242,7 @@ NO_OPENCODE=1 sh dev/coder-e2e.sh   # the check command makes it, OpenCode is no
 ```
 
 The script sends the task with `SendStreamingMessage`, waits for
-`TASK_STATE_COMPLETED`, and checks that the `branch` and `pull_request`
+`TASK_STATE_COMPLETED`, and checks that the `checks` (the last one passed, bound to the pushed commit), `branch` and `pull_request`
 artifacts are there, that `mock-github` saw exactly one
 `POST /repos/local/sandbox/pulls` (head = the branch, base = `main`), and that
 `git-server` has the branch with `hello.txt` containing `hello`. `TIMEOUT`,

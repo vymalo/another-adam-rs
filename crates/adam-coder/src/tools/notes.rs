@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use super::checks::ChecksReport;
+
 /// The outcome of one `run_checks` call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckRecord {
@@ -34,6 +36,10 @@ pub struct CheckRecord {
     /// `gitcli::working_tree_id`); `None` if it could not be determined.
     #[serde(default)]
     pub tree: Option<String>,
+    /// What the run reported as its `checks` artifact, so `commit_and_push` can bind it to the
+    /// commit it makes when the tree is the same.
+    #[serde(default)]
+    pub report: Option<ChecksReport>,
 }
 
 /// State of the check/fix cycle.
@@ -181,6 +187,7 @@ mod tests {
             exit_code: Some(i32::from(!passed)),
             tail: "out".into(),
             tree: Some("t1".into()),
+            report: None,
         }
     }
 

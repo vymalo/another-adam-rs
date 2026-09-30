@@ -8,7 +8,8 @@
 //!    cycles (`run_checks`),
 //! 4. commits, pushes and opens a pull request (`commit_and_push`,
 //!    `open_pull_request`), and
-//! 5. streams progress throughout and reports the pull request as an artifact.
+//! 5. streams progress throughout and reports the check results, the branch and the pull request
+//!    as artifacts (`checks`, `branch`, `pull_request`).
 //!
 //! It is durable (an [`adam_runtime::Runtime`] journals every model and tool
 //! step, so a restarted worker replays instead of repeating side effects) and
