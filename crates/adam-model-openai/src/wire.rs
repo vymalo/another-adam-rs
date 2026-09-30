@@ -134,18 +134,29 @@ fn text_message<'a>(role: &'static str, text: &str) -> WireMessage<'a> {
     }
 }
 
-/// Message content: a plain string when it is a single text part (accepted by
-/// every server), an array of typed parts otherwise.
+/// Message content: **one string**, the text parts joined with a blank line, for every message
+/// whose parts are all text (today, every one).
+///
+/// A user message that has several text parts (a continued conversation merges the messages that
+/// would otherwise sit next to each other, see `Conversation::continued`) is stored with its parts
+/// and sent as the text it says. A plain string is the form of `content` that every
+/// OpenAI-compatible server takes; an array of typed parts is not taken by all of them, nor by
+/// every chat template (*unverified* for each server: chat templates that insist on a string
+/// content are the reason), so it is kept for a part that is not text. [`ContentPart`] has only
+/// `Text` today, so this match fails to compile when a variant is added, which is where to send
+/// that part, and the text parts around it, as typed parts.
 fn content_value(parts: &[ContentPart]) -> Option<Value> {
-    match parts {
-        [] => None,
-        [only] => Some(Value::String(only.as_text().to_owned())),
-        many => Some(Value::Array(
-            many.iter()
-                .map(|p| json!({"type": "text", "text": p.as_text()}))
-                .collect(),
-        )),
+    if parts.is_empty() {
+        return None;
     }
+    let text = parts
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => text.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some(Value::String(text))
 }
 
 fn wire_message(message: &Message) -> Result<WireMessage<'_>, ModelError> {
@@ -645,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_part_content_and_null_schema() {
+    fn multi_part_text_content_is_one_string_and_a_null_schema_is_an_object() {
         let mut req = ModelRequest::new("m");
         req.messages = vec![Message::User {
             content: vec![ContentPart::text("a"), ContentPart::text("b")],
@@ -656,10 +667,8 @@ mod tests {
             parameters: Value::Null,
         }];
         let v = body(&req, false, MaxTokensField::MaxTokens);
-        assert_eq!(
-            v["messages"][0]["content"],
-            json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])
-        );
+        // The parts are sent as one string, joined with a blank line; the request still holds them.
+        assert_eq!(v["messages"][0]["content"], json!("a\n\nb"));
         assert_eq!(
             v["tools"][0]["function"]["parameters"],
             json!({"type": "object", "properties": {}})

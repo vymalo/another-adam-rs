@@ -12,6 +12,14 @@ from the raw record before anything is decoded, an unreadable one is skipped, th
 continues nothing, what the operator sees) and decision 1 (a repeat is recognised before the prior is
 read; a wrong-agent prior has its own error).
 
+*Amended 2026-09-30, second review (cap and wire):* the cap now shortens the tool outputs of the
+newest prior turn last, after old turns have been dropped (it used to shorten them first, which cost
+the turn the next message follows up on before any old turn was touched); the first message is reduced
+to its task before a marker is added, so the marker is always its second part (a first message of
+`[task, next]` with nothing omitted used to put the marker third, where the real marker counted as the
+person's text, a lookalike part was skipped, and the next continuation stacked a second marker or cut
+the user's own part); text-only content with several parts goes to the model as one string.
+
 *Amended 2026-09-30, second review (branch continuation):* a continued branch is reached only
 through the checks gate. The first version pushed a continuing run's commits straight to the
 branch that already had a pull request, so a rework whose checks never went green left unverified
@@ -92,27 +100,34 @@ out: this is not one of ADR 0001's host extensions and needs no capability detec
      the user's (a run that failed before the model answered), and the waiting ones in front of the new
      one. Chat templates that insist on alternating roles (Mistral, Gemma under vLLM or llama.cpp)
      reject two user messages in a row, and a continuation would otherwise produce them in every one of
-     these cases. The text parts keep each message's own text verbatim and in order, and the OpenAI
-     adapter already sends a message with several text parts as an array of typed parts;
+     these cases. The text parts keep each message's own text verbatim and in order in the stored
+     state, and the OpenAI adapter sends a message whose parts are all text as **one string**, the
+     parts joined with a blank line (an array of typed parts is for a part that is not text);
    * *bounded:* see the next decision.
 3. **The carried history is capped at 256 KiB of JSON** (`MAX_CARRIED_BYTES`), and what is given up to
    meet the cap is given up in this order, only as far as needed:
-   1. **Old tool outputs are shortened**, oldest first, each keeping its head and ending in the marker
-      `TRUNCATION_MARKER_PREFIX` that history truncation already uses (`shorten_output`, shared with
-      `fit_history`). No call loses its result. A coding run is mostly tool output, so this is usually
-      all that is needed.
+   1. **The tool outputs of the turns older than the newest are shortened**, oldest first, each keeping
+      its head and ending in the marker `TRUNCATION_MARKER_PREFIX` that history truncation already uses
+      (`shorten_output`, shared with `fit_history`). No call loses its result. A coding run is mostly
+      tool output, so this is usually all that is needed.
    2. **Whole old turns are dropped**, oldest first (a turn is a user message and everything up to the
       next user message, so no half turn is kept), and one marker says how many. The marker is the
       **second text part of the first user message**, starting with `OMITTED_MARKER_PREFIX`
       (`[earlier conversation omitted`), and `Conversation::omitted_turns` counts the turns left out
       over the whole chain. The count, and not the text, is what tells the next continuation that the
       part is a marker, so a user message that merely starts with the prefix is an ordinary message and
-      an ordinary turn start.
+      an ordinary turn start. The marker is **always** the second part: before anything is dropped
+      the first message is reduced to its task (its first part), and what else it holds (the marker of
+      an earlier omission, which is taken out, or the messages that joined it when a run ended before
+      the model answered) goes back to being a user message of its own, which is a turn like any other.
+   3. **The newest prior turn's tool outputs are shortened, last**, only if the cap is still exceeded
+      after the turns that could go have gone.
    Two things are **never** given up: **the first user message of the chain**, kept verbatim as the first
    text part of the first message (it is the task the whole conversation is about: a coder run is easily
    one turn larger than the cap, and dropping whole turns first would lose "implement X in repo R" at the
-   second rework, which is the amnesia this decision exists to end), and **the newest prior turn**, except
-   for step 1 shortening its tool outputs. A newest turn whose own assistant text and tool-call arguments
+   second rework, which is the amnesia this decision exists to end), and **the newest prior turn** (only
+   step 3 shortens its tool outputs: it is what the new message most likely follows up on, so old turns
+   are given up before it is touched). A newest turn whose own assistant text and tool-call arguments
    exceed the cap is carried over it: one run's own limits bound it, and the next continuation shortens or
    drops it. The waiting user messages and the new one are counted but never cut.
    Why a cap: each continuation copies the history into the new run's state, one JSON value in the
@@ -296,9 +311,10 @@ stateDiagram-v2
 * **Roles alternate, at the price of multi-part user messages.** A continued history is built so that no
   two user messages are adjacent (decision 2). The alternative, leaving them, is what the loop already
   sends when several messages arrive together, but alternation-strict templates reject it. A user
-  message with several text parts goes out as an array of typed parts. *Unverified 2026-09-30:* that
-  every OpenAI-compatible server accepts an array of text parts for a user message (the OpenAI API and
-  vLLM do; the tests use `MockModel`).
+  message with several text parts is stored with its parts and goes out as one string joined with a
+  blank line, so no server or chat template has to accept an array of typed parts for it (the first
+  version sent an array, which is *unverified* for every server but the OpenAI API and vLLM; the tests
+  use `MockModel` and the wire shape is unit-tested).
 * **Semver.** The workspace is 0.1.x and records no changelog, so this is where the breaking changes of
   this decision are recorded: `AgentStarter::State` now needs `DeserializeOwned`; `Conversation` has
   two new public fields (`continued_from`, `omitted_turns`), so code that builds it with a struct
@@ -348,6 +364,6 @@ including PostgreSQL across a restart and a real `LlmAgent` behind the backend) 
 (`tests/dev.rs`). Executed on 2026-09-30 against the in-memory store and PostgreSQL 16.13; the MongoDB
 variants of the `adam-runtime` cases use the same store calls and run in CI only (no MongoDB was at hand).
 
-*Unverified:* that a live provider accepts the histories described above (an array of text parts in a
-user message); how the orchestrator fills `referenceTaskIds` (that is its repository's change, recorded
+*Unverified:* that a live provider accepts the histories described above (a user message that holds
+several paragraphs joined by a blank line, and roles that alternate in every shape); how the orchestrator fills `referenceTaskIds` (that is its repository's change, recorded
 there).

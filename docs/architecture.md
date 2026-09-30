@@ -789,11 +789,11 @@ What the diagram cannot say:
   `Agent::init_continuing` and `AgentStarter::init_continuing` default to `init`, and a state that
   does not decode falls back to `init` with a warning. An agent that wraps another must forward
   `init_continuing`, as it forwards `init`.
-* **The history is bounded, and the task is not what gives.** `Conversation::continued` shortens old
-  tool outputs first (the truncation the loop already applies to what it sends), and only if that is not
-  enough drops the oldest whole turns beyond `MAX_CARRIED_BYTES` (256 KiB of JSON), saying so in a marker
-  text and in `omitted_turns`. The first user message of the chain and the newest prior turn are always
-  kept. Adjacent user messages become one message with several text parts, so the roles alternate.
+* **The history is bounded, and the task is not what gives.** `Conversation::continued` shortens the tool
+  outputs of old turns first (the truncation the loop already applies to what it sends), then, if that is not
+  enough, drops the oldest whole turns beyond `MAX_CARRIED_BYTES` (256 KiB of JSON), saying so in a marker
+  text and in `omitted_turns`, and shortens the newest prior turn's outputs only last. The first user message
+  of the chain and the newest prior turn are always kept. Adjacent user messages become one message with several text parts, so the roles alternate.
 * **The new run is an ordinary run**: a new id, its own journal and limits, its own worktree. Only its
   first state comes from the old run.
 * **The coder carries the work on, not only the words.** `CoderAgent` and `CoderStarter` forward
