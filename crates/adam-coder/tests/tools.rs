@@ -358,6 +358,70 @@ async fn every_written_form_of_a_named_repository_passes_the_gate() {
     }
 }
 
+/// The owner's case: the repository's default branch is `master`, the model guessed `main`. Without a
+/// base branch the workspace starts from the remote's default; a base branch that is not there is
+/// an error that lists the branches that are, so the model can pick one or ask.
+#[tokio::test]
+async fn prepare_workspace_without_a_base_branch_starts_from_the_remotes_default() {
+    let rig = Rig::new().await;
+    let remote = rig.fx.remote_url();
+    common::git(&rig.fx.remote, &["branch", "master", "refs/heads/main"]);
+    common::git(&rig.fx.remote, &["branch", "topic/one", "refs/heads/main"]);
+    common::git(
+        &rig.fx.remote,
+        &["symbolic-ref", "HEAD", "refs/heads/master"],
+    );
+    rig.say(&remote).await;
+
+    // A guess that is not there: the error lists what is.
+    let guessed = PrepareWorkspace
+        .call(
+            &rig.ctx,
+            json!({"repo_url": remote, "base_branch": "develop"}),
+        )
+        .await;
+    assert!(is_error(&guessed), "{guessed:?}");
+    let guessed = text(guessed);
+    assert!(
+        guessed.contains("develop") && guessed.contains("Its branches: main, master, topic/one."),
+        "{guessed}"
+    );
+    assert!(
+        !rig.worktree().exists(),
+        "nothing was created for the refused branch"
+    );
+
+    // No base branch (absent, or blank): the remote's default.
+    for args in [
+        json!({"repo_url": remote}),
+        json!({"repo_url": remote, "base_branch": "  "}),
+    ] {
+        let rig = Rig::from(Fixture::new("hello\n").await);
+        common::git(&rig.fx.remote, &["branch", "master", "refs/heads/main"]);
+        common::git(
+            &rig.fx.remote,
+            &["symbolic-ref", "HEAD", "refs/heads/master"],
+        );
+        rig.say(&rig.fx.remote_url()).await;
+        let mut args = args.clone();
+        args["repo_url"] = json!(rig.fx.remote_url());
+        let ready = PrepareWorkspace.call(&rig.ctx, args.clone()).await.unwrap();
+        assert!(!ready.is_error, "{}", ready.content);
+        assert!(
+            ready.content.contains("base branch: master"),
+            "{}",
+            ready.content
+        );
+        // Again in the same run: the workspace's own base, without asking the remote.
+        let again = PrepareWorkspace.call(&rig.ctx, args).await.unwrap();
+        assert!(
+            again.content.contains("base branch: master"),
+            "{}",
+            again.content
+        );
+    }
+}
+
 #[tokio::test]
 async fn tools_that_need_a_workspace_say_so() {
     let rig = Rig::new().await;
@@ -1303,21 +1367,48 @@ async fn a_later_task_continues_the_pushed_branch_and_reports_the_same_pull_requ
         .call(&two, json!({"message": "fix: two"}))
         .await
         .unwrap();
+    // The commit went to a branch of this run's own; the branch it continues is unchanged, and
+    // the text says so. The last two lines still name the line of work.
+    let own = pushed_again
+        .content
+        .split("pushed branch ")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .unwrap()
+        .to_owned();
+    assert!(own.starts_with("agent/") && own != branch, "{own}");
     assert!(
-        pushed_again
-            .content
-            .contains(&format!("pushed branch {branch}")),
+        pushed_again.content.contains("has not been changed"),
         "{}",
         pushed_again.content
     );
     assert_eq!(pushed_lines(&pushed_again.content).1, branch);
+    assert_eq!(pushed_again.artifacts[1].name, "branch");
+    assert_eq!(pushed_again.artifacts[1].data["branch"], own.as_str());
+    assert_eq!(pushed_again.artifacts[1].data["continues"], branch.as_str());
+    assert_eq!(rig.fx.agent_branches().len(), 2);
     assert_eq!(
-        rig.fx.agent_branches(),
-        std::slice::from_ref(&branch),
-        "no branch of its own"
+        rig.fx.commits_ahead(&branch),
+        1,
+        "the pull request's branch is unchanged"
     );
-    assert_eq!(rig.fx.commits_ahead(&branch), 2);
-    assert_eq!(rig.fx.file_on(&branch, "two.txt"), "two");
+    assert_eq!(rig.fx.commits_ahead(&own), 2);
+    // The tool recorded the line of work itself, in the notes of the run that pushed.
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&two.run_id().to_string())
+        .await
+        .unwrap();
+    assert_eq!(notes.continues.as_deref(), Some(branch.as_str()));
+    assert!(
+        notes.has_pushed(
+            &adam_coder::tools::named::key_of_argument(&remote).unwrap(),
+            &branch
+        ),
+        "{notes:?}"
+    );
 
     let reported = OpenPullRequest.call(&two, args).await.unwrap();
     assert!(!reported.is_error, "{}", reported.content);
@@ -1334,4 +1425,234 @@ async fn a_later_task_continues_the_pushed_branch_and_reports_the_same_pull_requ
         1,
         "no second pull request"
     );
+    // The gate passed, so the continued branch now has the commit, as a fast-forward.
+    assert_eq!(rig.fx.commits_ahead(&branch), 2);
+    assert_eq!(rig.fx.file_on(&branch, "two.txt"), "two");
+    assert!(rig.fx.comments().await.is_empty(), "verified: no note");
+}
+
+/// A second task on a continued branch, in a fixture where the first task's pull request is open:
+/// returns the context of task 2 with its worktree prepared on the branch, the branch, and the
+/// tip the branch has (the code that was verified).
+async fn rework_of_an_open_pull_request(
+    rig: &Rig,
+) -> (ToolCtx, std::path::PathBuf, String, String) {
+    let remote = rig.fx.remote_url();
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("one.txt"), "one\n").unwrap();
+    RunChecks
+        .call(&rig.ctx, json!({"command": "true"}))
+        .await
+        .unwrap();
+    let pushed = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: one"}))
+        .await
+        .unwrap();
+    let (_, branch) = pushed_lines(&pushed.content);
+    let args = json!({"title": "feat: one", "body": "One.\n\n## Verification\n- `true`"});
+    let opened = OpenPullRequest.call(&rig.ctx, args).await.unwrap();
+    assert!(opened.content.contains("is open"), "{}", opened.content);
+    let tip = common::git(
+        &rig.fx.remote,
+        &["rev-parse", &format!("refs/heads/{branch}")],
+    );
+
+    let two = next_task(&rig.fx, &remote, &[(&remote, &branch)]).await;
+    let ready = PrepareWorkspace
+        .call(
+            &two,
+            json!({"repo_url": remote, "base_branch": "main", "branch": branch}),
+        )
+        .await
+        .unwrap();
+    assert!(!ready.is_error, "{}", ready.content);
+    let worktree = rig.fx.root.join("worktrees").join(two.run_id().to_string());
+    (two, worktree, branch, tip)
+}
+
+/// The gate holds for a branch that already has a pull request: a rework whose checks are red
+/// pushes to its own branch and is refused by `open_pull_request`, and neither the branch nor its
+/// pull request is touched. Accepting the red checks explicitly moves the branch and leaves a
+/// comment that says the update was not verified.
+#[tokio::test]
+async fn red_checks_on_a_continued_branch_never_touch_the_existing_pull_request() {
+    let rig = Rig::new().await;
+    let (two, worktree, branch, tip) = rework_of_an_open_pull_request(&rig).await;
+    let remote_tip =
+        |b: &str| common::git(&rig.fx.remote, &["rev-parse", &format!("refs/heads/{b}")]);
+
+    std::fs::write(worktree.join("two.txt"), "unverified\n").unwrap();
+    let red = RunChecks
+        .call(&two, json!({"command": "echo broken; exit 1"}))
+        .await;
+    assert!(is_error(&red));
+    let pushed = CommitAndPush
+        .call(&two, json!({"message": "fix: two"}))
+        .await
+        .unwrap();
+    assert!(
+        pushed.artifacts[0].data["passed"] == json!(false),
+        "the verdict on the pushed commit is red: {:?}",
+        pushed.artifacts[0].data
+    );
+
+    let args = json!({"title": "fix: two", "body": "Two.\n\n## Verification\n- `exit 1`"});
+    let refused = OpenPullRequest.call(&two, args.clone()).await;
+    assert!(is_error(&refused), "{refused:?}");
+    assert!(text(refused).contains("Refusing to open a pull request"));
+    assert_eq!(
+        remote_tip(&branch),
+        tip,
+        "the pull request's branch is untouched"
+    );
+    assert_eq!(rig.fx.commits_ahead(&branch), 1);
+    assert_eq!(rig.fx.created_pulls().await.len(), 1);
+    assert!(rig.fx.comments().await.is_empty());
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&two.run_id().to_string())
+        .await
+        .unwrap();
+    assert!(
+        notes.pull_request.is_none(),
+        "nothing was delivered: {notes:?}"
+    );
+
+    // The person accepted the red checks: the branch moves, its pull request is reported, and a
+    // comment says what the update was.
+    let mut accepted = args;
+    accepted["accept_red_checks"] = json!(true);
+    let reported = OpenPullRequest.call(&two, accepted).await.unwrap();
+    assert!(!reported.is_error, "{}", reported.content);
+    assert!(
+        reported.content.contains("was already open")
+            && reported.content.contains("comment")
+            && reported.content.contains(PR_URL),
+        "{}",
+        reported.content
+    );
+    assert_ne!(remote_tip(&branch), tip);
+    assert_eq!(rig.fx.file_on(&branch, "two.txt"), "unverified");
+    assert_eq!(
+        rig.fx.created_pulls().await.len(),
+        1,
+        "still the one pull request"
+    );
+    let comments = rig.fx.comments().await;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert_eq!(comments[0].0, 7);
+    assert!(
+        comments[0].1.contains("not green") && comments[0].1.contains("explicitly accepted"),
+        "{}",
+        comments[0].1
+    );
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&two.run_id().to_string())
+        .await
+        .unwrap();
+    assert!(
+        notes
+            .pull_request
+            .as_ref()
+            .is_some_and(|p| p.red_checks_accepted)
+    );
+}
+
+/// If someone pushed to the continued branch since the task started, its commits are not added
+/// (that would overwrite theirs): the error names the branch and says to ask the person, the
+/// branch keeps what is on the remote, and no pull request is reported.
+#[tokio::test]
+async fn a_continued_branch_that_moved_on_the_remote_is_not_overwritten_by_open_pull_request() {
+    let rig = Rig::new().await;
+    let (two, worktree, branch, _tip) = rework_of_an_open_pull_request(&rig).await;
+
+    std::fs::write(worktree.join("two.txt"), "two\n").unwrap();
+    RunChecks
+        .call(&two, json!({"command": "true"}))
+        .await
+        .unwrap();
+    let pushed = CommitAndPush
+        .call(&two, json!({"message": "fix: two"}))
+        .await
+        .unwrap();
+    let own = pushed.artifacts[1].data["branch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Somebody else moves the branch on the remote: a commit on top of it from another clone.
+    let other = rig.fx.tmp.path().join("someone-else");
+    common::git(
+        rig.fx.tmp.path(),
+        &[
+            "clone",
+            "--quiet",
+            &rig.fx.remote_url(),
+            other.to_str().unwrap(),
+        ],
+    );
+    common::git(
+        &other,
+        &[
+            "checkout",
+            "--quiet",
+            "-B",
+            "theirs",
+            &format!("origin/{branch}"),
+        ],
+    );
+    std::fs::write(other.join("theirs.txt"), "theirs\n").unwrap();
+    common::git(&other, &["add", "-A"]);
+    common::git(&other, &["commit", "--quiet", "-m", "theirs"]);
+    common::git(
+        &other,
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            &format!("theirs:refs/heads/{branch}"),
+        ],
+    );
+    let theirs = common::git(
+        &rig.fx.remote,
+        &["rev-parse", &format!("refs/heads/{branch}")],
+    );
+
+    let args = json!({"title": "fix: two", "body": "Two.\n\n## Verification\n- `true`"});
+    let refused = OpenPullRequest.call(&two, args).await;
+    assert!(is_error(&refused), "{refused:?}");
+    let refused = text(refused);
+    assert!(
+        refused.contains("the branch moved on the remote since this task started")
+            && refused.contains("ask_user")
+            && refused.contains(&branch)
+            && refused.contains(&own),
+        "{refused}"
+    );
+    assert_eq!(
+        common::git(
+            &rig.fx.remote,
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        theirs,
+        "never forced"
+    );
+    assert_eq!(
+        rig.fx.file_on(&own, "two.txt"),
+        "two",
+        "the work is on the run's own branch"
+    );
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&two.run_id().to_string())
+        .await
+        .unwrap();
+    assert!(notes.pull_request.is_none());
 }

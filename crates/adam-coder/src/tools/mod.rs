@@ -2,7 +2,7 @@
 //!
 //! | Tool | Module |
 //! |---|---|
-//! | `prepare_workspace { repo_url, base_branch, branch? }` | [`prepare`] |
+//! | `prepare_workspace { repo_url, base_branch?, branch? }` | [`prepare`] |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
 //! | `run_checks { command }` | [`checks`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
@@ -19,8 +19,9 @@
 //! * `prepare_workspace`: `Workspaces::prepare` (or `prepare_continuing`) reuses the run's worktree.
 //! * `commit_and_push`: `commit_all` is a no-op without changes and the push of
 //!   a commit the remote already has is a no-op; the reported sha is `HEAD`.
-//! * `open_pull_request`: a pull request already open for the head is reported as it is (the run
-//!   continued a branch an earlier task opened it for, or the call is repeated), and
+//! * `open_pull_request`: moving the continued branch to the pushed commit is a no-op the second
+//!   time, a pull request already open for the head is reported as it is (the run continued a
+//!   branch an earlier task opened it for, or the call is repeated), and
 //!   `CodeHost::open_pull_request` returns it instead of a second one in any case.
 //! * `run_checks`: failures are counted per call id ([`notes`]).
 //!
@@ -29,12 +30,19 @@
 //! The prompt tells the model the rules; these make them hold: `prepare_workspace` refuses a
 //! repository the person did not name ([`named`]; the agent records the repositories of the
 //! person's own messages in the run notes before each step; it continues a branch only if a
-//! `commit_and_push` result of the conversation reported it, the same way), after
-//! `MAX_CHECK_CYCLES` failed check runs `run_checks` refuses to run, and
+//! `commit_and_push` of the conversation recorded it in the notes, which the agent carries from
+//! the run it continues, and as a fallback read from the result text, `publish::pushed_in`),
+//! after `MAX_CHECK_CYCLES` failed check runs `run_checks` refuses to run, and
 //! `open_pull_request` refuses unless the last check run passed on exactly the
 //! code the pull request contains (the tree of the pushed `HEAD`) or the model
 //! passes `accept_red_checks: true` (which the prompt reserves for explicit
 //! user consent obtained with `ask_user`).
+//!
+//! A run that continues a branch pushes to a branch of its own (`commit_and_push` never touches
+//! the continued one); only `open_pull_request`, after that check, fast-forwards the continued
+//! branch to the pushed commit (never forced), so a pull request open for it only ever carries
+//! code the gate has seen. On an accepted red check the update is noted in a comment on the pull
+//! request. A branch that moved on the remote is not overwritten.
 
 use std::sync::Arc;
 use std::time::Duration;

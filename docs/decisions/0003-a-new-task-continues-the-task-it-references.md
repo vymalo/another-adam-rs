@@ -12,6 +12,15 @@ from the raw record before anything is decoded, an unreadable one is skipped, th
 continues nothing, what the operator sees) and decision 1 (a repeat is recognised before the prior is
 read; a wrong-agent prior has its own error).
 
+*Amended 2026-09-30, second review (branch continuation):* a continued branch is reached only
+through the checks gate. The first version pushed a continuing run's commits straight to the
+branch that already had a pull request, so a rework whose checks never went green left unverified
+commits in a pull request that carried the first task's verification text, and the verdict said
+that no pull request had been opened. Now `commit_and_push` pushes to the run's own branch, and
+`open_pull_request` moves the continued branch after its gate (see *Consequences*, "A worktree is
+per run" and the diagrams there). The pushed-branch evidence is structured state written by the tool
+(run notes), not text read back from the history.
+
 ## Context
 
 A host such as the `another-agentic-system` orchestrator drives the coder over A2A. Every rework,
@@ -205,12 +214,79 @@ stateDiagram-v2
   may quote untrusted text in a user message (the orchestrator quotes check findings inside a fenced
   block). That rule is the coder's (`person_texts` in `adam-coder`, which does all of this, and is tested with
   a carried conversation), and the coupling is documented in both repositories.
-* **A worktree is per run, so a continued run gets a new one.** What the model remembers of the old
-  one (branch names, files) may not exist in it. The coder therefore continues a *pushed branch*, not the
-  old worktree: `prepare_workspace`'s `branch` (an `agent/*` branch that an earlier `commit_and_push` of the
-  conversation reported for the repository, recorded by the agent from those results and never taken from the
-  model's word) starts the new worktree from it and publishes to it, and `open_pull_request` reports the pull
-  request that is already open. See the coder's README. Nothing removes a finished run's worktree yet.
+* **A worktree is per run, so a continued run gets a new one, and the branch it continues is
+  reached only through the gate.** What the model remembers of the old worktree (branch names,
+  files) may not exist in the new one. The coder therefore continues a *pushed branch*, not the old
+  worktree: `prepare_workspace`'s `branch` (an `agent/*` branch that an earlier `commit_and_push` of
+  the conversation recorded for the repository, never taken from the model's word) starts the new
+  worktree from it. **The run's commits are pushed to the run's own branch `agent/<run>`, not to the
+  continued one** (`commit_and_push` cannot move it). `open_pull_request`, after its gate has passed
+  (the last check run passed on exactly the pushed code, or the person accepted red checks
+  explicitly), fast-forwards the continued branch to the pushed commit (`git push origin
+  <own>:<continued>`, never forced) and reports the pull request that is open for it; on an accepted
+  red check it adds a comment to that pull request saying the update was not verified (its body is
+  not ours to rewrite). So a pull request that is open never carries code the gate did not see, a
+  rework whose checks stay red leaves the branch and its pull request as they were, and the run ends
+  `failed` with "the pull request for <branch> was not updated" (the verdict no longer says that none
+  was opened when one exists). If the continued branch moved on the remote since the task started, it
+  is not overwritten: the tool says so, where the run's commits are, and tells the model to ask the
+  person. The pull request is found by head **and** base branch (`CodeHost::find_pull_request`).
+  Nothing removes a finished run's worktree yet. See the coder's README.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant M as Model
+    participant T as Coder tools (run 2)
+    participant R as Remote
+    participant H as Code host (PR 7 on agent/abc)
+
+    M->>T: prepare_workspace(branch agent/abc)
+    T->>R: fetch, then a worktree from origin/agent/abc
+    M->>T: run_checks, commit_and_push
+    T->>R: push agent/run2 (agent/abc untouched)
+    M->>T: open_pull_request
+    alt gate passed, or red checks explicitly accepted
+        T->>R: push run2:agent/abc (fast-forward only)
+        T->>H: find the pull request (head agent/abc, base main)
+        opt red checks accepted
+            T->>H: comment: this update was not verified
+        end
+        T-->>M: PR 7 was already open and carries the commits
+    else gate failed
+        T-->>M: refused, agent/abc and PR 7 untouched
+    else agent/abc moved on the remote
+        T-->>M: refused, ask the person (nothing overwritten)
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Prepared: prepare_workspace(branch)
+    Prepared --> PushedOwn: commit_and_push to agent/run2
+    PushedOwn --> PushedOwn: more work
+    PushedOwn --> Gated: open_pull_request
+    Gated --> Refused: red or unchecked, not accepted
+    Refused --> PushedOwn: fix and re-check
+    Refused --> Failed: check budget spent
+    Gated --> Moved: agent/abc fast-forwarded
+    Gated --> Stale: agent/abc moved on the remote
+    Moved --> Reported: the open pull request is reported
+    Reported --> [*]
+    Stale --> [*]: ask the person
+    Failed --> [*]: the pull request was not updated
+```
+
+* **Which branches may be continued is state, not text.** `commit_and_push` records the line of
+  work it pushed for (the continued branch, or the run's own) in the notes of its run
+  (`RunNotes::pushed_branches`), and a run that continues another adds, before every step, the
+  notes of the run it continues (`Conversation::continued_from`). Only when those notes are not at
+  hand (another worker's volume, as with the `isolated` placement) does the agent read the
+  `commit_and_push` results of the carried history: paired with their call by position (the k-th
+  result of a message answers its k-th call, because providers that send no ids repeat them), only
+  if the text ends with the two lines `repository:` and `branch:`, and never from a result that
+  history truncation cut (the cut is where the lines are). The first version parsed any line of any
+  result, and the cap's shortening removed the evidence exactly when a chain was long.
 * **Cost.** A continued task stores and sends the carried history, bounded by the cap and, for the
   model, by `max_history_tokens`. There is no summarising compaction: that needs a model call and
   loses detail, and is not needed for the bound.

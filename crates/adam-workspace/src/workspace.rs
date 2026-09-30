@@ -19,6 +19,8 @@ pub(crate) const REMOTE_TRACKING_PREFIX: &str = "refs/remotes/origin/";
 /// The namespace of the branches worktrees are checked out on, and the only one that can be
 /// continued ([`Workspaces::prepare_continuing`]).
 const AGENT_BRANCH_PREFIX: &str = "agent/";
+/// How many of the remote's branches the error about a missing branch names.
+const MAX_BRANCHES_LISTED: usize = 30;
 const META_VERSION: u32 = 1;
 const MAX_RUN_ID: usize = 128;
 
@@ -376,8 +378,10 @@ impl Workspaces {
         let base_ref = format!("{REMOTE_TRACKING_PREFIX}{}", repo.base_branch);
         if !self.inner.has_commit(&mirror, &base_ref).await? {
             return Err(WorkspaceError::NotFound(format!(
-                "branch {} does not exist on {}",
-                repo.base_branch, repo.url
+                "branch {} does not exist on {}. {}",
+                repo.base_branch,
+                repo.url,
+                self.inner.branches_said(&mirror).await
             )));
         }
         // What the worktree starts from: the base, or the branch it continues.
@@ -433,6 +437,40 @@ impl Workspaces {
             return Err(e);
         }
         Ok(self.inner.worktree(&meta, path, mirror))
+    }
+
+    /// The default branch of the repository at `repo_url`: what the remote's `HEAD` points at
+    /// (`git ls-remote --symref origin HEAD`), for a caller that was not told which branch to
+    /// start from. Nothing is checked out, and the mirror is created on first use like
+    /// [`prepare`](Self::prepare) does.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Invalid`] for a url the policy refuses,
+    /// [`WorkspaceError::NotFound`] when the remote has no `HEAD` that names a branch (an empty
+    /// repository), and the network and auth failures of `git ls-remote`.
+    #[tracing::instrument(skip(self))]
+    pub async fn default_branch(&self, repo_url: &str) -> WorkspaceResult<String> {
+        // Only the url matters here; the base branch is what the caller is asking for.
+        let repo = RepoRef::new(repo_url, "HEAD");
+        let loc = repo.locate()?;
+        self.inner.policy.check(&loc)?;
+        let mirror = self.inner.root.join(loc.mirror_relative());
+        let _guard = self.inner.lock_mirror(&mirror).await?;
+        self.inner.ensure_mirror(&repo, &loc, &mirror).await?;
+        let auth = self.inner.authorize(&repo, &loc).await?;
+        let out = self
+            .inner
+            .mirror_git(&mirror)
+            .args(["ls-remote", "--symref", "origin", "HEAD"])
+            .maybe_auth(auth)
+            .run()
+            .await?;
+        parse_symref_head(&out.stdout_text()).ok_or_else(|| {
+            WorkspaceError::NotFound(format!(
+                "{repo_url} has no default branch (is the repository empty?)"
+            ))
+        })
     }
 
     /// The worktree of `run`, if it exists on disk: how a restarted process
@@ -508,6 +546,17 @@ impl Workspaces {
             Err(e) => Err(WorkspaceError::io("cannot remove run metadata", e)),
         }
     }
+}
+
+/// The branch in the first line of `git ls-remote --symref origin HEAD`:
+/// `ref: refs/heads/<branch>\tHEAD`.
+fn parse_symref_head(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("ref: refs/heads/"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .filter(|b| !b.is_empty())
+        .map(str::to_owned)
 }
 
 impl Inner {
@@ -599,6 +648,55 @@ impl Inner {
         )
     }
 
+    /// The remote's branches as the last fetch saw them (`origin/*` of the mirror), sorted, the
+    /// symbolic `HEAD` left out.
+    async fn remote_branches(&self, mirror: &Path) -> WorkspaceResult<Vec<String>> {
+        let out = self
+            .mirror_git(mirror)
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                REMOTE_TRACKING_PREFIX,
+            ])
+            .run()
+            .await?;
+        Ok(out
+            .stdout_text()
+            .lines()
+            .filter_map(|r| r.strip_prefix(REMOTE_TRACKING_PREFIX))
+            .filter(|b| *b != "HEAD")
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// A sentence that lists the remote's branches (the first [`MAX_BRANCHES_LISTED`]), for the
+    /// error about a branch that is not there, so that a caller can pick one or ask.
+    async fn branches_said(&self, mirror: &Path) -> String {
+        match self.remote_branches(mirror).await {
+            Ok(branches) if branches.is_empty() => {
+                "The repository has no branches (is it empty?).".to_owned()
+            }
+            Ok(branches) => {
+                let more = branches.len().saturating_sub(MAX_BRANCHES_LISTED);
+                let mut said = format!(
+                    "Its branches: {}",
+                    branches
+                        .iter()
+                        .take(MAX_BRANCHES_LISTED)
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                if more > 0 {
+                    said.push_str(&format!(" (and {more} more)"));
+                }
+                said.push('.');
+                said
+            }
+            Err(_) => String::new(),
+        }
+    }
+
     /// `rev` names a commit in `mirror`.
     async fn has_commit(&self, mirror: &Path, rev: &str) -> WorkspaceResult<bool> {
         Ok(self
@@ -629,7 +727,8 @@ impl Inner {
             Ok(())
         } else {
             Err(WorkspaceError::Invalid(format!(
-                "{existing:?} is not a branch that can be continued: only branches named                  {AGENT_BRANCH_PREFIX}<...> that an agent pushed are"
+                "{existing:?} is not a branch that can be continued: only branches named \
+                 {AGENT_BRANCH_PREFIX}<...> that an agent pushed are"
             )))
         }
     }
@@ -913,5 +1012,20 @@ mod tests {
         for bad in ["", ".hidden", "..", "a/b", "a b", "a\nb", &"x".repeat(129)] {
             assert!(validate_run(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn the_default_branch_is_read_from_the_symref_line() {
+        assert_eq!(
+            parse_symref_head("ref: refs/heads/master\tHEAD\n0123abcd\tHEAD").as_deref(),
+            Some("master")
+        );
+        assert_eq!(
+            parse_symref_head("ref: refs/heads/feature/x\tHEAD").as_deref(),
+            Some("feature/x")
+        );
+        // An empty repository, or a detached HEAD, has no symref line.
+        assert_eq!(parse_symref_head(""), None);
+        assert_eq!(parse_symref_head("0123abcd\tHEAD"), None);
     }
 }

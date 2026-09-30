@@ -254,10 +254,11 @@ fn remote_branches(env: &Env) -> Vec<String> {
     names
 }
 
-/// A second run continues the branch a first one pushed: it starts from it, its own commits go to
-/// that very branch (so a pull request from it is updated), and no second branch appears.
+/// A second run continues the branch a first one pushed: it starts from it. Its own commits go to
+/// its own branch (`push`), and only `publish` moves the continued branch, so a pull request from
+/// it is updated when the caller says so and not before.
 #[tokio::test]
-async fn a_run_can_continue_a_pushed_branch_and_publishes_to_it() {
+async fn a_run_can_continue_a_pushed_branch_and_publishes_to_it_only_on_request() {
     let env = Env::new();
     let first = env.ws.prepare(&env.repo, "run-first-0001").await.unwrap();
     std::fs::write(first.path().join("first.txt"), "one\n").unwrap();
@@ -265,6 +266,13 @@ async fn a_run_can_continue_a_pushed_branch_and_publishes_to_it() {
     first.push().await.unwrap();
     let pushed = first.branch().to_owned();
     assert_eq!(pushed, "agent/run-firs");
+    assert_eq!(
+        first.continues(),
+        None,
+        "a run on its own branch continues nothing"
+    );
+    assert_eq!(first.local_branch(), pushed);
+    first.publish().await.unwrap();
 
     let second = env
         .ws
@@ -273,15 +281,15 @@ async fn a_run_can_continue_a_pushed_branch_and_publishes_to_it() {
         .unwrap();
     // It is the branch the pull request is opened from, and the work so far is in the worktree.
     assert_eq!(second.branch(), pushed);
+    assert_eq!(second.continues(), Some(pushed.as_str()));
+    assert_eq!(second.local_branch(), "agent/run-seco");
     assert_ne!(second.path(), first.path());
     assert_eq!(
         std::fs::read_to_string(second.path().join("first.txt")).unwrap(),
         "one\n"
     );
-    assert_eq!(
-        git(second.path(), &["rev-parse", "HEAD"]),
-        git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")])
-    );
+    let before = git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")]);
+    assert_eq!(git(second.path(), &["rev-parse", "HEAD"]), before);
     // What is checked out is the run's own branch: it cannot collide with the first worktree.
     assert_eq!(
         git(second.path(), &["symbolic-ref", "--short", "HEAD"]),
@@ -293,21 +301,33 @@ async fn a_run_can_continue_a_pushed_branch_and_publishes_to_it() {
     std::fs::write(second.path().join("second.txt"), "two\n").unwrap();
     let sha = second.commit_all("second", &me()).await.unwrap().unwrap();
     second.push().await.unwrap();
+    // The commit is on the remote, on the run's own branch; the continued branch has not moved.
+    assert_eq!(
+        git(&env.remote, &["rev-parse", "refs/heads/agent/run-seco"]),
+        sha
+    );
+    assert_eq!(
+        git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")]),
+        before,
+        "push leaves the continued branch where it was"
+    );
+    assert_eq!(
+        remote_branches(&env),
+        ["agent/run-firs", "agent/run-seco", "main"]
+    );
+    // Publishing moves it to the run's commit, as a fast-forward; repeating it is a no-op.
+    second.publish().await.unwrap();
+    second.publish().await.unwrap();
     assert_eq!(
         git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")]),
         sha,
         "the pushed branch moved"
     );
-    assert_eq!(
-        remote_branches(&env),
-        ["agent/run-firs", "main"],
-        "no branch of the second run's own was published"
-    );
-    // Pushing again is a no-op, and the upstream is the published branch.
+    // Pushing again is a no-op, and the upstream is the run's own branch.
     second.push().await.unwrap();
     assert_eq!(
         git(second.path(), &["rev-parse", "--abbrev-ref", "@{upstream}"]),
-        format!("origin/{pushed}")
+        "origin/agent/run-seco"
     );
     // The first worktree is untouched.
     assert!(!first.path().join("second.txt").exists());
@@ -473,13 +493,25 @@ async fn a_continued_branch_that_moved_on_the_remote_is_not_overwritten() {
     let theirs = git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")]);
 
     std::fs::write(second.path().join("c.txt"), "c\n").unwrap();
-    second.commit_all("c", &me()).await.unwrap().unwrap();
-    let err = second.push().await.unwrap_err();
-    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    let mine = second.commit_all("c", &me()).await.unwrap().unwrap();
+    // The run's own branch takes the commit; the continued one, which moved, refuses it.
+    second.push().await.unwrap();
+    let err = second.publish().await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Conflict(_)), "{err:?}");
+    assert!(!err.is_retryable());
+    assert!(
+        err.to_string().contains("moved on the remote") && err.to_string().contains(&pushed),
+        "{err}"
+    );
     assert_eq!(
         git(&env.remote, &["rev-parse", &format!("refs/heads/{pushed}")]),
         theirs,
         "never forced"
+    );
+    assert_eq!(
+        git(&env.remote, &["rev-parse", "refs/heads/agent/run-seco"]),
+        mine,
+        "the work is safe on the run's own branch"
     );
 }
 
@@ -840,6 +872,12 @@ async fn bad_inputs_are_reported_precisely() {
     let missing = RepoRef::new(env.repo.url.clone(), "no-such-branch");
     let err = env.ws.prepare(&missing, "run-err-0001").await.unwrap_err();
     assert!(matches!(err, WorkspaceError::NotFound(_)), "{err:?}");
+    // The error says which branches the repository has, so that a caller can pick one.
+    assert!(
+        err.to_string().contains("no-such-branch")
+            && err.to_string().contains("Its branches: main."),
+        "{err}"
+    );
     // Nothing half-made is left for the run.
     assert!(
         env.ws
@@ -1312,4 +1350,76 @@ async fn git_is_given_the_canonical_url_of_an_http_remote() {
     let config = std::fs::read_to_string(root.join(loc.mirror_relative()).join("config")).unwrap();
     let want = format!("url = {}/Octo/Widgets.git", server.uri());
     assert!(config.contains(&want), "{config}");
+}
+
+/// A repository whose default branch is not `main` (the owner's case: `master`): the caller that
+/// was not told a base branch asks the remote, and an unknown branch lists the real ones.
+#[tokio::test]
+async fn the_default_branch_is_the_remotes_and_a_missing_one_lists_the_branches() {
+    let env = Env::new();
+    assert_eq!(env.ws.default_branch(&env.repo.url).await.unwrap(), "main");
+    // The remote's HEAD moves to another branch.
+    git(&env.remote, &["branch", "master", "refs/heads/main"]);
+    git(&env.remote, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+    assert_eq!(
+        env.ws.default_branch(&env.repo.url).await.unwrap(),
+        "master"
+    );
+    // ...and the workspace can start from it.
+    let repo = RepoRef::new(env.repo.url.clone(), "master");
+    env.ws.prepare(&repo, "run-default-01").await.unwrap();
+
+    // Many branches: the first thirty by name, and the rest counted.
+    for n in 0..34 {
+        git(
+            &env.remote,
+            &["branch", &format!("topic-{n:02}"), "refs/heads/main"],
+        );
+    }
+    let gone = RepoRef::new(env.repo.url.clone(), "develop");
+    let err = env.ws.prepare(&gone, "run-default-02").await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::NotFound(_)), "{err:?}");
+    let said = err.to_string();
+    assert!(said.contains("develop"), "{said}");
+    assert!(
+        said.contains("master") && said.contains("topic-00"),
+        "{said}"
+    );
+    assert!(
+        said.contains("topic-27") && !said.contains("topic-28"),
+        "{said}"
+    );
+    assert!(said.contains("(and 6 more)"), "{said}");
+    // Branches of the agent's own are there too (a prior run's), not special.
+    assert!(!said.contains("HEAD"), "{said}");
+}
+
+/// An empty remote has no default branch, which is not an empty answer.
+#[tokio::test]
+async fn an_empty_remote_has_no_default_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote = tmp.path().join("empty.git");
+    std::fs::create_dir_all(&remote).unwrap();
+    git(
+        &remote,
+        &["init", "--bare", "--quiet", "--initial-branch=main"],
+    );
+    let ws = Workspaces::new(
+        tmp.path().join("workspaces"),
+        Arc::new(StaticToken::new(TOKEN)),
+    );
+    let err = ws
+        .default_branch(remote.to_str().unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::NotFound(_)), "{err:?}");
+    assert!(err.to_string().contains("no default branch"), "{err}");
+    // A refused url is refused before anything runs.
+    let closed = Workspaces::new(tmp.path().join("w2"), Arc::new(StaticToken::new(TOKEN)))
+        .allow_local(false);
+    let err = closed
+        .default_branch(remote.to_str().unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
 }

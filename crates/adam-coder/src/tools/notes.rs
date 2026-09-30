@@ -64,7 +64,13 @@ pub struct PullRequestNote {
     pub red_checks_accepted: bool,
 }
 
-/// A branch that a `commit_and_push` of this conversation pushed, as that tool's result said it.
+/// A branch that work of this conversation was pushed for: the branch a pull request for that work
+/// is (or will be) opened from, and what a later task may continue. For a run that continued a
+/// branch it is that branch (the line of work), not the run's own `agent/<run>` the commits were
+/// pushed to first.
+///
+/// Written by `commit_and_push` itself, in the notes of the run that pushed; a run that continues
+/// another inherits the ones of the run it continues (see `CoderAgent`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PushedBranch {
     /// The repository, as a [`named`](super::named) key.
@@ -95,11 +101,19 @@ pub struct RunNotes {
     /// the agent before each step from the conversation, never from what the model says.
     #[serde(default)]
     pub named_repos: Vec<String>,
-    /// The branches that earlier tasks of this conversation pushed (the `commit_and_push` results
-    /// in the carried history), which `prepare_workspace` may continue with its `branch`. Filled by
-    /// the agent before each step from what the tool reported, never from what the model says.
+    /// The branches that this run and the earlier tasks of the conversation pushed work for, which
+    /// `prepare_workspace` may continue with its `branch`. `commit_and_push` writes its own; the
+    /// agent adds, before each step, the ones in the notes of the run this one continues (and,
+    /// when those notes are not there, the ones the tool's own result text reports, see
+    /// `publish::pushed_in`). Never from what the model says.
     #[serde(default)]
     pub pushed_branches: Vec<PushedBranch>,
+    /// The pushed branch this run continues (`prepare_workspace`'s `branch`), once its workspace
+    /// is prepared: the commits go to the run's own branch, and this one is moved to them only by
+    /// `open_pull_request`, after its gate. The verdict of a run that ends without a pull request
+    /// says that this branch (and so its pull request) was not updated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<String>,
 }
 
 impl RunNotes {
@@ -200,6 +214,22 @@ impl NotesStore {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RunNotes::default()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The notes of `run`, or `None` when none were ever written for it (another worker's volume,
+    /// a purged directory, a run that never took a step).
+    ///
+    /// # Errors
+    ///
+    /// I/O errors, or a file that is not valid notes.
+    pub async fn load_existing(&self, run: &str) -> io::Result<Option<RunNotes>> {
+        match tokio::fs::read(self.path(run)?).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }

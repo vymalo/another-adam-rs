@@ -91,6 +91,7 @@ impl GitHub {
             .request(Method::GET, &format!("/repos/{owner}/{name}/pulls"), token)
             .query(&[
                 ("head", format!("{head_owner}:{branch}")),
+                ("base", repo.base_branch.clone()),
                 ("state", "open".to_owned()),
                 ("per_page", "100".to_owned()),
             ])
@@ -99,12 +100,17 @@ impl GitHub {
             .map_err(|e| transport(e, token))?;
         let resp = check(resp, token).await?;
         let pulls: Vec<ApiPull> = resp.json().await.map_err(|e| decode_error(e, token))?;
-        // The API filters by `owner:branch`; double-check the branch so a
-        // lenient server (or mock) cannot make us return somebody else's PR.
-        // A PR without a `head` cannot be proven to be ours, so it never matches.
+        // The API filters by `owner:branch` and base; double-check both so a lenient server (or
+        // mock) cannot make us return somebody else's PR, or one against another base branch.
+        // A PR without a `head` or a `base` cannot be proven to be ours, so it never matches.
         Ok(pulls
             .into_iter()
-            .find(|p| p.head.as_ref().is_some_and(|h| h.branch == branch))
+            .find(|p| {
+                p.head.as_ref().is_some_and(|h| h.branch == branch)
+                    && p.base
+                        .as_ref()
+                        .is_some_and(|b| b.branch == repo.base_branch)
+            })
             .map(|p| p.into_pull_request(branch)))
     }
 }
@@ -161,6 +167,29 @@ impl CodeHost for GitHub {
         let token = self.creds.token_for(repo).await?;
         self.find(&token, repo, head).await
     }
+
+    #[tracing::instrument(skip(self, body), fields(repo = %repo.url, number))]
+    async fn comment_on_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<(), WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        let (owner, name) = slug(repo)?;
+        // Pull requests are issues for comments.
+        let resp = self
+            .request(
+                Method::POST,
+                &format!("/repos/{owner}/{name}/issues/{number}/comments"),
+                &token,
+            )
+            .json(&json!({ "body": body }))
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        check(resp, &token).await.map(|_| ())
+    }
 }
 
 #[derive(Deserialize)]
@@ -168,8 +197,10 @@ struct ApiPull {
     number: u64,
     html_url: String,
     head: Option<ApiHead>,
+    base: Option<ApiHead>,
 }
 
+/// One end of a pull request: `head` or `base`.
 #[derive(Deserialize)]
 struct ApiHead {
     #[serde(rename = "ref")]

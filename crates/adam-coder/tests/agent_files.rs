@@ -77,7 +77,7 @@ async fn the_prompt_carries_the_rules_the_code_relies_on() {
         // The rule that lets a rework update the same pull request (`prepare_workspace`'s
         // `branch`, which the tool only accepts for a branch this conversation pushed).
         "`branch` set to the branch `commit_and_push` reported",
-        "you do not open another",
+        "`open_pull_request` at the end, and it reports (and updates)",
     ] {
         assert!(text.contains(needle), "prompt lost: {needle}");
     }

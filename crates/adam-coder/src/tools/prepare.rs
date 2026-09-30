@@ -1,4 +1,4 @@
-//! `prepare_workspace { repo_url, base_branch, branch? }`.
+//! `prepare_workspace { repo_url, base_branch?, branch? }`.
 
 use adam::prelude::*;
 use adam_workspace::RepoRef;
@@ -7,10 +7,12 @@ use super::named::{key_of_argument, listed};
 use super::notes::RunNotes;
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
-/// Branch used when the model leaves `base_branch` out.
-const DEFAULT_BASE_BRANCH: &str = "main";
-
 // Checks the repository out into this run's worktree.
+//
+// `base_branch` is optional: without it the worktree starts from the repository's own default
+// branch (what the remote's `HEAD` names), so a repository whose default is `master` needs no
+// guess. A branch that does not exist is reported with the branches that do (the workspace
+// lists the first thirty), so that the model can pick one or ask.
 //
 // The run id is the workspace's run key, so a restarted or retried call finds
 // the worktree it already made (`Workspaces::prepare` is idempotent per run)
@@ -29,22 +31,20 @@ const DEFAULT_BASE_BRANCH: &str = "main";
 // limits: an `agent/*` branch that exists on the remote, pushed without force.
 
 /// Check the repository out into your private worktree, on a fresh branch
-/// created from origin/<base_branch>. Call it once, first. Calling it again
+/// created from origin/<base_branch>, which is the repository's default branch
+/// when you leave base_branch out. Call it once, first. Calling it again
 /// for the same repository is harmless and keeps your changes. It works only on
 /// a repository the person named in their messages: otherwise it refuses, and
 /// you ask the person which one with ask_user. To carry on with work an earlier
 /// task of this conversation pushed (a rework, a follow-up), pass that branch as
-/// `branch`: the worktree starts from it and your pushes update its pull request.
+/// `branch`: the worktree starts from it and open_pull_request updates its pull request.
 #[tool]
 pub async fn prepare_workspace(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
     /// https://github.com/<owner>/<repo>
     repo_url: String,
-    // Optional for the code (a missing or empty branch means `main`), but the model is told it is
-    // required: it must say which branch the pull request goes against.
-    /// Branch to start from and to open the pull request against, e.g. main
-    #[schemars(required)]
+    /// Branch to start from and to open the pull request against, e.g. main. Leave out for the repository's default branch.
     base_branch: Option<String>,
     /// A branch that commit_and_push reported earlier in this conversation (agent/...), to carry on with it and update its pull request. Leave out to start a new branch.
     branch: Option<String>,
@@ -52,11 +52,15 @@ pub async fn prepare_workspace(
     let Some(url) = non_empty(&repo_url) else {
         return Ok(ToolOutput::error("repo_url is required"));
     };
-    let base = base_branch
-        .as_deref()
-        .and_then(non_empty)
-        .unwrap_or(DEFAULT_BASE_BRANCH);
     let run = ctx.run_id().to_string();
+    let base = match base_branch.as_deref().and_then(non_empty) {
+        Some(base) => base.to_owned(),
+        None => match default_base(&env, ctx, url).await {
+            Ok(base) => base,
+            Err(outcome) => return outcome,
+        },
+    };
+    let base = base.as_str();
     let continuing = branch.as_deref().and_then(non_empty);
     // An argument the workspace cannot read (not a URL or an absolute path) is its error to
     // report, below; every other one must be a repository of the person's.
@@ -96,6 +100,7 @@ pub async fn prepare_workspace(
         Some(branch) => env.workspaces.prepare_continuing(&repo, &run, branch).await,
         None => env.workspaces.prepare(&repo, &run).await,
     };
+
     let wt = match prepared {
         Ok(wt) => wt,
         Err(
@@ -108,6 +113,17 @@ pub async fn prepare_workspace(
         }
         Err(e) => return Err(env.delivery_error(ctx, &e).await),
     };
+    if let Some(line) = wt.continues() {
+        // What the verdict of a run that ends without a pull request says was not updated.
+        let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+        if notes.continues.as_deref() != Some(line) {
+            notes.continues = Some(line.to_owned());
+            env.notes
+                .save(&run, &notes)
+                .await
+                .map_err(|e| notes_error(&e))?;
+        }
+    }
     let mut text = format!(
         "Worktree ready.\nrepository: {url}\nbase branch: {base}\nbranch: {}\npath: {}",
         wt.branch(),
@@ -115,12 +131,37 @@ pub async fn prepare_workspace(
     );
     if continuing.is_some() {
         text.push_str(&format!(
-            "\nThis is the branch an earlier task pushed: its work is in the worktree, and \
-             commit_and_push adds to {} (and so to its pull request).",
+            "\nThis continues {0}, the branch an earlier task pushed: its work is in the \
+             worktree. commit_and_push pushes to a branch of this run's own; once the checks \
+             have passed, open_pull_request moves {0} to that commit, which updates its pull \
+             request.",
             wt.branch()
         ));
     }
     Ok(ToolOutput::text(text))
+}
+
+/// The branch to start from when the model gave none: the one this run's workspace already uses
+/// for `url` (a repeated call needs no network), else the remote's default branch.
+async fn default_base(env: &ToolEnv, ctx: &ToolCtx, url: &str) -> Result<String, Outcome> {
+    if let Ok(Some(existing)) = env
+        .workspaces
+        .open_existing(&ctx.run_id().to_string())
+        .await
+        && existing.repo().url == url
+    {
+        return Ok(existing.repo().base_branch.clone());
+    }
+    match env.workspaces.default_branch(url).await {
+        Ok(base) => Ok(base),
+        Err(
+            e @ (adam_workspace::WorkspaceError::Invalid(_)
+            | adam_workspace::WorkspaceError::NotFound(_)),
+        ) => Err(Ok(ToolOutput::error(format!(
+            "{e} Pass base_branch, or ask the person which branch to start from with ask_user."
+        )))),
+        Err(e) => Err(Err(env.delivery_error(ctx, &e).await)),
+    }
 }
 
 /// What the model is told when it asks to continue a branch that no `commit_and_push` of this

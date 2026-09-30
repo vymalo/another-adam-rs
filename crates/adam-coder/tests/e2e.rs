@@ -1032,8 +1032,19 @@ async fn a_second_task_continues_the_first_tasks_branch_and_pull_request(store: 
     );
     assert_ne!(second.task_id, first.task_id, "a new task");
 
-    // One branch, one pull request, both tasks' work in it.
-    assert_eq!(fx.agent_branches(), std::slice::from_ref(&branch));
+    // One pull request, both tasks' work in its branch. The second task pushed to a branch of its
+    // own first, and open_pull_request moved the continued branch to that commit.
+    let own: Vec<String> = fx
+        .agent_branches()
+        .into_iter()
+        .filter(|b| *b != branch)
+        .collect();
+    assert_eq!(own.len(), 1, "{:?}", fx.agent_branches());
+    assert_eq!(
+        fx.file_on(&own[0], "two.txt"),
+        "two",
+        "the second task's own branch"
+    );
     assert_eq!(fx.commits_ahead(&branch), 2);
     assert_eq!(fx.file_on(&branch, "hello.txt"), "hello");
     assert_eq!(fx.file_on(&branch, "two.txt"), "two");
@@ -1074,15 +1085,98 @@ async fn a_second_task_continues_the_first_tasks_branch_and_pull_request(store: 
     let results = tool_results(&requests.last().unwrap().messages);
     let by_id = |id: &str| results.iter().find(|(c, _, _)| c == id).unwrap().clone();
     assert!(
-        by_id("d1").1.contains("earlier task pushed"),
+        by_id("d1").1.contains("the branch an earlier task pushed"),
         "{:?}",
         by_id("d1")
     );
     assert!(
-        by_id("d4").1.contains("was already open"),
+        by_id("d3").1.contains("has not been changed"),
+        "{:?}",
+        by_id("d3")
+    );
+    assert!(
+        by_id("d4").1.contains("was already open") && by_id("d4").1.contains("now carries"),
         "{:?}",
         by_id("d4")
     );
+}
+
+/// A rework whose checks never go green ends `failed`, says that the pull request of the branch it
+/// continued was **not updated** (and not that none was opened), and the branch, with its pull
+/// request, is exactly where the first task left it.
+async fn a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone(
+    store: DynStore,
+) {
+    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 1).await;
+    let mock = Arc::new(MockModel::new());
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let mut first_message = user(&format!(
+        "In {} (base branch main), add hello.txt.",
+        fx.remote_url()
+    ));
+    first_message.context_id = Some("ctx-red-rework".into());
+    let first = run_message(&server, first_message).await;
+    assert_eq!(
+        first.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        first.labels
+    );
+    let branch = fx.agent_branches()[0].clone();
+    let verified = fx.file_on(&branch, "hello.txt");
+    let tip = |b: &str| common::git(&fx.remote, &["rev-parse", &format!("refs/heads/{b}")]);
+    let tip_before = tip(&branch);
+
+    mock.push_tool_calls(vec![call(
+        "d1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main", "branch": branch}),
+    )])
+    .push_tool_calls(vec![call(
+        "d2",
+        "run_checks",
+        json!({"command": "echo two > two.txt; echo 'two is unverified'; exit 1"}),
+    )])
+    // The model pushes anyway, and asks for the pull request: the cycle budget is spent.
+    .push_tool_calls(vec![
+        call("d3", "commit_and_push", json!({"message": "fix: two"})),
+        call(
+            "d4",
+            "open_pull_request",
+            json!({"title": "t", "body": "b", "accept_red_checks": true}),
+        ),
+    ])
+    .push_text("The checks still fail.");
+    let second = run_message(
+        &server,
+        follow_up("Also add two.txt.", "ctx-red-rework", &first.task_id),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        second.last_state,
+        Some(TaskState::Failed),
+        "{:?}",
+        second.labels
+    );
+    assert!(
+        second.saw_message(&format!("the pull request for {branch} was not updated")),
+        "{:#?}",
+        second.messages
+    );
+    assert!(
+        !second.saw_message("no pull request was opened"),
+        "that would be untrue of the pull request of the branch: {:#?}",
+        second.messages
+    );
+    // Nothing reached the branch the pull request is for.
+    assert_eq!(tip(&branch), tip_before);
+    assert_eq!(fx.file_on(&branch, "hello.txt"), verified);
+    assert_eq!(fx.commits_ahead(&branch), 1);
+    assert_eq!(fx.created_pulls().await.len(), 1);
+    assert!(fx.comments().await.is_empty());
 }
 
 /// In a task that continues another, what the person said in the first task is named, and what only
@@ -2613,6 +2707,7 @@ macro_rules! coder_suite {
                 another_caller_cannot_see_or_resume_the_task,
                 a_second_task_continues_the_first_tasks_branch_and_pull_request,
                 a_continued_task_refuses_what_only_the_model_or_a_fence_mentions,
+                a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone,
             );
         }
     };
