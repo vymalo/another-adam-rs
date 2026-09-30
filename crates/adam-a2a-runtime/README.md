@@ -91,10 +91,12 @@ not.
   an index to whoever holds it next**: keep the list append-only, or drop the contexts, when a holder changes.
   The **anonymous** caller (`Caller::ANONYMOUS`, authentication off) is every client at once, so a message from
   it **never continues anything**: references are ignored (debug log) and the task starts fresh.
-* **What the operator sees.** A request that named references and got no continuation from any leaves one
+* **What the operator sees.** A request that named references and **started a fresh task** anyway leaves one
   `info` line (`none of the referenceTaskIds could be continued`) with `given` and a count per reason
   (`malformed`, `unknown`, `not_the_callers`, `other_context`, `open`, `unreadable`, `over_limit`), and never an
-  id of another caller's task. At `debug` each reference is shown escaped (`{:?}`) and cut to 48 characters.
+  id of another caller's task. `start_or_join` says it once, after the start that settled the outcome: not
+  when a reference was continued, not when the message was delivered to the open task of its context, not
+  again when a busy conversation made the request pick twice, and not for a repeat of the request. At `debug` each reference is shown escaped (`{:?}`) and cut to 48 characters.
 
 An agent only continues if it overrides `init_continuing` (`LlmAgent`, `LlmStarter`, and the coder's
 `CoderAgent` and `CoderStarter` do); the default is `init`, and a wrapper must forward it. The decision, the rejected alternatives and the state diagram are in

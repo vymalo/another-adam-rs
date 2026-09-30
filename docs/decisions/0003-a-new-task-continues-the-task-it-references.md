@@ -18,7 +18,10 @@ the turn the next message follows up on before any old turn was touched); the fi
 to its task before a marker is added, so the marker is always its second part (a first message of
 `[task, next]` with nothing omitted used to put the marker third, where the real marker counted as the
 person's text, a lookalike part was skipped, and the next continuation stacked a second marker or cut
-the user's own part); text-only content with several parts goes to the model as one string.
+the user's own part); text-only content with several parts goes to the model as one string; the
+operator's `info` line about references that continued nothing is said once per request, for the
+outcome it really had (it was said on every pick, and for messages delivered to an open task, where a
+reference means nothing).
 
 *Amended 2026-09-30, second review (branch continuation):* a continued branch is reached only
 through the checks gate. The first version pushed a continuing run's commits straight to the
@@ -161,11 +164,15 @@ out: this is not one of ADR 0001's host extensions and needs no capability detec
      keep the list append-only (or drop the contexts) when a holder changes. The **anonymous** caller
      (authentication off, local development) is every client of the server at once, so a message from it
      **never continues anything**: its references are ignored (debug log) and the task starts fresh.
-   * **What the operator sees.** A request that named references and got no continuation from any of them
+   * **What the operator sees.** A request that named references and **started a fresh task** anyway
      leaves one `info` line with the number given and a count per reason (malformed, unknown, not the
      caller's, other context, open, unreadable, beyond the limit of eight): never an id of another
-     caller's task. An unreadable record of the caller's own also gets a `warn`. At `debug` each reference
-     is shown with `{:?}` (escaped) and cut to 48 characters, since it is client input.
+     caller's task. The line is said once, by `start_or_join`, for the outcome the request really had:
+     picking is silent, so a request that is picked again (the conversation was busy), is delivered to
+     the open task of its context (a reference means nothing there) or repeats an earlier one does not
+     repeat the line, and one whose chosen run is purged or unreadable at the start counts that too.
+     An unreadable record of the caller's own also gets a `warn`. At `debug` each reference is shown
+     with `{:?}` (escaped) and cut to 48 characters, since it is client input.
    * An **open** referenced task (`working`, `input-required`) is not continued: a message for the
      context goes to its open task as it always did (one open run per conversation), reference or not.
      If that task finishes between the two steps (the conversation was busy, the open task is gone by
@@ -188,7 +195,7 @@ sequenceDiagram
         B->>DB: load_run(reference), the raw record
         Note over B: skip it unless it is this agent's, this caller's,<br/>in c1 and terminal, and only then decode its state<br/>(unreadable: skip and warn). Anonymous: no loop at all
     end
-    Note over B: none qualified and some given: one info line with counts
+    Note over B: a fresh task started though some were given: one info line with counts
     B->>R: start_with_id_continuing(task_id_for(m2), agent, input, conversation, t1)
     R->>DB: load_run(t1), decode the agent state
     R->>R: starter.init_continuing(input, prior state, t1)
@@ -208,7 +215,7 @@ stateDiagram-v2
     Examined --> Skipped: still open
     Examined --> Skipped: the caller's own, but unreadable (warn)
     Skipped --> Examined: another reference is left
-    Skipped --> Fresh: none left (one info line)
+    Skipped --> Fresh: none left (one info line, when the task starts)
     Examined --> Continued: terminal, same caller, same context, readable
     Fresh --> [*]: start_with_id, nothing carried
     Continued --> [*]: start_with_id_continuing from that run

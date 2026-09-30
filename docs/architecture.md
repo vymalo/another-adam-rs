@@ -754,7 +754,7 @@ sequenceDiagram
         B->>R: view(reference), only for one that passed
         Note over B,R: a state that does not decode: warn, next reference
     end
-    Note over B: none qualified, some given: one info line with counts
+    Note over B: a fresh task started though some were given: one info line with counts
     alt a reference qualifies (t1)
         B->>R: start_with_id_continuing(task_id_for(...), agent, inbound, conversation, t1)
         R->>DB: load_run(run id): a repeat answers false here

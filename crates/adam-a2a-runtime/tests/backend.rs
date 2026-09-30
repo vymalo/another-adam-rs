@@ -1893,6 +1893,67 @@ impl Logs {
     }
 }
 
+/// How many lines say that references continued nothing.
+fn unmatched_lines(text: &str) -> usize {
+    text.lines()
+        .filter(|l| l.contains("none of the referenceTaskIds could be continued"))
+        .count()
+}
+
+/// The line is for a request that started a fresh task though it named references, and it is said
+/// once: not when the message is delivered to the open task of its context (where a reference
+/// means nothing), not when a reference was continued, and not again for a repeat of the request.
+#[tokio::test]
+async fn the_line_about_references_that_continued_nothing_is_said_once_for_the_real_outcome() {
+    let rig = Rig::new();
+    let worker = rig.worker();
+    let nowhere = RunId::new().to_string();
+
+    // Delivered to the open task of the context: no line.
+    let open = send(&rig, &alice(), "[input]", Some("c1"), &[]).await;
+    wait_state(&rig, &alice(), &open.id, TaskState::InputRequired).await;
+    let (logs, guard) = Logs::capture(tracing::Level::INFO);
+    let delivered = send(&rig, &alice(), "red", Some("c1"), &[nowhere.as_str()]).await;
+    drop(guard);
+    assert_eq!(delivered.id, open.id, "it joined the open task");
+    assert_eq!(unmatched_lines(&logs.text()), 0, "{}", logs.text());
+    wait_state(&rig, &alice(), &open.id, TaskState::Completed).await;
+
+    // A reference that was continued: no line.
+    let (logs, guard) = Logs::capture(tracing::Level::INFO);
+    let next = send(&rig, &alice(), "again", Some("c1"), &[open.id.as_str()]).await;
+    drop(guard);
+    assert_eq!(unmatched_lines(&logs.text()), 0, "{}", logs.text());
+    wait_state(&rig, &alice(), &next.id, TaskState::Completed).await;
+
+    // A fresh task though a reference was named: one line. The same request again (the same
+    // message id) finds its task and says nothing more.
+    let mut message = user_refs("fresh", &[nowhere.as_str()]);
+    message.message_id = "m-fresh".into();
+    let (logs, guard) = Logs::capture(tracing::Level::INFO);
+    let first = rig
+        .backend
+        .submit(alice(), message.clone(), None, Some("c2".into()))
+        .await
+        .unwrap();
+    assert_eq!(unmatched_lines(&logs.text()), 1, "{}", logs.text());
+    let repeat = rig
+        .backend
+        .submit(alice(), message, None, Some("c2".into()))
+        .await
+        .unwrap();
+    drop(guard);
+    assert_eq!(repeat.id, first.id, "a repeat, not a second task");
+    assert_eq!(
+        unmatched_lines(&logs.text()),
+        1,
+        "the repeat said nothing: {}",
+        logs.text()
+    );
+    wait_state(&rig, &alice(), &first.id, TaskState::Completed).await;
+    worker.stop().await;
+}
+
 /// A request that named references and got no continuation from any leaves one line at the
 /// default level with a count per reason, and not one id of another caller's task; at debug the
 /// references are shown escaped and cut short.

@@ -92,9 +92,13 @@ pub const MAX_REFERENCES: usize = 8;
 /// that never existed, so a reference is no way to learn whether another caller's task exists.
 /// The record is judged from its raw fields (agent, conversation, status) before its state is
 /// decoded, so a record the caller does not own is never decoded and cannot fail the request; one
-/// of the caller's own that does not decode is skipped with a warning. The operator sees one line
-/// per request that named references and got none, with a count per reason (never the ids of
-/// other callers' tasks). Without any usable reference the task starts from nothing, as before:
+/// of the caller's own that does not decode is skipped with a warning. The operator sees **one
+/// `info` line per request that named references and started a fresh task anyway**, with a count
+/// per reason (never the ids of other callers' tasks). It is said once, for the outcome the
+/// request really had: not when a reference was continued, not when the message was delivered to
+/// the open task of its context (a reference means nothing there), and not again when a busy
+/// conversation made the request pick a second time; a repeat of a request (same `messageId`)
+/// says nothing either. Without any usable reference the task starts from nothing, as before:
 /// the backend never guesses "the latest task of the context". Repeating a request (same
 /// `messageId`) is idempotent as ever.
 ///
@@ -243,49 +247,51 @@ impl RuntimeTaskBackend {
     /// it is decoded, so a record the caller does not own is never read, and cannot fail the
     /// request. The caller is the authenticated subject: the anonymous one is every client of an
     /// unauthenticated server at once, and continues nothing.
+    ///
+    /// Nothing is logged at `info` here: a request may pick more than once (the conversation was
+    /// busy and is picked again) or end up delivered to an open task, where a reference means
+    /// nothing. The [`Pick`] carries what was skipped, and [`start_or_join`](Self::start_or_join)
+    /// says it once, for the outcome the request really had.
     async fn continued_run(
         &self,
         caller: &Caller,
         message: &Message,
         context_id: Option<&str>,
-    ) -> Result<Option<RunId>, BackendError> {
+    ) -> Result<Pick, BackendError> {
         let references = message.reference_task_ids.as_deref().unwrap_or_default();
         if references.is_empty() {
-            return Ok(None);
+            return Ok(Pick::default());
         }
         if caller.subject == Caller::ANONYMOUS {
             tracing::debug!(
                 given = references.len(),
                 "referenceTaskIds are not honoured for the anonymous caller, which is shared by all; the task starts fresh"
             );
-            return Ok(None);
+            return Ok(Pick::default());
         }
         let mut skipped = Skipped {
+            given: references.len(),
             over_limit: references.len().saturating_sub(MAX_REFERENCES),
             ..Skipped::default()
         };
         for reference in references.iter().take(MAX_REFERENCES) {
             match self.judge(caller, reference, context_id).await? {
-                Verdict::Continue(run) => return Ok(Some(run)),
+                Verdict::Continue(run) => {
+                    return Ok(Pick {
+                        run: Some(run),
+                        skipped: Some(skipped),
+                    });
+                }
                 Verdict::Skip(why) => {
                     tracing::debug!(reference = ?shown(reference), ?why, "a referenced task is skipped");
                     skipped.count(why);
                 }
             }
         }
-        // The client is told nothing; the operator can see that it asked, and why it got nothing.
-        tracing::info!(
-            given = references.len(),
-            malformed = skipped.malformed,
-            unknown = skipped.unknown,
-            not_the_callers = skipped.not_the_callers,
-            other_context = skipped.other_context,
-            open = skipped.open,
-            unreadable = skipped.unreadable,
-            over_limit = skipped.over_limit,
-            "none of the referenceTaskIds could be continued; the task starts fresh"
-        );
-        Ok(None)
+        Ok(Pick {
+            run: None,
+            skipped: Some(skipped),
+        })
     }
 
     /// Whether one reference can be continued, from the raw record first: its agent, its
@@ -348,7 +354,10 @@ impl RuntimeTaskBackend {
         inbound: adam_runtime::Inbound,
         context_id: Option<String>,
     ) -> Result<(RunId, String), BackendError> {
-        let mut prior = self
+        let Pick {
+            run: mut prior,
+            skipped: mut tally,
+        } = self
             .continued_run(caller, message, context_id.as_deref())
             .await?;
         // Without a message id there is nothing to recognise a repeat by.
@@ -370,6 +379,10 @@ impl RuntimeTaskBackend {
             let run = match started {
                 // The run it continued was purged in the meantime: there is nothing to continue.
                 Err(e) if prior_is_gone(&e, prior) => {
+                    prior = None;
+                    if let Some(tally) = tally.as_mut() {
+                        tally.count(why_gone(&e));
+                    }
                     self.runtime
                         .start(&self.agent, inbound, Some(&conversation))
                         .await
@@ -377,6 +390,7 @@ impl RuntimeTaskBackend {
                 other => other,
             }
             .map_err(map_err)?;
+            say_fresh(prior, tally.as_ref());
             return Ok((run, context));
         }
         let run = task_id_for(
@@ -407,7 +421,10 @@ impl RuntimeTaskBackend {
                 }
             };
             match started {
-                Ok(true) => return Ok((run, context)),
+                Ok(true) => {
+                    say_fresh(prior, tally.as_ref());
+                    return Ok((run, context));
+                }
                 Ok(false) => {
                     // A repeat: the task exists, and its context is the one it
                     // was created with (a request without `contextId` got a
@@ -420,7 +437,12 @@ impl RuntimeTaskBackend {
                 }
                 // The run it continued was purged or became unreadable in the meantime: there is
                 // nothing to continue.
-                Err(e) if prior_is_gone(&e, prior) => prior = None,
+                Err(e) if prior_is_gone(&e, prior) => {
+                    prior = None;
+                    if let Some(tally) = tally.as_mut() {
+                        tally.count(why_gone(&e));
+                    }
+                }
                 Err(RuntimeError::ConversationBusy { .. }) => {
                     let open = self
                         .runtime
@@ -439,9 +461,10 @@ impl RuntimeTaskBackend {
                     // The open task was gone or finished by the time it was looked at, and the
                     // task that just finished may be the one this message references (it was open,
                     // so it was skipped): pick again instead of starting from nothing.
-                    prior = self
+                    let again = self
                         .continued_run(caller, message, context_id.as_deref())
                         .await?;
+                    (prior, tally) = (again.run, again.skipped);
                 }
                 Err(e) => return Err(map_err(e)),
             }
@@ -456,6 +479,15 @@ impl RuntimeTaskBackend {
             .map_err(map_err)?
             .ok_or_else(|| BackendError::TaskNotFound(run.to_string()))
     }
+}
+
+/// What picking the run to continue found: the run, if a reference qualified, and what was
+/// skipped on the way (`None` when the message named no reference, or the caller is anonymous,
+/// which honours none).
+#[derive(Default)]
+struct Pick {
+    run: Option<RunId>,
+    skipped: Option<Skipped>,
 }
 
 /// What [`RuntimeTaskBackend::judge`] made of a reference.
@@ -485,6 +517,7 @@ enum Why {
 /// continued.
 #[derive(Default)]
 struct Skipped {
+    given: usize,
     malformed: usize,
     unknown: usize,
     not_the_callers: usize,
@@ -504,6 +537,38 @@ impl Skipped {
             Why::Open => &mut self.open,
             Why::Unreadable => &mut self.unreadable,
         } += 1;
+    }
+}
+
+/// The one line for a request that named references and **started a fresh task** anyway: what it
+/// asked, and why none could be continued. Said once per request, by
+/// [`start_or_join`](RuntimeTaskBackend::start_or_join), after the start that settled the outcome:
+/// not when a run was continued, not when the message was delivered to the open task of its
+/// context (where a reference means nothing), and not again when a busy conversation made the
+/// request pick a second time. The client is told nothing; the operator sees that it asked.
+fn say_fresh(continued: Option<RunId>, tally: Option<&Skipped>) {
+    let (None, Some(skipped)) = (continued, tally) else {
+        return;
+    };
+    tracing::info!(
+        given = skipped.given,
+        malformed = skipped.malformed,
+        unknown = skipped.unknown,
+        not_the_callers = skipped.not_the_callers,
+        other_context = skipped.other_context,
+        open = skipped.open,
+        unreadable = skipped.unreadable,
+        over_limit = skipped.over_limit,
+        "none of the referenceTaskIds could be continued; the task starts fresh"
+    );
+}
+
+/// Why the run a start was to continue turned out not to be continuable after all (see
+/// [`prior_is_gone`]): purged, or unreadable.
+fn why_gone(error: &RuntimeError) -> Why {
+    match error {
+        RuntimeError::Corrupt { .. } => Why::Unreadable,
+        _ => Why::Unknown,
     }
 }
 
