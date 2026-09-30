@@ -379,6 +379,22 @@ impl Conversation {
         }
     }
 
+    /// Whether text part `part` of message `message` is the marker that says turns were left out
+    /// ([`omitted_turns`](Self::omitted_turns)): the second part of the first message, while turns
+    /// have been omitted. Anything else that merely starts like the marker is not one, so a rule
+    /// that reads what the user said can skip exactly the marker and nothing the user wrote.
+    #[must_use]
+    pub fn is_omission_marker(&self, message: usize, part: usize) -> bool {
+        self.omitted_turns > 0
+            && message == 0
+            && part == 1
+            && matches!(
+                self.messages.first(),
+                Some(Message::User { content })
+                    if content.get(1).is_some_and(|p| p.as_text().starts_with(OMITTED_MARKER_PREFIX))
+            )
+    }
+
     /// The conversation of a new run that carries on this one (the run `from`) with one more
     /// user message: what [`LlmAgent`](crate::LlmAgent) and [`LlmStarter`](crate::LlmStarter)
     /// start a run with when the runtime says it continues another.
@@ -1157,6 +1173,22 @@ mod tests {
             ["task", lookalike.as_str(), "more"]
         );
         assert_eq!(twice.omitted_turns, 0);
+    }
+
+    #[test]
+    fn only_the_marker_is_the_marker() {
+        let next = convo(turns(6, 1_000)).continued_within("next", RunId::new(), 1_200);
+        assert!(next.omitted_turns > 0);
+        assert!(next.is_omission_marker(0, 1));
+        // The task, and the message that follows the marker, are the user's.
+        assert!(!next.is_omission_marker(0, 0));
+        assert!(!next.is_omission_marker(0, 2));
+        assert!(!next.is_omission_marker(1, 1));
+        // Without omitted turns nothing is a marker, whatever it says.
+        let lookalike = format!("{OMITTED_MARKER_PREFIX} by me]");
+        let once = convo(vec![Message::user_text("task")]).continued(lookalike, RunId::new());
+        assert_eq!(once.omitted_turns, 0);
+        assert!(!once.is_omission_marker(0, 1));
     }
 
     #[test]
