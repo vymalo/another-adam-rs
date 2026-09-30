@@ -796,6 +796,13 @@ What the diagram cannot say:
   kept. Adjacent user messages become one message with several text parts, so the roles alternate.
 * **The new run is an ordinary run**: a new id, its own journal and limits, its own worktree. Only its
   first state comes from the old run.
+* **The coder carries the work on, not only the words.** `CoderAgent` and `CoderStarter` forward
+  `init_continuing`. The repository rule reads the person's messages of the whole carried conversation, part
+  by part, without the omission marker. A rework can check out the branch an earlier task pushed
+  (`prepare_workspace`'s `branch`, accepted only for a branch that a `commit_and_push` result of that
+  conversation reported for that repository) and its pushes update the same pull request, which
+  `open_pull_request` then reports as already open. See the
+  [coder's README](../crates/adam-coder/README.md#a-task-that-continues-a-task).
 
 ### The worker: claim, step, journal, commit
 

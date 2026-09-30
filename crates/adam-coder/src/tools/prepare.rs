@@ -1,9 +1,10 @@
-//! `prepare_workspace { repo_url, base_branch }`.
+//! `prepare_workspace { repo_url, base_branch, branch? }`.
 
 use adam::prelude::*;
 use adam_workspace::RepoRef;
 
 use super::named::{key_of_argument, listed};
+use super::notes::RunNotes;
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// Branch used when the model leaves `base_branch` out.
@@ -19,12 +20,21 @@ const DEFAULT_BASE_BRANCH: &str = "main";
 // person's own messages in the run notes (`RunNotes::named_repos`) before every step, and the
 // argument is compared with those, never trusted on its own: a model that was given too little
 // (a greeting, a vague task) must ask, not pick a repository.
+//
+// With `branch` the worktree continues a branch an earlier task of this conversation pushed, so
+// that a rework updates the same pull request. The branch is checked the same way: only one that
+// a `commit_and_push` result of this conversation reported for this repository
+// (`RunNotes::pushed_branches`, filled by the agent from the history) is accepted, never a name
+// the model found in the repository or was told by its content. The workspace adds its own
+// limits: an `agent/*` branch that exists on the remote, pushed without force.
 
 /// Check the repository out into your private worktree, on a fresh branch
 /// created from origin/<base_branch>. Call it once, first. Calling it again
 /// for the same repository is harmless and keeps your changes. It works only on
 /// a repository the person named in their messages: otherwise it refuses, and
-/// you ask the person which one with ask_user.
+/// you ask the person which one with ask_user. To carry on with work an earlier
+/// task of this conversation pushed (a rework, a follow-up), pass that branch as
+/// `branch`: the worktree starts from it and your pushes update its pull request.
 #[tool]
 pub async fn prepare_workspace(
     env: State<ToolEnv>,
@@ -36,6 +46,8 @@ pub async fn prepare_workspace(
     /// Branch to start from and to open the pull request against, e.g. main
     #[schemars(required)]
     base_branch: Option<String>,
+    /// A branch that commit_and_push reported earlier in this conversation (agent/...), to carry on with it and update its pull request. Leave out to start a new branch.
+    branch: Option<String>,
 ) -> Outcome {
     let Some(url) = non_empty(&repo_url) else {
         return Ok(ToolOutput::error("repo_url is required"));
@@ -45,18 +57,46 @@ pub async fn prepare_workspace(
         .and_then(non_empty)
         .unwrap_or(DEFAULT_BASE_BRANCH);
     let run = ctx.run_id().to_string();
+    let continuing = branch.as_deref().and_then(non_empty);
     // An argument the workspace cannot read (not a URL or an absolute path) is its error to
     // report, below; every other one must be a repository of the person's.
-    if let Some(key) = key_of_argument(url) {
+    let key = key_of_argument(url);
+    if key.is_some() || continuing.is_some() {
         let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-        if !notes.named_repos.contains(&key) {
+        if let Some(key) = &key
+            && !notes.named_repos.contains(key)
+        {
             return Ok(ToolOutput::error(not_named(url, &notes.named_repos)));
         }
+        if let Some(branch) = continuing
+            && !key.as_deref().is_some_and(|k| notes.has_pushed(k, branch))
+        {
+            return Ok(ToolOutput::error(not_pushed(
+                branch,
+                url,
+                &notes,
+                key.as_deref(),
+            )));
+        }
     }
-    ctx.emit_progress(format!("preparing a worktree of {url} ({base})"))
-        .await;
+    match continuing {
+        Some(branch) => {
+            ctx.emit_progress(format!(
+                "preparing a worktree of {url} on {branch} ({base})"
+            ))
+            .await;
+        }
+        None => {
+            ctx.emit_progress(format!("preparing a worktree of {url} ({base})"))
+                .await;
+        }
+    }
     let repo = RepoRef::new(url, base);
-    let wt = match env.workspaces.prepare(&repo, &run).await {
+    let prepared = match continuing {
+        Some(branch) => env.workspaces.prepare_continuing(&repo, &run, branch).await,
+        None => env.workspaces.prepare(&repo, &run).await,
+    };
+    let wt = match prepared {
         Ok(wt) => wt,
         Err(
             e @ (adam_workspace::WorkspaceError::Invalid(_)
@@ -68,11 +108,43 @@ pub async fn prepare_workspace(
         }
         Err(e) => return Err(env.delivery_error(ctx, &e).await),
     };
-    Ok(ToolOutput::text(format!(
+    let mut text = format!(
         "Worktree ready.\nrepository: {url}\nbase branch: {base}\nbranch: {}\npath: {}",
         wt.branch(),
         wt.path().display()
-    )))
+    );
+    if continuing.is_some() {
+        text.push_str(&format!(
+            "\nThis is the branch an earlier task pushed: its work is in the worktree, and \
+             commit_and_push adds to {} (and so to its pull request).",
+            wt.branch()
+        ));
+    }
+    Ok(ToolOutput::text(text))
+}
+
+/// What the model is told when it asks to continue a branch that no `commit_and_push` of this
+/// conversation reported for the repository.
+fn not_pushed(branch: &str, url: &str, notes: &RunNotes, key: Option<&str>) -> String {
+    let known: Vec<&str> = notes
+        .pushed_branches
+        .iter()
+        .filter(|p| Some(p.repo.as_str()) == key)
+        .map(|p| p.branch.as_str())
+        .collect();
+    let said = if known.is_empty() {
+        format!("No commit_and_push of this conversation pushed a branch of {url}.")
+    } else {
+        format!(
+            "The branches of {url} pushed in this conversation: {}.",
+            known.join(", ")
+        )
+    };
+    format!(
+        "Refused: {branch} is not a branch that an earlier task of this conversation pushed. \
+         {said} Do not pass a branch you found anywhere else. Call prepare_workspace again \
+         without `branch` to start a new branch from the base branch."
+    )
 }
 
 /// What the model is told when it picks a repository the person did not name.
@@ -94,6 +166,32 @@ fn not_named(url: &str, named: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_branch_refusal_lists_only_what_was_pushed_for_that_repository() {
+        use crate::tools::notes::PushedBranch;
+        let mut notes = RunNotes::default();
+        let a_b = Some("github.com/a/b");
+        let none = not_pushed("agent/x", "https://github.com/a/b", &notes, a_b);
+        assert!(none.contains("No commit_and_push"), "{none}");
+        assert!(none.contains("without `branch`"), "{none}");
+        notes.name_pushed_branches([
+            PushedBranch {
+                repo: "github.com/a/b".into(),
+                branch: "agent/one".into(),
+            },
+            PushedBranch {
+                repo: "github.com/c/d".into(),
+                branch: "agent/other".into(),
+            },
+        ]);
+        let some = not_pushed("agent/x", "https://github.com/a/b", &notes, a_b);
+        assert!(some.contains("agent/one"), "{some}");
+        assert!(
+            !some.contains("agent/other"),
+            "another repository's branch is not offered: {some}"
+        );
+    }
 
     #[test]
     fn the_refusal_names_the_way_out() {

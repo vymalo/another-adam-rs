@@ -3,7 +3,7 @@
 Status: **Accepted** (2026-09-30). Built in two steps: the runtime and `LlmAgent` (`init_continuing`,
 the carry cap), then `adam-a2a-runtime` (choosing the run from `referenceTaskIds`). What the coder
 agent does with a carried conversation (which repositories a task named, reusing a pushed branch) is
-a later change, see *Consequences*.
+slice 11 of the same branch, built; see *Consequences*.
 
 *Amended 2026-09-30, after review, before the first release:* decision 3 (the cap gave up the task
 itself in a long chain: tool output is now shortened first and the first user message is never
@@ -194,18 +194,23 @@ stateDiagram-v2
 
 * **A wrapper agent must forward `init_continuing`.** The default is `init`, so an agent that wraps
   an `LlmAgent` and delegates `init` to it silently stops the continuation unless it delegates
-  `init_continuing` too. `adam-assembly`'s dev-reload `LiveAgent` does. **`CoderAgent` and
-  `CoderStarter` in `adam-coder` do not yet:** until the coder change that follows, a coder task
-  that references another starts fresh, exactly as today. Nothing breaks, and nothing is carried.
+  `init_continuing` too. `adam-assembly`'s dev-reload `LiveAgent` does, and so do `CoderAgent` and `CoderStarter`
+  in `adam-coder` (*built 2026-09-30, after this ADR's first version*): before that a coder task that
+  referenced another started fresh, exactly as before, and nothing was carried.
 * **Only user messages say what the person asked.** The carried history holds the model's own words
   and tool output. A policy that decides from "what the user said" (the coder refuses a repository the
   task never named) must read user-role messages only, read them **part by part** (a continued user
   message can have several text parts: the task, the omission marker, the next message), skip the part
   that starts with `OMITTED_MARKER_PREFIX` when `omitted_turns` is not zero, and be aware that a host
   may quote untrusted text in a user message (the orchestrator quotes check findings inside a fenced
-  block). That rule belongs to the coder change, and the coupling is documented in both repositories.
+  block). That rule is the coder's (`person_texts` in `adam-coder`, which does all of this, and is tested with
+  a carried conversation), and the coupling is documented in both repositories.
 * **A worktree is per run, so a continued run gets a new one.** What the model remembers of the old
-  one (branch names, files) may not exist in it. Reusing a pushed branch is the coder change.
+  one (branch names, files) may not exist in it. The coder therefore continues a *pushed branch*, not the
+  old worktree: `prepare_workspace`'s `branch` (an `agent/*` branch that an earlier `commit_and_push` of the
+  conversation reported for the repository, recorded by the agent from those results and never taken from the
+  model's word) starts the new worktree from it and publishes to it, and `open_pull_request` reports the pull
+  request that is already open. See the coder's README. Nothing removes a finished run's worktree yet.
 * **Cost.** A continued task stores and sends the carried history, bounded by the cap and, for the
   model, by `max_history_tokens`. There is no summarising compaction: that needs a model call and
   loses detail, and is not needed for the bound.

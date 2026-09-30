@@ -64,6 +64,15 @@ pub struct PullRequestNote {
     pub red_checks_accepted: bool,
 }
 
+/// A branch that a `commit_and_push` of this conversation pushed, as that tool's result said it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushedBranch {
+    /// The repository, as a [`named`](super::named) key.
+    pub repo: String,
+    /// The branch name, `agent/...`.
+    pub branch: String,
+}
+
 /// Everything remembered about one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunNotes {
@@ -86,6 +95,11 @@ pub struct RunNotes {
     /// the agent before each step from the conversation, never from what the model says.
     #[serde(default)]
     pub named_repos: Vec<String>,
+    /// The branches that earlier tasks of this conversation pushed (the `commit_and_push` results
+    /// in the carried history), which `prepare_workspace` may continue with its `branch`. Filled by
+    /// the agent before each step from what the tool reported, never from what the model says.
+    #[serde(default)]
+    pub pushed_branches: Vec<PushedBranch>,
 }
 
 impl RunNotes {
@@ -108,6 +122,25 @@ impl RunNotes {
             }
         }
         added
+    }
+
+    /// Remember the branches `pushed` names; returns whether anything was new.
+    pub fn name_pushed_branches(&mut self, pushed: impl IntoIterator<Item = PushedBranch>) -> bool {
+        let mut added = false;
+        for one in pushed {
+            if !self.pushed_branches.contains(&one) {
+                self.pushed_branches.push(one);
+                added = true;
+            }
+        }
+        added
+    }
+
+    /// Whether an earlier task of the conversation pushed `branch` of the repository `repo`.
+    pub fn has_pushed(&self, repo: &str, branch: &str) -> bool {
+        self.pushed_branches
+            .iter()
+            .any(|p| p.repo == repo && p.branch == branch)
     }
 
     /// Whether the most recent check run failed.

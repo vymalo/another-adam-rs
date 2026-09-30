@@ -12,6 +12,7 @@ use adam_coder::tools::ask::AskUser;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::delegate::DelegateToOpenCode;
 use adam_coder::tools::named::{named_in, without_untrusted};
+use adam_coder::tools::notes::PushedBranch;
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
@@ -1172,4 +1173,165 @@ async fn malformed_arguments_are_reported_to_the_model() {
     }
     // Nothing ran: there is still no worktree.
     assert!(!rig.worktree().exists());
+}
+
+// ---------------------------------------------- a later task continues an earlier task's branch
+
+/// The `repository:` and `branch:` lines a `commit_and_push` result ends with, which is what a
+/// later task of the conversation learns its branches from.
+fn pushed_lines(result: &str) -> (String, String) {
+    let line = |key: &str| {
+        result
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("no {key} line in {result}"))
+            .to_owned()
+    };
+    (line("repository: "), line("branch: "))
+}
+
+/// A second run of the same conversation, in the same fixture: its own run id and notes. As the
+/// agent does before each step, the person's words (naming `repo`) and the branches the carried
+/// `commit_and_push` results reported are put in the notes.
+async fn next_task(fx: &Fixture, repo: &str, pushed: &[(&str, &str)]) -> ToolCtx {
+    let ctx = ToolCtx::detached("tool", "call-1", Arc::new(CollectingSink::new()))
+        .with_state(fx.env.clone());
+    say(&fx.env, &ctx, repo).await;
+    let run = ctx.run_id().to_string();
+    let mut notes = fx.env.notes.load(&run).await.unwrap();
+    notes.name_pushed_branches(pushed.iter().map(|(repo, branch)| PushedBranch {
+        repo: adam_coder::tools::named::key_of_argument(repo).unwrap(),
+        branch: (*branch).to_owned(),
+    }));
+    fx.env.notes.save(&run, &notes).await.unwrap();
+    ctx
+}
+
+/// A rework: the second task works on the branch the first pushed, its push updates that branch,
+/// and the pull request it reports is the one that is already open, not a second one.
+#[tokio::test]
+async fn a_later_task_continues_the_pushed_branch_and_reports_the_same_pull_request() {
+    let rig = Rig::new().await;
+    let remote = rig.fx.remote_url();
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("one.txt"), "one\n").unwrap();
+    RunChecks
+        .call(&rig.ctx, json!({"command": "true"}))
+        .await
+        .unwrap();
+    let pushed = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: one"}))
+        .await
+        .unwrap();
+    let (repository, branch) = pushed_lines(&pushed.content);
+    assert_eq!(repository, remote);
+    assert!(branch.starts_with("agent/"), "{branch}");
+    let args = json!({"title": "feat: one", "body": "One.\n\n## Verification\n- `true`"});
+    let opened = OpenPullRequest.call(&rig.ctx, args.clone()).await.unwrap();
+    assert!(opened.content.contains("is open"), "{}", opened.content);
+
+    // Task 2: a new run in the same conversation.
+    let two = next_task(&rig.fx, &remote, &[(&remote, &branch)]).await;
+    let prepare = |branch: Option<&str>| {
+        let mut args = json!({"repo_url": remote, "base_branch": "main"});
+        if let Some(branch) = branch {
+            args["branch"] = json!(branch);
+        }
+        args
+    };
+
+    // Only a branch that a commit_and_push of this conversation reported for this repository.
+    for wrong in ["agent/never-pushed", "main", "agent/"] {
+        let refused = PrepareWorkspace.call(&two, prepare(Some(wrong))).await;
+        assert!(is_error(&refused), "{wrong}");
+        let refused = text(refused);
+        assert!(
+            refused.contains("Refused") && refused.contains(&branch),
+            "{refused}"
+        );
+    }
+    let other_repo = next_task(
+        &rig.fx,
+        &remote,
+        &[("https://github.com/other/repo", &branch)],
+    )
+    .await;
+    let refused = PrepareWorkspace
+        .call(&other_repo, prepare(Some(&branch)))
+        .await;
+    assert!(
+        is_error(&refused),
+        "a branch of another repository is not this repository's"
+    );
+    // A branch that was never pushed to the remote is the workspace's refusal, not a crash.
+    let ghost = next_task(&rig.fx, &remote, &[(&remote, "agent/ghost")]).await;
+    let ghost_out = PrepareWorkspace
+        .call(&ghost, prepare(Some("agent/ghost")))
+        .await;
+    assert!(is_error(&ghost_out), "{ghost_out:?}");
+    assert!(text(ghost_out).contains("agent/ghost"));
+    // Notes that somehow name a branch outside the namespace cannot make the tool push onto it.
+    let outside = next_task(&rig.fx, &remote, &[(&remote, "main")]).await;
+    let outside_out = PrepareWorkspace.call(&outside, prepare(Some("main"))).await;
+    assert!(is_error(&outside_out), "{outside_out:?}");
+    assert!(text(outside_out).contains("is not a branch that can be continued"));
+
+    let ready = PrepareWorkspace
+        .call(&two, prepare(Some(&branch)))
+        .await
+        .unwrap();
+    assert!(!ready.is_error, "{}", ready.content);
+    assert!(
+        ready.content.contains(&format!("branch: {branch}"))
+            && ready.content.contains("earlier task pushed"),
+        "{}",
+        ready.content
+    );
+    let worktree = rig.fx.root.join("worktrees").join(two.run_id().to_string());
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("one.txt")).unwrap(),
+        "one\n",
+        "the work of the first task is in the worktree"
+    );
+
+    std::fs::write(worktree.join("two.txt"), "two\n").unwrap();
+    RunChecks
+        .call(&two, json!({"command": "true"}))
+        .await
+        .unwrap();
+    let pushed_again = CommitAndPush
+        .call(&two, json!({"message": "fix: two"}))
+        .await
+        .unwrap();
+    assert!(
+        pushed_again
+            .content
+            .contains(&format!("pushed branch {branch}")),
+        "{}",
+        pushed_again.content
+    );
+    assert_eq!(pushed_lines(&pushed_again.content).1, branch);
+    assert_eq!(
+        rig.fx.agent_branches(),
+        std::slice::from_ref(&branch),
+        "no branch of its own"
+    );
+    assert_eq!(rig.fx.commits_ahead(&branch), 2);
+    assert_eq!(rig.fx.file_on(&branch, "two.txt"), "two");
+
+    let reported = OpenPullRequest.call(&two, args).await.unwrap();
+    assert!(!reported.is_error, "{}", reported.content);
+    assert!(
+        reported.content.contains("was already open") && reported.content.contains(PR_URL),
+        "{}",
+        reported.content
+    );
+    assert_eq!(reported.artifacts[0].name, "pull_request");
+    assert_eq!(reported.artifacts[0].data["url"], PR_URL);
+    assert_eq!(reported.artifacts[0].data["branch"], branch.as_str());
+    assert_eq!(
+        rig.fx.created_pulls().await.len(),
+        1,
+        "no second pull request"
+    );
 }

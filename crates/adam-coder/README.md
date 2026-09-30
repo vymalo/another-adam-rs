@@ -41,11 +41,11 @@ sequenceDiagram
 
 | Tool | Does |
 |---|---|
-| `prepare_workspace { repo_url, base_branch }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user` |
+| `prepare_workspace { repo_url, base_branch, branch? }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch and pushes update its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
 | `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), streams its updates as progress, returns its summary and the changed files |
 | `run_checks { command, cwd? }` | `sh -lc <command>` in the worktree (a `cwd` must stay inside it), timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)) |
-| `commit_and_push { message }` | `commit_all` + `push`; artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch` |
-| `open_pull_request { title, body, accept_red_checks? }` | `CodeHost::open_pull_request`; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
+| `commit_and_push { message }` | `commit_all` + `push`; artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. The text ends with `repository: <url>` and `branch: <name>` lines: how a later task of the conversation learns which branches exist |
+| `open_pull_request { title, body, accept_red_checks? }` | the pull request already open for the branch if there is one (reported as "was already open", its title and description unchanged), else `CodeHost::open_pull_request`; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. Declared `#[tool(asks_user)]`, so `adam-assembly` refuses to give it to a subagent |
 
 Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../adam/README.md#tool)) in
@@ -184,7 +184,8 @@ make them hold:
   A message that continues a parked run (same `contextId`, no `taskId`, while the
   task is `input-required`) is delivered to that run, so a repository named in the
   original request still counts on it. A message after the task ended starts a new
-  task in the context, which knows only its own messages: name the repository again.
+  task in the context; it knows only its own messages unless it references the earlier task
+  (`referenceTaskIds`), see [A task that continues a task](#a-task-that-continues-a-task).
 
 ```mermaid
 stateDiagram-v2
@@ -202,8 +203,40 @@ stateDiagram-v2
   Canceled --> [*]
 ```
 
-Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories named) lives in
+Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories named, branches the
+conversation pushed) lives in
 `<WORKSPACE_ROOT>/coder/<run>.json` next to the worktree, written atomically.
+
+### A task that continues a task
+
+A rework or a follow-up is a new A2A task in the same `contextId` that names the task it builds on in
+`referenceTaskIds`. `CoderStarter` and `CoderAgent` forward `init_continuing` to `LlmStarter`, so the new
+run starts from the conversation of the referenced run (see
+[ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md)). Three things follow:
+
+* **The person's words are all of the conversation's.** `person_texts` reads the user messages of the
+  whole carried conversation, so a repository named in the first task is named in the second. A continued
+  user message can have several text parts (the task, the marker that says older turns were left out, the
+  next message), so they are read **part by part**, skipping the marker (`Conversation::is_omission_marker`,
+  which only ever matches the framework's own text, never a message that merely starts like it) and never
+  letting a block one part leaves open swallow the next. Everything else is as above: assistant text and
+  tool results never name a repository, nor does text in an `untrusted` fence.
+* **The branch can be carried on.** `prepare_workspace`'s `branch` checks out the branch an earlier task
+  pushed, so the new task's pushes update the pull request that is already open for it, and
+  `open_pull_request` reports that pull request ("was already open") instead of failing or opening
+  another. The branch is **not taken on the model's word**: before every step the agent records in the run
+  notes (`RunNotes::pushed_branches`) the `repository:`/`branch:` lines of the `commit_and_push` results of
+  the carried conversation (paired with their call by position, `agent/` names only), and the tool accepts
+  only a branch recorded for the repository it is asked about. A name the model found in the repository
+  (another person's branch, say) is refused and the model is told to start a new branch. The workspace adds
+  its own limits (`Workspaces::prepare_continuing`): an `agent/*` branch that exists on the remote, never
+  forced. The worktree is still the run's own (`agent/<run>` is what is checked out); what is published to
+  is the continued branch, and `Worktree::branch` names that one.
+* **A new job stays a new job.** Without `branch` the worktree starts from the base branch on a branch of
+  its own, as before, and the prompt says when to use which.
+
+The old run's worktree is not removed by this (nothing removes finished runs' worktrees yet); the branch
+that was pushed is what carries the work, so the new worktree does not depend on it.
 
 ### Where the prompt and the card live
 
@@ -558,8 +591,22 @@ database of its own, so the role needs `CREATEDB`):
   sandbox address of the vendored e2e mocks, local paths, default ports, `www.github.com`,
   the configured default host) and the removal of `untrusted` fences (3 and 4 backticks, tildes,
   unclosed, the exact shape of the orchestrator's rework prompt); those of `src/agent.rs` pin what
-  counts as the person's words (assistant text, other tools' results and colliding call ids do not)
-  and the format of the stop's call id.
+  counts as the person's words (assistant text, other tools' results and colliding call ids do not), what
+  a continued conversation adds (a repository named in an earlier task is named, the omission marker is
+  skipped and nothing that only starts like it is, parts are read one by one), which `commit_and_push`
+  results name a pushed branch, and the format of the stop's call id. `a_later_task_continues_the_pushed_branch_and_reports_the_same_pull_request`
+  in `tests/tools.rs` is the rework at the tool level (refusals of a branch that was not pushed here, of
+  another repository's, of one outside `agent/`, of one that is not on the remote; the continued worktree
+  has the first task's work; one branch, two commits, one pull request reported as already open), and
+  `a_second_task_continues_the_first_tasks_branch_and_pull_request` and
+  `a_continued_task_refuses_what_only_the_model_or_a_fence_mentions` in `tests/e2e.rs` are it over A2A with
+  `referenceTaskIds` (the model of the second task is shown the first's conversation, `continued_from` says
+  which run it continued, the repository of the first task is named in the second without being repeated;
+  a repository only the model or an `untrusted` fence mentions, and a branch that was not pushed here, are
+  refused). The unit test `a_same_size_rewrite_within_the_index_tick_is_in_the_tree_id` in `src/tools/gitcli.rs`
+  pins the fix of a flaky `checks_then_commit_binds_a_passing_verdict_to_the_pushed_commit`: the copy of
+  the index that the tree id is computed in keeps the index's mtime, or git trusts the stat data of a file
+  rewritten with the same size in the same clock tick and the tree holds its old content.
 * `tests/tool_specs.rs`: each tool's `ToolSpec` equals `tests/fixtures/tool-specs/<tool>.json`, the JSON of
   the hand-written tools, so a change to what the model is told is a reviewed diff. The one expected difference
   is normalised: an optional argument is `"type": ["string", "null"]` in a derived schema. Regenerate with

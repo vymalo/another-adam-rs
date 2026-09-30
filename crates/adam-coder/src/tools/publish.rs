@@ -10,6 +10,27 @@ use super::gitcli::{commits_ahead, head_sha, head_tree};
 use super::notes::PullRequestNote;
 use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, workspace_error};
 
+/// The name of [`commit_and_push`], which the agent also needs to tell its results apart in the
+/// conversation (see [`pushed_in`]).
+pub(crate) const COMMIT_AND_PUSH: &str = "commit_and_push";
+
+/// The repository and branch that the text of a `commit_and_push` result says it pushed: the
+/// `repository:` and `branch:` lines it ends with. This is how a later task of the same
+/// conversation learns which branches exist for it to continue (`prepare_workspace`'s `branch`),
+/// from what the tool said and not from what the model says.
+pub(crate) fn pushed_in(text: &str) -> Option<(String, String)> {
+    let mut repository = None;
+    let mut branch = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("repository: ") {
+            repository = Some(value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("branch: ") {
+            branch = Some(value.trim().to_owned());
+        }
+    }
+    Some((repository?, branch?)).filter(|(r, b)| !r.is_empty() && !b.is_empty())
+}
+
 // Commits everything in the worktree and pushes the run's branch.
 //
 // Idempotent by construction: with no changes `commit_all` does nothing, the
@@ -100,6 +121,12 @@ pub async fn commit_and_push(
             wt.branch()
         ),
     };
+    // What a later task of this conversation may continue (see `pushed_in`).
+    let summary = format!(
+        "{summary}\nrepository: {}\nbranch: {}",
+        wt.repo().url,
+        wt.branch()
+    );
     Ok(ToolOutput::text(summary)
         .with_artifact(checks)
         .with_artifact(Artifact {
@@ -159,8 +186,9 @@ fn checks_for_pushed(
 // unverified). The one override is `accept_red_checks: true`, which
 // the prompt reserves for explicit user consent; it never overrides an
 // exhausted check budget, and a pull request opened that way says so in its
-// body. Idempotent: `CodeHost::open_pull_request` returns the open pull
-// request of the same head instead of creating another.
+// body. Idempotent: a pull request that is already open for the branch (the run continued a
+// branch an earlier task opened it for, or this call is repeated) is reported as it is, and
+// `CodeHost::open_pull_request` would return it instead of creating another in any case.
 
 /// Open the pull request for the pushed branch. Requires that everything is
 /// pushed with commit_and_push and that the last check run passed on exactly
@@ -247,21 +275,38 @@ pub async fn open_pull_request(
              explicitly accepted that.\n",
         );
     }
-    ctx.emit_progress(format!("opening a pull request from {}", wt.branch()))
-        .await;
-    let opened = env
+    // A pull request that already exists for this branch (the run continues a branch an earlier
+    // task opened it for) is what this call reports: the push updated it, and nothing else is to
+    // be opened.
+    let existing = match env
         .code_host
-        .open_pull_request(NewPullRequest {
-            repo: wt.repo().clone(),
-            head: wt.branch().to_owned(),
-            title: title.to_owned(),
-            body,
-            draft: env.settings.draft_pull_requests,
-        })
-        .await;
-    let pr = match opened {
-        Ok(pr) => pr,
+        .find_pull_request(wt.repo(), wt.branch())
+        .await
+    {
+        Ok(found) => found,
         Err(e) => return Err(env.delivery_error(ctx, &e).await),
+    };
+    let reused = existing.is_some();
+    let pr = match existing {
+        Some(pr) => pr,
+        None => {
+            ctx.emit_progress(format!("opening a pull request from {}", wt.branch()))
+                .await;
+            let opened = env
+                .code_host
+                .open_pull_request(NewPullRequest {
+                    repo: wt.repo().clone(),
+                    head: wt.branch().to_owned(),
+                    title: title.to_owned(),
+                    body,
+                    draft: env.settings.draft_pull_requests,
+                })
+                .await;
+            match opened {
+                Ok(pr) => pr,
+                Err(e) => return Err(env.delivery_error(ctx, &e).await),
+            }
+        }
     };
 
     notes.pull_request = Some(PullRequestNote {
@@ -274,7 +319,17 @@ pub async fn open_pull_request(
         .await
         .map_err(|e| notes_error(&e))?;
 
-    let mut text = format!("Pull request #{} is open: {}", pr.number, pr.url);
+    let mut text = if reused {
+        format!(
+            "Pull request #{} for {} was already open, and your push updated it: {}\nIts title \
+             and description are unchanged.",
+            pr.number,
+            wt.branch(),
+            pr.url
+        )
+    } else {
+        format!("Pull request #{} is open: {}", pr.number, pr.url)
+    };
     if let Ok(dirty) = wt.status().await
         && !dirty.is_empty()
     {

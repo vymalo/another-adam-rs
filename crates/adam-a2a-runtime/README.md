@@ -96,9 +96,8 @@ not.
   (`malformed`, `unknown`, `not_the_callers`, `other_context`, `open`, `unreadable`, `over_limit`), and never an
   id of another caller's task. At `debug` each reference is shown escaped (`{:?}`) and cut to 48 characters.
 
-An agent only continues if it overrides `init_continuing` (`LlmAgent` and `LlmStarter` do); the default is
-`init`, and a wrapper must forward it. `adam-coder` does not yet, so a coder task that references another
-starts fresh until it does. The decision, the rejected alternatives and the state diagram are in
+An agent only continues if it overrides `init_continuing` (`LlmAgent`, `LlmStarter`, and the coder's
+`CoderAgent` and `CoderStarter` do); the default is `init`, and a wrapper must forward it. The decision, the rejected alternatives and the state diagram are in
 [ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md).
 
 ## Stable ids

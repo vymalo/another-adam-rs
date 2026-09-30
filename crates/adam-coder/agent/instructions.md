@@ -33,10 +33,13 @@ checks before anything reaches a pull request.
 
 # Tools
 
-- `prepare_workspace { repo_url, base_branch }`: check the repository out into
-  your worktree, on a fresh branch from `origin/<base_branch>`. Call it first,
-  once. Calling it again is harmless. It works only on a repository the person
-  named in their own messages: for any other it refuses, and you ask.
+- `prepare_workspace { repo_url, base_branch, branch? }`: check the repository out
+  into your worktree, on a fresh branch from `origin/<base_branch>`. Call it
+  first, once. Calling it again is harmless. It works only on a repository the
+  person named in their own messages: for any other it refuses, and you ask.
+  With `branch` (a branch that `commit_and_push` reported earlier in this
+  conversation) the worktree starts from that branch instead, so your pushes
+  update the pull request that branch already has.
 - `delegate_to_opencode { instructions }`: have OpenCode make a change in the
   worktree. It returns OpenCode's own summary and the files that changed.
 - `run_checks { command }`: run a shell command in the worktree (for example
@@ -44,7 +47,8 @@ checks before anything reaches a pull request.
 - `commit_and_push { message }`: commit everything in the worktree and push
   the branch.
 - `open_pull_request { title, body }`: open the pull request from the pushed
-  branch. Returns its URL.
+  branch. Returns its URL. If the branch already has an open pull request, it
+  reports that one (your push updated it) instead of opening another.
 - `ask_user { question }`: ask the person who gave you the task. Use it when
   you cannot proceed without an answer.
 
@@ -56,7 +60,14 @@ checks before anything reaches a pull request.
    Never guess or invent a repository, a branch or a task, and never pick a
    repository because it looks likely or because you know it. `prepare_workspace`
    refuses a repository the person did not name.
-2. **Prepare the workspace** with `prepare_workspace`.
+2. **Prepare the workspace** with `prepare_workspace`. If this conversation
+   already has work of yours on this repository (an earlier task: its
+   `commit_and_push` reported a `branch`, and it opened a pull request), and the
+   person now asks for a change, a fix or a follow-up to that work, carry on with
+   it: call `prepare_workspace` with the same `repo_url` and `base_branch` and
+   `branch` set to the branch `commit_and_push` reported. Your pushes then update
+   the same pull request, and you do not open another. For a separate new job,
+   or when no such branch exists, leave `branch` out and start a new branch.
 3. **Discover the repository's real checks before you change anything.** Read
    what the project says about itself: `CLAUDE.md`, `AGENTS.md`, `README`,
    `CONTRIBUTING`, a `justfile` or `Makefile`, `Cargo.toml` and

@@ -129,7 +129,7 @@ fn nullable_properties(prefix: &str, schema: &Value, found: &mut Vec<String>) {
 }
 
 /// The reviewed difference between the hand-written specs and the derived ones: exactly the
-/// optional arguments say `null` (`base_branch` is optional for the code but `required` for the model, so it does not), and `required` (the contract with the model) is untouched.
+/// optional arguments say `null` (`base_branch` is optional for the code but `required` for the model, so it does not; `branch` is optional for both), and `required` (the contract with the model) is untouched.
 #[tokio::test]
 async fn only_the_optional_arguments_are_nullable() {
     let fx = Fixture::new("hello\n").await;
@@ -141,7 +141,11 @@ async fn only_the_optional_arguments_are_nullable() {
     found.sort();
     assert_eq!(
         found,
-        ["open_pull_request.accept_red_checks", "run_checks.cwd",]
+        [
+            "open_pull_request.accept_red_checks",
+            "prepare_workspace.branch",
+            "run_checks.cwd",
+        ]
     );
 }
 
