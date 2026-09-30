@@ -430,9 +430,9 @@ classDiagram
     PermissionPrompt <|.. StaticPrompt
 ```
 
-Each box is a crate (underscores stand for hyphens). The six coder tools are
-`prepare_workspace`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
-`open_pull_request` and `ask_user`. A seventh type, `Redacting`, wraps each of
+Each box is a crate (underscores stand for hyphens). The seven coder tools are
+`prepare_workspace`, `run_command`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
+`open_pull_request` and `ask_user`. An eighth type, `Redacting`, wraps each of
 them to scrub secrets (`crates/adam-coder/src/tools/mod.rs`). `CoderAgent`
 wraps the `LlmAgent` that `adam-assembly` builds from `crates/adam-coder/agent/instructions.md` (the prompt, the
 limits and the A2A card are that file) and adds its completion rule. `FnTool` is a tool made from a closure. A tool
@@ -800,8 +800,9 @@ What the diagram cannot say:
   `init_continuing`. The repository rule reads the person's messages of the whole carried conversation, part
   by part, without the omission marker. A rework can check out the branch an earlier task pushed
   (`prepare_workspace`'s `branch`, accepted only for a branch that a `commit_and_push` result of that
-  conversation reported for that repository) and its pushes update the same pull request, which
-  `open_pull_request` then reports as already open. See the
+  conversation recorded for that repository, in the run notes by the tool itself) and, once its checks have
+  passed, `open_pull_request` moves that branch to the run's commits, which updates the same pull request,
+  and reports it as already open. See the
   [coder's README](../crates/adam-coder/README.md#a-task-that-continues-a-task).
 
 ### The worker: claim, step, journal, commit
@@ -1518,7 +1519,7 @@ Two rules keep this tree honest (details in the
 `adam-coder` turns a coding task into a pull request. A client sends
 "in repository X, do Y". The agent makes the change in a private git worktree,
 runs the project's own checks, and opens a pull request. It is an `LlmAgent`
-with six tools and one extra rule, running on the durable runtime and served
+with seven tools and one extra rule, running on the durable runtime and served
 over A2A.
 
 ### What it does
@@ -1642,8 +1643,9 @@ pushed sha, pull request) and the worktree.
 
 What the diagrams cannot say (`crates/adam-coder/src/`):
 
-* **The tools** (`tools/`): `prepare_workspace`, `delegate_to_opencode`,
-  `run_checks`, `commit_and_push`, `open_pull_request` and `ask_user`.
+* **The tools** (`tools/`): `prepare_workspace`, `run_command` (looking around: no check, no cycle,
+  read-only, a change is undone), `delegate_to_opencode`, `run_checks` (the project's own checks only),
+  `commit_and_push`, `open_pull_request` and `ask_user`.
 * **The prompt and the card** (`agent/instructions.md`, embedded by `build.rs`): the system prompt with its
   `{{max_check_cycles}}`, the loop's limits and the A2A card are a file, not Rust; `CoderAgent::new` puts
   the file, the tools, the `ToolEnv` state and the model together with `AgentDef`, and keeps only the
@@ -1652,7 +1654,12 @@ What the diagrams cannot say (`crates/adam-coder/src/`):
   * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`
     refuses to run. `commit_and_push` and `open_pull_request` refuse too.
   * `open_pull_request` refuses unless the pushed `HEAD` is the current commit
-    and the last check run passed **on exactly the tree it contains**.
+    and the last check run passed **on exactly the tree it contains**. A run that
+    continues a pushed branch pushes to a branch of its own, and only after this
+    gate does `open_pull_request` fast-forward the continued branch (never forced), so the pull
+    request that is open for it never carries unverified commits.
+  * A command the shell cannot find (exit 127, `not found`) is a missing toolchain: reported to the model,
+    no check cycle used, no `checks` artifact, and the model asks the person and waits.
   * A run that stops with no pull request fails if the check-cycle budget is
     used up with the last check red, or the credentials were rejected
     (`CoderAgent::verdict`). "The model said it

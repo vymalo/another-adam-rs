@@ -371,6 +371,20 @@ including PostgreSQL across a restart and a real `LlmAgent` behind the backend) 
 (`tests/dev.rs`). Executed on 2026-09-30 against the in-memory store and PostgreSQL 16.13; the MongoDB
 variants of the `adam-runtime` cases use the same store calls and run in CI only (no MongoDB was at hand).
 
-*Unverified:* that a live provider accepts the histories described above (a user message that holds
+*Verified 2026-09-30 (second review), by tests that ran locally against a local bare remote, a wiremock
+GitHub and in-memory and PostgreSQL 16 stores:* the gate on a continued branch (`adam-coder`
+`tests/tools.rs`: red checks never touch the branch or its pull request, green moves it, accepted red moves
+it and comments, a branch that moved on the remote is not overwritten; `tests/e2e.rs`: the failed
+verdict says the pull request was not updated), `Worktree::push` and `publish` and the match on head and
+base (`adam-workspace` `tests/workspace.rs`, `tests/github.rs`), the marker placement and the cap order
+(`adam-llm-agent` `src/conversation.rs`), the one-string wire shape (`adam-model-openai` `src/wire.rs`) and
+the single `info` line (`adam-a2a-runtime` `tests/backend.rs`). *Not done:* `judge` still reads the record
+and its envelope once more than the start does (`Runtime::view`, then `start_with_id_continuing`'s own read):
+removing it needs a runtime method that takes the record that was already read, a public addition for the
+saving of one envelope decode per task start.
+
+*Unverified:* the WireMock template of `dev/wiremock/mock-github` that now answers the list call with the
+requested base branch (it runs in CI, through `adam-workspace`'s `tests/wiremock_compose.rs`); that a live
+provider accepts the histories described above (a user message that holds
 several paragraphs joined by a blank line, and roles that alternate in every shape); how the orchestrator fills `referenceTaskIds` (that is its repository's change, recorded
 there).

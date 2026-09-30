@@ -3,6 +3,7 @@
 //! | Tool | Module |
 //! |---|---|
 //! | `prepare_workspace { repo_url, base_branch?, branch? }` | [`prepare`] |
+//! | `run_command { command, cwd? }` | [`inspect`] |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
 //! | `run_checks { command }` | [`checks`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
@@ -61,6 +62,7 @@ pub mod ask;
 pub mod checks;
 pub mod delegate;
 mod gitcli;
+pub mod inspect;
 pub mod named;
 pub mod notes;
 pub mod prepare;
@@ -212,6 +214,7 @@ impl ToolEnv {
 pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
     tools![
         prepare::PrepareWorkspace,
+        inspect::RunCommand,
         delegate::DelegateToOpenCode,
         checks::RunChecks,
         publish::CommitAndPush,

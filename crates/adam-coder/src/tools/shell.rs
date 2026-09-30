@@ -1,10 +1,13 @@
-//! Running a shell command for `run_checks`: cwd confined to the worktree, a
-//! timeout that kills the whole process group, and an output cap that keeps the
-//! tail.
+//! Running a shell command for `run_checks` and `run_command`: cwd confined to the worktree, a
+//! timeout that kills the whole process group, and an output cap that keeps the tail. The shell
+//! is a login shell (`bash -lc`, or `sh -lc` where there is no bash), and a command the shell
+//! cannot find is recognised ([`missing_tool`]) so that it is reported as a missing toolchain
+//! and not as a failing check.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -127,7 +130,73 @@ async fn pump(mut reader: impl AsyncRead + Unpin, tail: Arc<Mutex<Tail>>) {
     }
 }
 
-/// Run `sh -lc <command>` in `dir` (a login shell: agent tool `PATH`s are set
+/// The shell commands run in: `bash` when the image has one, else `sh`.
+///
+/// Models write bash (`${PIPESTATUS[0]}`, `[[ ]]`, arrays, `<(...)`), and where `sh` is dash
+/// they fail with "Bad substitution" for reasons that have nothing to do with the project. Both
+/// are run as login shells (`-l`), which is what keeps the toolchain's `PATH` from
+/// `/etc/profile.d`, since Debian's `/etc/profile` resets it. Found once, on `PATH`.
+pub fn login_shell() -> &'static str {
+    static SHELL: OnceLock<&'static str> = OnceLock::new();
+    SHELL.get_or_init(|| if on_path("bash") { "bash" } else { "sh" })
+}
+
+/// Whether an executable file called `name` is in a directory of `PATH`.
+fn on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(name))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// A command the shell could not find, as a run's output says it: the workspace lacks a tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingTool {
+    /// The command word, when the output names it (`mvn`); `None` when the shell only exited 127.
+    pub name: Option<String>,
+}
+
+/// Whether `outcome` is the shell saying it could not find a command.
+///
+/// Two shapes: `sh: 1: mvn: not found` (dash) and `bash: line 1: mvn: command not found` (also
+/// `bash: mvn: command not found`), and the exit code 127 they come with. A line of that shape
+/// counts when the run failed and it starts with a shell's name, or whatever it starts with when
+/// the exit code is 127 (a script that calls a missing command names itself first). A run that
+/// only exited 127 is a missing command too, with no name. So `cat: CLAUDE.md: No such file or
+/// directory` (a missing file), a test that prints "resource not found" and exits 1, and a
+/// timeout are not.
+pub fn missing_tool(outcome: &ShellOutcome) -> Option<MissingTool> {
+    let code = outcome.exit_code.filter(|c| *c != 0)?;
+    if outcome.timed_out {
+        return None;
+    }
+    let found = outcome.tail.lines().find_map(|line| {
+        let line = line.trim();
+        let before = line
+            .strip_suffix(": command not found")
+            .or_else(|| line.strip_suffix(": not found"))?;
+        let word = before.rsplit(": ").next()?.trim();
+        // The first thing such a line names is the shell that printed it (`sh`, `/bin/sh`).
+        let shell = before.split(": ").next().unwrap_or_default();
+        let shell_said_it = matches!(
+            shell.rsplit('/').next(),
+            Some("sh" | "bash" | "dash" | "zsh" | "ash")
+        );
+        let plausible =
+            !word.is_empty() && word.len() <= 128 && !word.contains(char::is_whitespace);
+        (plausible && (code == 127 || shell_said_it)).then(|| word.to_owned())
+    });
+    match (found, code) {
+        (Some(name), _) => Some(MissingTool { name: Some(name) }),
+        (None, 127) => Some(MissingTool { name: None }),
+        _ => None,
+    }
+}
+
+/// Run `<login shell> -lc <command>` in `dir` (see [`login_shell`]; agent tool `PATH`s are set
 /// up in `/etc/profile.d`).
 ///
 /// Stdin is closed. After `timeout` the whole process group is killed. The
@@ -156,7 +225,7 @@ async fn run_shell_with(
     tail_cap: usize,
     extra_env: &[(&str, &str)],
 ) -> io::Result<ShellOutcome> {
-    let mut cmd = Command::new("sh");
+    let mut cmd = Command::new(login_shell());
     cmd.arg("-lc")
         .arg(command)
         .current_dir(dir)
@@ -343,6 +412,152 @@ mod tests {
             "other variables still pass: {:?}",
             out.tail
         );
+    }
+
+    #[tokio::test]
+    async fn bash_constructs_work_when_there_is_a_bash() {
+        if login_shell() != "bash" {
+            eprintln!("skipping: no bash on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // The owner's case: `${PIPESTATUS[0]}` is "Bad substitution" in dash.
+        let out = run_shell(
+            dir.path(),
+            "false | true; echo status=${PIPESTATUS[0]}; [[ a == a ]] && echo ok; arr=(x y); echo ${arr[1]}",
+            LONG,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert!(out.passed(), "{out:?}");
+        assert!(out.tail.contains("status=1"), "{:?}", out.tail);
+        assert!(
+            out.tail.contains("ok") && out.tail.contains('y'),
+            "{:?}",
+            out.tail
+        );
+    }
+
+    #[test]
+    fn the_shell_is_bash_where_there_is_one_and_sh_otherwise() {
+        assert_eq!(login_shell() == "bash", on_path("bash"));
+        assert!(on_path("sh"));
+        assert!(!on_path("no-such-program-anywhere"));
+    }
+
+    fn failed(code: i32, tail: &str) -> ShellOutcome {
+        ShellOutcome {
+            exit_code: Some(code),
+            timed_out: false,
+            tail: tail.to_owned(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn a_command_the_shell_cannot_find_is_a_missing_tool() {
+        let named = |name: &str| {
+            Some(MissingTool {
+                name: Some(name.to_owned()),
+            })
+        };
+        // What dash, bash as `bash -c`, and a script under bash print, each with exit 127.
+        assert_eq!(
+            missing_tool(&failed(127, "sh: 1: mvn: not found\n")),
+            named("mvn")
+        );
+        assert_eq!(
+            missing_tool(&failed(127, "bash: line 1: mvn: command not found\n")),
+            named("mvn")
+        );
+        assert_eq!(
+            missing_tool(&failed(127, "bash: mvn: command not found")),
+            named("mvn")
+        );
+        assert_eq!(
+            missing_tool(&failed(
+                127,
+                "ls: fine\n./check.sh: line 4: cargo: command not found\n"
+            )),
+            named("cargo"),
+            "a script names itself first, the exit code is what says it"
+        );
+        assert_eq!(
+            missing_tool(&failed(127, "/bin/sh: 1: ./gradlew: not found")),
+            named("./gradlew")
+        );
+        // A shell line with another exit code (a pipeline, `|| exit 1`) still counts.
+        assert_eq!(
+            missing_tool(&failed(1, "sh: 1: mvn: not found")),
+            named("mvn")
+        );
+        // Exit 127 and nothing it names.
+        assert_eq!(
+            missing_tool(&failed(127, "something went wrong")),
+            Some(MissingTool { name: None })
+        );
+        // The first one is the one that is missing.
+        assert_eq!(
+            missing_tool(&failed(
+                127,
+                "sh: 1: mvn: not found\nsh: 2: gradle: not found"
+            )),
+            named("mvn")
+        );
+    }
+
+    #[test]
+    fn a_failure_that_is_not_a_missing_command_is_not_one() {
+        // A missing file, a failing test that says "not found", a pass, a timeout, a signal.
+        assert_eq!(
+            missing_tool(&failed(1, "cat: CLAUDE.md: No such file or directory")),
+            None
+        );
+        assert_eq!(
+            missing_tool(&failed(1, "FAILED: user 7: resource not found")),
+            None,
+            "not a shell's line, and not exit 127"
+        );
+        assert_eq!(
+            missing_tool(&failed(0, "sh: 1: mvn: not found")),
+            None,
+            "it passed"
+        );
+        let mut timed_out = failed(127, "sh: 1: mvn: not found");
+        timed_out.timed_out = true;
+        assert_eq!(missing_tool(&timed_out), None);
+        let mut signalled = failed(1, "");
+        signalled.exit_code = None;
+        assert_eq!(missing_tool(&signalled), None);
+        // A "word" that is a sentence is not a command.
+        assert_eq!(
+            missing_tool(&failed(1, "sh: 1: the thing you wanted: not found")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_missing_command_is_recognised_in_the_shell_that_runs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = run_shell(dir.path(), "no-such-toolchain --version", LONG, 1024)
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, Some(127), "{out:?}");
+        assert_eq!(
+            missing_tool(&out),
+            Some(MissingTool {
+                name: Some("no-such-toolchain".to_owned())
+            }),
+            "{:?}",
+            out.tail
+        );
+        // A command that exists and fails is not.
+        let out = run_shell(dir.path(), "ls /no/such/dir", LONG, 1024)
+            .await
+            .unwrap();
+        assert!(!out.passed());
+        assert_eq!(missing_tool(&out), None, "{:?}", out.tail);
     }
 
     #[test]

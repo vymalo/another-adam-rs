@@ -22,8 +22,9 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 6] = [
+const TOOLS: [&str; 7] = [
     "prepare_workspace",
+    "run_command",
     "delegate_to_opencode",
     "run_checks",
     "commit_and_push",
@@ -146,6 +147,7 @@ async fn only_the_optional_arguments_are_nullable() {
             "prepare_workspace.base_branch",
             "prepare_workspace.branch",
             "run_checks.cwd",
+            "run_command.cwd",
         ]
     );
 }

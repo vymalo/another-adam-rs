@@ -44,6 +44,42 @@ pub(crate) async fn commits_ahead(dir: &Path, base_branch: &str) -> Option<u64> 
         .ok()
 }
 
+/// The branch `HEAD` is on (`refs/heads/...`), `None` when it is detached.
+pub(crate) async fn head_ref(dir: &Path) -> Option<String> {
+    git_stdout(dir, &["symbolic-ref", "-q", "HEAD"])
+        .await
+        .filter(|s| !s.is_empty())
+}
+
+/// Put the worktree back the way it was: `HEAD` on `head_ref` (or detached at `head`) and at
+/// `head`, the files exactly as `tree` holds them (what [`working_tree_id`] returned: tracked
+/// changes and untracked files, minus what `.gitignore` excludes), and the index as `HEAD`'s.
+///
+/// Used after a read-only command changed something it should not have. `reset --hard` undoes
+/// what it did to tracked files and to `HEAD`, `clean` removes what it created, and `read-tree
+/// --reset -u` writes back what the worktree held before (uncommitted work included, files that
+/// were untracked included). `true` when every step succeeded.
+pub(crate) async fn restore_worktree(
+    dir: &Path,
+    head: &str,
+    head_ref: Option<&str>,
+    tree: &str,
+) -> bool {
+    let point_head = match head_ref {
+        Some(branch) => git_stdout(dir, &["symbolic-ref", "HEAD", branch]).await,
+        None => git_stdout(dir, &["update-ref", "--no-deref", "HEAD", head]).await,
+    };
+    point_head.is_some()
+        && git_stdout(dir, &["reset", "--hard", "--quiet", head])
+            .await
+            .is_some()
+        && git_stdout(dir, &["clean", "-ffdq"]).await.is_some()
+        && git_stdout(dir, &["read-tree", "--reset", "-u", tree])
+            .await
+            .is_some()
+        && git_stdout(dir, &["reset", "--quiet", head]).await.is_some()
+}
+
 /// The tree id of `HEAD`: the code a pull request from this branch contains.
 pub(crate) async fn head_tree(dir: &Path) -> Option<String> {
     git_stdout(dir, &["rev-parse", "HEAD^{tree}"])

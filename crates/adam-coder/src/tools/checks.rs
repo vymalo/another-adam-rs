@@ -26,7 +26,7 @@ use serde_json::Value;
 use crate::redact::Redactor;
 
 use super::notes::CheckRecord;
-use super::shell::{ShellOutcome, resolve_cwd, run_shell};
+use super::shell::{MissingTool, ShellOutcome, missing_tool, resolve_cwd, run_shell};
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// The name of the artifact `run_checks` emits.
@@ -322,6 +322,32 @@ fn human(d: std::time::Duration) -> String {
     }
 }
 
+/// What the model is told when a command failed because the workspace lacks a tool (see
+/// [`missing_tool`]): what is missing, that no check cycle was used, and that the way on is to tell
+/// the person and wait. It must not retry variants, hunt the filesystem, or install anything.
+pub(crate) fn missing_tool_text(missing: &MissingTool) -> String {
+    let what = match &missing.name {
+        Some(name) => {
+            format!("The workspace has no `{name}`: the shell could not find it (exit code 127).")
+        }
+        None => {
+            "The shell could not find a command the workspace needs (exit code 127).".to_owned()
+        }
+    };
+    let which = missing
+        .name
+        .as_deref()
+        .map_or("the toolchain this project needs".to_owned(), |n| {
+            format!("which toolchain is missing (`{n}`)")
+        });
+    format!(
+        "{what} That is a missing toolchain, not a failing check: no check cycle was used and \
+         nothing was recorded as a check. Do not retry variants of the command, do not search the \
+         filesystem for the tool and do not try to install it (you cannot). Tell the person {which} \
+         with ask_user, and wait for their answer."
+    )
+}
+
 fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -> String {
     let verdict = if outcome.timed_out {
         format!(
@@ -352,21 +378,23 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 
 // Runs a command in the worktree and reports how it went.
 //
-// * `sh -lc <command>`, cwd inside the worktree (`cwd`, if given, must stay
+// * `bash -lc <command>` (`sh -lc` without bash), cwd inside the worktree (`cwd`, if given, must stay
 //   inside it), the process group killed after the timeout, only the output
 //   tail kept.
 // * A failed run costs one check cycle. After `max_check_cycles` failures the
 //   tool no longer runs anything and tells the model to stop and report.
 
-/// Run a shell command in your worktree (a project check such as `cargo test`,
-/// `pnpm test` or `just ci`) and get its exit code and the tail of its output.
-/// Only exit code 0 counts as passing. Every failed run uses up one of your
-/// limited check cycles.
+/// Run one of the project's own checks in your worktree (the commands its CI, README or
+/// Makefile run: `cargo test`, `pnpm test`, `just ci`) and get its exit code and the tail of
+/// its output. Only exit code 0 counts as passing. Every failed run uses up one of your limited
+/// check cycles and is reported as a check: never use it to look around (use run_command). A
+/// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
+/// cycle, and is for the person to decide.
 #[tool]
 pub async fn run_checks(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
-    /// Shell command, run with `sh -lc` in the worktree
+    /// Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree
     command: String,
     /// Optional sub-directory of the worktree to run in (relative, inside the worktree)
     cwd: Option<String>,
@@ -421,6 +449,16 @@ pub async fn run_checks(
     .map_err(|e| ToolError::Transient(format!("cannot start the shell: {e}")))?;
 
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
+
+    // A command the shell could not find is a missing toolchain, not a failing check: the
+    // workspace lacks the tool, and no change to the code would make the check pass. So it is not
+    // recorded (no cycle used, no `checks` artifact, nothing for the gate to see), and the model
+    // is told to report it and wait, which is all it can do: nothing is installed here.
+    if let Some(missing) = missing_tool(&outcome) {
+        ctx.emit_progress(format!("the workspace lacks a tool: {shown}"))
+            .await;
+        return Ok(ToolOutput::error(missing_tool_text(&missing)));
+    }
 
     // The code the command just ran on, so a pull request can be tied to
     // the exact tree that was verified.

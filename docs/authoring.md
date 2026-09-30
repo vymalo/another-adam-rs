@@ -1068,7 +1068,7 @@ type already sets the pattern).
 `adam-coder` is written with the layer it documents, in two steps, neither of which changed what the
 agent does.
 
-**S3, tools.** The six tools are `#[tool]` functions reading `State<ToolEnv>`; `coder_tools(&env)` is
+**S3, tools.** The seven tools are `#[tool]` functions reading `State<ToolEnv>`; `coder_tools(&env)` is
 `tools![..]` wrapped in the `Redacting` layer. `tests/tool_specs.rs` pins each `ToolSpec` against the JSON
 of the hand-written tools.
 
@@ -1082,7 +1082,7 @@ skill `coding-task`); the body is the system prompt with `{{max_check_cycles}}`.
 ```rust
 AgentDef::from_manifest(AGENT)?
     .var("max_check_cycles", env.settings.max_check_cycles)   // the process's setting wins over the default
-    .bind(tools)?                                             // the six tools, in the order they are offered
+    .bind(tools)?                                             // the seven tools, in the order they are offered
     .state(env)                                               // what the tools read with State<ToolEnv>
     .model(model, alias)?                                     // one client, the gateway alias
 ```

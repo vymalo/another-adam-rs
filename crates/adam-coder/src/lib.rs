@@ -5,7 +5,7 @@
 //! 1. prepares a git worktree (`prepare_workspace`, `adam-workspace`),
 //! 2. has OpenCode make the change over ACP (`delegate_to_opencode`, `adam-acp`),
 //! 3. runs the project's own checks, at most a configured number of failing
-//!    cycles (`run_checks`),
+//!    cycles (`run_checks`; looking around uses `run_command`, which is no check),
 //! 4. commits, pushes and opens a pull request (`commit_and_push`,
 //!    `open_pull_request`), and
 //! 5. streams progress throughout and reports the check results, the branch and the pull request
@@ -20,7 +20,7 @@
 //! | Module | What |
 //! |---|---|
 //! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks or rejected credentials and no PR = failed; any other stop without a PR = a question, `input-required`) and the record of the repositories the person named; [`CoderStarter`]: its start-only half |
-//! | [`tools`] | the six tools (`#[tool]` functions reading [`ToolEnv`] from the agent's state) and [`CoderSettings`] |
+//! | [`tools`] | the seven tools (`#[tool]` functions reading [`ToolEnv`] from the agent's state) and [`CoderSettings`] |
 //! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`) |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |

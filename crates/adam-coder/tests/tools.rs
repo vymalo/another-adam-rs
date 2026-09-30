@@ -11,6 +11,7 @@ use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::ask::AskUser;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::delegate::DelegateToOpenCode;
+use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::notes::PushedBranch;
 use adam_coder::tools::prepare::PrepareWorkspace;
@@ -1237,6 +1238,324 @@ async fn malformed_arguments_are_reported_to_the_model() {
     }
     // Nothing ran: there is still no worktree.
     assert!(!rig.worktree().exists());
+}
+
+// ------------------------------------------------ run_command: looking around, and nothing else
+
+/// `git status --porcelain` and `HEAD` of the run's worktree, with the content of every file
+/// that is not ignored: what `run_command` must leave as it found it.
+fn worktree_state(rig: &Rig) -> (String, String, String) {
+    let dir = rig.worktree();
+    (
+        common::git(&dir, &["status", "--porcelain=v1", "--untracked-files=all"]),
+        common::git(&dir, &["rev-parse", "HEAD"]),
+        common::git(&dir, &["symbolic-ref", "HEAD"]),
+    )
+}
+
+async fn failures(rig: &Rig) -> u32 {
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap();
+    notes.checks.failures
+}
+
+/// A command for looking is not a check: no artifact, no cycle, and a non-zero exit is an answer.
+#[tokio::test]
+async fn run_command_looks_around_without_reporting_checks_or_using_cycles() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+
+    let listing = RunCommand
+        .call(
+            &rig.ctx,
+            json!({"command": "ls; git branch -r; cat README.md"}),
+        )
+        .await
+        .unwrap();
+    assert!(!listing.is_error, "{}", listing.content);
+    assert!(
+        listing.content.contains("README.md")
+            && listing.content.contains("origin/main")
+            && listing.content.contains("widgets")
+            && listing.content.contains("exit code 0"),
+        "{}",
+        listing.content
+    );
+    assert!(listing.artifacts.is_empty(), "no checks artifact");
+
+    // Exits that are answers (a missing file), as many times as the model likes: no cycle is used
+    // and nothing is reported, where run_checks would have failed the run at the third.
+    for _ in 0..(rig.fx.env.settings.max_check_cycles + 2) {
+        let out = RunCommand
+            .call(&rig.ctx, json!({"command": "cat CLAUDE.md"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("exit code 1"), "{}", out.content);
+        assert!(out.content.contains("CLAUDE.md"), "{}", out.content);
+        assert!(out.artifacts.is_empty());
+    }
+    assert_eq!(failures(&rig).await, 0, "no check cycle used");
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap();
+    assert!(notes.checks.last.is_none(), "nothing recorded as a check");
+    // The budget is whole: a real check still runs, and reports.
+    let check = RunChecks
+        .call(&rig.ctx, json!({"command": "true"}))
+        .await
+        .unwrap();
+    assert_eq!(check.artifacts.len(), 1);
+
+    // cwd stays inside the worktree, and a missing workspace is said.
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": "ls", "cwd": "../.."}))
+        .await
+        .unwrap();
+    assert!(
+        out.is_error && out.content.contains("cwd"),
+        "{}",
+        out.content
+    );
+    let blank = RunCommand
+        .call(&rig.ctx, json!({"command": "  "}))
+        .await
+        .unwrap();
+    assert!(blank.is_error);
+    let other = Rig::new().await;
+    let none = RunCommand
+        .call(&other.ctx, json!({"command": "ls"}))
+        .await
+        .unwrap();
+    assert!(
+        none.is_error && none.content.contains("prepare_workspace"),
+        "{}",
+        none.content
+    );
+}
+
+/// `run_command` is not an editing path: what a command changes is undone, whatever it is, and
+/// the uncommitted work that was in the worktree is exactly as it was.
+#[tokio::test]
+async fn run_command_undoes_a_change_and_says_where_changes_go() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    // Uncommitted work of the run: an edit to a tracked file, a new file, a deleted-to-be file.
+    std::fs::write(dir.join("README.md"), "widgets\nedited by opencode\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "mine\n").unwrap();
+    std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+    let before = worktree_state(&rig);
+    let content_before = std::fs::read_to_string(dir.join("README.md")).unwrap();
+    let diff_before = common::git(&dir, &["diff", "HEAD"]);
+
+    for command in [
+        // New file.
+        "echo x > created.txt",
+        // A second edit to a file that was already modified (git status looks the same).
+        "echo more >> README.md",
+        // Delete tracked and untracked files, and create a directory with a nested repository.
+        "rm README.md notes.txt; mkdir -p sub && git init -q sub && echo y > sub/f",
+        // HEAD: a commit, a new branch, a reset.
+        "git add -A && git -c user.name=a -c user.email=a@b commit -qm sneaky",
+        "git checkout -q -b elsewhere",
+        "git reset -q --hard HEAD && git -c user.name=a -c user.email=a@b commit -q --allow-empty -m e",
+        // Through a tool that edits in place.
+        "sed -i 's/widgets/gadgets/' README.md",
+    ] {
+        let out = RunCommand
+            .call(&rig.ctx, json!({ "command": command }))
+            .await
+            .unwrap();
+        assert!(out.is_error, "{command}: {}", out.content);
+        assert!(
+            out.content.contains("changed the worktree")
+                && out.content.contains("exactly as it was")
+                && out.content.contains("delegate_to_opencode"),
+            "{command}: {}",
+            out.content
+        );
+        assert!(out.artifacts.is_empty());
+        assert_eq!(
+            worktree_state(&rig),
+            before,
+            "{command}: status, HEAD and branch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            content_before,
+            "{command}: a tracked file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+            "mine\n",
+            "{command}: an untracked file"
+        );
+        assert!(!dir.join("created.txt").exists(), "{command}");
+        assert!(!dir.join("sub").exists(), "{command}");
+        assert_eq!(
+            common::git(&dir, &["diff", "HEAD"]),
+            diff_before,
+            "{command}: the tracked changes, to the byte"
+        );
+    }
+    // Branch `elsewhere` (made by one of the commands) was only ever HEAD's name: the run is
+    // back on its own branch, and the cycles are untouched.
+    assert!(
+        common::git(&dir, &["symbolic-ref", "--short", "HEAD"]).starts_with("agent/"),
+        "back on the run's own branch"
+    );
+    assert_eq!(failures(&rig).await, 0);
+
+    // Writing where git does not look (ignored build output) is not a change to the worktree.
+    let built = RunCommand
+        .call(
+            &rig.ctx,
+            json!({"command": "mkdir -p target && echo built > target/out && cat target/out"}),
+        )
+        .await
+        .unwrap();
+    assert!(!built.is_error, "{}", built.content);
+    assert!(built.content.contains("built"));
+    assert_eq!(worktree_state(&rig), before);
+
+    // Reading commands that look like editing ones are fine: `git status`, `git diff`, `sed -n`.
+    let reading = RunCommand
+        .call(
+            &rig.ctx,
+            json!({"command": "git status --short; git diff --stat; sed -n 1p README.md"}),
+        )
+        .await
+        .unwrap();
+    assert!(!reading.is_error, "{}", reading.content);
+    assert!(reading.content.contains("notes.txt"), "{}", reading.content);
+}
+
+/// A toolchain the workspace lacks is reported as that: the workspace lacks it, no cycle is used,
+/// no failing `checks` artifact exists, and the model is told to report and wait (nothing is
+/// installed).
+#[tokio::test]
+async fn a_missing_toolchain_is_reported_and_costs_nothing() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+
+    for _ in 0..(rig.fx.env.settings.max_check_cycles + 2) {
+        let out = RunChecks
+            .call(
+                &rig.ctx,
+                json!({"command": "no-such-toolchain package -DskipTests"}),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        let said = &out.content;
+        assert!(
+            said.contains("The workspace has no `no-such-toolchain`")
+                && said.contains("no check cycle was used")
+                && said.contains("ask_user")
+                && said.contains("do not try to install it"),
+            "{said}"
+        );
+        assert!(out.artifacts.is_empty(), "no failing checks artifact");
+    }
+    assert_eq!(failures(&rig).await, 0);
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap();
+    assert!(
+        notes.checks.last.is_none(),
+        "not recorded: the gate sees no check"
+    );
+    assert!(!notes.cycles_exhausted(rig.fx.env.settings.max_check_cycles));
+
+    // The same in a script, and from run_command (which also leaves the worktree alone).
+    std::fs::write(
+        dir.join("check.sh"),
+        "#!/bin/sh\necho building\nnosuchbuild verify\n",
+    )
+    .unwrap();
+    let before = worktree_state(&rig);
+    let scripted = RunChecks
+        .call(&rig.ctx, json!({"command": "sh ./check.sh"}))
+        .await
+        .unwrap();
+    assert!(
+        scripted.is_error
+            && scripted.content.contains("no `nosuchbuild`")
+            && scripted.artifacts.is_empty(),
+        "{}",
+        scripted.content
+    );
+    let looked = RunCommand
+        .call(&rig.ctx, json!({"command": "nosuchbuild -v"}))
+        .await
+        .unwrap();
+    assert!(
+        looked.is_error && looked.content.contains("no `nosuchbuild`"),
+        "{}",
+        looked.content
+    );
+    assert!(looked.artifacts.is_empty());
+    assert_eq!(worktree_state(&rig), before);
+    assert_eq!(failures(&rig).await, 0);
+
+    // A check that really fails still costs a cycle, and says it is a failed check.
+    let red = RunChecks
+        .call(&rig.ctx, json!({"command": "echo nope; exit 3"}))
+        .await
+        .unwrap();
+    assert!(
+        red.is_error && red.content.contains("failed check run 1"),
+        "{}",
+        red.content
+    );
+    assert_eq!(red.artifacts.len(), 1);
+    assert_eq!(failures(&rig).await, 1);
+}
+
+/// Bash constructs work in both tools where the image has bash (the owner's `${PIPESTATUS[0]}`
+/// was "Bad substitution" under dash).
+#[tokio::test]
+async fn both_tools_run_bash_when_there_is_bash() {
+    if adam_coder::tools::shell::login_shell() != "bash" {
+        eprintln!("skipping: no bash on PATH");
+        return;
+    }
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let command =
+        "false | true; echo first=${PIPESTATUS[0]}; [[ -f README.md ]] && echo has-readme";
+    let looked = RunCommand
+        .call(&rig.ctx, json!({ "command": command }))
+        .await
+        .unwrap();
+    assert!(!looked.is_error, "{}", looked.content);
+    assert!(
+        looked.content.contains("first=1") && looked.content.contains("has-readme"),
+        "{}",
+        looked.content
+    );
+    let checked = RunChecks
+        .call(&rig.ctx, json!({ "command": command }))
+        .await
+        .unwrap();
+    assert!(!checked.is_error, "{}", checked.content);
+    assert!(checked.content.contains("first=1"), "{}", checked.content);
+    assert!(!checked.content.contains("Bad substitution"));
 }
 
 // ---------------------------------------------- a later task continues an earlier task's branch

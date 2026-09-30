@@ -485,6 +485,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
         names,
         [
             "prepare_workspace",
+            "run_command",
             "delegate_to_opencode",
             "run_checks",
             "commit_and_push",
@@ -651,6 +652,116 @@ async fn a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run(store: D
     );
     assert_eq!(fx.created_pulls().await.len(), 1);
     assert_eq!(fx.agent_branches().len(), 1);
+}
+
+/// The owner's live thread, end to end: the repository is given, the model guessed a base branch
+/// the repository does not have (its default is `master`), then looked around with commands: a
+/// missing file, a toolchain the image lacks. None of it is a check: no cycle, no `checks`
+/// artifact, nothing failed. A question ("List all branches") is answered in plain text, which
+/// parks the run as a question with no pull request, and the chat goes on.
+async fn a_question_is_answered_from_a_look_around_and_costs_no_check_cycles(store: DynStore) {
+    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 1).await;
+    common::git(&fx.remote, &["branch", "master", "refs/heads/main"]);
+    common::git(&fx.remote, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "q1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "develop"}),
+    )])
+    // It is told which branches exist, and leaves the base out.
+    .push_tool_calls(vec![call(
+        "q2",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url()}),
+    )])
+    // Looking around: a missing file, a missing toolchain, the branches. With one check cycle in
+    // the budget, treating any of these as a check would have failed the run.
+    .push_tool_calls(vec![call(
+        "q3",
+        "run_command",
+        json!({"command": "cat README.md CLAUDE.md"}),
+    )])
+    .push_tool_calls(vec![call(
+        "q4",
+        "run_command",
+        json!({"command": "nosuchbuild package"}),
+    )])
+    .push_tool_calls(vec![call(
+        "q5",
+        "run_command",
+        json!({"command": "git branch -r"}),
+    )])
+    .push_tool_calls(vec![call(
+        "q6",
+        "run_checks",
+        json!({"command": "nosuchbuild package"}),
+    )])
+    .push_text("The branches are main and master.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(
+        &server,
+        &format!("List all branches of {}", fx.remote_url()),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "an answer parks the run, it does not fail it: {:?} {:#?}",
+        seen.labels,
+        seen.messages
+    );
+    assert!(
+        seen.saw_message("The branches are main and master."),
+        "{:#?}",
+        seen.messages
+    );
+    assert!(
+        !seen.labels.iter().any(|l| l == "artifact:checks"
+            || l == "artifact:pull_request"
+            || l.contains("Failed")
+            || l.contains("Completed")),
+        "{:?}",
+        seen.labels
+    );
+    assert!(fx.created_pulls().await.is_empty());
+    assert!(fx.agent_branches().is_empty(), "nothing was pushed");
+
+    let results = tool_results(&mock.requests().last().unwrap().messages);
+    let by_id = |id: &str| results.iter().find(|(c, _, _)| c == id).unwrap().clone();
+    let (_, guessed, is_error) = by_id("q1");
+    assert!(
+        is_error && guessed.contains("develop") && guessed.contains("Its branches: main, master"),
+        "{guessed}"
+    );
+    let (_, ready, is_error) = by_id("q2");
+    assert!(
+        !is_error && ready.contains("base branch: master"),
+        "{ready}"
+    );
+    let (_, readme, is_error) = by_id("q3");
+    assert!(
+        !is_error && readme.contains("widgets") && readme.contains("exit code 1"),
+        "{readme}"
+    );
+    let (_, no_mvn, is_error) = by_id("q4");
+    assert!(
+        is_error && no_mvn.contains("no `nosuchbuild`") && no_mvn.contains("ask_user"),
+        "{no_mvn}"
+    );
+    let (_, branches, is_error) = by_id("q5");
+    assert!(
+        !is_error && branches.contains("origin/main") && branches.contains("origin/master"),
+        "{branches}"
+    );
+    let (_, check, is_error) = by_id("q6");
+    assert!(
+        is_error && check.contains("no `nosuchbuild`") && check.contains("no check cycle was used"),
+        "{check}"
+    );
 }
 
 /// A model that stops with no text at all still parks the run, with a fixed question.
@@ -2680,6 +2791,7 @@ macro_rules! coder_suite {
                 add_hello_txt_streams_working_progress_checks_artifact_completed,
                 ask_user_parks_and_an_a2a_follow_up_resumes,
                 a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,
+                a_question_is_answered_from_a_look_around_and_costs_no_check_cycles,
                 a_stop_without_text_asks_what_to_do,
                 an_empty_stop_after_work_does_not_ask_for_the_repository,
                 red_checks_with_cycles_left_then_text_is_a_question,

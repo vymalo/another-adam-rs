@@ -42,8 +42,9 @@ sequenceDiagram
 | Tool | Does |
 |---|---|
 | `prepare_workspace { repo_url, base_branch?, branch? }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
+| `run_command { command, cwd? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. The same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch and the tree of the worktree (what `commit_and_push` would commit) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
 | `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), streams its updates as progress, returns its summary and the changed files |
-| `run_checks { command, cwd? }` | `sh -lc <command>` in the worktree (a `cwd` must stay inside it), timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)) |
+| `run_checks { command, cwd? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
 | `commit_and_push { message }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
 | `open_pull_request { title, body, accept_red_checks? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. Declared `#[tool(asks_user)]`, so `adam-assembly` refuses to give it to a subagent |
@@ -167,6 +168,22 @@ make them hold:
   something else or stop it. The exits are a pull request, a failure (the rules
   above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
   and CancelTask (a chat's Stop).
+* **Looking around is not checking.** `run_command` exists so that exploring a repository does not look like
+  verifying it: in the owner's live thread the model explored with `run_checks` (`ls`, `cat README.md
+  CLAUDE.md` with exit 1 because `CLAUDE.md` was missing, `mvn package`, `ls /usr/lib/jvm`) and every
+  exploration was a check cycle, so three "failures" failed a run that had checked nothing. Now exploration
+  has no artifact and no cycle, cannot edit, and the prompt says to use `run_checks` only for the
+  project's own checks.
+* **A missing toolchain is reported, and the coder waits.** When a command exits 127, or the shell says
+  `sh: 1: mvn: not found` / `bash: line 1: mvn: command not found` for a failed command (`missing_tool`; a
+  missing file, a test that prints "not found" and exits 1, a timeout are not), both tools answer that the
+  workspace has no `mvn`: **no check cycle is used, no `checks` artifact is emitted, nothing is recorded for
+  the gate**, and the model is told not to retry variants, not to search the filesystem and not to install
+  anything, but to tell the person which toolchain is missing with `ask_user` and wait (the owner's decision:
+  the workspace image carries the toolchains it carries, no Java for now, and the coder installs nothing).
+* **A question is answered, not worked on.** The prompt says that a greeting or a question about the
+  repository ("List all branches") gets a direct answer (after `prepare_workspace`, with `run_command`) and ends
+  the turn; the run then parks as a question like any stop without a pull request, and the chat goes on.
 * **Only a repository the person named.** `prepare_workspace` refuses a
   repository that is not named in the person's own messages of the run: the
   task, and every answer delivered to it (user messages and the results of
@@ -217,6 +234,49 @@ stateDiagram-v2
 Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories named, branches the
 conversation pushed) lives in
 `<WORKSPACE_ROOT>/coder/<run>.json` next to the worktree, written atomically.
+
+### Looking around, and what it may not do
+
+`run_command` is the only tool that runs a model's command outside the check gate, so it is made
+unable to edit: the worktree is recorded, the command runs, and the worktree is compared with what
+was recorded.
+
+```mermaid
+sequenceDiagram
+  participant M as Model
+  participant T as run_command
+  participant W as Worktree
+  participant S as Shell (bash -lc)
+  M->>T: command
+  T->>W: record HEAD, branch and tree of the files
+  T->>S: run (timeout, output cap, no secrets)
+  S-->>T: exit code and output tail
+  T->>W: read HEAD, branch and tree again
+  alt nothing differs
+    alt the shell could not find a command
+      T-->>M: the workspace lacks it: no cycle, no checks
+    else it ran
+      T-->>M: exit code and output, no artifact, no cycle
+    end
+  else something differs
+    T->>W: reset --hard, clean, read-tree: back to the record
+    T-->>M: refused and undone, changes go through delegate_to_opencode
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Recorded: HEAD, branch, tree
+  Recorded --> Ran: the command
+  Ran --> Unchanged: same HEAD, branch and tree
+  Ran --> Changed: any of them differs
+  Changed --> Undone: restored to the record
+  Unchanged --> MissingTool: the shell could not find a command
+  Unchanged --> Answered: exit code and output
+  Undone --> [*]: refused
+  MissingTool --> [*]: reported, nothing counted
+  Answered --> [*]
+```
 
 ### A task that continues a task
 
@@ -393,7 +453,7 @@ reported at once at startup):
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
-| `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` | `900`, `16384` |
+| `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` (and of one `run_command`) | `900`, `16384` |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
@@ -671,6 +731,20 @@ database of its own, so the role needs `CREATEDB`):
   pins the fix of a flaky `checks_then_commit_binds_a_passing_verdict_to_the_pushed_commit`: the copy of
   the index that the tree id is computed in keeps the index's mtime, or git trusts the stat data of a file
   rewritten with the same size in the same clock tick and the tree holds its old content.
+* `run_command`, the shell and the missing toolchain are tested in `tests/tools.rs`
+  (`run_command_looks_around_without_reporting_checks_or_using_cycles`: no artifact, no cycle, `cat` of a
+  missing file five times with a budget of three; `run_command_undoes_a_change_and_says_where_changes_go`: a new
+  file, a second edit of an already modified file, deletions and a nested repository, a commit, a new branch, a
+  reset, `sed -i`, each undone with the run's uncommitted work intact to the byte, ignored output allowed, reads
+  that look like writes allowed; `a_missing_toolchain_is_reported_and_costs_nothing`: from both tools and from
+  inside a script, no cycle, no artifact, a really failing check still costs one;
+  `both_tools_run_bash_when_there_is_bash`), in `tests/e2e.rs`
+  (`a_question_is_answered_from_a_look_around_and_costs_no_check_cycles`: the owner's thread, with a repository
+  whose default is `master`: a guessed base refused with the list of branches, the default taken when it is left
+  out, a missing file, a missing `mvn`, `git branch -r`, and a run that parks as a question with a budget of one
+  cycle) and in `src/tools/shell.rs` (`missing_tool` for dash and bash lines, `login_shell`).
+  The tests use a name no image has for the missing tool (`nosuchbuild`): a CI image that carries `mvn` would
+  otherwise run it.
 * `tests/tool_specs.rs`: each tool's `ToolSpec` equals `tests/fixtures/tool-specs/<tool>.json`, the JSON of
   the hand-written tools, so a change to what the model is told is a reviewed diff. The one expected difference
   is normalised: an optional argument is `"type": ["string", "null"]` in a derived schema. Regenerate with
