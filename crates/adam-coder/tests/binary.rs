@@ -1091,7 +1091,7 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
         front.logs(),
         worker.logs()
     );
-    for name in ["branch", "pull_request"] {
+    for name in ["checks", "branch", "pull_request"] {
         assert!(
             artifacts.iter().any(|a| a == name),
             "{name} missing from {labels:?}"

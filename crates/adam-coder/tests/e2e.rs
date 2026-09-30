@@ -328,6 +328,24 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
         "OpenCode runs before the checks: {:#?}",
         seen.messages
     );
+    // checks (of HEAD, from run_checks), checks (bound to the pushed commit), branch, pull request
+    let artifact_labels: Vec<_> = seen
+        .labels
+        .iter()
+        .filter(|l| l.starts_with("artifact:"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        artifact_labels,
+        [
+            "artifact:checks",
+            "artifact:checks",
+            "artifact:branch",
+            "artifact:pull_request"
+        ],
+        "{:?}",
+        seen.labels
+    );
     assert!(seen.position("artifact:branch") < seen.position("artifact:pull_request"));
     assert!(seen.position("artifact:pull_request") < seen.position("status:Completed"));
     assert_eq!(
@@ -365,11 +383,62 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
     let (_, branch) = seen.artifacts.iter().find(|(n, _)| n == "branch").unwrap();
     assert_eq!(branch.parts.len(), 1, "{:?}", branch.parts);
 
+    // The checks artifact: passed, on the commit the worktree was at when they ran (the base of
+    // the run's branch: the change was still uncommitted), one data part, no findings.
+    let (_, checks) = seen.artifacts.iter().find(|(n, _)| n == "checks").unwrap();
+    assert_eq!(checks.parts.len(), 1, "{:?}", checks.parts);
+    let a2a::PartContent::Data(data) = &checks.parts[0].content else {
+        panic!("data part expected")
+    };
+    assert_eq!(data["passed"], true, "{data}");
+    assert_eq!(data["tree"].as_str().unwrap().len(), 40, "{data}");
+    let commit = data["commit"].as_str().unwrap();
+    assert_eq!(commit.len(), 40, "{data}");
+    assert_eq!(
+        commit,
+        common::git(&fx.remote, &["rev-parse", "main"]),
+        "{data}"
+    );
+    assert!(
+        data["summary"]
+            .as_str()
+            .unwrap()
+            .contains("test -f hello.txt")
+    );
+    assert!(data.get("findings").is_none(), "{data}");
+
     // The branch is on the remote with the file, in one commit.
     let branches = fx.agent_branches();
     assert_eq!(branches.len(), 1, "{branches:?}");
     assert_eq!(fx.file_on(&branches[0], "hello.txt"), "hello");
     assert_eq!(fx.commits_ahead(&branches[0]), 1);
+
+    // The second checks artifact is bound to the pushed commit: the SHA on the remote branch, and
+    // the tree of that commit, which is the tree the check ran on.
+    let pushed = common::git(&fx.remote, &["rev-parse", &branches[0]]);
+    let bound: Vec<_> = seen
+        .artifacts
+        .iter()
+        .filter(|(n, _)| n == "checks")
+        .collect();
+    let a2a::PartContent::Data(first) = &bound[0].1.parts[0].content else {
+        panic!("data part expected")
+    };
+    let a2a::PartContent::Data(second) = &bound[1].1.parts[0].content else {
+        panic!("data part expected")
+    };
+    assert_eq!(second["passed"], true, "{second}");
+    assert_eq!(second["commit"], pushed.as_str(), "{second}");
+    assert_eq!(
+        second["tree"],
+        common::git(&fx.remote, &["rev-parse", &format!("{pushed}^{{tree}}")]).as_str()
+    );
+    assert_eq!(
+        second["tree"], first["tree"],
+        "the tree that was checked is the tree that was pushed"
+    );
+    assert_ne!(second["commit"], first["commit"]);
+    assert_ne!(bound[0].1.artifact_id, bound[1].1.artifact_id);
     assert_eq!(
         common::git(
             &fx.remote,
@@ -404,7 +473,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
         .iter()
         .filter_map(|a| a.name.clone())
         .collect();
-    assert_eq!(names, ["branch", "pull_request"]);
+    assert_eq!(names, ["checks", "checks", "branch", "pull_request"]);
 
     // The model saw the checks output as a tool result, and the instructions.
     let requests = mock.requests();
@@ -768,6 +837,9 @@ impl ModelClient for HangingModel {
 }
 
 enum CrashPoint {
+    /// After `run_checks` ran the check, before its result (and its `checks` artifact) was
+    /// journaled, so the whole call runs again on takeover.
+    InsideRunChecks,
     /// After `commit_and_push` pushed, before its result was journaled.
     InsideCommitAndPush,
     /// After `commit_and_push` was journaled and committed, at the next model call.
@@ -808,6 +880,7 @@ async fn crash_at(point: CrashPoint, store: DynStore) {
     let armed = Arc::new(AtomicBool::new(true));
 
     let (model, wrap): (DynModel, Option<&'static str>) = match point {
+        CrashPoint::InsideRunChecks => (mock.clone(), Some("run_checks")),
         CrashPoint::InsideCommitAndPush => (mock.clone(), Some("commit_and_push")),
         CrashPoint::InsideOpenPullRequest => (mock.clone(), Some("open_pull_request")),
         CrashPoint::InsideDelegate => (mock.clone(), Some("delegate_to_opencode")),
@@ -937,11 +1010,12 @@ async fn crash_at(point: CrashPoint, store: DynStore) {
     assert_eq!(task.status.state, TaskState::Completed);
     let names: Vec<_> = task
         .artifacts
+        .clone()
         .unwrap()
         .iter()
         .filter_map(|a| a.name.clone())
         .collect();
-    assert_eq!(names, ["branch", "pull_request"]);
+    assert_eq!(names, ["checks", "checks", "branch", "pull_request"]);
     let conversation: Conversation = serde_json::from_value(view.state).unwrap();
     assert!(
         conversation
@@ -949,10 +1023,45 @@ async fn crash_at(point: CrashPoint, store: DynStore) {
             .iter()
             .any(|a| a.name == "pull_request")
     );
+    // Whatever the crash: one checks artifact per commit. The first names the commit the
+    // worktree was at when the check ran; the second is bound to the pushed commit, once.
+    let checks: Vec<_> = task
+        .artifacts
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.name.as_deref() == Some("checks"))
+        .collect();
+    assert_eq!(checks.len(), 2, "no duplicate checks artifact: {checks:?}");
+    let data: Vec<_> = checks
+        .iter()
+        .map(|a| match &a.parts[0].content {
+            a2a::PartContent::Data(d) => d.clone(),
+            other => panic!("data part expected, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(data[0]["passed"], true, "{data:?}");
+    assert_eq!(
+        data[0]["commit"],
+        common::git(&fx.remote, &["rev-parse", "main"]).as_str()
+    );
+    let pushed = common::git(&fx.remote, &["rev-parse", &branches[0]]);
+    assert_eq!(data[1]["passed"], true, "{data:?}");
+    assert_eq!(
+        data[1]["commit"],
+        pushed.as_str(),
+        "bound to the pushed commit"
+    );
+    assert_eq!(data[1]["tree"], data[0]["tree"]);
 }
 
 async fn crash_after_commit_and_push_was_journaled_repeats_nothing(store: DynStore) {
     crash_at(CrashPoint::AfterCommitAndPush, store).await;
+}
+
+/// The worker dies after the check ran, before the result reached the journal. The takeover runs
+/// the check again and reports it once: one `checks` artifact, not two under different ids.
+async fn crash_inside_run_checks_before_the_journal_emits_one_checks_artifact(store: DynStore) {
+    crash_at(CrashPoint::InsideRunChecks, store).await;
 }
 
 async fn crash_inside_commit_and_push_before_the_journal_is_idempotent(store: DynStore) {
@@ -1821,6 +1930,7 @@ macro_rules! coder_suite {
                 red_checks_n_times_fail_the_run_with_the_findings_and_no_pr,
                 a_pull_request_with_red_checks_needs_explicit_acceptance,
                 crash_after_commit_and_push_was_journaled_repeats_nothing,
+                crash_inside_run_checks_before_the_journal_emits_one_checks_artifact,
                 crash_inside_commit_and_push_before_the_journal_is_idempotent,
                 crash_inside_open_pull_request_before_the_journal_is_idempotent,
                 crash_during_delegate_to_opencode_reruns_on_the_same_worktree,

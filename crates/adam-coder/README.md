@@ -8,7 +8,7 @@ Given "in repo X, do Y" it
 2. has OpenCode make the change over ACP (`adam-acp`),
 3. runs the project's own checks, at most `MAX_CHECK_CYCLES` failing cycles,
 4. commits, pushes and opens a pull request, and
-5. streams progress throughout and reports the pull request as an artifact.
+5. streams progress throughout and reports the check results, the branch and the pull request as artifacts.
 
 It is durable (every model and tool step is journaled by `adam-runtime`, so a
 restarted worker replays instead of repeating a side effect) and addressable
@@ -34,7 +34,7 @@ sequenceDiagram
     R-->>O: progress (status updates)
   end
   R->>G: commit_and_push, open_pull_request
-  R-->>O: artifact (branch, pull_request) then completed
+  R-->>O: artifacts (checks, branch, pull_request) then completed
 ```
 
 ## Tools
@@ -43,8 +43,8 @@ sequenceDiagram
 |---|---|
 | `prepare_workspace { repo_url, base_branch }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree |
 | `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), streams its updates as progress, returns its summary and the changed files |
-| `run_checks { command, cwd? }` | `sh -lc <command>` in the worktree (a `cwd` must stay inside it), timeout kills the process group, output tail capped, secrets hidden from the child |
-| `commit_and_push { message }` | `commit_all` + `push`; artifact `branch` |
+| `run_checks { command, cwd? }` | `sh -lc <command>` in the worktree (a `cwd` must stay inside it), timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)) |
+| `commit_and_push { message }` | `commit_all` + `push`; artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch` |
 | `open_pull_request { title, body, accept_red_checks? }` | `CodeHost::open_pull_request`; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. Declared `#[tool(asks_user)]`, so `adam-assembly` refuses to give it to a subagent |
 
@@ -55,6 +55,61 @@ argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_to
 `CoderAgent` gives the agent the `ToolEnv` as state (`LlmAgentBuilder::state`), which is where the tools read it.
 The specs the model sees are pinned by `tests/fixtures/tool-specs/*.json` (see [Tests](#tests)); tool names and the
 journal's `tool:<call id>` step names are unchanged, so a run started before the port replays.
+
+### Artifacts
+
+A run reports its work as A2A artifacts (`adam_a2a_runtime::artifact_of`): one data part of media type
+`application/json`, with an id derived from the content, so a replayed step's artifact carries the same id and a
+subscriber sees it once.
+
+| Name | From | Data |
+|---|---|---|
+| `checks` | every `run_checks` call that ran its command, and `commit_and_push` (bound, below) | `passed`, `commit`, `tree?`, `summary?`, `findings?` (below) |
+| `branch` | `commit_and_push`, after its bound `checks` | `repository`, `branch`, `base_branch`, `commit` |
+| `pull_request` | `open_pull_request` | `url`, `number` (a string), `branch`, `repository`, then an A2A `url` part |
+
+**`checks`** is what an orchestrator gates on. Its data part:
+
+| Field | Type | |
+|---|---|---|
+| `passed` | bool | the command exited 0 in time **and** `commit` was determined |
+| `commit` | string | the 40-hex SHA of a commit: for `run_checks`, the `HEAD` of the run's worktree when the command ran (`""` only when it could not be read); for `commit_and_push`, the pushed commit |
+| `tree` | string, optional | the 40-hex git tree id of the code that was checked: the worktree as `commit_and_push` would commit it (`git add -A`: tracked changes and untracked files, minus what `.gitignore` excludes), computed in a temporary index. Absent when it could not be computed |
+| `summary` | string, optional | one line: `` `cmd` passed ``, or `` `cmd` failed: exit code 2 `` / `timed out after 900s` / `killed by a signal`. Says so when the worktree had uncommitted changes on top of `commit`, or that the tree was checked before it was committed |
+| `findings` | `[{check, message}]`, optional | one entry per failing check: `check` is the command, `message` is how it ended, then the tail of its output |
+
+* **From `run_checks`: one artifact per call that ran**, reflecting that run and bound to `HEAD`, with `tree`.
+  The agent runs its checks before `commit_and_push`, so this is usually the commit *below* the one that gets
+  pushed, with the change still uncommitted (the summary says so). Calls the tool refuses before running anything
+  (a bad `cwd`, no workspace, the exhausted cycle budget) emit none.
+* **From `commit_and_push`: the verdict on the pushed commit,** emitted before `branch`, so a consumer that has
+  seen `branch` already has it. The tool compares the tree of the pushed commit with the `tree` of the run's last
+  `run_checks`:
+  * **Same tree:** the same report bound to the pushed commit: `commit` is the pushed SHA, `tree` its tree,
+    `passed` and `findings` are the last run's, and the summary notes it was checked on the identical tree
+    before it was committed. This is also what a `commit_and_push` with nothing new to commit reports, when the
+    checks ran on the tree that is already pushed.
+  * **Different tree, or no `run_checks` in the run:** `passed: false`, `commit` the pushed SHA, `tree` its tree,
+    and one finding `{check: "checks", message: "the pushed tree was not checked: the last checks ran on <tree10>
+    (or: no check ran in this run), the commit has <tree10>"}`. Edits made after the checks are unverified.
+* **The last one for a commit wins.** A run reports several `checks` (red, fix, green, then the bound one). A
+  consumer that gates on "the checks for the pushed SHA" takes the last `checks` whose `commit` is that SHA; a
+  green one there means the code in that commit was checked. Each is a separate artifact (its id is derived from
+  its content); two with identical content share an id and arrive once.
+* **No commit is a failure, not a gap.** If `HEAD` cannot be read (no repository, no commit) `run_checks` still
+  emits the artifact with `passed: false`, `commit: ""` and a finding named `commit` that says so.
+* **Caps.** At most 20 findings and 16 KiB in total (the names and the messages). A message that does not fit keeps its
+  end behind a `[cut: the last N of M bytes]` line; findings that do not fit are replaced by a last one named `findings`
+  (`[cut: N more findings left out ...]`). A check name is cut at 256 bytes. A run of one command yields one
+  finding; the caps guard the other cases.
+* **Redacted.** The output is scrubbed with the run's `Redactor` (see [Secrets in output](#secrets-in-output)) before it
+  is cut, and the finished artifact is scrubbed again on its way out, like every tool result.
+* **Replay-safe.** Both artifacts are part of their tool's journaled result and hold nothing that varies between
+  executions (no timestamps, no ids of their own), so a replayed step re-emits identical artifacts. The last
+  report and its tree are kept in the run's notes (the file next to the worktree that also holds the cycle count),
+  written before the tool's result is journaled; the bound report is a pure function of the notes, the pushed SHA
+  and its tree. A `commit_and_push` that ran twice (a crash before its result was journaled) commits nothing the
+  second time, sees the same `HEAD` and tree, and emits the same `checks` once.
 
 Arguments the schema does not allow (a missing `command`, a number where a string belongs) come back to the model
 as a tool result, `invalid arguments for `run_checks`: ...`; an empty or blank required value still says
@@ -315,7 +370,7 @@ clients as run errors, events and tool results. A `Redactor` built from the
 configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN` (both only where the role holds them), every
 `A2A_BEARER_TOKENS` entry and the `DATABASE_URL` password (and their Base64
 forms) with `[redacted]` in tool results and errors, in OpenCode's and the
-checks' progress lines, in the checks' findings, in the agent's final
+checks' progress lines, in the `checks` artifact's findings and summary, in the agent's final
 failure message, and in the process's own `adam-coder failed` log line.
 A failed step's error crosses one boundary (`boundary_error` in
 `src/agent.rs`): its whole cause chain is flattened into the message, scrubbed,
@@ -376,13 +431,14 @@ database of its own, so the role needs `CREATEDB`):
   local bare git repository as the remote, the `adam-acp` fake agent as OpenCode
   and a wiremock GitHub. **Every case runs once per store** (`memory::*`, and
   `postgres::*` when the variable is set): the happy path (working, progress,
-  checks, artifacts, completed, branch on the remote, PR request at the mock),
+  checks, artifacts (`checks`, the `checks` bound to the pushed commit, `branch`, `pull_request`), completed, branch on the remote, PR request at the mock),
   the `input-required` round trip, red checks N times (failed, findings, no PR),
   the explicit-acceptance path, ownership, the wrong bearer token (401 at the
-  coder's own router; card and `/healthz` open), four crash points (inside
-  `commit_and_push`, after it was journaled, inside `open_pull_request`, inside
-  `delegate_to_opencode`) with a second worker taking over: one commit, one
-  push, one pull request, the same worktree; OpenCode crashing on every attempt
+  coder's own router; card and `/healthz` open), five crash points (inside
+  `run_checks`, inside `commit_and_push`, after it was journaled, inside
+  `open_pull_request`, inside `delegate_to_opencode`) with a second worker taking
+  over: one commit, one push, one pull request, one `checks` artifact per
+  commit (the one bound to the pushed commit is emitted once), the same worktree; OpenCode crashing on every attempt
   (run fails after the retry budget, with the child's stderr) and once
   (retried, completes); two concurrent tasks on one repository (two branches,
   two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`).
@@ -478,7 +534,7 @@ curl -N http://127.0.0.1:8080/ \
 ```
 
 Expected: a stream of status updates whose messages include `opencode: ...`
-lines and `running checks: ...`, then artifacts `branch` and `pull_request`,
+lines and `running checks: ...`, then artifacts `checks` (twice: of `HEAD`, then bound to the pushed commit), `branch` and `pull_request`,
 then `TASK_STATE_COMPLETED`. Verify:
 
 * the pull request URL from the artifact opens on GitHub, from a branch

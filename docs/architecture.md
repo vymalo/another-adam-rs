@@ -1478,6 +1478,7 @@ sequenceDiagram
     loop until green, or the check cycles are used up
         A->>Sh: run_checks(command), with a time limit
         Sh-->>A: exit code and output tail
+        A-->>C: artifact "checks"
         opt exit code is not 0
             A->>O: delegate_to_opencode(fix the failure)
         end
@@ -1486,6 +1487,7 @@ sequenceDiagram
     A->>G: commit_and_push(message)
     G->>G: git add -A, git commit
     G->>R: git push origin agent/short-run-id (never forced)
+    A-->>C: artifact "checks" (bound to the pushed commit)
     A-->>C: artifact "branch"
 
     A->>A: open_pull_request guard: HEAD is pushed, and the last check passed on this exact tree
@@ -1506,6 +1508,12 @@ The `pull_request` artifact has two parts: a data part with the JSON
 shows a link. The mapping is `adam_a2a_runtime::artifact_of`, which does this
 for any artifact whose data is an object with an absolute `http(s)` `url`; the
 `branch` artifact has no such field and stays a single data part.
+
+Every `run_checks` that ran its command also reports an artifact `checks` (`passed`, `commit`, `tree`, optional
+`summary` and `findings`), and `commit_and_push` emits, before `branch`, a `checks` bound to the pushed commit:
+the last run's report if it ran on the tree that was pushed, else `passed: false` with a finding saying the
+pushed tree was not checked. An orchestrator gates on the last `checks` whose `commit` is the pushed SHA. The
+schema, caps, binding rule and redaction are in the [coder README](../crates/adam-coder/README.md#artifacts).
 
 The same flow as states, from the point of view of the run notes and the
 tools' guards:
