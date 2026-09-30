@@ -40,8 +40,9 @@ fn expected_prompt(cycles: u32) -> String {
 }
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 6] = [
+const TOOLS: [&str; 7] = [
     "prepare_workspace",
+    "run_command",
     "delegate_to_opencode",
     "run_checks",
     "commit_and_push",
@@ -74,6 +75,19 @@ async fn the_prompt_carries_the_rules_the_code_relies_on() {
         "justfile",
         "small, focused commits",
         "verification section",
+        // The rule that lets a rework update the same pull request (`prepare_workspace`'s
+        // `branch`, which the tool only accepts for a branch this conversation pushed).
+        "`branch` set to the branch `commit_and_push` reported",
+        "`open_pull_request` at the end, and it reports (and updates)",
+        // Looking around is `run_command`, never a check; a missing toolchain is reported and
+        // waited on; a question is answered, not turned into a coding workflow.
+        "never to look around",
+        "that is not a failing check",
+        "toolchain is missing and what you needed it for",
+        "and do not try to install it",
+        "A tool that the **project** brings itself",
+        "Do not start the coding workflow",
+        "`base_branch` out to start from the repository's default branch",
     ] {
         assert!(text.contains(needle), "prompt lost: {needle}");
     }

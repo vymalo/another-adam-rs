@@ -41,11 +41,12 @@ sequenceDiagram
 
 | Tool | Does |
 |---|---|
-| `prepare_workspace { repo_url, base_branch }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user` |
+| `prepare_workspace { repo_url, base_branch?, branch? }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
+| `run_command { command, cwd? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. The same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
 | `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), streams its updates as progress, returns its summary and the changed files |
-| `run_checks { command, cwd? }` | `sh -lc <command>` in the worktree (a `cwd` must stay inside it), timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)) |
-| `commit_and_push { message }` | `commit_all` + `push`; artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch` |
-| `open_pull_request { title, body, accept_red_checks? }` | `CodeHost::open_pull_request`; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
+| `run_checks { command, cwd? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
+| `commit_and_push { message }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
+| `open_pull_request { title, body, accept_red_checks? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. Declared `#[tool(asks_user)]`, so `adam-assembly` refuses to give it to a subagent |
 
 Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../adam/README.md#tool)) in
@@ -65,7 +66,7 @@ subscriber sees it once.
 | Name | From | Data |
 |---|---|---|
 | `checks` | every `run_checks` call that ran its command, and `commit_and_push` (bound, below) | `passed`, `commit`, `tree?`, `summary?`, `findings?` (below) |
-| `branch` | `commit_and_push`, after its bound `checks` | `repository`, `branch`, `base_branch`, `commit` |
+| `branch` | `commit_and_push`, after its bound `checks` | `repository`, `branch` (the branch the commit was pushed to: the run's own), `base_branch`, `commit`, and `continues` when the run continues another branch that the commit has not been published to yet (it is, by `open_pull_request`, after the gate) |
 | `pull_request` | `open_pull_request` | `url`, `number` (a string), `branch`, `repository`, then an A2A `url` part |
 
 **`checks`** is what an orchestrator gates on. Its data part:
@@ -131,10 +132,27 @@ make them hold:
   tree of the pushed `HEAD`, compared with the tree the check ran on), and the
   branch is pushed. The single override is `accept_red_checks: true`, which the
   prompt reserves for explicit user consent obtained with `ask_user`; a pull
-  request opened that way says so in its body. It never overrides an exhausted
+  request opened that way says so in its body, and one that was already open says
+  so in a comment (its body is not ours to rewrite). It never overrides an exhausted
   cycle budget (a deliberate hardening: after the limit the run must stop).
+* **A continued branch is reached only through the gate.** A run that continues a branch
+  (`prepare_workspace`'s `branch`) pushes its commits to the run's own `agent/<run>`, never to
+  that branch: `commit_and_push` cannot move it. Only `open_pull_request`, after the check
+  above has passed (or been accepted), moves it to the pushed commit, as a fast-forward
+  that is never forced. So a pull request that is open for the branch never carries commits that
+  nobody verified, and a rework whose checks stay red leaves the branch and its pull request
+  exactly as the last verified task left them. The pull request of a continued branch is found by its head
+  alone (`find_pull_request_on_head`), and the base branch is recorded with the branch (`PushedBranch::base`,
+  inherited with the notes), so a continuing run works against the same base and never opens a second pull
+  request. A comment that cannot be posted (accepted red checks on an open pull request) does not undo the
+  update: the tool reports the pull request with a warning, records it (`RunNotes::published`, so the verdict
+  of a run that ends anyway does not say the pull request was not updated), and posts the note once per
+  pushed commit. If the branch moved on the remote since the task
+  started (someone pushed to it), it is not overwritten: the tool says so, names the run's own
+  branch where the commits are, and tells the model to ask the person.
 * **Completion policy.** When the model stops (a turn without tool calls) the
-  run completes only if it opened a pull request. A run that ends with red
+  run completes only if it opened a pull request (or updated the one of the branch it
+  continues). A run that ends with red
   checks, the check-cycle budget used up and no pull request fails instead of
   completing, whatever the model says. So does a run that ends without a pull
   request because GitHub or git rejected the credentials (the model cannot fix a
@@ -156,6 +174,31 @@ make them hold:
   something else or stop it. The exits are a pull request, a failure (the rules
   above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
   and CancelTask (a chat's Stop).
+* **Looking around is not checking.** `run_command` exists so that exploring a repository does not look like
+  verifying it: in the owner's live thread the model explored with `run_checks` (`ls`, `cat README.md
+  CLAUDE.md` with exit 1 because `CLAUDE.md` was missing, `mvn package`, `ls /usr/lib/jvm`) and every
+  exploration was a check cycle, so three "failures" failed a run that had checked nothing. Now exploration
+  has no artifact and no cycle, has its changes to `HEAD`, the branch and the working tree undone, and the prompt says to use `run_checks` only for the
+  project's own checks.
+* **A missing toolchain is reported, and the coder waits.** When a command **exits 127 and says so as a
+  shell does** (`sh: 1: mvn: not found`, `bash: line 1: mvn: command not found`, printed by the shell that ran it
+  or by a script the command runs; `missing_tool`; both are required, so a nested `sh: 1: gti: not found` in the
+  output of a run that exits 101, a bare 127, a missing file or a test that prints "not found" is not one), both
+  tools answer that the workspace has no `mvn`: **no check cycle is used, no `checks` artifact is emitted,
+  nothing is recorded for the gate**, and the model is told not to retry variants, not to search the filesystem
+  and not to install a system toolchain, but to tell the person which toolchain is missing with `ask_user` and
+  wait (the owner's decision: the workspace image carries the toolchains it carries, no Java for now). A tool
+  that **the project brings itself** (`jest`, `vitest`, `tsc` with a `package.json` that declares it or is
+  one of the well-known node tools, `pytest` with a Python project file; `project_dependency_hint`) is a
+  dependency that is not installed yet, and the answer says to install the project's dependencies with its own
+  command (`pnpm install`, `npm ci`, `pip install -r requirements.txt`, picked from the lock files) through
+  `delegate_to_opencode` **only** (an install that passes under `run_checks` would be a green check on code
+  nobody tested); it also costs no cycle. The second time the same tool is reported missing in a run
+  (`RunNotes::missing_tools`, one entry per call id so a replay counts once) the answer is to ask the person,
+  whatever the project says.
+* **A question is answered, not worked on.** The prompt says that a greeting or a question about the
+  repository ("List all branches") gets a direct answer (after `prepare_workspace`, with `run_command`) and ends
+  the turn; the run then parks as a question like any stop without a pull request, and the chat goes on.
 * **Only a repository the person named.** `prepare_workspace` refuses a
   repository that is not named in the person's own messages of the run: the
   task, and every answer delivered to it (user messages and the results of
@@ -184,7 +227,8 @@ make them hold:
   A message that continues a parked run (same `contextId`, no `taskId`, while the
   task is `input-required`) is delivered to that run, so a repository named in the
   original request still counts on it. A message after the task ended starts a new
-  task in the context, which knows only its own messages: name the repository again.
+  task in the context; it knows only its own messages unless it references the earlier task
+  (`referenceTaskIds`), see [A task that continues a task](#a-task-that-continues-a-task).
 
 ```mermaid
 stateDiagram-v2
@@ -202,8 +246,148 @@ stateDiagram-v2
   Canceled --> [*]
 ```
 
-Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories named) lives in
+Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories named, branches the
+conversation pushed) lives in
 `<WORKSPACE_ROOT>/coder/<run>.json` next to the worktree, written atomically.
+
+### Looking around, and what it may not do
+
+`run_command` is the only tool that runs a model's command outside the check gate, so changes it makes
+to `HEAD`, the branch and the working tree are undone: the worktree is recorded, the command runs, and the
+worktree is compared with what was recorded. The record also covers what a command could change without
+touching a file and that later git calls of the coder would act on: the refs outside the agent's own
+namespaces (`refs/heads/agent/*` and `refs/remotes/*` are other runs' and fetches', and move while a
+command runs) and the local git configuration (without `branch.*`, which `prepare` writes), so a
+`core.fsmonitor`, a `remote.origin.pushurl`, a `url.*.insteadOf`, an alias, a new branch or tag is undone too.
+**This is a guard against accidents, not isolation**, and not what the credentials rely on (the workspace
+cleans the mirror's configuration itself, under its lock, before every credentialed command). A command can
+still read everything the process can, use the network and write outside the worktree. The refs and the
+configuration are shared by every run on the mirror and other runs change them while a command runs, so
+these are **not** compared, and a command can change them unseen: `refs/heads/agent/*` (another run's
+branch), `refs/remotes/*`, `refs/tags/*` (a fetch follows tags) and `refs/stash` (a `git stash` elsewhere),
+and the configuration keys `branch.agent/*.adam-run`, `.remote` and `.merge`. `info/exclude` is compared.
+The restore holds the mirror lock, refuses to touch anything if the worktree's `.git` no longer points at this
+run's git directory (and puts that file back first), and deletes and sets refs with `--no-deref`. Where the tree cannot be computed (an embedded repository without a commit), the record falls back to
+`git status`: a change is still seen and refused, but only `HEAD` and the branch are put back, and the model
+is told the files may differ.
+
+```mermaid
+sequenceDiagram
+  participant M as Model
+  participant T as run_command
+  participant W as Worktree
+  participant S as Shell (bash -lc)
+  M->>T: command
+  T->>W: record HEAD, branch and tree of the files
+  T->>S: run (timeout, output cap, no secrets)
+  S-->>T: exit code and output tail
+  T->>W: read HEAD, branch and tree again
+  alt nothing differs
+    alt the shell could not find a command
+      T-->>M: the workspace lacks it: no cycle, no checks
+    else it ran
+      T-->>M: exit code and output, no artifact, no cycle
+    end
+  else something differs
+    T->>W: reset --hard, clean, read-tree: back to the record
+    T-->>M: refused and undone, changes go through delegate_to_opencode
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Recorded: HEAD, branch, tree
+  Recorded --> Ran: the command
+  Ran --> Unchanged: same HEAD, branch and tree
+  Ran --> Changed: any of them differs
+  Changed --> Undone: restored to the record
+  Unchanged --> MissingTool: the shell could not find a command
+  Unchanged --> Answered: exit code and output
+  Undone --> [*]: refused
+  MissingTool --> [*]: reported, nothing counted
+  Answered --> [*]
+```
+
+### A task that continues a task
+
+A rework or a follow-up is a new A2A task in the same `contextId` that names the task it builds on in
+`referenceTaskIds`. `CoderStarter` and `CoderAgent` forward `init_continuing` to `LlmStarter`, so the new
+run starts from the conversation of the referenced run (see
+[ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md)). Three things follow:
+
+* **The person's words are all of the conversation's.** `person_texts` reads the user messages of the
+  whole carried conversation, so a repository named in the first task is named in the second. A continued
+  user message can have several text parts (the task, the marker that says older turns were left out, the
+  next message), so they are read **part by part**, skipping the marker (`Conversation::is_omission_marker`,
+  which only ever matches the framework's own text, never a message that merely starts like it) and never
+  letting a block one part leaves open swallow the next. Everything else is as above: assistant text and
+  tool results never name a repository, nor does text in an `untrusted` fence.
+* **The branch can be carried on.** `prepare_workspace`'s `branch` starts the worktree from the branch an
+  earlier task pushed, and `open_pull_request` later moves that branch to the run's commits (after its
+  gate) and reports the pull request that is already open for it ("was already open") instead of failing or
+  opening another. The branch is **not taken on the model's word**, and **not parsed out of text** when it
+  can be avoided: `commit_and_push` records the line of work itself in the notes of its run
+  (`RunNotes::pushed_branches`: the branch it continued, or the run's own), and before every step the agent
+  adds the `pushed_branches` of the notes of the run it continues (`Conversation::continued_from`; it holds
+  what that run inherited too, so one hop is enough). Only when those notes are not there (the earlier run's
+  volume is not this worker's, as with the `isolated` placement) does it read the `commit_and_push` results
+  of the carried history, paired with their call by position, and then only results that end in the two
+  lines `repository: <url>` and `branch: <name>` and that history truncation did not cut (the cut is exactly
+  where the lines are, so a shortened result is no evidence). The tool accepts only a branch recorded for the
+  repository it is asked about; a name the model found in the repository (another person's branch, say) is
+  refused and the model is told to start a new branch. The workspace adds its own limits
+  (`Workspaces::prepare_continuing`): an `agent/*` branch that exists on the remote, never forced. The
+  worktree is still the run's own (`agent/<run>` is what is checked out and what `commit_and_push` pushes);
+  `Worktree::branch` names the continued branch, `Worktree::local_branch` the run's own.
+* **A new job stays a new job.** Without `branch` the worktree starts from the base branch on a branch of
+  its own, as before, and the prompt says when to use which.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant M as Model
+  participant T as Coder tools
+  participant W as Worktree (agent/run2)
+  participant R as Remote
+  participant H as Code host (PR 7 on agent/abc)
+  M->>T: prepare_workspace(branch agent/abc)
+  T->>W: start from origin/agent/abc
+  M->>T: run_checks, commit_and_push
+  T->>R: push agent/run2 (agent/abc untouched)
+  M->>T: open_pull_request
+  alt gate passed, or red checks accepted
+    T->>R: push run2:agent/abc (fast-forward, never forced)
+    T->>H: find the pull request of agent/abc (head and base)
+    H-->>T: PR 7
+    opt red checks accepted
+      T->>H: comment: the update was not verified
+    end
+    T-->>M: PR 7 was already open and carries the commits
+  else red or unchecked, or budget spent
+    T-->>M: refused: nothing touched agent/abc or PR 7
+  else agent/abc moved on the remote
+    T-->>M: refused, ask the person (commits are on agent/run2)
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Prepared: prepare_workspace(branch)
+  Prepared --> PushedOwn: commit_and_push (agent/run2)
+  PushedOwn --> PushedOwn: more work, commit_and_push
+  PushedOwn --> Gated: open_pull_request
+  Gated --> Refused: checks red or missing, unless accepted
+  Refused --> PushedOwn: fix, re-run the checks
+  Gated --> Moved: agent/abc fast-forwarded to the pushed commit
+  Gated --> Stale: agent/abc moved on the remote
+  Stale --> [*]: ask the person; nothing overwritten
+  Moved --> Reported: the open pull request is reported
+  Reported --> [*]: completed
+  Refused --> [*]: check budget spent, the run fails: the pull request was not updated
+```
+
+The old run's worktree is not removed by this (nothing removes finished runs' worktrees yet); the branch
+that was pushed is what carries the work, so the new worktree does not depend on it.
 
 ### Where the prompt and the card live
 
@@ -254,8 +438,11 @@ Each tool's side effect runs inside `LlmAgent`'s journaled `tool:<call id>`
 step, and each is also idempotent by construction, so a call that dies before
 its result is journaled (or a transient retry, which starts at a fresh journal
 position) does not duplicate anything: `commit_all` is a no-op without changes,
-pushing a commit the remote already has is a no-op, and
+pushing a commit the remote already has is a no-op (so is moving a continued
+branch to a commit it already has), and
 `CodeHost::open_pull_request` returns the open pull request of the same head.
+The one exception is the comment that a red-accepted update of an open pull request adds: a
+crash after it was posted and before the call was journaled posts it again when the call repeats.
 
 ### Cancel and rate limits
 
@@ -296,7 +483,7 @@ reported at once at startup):
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
-| `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` | `900`, `16384` |
+| `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks` (and of one `run_command`) | `900`, `16384` |
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
@@ -558,8 +745,45 @@ database of its own, so the role needs `CREATEDB`):
   sandbox address of the vendored e2e mocks, local paths, default ports, `www.github.com`,
   the configured default host) and the removal of `untrusted` fences (3 and 4 backticks, tildes,
   unclosed, the exact shape of the orchestrator's rework prompt); those of `src/agent.rs` pin what
-  counts as the person's words (assistant text, other tools' results and colliding call ids do not)
-  and the format of the stop's call id.
+  counts as the person's words (assistant text, other tools' results and colliding call ids do not), what
+  a continued conversation adds (a repository named in an earlier task is named, the omission marker is
+  skipped and nothing that only starts like it is, parts are read one by one), which `commit_and_push`
+  results name a pushed branch, and the format of the stop's call id. `a_later_task_continues_the_pushed_branch_and_reports_the_same_pull_request`
+  in `tests/tools.rs` is the rework at the tool level (refusals of a branch that was not pushed here, of
+  another repository's, of one outside `agent/`, of one that is not on the remote; the continued worktree
+  has the first task's work; one branch, two commits, one pull request reported as already open), and
+  `a_second_task_continues_the_first_tasks_branch_and_pull_request` and
+  `a_continued_task_refuses_what_only_the_model_or_a_fence_mentions` in `tests/e2e.rs` are it over A2A with
+  `referenceTaskIds` (the model of the second task is shown the first's conversation, `continued_from` says
+  which run it continued, the repository of the first task is named in the second without being repeated;
+  a repository only the model or an `untrusted` fence mentions, and a branch that was not pushed here, are
+  refused; `a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes_are_gone` removes the notes
+  of the first run and shows the branch is still found from the two last lines of its `commit_and_push` result, and
+  `a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone` that the failed verdict says the
+  pull request was not updated). The unit test `a_same_size_rewrite_within_the_index_tick_is_in_the_tree_id` in `src/tools/gitcli.rs`
+  pins the fix of a flaky `checks_then_commit_binds_a_passing_verdict_to_the_pushed_commit`: the copy of
+  the index that the tree id is computed in keeps the index's mtime, or git trusts the stat data of a file
+  rewritten with the same size in the same clock tick and the tree holds its old content.
+* `an_unnamed_repository_is_not_probed_for_its_default_branch` (no request, no mirror, for an unnamed
+  repository with `base_branch` left out), `a_continued_branch_keeps_the_base_of_its_pull_request`,
+  `a_comment_that_fails_leaves_the_update_delivered_and_the_note_is_posted_once`,
+  `run_command_undoes_changes_to_the_git_configuration_and_to_refs`,
+  `run_command_still_works_when_the_tree_cannot_be_computed` and
+  `a_project_dependency_is_to_be_installed_and_a_nested_not_found_is_a_failed_check` are in `tests/tools.rs` too.
+* `run_command`, the shell and the missing toolchain are tested in `tests/tools.rs`
+  (`run_command_looks_around_without_reporting_checks_or_using_cycles`: no artifact, no cycle, `cat` of a
+  missing file five times with a budget of three; `run_command_undoes_a_change_and_says_where_changes_go`: a new
+  file, a second edit of an already modified file, deletions and a nested repository, a commit, a new branch, a
+  reset, `sed -i`, each undone with the run's uncommitted work intact to the byte, ignored output allowed, reads
+  that look like writes allowed; `a_missing_toolchain_is_reported_and_costs_nothing`: from both tools and from
+  inside a script, no cycle, no artifact, a really failing check still costs one;
+  `both_tools_run_bash_when_there_is_bash`), in `tests/e2e.rs`
+  (`a_question_is_answered_from_a_look_around_and_costs_no_check_cycles`: the owner's thread, with a repository
+  whose default is `master`: a guessed base refused with the list of branches, the default taken when it is left
+  out, a missing file, a missing `mvn`, `git branch -r`, and a run that parks as a question with a budget of one
+  cycle) and in `src/tools/shell.rs` (`missing_tool` for dash and bash lines, `login_shell`).
+  The tests use a name no image has for the missing tool (`nosuchbuild`): a CI image that carries `mvn` would
+  otherwise run it.
 * `tests/tool_specs.rs`: each tool's `ToolSpec` equals `tests/fixtures/tool-specs/<tool>.json`, the JSON of
   the hand-written tools, so a change to what the model is told is a reviewed diff. The one expected difference
   is normalised: an optional argument is `"type": ["string", "null"]` in a derived schema. Regenerate with

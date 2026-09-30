@@ -729,6 +729,11 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
             ("MODEL_BASE_URL".to_owned(), model.uri()),
             ("GITHUB_API_URL".to_owned(), github.uri()),
             ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+            // The operator's own global configuration (the coder ignores `$HOME/.gitconfig`).
+            (
+                "GIT_CONFIG_GLOBAL".to_owned(),
+                home.join(".gitconfig").to_string_lossy().into_owned(),
+            ),
             (
                 "OPENCODE_COMMAND".to_owned(),
                 format!("/bin/sh {}", script.display()),
@@ -963,6 +968,11 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
             ("MODEL_BASE_URL".to_owned(), model.uri()),
             ("GITHUB_API_URL".to_owned(), github.uri()),
             ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+            // The operator's own global configuration (the coder ignores `$HOME/.gitconfig`).
+            (
+                "GIT_CONFIG_GLOBAL".to_owned(),
+                home.join(".gitconfig").to_string_lossy().into_owned(),
+            ),
             (
                 "OPENCODE_COMMAND".to_owned(),
                 common::fake_agent().to_string_lossy().into_owned(),
@@ -1082,7 +1092,7 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
             StreamResponse::Message(_) => {}
         }
     }
-    assert_eq!(last, Some(TaskState::Completed), "{labels:?}");
+    assert_eq!(last, Some(TaskState::Completed), "{labels:?} {progress:?}");
     assert!(
         progress
             .iter()

@@ -144,11 +144,12 @@ fn branch_of(head: &str) -> &str {
     head.split_once(':').map_or(head, |(_, b)| b)
 }
 
-fn api_pull(number: u64, branch: &str) -> Value {
+fn api_pull(number: u64, branch: &str, base: &str) -> Value {
     json!({
         "number": number,
         "html_url": pull_url(number),
         "head": {"ref": branch},
+        "base": {"ref": base},
         "state": "open",
     })
 }
@@ -165,11 +166,16 @@ impl Respond for ListPulls {
             .find(|(k, _)| k == "head")
             .map(|(_, v)| v.into_owned())
             .unwrap_or_default();
+        let base = request
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "base")
+            .map_or_else(|| "main".to_owned(), |(_, v)| v.into_owned());
         let branch = branch_of(&head);
         let open: Vec<Value> = self
             .pulls
             .get(branch)
-            .map(|n| api_pull(n, branch))
+            .map(|n| api_pull(n, branch, &base))
             .into_iter()
             .collect();
         ResponseTemplate::new(200).set_body_json(open)
@@ -184,8 +190,9 @@ impl Respond for CreatePull {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
         let head = body["head"].as_str().unwrap_or_default();
+        let base = body["base"].as_str().unwrap_or("main");
         let number = self.pulls.create(head);
-        ResponseTemplate::new(201).set_body_json(api_pull(number, head))
+        ResponseTemplate::new(201).set_body_json(api_pull(number, head, base))
     }
 }
 
@@ -205,6 +212,14 @@ pub async fn mock_github() -> MockServer {
         .respond_with(CreatePull { pulls })
         .mount(&github)
         .await;
+    // Comments on a pull request (the issue's comments).
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(
+            r"^/repos/octo/widgets/issues/\d+/comments$",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .mount(&github)
+        .await;
     github
 }
 
@@ -212,6 +227,20 @@ pub async fn mock_github() -> MockServer {
 pub async fn github_fails_with(github: &MockServer, status: u16, message: &str) {
     Mock::given(wiremock::matchers::any())
         .respond_with(ResponseTemplate::new(status).set_body_json(json!({"message": message})))
+        .with_priority(1)
+        .mount(github)
+        .await;
+}
+
+/// Make the mock GitHub refuse every comment on a pull request with `status` from now on.
+pub async fn comments_fail_with(github: &MockServer, status: u16) {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex(
+            r"^/repos/octo/widgets/issues/\d+/comments$",
+        ))
+        .respond_with(
+            ResponseTemplate::new(status).set_body_json(json!({"message": "comments are closed"})),
+        )
         .with_priority(1)
         .mount(github)
         .await;
@@ -231,16 +260,39 @@ impl CodeHost for GithubBehindMock {
         &self,
         mut pr: NewPullRequest,
     ) -> Result<PullRequest, WorkspaceError> {
-        pr.repo = self.slug.clone();
+        pr.repo = RepoRef::new(self.slug.url.clone(), pr.repo.base_branch.clone());
         self.inner.open_pull_request(pr).await
     }
 
     async fn find_pull_request(
         &self,
-        _repo: &RepoRef,
+        repo: &RepoRef,
         head: &str,
     ) -> Result<Option<PullRequest>, WorkspaceError> {
-        self.inner.find_pull_request(&self.slug, head).await
+        // The mock repository's base is whatever the caller works against; the slug stands in
+        // for the repository only.
+        let repo = RepoRef::new(self.slug.url.clone(), repo.base_branch.clone());
+        self.inner.find_pull_request(&repo, head).await
+    }
+
+    async fn find_pull_request_on_head(
+        &self,
+        repo: &RepoRef,
+        head: &str,
+    ) -> Result<Option<PullRequest>, WorkspaceError> {
+        let repo = RepoRef::new(self.slug.url.clone(), repo.base_branch.clone());
+        self.inner.find_pull_request_on_head(&repo, head).await
+    }
+
+    async fn comment_on_pull_request(
+        &self,
+        _repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<(), WorkspaceError> {
+        self.inner
+            .comment_on_pull_request(&self.slug, number, body)
+            .await
     }
 }
 
@@ -376,6 +428,29 @@ impl Fixture {
         std::fs::read_to_string(log).map_or(0, |t| t.lines().count())
     }
 
+    /// The bodies of the comments the mock GitHub received, as `(pull request number, text)`.
+    pub async fn comments(&self) -> Vec<(u64, String)> {
+        self.github
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/comments"))
+            .map(|r| {
+                let number = r
+                    .url
+                    .path()
+                    .split('/')
+                    .rev()
+                    .nth(1)
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+                (number, body["body"].as_str().unwrap_or_default().to_owned())
+            })
+            .collect()
+    }
+
     /// The JSON bodies of every `POST /pulls` the mock GitHub received.
     pub async fn created_pulls(&self) -> Vec<Value> {
         self.github
@@ -383,7 +458,7 @@ impl Fixture {
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter(|r| r.method.as_str() == "POST")
+            .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/pulls"))
             .map(|r| serde_json::from_slice(&r.body).unwrap_or(Value::Null))
             .collect()
     }

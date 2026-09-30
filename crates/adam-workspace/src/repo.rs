@@ -194,6 +194,14 @@ impl RepoLocation {
         }
     }
 
+    /// What git is told to connect to: the canonical URL of an http(s) remote, else `raw` (a
+    /// filesystem path or `file://` URL). Authenticated commands name **this** and not the remote
+    /// called `origin`, so a `remote.origin.url` or `pushurl` that someone changed in the shared
+    /// mirror's config cannot redirect what carries the credentials.
+    pub(crate) fn remote_url<'a>(&'a self, raw: &'a str) -> &'a str {
+        self.canonical_http_url().unwrap_or(raw)
+    }
+
     /// Whether an http(s) remote is reached over TLS.
     pub(crate) fn is_secure(&self) -> bool {
         matches!(&self.remote, Remote::Http { secure: true, .. })

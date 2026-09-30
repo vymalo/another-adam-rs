@@ -2,13 +2,41 @@
 
 use adam::Artifact;
 use adam::prelude::*;
-use adam_workspace::NewPullRequest;
+use adam_llm_agent::TRUNCATION_MARKER_PREFIX;
+use adam_workspace::{NewPullRequest, WorkspaceError};
 use serde_json::json;
 
 use super::checks::ChecksReport;
 use super::gitcli::{commits_ahead, head_sha, head_tree};
-use super::notes::PullRequestNote;
+use super::named::key_of_argument;
+use super::notes::{PullRequestNote, PushedBranch};
 use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, workspace_error};
+
+/// The name of [`commit_and_push`], which the agent also needs to tell its results apart in the
+/// conversation (see [`pushed_in`]).
+pub(crate) const COMMIT_AND_PUSH: &str = "commit_and_push";
+
+/// The repository and branch that the text of a `commit_and_push` result ends with: the last two
+/// lines, `repository: <url>` then `branch: <name>`, which name the line of work a later task may
+/// continue (the run's own branch, or the branch it continued).
+///
+/// This is the **fallback** for learning which branches exist: the tool records them itself in the
+/// run's notes (`RunNotes::pushed_branches`), and a run that continues another reads the notes of
+/// that run. The text is read only when those are not there (another worker's volume), and with
+/// the care a text calls for: only the final two lines count (a line like them anywhere else is
+/// whatever the tool or a repository wrote), and a result that history truncation cut
+/// ([`TRUNCATION_MARKER_PREFIX`]) is not read at all, because the cut is exactly where the lines
+/// were.
+pub(crate) fn pushed_in(text: &str) -> Option<(String, String)> {
+    if text.contains(TRUNCATION_MARKER_PREFIX) {
+        return None;
+    }
+    let mut last = text.lines().rev();
+    let branch = last.next()?.strip_prefix("branch: ")?.trim();
+    let repository = last.next()?.strip_prefix("repository: ")?.trim();
+    (!repository.is_empty() && !branch.is_empty())
+        .then(|| (repository.to_owned(), branch.to_owned()))
+}
 
 // Commits everything in the worktree and pushes the run's branch.
 //
@@ -83,6 +111,15 @@ pub async fn commit_and_push(
     }
 
     notes.pushed_sha = Some(sha.clone());
+    // The line of work this push belongs to, recorded by the tool itself: what a later task of the
+    // conversation may continue. Its own branch, or the branch the run continues.
+    if let Some(repo) = key_of_argument(&wt.repo().url) {
+        notes.name_pushed_branches([PushedBranch {
+            repo,
+            branch: wt.branch().to_owned(),
+            base: Some(wt.repo().base_branch.clone()),
+        }]);
+    }
     env.notes
         .save(&run, &notes)
         .await
@@ -93,25 +130,53 @@ pub async fn commit_and_push(
     let checks =
         checks_for_pushed(&notes, &sha, pushed_tree.as_deref()).into_artifact(&env.redactor);
 
-    let summary = match &committed {
-        Some(_) => format!("Committed {sha} and pushed branch {}.", wt.branch()),
-        None => format!(
-            "Nothing new to commit; branch {} is pushed at {sha}.",
-            wt.branch()
-        ),
+    let own = wt.local_branch();
+    let mut summary = match &committed {
+        Some(_) => format!("Committed {sha} and pushed branch {own}."),
+        None => format!("Nothing new to commit; branch {own} is pushed at {sha}."),
     };
+    if let Some(line) = wt.continues() {
+        summary.push_str(&format!(
+            "\nThis run continues {line}, which has not been changed: open_pull_request moves it \
+             to this commit (and so updates its pull request) once the checks have passed on \
+             exactly this code."
+        ));
+    }
+    // What a later task of this conversation may continue, as the last two lines (see
+    // `pushed_in`): the line of work, not necessarily the branch that was just pushed.
+    let summary = format!(
+        "{summary}\nrepository: {}\nbranch: {}",
+        wt.repo().url,
+        wt.branch()
+    );
     Ok(ToolOutput::text(summary)
         .with_artifact(checks)
         .with_artifact(Artifact {
             name: "branch".into(),
             mime_type: Some("application/json".into()),
-            data: json!({
-                "repository": wt.repo().url,
-                "branch": wt.branch(),
-                "base_branch": base,
-                "commit": sha,
-            }),
+            data: branch_data(wt.repo().url.as_str(), &wt, base, &sha),
         }))
+}
+
+/// The data of the `branch` artifact: the branch the commit was pushed to (the run's own), and,
+/// when the run continues another branch that the commit has not been published to yet, which
+/// one (`continues`).
+fn branch_data(
+    repository: &str,
+    wt: &adam_workspace::Worktree,
+    base: &str,
+    commit: &str,
+) -> serde_json::Value {
+    let mut data = json!({
+        "repository": repository,
+        "branch": wt.local_branch(),
+        "base_branch": base,
+        "commit": commit,
+    });
+    if let Some(line) = wt.continues() {
+        data["continues"] = json!(line);
+    }
+    data
 }
 
 /// The `checks` verdict on the pushed commit `sha`, whose tree is `tree`.
@@ -159,14 +224,20 @@ fn checks_for_pushed(
 // unverified). The one override is `accept_red_checks: true`, which
 // the prompt reserves for explicit user consent; it never overrides an
 // exhausted check budget, and a pull request opened that way says so in its
-// body. Idempotent: `CodeHost::open_pull_request` returns the open pull
-// request of the same head instead of creating another.
+// body (on a pull request that was already open, in a comment). When the run continues a branch,
+// its commits are on the run's own branch until this point: only after the gate has passed is the
+// continued branch fast-forwarded to the pushed commit (`Worktree::publish`, never forced), so a
+// pull request that is open for it never carries code the gate did not see. Idempotent: a pull
+// request that is already open for the branch (the run continued a branch an earlier task opened
+// it for, or this call is repeated) is reported as it is, and `CodeHost::open_pull_request` would
+// return it instead of creating another in any case.
 
 /// Open the pull request for the pushed branch. Requires that everything is
 /// pushed with commit_and_push and that the last check run passed on exactly
 /// this code (re-run the checks after your last change). The body must have a
 /// summary and a verification section listing the commands you ran and their
-/// results.
+/// results. If you continue a branch that already has an open pull request, this
+/// updates it with your commits (after the same check) instead of opening another.
 #[tool]
 pub async fn open_pull_request(
     env: State<ToolEnv>,
@@ -239,42 +310,144 @@ pub async fn open_pull_request(
         )));
     }
 
+    // A run that continues a branch has pushed its commits to its own branch only. Until this
+    // point nothing has touched the branch (or the pull request) it continues: the gate above is
+    // what lets the work in. Now the continued branch is moved to the pushed commit, never
+    // forced, so a pull request that is open for it carries exactly the code that was verified.
+    if let Some(line) = wt.continues() {
+        ctx.emit_progress(format!("updating {line} with {}", wt.local_branch()))
+            .await;
+        if let Err(e) = wt.publish().await {
+            return match e {
+                WorkspaceError::Conflict(_) => Ok(ToolOutput::error(format!(
+                    "Refusing to update {line}: the branch moved on the remote since this task \
+                     started (someone pushed to it), and adding this run's commits would overwrite \
+                     that. Nothing was changed on {line}; this run's commits are safe on {}. Do not \
+                     retry and do not push anywhere else: tell the person what happened and ask how \
+                     to go on with ask_user.",
+                    wt.local_branch()
+                ))),
+                e => Err(env.delivery_error(ctx, &e).await),
+            };
+        }
+        // From here on the branch carries the commits: whatever goes wrong next, the verdict must
+        // not say that it was not updated.
+        notes.published = true;
+        env.notes
+            .save(&run, &notes)
+            .await
+            .map_err(|e| notes_error(&e))?;
+    }
+
     let mut body = body.to_owned();
     if red {
-        body.push_str(
-            "\n\n> **Note:** the checks were not green for this exact code (failing, not run, or run \
-             before the last change) when this pull request was opened. The requester \
-             explicitly accepted that.\n",
-        );
+        body.push_str(RED_NOTE_IN_BODY);
     }
-    ctx.emit_progress(format!("opening a pull request from {}", wt.branch()))
-        .await;
-    let opened = env
-        .code_host
-        .open_pull_request(NewPullRequest {
-            repo: wt.repo().clone(),
-            head: wt.branch().to_owned(),
-            title: title.to_owned(),
-            body,
-            draft: env.settings.draft_pull_requests,
-        })
-        .await;
-    let pr = match opened {
-        Ok(pr) => pr,
+    // A pull request that already exists for the branch (the run continues a branch an earlier
+    // task opened it for) is what this call reports: the branch now carries this run's commits,
+    // and nothing else is to be opened. For a continued branch the pull request is the one of that
+    // branch whatever base it was opened against (a run that disagrees about the base must not
+    // get a second pull request); otherwise it is the one from this head against this base.
+    let found = if wt.continues().is_some() {
+        env.code_host
+            .find_pull_request_on_head(wt.repo(), wt.branch())
+            .await
+    } else {
+        env.code_host
+            .find_pull_request(wt.repo(), wt.branch())
+            .await
+    };
+    let existing = match found {
+        Ok(found) => found,
         Err(e) => return Err(env.delivery_error(ctx, &e).await),
     };
-
+    let reused = existing.is_some();
+    let pr = match existing {
+        Some(pr) => pr,
+        None => {
+            ctx.emit_progress(format!("opening a pull request from {}", wt.branch()))
+                .await;
+            let opened = env
+                .code_host
+                .open_pull_request(NewPullRequest {
+                    repo: wt.repo().clone(),
+                    head: wt.branch().to_owned(),
+                    title: title.to_owned(),
+                    body,
+                    draft: env.settings.draft_pull_requests,
+                })
+                .await;
+            match opened {
+                Ok(pr) => pr,
+                Err(e) => return Err(env.delivery_error(ctx, &e).await),
+            }
+        }
+    };
+    // The pull request is recorded before anything else is done for it: it is delivered.
+    let already_noted = notes.pull_request.as_ref().is_some_and(|p| {
+        p.number == pr.number
+            && p.red_checks_accepted
+            && p.commented_sha.as_deref() == Some(head.as_str())
+    });
     notes.pull_request = Some(PullRequestNote {
         url: pr.url.clone(),
         number: pr.number,
         red_checks_accepted: red,
+        commented_sha: already_noted.then(|| head.clone()),
     });
     env.notes
         .save(&run, &notes)
         .await
         .map_err(|e| notes_error(&e))?;
+    // The body of a pull request that was already open is not ours to rewrite, so the note that
+    // the update was not verified goes into a comment, once per pushed commit (a call that
+    // repeats finds it in the notes). A comment that cannot be posted does not undo the update
+    // (the branch has the commits and the pull request is reported): the model is told, so that
+    // it says so to the person.
+    let mut comment_failed = None;
+    if reused && red && !already_noted {
+        match env
+            .code_host
+            .comment_on_pull_request(wt.repo(), pr.number, RED_NOTE_IN_COMMENT)
+            .await
+        {
+            Ok(()) => {
+                if let Some(note) = notes.pull_request.as_mut() {
+                    note.commented_sha = Some(head.clone());
+                }
+                env.notes
+                    .save(&run, &notes)
+                    .await
+                    .map_err(|e| notes_error(&e))?;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot comment on the pull request");
+                comment_failed = Some(e.to_string());
+            }
+        }
+    }
 
-    let mut text = format!("Pull request #{} is open: {}", pr.number, pr.url);
+    let mut text = if reused {
+        let mut text = format!(
+            "Pull request #{} for {} was already open, and it now carries this run's commits: \
+             {}\nIts title and description are unchanged.",
+            pr.number,
+            wt.branch(),
+            pr.url
+        );
+        if red {
+            match &comment_failed {
+                None => text.push_str(" A comment says the update was not verified."),
+                Some(why) => text.push_str(&format!(
+                    " The comment that says the update was not verified could not be posted \
+                     ({why}): tell the person."
+                )),
+            }
+        }
+        text
+    } else {
+        format!("Pull request #{} is open: {}", pr.number, pr.url)
+    };
     if let Ok(dirty) = wt.status().await
         && !dirty.is_empty()
     {
@@ -297,3 +470,13 @@ pub async fn open_pull_request(
         }),
     }))
 }
+
+/// What a pull request opened on unverified code says in its body.
+const RED_NOTE_IN_BODY: &str = "\n\n> **Note:** the checks were not green for this exact code (failing, not run, or run \
+     before the last change) when this pull request was opened. The requester \
+     explicitly accepted that.\n";
+
+/// What an update of an open pull request with unverified code says in a comment.
+const RED_NOTE_IN_COMMENT: &str = "> **Note:** this update was added with checks that were not green for this exact code \
+     (failing, not run, or run before the last change). The requester explicitly accepted \
+     that.";

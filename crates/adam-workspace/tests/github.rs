@@ -39,6 +39,7 @@ fn api_pull(number: u64, branch: &str) -> serde_json::Value {
         "number": number,
         "html_url": format!("https://github.com/octo/widgets/pull/{number}"),
         "head": {"ref": branch, "label": format!("octo:{branch}")},
+        "base": {"ref": "main", "label": "octo:main"},
         "state": "open",
     })
 }
@@ -47,6 +48,7 @@ fn list_mock(branch: &str) -> wiremock::MockBuilder {
     Mock::given(method("GET"))
         .and(path("/repos/octo/widgets/pulls"))
         .and(query_param("head", format!("octo:{branch}")))
+        .and(query_param("base", "main"))
         .and(query_param("state", "open"))
 }
 
@@ -182,6 +184,82 @@ async fn find_pull_request_matches_the_head_branch_exactly() {
         gh.find_pull_request(&repo(), "agent/none").await.unwrap(),
         None
     );
+}
+
+/// The same head against another base is another pull request: the query names the base, and a
+/// server that answers with one anyway (a lenient one) does not make it this repository's match.
+#[tokio::test]
+async fn find_pull_request_matches_the_base_branch_too() {
+    let server = MockServer::start().await;
+    let mut against_dev = api_pull(4, "agent/x");
+    against_dev["base"] = json!({"ref": "dev", "label": "octo:dev"});
+    let mut no_base = api_pull(5, "agent/x");
+    no_base.as_object_mut().unwrap().remove("base");
+    list_mock("agent/x")
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([against_dev, no_base])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let gh = client(&server);
+    assert_eq!(
+        gh.find_pull_request(&repo(), "agent/x").await.unwrap(),
+        None,
+        "another base, or no base to prove it by"
+    );
+    // The repository's own base branch is the one asked about.
+    Mock::given(method("GET"))
+        .and(path("/repos/octo/widgets/pulls"))
+        .and(query_param("head", "octo:agent/x"))
+        .and(query_param("base", "dev"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "number": 4,
+            "html_url": "https://github.com/octo/widgets/pull/4",
+            "head": {"ref": "agent/x"},
+            "base": {"ref": "dev"},
+        }])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dev = RepoRef::new("https://github.com/octo/widgets.git", "dev");
+    assert_eq!(
+        gh.find_pull_request(&dev, "agent/x")
+            .await
+            .unwrap()
+            .unwrap()
+            .number,
+        4
+    );
+}
+
+#[tokio::test]
+async fn a_comment_is_posted_on_the_issue_of_the_pull_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/octo/widgets/issues/7/comments"))
+        .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+        .and(body_json(json!({"body": "the checks were red"})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    client(&server)
+        .comment_on_pull_request(&repo(), 7, "the checks were red")
+        .await
+        .unwrap();
+
+    // A refusal is an error, classified like every other call.
+    let forbidden = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(json!({"message": "Resource not accessible"})),
+        )
+        .mount(&forbidden)
+        .await;
+    let err = client(&forbidden)
+        .comment_on_pull_request(&repo(), 7, "x")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::Auth(_)), "{err:?}");
 }
 
 #[tokio::test]

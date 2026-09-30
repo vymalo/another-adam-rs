@@ -1,6 +1,6 @@
 {
   "name": "open_pull_request",
-  "description": "Open the pull request for the pushed branch. Requires that everything is pushed with commit_and_push and that the last check run passed on exactly this code (re-run the checks after your last change). The body must have a summary and a verification section listing the commands you ran and their results.",
+  "description": "Open the pull request for the pushed branch. Requires that everything is pushed with commit_and_push and that the last check run passed on exactly this code (re-run the checks after your last change). The body must have a summary and a verification section listing the commands you ran and their results. If you continue a branch that already has an open pull request, this updates it with your commits (after the same check) instead of opening another.",
   "parameters": {
     "type": "object",
     "properties": {

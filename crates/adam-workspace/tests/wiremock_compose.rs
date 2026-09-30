@@ -110,6 +110,18 @@ async fn pull_requests_and_scenarios_against_the_mock() {
         "the scenario must reset after the second probe"
     );
 
+    // A comment on a pull request (what an update with accepted red checks leaves): posted with a
+    // good token, refused with a bad one.
+    github
+        .comment_on_pull_request(&repo(), 7, "the update was not verified")
+        .await
+        .expect("comment");
+    let err = client(&root, "bad-token")
+        .comment_on_pull_request(&repo(), 7, "x")
+        .await
+        .expect_err("401");
+    assert!(matches!(err, WorkspaceError::Auth(_)), "{err:?}");
+
     // Bad credentials, by token and by keyword.
     let err = client(&root, "bad-token")
         .open_pull_request(new_pr("agent/three", "Bad token"))

@@ -21,7 +21,11 @@ pub struct Worktree {
     run: String,
     repo: RepoRef,
     path: PathBuf,
+    /// The name the work ends up under: the run's own branch, or the pushed branch this worktree
+    /// continues (which only [`Worktree::publish`] moves).
     branch: String,
+    /// The local branch that is checked out, always the run's own.
+    local: String,
     mirror: PathBuf,
 }
 
@@ -103,6 +107,7 @@ impl Worktree {
         repo: RepoRef,
         path: PathBuf,
         branch: String,
+        continued: Option<String>,
         mirror: PathBuf,
     ) -> Self {
         Self {
@@ -110,7 +115,8 @@ impl Worktree {
             run,
             repo,
             path,
-            branch,
+            branch: continued.unwrap_or_else(|| branch.clone()),
+            local: branch,
             mirror,
         }
     }
@@ -120,9 +126,27 @@ impl Worktree {
         &self.path
     }
 
-    /// The branch checked out here: `agent/<run-short-id>`.
+    /// The branch this worktree's work ends up on, which is what a pull request is opened from:
+    /// `agent/<run-short-id>`, or, for a worktree made by
+    /// [`Workspaces::prepare_continuing`](crate::Workspaces::prepare_continuing), the pushed
+    /// branch it continues. It is **not** where [`push`](Self::push) sends the commits: that is
+    /// [`local_branch`](Self::local_branch), and the continued branch only receives them through
+    /// [`publish`](Self::publish).
     pub fn branch(&self) -> &str {
         &self.branch
+    }
+
+    /// The run's own branch, `agent/<run-short-id>`: what is checked out, and what
+    /// [`push`](Self::push) publishes.
+    pub fn local_branch(&self) -> &str {
+        &self.local
+    }
+
+    /// The pushed branch this worktree continues, if it continues one
+    /// ([`Workspaces::prepare_continuing`](crate::Workspaces::prepare_continuing)): the branch
+    /// that [`publish`](Self::publish) moves forward.
+    pub fn continues(&self) -> Option<&str> {
+        (self.branch != self.local).then_some(self.branch.as_str())
     }
 
     /// The run this worktree belongs to.
@@ -190,6 +214,27 @@ impl Worktree {
         tokio::fs::copy(&index, &tmp)
             .await
             .map_err(|e| WorkspaceError::io("cannot copy the index", e))?;
+        // The copy keeps the index's modification time: git re-reads an entry that is as new as
+        // the index file ("racily clean"), and a copy stamped with the time it was made would
+        // make every entry look old, so a file rewritten with the same size right after the
+        // checkout would be counted with its old content.
+        let keep = async {
+            let modified = tokio::fs::metadata(&index).await?.modified()?;
+            let copy = tmp.clone();
+            tokio::task::spawn_blocking(move || {
+                std::fs::File::options()
+                    .write(true)
+                    .open(copy)?
+                    .set_modified(modified)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        }
+        .await;
+        if let Err(e) = keep {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(WorkspaceError::io("cannot copy the index's timestamp", e));
+        }
 
         let result = async {
             self.git()
@@ -258,28 +303,41 @@ impl Worktree {
         Ok(Some(sha.stdout_text()))
     }
 
-    /// Push the branch to `origin` (`refs/heads/<branch>`) and set it as the
-    /// branch's upstream.
+    /// Push the run's own branch ([`local_branch`](Self::local_branch), `agent/<run-short-id>`) to
+    /// `origin` under the same name and set it as the branch's upstream.
+    ///
+    /// This is the publication of the run's commits, and it is the same for a worktree that
+    /// continues a pushed branch: the run's work goes to its own branch first, and the branch it
+    /// continues is only moved by [`publish`](Self::publish), when the caller has decided that work
+    /// may be published there (a pull request that is open for that branch must not carry commits
+    /// nobody has verified).
     ///
     /// Never forces: pushing a commit the remote already has is a no-op, so
     /// retrying after a lost response is safe. A remote that has diverged is
     /// [`WorkspaceError::Invalid`].
-    #[tracing::instrument(skip(self), fields(run = %self.run, branch = %self.branch))]
+    #[tracing::instrument(skip(self), fields(run = %self.run, branch = %self.local))]
     pub async fn push(&self) -> WorkspaceResult<()> {
         let loc = self.repo.locate()?;
         let auth = self.ws.authorize(&self.repo, &loc).await?;
+        // The mirror lock is held from the clean-up of the configuration to the end of the
+        // push and of the upstream bookkeeping: what carries the token runs on a configuration
+        // that was just made safe, and the branch config (the mirror's shared file, which
+        // concurrent pushes of different runs would otherwise race on) is written by one at a time.
+        let _guard = self.ws.lock_mirror(&self.mirror).await?;
+        self.ws
+            .sanitize_mirror_config(&self.mirror, loc.remote_url(&self.repo.url))
+            .await?;
         self.git()
-            .args(["push", "--quiet", "origin"])
-            .arg(format!("refs/heads/{0}:refs/heads/{0}", self.branch))
+            .args(["push", "--quiet"])
+            .arg(loc.remote_url(&self.repo.url))
+            .arg(format!("refs/heads/{0}:refs/heads/{0}", self.local))
             .maybe_auth(auth)
             .run()
             .await?;
+        self.record_pushed(&self.local).await;
 
-        // Equivalent of `--set-upstream`. Done by hand and under the repo lock
-        // because the branch config lives in the mirror's shared config file,
-        // which concurrent pushes of different runs would otherwise race on.
-        let _guard = self.ws.lock_mirror(&self.mirror).await?;
-        let key = |k: &str| format!("branch.{}.{k}", self.branch);
+        // Equivalent of `--set-upstream`, done by hand.
+        let key = |k: &str| format!("branch.{}.{k}", self.local);
         self.ws
             .mirror_git(&self.mirror)
             .args(["config", &key("remote"), "origin"])
@@ -290,12 +348,114 @@ impl Worktree {
             .args([
                 "config",
                 &key("merge"),
-                &format!("refs/heads/{}", self.branch),
+                &format!("refs/heads/{}", self.local),
             ])
             .run()
             .await?;
         Ok(())
     }
+
+    /// Move the branch this worktree continues ([`branch`](Self::branch)) forward to the run's
+    /// branch: `git push origin <local>:<branch>`, **never forced**, so the branch only ever gets
+    /// this run's commits on top of what it had. A worktree that continues nothing has nothing to
+    /// do and returns at once.
+    ///
+    /// Call it after [`push`](Self::push) (the commits are then on the remote already), once the
+    /// work has earned its place on the branch. Repeating it is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Conflict`] when the branch has moved on the remote since this worktree
+    /// started from it (someone pushed to it: the run's commits are no longer a fast-forward of
+    /// it), and it was not touched. Any other push failure as for [`push`](Self::push).
+    #[tracing::instrument(skip(self), fields(run = %self.run, branch = %self.branch))]
+    pub async fn publish(&self) -> WorkspaceResult<()> {
+        if self.continues().is_none() {
+            return Ok(());
+        }
+        let loc = self.repo.locate()?;
+        let auth = self.ws.authorize(&self.repo, &loc).await?;
+        let _guard = self.ws.lock_mirror(&self.mirror).await?;
+        self.ws
+            .sanitize_mirror_config(&self.mirror, loc.remote_url(&self.repo.url))
+            .await?;
+        let pushed = self
+            .git()
+            .args(["push", "--quiet"])
+            .arg(loc.remote_url(&self.repo.url))
+            .arg(format!(
+                "refs/heads/{}:refs/heads/{}",
+                self.local, self.branch
+            ))
+            .maybe_auth(auth)
+            .run()
+            .await;
+        match pushed {
+            Err(WorkspaceError::Invalid(message))
+                if message.contains("non-fast-forward") || message.contains("fetch first") =>
+            {
+                Err(WorkspaceError::Conflict(format!(
+                    "the branch {} moved on the remote since this worktree was started from it, \
+                     so this run's commits cannot be added to it without overwriting what was \
+                     pushed there; it was not changed",
+                    self.branch
+                )))
+            }
+            Err(e) => Err(e),
+            Ok(_) => {
+                self.record_pushed(&self.branch).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Note in the mirror that `origin/<branch>` is now the run's branch tip, as `git push origin`
+    /// would have: the pushes name the URL and not the remote called `origin`, which does not
+    /// update the remote-tracking ref by itself, and `@{upstream}` and the next `prepare` read it.
+    ///
+    /// Best effort: the push has succeeded, and a failure here must not turn it into an error
+    /// (the next fetch writes the same ref).
+    async fn record_pushed(&self, branch: &str) {
+        let noted = async {
+            let tip = self
+                .git()
+                .args(["rev-parse", "--verify", "--quiet"])
+                .arg(format!("refs/heads/{}^{{commit}}", self.local))
+                .run()
+                .await?
+                .stdout_text();
+            self.ws
+                .mirror_git(&self.mirror)
+                .args(["update-ref", "--no-deref"])
+                .arg(format!("{REMOTE_TRACKING_PREFIX}{branch}"))
+                .arg(tip)
+                .run()
+                .await
+        }
+        .await;
+        if let Err(e) = noted {
+            tracing::warn!(error = %e, branch, "cannot record the pushed tip in the mirror");
+        }
+    }
+
+    /// Hold the lock of this worktree's mirror: the repository state that every run shares (refs,
+    /// configuration) is changed by one at a time while it is held. For a caller that writes that
+    /// state itself, such as undoing a change a command made to it.
+    ///
+    /// # Errors
+    ///
+    /// When the lock cannot be taken (see *Sharing a root between processes* in the README).
+    pub async fn lock_mirror(&self) -> WorkspaceResult<MirrorLock> {
+        Ok(MirrorLock {
+            _guard: self.ws.lock_mirror(&self.mirror).await?,
+        })
+    }
+}
+
+/// The lock of a mirror, held by [`Worktree::lock_mirror`] until it is dropped.
+#[must_use = "the lock is released when this is dropped"]
+pub struct MirrorLock {
+    _guard: crate::workspace::MirrorGuard,
 }
 
 /// Parse `git status --porcelain=v1 -z`: `XY <path>\0`, plus an extra

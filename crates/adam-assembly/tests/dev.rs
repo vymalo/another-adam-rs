@@ -229,6 +229,46 @@ async fn an_edit_reaches_the_next_step_of_a_running_run() {
     }
 }
 
+/// The stable agent the runtime holds under a dev reload is a wrapper, and a wrapper that only
+/// delegated `init` would silently start every continued run from nothing.
+#[tokio::test]
+async fn a_run_that_continues_another_carries_the_conversation_through_the_live_agent() {
+    for (backend, store) in stores().await {
+        let name = uniq("helper");
+        let dir = tempfile::tempdir().unwrap();
+        edit(dir.path(), FILE, &agent_file(&name, "", "A prompt."));
+        let model = Arc::new(MockModel::new());
+        model.push_text("answer one").push_text("answer two");
+        let live = builder(dir.path(), &model).load().unwrap();
+        let rt = runtime(&live, &store);
+        let worker = spawn_worker(&rt);
+
+        let first = rt
+            .start(&name, user_message("first task"), None)
+            .await
+            .unwrap();
+        wait_done(&rt, first).await;
+        let second = RunId::new();
+        assert!(
+            rt.start_with_id_continuing(second, &name, user_message("second task"), None, first)
+                .await
+                .unwrap(),
+            "{backend}"
+        );
+        wait_done(&rt, second).await;
+        worker.stop().await;
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2, "{backend}");
+        let said: Vec<String> = requests[1].messages.iter().map(|m| m.text()).collect();
+        assert_eq!(
+            said,
+            ["first task", "answer one", "second task"],
+            "{backend}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_reload_of_unchanged_files_swaps_and_says_nothing_changed() {
     let name = uniq("helper");

@@ -29,6 +29,11 @@ const CANCEL_REASON: &str = "canceled by client";
 /// under it.
 const MAX_JOIN_ATTEMPTS: usize = 5;
 
+/// How many of a message's `referenceTaskIds` are looked at, in order. Each one costs a store
+/// read, and a client names one (the task it builds on), so a long list is a mistake or an
+/// attempt to make the server read a lot. The ones after these are ignored.
+pub const MAX_REFERENCES: usize = 8;
+
 /// A task is a run: `task_id` is the run id, `context_id` the conversation
 /// (namespaced by the caller, see below).
 ///
@@ -37,6 +42,7 @@ const MAX_JOIN_ATTEMPTS: usize = 5;
 /// | A2A | Runtime |
 /// |---|---|
 /// | `SendMessage` (new) | `Runtime::start_with_id` with [`task_id_for`], conversation `<subject>:<context id>` |
+/// | `SendMessage` (new) with `referenceTaskIds` | `Runtime::start_with_id_continuing` from the first reference that qualifies (see below) |
 /// | `SendMessage` with `taskId` | `Runtime::deliver` (only while `input-required`) |
 /// | `input-required` | run parked with no timer (`RunView::waiting`); the question comes from [`PromptFn`] |
 /// | `completed` | `Done`; `output.text` is the status message, `RunView::artifacts` are the task artifacts |
@@ -60,6 +66,47 @@ const MAX_JOIN_ATTEMPTS: usize = 5;
 /// still has an open task is delivered to that task (the runtime allows one
 /// open run per conversation); once it is finished the message starts a new
 /// task in the same context.
+///
+/// # A new task continues the task it references
+///
+/// A refinement, a follow-up or a rework is a **new** task in the same `contextId`, and A2A says
+/// it names the task it builds on in `Message.referenceTaskIds`. Without help the new run would
+/// start from nothing and the agent would forget the conversation, so a new task whose message
+/// has `referenceTaskIds` starts **continuing** one of them: the new run's first state is
+/// `Agent::init_continuing` (`AgentStarter::init_continuing` on a front that only holds the
+/// starter) of the referenced run's last state. It is still a new run with a new id, journal and
+/// limits, and `task_id_for` is unchanged.
+///
+/// The backend takes the **first** reference (of the first [`MAX_REFERENCES`]) that is all of:
+///
+/// * a task of this agent owned by the caller, the rule of every other call ("Ownership" below);
+/// * in the **same context** as the new task: the message's `contextId`, so a message without
+///   one, which gets a context of its own, continues nothing;
+/// * **terminal**: `completed`, `failed` or `canceled` (`rejected`, the fourth terminal A2A
+///   state, is never produced here). A task that is `input-required` is not finished: a message
+///   for it is the follow-up that resumes it, and what a message with a `contextId` and no
+///   `taskId` does while the context has an open task is unchanged (it is delivered to it).
+///
+/// A reference that is malformed, unknown, someone else's, another context's, still open or
+/// unreadable is skipped. The client cannot tell why: it gets a fresh task, as it would for an id
+/// that never existed, so a reference is no way to learn whether another caller's task exists.
+/// The record is judged from its raw fields (agent, conversation, status) before its state is
+/// decoded, so a record the caller does not own is never decoded and cannot fail the request; one
+/// of the caller's own that does not decode is skipped with a warning. The operator sees **one
+/// `info` line per request that named references and started a fresh task anyway**, with a count
+/// per reason (never the ids of other callers' tasks). It is said once, for the outcome the
+/// request really had: not when a reference was continued, not when the message was delivered to
+/// the open task of its context (a reference means nothing there), and not again when a busy
+/// conversation made the request pick a second time; a repeat of a request (same `messageId`)
+/// says nothing either. Without any usable reference the task starts from nothing, as before:
+/// the backend never guesses "the latest task of the context". Repeating a request (same
+/// `messageId`) is idempotent as ever.
+///
+/// "The caller" is the authenticated subject ([`Caller::subject`]). The anonymous caller of an
+/// unauthenticated server is every client at once, so **a message from it never continues
+/// anything**: references are ignored (debug log) and the task starts fresh. With token
+/// authentication the subject is `token-<index>` in the configured list, so reordering or
+/// replacing tokens hands the history of an index to whoever holds it next.
 ///
 /// # Ownership
 ///
@@ -172,11 +219,123 @@ impl RuntimeTaskBackend {
 
     /// `Some((view, context id))` if the run is this agent's and the caller's.
     pub(crate) fn ownership(&self, caller: &Caller, view: RunView) -> Option<(RunView, String)> {
-        if view.agent != self.agent {
+        let context = self.context_of(caller, &view.agent, view.conversation_id.as_deref())?;
+        Some((view, context))
+    }
+
+    /// The context id of a run of `agent` in `conversation_id`, if it is this agent's and the
+    /// caller's: the one rule of ownership, from what the record says, before any of its state is
+    /// read.
+    fn context_of(
+        &self,
+        caller: &Caller,
+        agent: &str,
+        conversation_id: Option<&str>,
+    ) -> Option<String> {
+        if agent != self.agent {
             return None;
         }
-        let (subject, context) = decode_conversation(view.conversation_id.as_deref()?)?;
-        (subject == caller.subject).then_some((view, context))
+        let (subject, context) = decode_conversation(conversation_id?)?;
+        (subject == caller.subject).then_some(context)
+    }
+
+    /// The run that a new task started by `message` in `context_id` continues: the first of its
+    /// `referenceTaskIds` that is this caller's, this agent's, in this context and finished.
+    ///
+    /// Everything else is skipped without a word to the client (see the type's docs), and a
+    /// reference is judged from the raw record (agent, conversation, status) before any state of
+    /// it is decoded, so a record the caller does not own is never read, and cannot fail the
+    /// request. The caller is the authenticated subject: the anonymous one is every client of an
+    /// unauthenticated server at once, and continues nothing.
+    ///
+    /// Nothing is logged at `info` here: a request may pick more than once (the conversation was
+    /// busy and is picked again) or end up delivered to an open task, where a reference means
+    /// nothing. The [`Pick`] carries what was skipped, and [`start_or_join`](Self::start_or_join)
+    /// says it once, for the outcome the request really had.
+    async fn continued_run(
+        &self,
+        caller: &Caller,
+        message: &Message,
+        context_id: Option<&str>,
+    ) -> Result<Pick, BackendError> {
+        let references = message.reference_task_ids.as_deref().unwrap_or_default();
+        if references.is_empty() {
+            return Ok(Pick::default());
+        }
+        if caller.subject == Caller::ANONYMOUS {
+            tracing::debug!(
+                given = references.len(),
+                "referenceTaskIds are not honoured for the anonymous caller, which is shared by all; the task starts fresh"
+            );
+            return Ok(Pick::default());
+        }
+        let mut skipped = Skipped {
+            given: references.len(),
+            over_limit: references.len().saturating_sub(MAX_REFERENCES),
+            ..Skipped::default()
+        };
+        for reference in references.iter().take(MAX_REFERENCES) {
+            match self.judge(caller, reference, context_id).await? {
+                Verdict::Continue(run) => {
+                    return Ok(Pick {
+                        run: Some(run),
+                        skipped: Some(skipped),
+                    });
+                }
+                Verdict::Skip(why) => {
+                    tracing::debug!(reference = ?shown(reference), ?why, "a referenced task is skipped");
+                    skipped.count(why);
+                }
+            }
+        }
+        Ok(Pick {
+            run: None,
+            skipped: Some(skipped),
+        })
+    }
+
+    /// Whether one reference can be continued, from the raw record first: its agent, its
+    /// conversation (subject and context) and its status. Only a record that passes all of those,
+    /// which is therefore the caller's own, has its state decoded, and one that does not decode is
+    /// skipped with a warning instead of failing the request.
+    async fn judge(
+        &self,
+        caller: &Caller,
+        reference: &str,
+        context_id: Option<&str>,
+    ) -> Result<Verdict, BackendError> {
+        let Ok(uuid) = Uuid::parse_str(reference) else {
+            return Ok(Verdict::Skip(Why::Malformed));
+        };
+        let run = RunId(uuid);
+        let Some(rec) = self
+            .runtime
+            .store()
+            .load_run(run)
+            .await
+            .map_err(|e| map_err(e.into()))?
+        else {
+            return Ok(Verdict::Skip(Why::Unknown));
+        };
+        let Some(context) = self.context_of(caller, &rec.agent, rec.conversation_id.as_deref())
+        else {
+            return Ok(Verdict::Skip(Why::NotTheCallers));
+        };
+        if context_id != Some(context.as_str()) {
+            return Ok(Verdict::Skip(Why::OtherContext));
+        }
+        if !rec.status.is_terminal() {
+            return Ok(Verdict::Skip(Why::Open));
+        }
+        match self.runtime.view(run).await {
+            Ok(Some(_)) => Ok(Verdict::Continue(run)),
+            Ok(None) => Ok(Verdict::Skip(Why::Unknown)),
+            Err(RuntimeError::Corrupt { .. }) => {
+                tracing::warn!(%run, "a referenced task of the caller has an unreadable state; it is not continued");
+                Ok(Verdict::Skip(Why::Unreadable))
+            }
+            Err(e) => Err(map_err(e)),
+        }
     }
 
     /// A new-task submission: `(run id, context id)` of the task that took the
@@ -185,7 +344,9 @@ impl RuntimeTaskBackend {
     /// The run id is [`task_id_for`], so a repeat of the same request (same
     /// caller, `contextId` and `messageId`) finds the run its first attempt
     /// created and starts nothing. If the conversation already has an open task
-    /// the message is delivered to it, as `Runtime::start` does.
+    /// the message is delivered to it, as `Runtime::start` does. Otherwise the
+    /// task starts from nothing, or continuing the run that
+    /// [`continued_run`](Self::continued_run) picks.
     async fn start_or_join(
         &self,
         caller: &Caller,
@@ -193,15 +354,43 @@ impl RuntimeTaskBackend {
         inbound: adam_runtime::Inbound,
         context_id: Option<String>,
     ) -> Result<(RunId, String), BackendError> {
+        let Pick {
+            run: mut prior,
+            skipped: mut tally,
+        } = self
+            .continued_run(caller, message, context_id.as_deref())
+            .await?;
         // Without a message id there is nothing to recognise a repeat by.
         if message.message_id.is_empty() {
             let context = context_id.unwrap_or_else(a2a::new_context_id);
             let conversation = encode_conversation(&caller.subject, &context);
-            let run = self
-                .runtime
-                .start(&self.agent, inbound, Some(&conversation))
-                .await
-                .map_err(map_err)?;
+            let started = match prior {
+                Some(prior) => {
+                    self.runtime
+                        .start_continuing(&self.agent, inbound.clone(), Some(&conversation), prior)
+                        .await
+                }
+                None => {
+                    self.runtime
+                        .start(&self.agent, inbound.clone(), Some(&conversation))
+                        .await
+                }
+            };
+            let run = match started {
+                // The run it continued was purged in the meantime: there is nothing to continue.
+                Err(e) if prior_is_gone(&e, prior) => {
+                    prior = None;
+                    if let Some(tally) = tally.as_mut() {
+                        tally.count(why_gone(&e));
+                    }
+                    self.runtime
+                        .start(&self.agent, inbound, Some(&conversation))
+                        .await
+                }
+                other => other,
+            }
+            .map_err(map_err)?;
+            say_fresh(prior, tally.as_ref());
             return Ok((run, context));
         }
         let run = task_id_for(
@@ -213,12 +402,29 @@ impl RuntimeTaskBackend {
         let context = context_id.clone().unwrap_or_else(a2a::new_context_id);
         let conversation = encode_conversation(&caller.subject, &context);
         for _ in 0..MAX_JOIN_ATTEMPTS {
-            match self
-                .runtime
-                .start_with_id(run, &self.agent, inbound.clone(), Some(&conversation))
-                .await
-            {
-                Ok(true) => return Ok((run, context)),
+            let started = match prior {
+                Some(prior) => {
+                    self.runtime
+                        .start_with_id_continuing(
+                            run,
+                            &self.agent,
+                            inbound.clone(),
+                            Some(&conversation),
+                            prior,
+                        )
+                        .await
+                }
+                None => {
+                    self.runtime
+                        .start_with_id(run, &self.agent, inbound.clone(), Some(&conversation))
+                        .await
+                }
+            };
+            match started {
+                Ok(true) => {
+                    say_fresh(prior, tally.as_ref());
+                    return Ok((run, context));
+                }
                 Ok(false) => {
                     // A repeat: the task exists, and its context is the one it
                     // was created with (a request without `contextId` got a
@@ -229,6 +435,14 @@ impl RuntimeTaskBackend {
                         })?;
                     return Ok((run, context));
                 }
+                // The run it continued was purged or became unreadable in the meantime: there is
+                // nothing to continue.
+                Err(e) if prior_is_gone(&e, prior) => {
+                    prior = None;
+                    if let Some(tally) = tally.as_mut() {
+                        tally.count(why_gone(&e));
+                    }
+                }
                 Err(RuntimeError::ConversationBusy { .. }) => {
                     let open = self
                         .runtime
@@ -236,13 +450,21 @@ impl RuntimeTaskBackend {
                         .open_run_for_conversation(&self.agent, &conversation)
                         .await
                         .map_err(|e| map_err(e.into()))?;
-                    let Some(open) = open else { continue };
-                    match self.runtime.deliver(open.id, inbound.clone()).await {
-                        Ok(()) => return Ok((open.id, context)),
-                        // It finished meanwhile: the context takes a new task.
-                        Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => {}
-                        Err(e) => return Err(map_err(e)),
+                    if let Some(open) = open {
+                        match self.runtime.deliver(open.id, inbound.clone()).await {
+                            Ok(()) => return Ok((open.id, context)),
+                            // It finished meanwhile: the context takes a new task.
+                            Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => {}
+                            Err(e) => return Err(map_err(e)),
+                        }
                     }
+                    // The open task was gone or finished by the time it was looked at, and the
+                    // task that just finished may be the one this message references (it was open,
+                    // so it was skipped): pick again instead of starting from nothing.
+                    let again = self
+                        .continued_run(caller, message, context_id.as_deref())
+                        .await?;
+                    (prior, tally) = (again.run, again.skipped);
                 }
                 Err(e) => return Err(map_err(e)),
             }
@@ -256,6 +478,117 @@ impl RuntimeTaskBackend {
             .await
             .map_err(map_err)?
             .ok_or_else(|| BackendError::TaskNotFound(run.to_string()))
+    }
+}
+
+/// What picking the run to continue found: the run, if a reference qualified, and what was
+/// skipped on the way (`None` when the message named no reference, or the caller is anonymous,
+/// which honours none).
+#[derive(Default)]
+struct Pick {
+    run: Option<RunId>,
+    skipped: Option<Skipped>,
+}
+
+/// What [`RuntimeTaskBackend::judge`] made of a reference.
+enum Verdict {
+    Continue(RunId),
+    Skip(Why),
+}
+
+/// Why a reference was skipped. Only the log says.
+#[derive(Clone, Copy, Debug)]
+enum Why {
+    /// Not a task id at all.
+    Malformed,
+    /// No such run (or it was purged meanwhile).
+    Unknown,
+    /// Another agent's, or another caller's: the client cannot be told which, and neither is the log.
+    NotTheCallers,
+    /// The caller's, in another context than the new task.
+    OtherContext,
+    /// Still open.
+    Open,
+    /// The caller's own, finished, in this context, and unreadable.
+    Unreadable,
+}
+
+/// How many references were skipped for each reason, for the one line that says nothing could be
+/// continued.
+#[derive(Default)]
+struct Skipped {
+    given: usize,
+    malformed: usize,
+    unknown: usize,
+    not_the_callers: usize,
+    other_context: usize,
+    open: usize,
+    unreadable: usize,
+    over_limit: usize,
+}
+
+impl Skipped {
+    fn count(&mut self, why: Why) {
+        *match why {
+            Why::Malformed => &mut self.malformed,
+            Why::Unknown => &mut self.unknown,
+            Why::NotTheCallers => &mut self.not_the_callers,
+            Why::OtherContext => &mut self.other_context,
+            Why::Open => &mut self.open,
+            Why::Unreadable => &mut self.unreadable,
+        } += 1;
+    }
+}
+
+/// The one line for a request that named references and **started a fresh task** anyway: what it
+/// asked, and why none could be continued. Said once per request, by
+/// [`start_or_join`](RuntimeTaskBackend::start_or_join), after the start that settled the outcome:
+/// not when a run was continued, not when the message was delivered to the open task of its
+/// context (where a reference means nothing), and not again when a busy conversation made the
+/// request pick a second time. The client is told nothing; the operator sees that it asked.
+fn say_fresh(continued: Option<RunId>, tally: Option<&Skipped>) {
+    let (None, Some(skipped)) = (continued, tally) else {
+        return;
+    };
+    tracing::info!(
+        given = skipped.given,
+        malformed = skipped.malformed,
+        unknown = skipped.unknown,
+        not_the_callers = skipped.not_the_callers,
+        other_context = skipped.other_context,
+        open = skipped.open,
+        unreadable = skipped.unreadable,
+        over_limit = skipped.over_limit,
+        "none of the referenceTaskIds could be continued; the task starts fresh"
+    );
+}
+
+/// Why the run a start was to continue turned out not to be continuable after all (see
+/// [`prior_is_gone`]): purged, or unreadable.
+fn why_gone(error: &RuntimeError) -> Why {
+    match error {
+        RuntimeError::Corrupt { .. } => Why::Unreadable,
+        _ => Why::Unknown,
+    }
+}
+
+/// A client-supplied id for a log line: cut short, so that it cannot flood one. It is formatted
+/// with `?`, which escapes what is not printable.
+fn shown(reference: &str) -> String {
+    const MAX: usize = 48;
+    match reference.char_indices().nth(MAX) {
+        Some((at, _)) => format!("{}...", &reference[..at]),
+        None => reference.to_owned(),
+    }
+}
+
+/// Whether `error` says the run `prior` (named to continue) cannot be continued from any more
+/// (purged, or unreadable) rather than that the request failed.
+fn prior_is_gone(error: &RuntimeError, prior: Option<RunId>) -> bool {
+    match (error, prior) {
+        (RuntimeError::NotFound(gone), Some(prior)) => *gone == prior,
+        (RuntimeError::Corrupt { run, .. }, Some(prior)) => *run == prior,
+        _ => false,
     }
 }
 

@@ -75,4 +75,4 @@ pub use error::{WorkspaceError, WorkspaceResult};
 pub use github::GitHub;
 pub use repo::{RepoLocation, RepoRef};
 pub use workspace::Workspaces;
-pub use worktree::{ChangedFile, FileStatus, GitIdentity, Worktree};
+pub use worktree::{ChangedFile, FileStatus, GitIdentity, MirrorLock, Worktree};

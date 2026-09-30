@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use adam_core::StoreError;
+use adam_core::{RunId, StoreError};
 use adam_error::{BoxError, Classify, ErrorClass};
 
 use crate::ctx::Ctx;
@@ -257,6 +257,34 @@ pub trait Agent: Send + Sync + 'static {
     /// Initial state for a new run.
     fn init(&self, input: Inbound) -> Result<Self::State, AgentError>;
 
+    /// Initial state for a new run that **continues** run `prior_run`, whose last committed state
+    /// is `prior`.
+    ///
+    /// This is how a new task in the same conversation remembers the one before it: the runtime
+    /// calls it (`Runtime::start_continuing`, `Runtime::start_with_id_continuing`) instead of
+    /// [`init`](Self::init) when the caller names a run to continue. The new run is an ordinary
+    /// run with its own id, journal and limits; only its starting state is derived from `prior`.
+    ///
+    /// The default ignores `prior` and returns `self.init(input)`, so an agent that has nothing to
+    /// carry over keeps working unchanged. An agent that overrides it must return the same kind of
+    /// state `init` does, and a wrapper that delegates `init` to another agent must delegate this
+    /// as well, or the continuation silently stops at the wrapper.
+    ///
+    /// `prior` is the state as the prior run last committed it, whatever status that run has: a
+    /// run that failed mid-turn may hold a half-done step, and an override decides what to keep.
+    /// The runtime does not check that the caller may read the prior run (ownership is the
+    /// caller's rule, for A2A `adam-a2a-runtime`'s), only that it is a run of this agent whose
+    /// state decodes; one that does not decode falls back to `init` with a warning.
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &Self::State,
+        prior_run: RunId,
+    ) -> Result<Self::State, AgentError> {
+        let _ = (prior, prior_run);
+        self.init(input)
+    }
+
     /// Advance by one transition. Side effects go through `ctx.step`; `step`
     /// may be re-invoked after a crash.
     async fn step(
@@ -278,12 +306,15 @@ pub trait Agent: Send + Sync + 'static {
 ///
 /// `init` must produce the same state the [`Agent`] of that name would, and
 /// `State` must be the type that agent decodes (the runtime stores it as
-/// JSON). A run of a name that only a starter is registered for is never
-/// claimed by this runtime's workers.
+/// JSON). The same goes for [`init_continuing`](Self::init_continuing) and
+/// [`Agent::init_continuing`]. A run of a name that only a starter is registered
+/// for is never claimed by this runtime's workers.
 pub trait AgentStarter: Send + Sync + 'static {
     /// The state a new run starts with, stored as JSON. It is the same type as
-    /// the [`Agent::State`] of the agent that steps the run.
-    type State: Serialize + Send + Sync;
+    /// the [`Agent::State`] of the agent that steps the run, and so it decodes
+    /// too: a run that continues another starts from the prior run's stored
+    /// state.
+    type State: Serialize + DeserializeOwned + Send + Sync;
 
     /// Stable name, stored as `RunRecord::agent`. Equal to the name of the
     /// [`Agent`] that steps these runs.
@@ -291,6 +322,19 @@ pub trait AgentStarter: Send + Sync + 'static {
 
     /// Initial state for a new run.
     fn init(&self, input: Inbound) -> Result<Self::State, AgentError>;
+
+    /// Initial state for a new run that continues run `prior_run`: the start-only half of
+    /// [`Agent::init_continuing`], and it must return what that does. The default ignores
+    /// `prior` and returns `self.init(input)`.
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &Self::State,
+        prior_run: RunId,
+    ) -> Result<Self::State, AgentError> {
+        let _ = (prior, prior_run);
+        self.init(input)
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +345,53 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     #[error("lower")]
     struct Lower;
+
+    /// Implements `init` only: `init_continuing` is the default.
+    struct Echo;
+
+    #[async_trait]
+    impl Agent for Echo {
+        type State = Value;
+
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn init(&self, input: Inbound) -> Result<Value, AgentError> {
+            Ok(input.payload)
+        }
+
+        async fn step(&self, _: &mut Ctx, s: Value) -> Result<Transition<Value>, AgentError> {
+            Ok(Transition::Continue(s))
+        }
+    }
+
+    impl AgentStarter for Echo {
+        type State = Value;
+
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn init(&self, input: Inbound) -> Result<Value, AgentError> {
+            Ok(input.payload)
+        }
+    }
+
+    #[test]
+    fn the_default_continuation_is_init_and_ignores_the_prior_state() {
+        let input = Inbound::new("message", serde_json::json!({"text": "second"}));
+        let prior = serde_json::json!({"text": "first"});
+        let run = RunId::new();
+        assert_eq!(
+            Agent::init_continuing(&Echo, input.clone(), &prior, run).unwrap(),
+            Agent::init(&Echo, input.clone()).unwrap()
+        );
+        assert_eq!(
+            AgentStarter::init_continuing(&Echo, input.clone(), &prior, run).unwrap(),
+            AgentStarter::init(&Echo, input).unwrap()
+        );
+    }
 
     #[derive(Debug, thiserror::Error)]
     #[error("classified")]

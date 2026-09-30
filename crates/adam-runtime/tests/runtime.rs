@@ -27,6 +27,7 @@ use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, oneshot};
 
@@ -515,6 +516,129 @@ async fn wait_injected(faulty: &FaultyStore, method: Method, at_least: u64, what
 // ---------------------------------------------------------------------------
 // Cases
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Continuing another run
+// ---------------------------------------------------------------------------
+
+/// A state that remembers what it continued, so a continuation is visible in the stored run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Chain {
+    text: String,
+    /// The texts of the runs before this one, oldest first.
+    before: Vec<String>,
+}
+
+fn said(input: &Inbound) -> String {
+    input.payload["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn say(text: &str) -> Inbound {
+    Inbound::new("message", json!({ "text": text }))
+}
+
+fn chain_start(input: &Inbound) -> Chain {
+    Chain {
+        text: said(input),
+        before: Vec::new(),
+    }
+}
+
+fn chain_continued(input: &Inbound, prior: &Chain) -> Chain {
+    let mut before = prior.before.clone();
+    before.push(prior.text.clone());
+    Chain {
+        text: said(input),
+        before,
+    }
+}
+
+fn chain_of(view: &RunView) -> Chain {
+    serde_json::from_value(view.state.clone()).expect("the run holds a Chain")
+}
+
+/// An agent that finishes at its first step and carries `before` over a continuation.
+struct ChainAgent(String);
+
+#[async_trait]
+impl Agent for ChainAgent {
+    type State = Chain;
+
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn init(&self, input: Inbound) -> Result<Chain, AgentError> {
+        Ok(chain_start(&input))
+    }
+
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &Chain,
+        _prior_run: RunId,
+    ) -> Result<Chain, AgentError> {
+        Ok(chain_continued(&input, prior))
+    }
+
+    async fn step(&self, _ctx: &mut Ctx, state: Chain) -> Result<Transition<Chain>, AgentError> {
+        Ok(Transition::Done {
+            output: json!({"text": state.text}),
+            state,
+        })
+    }
+}
+
+/// A starter that refuses every input, continuing or not.
+struct RefusingStarter(String);
+
+impl AgentStarter for RefusingStarter {
+    type State = Chain;
+
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn init(&self, _input: Inbound) -> Result<Chain, AgentError> {
+        Err(AgentError::permanent("unusable start message: no"))
+    }
+
+    fn init_continuing(
+        &self,
+        _input: Inbound,
+        _prior: &Chain,
+        _prior_run: RunId,
+    ) -> Result<Chain, AgentError> {
+        Err(AgentError::permanent("unusable start message: no"))
+    }
+}
+
+/// The start-only half of [`ChainAgent`], what an A2A front registers.
+struct ChainStarter(String);
+
+impl AgentStarter for ChainStarter {
+    type State = Chain;
+
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    fn init(&self, input: Inbound) -> Result<Chain, AgentError> {
+        Ok(chain_start(&input))
+    }
+
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &Chain,
+        _prior_run: RunId,
+    ) -> Result<Chain, AgentError> {
+        Ok(chain_continued(&input, prior))
+    }
+}
 
 mod cases {
     use super::*;
@@ -3904,6 +4028,337 @@ mod cases {
             json!({"status": "failed", "error": "nope"})
         );
     }
+
+    /// A new run continues a finished one from a front that only holds the starter: the state comes
+    /// from the prior run's last commit, the run is an ordinary new run, a busy conversation is
+    /// refused as for any start, and asking again is idempotent even when the prior run has been
+    /// purged meanwhile.
+    pub async fn a_run_continues_a_finished_run_from_a_start_only_front(store: DynStore) {
+        let name = uniq("chain");
+        let conversation = uniq("conv");
+        let back = Runtime::builder(store.clone())
+            .agent(ChainAgent(name.clone()))
+            .worker_id(uniq("back"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let front = Runtime::builder(store.clone())
+            .starter(ChainStarter(name.clone()))
+            .worker_id(uniq("front"))
+            .build();
+
+        let first = RunId::new();
+        assert!(
+            front
+                .start_with_id(first, &name, say("one"), Some(&conversation))
+                .await
+                .unwrap()
+        );
+        let worker = spawn_worker(&back);
+        wait_done(&back, first).await;
+
+        let second = RunId::new();
+        assert!(
+            front
+                .start_with_id_continuing(second, &name, say("two"), Some(&conversation), first)
+                .await
+                .unwrap()
+        );
+        let view = front.view(second).await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Runnable);
+        assert_eq!(view.conversation_id.as_deref(), Some(conversation.as_str()));
+        assert_eq!(
+            chain_of(&view),
+            Chain {
+                text: "two".into(),
+                before: vec!["one".into()]
+            }
+        );
+        // The worker steps it like any run; the prior run is untouched.
+        wait_done(&back, second).await;
+        assert_eq!(
+            chain_of(&back.view(first).await.unwrap().unwrap()).text,
+            "one"
+        );
+        worker.stop().await;
+
+        // A third continues the second: the chain grows.
+        let third = RunId::new();
+        assert!(
+            front
+                .start_with_id_continuing(third, &name, say("three"), Some(&conversation), second)
+                .await
+                .unwrap()
+        );
+        let expected = Chain {
+            text: "three".into(),
+            before: vec!["one".into(), "two".into()],
+        };
+        assert_eq!(
+            chain_of(&front.view(third).await.unwrap().unwrap()),
+            expected
+        );
+
+        // One open run per conversation, as for any start: a fourth, while the third is open,
+        // is refused and the third is untouched.
+        let fourth = RunId::new();
+        let busy = front
+            .start_with_id_continuing(fourth, &name, say("four"), Some(&conversation), second)
+            .await;
+        assert!(
+            matches!(busy, Err(RuntimeError::ConversationBusy { .. })),
+            "{busy:?}"
+        );
+        assert!(front.view(fourth).await.unwrap().is_none());
+
+        // Asking again is idempotent, also once the runs it came from are gone (a retry after the
+        // prior was purged); with a different id and a prior that is gone, it is not found.
+        let fifth = RunId::new();
+        assert!(
+            front
+                .start_with_id_continuing(fifth, &name, say("five"), None, second)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !front
+                .start_with_id_continuing(fifth, &name, say("five"), None, second)
+                .await
+                .unwrap()
+        );
+        let purged = store
+            .purge_finished(&name, chrono::Utc::now() + chrono::Duration::hours(1))
+            .await
+            .expect("purge");
+        assert!(purged >= 2, "purged {purged}");
+        assert!(store.load_run(second).await.unwrap().is_none());
+        assert!(
+            !front
+                .start_with_id_continuing(fifth, &name, say("five"), None, second)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            chain_of(&front.view(fifth).await.unwrap().unwrap()),
+            Chain {
+                text: "five".into(),
+                before: vec!["one".into(), "two".into()]
+            }
+        );
+        let gone = front
+            .start_with_id_continuing(RunId::new(), &name, say("x"), None, second)
+            .await;
+        assert!(
+            matches!(gone, Err(RuntimeError::NotFound(id)) if id == second),
+            "{gone:?}"
+        );
+    }
+
+    /// The runtime refuses what it can check and leaves no run behind: a prior that does not
+    /// exist, a prior of another agent, an input the agent refuses.
+    pub async fn continuing_checks_the_prior_run_and_creates_nothing_when_it_refuses(
+        store: DynStore,
+    ) {
+        let (name, other) = (uniq("chain"), uniq("other"));
+        let rt = Runtime::builder(store.clone())
+            .starter(ChainStarter(name.clone()))
+            .starter(JsonStarter(other.clone()))
+            .worker_id(uniq("front"))
+            .build();
+        let foreign = RunId::new();
+        assert!(
+            rt.start_with_id(foreign, &other, inbound(), None)
+                .await
+                .unwrap()
+        );
+
+        let ghost = RunId::new();
+        let id = RunId::new();
+        let missing = rt
+            .start_with_id_continuing(id, &name, say("x"), None, ghost)
+            .await;
+        assert!(
+            matches!(missing, Err(RuntimeError::NotFound(g)) if g == ghost),
+            "{missing:?}"
+        );
+        let wrong_agent = rt
+            .start_with_id_continuing(id, &name, say("x"), None, foreign)
+            .await
+            .expect_err("another agent's run is not this agent's to continue");
+        assert_eq!(wrong_agent.class(), adam_runtime::ErrorClass::Invalid);
+        assert!(!wrong_agent.is_retryable());
+        assert!(
+            matches!(&wrong_agent, RuntimeError::WrongAgent { run, agent } if *run == foreign && *agent == name),
+            "{wrong_agent:?}"
+        );
+        let unknown_agent = rt
+            .start_with_id_continuing(id, "nobody", say("x"), None, foreign)
+            .await;
+        assert!(matches!(unknown_agent, Err(RuntimeError::UnknownAgent(_))));
+        assert!(
+            store.load_run(id).await.unwrap().is_none(),
+            "nothing was created"
+        );
+        assert!(matches!(
+            rt.start_continuing(&name, say("x"), None, ghost).await,
+            Err(RuntimeError::NotFound(g)) if g == ghost
+        ));
+
+        // The agent's own refusal of the input is the caller's error, not a fallback.
+        let prior = RunId::new();
+        assert!(
+            rt.start_with_id(prior, &name, say("one"), None)
+                .await
+                .unwrap()
+        );
+        let refusing = Runtime::builder(store.clone())
+            .starter(RefusingStarter(name.clone()))
+            .worker_id(uniq("refusing"))
+            .build();
+        let refused = refusing
+            .start_with_id_continuing(id, &name, say("x"), None, prior)
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(RuntimeError::Agent(AgentError::Permanent { .. }))
+            ),
+            "{refused:?}"
+        );
+        assert!(store.load_run(id).await.unwrap().is_none());
+
+        // A repeat of a request that already started its run answers `false` before the prior is
+        // read or `init_continuing` runs: a prior that is wrong, or gone, changes nothing.
+        let started = RunId::new();
+        assert!(
+            rt.start_with_id_continuing(started, &name, say("two"), None, prior)
+                .await
+                .unwrap()
+        );
+        for other_prior in [foreign, ghost] {
+            assert!(
+                !rt.start_with_id_continuing(started, &name, say("two"), None, other_prior)
+                    .await
+                    .unwrap(),
+                "a repeat is recognised before the prior is looked at"
+            );
+        }
+        // Whereas a request that has not started anything is still refused for it.
+        assert!(matches!(
+            rt.start_with_id_continuing(RunId::new(), &name, say("x"), None, foreign)
+                .await,
+            Err(RuntimeError::WrongAgent { .. })
+        ));
+    }
+
+    /// A prior state the agent cannot decode (another shape under the same name) does not stop a
+    /// new run from starting: it starts as `init` says, and the run is fine.
+    pub async fn a_prior_state_that_does_not_decode_starts_the_run_fresh(store: DynStore) {
+        let name = uniq("chain");
+        let old_shape = Runtime::builder(store.clone())
+            .starter(JsonStarter(name.clone()))
+            .worker_id(uniq("old"))
+            .build();
+        let prior = RunId::new();
+        assert!(
+            old_shape
+                .start_with_id(prior, &name, Inbound::new("m", json!({"text": 7})), None)
+                .await
+                .unwrap()
+        );
+
+        let rt = Runtime::builder(store.clone())
+            .starter(ChainStarter(name.clone()))
+            .worker_id(uniq("front"))
+            .build();
+        let id = RunId::new();
+        assert!(
+            rt.start_with_id_continuing(id, &name, say("two"), None, prior)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            chain_of(&rt.view(id).await.unwrap().unwrap()),
+            Chain {
+                text: "two".into(),
+                before: Vec::new()
+            }
+        );
+    }
+
+    /// An agent that does not override `init_continuing` gets what `init` makes of the input, so
+    /// nothing changes for it, whatever the prior run held.
+    pub async fn an_agent_without_an_override_starts_fresh_when_asked_to_continue(store: DynStore) {
+        let name = uniq("plain");
+        let agent = fn_agent(
+            &name,
+            step_fn(|_ctx, state| {
+                async move {
+                    Ok(Transition::Done {
+                        state,
+                        output: json!(1),
+                    })
+                }
+                .boxed()
+            }),
+        );
+        let rt = runtime(&store, &agent);
+        let prior = rt
+            .start(&name, Inbound::new("m", json!({"k": 1})), None)
+            .await
+            .unwrap();
+        let id = RunId::new();
+        assert!(
+            rt.start_with_id_continuing(id, &name, Inbound::new("m", json!({"k": 2})), None, prior)
+                .await
+                .unwrap()
+        );
+        assert_eq!(rt.view(id).await.unwrap().unwrap().state, json!({"k": 2}));
+        let by_start = rt
+            .start_continuing(&name, Inbound::new("m", json!({"k": 3})), None, prior)
+            .await
+            .unwrap();
+        assert_eq!(
+            rt.view(by_start).await.unwrap().unwrap().state,
+            json!({"k": 3})
+        );
+    }
+
+    /// `start_continuing` is `start` for a continuation: it delivers to the conversation's open
+    /// run (and does not even read the prior), and creates a continuing run when none is open.
+    pub async fn start_continuing_delivers_to_an_open_run_and_otherwise_continues(store: DynStore) {
+        let name = uniq("chain");
+        let conversation = uniq("conv");
+        let rt = Runtime::builder(store.clone())
+            .agent(ChainAgent(name.clone()))
+            .worker_id(uniq("w"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let open = rt
+            .start(&name, say("one"), Some(&conversation))
+            .await
+            .unwrap();
+        // The conversation is busy: the message goes to the open run; the prior is not needed.
+        let delivered = rt
+            .start_continuing(&name, say("more"), Some(&conversation), RunId::new())
+            .await
+            .unwrap();
+        assert_eq!(delivered, open);
+        assert_eq!(rt.view(open).await.unwrap().unwrap().pending_inbox, 1);
+
+        rt.cancel(open, "done with it").await.unwrap();
+        let next = rt
+            .start_continuing(&name, say("two"), Some(&conversation), open)
+            .await
+            .unwrap();
+        assert_ne!(next, open);
+        assert_eq!(
+            chain_of(&rt.view(next).await.unwrap().unwrap()),
+            Chain {
+                text: "two".into(),
+                before: vec!["one".into()]
+            }
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3975,6 +4430,11 @@ macro_rules! runtime_suite {
                 child_status_reads_only_the_callers_children,
                 a_purged_child_reads_as_gone,
                 the_notice_is_an_ordinary_inbound_with_the_childs_id,
+                a_run_continues_a_finished_run_from_a_start_only_front,
+                continuing_checks_the_prior_run_and_creates_nothing_when_it_refuses,
+                a_prior_state_that_does_not_decode_starts_the_run_fresh,
+                an_agent_without_an_override_starts_fresh_when_asked_to_continue,
+                start_continuing_delivers_to_an_open_run_and_otherwise_continues,
             );
         }
     };

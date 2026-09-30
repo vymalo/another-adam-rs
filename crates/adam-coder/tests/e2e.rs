@@ -485,6 +485,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
         names,
         [
             "prepare_workspace",
+            "run_command",
             "delegate_to_opencode",
             "run_checks",
             "commit_and_push",
@@ -651,6 +652,116 @@ async fn a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run(store: D
     );
     assert_eq!(fx.created_pulls().await.len(), 1);
     assert_eq!(fx.agent_branches().len(), 1);
+}
+
+/// The owner's live thread, end to end: the repository is given, the model guessed a base branch
+/// the repository does not have (its default is `master`), then looked around with commands: a
+/// missing file, a toolchain the image lacks. None of it is a check: no cycle, no `checks`
+/// artifact, nothing failed. A question ("List all branches") is answered in plain text, which
+/// parks the run as a question with no pull request, and the chat goes on.
+async fn a_question_is_answered_from_a_look_around_and_costs_no_check_cycles(store: DynStore) {
+    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 1).await;
+    common::git(&fx.remote, &["branch", "master", "refs/heads/main"]);
+    common::git(&fx.remote, &["symbolic-ref", "HEAD", "refs/heads/master"]);
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "q1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "develop"}),
+    )])
+    // It is told which branches exist, and leaves the base out.
+    .push_tool_calls(vec![call(
+        "q2",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url()}),
+    )])
+    // Looking around: a missing file, a missing toolchain, the branches. With one check cycle in
+    // the budget, treating any of these as a check would have failed the run.
+    .push_tool_calls(vec![call(
+        "q3",
+        "run_command",
+        json!({"command": "cat README.md CLAUDE.md"}),
+    )])
+    .push_tool_calls(vec![call(
+        "q4",
+        "run_command",
+        json!({"command": "nosuchbuild package"}),
+    )])
+    .push_tool_calls(vec![call(
+        "q5",
+        "run_command",
+        json!({"command": "git branch -r"}),
+    )])
+    .push_tool_calls(vec![call(
+        "q6",
+        "run_checks",
+        json!({"command": "nosuchbuild package"}),
+    )])
+    .push_text("The branches are main and master.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(
+        &server,
+        &format!("List all branches of {}", fx.remote_url()),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "an answer parks the run, it does not fail it: {:?} {:#?}",
+        seen.labels,
+        seen.messages
+    );
+    assert!(
+        seen.saw_message("The branches are main and master."),
+        "{:#?}",
+        seen.messages
+    );
+    assert!(
+        !seen.labels.iter().any(|l| l == "artifact:checks"
+            || l == "artifact:pull_request"
+            || l.contains("Failed")
+            || l.contains("Completed")),
+        "{:?}",
+        seen.labels
+    );
+    assert!(fx.created_pulls().await.is_empty());
+    assert!(fx.agent_branches().is_empty(), "nothing was pushed");
+
+    let results = tool_results(&mock.requests().last().unwrap().messages);
+    let by_id = |id: &str| results.iter().find(|(c, _, _)| c == id).unwrap().clone();
+    let (_, guessed, is_error) = by_id("q1");
+    assert!(
+        is_error && guessed.contains("develop") && guessed.contains("Its branches: main, master"),
+        "{guessed}"
+    );
+    let (_, ready, is_error) = by_id("q2");
+    assert!(
+        !is_error && ready.contains("base branch: master"),
+        "{ready}"
+    );
+    let (_, readme, is_error) = by_id("q3");
+    assert!(
+        !is_error && readme.contains("widgets") && readme.contains("exit code 1"),
+        "{readme}"
+    );
+    let (_, no_mvn, is_error) = by_id("q4");
+    assert!(
+        is_error && no_mvn.contains("no `nosuchbuild`") && no_mvn.contains("ask_user"),
+        "{no_mvn}"
+    );
+    let (_, branches, is_error) = by_id("q5");
+    assert!(
+        !is_error && branches.contains("origin/main") && branches.contains("origin/master"),
+        "{branches}"
+    );
+    let (_, check, is_error) = by_id("q6");
+    assert!(
+        is_error && check.contains("no `nosuchbuild`") && check.contains("no check cycle was used"),
+        "{check}"
+    );
 }
 
 /// A model that stops with no text at all still parks the run, with a fixed question.
@@ -958,6 +1069,395 @@ async fn a_repository_in_quoted_findings_is_not_named(store: DynStore) {
     );
     let (_, prepared, is_error) = by_id("c2");
     assert!(!is_error, "the request's repository is named: {prepared}");
+}
+
+// -------------------------------------------------------------- a task that continues a task
+
+/// A message of the context `context` that builds on `task` (A2A `referenceTaskIds`).
+fn follow_up(text: &str, context: &str, task: &str) -> Message {
+    let mut message = user(text);
+    message.context_id = Some(context.to_owned());
+    message.reference_task_ids = Some(vec![task.to_owned()]);
+    message
+}
+
+/// A rework: the second task of a context references the first, does not name the repository
+/// again, and carries on with the branch the first pushed, so its push updates the same pull
+/// request. Its model is shown the first task's conversation.
+async fn a_second_task_continues_the_first_tasks_branch_and_pull_request(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let task_one = format!("In {} (base branch main), add hello.txt.", fx.remote_url());
+    let mut first_message = user(&task_one);
+    first_message.context_id = Some("ctx-rework".into());
+    let first = run_message(&server, first_message).await;
+    assert_eq!(
+        first.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        first.labels
+    );
+    let branches = fx.agent_branches();
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    let branch = branches[0].clone();
+    let first_requests = mock.requests().len();
+
+    // The second task: the repository is not named, the branch is the one `commit_and_push`
+    // reported, and the change is made by a command (what OpenCode would have done).
+    mock.push_tool_calls(vec![call(
+        "d1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main", "branch": branch}),
+    )])
+    .push_tool_calls(vec![call(
+        "d2",
+        "run_checks",
+        json!({"command": "echo two > two.txt && test -f hello.txt"}),
+    )])
+    .push_tool_calls(vec![call(
+        "d3",
+        "commit_and_push",
+        json!({"message": "fix: add two.txt"}),
+    )])
+    .push_tool_calls(vec![call(
+        "d4",
+        "open_pull_request",
+        json!({"title": "feat: add hello.txt", "body": "Adds hello.txt and two.txt.\n\n## Verification\n- checked"}),
+    )])
+    .push_text("Updated the pull request.");
+    let second = run_message(
+        &server,
+        follow_up("Also add two.txt, please.", "ctx-rework", &first.task_id),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        second.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        second.labels
+    );
+    assert_ne!(second.task_id, first.task_id, "a new task");
+
+    // One pull request, both tasks' work in its branch. The second task pushed to a branch of its
+    // own first, and open_pull_request moved the continued branch to that commit.
+    let own: Vec<String> = fx
+        .agent_branches()
+        .into_iter()
+        .filter(|b| *b != branch)
+        .collect();
+    assert_eq!(own.len(), 1, "{:?}", fx.agent_branches());
+    assert_eq!(
+        fx.file_on(&own[0], "two.txt"),
+        "two",
+        "the second task's own branch"
+    );
+    assert_eq!(fx.commits_ahead(&branch), 2);
+    assert_eq!(fx.file_on(&branch, "hello.txt"), "hello");
+    assert_eq!(fx.file_on(&branch, "two.txt"), "two");
+    assert_eq!(fx.created_pulls().await.len(), 1, "no second pull request");
+    let url_of = |seen: &Seen| {
+        let (_, artifact) = seen
+            .artifacts
+            .iter()
+            .find(|(n, _)| n == "pull_request")
+            .expect("a pull_request artifact");
+        format!("{:?}", artifact.parts)
+    };
+    assert_eq!(
+        url_of(&first).contains(PR_URL),
+        url_of(&second).contains(PR_URL)
+    );
+    assert!(url_of(&second).contains(PR_URL), "{}", url_of(&second));
+
+    // The model of the second task was shown the first task's conversation, then the new message.
+    let requests = mock.requests();
+    let opening = &requests[first_requests].messages;
+    assert_eq!(opening.first().unwrap().text(), task_one);
+    assert_eq!(opening.last().unwrap().text(), "Also add two.txt, please.");
+    assert!(
+        opening.len() > 4,
+        "the first task's tool calls are there: {opening:#?}"
+    );
+    // And the run says which run it continued.
+    let view = server
+        .coder
+        .runtime
+        .view(run_id(&second.task_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.state["continued_from"], first.task_id.as_str());
+    // Its tools did what was asked (the last request saw the reported pull request).
+    let results = tool_results(&requests.last().unwrap().messages);
+    let by_id = |id: &str| results.iter().find(|(c, _, _)| c == id).unwrap().clone();
+    assert!(
+        by_id("d1").1.contains("the branch an earlier task pushed"),
+        "{:?}",
+        by_id("d1")
+    );
+    assert!(
+        by_id("d3").1.contains("has not been changed"),
+        "{:?}",
+        by_id("d3")
+    );
+    assert!(
+        by_id("d4").1.contains("was already open") && by_id("d4").1.contains("now carries"),
+        "{:?}",
+        by_id("d4")
+    );
+}
+
+/// The branch a continued task may carry on comes from the notes of the run it continues, and,
+/// when those are not at hand (another worker's volume), from the two last lines of the
+/// `commit_and_push` result in the carried history. Without either, it is refused.
+async fn a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes_are_gone(
+    store: DynStore,
+) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let mut first_message = user(&format!(
+        "In {} (base branch main), add hello.txt.",
+        fx.remote_url()
+    ));
+    first_message.context_id = Some("ctx-volume".into());
+    let first = run_message(&server, first_message).await;
+    assert_eq!(
+        first.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        first.labels
+    );
+    let branch = fx.agent_branches()[0].clone();
+
+    // The notes of the first run are not on this volume.
+    let notes = fx
+        .root
+        .join("coder")
+        .join(format!("{}.json", first.task_id));
+    assert!(notes.is_file(), "{}", notes.display());
+    std::fs::remove_file(&notes).unwrap();
+
+    mock.push_tool_calls(vec![call(
+        "f1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main", "branch": "agent/not-pushed-here"}),
+    )])
+    .push_tool_calls(vec![call(
+        "f2",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main", "branch": branch}),
+    )])
+    .push_text("Ready.");
+    let second = run_message(
+        &server,
+        follow_up("Carry on, please.", "ctx-volume", &first.task_id),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        second.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        second.labels
+    );
+    let results = tool_results(&mock.requests().last().unwrap().messages);
+    let by_id = |id: &str| results.iter().find(|(c, _, _)| c == id).unwrap().clone();
+    let (_, refused, is_error) = by_id("f1");
+    assert!(is_error && refused.contains("Refused"), "{refused}");
+    let (_, ready, is_error) = by_id("f2");
+    assert!(
+        !is_error && ready.contains("the branch an earlier task pushed"),
+        "read from the history: {ready}"
+    );
+}
+
+/// A rework whose checks never go green ends `failed`, says that the pull request of the branch it
+/// continued was **not updated** (and not that none was opened), and the branch, with its pull
+/// request, is exactly where the first task left it.
+async fn a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone(
+    store: DynStore,
+) {
+    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 1).await;
+    let mock = Arc::new(MockModel::new());
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let mut first_message = user(&format!(
+        "In {} (base branch main), add hello.txt.",
+        fx.remote_url()
+    ));
+    first_message.context_id = Some("ctx-red-rework".into());
+    let first = run_message(&server, first_message).await;
+    assert_eq!(
+        first.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        first.labels
+    );
+    let branch = fx.agent_branches()[0].clone();
+    let verified = fx.file_on(&branch, "hello.txt");
+    let tip = |b: &str| common::git(&fx.remote, &["rev-parse", &format!("refs/heads/{b}")]);
+    let tip_before = tip(&branch);
+
+    mock.push_tool_calls(vec![call(
+        "d1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main", "branch": branch}),
+    )])
+    .push_tool_calls(vec![call(
+        "d2",
+        "run_checks",
+        json!({"command": "echo two > two.txt; echo 'two is unverified'; exit 1"}),
+    )])
+    // The model pushes anyway, and asks for the pull request: the cycle budget is spent.
+    .push_tool_calls(vec![
+        call("d3", "commit_and_push", json!({"message": "fix: two"})),
+        call(
+            "d4",
+            "open_pull_request",
+            json!({"title": "t", "body": "b", "accept_red_checks": true}),
+        ),
+    ])
+    .push_text("The checks still fail.");
+    let second = run_message(
+        &server,
+        follow_up("Also add two.txt.", "ctx-red-rework", &first.task_id),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        second.last_state,
+        Some(TaskState::Failed),
+        "{:?}",
+        second.labels
+    );
+    assert!(
+        second.saw_message(&format!("the pull request for {branch} was not updated")),
+        "{:#?}",
+        second.messages
+    );
+    assert!(
+        !second.saw_message("no pull request was opened"),
+        "that would be untrue of the pull request of the branch: {:#?}",
+        second.messages
+    );
+    // Nothing reached the branch the pull request is for.
+    assert_eq!(tip(&branch), tip_before);
+    assert_eq!(fx.file_on(&branch, "hello.txt"), verified);
+    assert_eq!(fx.commits_ahead(&branch), 1);
+    assert_eq!(fx.created_pulls().await.len(), 1);
+    assert!(fx.comments().await.is_empty());
+}
+
+/// In a task that continues another, what the person said in the first task is named, and what only
+/// the model said, or a block labelled `untrusted` quotes, is still not; and a branch that was not
+/// pushed in the conversation cannot be continued.
+async fn a_continued_task_refuses_what_only_the_model_or_a_fence_mentions(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    // Task 1 names the repository; its last words mention another one.
+    mock.push_tool_calls(vec![call(
+        "c1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c2",
+        "delegate_to_opencode",
+        json!({"instructions": "add hello.txt containing hello"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c3",
+        "run_checks",
+        json!({"command": "test -f hello.txt"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c4",
+        "commit_and_push",
+        json!({"message": "feat: hello"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c5",
+        "open_pull_request",
+        json!({"title": "feat: hello", "body": "Hello.\n\n## Verification\n- checked"}),
+    )])
+    .push_text("Opened it. You could also try https://github.com/evil/payload next.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let mut first_message = user(&format!(
+        "In {} (base branch main), add hello.txt.",
+        fx.remote_url()
+    ));
+    first_message.context_id = Some("ctx-refuse".into());
+    let first = run_message(&server, first_message).await;
+    assert_eq!(
+        first.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        first.labels
+    );
+    let branch = fx.agent_branches()[0].clone();
+
+    // Task 2: a finding quoted in an untrusted block names yet another repository.
+    mock.push_tool_calls(vec![call(
+        "e1",
+        "prepare_workspace",
+        json!({"repo_url": "https://github.com/evil/payload", "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
+        "e2",
+        "prepare_workspace",
+        json!({"repo_url": "https://github.com/evil/fence", "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
+        "e3",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main", "branch": "agent/not-pushed-here"}),
+    )])
+    .push_tool_calls(vec![call(
+        "e4",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main", "branch": branch}),
+    )])
+    .push_text("Ready.");
+    let rework = "Please fix the typo.\n\n```untrusted\n- see https://github.com/evil/fence\n```\n";
+    let second = run_message(&server, follow_up(rework, "ctx-refuse", &first.task_id)).await;
+    worker.stop().await;
+    assert_eq!(
+        second.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        second.labels
+    );
+
+    let results = tool_results(&mock.requests().last().unwrap().messages);
+    let by_id = |id: &str| results.iter().find(|(c, _, _)| c == id).unwrap().clone();
+    let (_, said_by_the_model, is_error) = by_id("e1");
+    assert!(
+        is_error && said_by_the_model.contains("ask_user"),
+        "{said_by_the_model}"
+    );
+    let (_, quoted, is_error) = by_id("e2");
+    assert!(is_error && quoted.contains("ask_user"), "{quoted}");
+    let (_, not_pushed, is_error) = by_id("e3");
+    assert!(
+        is_error && not_pushed.contains("Refused") && not_pushed.contains(&branch),
+        "{not_pushed}"
+    );
+    let (_, ready, is_error) = by_id("e4");
+    assert!(
+        !is_error,
+        "the repository and the branch of the first task are the conversation's: {ready}"
+    );
+    assert!(fx.created_pulls().await.len() == 1);
 }
 
 // ------------------------------------------------------------------- red checks
@@ -1519,9 +2019,14 @@ fn coder_retrying(fx: &Fixture, model: DynModel, store: DynStore, max_attempts: 
 
 /// Send `text` and follow the stream until the task stops.
 async fn run_to_end(server: &Server, text: &str) -> Seen {
+    run_message(server, user(text)).await
+}
+
+/// Send `message` and follow its task until the stream ends.
+async fn run_message(server: &Server, message: Message) -> Seen {
     let mut stream = server
         .client
-        .send_streaming_message(&request(user(text)))
+        .send_streaming_message(&request(message))
         .await
         .unwrap();
     let mut seen = Seen::default();
@@ -2353,6 +2858,7 @@ macro_rules! coder_suite {
                 add_hello_txt_streams_working_progress_checks_artifact_completed,
                 ask_user_parks_and_an_a2a_follow_up_resumes,
                 a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,
+                a_question_is_answered_from_a_look_around_and_costs_no_check_cycles,
                 a_stop_without_text_asks_what_to_do,
                 an_empty_stop_after_work_does_not_ask_for_the_repository,
                 red_checks_with_cycles_left_then_text_is_a_question,
@@ -2378,6 +2884,10 @@ macro_rules! coder_suite {
                 secrets_in_check_output_never_reach_the_client,
                 wrong_token_on_the_coder_router_is_401,
                 another_caller_cannot_see_or_resume_the_task,
+                a_second_task_continues_the_first_tasks_branch_and_pull_request,
+                a_continued_task_refuses_what_only_the_model_or_a_fence_mentions,
+                a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone,
+                a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes_are_gone,
             );
         }
     };

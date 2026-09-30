@@ -915,9 +915,28 @@ async fn output_message(
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
 /// [`LlmAgent::init`] and [`LlmStarter::init`], so they cannot drift apart.
 fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
-    let text = parse_user_text(&input.payload)
-        .map_err(|reason| AgentError::permanent(format!("unusable start message: {reason}")))?;
+    let text = start_text(&input)?;
     Ok(Conversation::new(text))
+}
+
+/// The user message of a new run, continuing or not: one rule for what is accepted and how a
+/// refusal reads.
+fn start_text(input: &Inbound) -> Result<String, AgentError> {
+    parse_user_text(&input.payload)
+        .map_err(|reason| AgentError::permanent(format!("unusable start message: {reason}")))
+}
+
+/// The conversation of a run that continues `prior_run` (whose last state is `prior`) with the
+/// user message of `input`: [`Conversation::continued`]. Shared by [`LlmAgent::init_continuing`]
+/// and [`LlmStarter::init_continuing`], so the front that starts the run and the worker that
+/// would have cannot disagree on what a continuation is.
+fn continue_conversation(
+    input: &Inbound,
+    prior: &Conversation,
+    prior_run: RunId,
+) -> Result<Conversation, AgentError> {
+    let text = start_text(input)?;
+    Ok(prior.continued(text, prior_run))
 }
 
 /// The start-only half of an [`LlmAgent`]: it turns the first user message
@@ -927,7 +946,9 @@ fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
 /// Register it with `RuntimeBuilder::starter` on a process that only accepts
 /// requests, under the name of the [`LlmAgent`] that steps the runs on a
 /// worker. `init` accepts exactly what [`LlmAgent::init`] accepts (payload
-/// `{"text": "..."}` or a bare JSON string) and rejects what it rejects.
+/// `{"text": "..."}` or a bare JSON string) and rejects what it rejects. So does
+/// `init_continuing`, which carries the prior run's conversation over exactly as
+/// [`LlmAgent::init_continuing`] does ([`Conversation::continued`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmStarter {
     name: String,
@@ -949,6 +970,15 @@ impl AgentStarter for LlmStarter {
 
     fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
         start_conversation(input)
+    }
+
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &Conversation,
+        prior_run: RunId,
+    ) -> Result<Conversation, AgentError> {
+        continue_conversation(&input, prior, prior_run)
     }
 }
 
@@ -1006,6 +1036,18 @@ impl Agent for LlmAgent {
     /// not inspected. The same as [`LlmStarter::init`].
     fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
         start_conversation(input)
+    }
+
+    /// The prior run's conversation with the input as its newest user message, see
+    /// [`Conversation::continued`] for what is carried, dropped and reset. The same as
+    /// [`LlmStarter::init_continuing`].
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &Conversation,
+        prior_run: RunId,
+    ) -> Result<Conversation, AgentError> {
+        continue_conversation(&input, prior, prior_run)
     }
 
     #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), agent = %self.name))]

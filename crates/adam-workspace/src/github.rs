@@ -79,32 +79,45 @@ impl GitHub {
             .header(USER_AGENT, DEFAULT_USER_AGENT)
     }
 
+    /// The open pull request from `head`; against `repo.base_branch` when `on_base`, against any
+    /// base otherwise.
     async fn find(
         &self,
         token: &SecretString,
         repo: &RepoRef,
         head: &str,
+        on_base: bool,
     ) -> WorkspaceResult<Option<PullRequest>> {
         let (owner, name) = slug(repo)?;
         let (head_owner, branch) = split_head(&owner, head);
+        let mut query = vec![
+            ("head", format!("{head_owner}:{branch}")),
+            ("state", "open".to_owned()),
+            ("per_page", "100".to_owned()),
+        ];
+        if on_base {
+            query.push(("base", repo.base_branch.clone()));
+        }
         let resp = self
             .request(Method::GET, &format!("/repos/{owner}/{name}/pulls"), token)
-            .query(&[
-                ("head", format!("{head_owner}:{branch}")),
-                ("state", "open".to_owned()),
-                ("per_page", "100".to_owned()),
-            ])
+            .query(&query)
             .send()
             .await
             .map_err(|e| transport(e, token))?;
         let resp = check(resp, token).await?;
         let pulls: Vec<ApiPull> = resp.json().await.map_err(|e| decode_error(e, token))?;
-        // The API filters by `owner:branch`; double-check the branch so a
-        // lenient server (or mock) cannot make us return somebody else's PR.
-        // A PR without a `head` cannot be proven to be ours, so it never matches.
+        // The API filters by `owner:branch` and base; double-check both so a lenient server (or
+        // mock) cannot make us return somebody else's PR, or one against another base branch.
+        // A PR without a `head` or a `base` cannot be proven to be ours, so it never matches.
         Ok(pulls
             .into_iter()
-            .find(|p| p.head.as_ref().is_some_and(|h| h.branch == branch))
+            .find(|p| {
+                p.head.as_ref().is_some_and(|h| h.branch == branch)
+                    && (!on_base
+                        || p.base
+                            .as_ref()
+                            .is_some_and(|b| b.branch == repo.base_branch))
+            })
             .map(|p| p.into_pull_request(branch)))
     }
 }
@@ -114,7 +127,7 @@ impl CodeHost for GitHub {
     #[tracing::instrument(skip(self, pr), fields(repo = %pr.repo.url, head = %pr.head))]
     async fn open_pull_request(&self, pr: NewPullRequest) -> Result<PullRequest, WorkspaceError> {
         let token = self.creds.token_for(&pr.repo).await?;
-        if let Some(existing) = self.find(&token, &pr.repo, &pr.head).await? {
+        if let Some(existing) = self.find(&token, &pr.repo, &pr.head, true).await? {
             return Ok(existing);
         }
         let (owner, name) = slug(&pr.repo)?;
@@ -143,7 +156,7 @@ impl CodeHost for GitHub {
             }
             // Lost a race with another opener: the PR now exists, so return it.
             Err(WorkspaceError::Invalid(message)) if message.contains("already exists") => {
-                match self.find(&token, &pr.repo, &pr.head).await? {
+                match self.find(&token, &pr.repo, &pr.head, true).await? {
                     Some(existing) => Ok(existing),
                     None => Err(WorkspaceError::Invalid(message)),
                 }
@@ -159,7 +172,40 @@ impl CodeHost for GitHub {
         head: &str,
     ) -> Result<Option<PullRequest>, WorkspaceError> {
         let token = self.creds.token_for(repo).await?;
-        self.find(&token, repo, head).await
+        self.find(&token, repo, head, true).await
+    }
+
+    #[tracing::instrument(skip(self), fields(repo = %repo.url))]
+    async fn find_pull_request_on_head(
+        &self,
+        repo: &RepoRef,
+        head: &str,
+    ) -> Result<Option<PullRequest>, WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        self.find(&token, repo, head, false).await
+    }
+
+    #[tracing::instrument(skip(self, body), fields(repo = %repo.url, number))]
+    async fn comment_on_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<(), WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        let (owner, name) = slug(repo)?;
+        // Pull requests are issues for comments.
+        let resp = self
+            .request(
+                Method::POST,
+                &format!("/repos/{owner}/{name}/issues/{number}/comments"),
+                &token,
+            )
+            .json(&json!({ "body": body }))
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        check(resp, &token).await.map(|_| ())
     }
 }
 
@@ -168,8 +214,10 @@ struct ApiPull {
     number: u64,
     html_url: String,
     head: Option<ApiHead>,
+    base: Option<ApiHead>,
 }
 
+/// One end of a pull request: `head` or `base`.
 #[derive(Deserialize)]
 struct ApiHead {
     #[serde(rename = "ref")]

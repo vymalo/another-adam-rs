@@ -121,6 +121,8 @@ flowchart TB
     rt -.-> mongo
     rt -.-> pg
     rt -.-> testkit
+    a2art -.-> llm
+    a2art -.-> model
     a2art -.-> pg
     mongo -.-> testkit
     pg -.-> testkit
@@ -146,7 +148,7 @@ flowchart TB
     host --> err
     pgn --> err
 
-    linkStyle 51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67 stroke:#999,stroke-width:1px
+    linkStyle 53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -235,7 +237,9 @@ The layers, from the bottom:
 
 Dev-only edges (dotted): the runtime's tests run against real Postgres and
 MongoDB stores, every store runs the store testkit, and `adam-notify-postgres`
-runs the notifier testkit and its two-runtime tests over `adam-store-postgres`. `adam-a2a`,
+runs the notifier testkit and its two-runtime tests over `adam-store-postgres`.
+`adam-a2a-runtime`'s tests also put a real `LlmAgent` and a `MockModel` behind the backend, to
+show that a task which continues another gives the model the earlier messages. `adam-a2a`,
 `adam-workspace` and `adam-coder` also enable their own `test-util` feature in
 tests. That adds no new crate edge.
 
@@ -340,12 +344,14 @@ classDiagram
             <<interface>>
             name()
             init()
+            init_continuing()
             step()
         }
         class AgentStarter {
             <<interface>>
             name()
             init()
+            init_continuing()
         }
         class EventSink {
             <<interface>>
@@ -424,9 +430,9 @@ classDiagram
     PermissionPrompt <|.. StaticPrompt
 ```
 
-Each box is a crate (underscores stand for hyphens). The six coder tools are
-`prepare_workspace`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
-`open_pull_request` and `ask_user`. A seventh type, `Redacting`, wraps each of
+Each box is a crate (underscores stand for hyphens). The seven coder tools are
+`prepare_workspace`, `run_command`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
+`open_pull_request` and `ask_user`. An eighth type, `Redacting`, wraps each of
 them to scrub secrets (`crates/adam-coder/src/tools/mod.rs`). `CoderAgent`
 wraps the `LlmAgent` that `adam-assembly` builds from `crates/adam-coder/agent/instructions.md` (the prompt, the
 limits and the A2A card are that file) and adds its completion rule. `FnTool` is a tool made from a closure. A tool
@@ -435,7 +441,7 @@ reads shared dependencies with `ToolCtx::state::<T>()` (given to the agent with
 `LlmAgentBuilder::try_build` fails at startup when one is missing; `parse_args`,
 `IntoToolOutput`, `ToolSet` and, with the `schema` feature, `spec_for` remove the boilerplate
 (see the [crate README](../crates/adam-llm-agent/README.md)). `AgentStarter` is the start-only half
-of `Agent` (`name` and `init`, no `step`): a process that only accepts requests registers
+of `Agent` (`name`, `init` and `init_continuing`, no `step`): a process that only accepts requests registers
 a starter (`LlmStarter`, `CoderStarter`) and never holds the agent's model or credentials.
 
 The boundaries, by what they swap:
@@ -708,7 +714,9 @@ What the diagram cannot say:
   with `Runtime::deliver`, and only while the task is `input-required`. Any
   other state gives `-32602`. A message with a `contextId` and no `taskId`
   is delivered to the context's open task, or starts a new one when there is
-  none.
+  none. A new task whose message has `referenceTaskIds` starts from the
+  conversation of one of them, see
+  [A new task that continues a finished one](#a-new-task-that-continues-a-finished-one).
 * **Streams survive restarts.** The subscription takes its snapshot from
   `Runtime::view`, which reads the durable record, and then polls it. The live
   events from the `BroadcastSink` only cut the latency and add intermediate
@@ -721,6 +729,81 @@ What the diagram cannot say:
   `SubscribeToTask` are served. `ListTasks` is unsupported, push-notification
   methods return `PushNotificationNotSupported`, and there is no extended agent
   card (`crates/adam-a2a/src/handler.rs`).
+
+### A new task that continues a finished one
+
+A refinement, a follow-up or a rework is a new A2A task in the same `contextId`, because a finished
+task accepts nothing more. Without help, the new run starts from nothing and the agent forgets the
+conversation. A2A lets the client say what the new task builds on, in `Message.referenceTaskIds`, and
+`RuntimeTaskBackend` uses it ([ADR 0003](decisions/0003-a-new-task-continues-the-task-it-references.md),
+which has the state diagram of a reference's fate and the rejected alternatives).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as A2A client
+    participant B as RuntimeTaskBackend<br/>adam-a2a-runtime
+    participant R as Runtime<br/>adam-runtime
+    participant DB as Store<br/>Postgres
+    participant A as AgentStarter or Agent<br/>LlmStarter, LlmAgent
+
+    C->>B: submit(caller, message with referenceTaskIds [t1], no taskId, contextId c1)
+    loop each reference, at most MAX_REFERENCES (8), in order (none at all for the anonymous caller)
+        B->>DB: load_run(reference), the raw record
+        B->>B: this agent's, this caller's, in c1, terminal?<br/>if not: debug log and next reference
+        B->>R: view(reference), only for one that passed
+        Note over B,R: a state that does not decode: warn, next reference
+    end
+    Note over B: a fresh task started though some were given: one info line with counts
+    alt a reference qualifies (t1)
+        B->>R: start_with_id_continuing(task_id_for(...), agent, inbound, conversation, t1)
+        R->>DB: load_run(run id): a repeat answers false here
+        R->>DB: load_run(t1), and the envelope's agent state
+        R->>A: init_continuing(inbound, prior state, t1)
+        Note over A: LlmAgent: carry the history, drop a tool call<br/>that never got its result, reset the counters,<br/>cap the history at 256 KiB (tool output first),<br/>keep the roles alternating
+        A-->>R: the new run's state
+        R->>DB: create_run (Runnable, version 1)
+    else none, or the conversation has an open task
+        B->>R: start_with_id (a fresh start), or deliver to the open task
+    end
+    B-->>C: Task t2 (a new task id), same contextId
+```
+
+What the diagram cannot say:
+
+* **The reference is checked like every task id, from the raw record.** It must be this agent's and the
+  caller's (the caller's subject is part of the run's conversation id), in the same context as the new
+  task, and terminal (`completed`, `failed` or `canceled`), and all of that is read from the stored record
+  before any state is decoded, so a record the caller does not own is never decoded and cannot fail the
+  request. One that is malformed, unknown, someone else's, in another context, still open or (the caller's
+  own) unreadable is skipped, and the client gets the fresh task it would for an id that never existed, so
+  it learns nothing about other callers' tasks. A message without a `contextId` gets a context of its own
+  and continues nothing. Without a reference nothing is carried: the backend never guesses "the latest
+  task of the context". The operator gets one `info` line, with a count per reason, when references were
+  given and none qualified.
+* **"Caller" is the authenticated subject.** With token authentication that is `token-<index>`, so
+  reordering or replacing the configured tokens hands the history of an index to whoever holds it next;
+  and the anonymous caller is every client at once, so it continues nothing.
+* **It works on a front that holds only the starter.** The prior state is read from the store and
+  decoded as the starter's `State`, so the split control plane needs no model or credentials.
+  `Agent::init_continuing` and `AgentStarter::init_continuing` default to `init`, and a state that
+  does not decode falls back to `init` with a warning. An agent that wraps another must forward
+  `init_continuing`, as it forwards `init`.
+* **The history is bounded, and the task is not what gives.** `Conversation::continued` shortens the tool
+  outputs of old turns first (the truncation the loop already applies to what it sends), then, if that is not
+  enough, drops the oldest whole turns beyond `MAX_CARRIED_BYTES` (256 KiB of JSON), saying so in a marker
+  text and in `omitted_turns`, and shortens the newest prior turn's outputs only last. The first user message
+  of the chain and the newest prior turn are always kept. Adjacent user messages become one message with several text parts, so the roles alternate.
+* **The new run is an ordinary run**: a new id, its own journal and limits, its own worktree. Only its
+  first state comes from the old run.
+* **The coder carries the work on, not only the words.** `CoderAgent` and `CoderStarter` forward
+  `init_continuing`. The repository rule reads the person's messages of the whole carried conversation, part
+  by part, without the omission marker. A rework can check out the branch an earlier task pushed
+  (`prepare_workspace`'s `branch`, accepted only for a branch that a `commit_and_push` result of that
+  conversation recorded for that repository, in the run notes by the tool itself) and, once its checks have
+  passed, `open_pull_request` moves that branch to the run's commits, which updates the same pull request,
+  and reports it as already open. See the
+  [coder's README](../crates/adam-coder/README.md#a-task-that-continues-a-task).
 
 ### The worker: claim, step, journal, commit
 
@@ -922,7 +1005,7 @@ makes (`runtime.rs` and `worker.rs`).
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Runnable: start, start_with_id or start_child, version 1
+    [*] --> Runnable: start, start_with_id, start_child or a continuing start, version 1
 
     Runnable --> Runnable: Continue, next turn
     Runnable --> Runnable: transient error with tries left, wake_at is now plus max of backoff and retry_after
@@ -1436,7 +1519,7 @@ Two rules keep this tree honest (details in the
 `adam-coder` turns a coding task into a pull request. A client sends
 "in repository X, do Y". The agent makes the change in a private git worktree,
 runs the project's own checks, and opens a pull request. It is an `LlmAgent`
-with six tools and one extra rule, running on the durable runtime and served
+with seven tools and one extra rule, running on the durable runtime and served
 over A2A.
 
 ### What it does
@@ -1560,8 +1643,9 @@ pushed sha, pull request) and the worktree.
 
 What the diagrams cannot say (`crates/adam-coder/src/`):
 
-* **The tools** (`tools/`): `prepare_workspace`, `delegate_to_opencode`,
-  `run_checks`, `commit_and_push`, `open_pull_request` and `ask_user`.
+* **The tools** (`tools/`): `prepare_workspace`, `run_command` (looking around: no check, no cycle,
+  changes to HEAD, the branch, the working tree, refs and git configuration are undone), `delegate_to_opencode`, `run_checks` (the project's own checks only),
+  `commit_and_push`, `open_pull_request` and `ask_user`.
 * **The prompt and the card** (`agent/instructions.md`, embedded by `build.rs`): the system prompt with its
   `{{max_check_cycles}}`, the loop's limits and the A2A card are a file, not Rust; `CoderAgent::new` puts
   the file, the tools, the `ToolEnv` state and the model together with `AgentDef`, and keeps only the
@@ -1570,7 +1654,12 @@ What the diagrams cannot say (`crates/adam-coder/src/`):
   * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`
     refuses to run. `commit_and_push` and `open_pull_request` refuse too.
   * `open_pull_request` refuses unless the pushed `HEAD` is the current commit
-    and the last check run passed **on exactly the tree it contains**.
+    and the last check run passed **on exactly the tree it contains**. A run that
+    continues a pushed branch pushes to a branch of its own, and only after this
+    gate does `open_pull_request` fast-forward the continued branch (never forced), so the pull
+    request that is open for it never carries unverified commits.
+  * A command the shell cannot find (exit 127, `not found`) is a missing toolchain: reported to the model,
+    no check cycle used, no `checks` artifact, and the model asks the person and waits.
   * A run that stops with no pull request fails if the check-cycle budget is
     used up with the last check red, or the credentials were rejected
     (`CoderAgent::verdict`). "The model said it
@@ -1840,6 +1929,13 @@ lifecycle above are checked by `crates/adam-notify-postgres/tests/two_runtimes.r
 (a front and a worker with a 30 s poll, against PostgreSQL 16), and the
 `NOTIFY` payload limit of 8000 bytes against a 16.13 server. See the crate's
 README for the third-party facts (PostgreSQL docs, `sqlx-postgres` 0.9.0 source).
+
+**Verified 2026-09-30, source: this repository with ADR 0003, executed.** The path of a task that
+references a finished one, and what `LlmAgent` carries over, are checked by the tests the ADR names
+(`adam-runtime` over every store, `adam-llm-agent`, and `adam-a2a-runtime` over memory and PostgreSQL,
+across a restart and with a real `LlmAgent` behind the backend; executed against memory and PostgreSQL 16.13,
+the MongoDB variants run in CI). The A2A text and the `a2a-lf` field
+behind it are quoted in the ADR.
 
 **Unverified.**
 

@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter, PendingQuestion,
-    PendingWait, TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
+    Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter, MAX_CARRIED_BYTES,
+    OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, TRUNCATION_MARKER_PREFIX, Tool, ToolCtx,
+    ToolError, ToolOutput, user_message,
 };
 use adam_model::{
-    DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest,
-    ModelResponse, ToolCall, ToolSpec,
+    ContentPart, DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError,
+    ModelRequest, ModelResponse, ToolCall, ToolSpec,
 };
 use adam_runtime::{
     Agent, AgentStarter, CancelToken, Clock, CollectingSink, Inbound, ManualClock, RetryPolicy,
@@ -1519,4 +1520,336 @@ fn a_starter_inits_exactly_like_the_agent() {
         assert_eq!(from_starter.to_string(), from_agent.to_string());
         assert!(from_starter.to_string().contains("unusable start message"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Continuing another run
+// ---------------------------------------------------------------------------
+
+/// A conversation as a finished run leaves it: one task, one tool exchange, an answer.
+fn finished_conversation() -> Conversation {
+    Conversation {
+        messages: vec![
+            Message::user_text("first task"),
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![call("c1", "a", json!({}))],
+            },
+            Message::tool_result("c1", "a-out"),
+            Message::assistant_text("answer one"),
+        ],
+        turns: 2,
+        tool_calls: 1,
+        ..Conversation::default()
+    }
+}
+
+/// The front's `LlmStarter` and the worker's `LlmAgent` continue a conversation identically, and
+/// refuse the same inputs with the same error.
+#[test]
+fn a_starter_continues_exactly_like_the_agent() {
+    let agent = LlmAgent::builder("assistant", Arc::new(MockModel::new()), "m").build();
+    let starter = LlmStarter::new("assistant");
+    let prior = finished_conversation();
+    let run = RunId::new();
+
+    for input in [
+        user_message("second task"),
+        Inbound::new("anything", json!("a bare string")),
+    ] {
+        let from_agent = agent.init_continuing(input.clone(), &prior, run).unwrap();
+        let from_starter = starter.init_continuing(input, &prior, run).unwrap();
+        assert_eq!(from_starter, from_agent);
+        assert_eq!(from_starter.continued_from, Some(run));
+        assert_eq!(from_starter.messages.len(), prior.messages.len() + 1);
+    }
+
+    for payload in [json!({"text": 7}), json!({}), json!(null), json!([1])] {
+        let input = Inbound::new("message", payload);
+        let from_agent = agent
+            .init_continuing(input.clone(), &prior, run)
+            .unwrap_err();
+        let from_starter = starter.init_continuing(input, &prior, run).unwrap_err();
+        assert_eq!(from_starter.to_string(), from_agent.to_string());
+        assert!(from_starter.to_string().contains("unusable start message"));
+    }
+}
+
+/// End to end on one runtime: the run that continues a finished one calls the model with the
+/// earlier messages and then the new one, and counts its own turns.
+#[tokio::test]
+async fn a_new_run_continues_a_finished_one_and_the_model_sees_the_earlier_messages() {
+    let h = Harness::new();
+    let (a, _) = CountingTool::new("a");
+    let agent = h.agent().tool(a).build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "a", json!({}))])
+        .push_text("answer one")
+        .push_text("answer two");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+
+    let first = rt
+        .start("llm", user_message("first task"), Some("conv"))
+        .await
+        .expect("start");
+    let first_view = wait_done(&rt, first).await;
+    let earlier = conversation(&first_view).messages;
+    assert_eq!(earlier.len(), 4);
+
+    let second = RunId::new();
+    assert!(
+        rt.start_with_id_continuing(
+            second,
+            "llm",
+            user_message("second task"),
+            Some("conv"),
+            first
+        )
+        .await
+        .expect("continue")
+    );
+    let view = wait_done(&rt, second).await;
+    worker.stop().await;
+
+    // The model's only call for the second run saw everything before, then the new message.
+    let requests = h.mock.requests();
+    let mut expected = earlier.clone();
+    expected.push(Message::user_text("second task"));
+    assert_eq!(requests.last().unwrap().messages, expected);
+
+    let state = conversation(&view);
+    assert_eq!(state.continued_from, Some(first));
+    assert_eq!((state.turns, state.tool_calls), (1, 0));
+    assert_eq!(
+        state.messages.last(),
+        Some(&Message::assistant_text("answer two"))
+    );
+    assert_eq!(
+        view.output,
+        Some(json!({"text": "answer two", "artifacts": []}))
+    );
+    // The first run is as it was.
+    assert_eq!(
+        conversation(&rt.view(first).await.unwrap().unwrap()).messages,
+        earlier
+    );
+}
+
+/// What an A2A front does: it holds only the starter, and a worker with the agent steps the run.
+#[tokio::test]
+async fn a_start_only_front_continues_and_a_worker_steps() {
+    let h = Harness::new();
+    h.mock.push_text("answer one").push_text("answer two");
+    let agent = h.agent().build();
+    let worker_rt = h.runtime(&agent);
+    let front = Runtime::builder(h.store.clone())
+        .starter(LlmStarter::new("llm"))
+        .worker_id("front")
+        .build();
+    let worker = spawn_worker(&worker_rt);
+
+    let first = RunId::new();
+    assert!(
+        front
+            .start_with_id(first, "llm", user_message("first task"), Some("conv"))
+            .await
+            .unwrap()
+    );
+    wait_done(&worker_rt, first).await;
+
+    let second = RunId::new();
+    assert!(
+        front
+            .start_with_id_continuing(
+                second,
+                "llm",
+                user_message("second task"),
+                Some("conv"),
+                first
+            )
+            .await
+            .unwrap()
+    );
+    let started = conversation(&front.view(second).await.unwrap().unwrap());
+    assert_eq!(
+        started.messages,
+        [
+            Message::user_text("first task"),
+            Message::assistant_text("answer one"),
+            Message::user_text("second task"),
+        ]
+    );
+    wait_done(&worker_rt, second).await;
+    worker.stop().await;
+    assert_eq!(h.mock.requests().last().unwrap().messages, started.messages);
+}
+
+/// A run that stopped mid-turn, parked on a question and then cancelled, leaves an assistant
+/// message whose call never got its result. The run that continues it must not ask the model
+/// to answer a question nobody is waiting for, and must not send a call without a result.
+#[tokio::test]
+async fn a_run_cancelled_on_a_question_continues_without_the_stale_wait() {
+    let h = Harness::new();
+    let agent = h.agent().tool(asking_tool()).build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "ask", json!({}))])
+        .push_text("deploying to staging");
+    let rt = h.runtime(&agent);
+    let worker = spawn_worker(&rt);
+
+    let first = rt
+        .start("llm", user_message("deploy"), Some("conv"))
+        .await
+        .expect("start");
+    let parked = wait_waiting(&rt, first).await;
+    assert!(conversation(&parked).pending_wait.is_some());
+    rt.cancel(first, "changed my mind").await.unwrap();
+
+    let second = RunId::new();
+    assert!(
+        rt.start_with_id_continuing(
+            second,
+            "llm",
+            user_message("just deploy to staging"),
+            Some("conv"),
+            first
+        )
+        .await
+        .unwrap()
+    );
+    let started = conversation(&rt.view(second).await.unwrap().unwrap());
+    assert!(started.pending_wait.is_none() && started.pending_calls.is_empty());
+    // The run ended with nothing after the task, so the new message joins it: a chat template
+    // that wants the roles to alternate gets one user message with two parts.
+    assert_eq!(
+        started.messages,
+        [Message::User {
+            content: vec![
+                ContentPart::text("deploy"),
+                ContentPart::text("just deploy to staging")
+            ]
+        }]
+    );
+    let done = wait_done(&rt, second).await;
+    worker.stop().await;
+    assert_eq!(done.output.unwrap()["text"], "deploying to staging");
+    // The model was never shown the call without its result.
+    let requests = h.mock.requests();
+    let shown = &requests.last().unwrap().messages;
+    assert!(
+        !shown
+            .iter()
+            .any(|m| matches!(m, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()))
+    );
+}
+
+/// The bound on what is carried, seen through the starter the A2A front uses: over 256 KiB old
+/// tool outputs are shortened first, the oldest whole turns go only after that (with one marker),
+/// and the first user message is never given up.
+#[test]
+fn the_carried_history_is_bounded_shortening_first_and_the_task_is_kept() {
+    let turn = |i: usize, output: usize, answer: usize| {
+        vec![
+            Message::user_text(format!("task {i}")),
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![call(&format!("c{i}"), "a", json!({}))],
+            },
+            Message::tool_result(format!("c{i}"), "x".repeat(output)),
+            Message::assistant_text(format!("{i}{}", "y".repeat(answer))),
+        ]
+    };
+    let size = |c: &Conversation| {
+        c.messages
+            .iter()
+            .map(|m| serde_json::to_vec(m).unwrap().len())
+            .sum::<usize>()
+    };
+    let starter = LlmStarter::new("assistant");
+
+    // Tool output is the bulk: shortening the oldest covers it, no turn is given up.
+    let prior = Conversation {
+        messages: (0..3).flat_map(|i| turn(i, 100_000, 10)).collect(),
+        ..Conversation::default()
+    };
+    assert!(size(&prior) > MAX_CARRIED_BYTES);
+    let next = starter
+        .init_continuing(user_message("task 3"), &prior, RunId::new())
+        .unwrap();
+    assert!(size(&next) <= MAX_CARRIED_BYTES, "{}", size(&next));
+    assert_eq!(next.omitted_turns, 0);
+    let users: Vec<String> = next
+        .messages
+        .iter()
+        .filter(|m| matches!(m, Message::User { .. }))
+        .map(Message::text)
+        .collect();
+    assert_eq!(users, ["task 0", "task 1", "task 2", "task 3"]);
+    assert!(next.messages.iter().any(
+        |m| matches!(m, Message::Tool { content, .. } if content.contains(TRUNCATION_MARKER_PREFIX))
+    ));
+
+    // What the assistant said is the bulk: nothing to shorten, so the oldest turns go, the task
+    // stays as the first part of the first message, and the marker says how many.
+    let prior = Conversation {
+        messages: (0..3).flat_map(|i| turn(i, 10, 100_000)).collect(),
+        ..Conversation::default()
+    };
+    assert!(size(&prior) > MAX_CARRIED_BYTES);
+    let next = starter
+        .init_continuing(user_message("task 3"), &prior, RunId::new())
+        .unwrap();
+    assert!(size(&next) <= MAX_CARRIED_BYTES, "{}", size(&next));
+    assert_eq!(
+        next.omitted_turns, 1,
+        "the body of the first turn was enough"
+    );
+    let Message::User { content } = &next.messages[0] else {
+        panic!("the first message is the task");
+    };
+    assert_eq!(content[0].as_text(), "task 0");
+    assert!(content[1].as_text().starts_with(OMITTED_MARKER_PREFIX));
+    assert_eq!(content[2].as_text(), "task 1");
+    assert_eq!(next.messages[1..8], prior.messages[5..12]);
+    assert_eq!(next.messages.last(), Some(&Message::user_text("task 3")));
+
+    // A small conversation is carried whole, without a marker.
+    let small = starter
+        .init_continuing(user_message("next"), &finished_conversation(), RunId::new())
+        .unwrap();
+    assert_eq!(small.omitted_turns, 0);
+    assert!(
+        !small
+            .messages
+            .iter()
+            .any(|m| m.text().starts_with(OMITTED_MARKER_PREFIX))
+    );
+}
+
+/// A conversation as an older build stored it (no `continued_from`, and the wait under its old
+/// name) is a fine thing to continue.
+#[test]
+fn state_stored_before_continuation_existed_can_be_continued() {
+    let old: Conversation = serde_json::from_value(json!({
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "deploy"}]}],
+        "turns": 1,
+        "tool_calls": 0,
+        "pending_question": null
+    }))
+    .unwrap();
+    assert_eq!(old.continued_from, None);
+    let run = RunId::new();
+    let next = LlmStarter::new("assistant")
+        .init_continuing(user_message("and then?"), &old, run)
+        .unwrap();
+    assert_eq!(next.continued_from, Some(run));
+    assert_eq!(next.omitted_turns, 0);
+    // "deploy" had no answer, so "and then?" joins it as a second part.
+    assert_eq!(
+        next.messages,
+        [Message::User {
+            content: vec![ContentPart::text("deploy"), ContentPart::text("and then?")]
+        }]
+    );
 }

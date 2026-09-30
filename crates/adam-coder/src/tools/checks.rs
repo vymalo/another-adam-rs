@@ -26,7 +26,9 @@ use serde_json::Value;
 use crate::redact::Redactor;
 
 use super::notes::CheckRecord;
-use super::shell::{ShellOutcome, resolve_cwd, run_shell};
+use super::shell::{
+    MissingTool, ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, run_shell,
+};
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// The name of the artifact `run_checks` emits.
@@ -322,6 +324,72 @@ fn human(d: std::time::Duration) -> String {
     }
 }
 
+/// The answer to a command that failed because the workspace lacks a tool (see [`missing_tool`]),
+/// and the record of it: the first time a tool is reported missing in the run, a tool that the
+/// **project** brings (see [`project_dependency_hint`]) is answered with the project's install
+/// command; every other case, and the second time the same tool is reported, with the ask-the-person
+/// text. `dirs` are where the project's files are looked for.
+pub(crate) async fn missing_tool_answer(
+    env: &ToolEnv,
+    ctx: &ToolCtx,
+    missing: &MissingTool,
+    dirs: &[&std::path::Path],
+) -> Result<String, ToolError> {
+    let run = ctx.run_id().to_string();
+    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    let earlier = notes.record_missing_tool(ctx.call_id(), &missing.name);
+    env.notes
+        .save(&run, &notes)
+        .await
+        .map_err(|e| notes_error(&e))?;
+    let install = if earlier == 0 {
+        project_dependency_hint(dirs, &missing.name)
+    } else {
+        None
+    };
+    Ok(missing_tool_text(missing, install.as_deref(), earlier > 0))
+}
+
+/// What the model is told when a command failed because the workspace lacks a tool: what is
+/// missing, that no check cycle was used, and that the way on is to tell the person and wait. It
+/// must not retry variants, hunt the filesystem, or install a system toolchain. A tool the
+/// **project** brings itself (`install` is the project's own install command) is another story: the
+/// project's dependencies are installed with the project's own command, **through
+/// `delegate_to_opencode` and not `run_checks`** (an install that passes is a green check on code
+/// nobody tested, and `run_checks` is for the project's real checks). `repeated`: the same tool was
+/// already reported, so whatever was tried did not work, and the person decides.
+pub(crate) fn missing_tool_text(
+    missing: &MissingTool,
+    install: Option<&str>,
+    repeated: bool,
+) -> String {
+    let name = &missing.name;
+    if let Some(install) = install {
+        return format!(
+            "`{name}` is not on the PATH, but it is one of this project's own dependencies, which \
+             are not installed in the workspace yet: that is not a missing toolchain and not a \
+             failing check (no check cycle was used, nothing was recorded as a check). Have \
+             OpenCode install the project's dependencies with its own command (`{install}`), with \
+             delegate_to_opencode (not run_checks: that is only for the project's real checks), \
+             then run this again. Only if that fails, tell the person with ask_user."
+        );
+    }
+    let again = if repeated {
+        " You were told about this tool before and it is still missing: whatever was tried did \
+         not provide it, so stop and ask."
+    } else {
+        ""
+    };
+    format!(
+        "The workspace has no `{name}`: the shell could not find it (exit code 127). That is a \
+         missing toolchain, not a failing check: no check cycle was used and nothing was \
+         recorded as a check. Do not retry variants of the command, do not search the \
+         filesystem for the tool and do not try to install it (system toolchains are not yours to \
+         install). Tell the person which toolchain is missing (`{name}`) with ask_user, and wait \
+         for their answer.{again}"
+    )
+}
+
 fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -> String {
     let verdict = if outcome.timed_out {
         format!(
@@ -352,21 +420,23 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 
 // Runs a command in the worktree and reports how it went.
 //
-// * `sh -lc <command>`, cwd inside the worktree (`cwd`, if given, must stay
+// * `bash -lc <command>` (`sh -lc` without bash), cwd inside the worktree (`cwd`, if given, must stay
 //   inside it), the process group killed after the timeout, only the output
 //   tail kept.
 // * A failed run costs one check cycle. After `max_check_cycles` failures the
 //   tool no longer runs anything and tells the model to stop and report.
 
-/// Run a shell command in your worktree (a project check such as `cargo test`,
-/// `pnpm test` or `just ci`) and get its exit code and the tail of its output.
-/// Only exit code 0 counts as passing. Every failed run uses up one of your
-/// limited check cycles.
+/// Run one of the project's own checks in your worktree (the commands its CI, README or
+/// Makefile run: `cargo test`, `pnpm test`, `just ci`) and get its exit code and the tail of
+/// its output. Only exit code 0 counts as passing. Every failed run uses up one of your limited
+/// check cycles and is reported as a check: never use it to look around (use run_command). A
+/// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
+/// cycle, and is for the person to decide.
 #[tool]
 pub async fn run_checks(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
-    /// Shell command, run with `sh -lc` in the worktree
+    /// Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree
     command: String,
     /// Optional sub-directory of the worktree to run in (relative, inside the worktree)
     cwd: Option<String>,
@@ -421,6 +491,17 @@ pub async fn run_checks(
     .map_err(|e| ToolError::Transient(format!("cannot start the shell: {e}")))?;
 
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
+
+    // A command the shell could not find is a missing toolchain, not a failing check: the
+    // workspace lacks the tool, and no change to the code would make the check pass. So it is not
+    // recorded (no cycle used, no `checks` artifact, nothing for the gate to see), and the model
+    // is told to report it and wait, which is all it can do: nothing is installed here.
+    if let Some(missing) = missing_tool(&outcome, command) {
+        ctx.emit_progress(format!("the workspace lacks a tool: {shown}"))
+            .await;
+        let said = missing_tool_answer(&env, ctx, &missing, &[dir.as_path(), wt.path()]).await?;
+        return Ok(ToolOutput::error(said));
+    }
 
     // The code the command just ran on, so a pull request can be tied to
     // the exact tree that was verified.

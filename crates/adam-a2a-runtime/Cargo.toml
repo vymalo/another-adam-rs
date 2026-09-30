@@ -26,6 +26,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+adam-llm-agent.workspace = true
+adam-model.workspace = true
 adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
 a2a-client-lf.workspace = true
 async-trait.workspace = true
@@ -33,6 +35,7 @@ axum.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

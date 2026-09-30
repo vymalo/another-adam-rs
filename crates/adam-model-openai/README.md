@@ -40,6 +40,10 @@ Behaviour (details in the crate docs, `src/lib.rs`):
 * The key is a `SecretString`, sent as a sensitive `Authorization: Bearer`
   header, and never appears in `Debug`, errors or logs. An empty key sends no
   header.
+* A message whose content has several text parts (a continued conversation merges adjacent
+  user messages) goes out as **one string**, the parts joined with a blank line (`\n\n`); the
+  parts stay in the stored state. An array of typed parts is for a part that is not text
+  (`ContentPart` has only `Text` today), so a chat template that wants a string content always gets one.
 * Malformed tool-call argument JSON is `ModelError::Protocol`.
 * A transport failure (timeout, connection error) is a `Transient` that keeps
   the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
@@ -78,8 +82,9 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
 * `tests/http.rs`: the client against a `wiremock` server (requests, streaming,
   tool calls, error mapping and classes, timeouts, source chains). Always
   runs, no network.
-* Unit tests: `src/errors.rs` (`status_mapping`) and `src/lib.rs`
-  (`config_error_class_table`).
+* Unit tests: `src/errors.rs` (`status_mapping`), `src/lib.rs`
+  (`config_error_class_table`) and `src/wire.rs` (the request shape, including several text parts
+  sent as one string).
 * `tests/live.rs`: optional, against a real endpoint. Passes without doing
   anything unless the variables are set.
 

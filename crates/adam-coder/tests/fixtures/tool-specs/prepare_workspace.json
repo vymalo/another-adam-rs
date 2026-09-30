@@ -1,6 +1,6 @@
 {
   "name": "prepare_workspace",
-  "description": "Check the repository out into your private worktree, on a fresh branch created from origin/<base_branch>. Call it once, first. Calling it again for the same repository is harmless and keeps your changes. It works only on a repository the person named in their messages: otherwise it refuses, and you ask the person which one with ask_user.",
+  "description": "Check the repository out into your private worktree, on a fresh branch created from origin/<base_branch>, which is the repository's default branch when you leave base_branch out. Call it once, first. Calling it again for the same repository is harmless and keeps your changes. It works only on a repository the person named in their messages: otherwise it refuses, and you ask the person which one with ask_user. To carry on with work an earlier task of this conversation pushed (a rework, a follow-up), pass that branch as `branch`: the worktree starts from it and open_pull_request updates its pull request.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,12 +10,15 @@
       },
       "base_branch": {
         "type": "string",
-        "description": "Branch to start from and to open the pull request against, e.g. main"
+        "description": "Branch to start from and to open the pull request against, e.g. main. Leave out for the repository's default branch."
+      },
+      "branch": {
+        "type": "string",
+        "description": "A branch that commit_and_push reported earlier in this conversation (agent/...), to carry on with it and update its pull request. Leave out to start a new branch."
       }
     },
     "required": [
-      "repo_url",
-      "base_branch"
+      "repo_url"
     ]
   }
 }
