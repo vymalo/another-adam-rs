@@ -24,8 +24,9 @@
 //! `AgentStarter` (`RuntimeBuilder::starter`) instead of the agent: the backend
 //! never steps a run, so a worker with the full agent elsewhere does.
 //!
-//! See [`RuntimeTaskBackend`] for the mapping (tasks are runs), ownership and
-//! why subscriptions survive restarts.
+//! See [`RuntimeTaskBackend`] for the mapping (tasks are runs), how a new task that
+//! references a finished one continues its conversation, ownership and why
+//! subscriptions survive restarts.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -35,7 +36,7 @@ mod convert;
 mod ids;
 mod subscribe;
 
-pub use backend::{DEFAULT_POLL_INTERVAL, RuntimeTaskBackend};
+pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
 pub use convert::{
     InboundFn, PromptFn, artifact_id, artifact_of, default_inbound, default_prompt, task_state,
 };

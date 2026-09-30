@@ -19,6 +19,7 @@ agent; [`adam-coder`](../adam-coder/README.md) uses it.
 | `.with_prompt(..)`, `.with_inbound(..)` | override how the `input-required` question is derived (`PromptFn`; the default reads `state.pending_wait.question`, and `state.pending_question.question` for runs parked by an older build) and how an A2A message becomes an `Inbound` (`InboundFn`) |
 | `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings. `artifact_of`: string data is a text part, anything else a data part; an object whose `url` is an absolute `http(s)` URL also gets a `url` part after the data part (A2A v1 `Part.url`), so a client can show a link |
 | `task_id_for(agent, subject, context_id, message_id)` | the task id a new task of `agent` started by that message gets (see *Stable ids*) |
+| `MAX_REFERENCES` | how many of a message's `referenceTaskIds` are looked at (8); see *Continuing a task* |
 
 ```rust
 use std::sync::Arc;
@@ -41,7 +42,8 @@ credentials, while workers with the full agent run in another process over the
 same store. Nothing steps a task in the front itself.
 
 Mapping (full table in `src/backend.rs`): a task is a run (`task_id` is the run
-id); a new `SendMessage` is `Runtime::start_with_id` (delivering to the context's open task if it has one); a message with `taskId` is
+id); a new `SendMessage` is `Runtime::start_with_id` (delivering to the context's open task if it has one), or
+`Runtime::start_with_id_continuing` when it references a finished task (see *Continuing a task*); a message with `taskId` is
 `Runtime::deliver`, only while the task is `input-required`; `CancelTask` is
 `Runtime::cancel`. Ownership is encoded in the run's durable conversation id
 (`<subject>:<context id>`), so it survives restarts with no side table, and a
@@ -56,6 +58,35 @@ subscription of a task another process is stepping advances at the durable poll.
 delivers a `CancelTask` to the running step at once (a `Notifier`), instead of at
 the next poll. `adam-coder` wires it in for every role (`Coder::new_with`,
 `Coder::control_plane_with`).
+
+## Continuing a task
+
+A refinement, a follow-up or a rework is a **new** task in the same `contextId` (a finished task accepts
+nothing more), and A2A lets the client name what it builds on in `Message.referenceTaskIds`. A new task
+(no `taskId`) whose message has references starts its run **continuing** one of them: the new run's first
+state is `Agent::init_continuing` (`AgentStarter::init_continuing` on a front that holds only the starter,
+which works because the prior state is read from the store) of that run's last state, so an `LlmAgent` keeps
+the conversation. The new run is still a new run, with its own id, journal and limits.
+
+The backend takes the **first** of the first `MAX_REFERENCES` (8) references that is all of:
+
+* a task **of this agent, owned by the caller**: the rule of every other call;
+* in the **same context** as the new task (the message's `contextId`; a message without one gets a context of
+  its own, so it continues nothing);
+* **terminal**: `completed`, `failed` or `canceled`. A task that is `input-required` or `working` is open: a
+  message for the context goes to its open task as before, reference or not.
+
+A reference that is unknown, malformed, someone else's, in another context or still open is skipped, with a
+debug log the client never sees. The client gets the fresh task it would for an id that never existed, so a
+reference is no way to find out whether another caller's task exists. No reference, no continuation: the
+backend never guesses "the latest task of the context". `task_id_for` does not depend on the references, so a
+repeated request is idempotent, continuing or not. The decision, the rejected alternatives and the state
+diagram are in
+[ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md).
+
+An agent only continues if it overrides `init_continuing` (`LlmAgent` and `LlmStarter` do); the default is
+`init`, and a wrapper must forward it. `adam-coder` does not yet, so a coder task that references another
+starts fresh until it does.
 
 ## Stable ids
 
@@ -117,14 +148,20 @@ that is `-32602` and not `-32603`
 `an_init_rejection_is_a_32602_over_http`), and a
 `a_starter_only_front_accepts_a_task_a_separate_worker_completes_it`, and a
 restart scenario in which a second backend (a second replica) rebuilds a
-subscription from the store, and the repeated-`messageId` cases. Unit tests in `src/backend.rs`
+subscription from the store, and the repeated-`messageId` cases. The continuation cases: a
+new task that references a finished one continues it (and a failed or canceled one), no reference means a fresh
+task, another caller's, another context's, unknown and malformed references are ignored without a difference the
+caller can see, an open referenced task keeps the old semantics, the first qualifying reference wins and the list is
+bounded, a repeated continuing request starts one task, a front that holds only the starter continues what a
+separate worker finished, a continuation after a restart (memory and PostgreSQL), and a real `LlmAgent` behind
+the backend whose model is shown the earlier messages (memory and PostgreSQL). Unit tests in `src/backend.rs`
 (`runtime_errors_map_by_class`,
 `what_a_client_is_told_carries_no_cause_and_no_conversation_id`) and
 `src/convert.rs`.
 
 | Variable | Meaning |
 |---|---|
-| `ADAM_TEST_POSTGRES_URL` | also runs the restart scenario against PostgreSQL (`adam-store-postgres`); the in-memory variant always runs |
+| `ADAM_TEST_POSTGRES_URL` | also runs the restart and continuation scenarios against PostgreSQL (`adam-store-postgres`); the in-memory variants always run |
 | `ADAM_TEST_REQUIRE_DB` | `1`: an unset Postgres URL fails instead of skipping (CI sets it) |
 
 ## See also

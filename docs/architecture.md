@@ -121,6 +121,8 @@ flowchart TB
     rt -.-> mongo
     rt -.-> pg
     rt -.-> testkit
+    a2art -.-> llm
+    a2art -.-> model
     a2art -.-> pg
     mongo -.-> testkit
     pg -.-> testkit
@@ -146,7 +148,7 @@ flowchart TB
     host --> err
     pgn --> err
 
-    linkStyle 51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67 stroke:#999,stroke-width:1px
+    linkStyle 53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -235,7 +237,9 @@ The layers, from the bottom:
 
 Dev-only edges (dotted): the runtime's tests run against real Postgres and
 MongoDB stores, every store runs the store testkit, and `adam-notify-postgres`
-runs the notifier testkit and its two-runtime tests over `adam-store-postgres`. `adam-a2a`,
+runs the notifier testkit and its two-runtime tests over `adam-store-postgres`.
+`adam-a2a-runtime`'s tests also put a real `LlmAgent` and a `MockModel` behind the backend, to
+show that a task which continues another gives the model the earlier messages. `adam-a2a`,
 `adam-workspace` and `adam-coder` also enable their own `test-util` feature in
 tests. That adds no new crate edge.
 
@@ -710,7 +714,9 @@ What the diagram cannot say:
   with `Runtime::deliver`, and only while the task is `input-required`. Any
   other state gives `-32602`. A message with a `contextId` and no `taskId`
   is delivered to the context's open task, or starts a new one when there is
-  none.
+  none. A new task whose message has `referenceTaskIds` starts from the
+  conversation of one of them, see
+  [A new task that continues a finished one](#a-new-task-that-continues-a-finished-one).
 * **Streams survive restarts.** The subscription takes its snapshot from
   `Runtime::view`, which reads the durable record, and then polls it. The live
   events from the `BroadcastSink` only cut the latency and add intermediate
@@ -723,6 +729,62 @@ What the diagram cannot say:
   `SubscribeToTask` are served. `ListTasks` is unsupported, push-notification
   methods return `PushNotificationNotSupported`, and there is no extended agent
   card (`crates/adam-a2a/src/handler.rs`).
+
+### A new task that continues a finished one
+
+A refinement, a follow-up or a rework is a new A2A task in the same `contextId`, because a finished
+task accepts nothing more. Without help, the new run starts from nothing and the agent forgets the
+conversation. A2A lets the client say what the new task builds on, in `Message.referenceTaskIds`, and
+`RuntimeTaskBackend` uses it ([ADR 0003](decisions/0003-a-new-task-continues-the-task-it-references.md),
+which has the state diagram of a reference's fate and the rejected alternatives).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as A2A client
+    participant B as RuntimeTaskBackend<br/>adam-a2a-runtime
+    participant R as Runtime<br/>adam-runtime
+    participant DB as Store<br/>Postgres
+    participant A as AgentStarter or Agent<br/>LlmStarter, LlmAgent
+
+    C->>B: submit(caller, message with referenceTaskIds [t1], no taskId, contextId c1)
+    loop each reference, at most MAX_REFERENCES (8), in order
+        B->>R: view(reference)
+        R->>DB: load_run
+        B->>B: this agent's, this caller's (owned), in c1, terminal?<br/>if not: debug log and next reference
+    end
+    alt a reference qualifies (t1)
+        B->>R: start_with_id_continuing(task_id_for(...), agent, inbound, conversation, t1)
+        R->>DB: load_run(t1), and the envelope's agent state
+        R->>A: init_continuing(inbound, prior state, t1)
+        Note over A: LlmAgent: carry the history, drop a tool call<br/>that never got its result, reset the counters,<br/>cap the history at 256 KiB
+        A-->>R: the new run's state
+        R->>DB: create_run (Runnable, version 1)
+    else none, or the conversation has an open task
+        B->>R: start_with_id (a fresh start), or deliver to the open task
+    end
+    B-->>C: Task t2 (a new task id), same contextId
+```
+
+What the diagram cannot say:
+
+* **The reference is checked like every task id.** It must be this agent's and the caller's (the
+  caller's subject is part of the run's conversation id), in the same context as the new task, and
+  terminal (`completed`, `failed` or `canceled`). One that is unknown, someone else's, in another
+  context or still open is skipped, and the client gets the fresh task it would for an id that never
+  existed, so it learns nothing about other callers' tasks. A message without a `contextId` gets a
+  context of its own and continues nothing. Without a reference nothing is carried: the backend never
+  guesses "the latest task of the context".
+* **It works on a front that holds only the starter.** The prior state is read from the store and
+  decoded as the starter's `State`, so the split control plane needs no model or credentials.
+  `Agent::init_continuing` and `AgentStarter::init_continuing` default to `init`, and a state that
+  does not decode falls back to `init` with a warning. An agent that wraps another must forward
+  `init_continuing`, as it forwards `init`.
+* **The history is bounded.** `Conversation::continued` drops the oldest whole turns beyond
+  `MAX_CARRIED_BYTES` (256 KiB of JSON) and puts one marker message where they were. The newest turn
+  is always kept.
+* **The new run is an ordinary run**: a new id, its own journal and limits, its own worktree. Only its
+  first state comes from the old run.
 
 ### The worker: claim, step, journal, commit
 
@@ -1842,6 +1904,13 @@ lifecycle above are checked by `crates/adam-notify-postgres/tests/two_runtimes.r
 (a front and a worker with a 30 s poll, against PostgreSQL 16), and the
 `NOTIFY` payload limit of 8000 bytes against a 16.13 server. See the crate's
 README for the third-party facts (PostgreSQL docs, `sqlx-postgres` 0.9.0 source).
+
+**Verified 2026-09-30, source: this repository with ADR 0003, executed.** The path of a task that
+references a finished one, and what `LlmAgent` carries over, are checked by the tests the ADR names
+(`adam-runtime` over every store, `adam-llm-agent`, and `adam-a2a-runtime` over memory and PostgreSQL,
+across a restart and with a real `LlmAgent` behind the backend; executed against memory and PostgreSQL 16.13,
+the MongoDB variants run in CI). The A2A text and the `a2a-lf` field
+behind it are quoted in the ADR.
 
 **Unverified.**
 
