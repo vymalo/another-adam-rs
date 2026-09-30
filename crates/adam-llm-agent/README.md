@@ -33,9 +33,9 @@ instructions + a model + a toolset. It is served over A2A by
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
 | `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
 | `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
-| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on (absent otherwise, and in state stored before it existed) |
+| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed) |
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
-| `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker message that stands in for the turns dropped to fit it |
+| `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
 | `Tool::poll_remote`, `RemotePoll` | how a tool that returned `AwaitRemote` answers "how does the task stand": `Ready(ToolOutput)` or `Working`; the default refuses |
 | `DEFAULT_WAIT_POLL` | 60 s: how long a run waiting for a child sleeps before it reads the child itself |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
@@ -99,12 +99,17 @@ the conversation of the run before:
 | **Carried** | the history, oldest first, and the user messages that were waiting behind an owed tool result (`deferred`), in arrival order; then the new user message |
 | **Dropped** | a last assistant message whose tool calls did not all get a result, with the results that did arrive: a run that ended mid-turn (a limit, a cancel, a question nobody answered) leaves one, and a provider rejects a call without a result. So `pending_calls` and `pending_wait` are always empty: a continued run never answers a question or a child run of the run before. The side effects of the dropped calls are not undone |
 | **Reset** | `turns`, `tool_calls`, `usage` (`Limits` are per run) and `artifacts` (the final output lists what this run produced) |
-| **Recorded** | `continued_from: Option<RunId>`, not written while `None` |
-| **Bounded** | over `MAX_CARRIED_BYTES` (256 KiB of JSON, roughly what `max_history_tokens` lets through), the oldest **whole turns** (a user message and what follows it up to the next) are dropped and one user message starting with `OMITTED_MARKER_PREFIX` stands in for them. The newest turn is always kept, even when it alone is over the cap. A rule that reads what the user said should skip the marker |
+| **Recorded** | `continued_from: Option<RunId>`, not written while `None`; `omitted_turns: u32`, not written while zero |
+| **Bounded** | over `MAX_CARRIED_BYTES` (256 KiB of JSON) **old tool outputs are shortened first**, oldest first, each keeping its head and ending in the `TRUNCATION_MARKER_PREFIX` marker (the same truncation `max_history_tokens` does when a history is sent), and **whole old turns are dropped only after that** (a turn is a user message and what follows it up to the next), one marker standing in for them. Never given up: **the first user message of the chain** (the task; kept verbatim as the first text part of the first message) and the **newest prior turn** (only its tool outputs are shortened). A newest turn whose own text is over the cap is carried over it. The waiting messages and the new one are counted, never cut |
+| **The marker** | the **second text part of the first user message**, starting with `OMITTED_MARKER_PREFIX` and naming the number of turns; `omitted_turns` (not the text) is what says the part is a marker, so a user message that merely starts with the prefix is an ordinary one. A rule that reads what the user said should read user messages part by part and skip that part |
+| **Alternating** | user messages that would be adjacent become one message with several text parts (the marker and what follows it, the new message after a history that ends with the user's, the waiting ones before the new one), because chat templates that insist on alternating roles reject two user messages in a row |
 
-`max_history_tokens` still shortens old tool output in what is sent to the model (`src/history.rs`); the cap is
-about what is stored and carried. **An agent that wraps an `LlmAgent` and delegates `init` must delegate
-`init_continuing` too.** The decision is
+The cap is not "history the model would be cut anyway": `max_history_tokens` (`src/history.rs`) only ever
+shortens tool output in what is sent, so shortening tool output first is the loss the loop already accepts, and
+dropping turns is the last resort. The cap is about what is stored and carried. **An agent that wraps an
+`LlmAgent` and delegates `init` must delegate `init_continuing` too.** Breaking for code that builds a
+`Conversation` with a struct literal (two new public fields) and for `AgentStarter` implementors (`State` now
+needs `DeserializeOwned`), see the ADR's *Consequences*. The decision is
 [ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md).
 
 ## Child runs
@@ -216,11 +221,15 @@ a failed result, permanent and transient poll errors, the timeout, a tool that c
 message queueing behind the result. The shapes of `AwaitRemote` and of the wait are literals in `src/tool.rs`
 and `src/conversation.rs`.
 
-The continuation is tested in `src/conversation.rs` (what is carried, dropped and reset; the cap on small
-caps, never stacking markers, the newest turn kept whole; state stored before `continued_from` existed
-still loads) and in `tests/llm_agent.rs` (`a_starter_continues_exactly_like_the_agent`, a new run whose model
-is shown the earlier messages, a front that holds only the starter, a run cancelled on a question that is
-continued without the stale wait, the 256 KiB cap).
+The continuation is tested in `src/conversation.rs` (what is carried, dropped and reset; tool outputs shortened
+before any turn is dropped; a huge single turn keeping the task through two continuations; the first user message
+surviving a long chain under a small cap; markers counted by `omitted_turns` and never stacked or forged by a
+message that starts like one; the newest prior turn protected with waiting messages present; the roles
+alternating in each shape a continuation can take; state stored before `continued_from` and `omitted_turns`
+existed still loads), in `src/history.rs` (`shorten_output`) and in `tests/llm_agent.rs`
+(`a_starter_continues_exactly_like_the_agent`, a new run whose model is shown the earlier messages, a front that
+holds only the starter, a run cancelled on a question that is continued without the stale wait, the 256 KiB cap
+through the starter).
 
 `tests/llm_agent.rs` is a behavioural suite over a scripted `MockModel` and
 `MemoryStore` (`a_starter_inits_exactly_like_the_agent`, tool loop, retries and rate limits, limits, replay after a

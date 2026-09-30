@@ -14,8 +14,8 @@ use adam_llm_agent::{
     ToolError, ToolOutput, user_message,
 };
 use adam_model::{
-    DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest,
-    ModelResponse, ToolCall, ToolSpec,
+    ContentPart, DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError,
+    ModelRequest, ModelResponse, ToolCall, ToolSpec,
 };
 use adam_runtime::{
     Agent, AgentStarter, CancelToken, Clock, CollectingSink, Inbound, ManualClock, RetryPolicy,
@@ -1720,12 +1720,16 @@ async fn a_run_cancelled_on_a_question_continues_without_the_stale_wait() {
     );
     let started = conversation(&rt.view(second).await.unwrap().unwrap());
     assert!(started.pending_wait.is_none() && started.pending_calls.is_empty());
+    // The run ended with nothing after the task, so the new message joins it: a chat template
+    // that wants the roles to alternate gets one user message with two parts.
     assert_eq!(
         started.messages,
-        [
-            Message::user_text("deploy"),
-            Message::user_text("just deploy to staging")
-        ]
+        [Message::User {
+            content: vec![
+                ContentPart::text("deploy"),
+                ContentPart::text("just deploy to staging")
+            ]
+        }]
     );
     let done = wait_done(&rt, second).await;
     worker.stop().await;
@@ -1740,23 +1744,21 @@ async fn a_run_cancelled_on_a_question_continues_without_the_stale_wait() {
     );
 }
 
-/// The bound on what is carried: over 256 KiB the oldest whole turns go, once, with a marker.
+/// The bound on what is carried, seen through the starter the A2A front uses: over 256 KiB old
+/// tool outputs are shortened first, the oldest whole turns go only after that (with one marker),
+/// and the first user message is never given up.
 #[test]
-fn the_carried_history_is_bounded_and_the_oldest_whole_turns_go() {
-    let turn = |i: usize| {
+fn the_carried_history_is_bounded_shortening_first_and_the_task_is_kept() {
+    let turn = |i: usize, output: usize, answer: usize| {
         vec![
             Message::user_text(format!("task {i}")),
             Message::Assistant {
                 content: vec![],
                 tool_calls: vec![call(&format!("c{i}"), "a", json!({}))],
             },
-            Message::tool_result(format!("c{i}"), "x".repeat(100_000)),
-            Message::assistant_text(format!("answer {i}")),
+            Message::tool_result(format!("c{i}"), "x".repeat(output)),
+            Message::assistant_text(format!("{i}{}", "y".repeat(answer))),
         ]
-    };
-    let prior = Conversation {
-        messages: (0..3).flat_map(turn).collect(),
-        ..Conversation::default()
     };
     let size = |c: &Conversation| {
         c.messages
@@ -1764,22 +1766,59 @@ fn the_carried_history_is_bounded_and_the_oldest_whole_turns_go() {
             .map(|m| serde_json::to_vec(m).unwrap().len())
             .sum::<usize>()
     };
-    assert!(size(&prior) > MAX_CARRIED_BYTES);
-
     let starter = LlmStarter::new("assistant");
+
+    // Tool output is the bulk: shortening the oldest covers it, no turn is given up.
+    let prior = Conversation {
+        messages: (0..3).flat_map(|i| turn(i, 100_000, 10)).collect(),
+        ..Conversation::default()
+    };
+    assert!(size(&prior) > MAX_CARRIED_BYTES);
     let next = starter
         .init_continuing(user_message("task 3"), &prior, RunId::new())
         .unwrap();
     assert!(size(&next) <= MAX_CARRIED_BYTES, "{}", size(&next));
-    assert!(next.messages[0].text().starts_with(OMITTED_MARKER_PREFIX));
-    assert_eq!(next.messages[1], Message::user_text("task 1"));
-    assert_eq!(next.messages[1..9], prior.messages[4..12]);
+    assert_eq!(next.omitted_turns, 0);
+    let users: Vec<String> = next
+        .messages
+        .iter()
+        .filter(|m| matches!(m, Message::User { .. }))
+        .map(Message::text)
+        .collect();
+    assert_eq!(users, ["task 0", "task 1", "task 2", "task 3"]);
+    assert!(next.messages.iter().any(
+        |m| matches!(m, Message::Tool { content, .. } if content.contains(TRUNCATION_MARKER_PREFIX))
+    ));
+
+    // What the assistant said is the bulk: nothing to shorten, so the oldest turns go, the task
+    // stays as the first part of the first message, and the marker says how many.
+    let prior = Conversation {
+        messages: (0..3).flat_map(|i| turn(i, 10, 100_000)).collect(),
+        ..Conversation::default()
+    };
+    assert!(size(&prior) > MAX_CARRIED_BYTES);
+    let next = starter
+        .init_continuing(user_message("task 3"), &prior, RunId::new())
+        .unwrap();
+    assert!(size(&next) <= MAX_CARRIED_BYTES, "{}", size(&next));
+    assert_eq!(
+        next.omitted_turns, 1,
+        "the body of the first turn was enough"
+    );
+    let Message::User { content } = &next.messages[0] else {
+        panic!("the first message is the task");
+    };
+    assert_eq!(content[0].as_text(), "task 0");
+    assert!(content[1].as_text().starts_with(OMITTED_MARKER_PREFIX));
+    assert_eq!(content[2].as_text(), "task 1");
+    assert_eq!(next.messages[1..8], prior.messages[5..12]);
     assert_eq!(next.messages.last(), Some(&Message::user_text("task 3")));
 
     // A small conversation is carried whole, without a marker.
     let small = starter
         .init_continuing(user_message("next"), &finished_conversation(), RunId::new())
         .unwrap();
+    assert_eq!(small.omitted_turns, 0);
     assert!(
         !small
             .messages
@@ -1805,5 +1844,12 @@ fn state_stored_before_continuation_existed_can_be_continued() {
         .init_continuing(user_message("and then?"), &old, run)
         .unwrap();
     assert_eq!(next.continued_from, Some(run));
-    assert_eq!(next.messages.len(), 2);
+    assert_eq!(next.omitted_turns, 0);
+    // "deploy" had no answer, so "and then?" joins it as a second part.
+    assert_eq!(
+        next.messages,
+        [Message::User {
+            content: vec![ContentPart::text("deploy"), ContentPart::text("and then?")]
+        }]
+    );
 }

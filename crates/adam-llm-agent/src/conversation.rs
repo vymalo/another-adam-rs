@@ -132,8 +132,10 @@ pub struct ArtifactRef {
 /// still loads.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Conversation {
-    /// The full history, oldest first. Never truncated here: history limits
-    /// only shape what is sent to the model.
+    /// The history, oldest first. Nothing is removed from it while the run goes on: history
+    /// limits only shape what is sent to the model. A run that continues another starts from a
+    /// bounded copy of the earlier history instead ([`Conversation::continued`]: old tool
+    /// outputs shortened, and as a last resort old turns left out).
     #[serde(default)]
     pub messages: Vec<Message>,
     /// Model calls made so far.
@@ -169,40 +171,59 @@ pub struct Conversation {
     /// Absent from state written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_from: Option<RunId>,
+    /// How many turns of earlier conversation were left out to keep a continued run's carried
+    /// history within [`MAX_CARRIED_BYTES`], summed over every continuation in the chain. While it
+    /// is not zero the **second text part of the first user message** is a marker that says so
+    /// (it starts with [`OMITTED_MARKER_PREFIX`]); this count, and not the text, is what says the
+    /// part is a marker. Absent from state written before it existed, and not written while it is
+    /// zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub omitted_turns: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// The most serialized JSON, in bytes, of messages that a continued conversation carries from the
 /// conversation it continues ([`Conversation::continued`]): 256 KiB.
 ///
-/// Beyond it the oldest whole turns are dropped, a turn being a user message and everything that
-/// followed it up to the next user message, and one marker message
-/// ([`OMITTED_MARKER_PREFIX`]) stands in for them. The newest prior turn is never dropped, even
-/// when it alone is larger (one run's own limits bound it, and the next continuation drops it).
-///
 /// Why a cap at all: every continuation copies the carried history into the new run's state, which
 /// is one JSON value in the store, so without a bound each task in a long-lived context would
 /// store, and each model call would re-read, everything said before. Why this size: it is about
 /// what `Limits::max_history_tokens` lets through to the model (100 000 tokens of about 4
-/// characters), so the cap removes history the model would not be shown whole anyway. Bytes of
-/// JSON, not tokens: the cap has to be checkable without a tokenizer, and it over-counts the
-/// JSON's own punctuation, which only makes it stricter.
+/// characters). Bytes of JSON, not tokens: the cap has to be checkable without a tokenizer, and it
+/// over-counts the JSON's own punctuation, which only makes it stricter.
+///
+/// What is given up to meet it, in this order, and only as far as needed:
+///
+/// 1. **Old tool outputs are shortened**, oldest first, each keeping its head and ending in the
+///    [`TRUNCATION_MARKER_PREFIX`](crate::TRUNCATION_MARKER_PREFIX) marker: what the model
+///    already does to a long history when it is sent ([`Limits::max_history_tokens`](crate::Limits)),
+///    and the output of a tool is the bulk of a coding run. No call loses its result.
+/// 2. **Whole old turns are dropped**, oldest first (a turn is a user message and everything that
+///    followed it up to the next user message), and one marker text
+///    ([`OMITTED_MARKER_PREFIX`]) says how many. This is what the model is *not* already shown in
+///    full, so it is the last resort.
+///
+/// Two things are never given up: **the first user message of the chain** (the task the whole
+/// conversation is about, kept verbatim as the first text part of the first message) and **the
+/// newest prior turn** (what the new message most likely follows up on), except for step 1
+/// shortening its tool outputs. A newest turn whose own assistant text and tool-call arguments are
+/// larger than the cap is therefore carried over the cap: one run's own limits bound it, and the
+/// next continuation shortens or drops it.
 pub const MAX_CARRIED_BYTES: usize = 256 * 1024;
 
-/// How the text of the marker message that replaces dropped turns begins. The marker is a user
-/// message (a conversation may start with one, unlike with an assistant message), so a reader that
-/// looks at what the user said, such as the coder's rule about which repositories a task named,
-/// can recognise it by this prefix and skip it.
+/// How the text of the marker that stands in for dropped turns begins. The marker is the second
+/// text part of the first user message ([`Conversation::omitted_turns`] says it is there), so a
+/// reader that looks at what the user said, such as the coder's rule about which repositories a
+/// task named, can skip it by this prefix.
 pub const OMITTED_MARKER_PREFIX: &str = "[earlier conversation omitted";
 
-fn omission_marker() -> Message {
+fn omission_marker(turns: u32) -> Message {
     Message::user_text(format!(
-        "{OMITTED_MARKER_PREFIX} to keep the carried history within its limit]"
+        "{OMITTED_MARKER_PREFIX}: {turns} earlier turn(s) left out to keep the carried history within its limit]"
     ))
-}
-
-fn is_omission_marker(message: &Message) -> bool {
-    matches!(message, Message::User { content }
-        if content.first().is_some_and(|p| p.as_text().starts_with(OMITTED_MARKER_PREFIX)))
 }
 
 fn json_len(message: &Message) -> usize {
@@ -235,39 +256,118 @@ fn drop_unanswered_calls(messages: &mut Vec<Message>) {
     }
 }
 
-/// `prior` followed by `new`, with the oldest whole turns of `prior` dropped (and a marker put in
-/// their place) while the JSON of all of it exceeds `cap` bytes. See [`MAX_CARRIED_BYTES`].
-fn carry(prior: Vec<Message>, new: Message, cap: usize) -> Vec<Message> {
-    let sizes: Vec<usize> = prior.iter().map(json_len).collect();
-    let mut total = sizes.iter().sum::<usize>() + json_len(&new);
-    // Where each turn starts. What precedes the first start (an earlier marker) belongs to the
-    // first turn, so it goes with it.
+/// Undoes what the last continuation did to the first message when it dropped turns: the marker
+/// (its second part, which `omitted` says is there) is taken out, and whatever was merged into the
+/// message after it goes back to being a user message of its own, so that the turns are again
+/// separate ones that can be dropped. A count that finds no marker where it should be (state
+/// edited by hand) counts for nothing.
+fn split_head(prior: &mut Vec<Message>, omitted: u32) -> u32 {
+    if omitted == 0 {
+        return 0;
+    }
+    let Some(Message::User { content }) = prior.first_mut() else {
+        return 0;
+    };
+    if !content
+        .get(1)
+        .is_some_and(|part| part.as_text().starts_with(OMITTED_MARKER_PREFIX))
+    {
+        return 0;
+    }
+    let rest = content.split_off(2);
+    content.truncate(1);
+    if !rest.is_empty() {
+        prior.insert(1, Message::User { content: rest });
+    }
+    omitted
+}
+
+/// Adjacent user messages become one message with all their parts, in order. Chat templates that
+/// require the roles to alternate (and some providers) reject two user messages in a row, which
+/// the carried history would otherwise have after a marker, after a prior run that ended before
+/// the model answered, and after user messages that were waiting behind a tool result.
+fn merge_adjacent_users(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message {
+            Message::User { content } => match out.last_mut() {
+                Some(Message::User { content: before }) => before.extend(content),
+                _ => out.push(Message::User { content }),
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The history a continued run starts from: `prior`, then `tail` (user messages that are never
+/// cut), within `cap` bytes of JSON where that can be done without giving up what
+/// [`MAX_CARRIED_BYTES`] says is never given up. Returns the messages and the total number of turns
+/// left out so far (`omitted` and what this call drops).
+fn carry(
+    mut prior: Vec<Message>,
+    omitted: u32,
+    tail: Vec<Message>,
+    cap: usize,
+) -> (Vec<Message>, u32) {
+    let omitted = split_head(&mut prior, omitted);
+    let mut sizes: Vec<usize> = prior.iter().map(json_len).collect();
+    let tail_len: usize = tail.iter().map(json_len).sum();
+    let mut total = sizes.iter().sum::<usize>() + tail_len;
+    // What the marker can take, for any count.
+    let marker_len = json_len(&omission_marker(u32::MAX));
+    let reserve = |omitted_now: u32| if omitted_now > 0 { marker_len } else { 0 };
+
+    // 1. Shorten tool outputs, oldest first, as far as needed.
+    for (message, size) in prior.iter_mut().zip(sizes.iter_mut()) {
+        let needed = total + reserve(omitted);
+        if needed <= cap {
+            break;
+        }
+        let Message::Tool { content, .. } = &mut *message else {
+            continue;
+        };
+        // Two characters more than needed: the marker starts with a newline, which JSON writes
+        // as two bytes, and this way one output is enough where one can be.
+        let Some(shortened) = crate::history::shorten_output(content, needed - cap + 2) else {
+            continue;
+        };
+        *content = shortened;
+        let now = json_len(message);
+        total = total - *size + now;
+        *size = now;
+    }
+
+    // 2. Drop whole turns, oldest first, never the first user message or the newest turn. The
+    //    turns are consecutive, so what goes is one stretch after the first user message.
     let starts: Vec<usize> = prior
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m, Message::User { .. }) && !is_omission_marker(m))
+        .filter(|(_, m)| matches!(m, Message::User { .. }))
         .map(|(i, _)| i)
         .collect();
-    let marker = omission_marker();
-    let marker_len = json_len(&marker);
-    let mut dropped = 0;
-    let mut next_turn = 1;
-    if total > cap {
-        // Never the last turn: it is the one the new message most likely follows up on.
-        while total + marker_len > cap && next_turn < starts.len() {
-            let end = starts[next_turn];
-            total -= sizes[dropped..end].iter().sum::<usize>();
-            dropped = end;
-            next_turn += 1;
+    let mut dropped_turns = 0;
+    if let Some(&first) = starts.first() {
+        let mut cut = first + 1;
+        for &end in &starts[1..] {
+            if total + reserve(omitted + dropped_turns) <= cap {
+                break;
+            }
+            let size: usize = sizes[cut..end].iter().sum();
+            if end > cut {
+                total -= size;
+                dropped_turns += 1;
+            }
+            cut = end;
+        }
+        prior.drain(first + 1..cut);
+        let omitted_now = omitted + dropped_turns;
+        if omitted_now > 0 {
+            prior.insert(first + 1, omission_marker(omitted_now));
         }
     }
-    let mut out = Vec::with_capacity(prior.len() - dropped + 2);
-    if dropped > 0 {
-        out.push(marker);
-    }
-    out.extend(prior.into_iter().skip(dropped));
-    out.push(new);
-    out
+    prior.extend(tail);
+    (merge_adjacent_users(prior), omitted + dropped_turns)
 }
 
 impl Conversation {
@@ -294,19 +394,30 @@ impl Conversation {
     /// * **Reset, per task:** `turns`, `tool_calls` and `usage` (the [`Limits`](crate::Limits) are
     ///   per run, and this is a new run) and `artifacts` (the final output lists what this run
     ///   produced).
-    /// * **Recorded:** `continued_from`.
-    /// * **Bounded:** by [`MAX_CARRIED_BYTES`], which drops the oldest whole turns.
+    /// * **Recorded:** `continued_from`, and in `omitted_turns` how many turns have been left
+    ///   out, in this and earlier continuations.
+    /// * **Bounded:** by [`MAX_CARRIED_BYTES`]: old tool outputs are shortened first, whole old
+    ///   turns are dropped only after that, and the first user message is never dropped.
+    /// * **Alternating:** user messages that would end up next to each other (the marker and the
+    ///   message after it, the new one after a history that ends with a user message, the ones
+    ///   that were waiting) become one message with several text parts, so that the roles
+    ///   alternate as chat templates that insist on it need.
     #[must_use]
     pub fn continued(&self, text: impl Into<String>, from: RunId) -> Self {
         self.continued_within(text, from, MAX_CARRIED_BYTES)
     }
 
     fn continued_within(&self, text: impl Into<String>, from: RunId, cap: usize) -> Self {
-        let mut messages = self.messages.clone();
-        drop_unanswered_calls(&mut messages);
-        messages.extend(self.deferred.iter().cloned());
+        let mut prior = self.messages.clone();
+        drop_unanswered_calls(&mut prior);
+        // The deferred messages and the new one are the tail: counted, never cut, and not turns of
+        // the prior, so the newest turn that is protected is the prior's own.
+        let mut tail = self.deferred.clone();
+        tail.push(Message::user_text(text));
+        let (messages, omitted_turns) = carry(prior, self.omitted_turns, tail, cap);
         Self {
-            messages: carry(messages, Message::user_text(text), cap),
+            messages,
+            omitted_turns,
             continued_from: Some(from),
             ..Self::default()
         }
@@ -492,10 +603,6 @@ mod tests {
         }
     }
 
-    fn texts(messages: &[Message]) -> Vec<String> {
-        messages.iter().map(Message::text).collect()
-    }
-
     #[test]
     fn a_continuation_carries_the_history_and_starts_the_counters_again() {
         let mut prior = Conversation::new("first task");
@@ -531,6 +638,50 @@ mod tests {
         assert_eq!(prior.messages.len(), 4);
     }
 
+    /// A user message with these text parts.
+    fn user_of(parts: &[&str]) -> Message {
+        Message::User {
+            content: parts
+                .iter()
+                .map(|t| adam_model::ContentPart::text(*t))
+                .collect(),
+        }
+    }
+
+    /// The text parts of a user message.
+    fn parts_of(m: &Message) -> Vec<String> {
+        match m {
+            Message::User { content } => content.iter().map(|p| p.as_text().to_owned()).collect(),
+            other => panic!("not a user message: {other:?}"),
+        }
+    }
+
+    /// The roles of a history as a chat template that insists on alternation reads them: it starts
+    /// with a user message, a user message follows an assistant message or a tool result (never
+    /// another user message), an assistant message follows a user message or a tool result, and a
+    /// tool result follows the assistant message that called it or another result.
+    #[track_caller]
+    fn assert_alternating(messages: &[Message]) {
+        for (i, m) in messages.iter().enumerate() {
+            let before = i.checked_sub(1).map(|j| &messages[j]);
+            let ok = match (before, m) {
+                (None, Message::User { .. }) => true,
+                (Some(Message::Assistant { .. } | Message::Tool { .. }), Message::User { .. }) => {
+                    true
+                }
+                (Some(Message::User { .. } | Message::Tool { .. }), Message::Assistant { .. }) => {
+                    true
+                }
+                (Some(Message::Assistant { tool_calls, .. }), Message::Tool { call_id, .. }) => {
+                    tool_calls.iter().any(|c| c.id == *call_id)
+                }
+                (Some(Message::Tool { .. }), Message::Tool { .. }) => true,
+                _ => false,
+            };
+            assert!(ok, "message {i} breaks the alternation: {messages:#?}");
+        }
+    }
+
     #[test]
     fn user_messages_that_were_waiting_behind_a_result_come_before_the_new_one() {
         let mut prior = Conversation::new("first task");
@@ -540,10 +691,16 @@ mod tests {
             Message::user_text("and this"),
         ];
         let next = prior.continued("second task", RunId::new());
+        // In the order they arrived, as the parts of the one user message that follows the answer.
         assert_eq!(
-            texts(&next.messages),
-            ["first task", "done", "also this", "and this", "second task"]
+            next.messages,
+            [
+                Message::user_text("first task"),
+                Message::assistant_text("done"),
+                user_of(&["also this", "and this", "second task"]),
+            ]
         );
+        assert_alternating(&next.messages);
         assert!(next.deferred.is_empty());
     }
 
@@ -552,13 +709,13 @@ mod tests {
         let run = RunId::new();
         let user = |t: &str| Message::user_text(t);
 
-        // Nothing came back at all (a limit failed the run right after the model's turn).
+        // Nothing came back at all (a limit failed the run right after the model's turn): what is
+        // left ends with the task, so the new message joins it instead of following it.
         let mut c = Conversation::new("task");
         c.messages.push(calls(&["c1", "c2"]));
-        assert_eq!(
-            c.continued("more", run).messages,
-            [user("task"), user("more")]
-        );
+        let next = c.continued("more", run);
+        assert_eq!(next.messages, [user_of(&["task", "more"])]);
+        assert_alternating(&next.messages);
 
         // Some results came back, not all.
         let mut c = Conversation::new("task");
@@ -566,7 +723,7 @@ mod tests {
         c.messages.push(Message::tool_result("c1", "partial"));
         assert_eq!(
             c.continued("more", run).messages,
-            [user("task"), user("more")]
+            [user_of(&["task", "more"])]
         );
 
         // Parked on a question the run never got an answer to: the wait goes with the call.
@@ -579,7 +736,7 @@ mod tests {
             question: "which?".into(),
         }));
         let next = c.continued("more", run);
-        assert_eq!(next.messages, [user("task"), user("more")]);
+        assert_eq!(next.messages, [user_of(&["task", "more"])]);
         assert!(next.pending_calls.is_empty() && next.pending_wait.is_none());
 
         // Earlier, finished exchanges stay; only the last, unfinished one goes.
@@ -597,6 +754,7 @@ mod tests {
                 user("more"),
             ]
         );
+        assert_alternating(&next.messages);
 
         // Answered calls are history, whatever came after them.
         let mut c = Conversation::new("task");
@@ -604,11 +762,13 @@ mod tests {
         c.messages.push(Message::tool_result("c1", "one"));
         c.messages.push(Message::tool_error("c2", "two"));
         c.messages.push(Message::assistant_text("done"));
-        assert_eq!(c.continued("more", run).messages.len(), 6);
+        let next = c.continued("more", run);
+        assert_eq!(next.messages.len(), 6);
+        assert_alternating(&next.messages);
     }
 
-    /// A conversation of `turns` turns: a user message, a tool exchange whose result is `size`
-    /// bytes, and the answer.
+    /// A conversation of `n` turns: a user message, a tool exchange whose result is `size` bytes,
+    /// and the answer.
     fn turns(n: usize, size: usize) -> Vec<Message> {
         let mut out = Vec::new();
         for i in 0..n {
@@ -620,59 +780,54 @@ mod tests {
         out
     }
 
+    fn convo(messages: Vec<Message>) -> Conversation {
+        Conversation {
+            messages,
+            ..Conversation::default()
+        }
+    }
+
     fn total_len(messages: &[Message]) -> usize {
         messages.iter().map(json_len).sum()
     }
 
-    fn is_marker(m: &Message) -> bool {
-        is_omission_marker(m)
+    /// Whether a tool output was shortened by the truncation of the history.
+    fn shortened(m: &Message) -> bool {
+        matches!(m, Message::Tool { content, .. }
+            if content.contains(crate::history::TRUNCATION_MARKER_PREFIX))
     }
 
-    #[test]
-    fn under_the_cap_nothing_is_dropped_and_no_marker_appears() {
-        let prior = Conversation {
-            messages: turns(3, 1000),
-            ..Conversation::default()
-        };
-        let next = prior.continued_within("next", RunId::new(), 100_000);
-        assert_eq!(next.messages.len(), 13);
-        assert!(!next.messages.iter().any(is_marker));
-        assert_eq!(&next.messages[..12], &prior.messages[..]);
+    /// How many text parts of user messages are the omission marker.
+    fn markers(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter(|m| matches!(m, Message::User { .. }))
+            .flat_map(parts_of)
+            .filter(|t| t.starts_with(OMITTED_MARKER_PREFIX))
+            .count()
     }
 
-    #[test]
-    fn over_the_cap_the_oldest_whole_turns_go_and_one_marker_stands_in() {
-        // Five turns of about 1260 bytes each: this cap fits three of them, the new message and
-        // the marker, and not four.
-        let prior = Conversation {
-            messages: turns(5, 1000),
-            ..Conversation::default()
-        };
-        let cap = 4_500;
-        let next = prior.continued_within("next", RunId::new(), cap);
+    /// Every user message text of the history, in order (a part at a time).
+    fn said(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter(|m| matches!(m, Message::User { .. }))
+            .flat_map(parts_of)
+            .collect()
+    }
 
-        assert!(is_marker(&next.messages[0]));
-        assert!(next.messages[0].text().starts_with(OMITTED_MARKER_PREFIX));
-        // The first kept message starts a turn: no half turns.
-        assert_eq!(next.messages[1].text(), "task 2");
-        assert_eq!(next.messages.last().unwrap().text(), "next");
-        // Whole turns only: the kept ones are the newest, in order, unchanged.
-        let kept = &next.messages[1..next.messages.len() - 1];
-        assert_eq!(kept, &prior.messages[8..]);
-        assert_eq!(next.messages.iter().filter(|m| is_marker(m)).count(), 1);
-        assert!(
-            total_len(&next.messages) <= cap,
-            "{}",
-            total_len(&next.messages)
-        );
-        // No tool call lost its result in what is kept.
-        for m in kept {
+    /// No call without its result in `messages`.
+    #[track_caller]
+    fn assert_calls_answered(messages: &[Message]) {
+        for m in messages {
             if let Message::Assistant { tool_calls, .. } = m {
                 for c in tool_calls {
                     assert!(
-                        kept.iter().any(
+                        messages.iter().any(
                             |r| matches!(r, Message::Tool { call_id, .. } if *call_id == c.id)
-                        )
+                        ),
+                        "{} has no result",
+                        c.id
                     );
                 }
             }
@@ -680,60 +835,374 @@ mod tests {
     }
 
     #[test]
-    fn continuing_again_replaces_the_marker_instead_of_stacking_them() {
-        let prior = Conversation {
-            messages: turns(5, 1000),
-            ..Conversation::default()
-        };
-        let once = prior.continued_within("next", RunId::new(), 4_500);
-        assert!(is_marker(&once.messages[0]));
-        // Still over this smaller cap: one more turn goes, with the old marker, and there is one
-        // new marker.
-        let cap = 3_000;
-        let twice = once.continued_within("and again", RunId::new(), cap);
-        assert_eq!(twice.messages.iter().filter(|m| is_marker(m)).count(), 1);
-        assert!(is_marker(&twice.messages[0]));
-        assert_eq!(twice.messages[1].text(), "task 3");
-        assert_eq!(twice.messages.last().unwrap().text(), "and again");
-        assert!(total_len(&twice.messages) <= cap);
-        // Under the cap, the marker of an earlier omission stays where it is.
-        let small = once.continued_within("tiny", RunId::new(), 1_000_000);
-        assert_eq!(small.messages.len(), once.messages.len() + 1);
-        assert!(is_marker(&small.messages[0]));
+    fn under_the_cap_nothing_is_shortened_dropped_or_marked() {
+        let prior = convo(turns(3, 1000));
+        let next = prior.continued_within("next", RunId::new(), 100_000);
+        assert_eq!(next.messages.len(), 13);
+        assert_eq!(&next.messages[..12], &prior.messages[..]);
+        assert_eq!(next.omitted_turns, 0);
+        assert_eq!(markers(&next.messages), 0);
+        assert!(!next.messages.iter().any(shortened));
+        assert_alternating(&next.messages);
     }
 
     #[test]
-    fn the_newest_turn_is_carried_whole_even_when_it_alone_is_over_the_cap() {
-        let prior = Conversation {
-            messages: turns(1, 10_000),
-            ..Conversation::default()
-        };
-        let next = prior.continued_within("next", RunId::new(), 1_000);
-        assert_eq!(next.messages.len(), 5);
-        assert!(!next.messages.iter().any(is_marker));
+    fn over_the_cap_tool_outputs_are_shortened_before_any_turn_is_dropped() {
+        // Five turns of about 1280 bytes each, the bulk of it tool output. This cap is over by
+        // about 900 bytes, which shortening the oldest output covers: every turn is carried.
+        let prior = convo(turns(5, 1000));
+        let cap = 5_600;
+        assert!(total_len(&prior.messages) > cap + 500);
+        let next = prior.continued_within("next", RunId::new(), cap);
 
-        // With older turns before it, they go and it stays.
-        let prior = Conversation {
-            messages: turns(3, 10_000),
-            ..Conversation::default()
+        assert_eq!(next.omitted_turns, 0, "no turn had to go");
+        assert_eq!(markers(&next.messages), 0);
+        assert_eq!(next.messages.len(), 21, "every message is still there");
+        assert_eq!(said(&next.messages).len(), 6);
+        assert_alternating(&next.messages);
+        assert_calls_answered(&next.messages);
+        // Only as much as needed, oldest first: the first output lost its tail (keeping its head
+        // and ending in the marker the history truncation uses), the others are whole.
+        let outputs: Vec<&Message> = next
+            .messages
+            .iter()
+            .filter(|m| matches!(m, Message::Tool { .. }))
+            .collect();
+        assert_eq!(
+            outputs.iter().map(|m| shortened(m)).collect::<Vec<_>>(),
+            [true, false, false, false, false]
+        );
+        let Message::Tool { content, .. } = outputs[0] else {
+            unreachable!()
         };
+        assert!(content.starts_with("xxx"), "the head of the output stays");
+        assert!(content.contains(crate::history::TRUNCATION_MARKER_PREFIX));
+        assert!(total_len(&next.messages) <= cap);
+        // Carried again under the same cap it needs nothing more: no marker on a marker.
+        let again = next.continued_within("more", RunId::new(), cap + 100);
+        assert_eq!(again.omitted_turns, 0);
+        assert_eq!(markers(&again.messages), 0);
+    }
+
+    #[test]
+    fn whole_turns_go_only_when_shortening_is_not_enough() {
+        // With every output shortened to its marker five turns still take about 1700 bytes.
+        let prior = convo(turns(5, 1000));
+        let cap = 1_200;
+        let next = prior.continued_within("next", RunId::new(), cap);
+
+        assert!(next.omitted_turns >= 1 && next.omitted_turns < 5);
+        assert_eq!(markers(&next.messages), 1);
+        assert_alternating(&next.messages);
+        assert_calls_answered(&next.messages);
+        // The first user message is kept verbatim, as the first text part of the first message;
+        // the marker is the second, and says how many turns it stands for.
+        let head = parts_of(&next.messages[0]);
+        assert_eq!(head[0], "task 0");
+        assert!(head[1].starts_with(OMITTED_MARKER_PREFIX));
+        assert!(
+            head[1].contains(&format!(": {} earlier", next.omitted_turns)),
+            "{}",
+            head[1]
+        );
+        // The third part is what was the next kept user message, a turn start, unchanged: turns
+        // 0 (its body) up to the one before it are the omitted ones.
+        assert_eq!(head[2], format!("task {}", next.omitted_turns), "{head:?}");
+        // The newest prior turn and the new message are there; the survivors' outputs had been
+        // shortened first (they are all at their floor), the newest turn's included.
+        let users = said(&next.messages);
+        assert!(users.contains(&"task 4".to_owned()));
+        assert_eq!(users.last().unwrap(), "next");
+        assert!(
+            next.messages
+                .iter()
+                .filter(|m| matches!(m, Message::Tool { .. }))
+                .all(shortened)
+        );
+        assert!(total_len(&next.messages) <= cap);
+    }
+
+    #[test]
+    fn a_huge_single_turn_keeps_the_task_through_two_continuations() {
+        // One coding run: a task, forty tool exchanges of 100 KB each, an answer. Far over the
+        // cap, and the old rule would have dropped the whole turn (the task with it) at the
+        // second rework.
+        let big_run = |task: &str, tag: &str| {
+            let mut m = vec![Message::user_text(task)];
+            for i in 0..40 {
+                let id = format!("{tag}-{i}");
+                m.push(calls(&[&id]));
+                m.push(Message::tool_result(id, "o".repeat(100_000)));
+            }
+            m.push(Message::assistant_text(format!("done {tag}")));
+            m
+        };
+        let task = "implement X in repo R";
+        let first = convo(big_run(task, "a"));
+        assert!(total_len(&first.messages) > 10 * MAX_CARRIED_BYTES);
+
+        // First rework.
+        let second = first.continued("rework it", RunId::new());
+        assert_eq!(second.omitted_turns, 0, "one turn alone is never dropped");
+        assert_eq!(second.messages[0], Message::user_text(task));
+        assert_alternating(&second.messages);
+        assert_calls_answered(&second.messages);
+        assert!(total_len(&second.messages) <= MAX_CARRIED_BYTES);
+        assert_eq!(said(&second.messages), [task, "rework it"]);
+        assert!(second.messages.iter().any(shortened));
+
+        // The rework ran, and is as big; second rework.
+        let mut worked = second.clone();
+        worked
+            .messages
+            .extend(big_run("x", "b").into_iter().skip(1));
+        let third = worked.continued("and once more", RunId::new());
+        assert_eq!(
+            third.messages[0],
+            Message::user_text(task),
+            "the task survives"
+        );
+        assert_eq!(said(&third.messages), [task, "rework it", "and once more"]);
+        assert_alternating(&third.messages);
+        assert_calls_answered(&third.messages);
+        assert!(total_len(&third.messages) <= MAX_CARRIED_BYTES);
+        assert!(third.continued_from.is_some());
+    }
+
+    #[test]
+    fn the_first_user_message_survives_a_long_chain_under_a_small_cap() {
+        let task = "the original task";
+        let mut c = convo(vec![
+            Message::user_text(task),
+            Message::assistant_text("ok"),
+        ]);
+        let mut last_omitted = 0;
+        for round in 0..12 {
+            let next = c.continued_within(format!("rework {round}"), RunId::new(), 3_000);
+            assert_eq!(parts_of(&next.messages[0])[0], task, "round {round}");
+            assert!(next.omitted_turns >= last_omitted, "round {round}");
+            assert_eq!(
+                next.omitted_turns > 0,
+                markers(&next.messages) == 1,
+                "round {round}"
+            );
+            assert!(markers(&next.messages) <= 1, "markers do not stack");
+            assert_alternating(&next.messages);
+            assert_calls_answered(&next.messages);
+            assert_eq!(
+                said(&next.messages).last().unwrap(),
+                &format!("rework {round}")
+            );
+            last_omitted = next.omitted_turns;
+            // The rework runs: a tool exchange with a big output and an answer.
+            c = next;
+            c.messages.push(calls(&[&format!("r{round}")]));
+            c.messages
+                .push(Message::tool_result(format!("r{round}"), "y".repeat(2_000)));
+            c.messages
+                .push(Message::assistant_text(format!("done {round}")));
+        }
+        assert!(last_omitted > 0, "the chain was long enough to drop turns");
+    }
+
+    #[test]
+    fn continuing_again_replaces_the_marker_instead_of_stacking_them() {
+        let prior = convo(turns(6, 1000));
+        let once = prior.continued_within("next", RunId::new(), 1_200);
+        assert_eq!(markers(&once.messages), 1);
+        let first_count = once.omitted_turns;
+        assert!(first_count >= 1);
+
+        // Still over a smaller cap: more turns go, there is still one marker, and it counts all.
+        let twice = once.continued_within("and again", RunId::new(), 800);
+        assert_eq!(markers(&twice.messages), 1);
+        assert!(twice.omitted_turns > first_count);
+        let head = parts_of(&twice.messages[0]);
+        assert_eq!(head[0], "task 0");
+        assert!(head[1].starts_with(OMITTED_MARKER_PREFIX));
+        assert!(head[1].contains(&format!(": {} earlier", twice.omitted_turns)));
+        assert_eq!(said(&twice.messages).last().unwrap(), "and again");
+        assert_alternating(&twice.messages);
+
+        // Under a cap that fits, the marker of an earlier omission stays, with its count, and the
+        // turns merged behind it are turns of their own again.
+        let small = once.continued_within("tiny", RunId::new(), 1_000_000);
+        assert_eq!(small.omitted_turns, first_count);
+        assert_eq!(markers(&small.messages), 1);
+        // "next" was the last message and a user message: "tiny" joins it.
+        assert_eq!(small.messages.len(), once.messages.len());
+        assert_eq!(parts_of(small.messages.last().unwrap()), ["next", "tiny"]);
+        assert_eq!(
+            small.messages[..small.messages.len() - 1],
+            once.messages[..once.messages.len() - 1]
+        );
+        assert_alternating(&small.messages);
+    }
+
+    #[test]
+    fn the_newest_turn_is_carried_even_when_its_own_text_is_over_the_cap() {
+        // Its tool outputs are shortened like any other, but what the assistant said is not
+        // touched, and nothing drops the turn: the cap is overshot by it alone.
+        let mut newest = vec![Message::user_text("newest")];
+        newest.push(Message::assistant_text("a".repeat(20_000)));
+        let mut messages = turns(3, 10_000);
+        messages.extend(newest);
+        let prior = convo(messages);
         let next = prior.continued_within("next", RunId::new(), 1_000);
-        assert!(is_marker(&next.messages[0]));
-        assert_eq!(&next.messages[1..5], &prior.messages[8..]);
-        assert_eq!(next.messages.len(), 6);
+
+        // What the assistant said in the newest turn is whole, and the turn's user message is
+        // the third part of the first message (behind the task and the marker).
+        let marker = omission_marker(3).text();
+        assert_eq!(
+            parts_of(&next.messages[0]),
+            ["task 0", marker.as_str(), "newest"]
+        );
+        assert_eq!(
+            next.messages[1],
+            Message::assistant_text("a".repeat(20_000))
+        );
+        assert_eq!(next.messages.last().unwrap(), &Message::user_text("next"));
+        // The older turns are gone but for the task; the marker says how many.
+        assert_eq!(next.omitted_turns, 3);
+        assert_eq!(said(&next.messages)[0], "task 0");
+        assert_alternating(&next.messages);
+
+        // One turn only: nothing to drop at all, and its output is shortened to fit what it can.
+        let prior = convo(turns(1, 10_000));
+        let next = prior.continued_within("next", RunId::new(), 1_000);
+        assert_eq!(next.omitted_turns, 0);
+        assert_eq!(next.messages.len(), 5);
+        assert!(shortened(&next.messages[2]));
+    }
+
+    #[test]
+    fn deferred_messages_do_not_make_the_priors_last_turn_droppable() {
+        // The waiting messages and the new one are the tail, not turns of the prior: the newest
+        // prior turn is still the one that is protected, and the older ones go instead.
+        let mut prior = convo(turns(4, 1_000));
+        prior.deferred = vec![Message::user_text("waiting")];
+        let next = prior.continued_within("next", RunId::new(), 1_000);
+
+        assert!(next.omitted_turns >= 1);
+        let users = said(&next.messages);
+        assert!(users.contains(&"task 3".to_owned()), "{users:?}");
+        assert_eq!(&users[users.len() - 2..], ["waiting", "next"]);
+        assert!(
+            next.messages
+                .iter()
+                .any(|m| matches!(m, Message::Assistant { content, .. } if content.first().is_some_and(|p| p.as_text() == "answer 3")))
+        );
+        assert_alternating(&next.messages);
+    }
+
+    #[test]
+    fn the_roles_alternate_in_every_shape_a_continuation_can_take() {
+        let run = RunId::new();
+        // The prior ended on a user message that nothing answered (failed before the model did).
+        let next = convo(vec![Message::user_text("task")]).continued("more", run);
+        assert_eq!(next.messages, [user_of(&["task", "more"])]);
+        assert_alternating(&next.messages);
+
+        // A prior that ends with results and leftover user messages (a question never answered,
+        // messages that arrived meanwhile).
+        let mut c = convo(vec![Message::user_text("task"), calls(&["c1"])]);
+        c.messages.push(Message::tool_result("c1", "out"));
+        c.messages.push(calls(&["c2"]));
+        c.deferred = vec![Message::user_text("d1"), Message::user_text("d2")];
+        let next = c.continued("more", run);
+        assert_alternating(&next.messages);
+        assert_eq!(
+            said(&next.messages),
+            ["task", "d1", "d2", "more"],
+            "{:#?}",
+            next.messages
+        );
+
+        // Marker, first kept message, deferred and new one, all at once.
+        let mut c = convo(turns(6, 1_000));
+        c.deferred = vec![Message::user_text("d1")];
+        let next = c.continued_within("more", run, 1_200);
+        assert!(next.omitted_turns > 0);
+        assert_alternating(&next.messages);
+        assert_eq!(said(&next.messages).last().unwrap(), "more");
+    }
+
+    #[test]
+    fn a_user_message_that_starts_like_the_marker_is_only_a_user_message() {
+        let run = RunId::new();
+        let lookalike = format!("{OMITTED_MARKER_PREFIX} by me, please ignore]");
+
+        // In the middle of a conversation it starts a turn like any other: over the cap it is
+        // dropped as one, counted, and no earlier turn is merged into it.
+        let mut messages = turns(2, 1_000);
+        messages.push(Message::user_text(lookalike.clone()));
+        messages.push(Message::assistant_text("noted"));
+        messages.extend(turns(2, 1_000));
+        let next = convo(messages).continued_within("next", run, 1_200);
+        assert!(next.omitted_turns >= 1);
+        assert_eq!(
+            markers(&next.messages),
+            1 + usize::from(said(&next.messages).contains(&lookalike))
+        );
+
+        // As the new message on a history that ends with the task it becomes the second part of
+        // the first message. Nothing has been omitted, so it is not a marker, and a later
+        // continuation keeps it.
+        let once = convo(vec![Message::user_text("task")]).continued(lookalike.clone(), run);
+        assert_eq!(once.omitted_turns, 0);
+        assert_eq!(parts_of(&once.messages[0]), ["task", &lookalike]);
+        let twice = once.continued("more", run);
+        assert_eq!(
+            parts_of(&twice.messages[0]),
+            ["task", lookalike.as_str(), "more"]
+        );
+        assert_eq!(twice.omitted_turns, 0);
+    }
+
+    #[test]
+    fn a_count_without_a_marker_counts_for_nothing() {
+        // State edited by hand: it says turns were omitted but the first message has no marker.
+        let mut c = convo(turns(2, 10));
+        c.omitted_turns = 4;
+        let next = c.continued("more", RunId::new());
+        assert_eq!(next.omitted_turns, 0);
+        assert_eq!(markers(&next.messages), 0);
+        assert_alternating(&next.messages);
+    }
+
+    #[test]
+    fn omitted_turns_is_only_stored_when_there_are_some() {
+        let c = convo(turns(1, 10));
+        assert!(
+            serde_json::to_value(&c)
+                .unwrap()
+                .get("omitted_turns")
+                .is_none()
+        );
+        let old: Conversation = serde_json::from_str(OLD_PARKED_ON_A_QUESTION).unwrap();
+        assert_eq!(old.omitted_turns, 0);
+
+        let next = convo(turns(6, 1_000)).continued_within("next", RunId::new(), 1_200);
+        let stored = serde_json::to_value(&next).unwrap();
+        assert_eq!(stored["omitted_turns"], json!(next.omitted_turns));
+        assert_eq!(
+            serde_json::from_value::<Conversation>(stored).unwrap(),
+            next
+        );
     }
 
     #[test]
     fn the_default_cap_is_256_kib_of_json() {
         assert_eq!(MAX_CARRIED_BYTES, 262_144);
-        let prior = Conversation {
-            messages: turns(3, 100_000),
-            ..Conversation::default()
-        };
+        let prior = convo(turns(3, 100_000));
         assert!(total_len(&prior.messages) > MAX_CARRIED_BYTES);
         let next = prior.continued("next", RunId::new());
-        assert!(is_marker(&next.messages[0]));
-        assert_eq!(next.messages[1].text(), "task 1");
+        // Shortening the oldest outputs is enough: nothing is dropped, nothing marked.
+        assert_eq!(next.omitted_turns, 0);
+        assert_eq!(markers(&next.messages), 0);
+        assert_eq!(said(&next.messages), ["task 0", "task 1", "task 2", "next"]);
         assert!(total_len(&next.messages) <= MAX_CARRIED_BYTES);
+        assert!(shortened(&next.messages[2]));
+        assert!(!shortened(&next.messages[10]));
     }
 }

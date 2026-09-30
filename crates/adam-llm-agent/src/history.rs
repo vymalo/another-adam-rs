@@ -12,6 +12,30 @@ fn marker(removed: usize) -> String {
     )
 }
 
+/// `content` shortened by at least `excess` characters, keeping its head and ending in the
+/// truncation marker ([`TRUNCATION_MARKER_PREFIX`]); `None` when that would not make it shorter
+/// (it is already about as short as the marker, or already nothing but a marker, whose count of
+/// what was omitted is not to be overwritten by the marker's own length). Both [`fit_history`] and
+/// the history a continued run carries shorten tool outputs this way.
+pub(crate) fn shorten_output(content: &str, excess: usize) -> Option<String> {
+    if content
+        .strip_prefix('\n')
+        .is_some_and(|rest| rest.starts_with(TRUNCATION_MARKER_PREFIX))
+    {
+        return None;
+    }
+    let len = content.chars().count();
+    // The marker is at most this long for any smaller `removed`.
+    let marker_max = marker(len).chars().count();
+    if len <= marker_max {
+        return None;
+    }
+    let removed = len.min(excess.saturating_add(marker_max));
+    let mut shortened: String = content.chars().take(len - removed).collect();
+    shortened.push_str(&marker(removed));
+    Some(shortened)
+}
+
 /// Characters a message contributes to the estimate.
 fn message_chars(m: &Message) -> usize {
     match m {
@@ -79,15 +103,9 @@ pub(crate) fn fit_history(messages: &[Message], max_tokens: u32) -> Vec<Message>
             continue;
         };
         let len = content.chars().count();
-        // The marker is at most this long for any smaller `removed`.
-        let marker_max = marker(len).chars().count();
-        if len <= marker_max {
+        let Some(shortened) = shorten_output(content, total - budget) else {
             continue; // would not get shorter
-        }
-        let excess = total - budget;
-        let removed = len.min(excess + marker_max);
-        let mut shortened: String = content.chars().take(len - removed).collect();
-        shortened.push_str(&marker(removed));
+        };
         total = total - len + shortened.chars().count();
         *content = shortened;
     }
@@ -125,6 +143,21 @@ mod tests {
             call("c3"),
             big("c3", 4000, 'c'),
         ]
+    }
+
+    #[test]
+    fn shorten_output_keeps_the_head_removes_at_least_the_excess_and_never_grows() {
+        let text = "h".repeat(1_000);
+        let shorter = shorten_output(&text, 300).unwrap();
+        assert!(shorter.starts_with("hhh") && shorter.contains(TRUNCATION_MARKER_PREFIX));
+        assert!(shorter.chars().count() <= 1_000 - 300);
+        // More than it has to give: only the marker is left.
+        let floor = shorten_output(&text, 10_000).unwrap();
+        assert!(floor.starts_with('\n') && floor.contains(TRUNCATION_MARKER_PREFIX));
+        assert!(floor.chars().count() < 1_000);
+        // Already as short as a marker: not touched again.
+        assert_eq!(shorten_output("short", 3), None);
+        assert_eq!(shorten_output(&floor, 10), None);
     }
 
     #[test]
