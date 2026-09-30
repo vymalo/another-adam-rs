@@ -19,7 +19,7 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.build()` |
-| `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection) |
+| `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) |
 | `ToolOutput` | `text`, `error`, `with_artifact` |
@@ -33,7 +33,9 @@ instructions + a model + a toolset. It is served over A2A by
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
 | `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
 | `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
-| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads) |
+| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on (absent otherwise, and in state stored before it existed) |
+| `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
+| `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker message that stands in for the turns dropped to fit it |
 | `Tool::poll_remote`, `RemotePoll` | how a tool that returned `AwaitRemote` answers "how does the task stand": `Ready(ToolOutput)` or `Working`; the default refuses |
 | `DEFAULT_WAIT_POLL` | 60 s: how long a run waiting for a child sleeps before it reads the child itself |
 | `user_message(text)`, `MESSAGE_KIND` | build the `Inbound` that starts or continues a run |
@@ -84,6 +86,26 @@ With the `schema` feature, `spec_for::<Args>("name", "description")` derives `pa
 become descriptions and `Option<T>` fields are not required. The feature also enables schemars' `derive`, so
 `#[derive(JsonSchema)]` works for whoever depends on it, and it is what `#[tool(crate = ::adam_llm_agent)]`
 needs from a crate that does not use the `adam` facade.
+
+## Continuing a conversation
+
+When the runtime starts a run as the continuation of another (`Runtime::start_with_id_continuing`; over A2A,
+a new task whose message references a finished one), `LlmAgent::init_continuing` and
+`LlmStarter::init_continuing` (both `Conversation::continued`, so a front and a worker cannot disagree) give it
+the conversation of the run before:
+
+| | |
+|---|---|
+| **Carried** | the history, oldest first, and the user messages that were waiting behind an owed tool result (`deferred`), in arrival order; then the new user message |
+| **Dropped** | a last assistant message whose tool calls did not all get a result, with the results that did arrive: a run that ended mid-turn (a limit, a cancel, a question nobody answered) leaves one, and a provider rejects a call without a result. So `pending_calls` and `pending_wait` are always empty: a continued run never answers a question or a child run of the run before. The side effects of the dropped calls are not undone |
+| **Reset** | `turns`, `tool_calls`, `usage` (`Limits` are per run) and `artifacts` (the final output lists what this run produced) |
+| **Recorded** | `continued_from: Option<RunId>`, not written while `None` |
+| **Bounded** | over `MAX_CARRIED_BYTES` (256 KiB of JSON, roughly what `max_history_tokens` lets through), the oldest **whole turns** (a user message and what follows it up to the next) are dropped and one user message starting with `OMITTED_MARKER_PREFIX` stands in for them. The newest turn is always kept, even when it alone is over the cap. A rule that reads what the user said should skip the marker |
+
+`max_history_tokens` still shortens old tool output in what is sent to the model (`src/history.rs`); the cap is
+about what is stored and carried. **An agent that wraps an `LlmAgent` and delegates `init` must delegate
+`init_continuing` too.** The decision is
+[ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md).
 
 ## Child runs
 
@@ -193,6 +215,12 @@ set): polling on the moved clock until `Ready` with one start, a new process tha
 a failed result, permanent and transient poll errors, the timeout, a tool that cannot be polled, and a user
 message queueing behind the result. The shapes of `AwaitRemote` and of the wait are literals in `src/tool.rs`
 and `src/conversation.rs`.
+
+The continuation is tested in `src/conversation.rs` (what is carried, dropped and reset; the cap on small
+caps, never stacking markers, the newest turn kept whole; state stored before `continued_from` existed
+still loads) and in `tests/llm_agent.rs` (`a_starter_continues_exactly_like_the_agent`, a new run whose model
+is shown the earlier messages, a front that holds only the starter, a run cancelled on a question that is
+continued without the stale wait, the 256 KiB cap).
 
 `tests/llm_agent.rs` is a behavioural suite over a scripted `MockModel` and
 `MemoryStore` (`a_starter_inits_exactly_like_the_agent`, tool loop, retries and rate limits, limits, replay after a

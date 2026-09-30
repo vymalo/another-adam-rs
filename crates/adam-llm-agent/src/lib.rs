@@ -113,10 +113,20 @@
 //! parked on a [`ToolError::NeedsInput`] question, the first message is that
 //! tool call's answer.
 //!
+//! # Continuing a conversation
+//!
+//! A run that the runtime starts as the continuation of another
+//! (`Runtime::start_with_id_continuing`; over A2A, a new task that references the one before it)
+//! starts from that run's conversation: [`LlmAgent`] and [`LlmStarter`] implement
+//! `init_continuing` with [`Conversation::continued`]. The history and the new user message are
+//! carried, a tool call that never got its result and the wait it was parked on are dropped, the
+//! per-run counters start again, and the history is bounded by [`MAX_CARRIED_BYTES`].
+//!
 //! # Observing a run
 //!
 //! `Runtime::view(run).state` deserializes into [`Conversation`]: the full
-//! history, counters, and `pending_wait` while the run waits for input or for a child run.
+//! history, counters, `continued_from` for a run that carries on another, and `pending_wait` while
+//! the run waits for input or for a child run.
 //! Live progress arrives as `RunEvent`s; see [`LlmAgent`] for their shapes.
 
 #![warn(missing_docs)]
@@ -139,8 +149,8 @@ mod typed;
 pub use adam_runtime::Artifact;
 pub use agent::{BuildError, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter};
 pub use conversation::{
-    ArtifactRef, Conversation, MESSAGE_KIND, PendingQuestion, PendingRemote, PendingRun,
-    PendingWait, user_message,
+    ArtifactRef, Conversation, MAX_CARRIED_BYTES, MESSAGE_KIND, OMITTED_MARKER_PREFIX,
+    PendingQuestion, PendingRemote, PendingRun, PendingWait, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]

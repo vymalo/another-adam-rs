@@ -622,7 +622,9 @@ place each:
   enum, "already loaded", files still readable), a subagent with its own selection, and the embedded
   fixture against the same files read from disk giving equal `AgentInfo`s and equal tool results.
 * `tests/dev.rs` (feature `dev`): a temp directory is edited while a run is parked on a question, and the
-  model request of the run's next step carries the new prompt (memory and PostgreSQL); an unchanged file
+  model request of the run's next step carries the new prompt (memory and PostgreSQL); a run started as the
+  continuation of a finished one (`Runtime::start_with_id_continuing`) carries its conversation through the
+  stable agent a reload registers, which forwards `init_continuing` as it forwards `init`; an unchanged file
   swaps and reports no change; an invalid edit keeps the old version (the run's next step still has the old
   prompt), the loader's diagnostic is in `last_error()` and in the captured log, a bind error is refused
   the same way, and the fix applies and clears the error; a bad first load and a missing directory are

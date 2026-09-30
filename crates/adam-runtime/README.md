@@ -18,12 +18,12 @@ over A2A).
 
 | Item | What |
 |---|---|
-| `Agent` (trait) | `name`, `init(Inbound) -> State`, `async step(&mut Ctx, State) -> Transition<State>` |
-| `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, no `step`; `State` is only `Serialize`. See *Starting without stepping* |
+| `Agent` (trait) | `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`; see *Continuing another run*), `async step(&mut Ctx, State) -> Transition<State>` |
+| `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is. See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children, and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
-| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
+| `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`) |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
@@ -59,7 +59,7 @@ that only accepts requests (an A2A front) registers an `AgentStarter` with
 `Agent` under the same name and steps what the front started, over the same
 store.
 
-* `start` and `start_with_id` work for both kinds of registration, and an
+* `start`, `start_with_id` and their continuing variants work for both kinds of registration, and an
   unknown name is still `UnknownAgent`.
 * `run_worker` claims only the names registered with `.agent(..)`. A runtime
   with starters only warns once and claims nothing, so a run of a
@@ -79,6 +79,34 @@ let runtime = Runtime::builder(store)   // store: adam_core::DynStore
 let run = runtime.start("my-agent", inbound, None).await?;
 // a worker process: Runtime::builder(store).agent(MyAgent)...run_worker(..)
 ```
+
+## Continuing another run
+
+A new task in a conversation that already finished one should remember it. The runtime does not know
+what of an agent's state is worth carrying, so the agent decides:
+
+* `Agent::init_continuing(input, prior, prior_run)` and `AgentStarter::init_continuing(..)` return the
+  first state of a run that continues run `prior_run`, whose last committed state is `prior`. The default
+  ignores both and returns `init(input)`, so an agent that does not override it is unchanged. **A wrapper
+  that delegates `init` to another agent must delegate `init_continuing` too**, or the continuation stops
+  at the wrapper.
+* `Runtime::start_with_id_continuing(run, agent, input, conversation, prior)` is `start_with_id` for such
+  a run (idempotent: `true` if created, `false` if `run` already existed), and
+  `Runtime::start_continuing(agent, input, conversation, prior)` is `start` for one (it delivers to the
+  conversation's open run if there is one, and then does not read `prior`). The prior state is read with
+  `Store::load_run` (so every store works, and no store method was added) and decoded as the registered
+  `State`, which is why a front process that registered only the `AgentStarter` can do it.
+* **Checked:** `prior` exists (`RuntimeError::NotFound`) and is a run of `agent` (`Invalid`, so its state
+  is this agent's). **Not checked:** whether the caller may continue it (same owner, same conversation):
+  the runtime has no owners, and `adam-a2a-runtime` checks that before it calls. Its status does not
+  matter; an agent that continues an unfinished run copes with a half-done turn.
+* A `prior` state that does not decode as the agent's state is not an error: the run starts as `init`
+  says, and a warning says so (the decoder's kind of error, never its text, which can quote the
+  conversation).
+
+The A2A side of this (`referenceTaskIds`) is in
+[`adam-a2a-runtime`](../adam-a2a-runtime/README.md), and the decision in
+[ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md).
 
 ## Child runs
 
@@ -204,17 +232,22 @@ No Cargo features, no environment variables at runtime.
 ## Tests
 
 `tests/runtime.rs` is one behavioural suite (including
-`a_starter_only_runtime_starts_and_a_full_runtime_steps`, the pair
+`a_starter_only_runtime_starts_and_a_full_runtime_steps`, the continuation cases
+(`a_run_continues_a_finished_run_from_a_start_only_front`,
+`continuing_checks_the_prior_run_and_creates_nothing_when_it_refuses`,
+`a_prior_state_that_does_not_decode_starts_the_run_fresh`,
+`an_agent_without_an_override_starts_fresh_when_asked_to_continue`,
+`start_continuing_delivers_to_an_open_run_and_otherwise_continues`), the pair
 `pinned_workers_step_a_run_only_on_its_owner` (three workers, each first seeded alone with one
 unfinished run so all three own something, then twelve six-step runs stepped together: each run
 steps on one worker only) and its control
 `any_workers_let_a_run_move_between_workers` (a run seeded by one worker is finished by another), and the two
 `notifier_*` cases: two runtimes over one store and one `LocalNotifier`, a 30 s poll, a 5 s deadline, and the child-run cases: `a_finished_child_wakes_its_parent_once`, `a_lost_notice_is_recovered_by_the_timer`, `a_parent_that_loses_its_lease_does_not_start_or_resume_twice` and the rest, which use gates, a `ManualClock` and `FaultyStore::fail_run` and never sleep for a fixed time) run against `MemoryStore` always,
 against PostgreSQL and against MongoDB when their variables are set. Unit
-tests sit in `src/cancel.rs`, `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs`, `events.rs`, `notify.rs` and `retry.rs`, and the
+tests sit in `src/cancel.rs`, `erased.rs` (an override reaches an agent and a starter, the default is `init`, a prior state that does not decode falls back to `init`), `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs`, `events.rs`, `notify.rs` and `retry.rs`, and the
 class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
 (`class_table`, `from_classified_maps_retryable_to_transient_and_keeps_the_hint`,
-`a_message_never_repeats_its_source`) and `src/runtime.rs` (`error_tests`).
+`a_message_never_repeats_its_source`, `the_default_continuation_is_init_and_ignores_the_prior_state`) and `src/runtime.rs` (`error_tests`).
 
 | Variable | Meaning |
 |---|---|

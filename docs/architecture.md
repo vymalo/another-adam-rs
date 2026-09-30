@@ -340,12 +340,14 @@ classDiagram
             <<interface>>
             name()
             init()
+            init_continuing()
             step()
         }
         class AgentStarter {
             <<interface>>
             name()
             init()
+            init_continuing()
         }
         class EventSink {
             <<interface>>
@@ -435,7 +437,7 @@ reads shared dependencies with `ToolCtx::state::<T>()` (given to the agent with
 `LlmAgentBuilder::try_build` fails at startup when one is missing; `parse_args`,
 `IntoToolOutput`, `ToolSet` and, with the `schema` feature, `spec_for` remove the boilerplate
 (see the [crate README](../crates/adam-llm-agent/README.md)). `AgentStarter` is the start-only half
-of `Agent` (`name` and `init`, no `step`): a process that only accepts requests registers
+of `Agent` (`name`, `init` and `init_continuing`, no `step`): a process that only accepts requests registers
 a starter (`LlmStarter`, `CoderStarter`) and never holds the agent's model or credentials.
 
 The boundaries, by what they swap:
@@ -922,7 +924,7 @@ makes (`runtime.rs` and `worker.rs`).
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Runnable: start, start_with_id or start_child, version 1
+    [*] --> Runnable: start, start_with_id, start_child or a continuing start, version 1
 
     Runnable --> Runnable: Continue, next turn
     Runnable --> Runnable: transient error with tries left, wake_at is now plus max of backoff and retry_after

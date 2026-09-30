@@ -966,6 +966,21 @@ impl Agent for LiveAgent {
         }
     }
 
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &Conversation,
+        prior_run: RunId,
+    ) -> Result<Conversation, AgentError> {
+        match self.agent_for_start() {
+            Some(agent) => agent.init_continuing(input, prior, prior_run),
+            None => Err(AgentError::permanent(format!(
+                "agent `{}` is not loaded",
+                self.name
+            ))),
+        }
+    }
+
     async fn step(
         &self,
         ctx: &mut Ctx,
