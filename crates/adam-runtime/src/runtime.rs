@@ -27,7 +27,7 @@ pub(crate) const MAX_COMMIT_RETRIES: usize = 16;
 
 /// Why a [`Runtime`] call failed.
 ///
-/// Decide from [`Classify::class`]: `UnknownAgent` is `Invalid`, `NotFound` is `NotFound`,
+/// Decide from [`Classify::class`]: `UnknownAgent` and `WrongAgent` are `Invalid`, `NotFound` is `NotFound`,
 /// `Finished` and `ConversationBusy` are `Rejected`, `Corrupt` is `Corrupt`, `Contended` is
 /// `Conflict`, and `Agent` and `Store` carry the class of the error they wrap.
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +39,16 @@ pub enum RuntimeError {
     /// The run does not exist.
     #[error("run {0} not found")]
     NotFound(RunId),
+    /// A run was named as the one to continue for an agent it does not belong to, so its state is
+    /// not that agent's to read ([`Runtime::start_with_id_continuing`]). The text names the run,
+    /// which the caller chose to name; `adam-a2a-runtime` never puts it in front of a client.
+    #[error("run {run} is not a run of agent {agent:?}")]
+    WrongAgent {
+        /// The run that was named.
+        run: RunId,
+        /// The agent it was named for.
+        agent: String,
+    },
     /// The run already finished, so it cannot take more input.
     #[error("run {run} is already {status}")]
     Finished {
@@ -81,7 +91,7 @@ pub enum RuntimeError {
 impl Classify for RuntimeError {
     fn class(&self) -> ErrorClass {
         match self {
-            Self::UnknownAgent(_) => ErrorClass::Invalid,
+            Self::UnknownAgent(_) | Self::WrongAgent { .. } => ErrorClass::Invalid,
             Self::NotFound(_) => ErrorClass::NotFound,
             Self::Finished { .. } | Self::ConversationBusy { .. } => ErrorClass::Rejected,
             Self::Corrupt { .. } => ErrorClass::Corrupt,
@@ -685,12 +695,12 @@ impl Runtime {
     /// The new run is an ordinary run: its own id, journal, limits and conversation. Nothing links
     /// the two beyond the state the agent chose to carry. Idempotent like `start_with_id`:
     /// `true` if this call created the run, `false` if a run with `run_id` already existed (then
-    /// `input` is ignored, and so is whether `prior` still exists).
+    /// `input` is ignored, and `prior` is neither read nor checked: it may be gone, or wrong).
     ///
     /// # What the runtime checks, and what it leaves to the caller
     ///
     /// * `prior` must exist ([`RuntimeError::NotFound`]) and be a run of `agent`, so that its state
-    ///   is this agent's and not another's (an `Invalid` error otherwise). Its status does not
+    ///   is this agent's and not another's ([`RuntimeError::WrongAgent`], class `Invalid`). Its status does not
     ///   matter: the state is whatever its last commit holds, and an agent that continues from an
     ///   unfinished run must cope with a half-done turn (`LlmAgent` drops a tool call that never
     ///   got its result).
@@ -711,17 +721,14 @@ impl Runtime {
         prior: RunId,
     ) -> Result<bool, RuntimeError> {
         let registered = self.registered(agent)?;
-        let state = match self.prior_state(agent, prior).await {
-            Ok(state) => state,
-            // A repeat of a request whose first attempt already started the run, after the prior
-            // was purged: the run exists, so the answer is the one `start_with_id` gives.
-            Err(RuntimeError::NotFound(_))
-                if self.inner.store.load_run(run_id).await?.is_some() =>
-            {
-                return Ok(false);
-            }
-            Err(e) => return Err(e),
-        };
+        // A repeat of a request whose first attempt already started the run answers as
+        // `start_with_id` does, before anything is read or initialised for it: the prior may be
+        // purged by now, and `init_continuing` may be costly. (A race with a first attempt that
+        // has not committed yet is settled by `create_run` below.)
+        if self.inner.store.load_run(run_id).await?.is_some() {
+            return Ok(false);
+        }
+        let state = self.prior_state(agent, prior).await?;
         let new = self.new_run(
             registered.starter(),
             input,
@@ -825,9 +832,10 @@ impl Runtime {
             .ok_or(RuntimeError::NotFound(prior))?;
         if rec.agent != agent {
             // The caller named a run of another agent, whose state is not this agent's to read.
-            return Err(RuntimeError::Agent(AgentError::permanent(format!(
-                "run {prior} is not a run of agent {agent:?}"
-            ))));
+            return Err(RuntimeError::WrongAgent {
+                run: prior,
+                agent: agent.to_owned(),
+            });
         }
         Ok(Envelope::decode(prior, &rec.state)?.agent)
     }
@@ -941,6 +949,7 @@ mod error_tests {
     fn expected(e: &RuntimeError) -> ErrorClass {
         match e {
             RuntimeError::UnknownAgent(_) => ErrorClass::Invalid,
+            RuntimeError::WrongAgent { .. } => ErrorClass::Invalid,
             RuntimeError::NotFound(_) => ErrorClass::NotFound,
             RuntimeError::Finished { .. } => ErrorClass::Rejected,
             RuntimeError::ConversationBusy { .. } => ErrorClass::Rejected,
@@ -956,6 +965,10 @@ mod error_tests {
         let run = RunId::new();
         let samples = [
             RuntimeError::UnknownAgent("x".into()),
+            RuntimeError::WrongAgent {
+                run,
+                agent: "x".into(),
+            },
             RuntimeError::NotFound(run),
             RuntimeError::Finished {
                 run,
@@ -990,10 +1003,10 @@ mod error_tests {
         assert_eq!(
             retryable,
             [
-                false, false, false, false, false, true, false, true, true, true, false
+                false, false, false, false, false, false, true, false, true, true, true, false
             ]
         );
-        assert_eq!(samples[7].retry_after(), Some(Duration::from_secs(3)));
+        assert_eq!(samples[8].retry_after(), Some(Duration::from_secs(3)));
     }
 
     #[test]

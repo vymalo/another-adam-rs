@@ -19,7 +19,7 @@ over A2A).
 | Item | What |
 |---|---|
 | `Agent` (trait) | `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`; see *Continuing another run*), `async step(&mut Ctx, State) -> Transition<State>` |
-| `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is. See *Starting without stepping* |
+| `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is (new: a starter whose state was only `Serialize` must derive `Deserialize` too, because it reads the prior state). See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
 | `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children, and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
@@ -91,13 +91,15 @@ what of an agent's state is worth carrying, so the agent decides:
   that delegates `init` to another agent must delegate `init_continuing` too**, or the continuation stops
   at the wrapper.
 * `Runtime::start_with_id_continuing(run, agent, input, conversation, prior)` is `start_with_id` for such
-  a run (idempotent: `true` if created, `false` if `run` already existed), and
+  a run (idempotent: `true` if created, `false` if `run` already existed, which it finds out **first**, before
+  the prior is read or `init_continuing` runs, so a repeat works when the prior is gone), and
   `Runtime::start_continuing(agent, input, conversation, prior)` is `start` for one (it delivers to the
   conversation's open run if there is one, and then does not read `prior`). The prior state is read with
   `Store::load_run` (so every store works, and no store method was added) and decoded as the registered
   `State`, which is why a front process that registered only the `AgentStarter` can do it.
-* **Checked:** `prior` exists (`RuntimeError::NotFound`) and is a run of `agent` (`Invalid`, so its state
-  is this agent's). **Not checked:** whether the caller may continue it (same owner, same conversation):
+* **Checked:** `prior` exists (`RuntimeError::NotFound`) and is a run of `agent` (`RuntimeError::WrongAgent`,
+  class `Invalid`, so its state is this agent's; its text names the run, and `adam-a2a-runtime` never shows it
+  to a client). **Not checked:** whether the caller may continue it (same owner, same conversation):
   the runtime has no owners, and `adam-a2a-runtime` checks that before it calls. Its status does not
   matter; an agent that continues an unfinished run copes with a half-done turn.
 * A `prior` state that does not decode as the agent's state is not an error: the run starts as `init`
@@ -207,7 +209,7 @@ decides from the class (see [`adam-error`](../adam-error/README.md)).
 
 | `RuntimeError` | Class |
 |---|---|
-| `UnknownAgent` | `Invalid` |
+| `UnknownAgent`, `WrongAgent { run, agent }` | `Invalid` |
 | `NotFound` | `NotFound` |
 | `Finished`, `ConversationBusy` | `Rejected` |
 | `Corrupt { run, reason, source }` | `Corrupt` |
@@ -237,7 +239,8 @@ No Cargo features, no environment variables at runtime.
 `continuing_checks_the_prior_run_and_creates_nothing_when_it_refuses`,
 `a_prior_state_that_does_not_decode_starts_the_run_fresh`,
 `an_agent_without_an_override_starts_fresh_when_asked_to_continue`,
-`start_continuing_delivers_to_an_open_run_and_otherwise_continues`), the pair
+`start_continuing_delivers_to_an_open_run_and_otherwise_continues`; a repeat of a started run answers `false`
+even when its prior is wrong or gone), the pair
 `pinned_workers_step_a_run_only_on_its_owner` (three workers, each first seeded alone with one
 unfinished run so all three own something, then twelve six-step runs stepped together: each run
 steps on one worker only) and its control

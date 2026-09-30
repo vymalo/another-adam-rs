@@ -4186,6 +4186,10 @@ mod cases {
             .expect_err("another agent's run is not this agent's to continue");
         assert_eq!(wrong_agent.class(), adam_runtime::ErrorClass::Invalid);
         assert!(!wrong_agent.is_retryable());
+        assert!(
+            matches!(&wrong_agent, RuntimeError::WrongAgent { run, agent } if *run == foreign && *agent == name),
+            "{wrong_agent:?}"
+        );
         let unknown_agent = rt
             .start_with_id_continuing(id, "nobody", say("x"), None, foreign)
             .await;
@@ -4221,6 +4225,29 @@ mod cases {
             "{refused:?}"
         );
         assert!(store.load_run(id).await.unwrap().is_none());
+
+        // A repeat of a request that already started its run answers `false` before the prior is
+        // read or `init_continuing` runs: a prior that is wrong, or gone, changes nothing.
+        let started = RunId::new();
+        assert!(
+            rt.start_with_id_continuing(started, &name, say("two"), None, prior)
+                .await
+                .unwrap()
+        );
+        for other_prior in [foreign, ghost] {
+            assert!(
+                !rt.start_with_id_continuing(started, &name, say("two"), None, other_prior)
+                    .await
+                    .unwrap(),
+                "a repeat is recognised before the prior is looked at"
+            );
+        }
+        // Whereas a request that has not started anything is still refused for it.
+        assert!(matches!(
+            rt.start_with_id_continuing(RunId::new(), &name, say("x"), None, foreign)
+                .await,
+            Err(RuntimeError::WrongAgent { .. })
+        ));
     }
 
     /// A prior state the agent cannot decode (another shape under the same name) does not stop a
