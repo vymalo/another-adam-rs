@@ -727,7 +727,10 @@ database of its own, so the role needs `CREATEDB`):
   `referenceTaskIds` (the model of the second task is shown the first's conversation, `continued_from` says
   which run it continued, the repository of the first task is named in the second without being repeated;
   a repository only the model or an `untrusted` fence mentions, and a branch that was not pushed here, are
-  refused). The unit test `a_same_size_rewrite_within_the_index_tick_is_in_the_tree_id` in `src/tools/gitcli.rs`
+  refused; `a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes_are_gone` removes the notes
+  of the first run and shows the branch is still found from the two last lines of its `commit_and_push` result, and
+  `a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone` that the failed verdict says the
+  pull request was not updated). The unit test `a_same_size_rewrite_within_the_index_tick_is_in_the_tree_id` in `src/tools/gitcli.rs`
   pins the fix of a flaky `checks_then_commit_binds_a_passing_verdict_to_the_pushed_commit`: the copy of
   the index that the tree id is computed in keeps the index's mtime, or git trusts the stat data of a file
   rewritten with the same size in the same clock tick and the tree holds its old content.

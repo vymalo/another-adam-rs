@@ -15,7 +15,7 @@
 //!   that they are the work of the tool that commits, checks and reports them.
 //!
 //! A command the shell cannot find is reported as a missing toolchain, as for `run_checks` (see
-//! [`missing_tool`](super::shell::missing_tool)).
+//! [`missing_tool`]).
 
 use adam::prelude::*;
 

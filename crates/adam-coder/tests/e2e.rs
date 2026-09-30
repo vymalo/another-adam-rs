@@ -1212,6 +1212,73 @@ async fn a_second_task_continues_the_first_tasks_branch_and_pull_request(store: 
     );
 }
 
+/// The branch a continued task may carry on comes from the notes of the run it continues, and,
+/// when those are not at hand (another worker's volume), from the two last lines of the
+/// `commit_and_push` result in the carried history. Without either, it is refused.
+async fn a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes_are_gone(
+    store: DynStore,
+) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let mut first_message = user(&format!(
+        "In {} (base branch main), add hello.txt.",
+        fx.remote_url()
+    ));
+    first_message.context_id = Some("ctx-volume".into());
+    let first = run_message(&server, first_message).await;
+    assert_eq!(
+        first.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        first.labels
+    );
+    let branch = fx.agent_branches()[0].clone();
+
+    // The notes of the first run are not on this volume.
+    let notes = fx
+        .root
+        .join("coder")
+        .join(format!("{}.json", first.task_id));
+    assert!(notes.is_file(), "{}", notes.display());
+    std::fs::remove_file(&notes).unwrap();
+
+    mock.push_tool_calls(vec![call(
+        "f1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main", "branch": "agent/not-pushed-here"}),
+    )])
+    .push_tool_calls(vec![call(
+        "f2",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main", "branch": branch}),
+    )])
+    .push_text("Ready.");
+    let second = run_message(
+        &server,
+        follow_up("Carry on, please.", "ctx-volume", &first.task_id),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        second.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        second.labels
+    );
+    let results = tool_results(&mock.requests().last().unwrap().messages);
+    let by_id = |id: &str| results.iter().find(|(c, _, _)| c == id).unwrap().clone();
+    let (_, refused, is_error) = by_id("f1");
+    assert!(is_error && refused.contains("Refused"), "{refused}");
+    let (_, ready, is_error) = by_id("f2");
+    assert!(
+        !is_error && ready.contains("the branch an earlier task pushed"),
+        "read from the history: {ready}"
+    );
+}
+
 /// A rework whose checks never go green ends `failed`, says that the pull request of the branch it
 /// continued was **not updated** (and not that none was opened), and the branch, with its pull
 /// request, is exactly where the first task left it.
@@ -2820,6 +2887,7 @@ macro_rules! coder_suite {
                 a_second_task_continues_the_first_tasks_branch_and_pull_request,
                 a_continued_task_refuses_what_only_the_model_or_a_fence_mentions,
                 a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone,
+                a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes_are_gone,
             );
         }
     };
