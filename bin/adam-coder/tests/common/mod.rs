@@ -522,6 +522,58 @@ pub fn tool_reply(id: &str, name: &str, arguments: Value) -> Value {
     })
 }
 
+/// A reply of [`text_reply`] or [`tool_reply`] as the server-sent-events stream a request with
+/// `"stream": true` is answered with (the agent streams its model calls): a text in two deltas, a
+/// tool call whole, the finish chunk, the usage chunk and `[DONE]`.
+pub fn sse_of(reply: &Value) -> String {
+    let message = &reply["choices"][0]["message"];
+    let mut events = vec![
+        json!({"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]}),
+    ];
+    if let Some(text) = message["content"].as_str() {
+        let middle = text
+            .char_indices()
+            .nth(text.chars().count() / 2)
+            .map_or(text.len(), |(at, _)| at);
+        for piece in [&text[..middle], &text[middle..]] {
+            events.push(
+                json!({"choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": null}]}),
+            );
+        }
+    }
+    for (index, call) in message["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        events.push(json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": index, "id": call["id"], "type": "function", "function": call["function"]
+        }]}, "finish_reason": null}]}));
+    }
+    events.push(
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": reply["choices"][0]["finish_reason"]}]}),
+    );
+    events.push(json!({"choices": [], "usage": reply["usage"]}));
+    let mut body: String = events.iter().map(|e| format!("data: {e}\n\n")).collect();
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// The response to a chat-completions `request` that is answered with `reply`: the stream the
+/// request asks for with `"stream": true` (the agent streams its model calls), or JSON.
+pub fn chat_response(request: &wiremock::Request, reply: &Value) -> wiremock::ResponseTemplate {
+    let streaming =
+        serde_json::from_slice::<Value>(&request.body).is_ok_and(|b| b["stream"] == true);
+    if streaming {
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(sse_of(reply))
+    } else {
+        wiremock::ResponseTemplate::new(200).set_body_json(reply)
+    }
+}
+
 /// An OpenAI chat-completions reply that answers with text.
 pub fn text_reply(text: &str) -> Value {
     json!({

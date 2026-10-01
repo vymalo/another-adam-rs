@@ -160,7 +160,8 @@ async fn the_card_is_the_one_the_folder_declares() {
     assert_eq!(card.skills.len(), 1);
     assert_eq!(card.skills[0].id, "conversation");
     assert_eq!(card.skills[0].tags, ["chat"]);
-    // What it speaks, besides A2A: the screen's extensions, and steps for every tool call.
+    // What it speaks, besides A2A: the screen's extensions, steps for every tool call and the model's
+    // answer as it is written.
     let uris: Vec<&str> = card.extensions.iter().map(|e| e.uri.as_str()).collect();
     assert_eq!(
         uris,
@@ -169,6 +170,7 @@ async fn the_card_is_the_one_the_folder_declares() {
             adam_a2a::UI_CATALOG_EXTENSION,
             adam_a2a::THREAD_TOOLS_EXTENSION,
             adam_a2a::STEPS_EXTENSION,
+            adam_a2a::TEXT_STREAM_EXTENSION,
         ]
     );
 

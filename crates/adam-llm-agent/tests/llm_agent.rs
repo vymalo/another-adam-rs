@@ -145,12 +145,21 @@ impl Harness {
         .build()
     }
 
-    /// Events of a run without the runtime's own status events.
+    /// Events of a run without the runtime's own status events, and without the pieces of streamed
+    /// text and the id of the stream in `agent_text` (random, and the subject of `tests/streaming.rs`).
     fn events(&self, run: RunId) -> Vec<RunEvent> {
         self.sink
             .events_for(run)
             .into_iter()
-            .filter(|e| !matches!(e, RunEvent::Status { .. }))
+            .filter(|e| !matches!(e, RunEvent::Status { .. } | RunEvent::TextDelta { .. }))
+            .map(|mut e| {
+                if let RunEvent::Custom { payload, .. } = &mut e
+                    && let Some(fields) = payload.as_object_mut()
+                {
+                    fields.remove("stream");
+                }
+                e
+            })
             .collect()
     }
 }
@@ -213,6 +222,16 @@ async fn wait_failed(rt: &Runtime, run: RunId) -> RunView {
 
 async fn wait_waiting(rt: &Runtime, run: RunId) -> RunView {
     wait_for(rt, run, "parked and waiting", |v| v.waiting).await
+}
+
+/// A run's output without the id of the stream its answer was sent as (random; `tests/streaming.rs`
+/// is about it).
+fn output_of(view: &RunView) -> Option<Value> {
+    let mut output = view.output.clone();
+    if let Some(Value::Object(fields)) = &mut output {
+        fields.remove("stream");
+    }
+    output
 }
 
 fn conversation(view: &RunView) -> Conversation {
@@ -293,7 +312,7 @@ async fn model_calls_tool_a_then_b_then_answers() {
     worker.stop().await;
 
     assert_eq!(
-        view.output,
+        output_of(&view),
         Some(json!({"text": "all done", "artifacts": []}))
     );
     assert_eq!(a_calls.load(SeqCst), 1);
@@ -550,7 +569,7 @@ async fn artifacts_progress_and_context_reach_observers() {
         }]
     );
     assert_eq!(
-        view.output,
+        output_of(&view),
         Some(json!({
             "text": "here you go",
             "artifacts": [{"name": "report.md", "mime_type": "text/markdown"}]
@@ -678,7 +697,7 @@ async fn transient_model_error_retries_then_succeeds() {
     worker.stop().await;
 
     assert_eq!(
-        view.output,
+        output_of(&view),
         Some(json!({"text": "recovered", "artifacts": []}))
     );
     assert_eq!(h.mock.requests().len(), 3);
@@ -765,7 +784,7 @@ async fn rate_limited_model_waits_for_retry_after_then_succeeds() {
     let view = wait_done(&rt, run).await;
     worker.stop().await;
     assert_eq!(
-        view.output,
+        output_of(&view),
         Some(json!({"text": "through", "artifacts": []}))
     );
     assert_eq!(h.mock.requests().len(), 2);
@@ -849,11 +868,11 @@ async fn length_finish_without_tools_is_done_and_marked_truncated() {
     worker.stop().await;
 
     assert_eq!(
-        cut.output,
+        output_of(&cut),
         Some(json!({"text": "the answer was cut o", "artifacts": [], "truncated": true}))
     );
     assert_eq!(
-        whole.output,
+        output_of(&whole),
         Some(json!({"text": "a complete answer", "artifacts": []})),
         "a normal stop is not marked"
     );
@@ -1036,6 +1055,7 @@ async fn needs_input_parks_and_the_answer_becomes_the_tool_result() {
             tool: "ask".into(),
             question: "which environment?".into(),
             ui: None,
+            stream: None,
         }))
     );
     assert_eq!(
@@ -1359,21 +1379,30 @@ struct HangingModel {
     reached: Arc<Notify>,
 }
 
-#[async_trait]
-impl ModelClient for HangingModel {
-    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+impl HangingModel {
+    /// Hangs the call this model was told to hang, for ever.
+    async fn hang(&self) {
         let n = self.calls.fetch_add(1, SeqCst);
         if n == self.hang_on && self.armed.swap(false, SeqCst) {
             self.reached.notify_one();
             std::future::pending::<()>().await;
         }
+    }
+}
+
+#[async_trait]
+impl ModelClient for HangingModel {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.hang().await;
         self.inner.complete(req).await
     }
 
+    // The agent streams its model calls: the hang is there too.
     async fn stream(
         &self,
         req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        self.hang().await;
         self.inner.stream(req).await
     }
 }
@@ -1422,7 +1451,7 @@ async fn crash_between_a_tool_and_the_next_model_call_does_not_repeat_the_tool()
 
     assert_eq!(a_calls.load(SeqCst), 1, "the tool must not run again");
     assert_eq!(
-        view.output,
+        output_of(&view),
         Some(json!({"text": "finished", "artifacts": []}))
     );
     let messages = conversation(&view).messages;
@@ -1669,7 +1698,7 @@ async fn a_new_run_continues_a_finished_one_and_the_model_sees_the_earlier_messa
         Some(&Message::assistant_text("answer two"))
     );
     assert_eq!(
-        view.output,
+        output_of(&view),
         Some(json!({"text": "answer two", "artifacts": []}))
     );
     // The first run is as it was.

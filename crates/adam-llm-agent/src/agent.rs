@@ -11,8 +11,8 @@ use adam_model::{
     ToolSpec,
 };
 use adam_runtime::{
-    Agent, AgentError, AgentStarter, ChildStatus, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent,
-    StepState, Transition,
+    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, ChildStatus, Ctx, Inbound, RUN_FINISHED_KIND,
+    RunEvent, StepState, Transition,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -26,6 +26,7 @@ use crate::conversation::{
 use crate::history::fit_history;
 use crate::source::{DynToolSource, SourceCtx, ToolSource, offered};
 use crate::state::Extensions;
+use crate::text_stream;
 use crate::tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use crate::toolset::ToolSet;
 
@@ -92,6 +93,29 @@ impl From<ModelError> for ModelFailure {
     }
 }
 
+/// A model call as the journal records it: the response, and the stream its words were sent as, if
+/// they were (see [`LlmAgentBuilder::stream_text`]).
+///
+/// The response's own members are written at the top level, as a journal written before streaming
+/// existed holds them (a bare [`ModelResponse`]), which therefore decodes as one with no stream.
+#[derive(Debug, Serialize, Deserialize)]
+struct Recorded {
+    #[serde(flatten)]
+    response: ModelResponse,
+    /// Absent when the words were not streamed, and in journals written before they could be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream: Option<String>,
+}
+
+/// The id of the stream of the words of turn `turn` of `run`: unique within the task, because the
+/// run and the turn are, and because a retry of the turn (the failed try's journal is abandoned and
+/// the step runs again) is another stream, which the suffix tells from the one that was abandoned.
+fn stream_id(run: RunId, turn: u32) -> String {
+    let mut suffix = uuid::Uuid::new_v4().simple().to_string();
+    suffix.truncate(8);
+    format!("{run}-m{turn}-{suffix}")
+}
+
 /// Configures an [`LlmAgent`]. Start with [`LlmAgent::builder`].
 pub struct LlmAgentBuilder {
     name: String,
@@ -103,6 +127,7 @@ pub struct LlmAgentBuilder {
     limits: Limits,
     extensions: Extensions,
     wait_poll: Duration,
+    stream_text: bool,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -206,6 +231,19 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// Whether a model turn is asked for as a stream (the default) and its words are sent as they are
+    /// written ([`RunEvent::TextDelta`]), or as one answer ([`ModelClient::complete`](adam_model::ModelClient::complete))
+    /// that is told when it is whole, as it was before.
+    ///
+    /// Streaming changes what observers see, not what the run does: the turn is still one journaled
+    /// step and the answer is the assembled response, so the history, the tools and the outcome are
+    /// the same. A client of the model that cannot stream, or a provider that answers a stream
+    /// request with an error, is a reason to turn it off. See "Streamed text" on [`LlmAgent`].
+    pub fn stream_text(mut self, on: bool) -> Self {
+        self.stream_text = on;
+        self
+    }
+
     /// Build the agent, or say what is wrong with how it was put together:
     /// a tool whose [`Tool::required_state`] was not registered with
     /// [`state`](Self::state), or two tools with one name.
@@ -294,6 +332,7 @@ impl LlmAgentBuilder {
             limits: self.limits,
             extensions: Arc::new(self.extensions),
             wait_poll: self.wait_poll,
+            stream_text: self.stream_text,
         }
     }
 }
@@ -323,7 +362,11 @@ impl LlmAgentBuilder {
 /// # Events
 ///
 /// All best effort, through `Ctx::emit`:
-/// * `Custom { kind: "agent_text", payload: {text, turn} }` for each model turn with text;
+/// * `TextDelta` while a model turn that streams ([`LlmAgentBuilder::stream_text`], on by default) writes: the
+///   pieces of its words, in a stream whose id is made inside the journaled step and recorded with the answer
+///   (see "Streamed text" below);
+/// * `Custom { kind: "agent_text", payload: {text, turn} }` for each model turn with text, with `stream` (the
+///   id of the stream the words were sent as) for a turn that goes on to call tools;
 /// * `Step` for each tool call: a [`StepEvent`](adam_runtime::StepEvent) with the id `tool:<call id>`, the
 ///   kind, label and icon of [`Tool::step_style`] (the tool's name by default), `running` before
 ///   the tool runs and, after it, `completed` (a result), `failed` (an error result, or a failure
@@ -343,6 +386,19 @@ impl LlmAgentBuilder {
 /// `Step` replaces the `Custom` events `tool_start` and `tool_end` that earlier versions emitted
 /// (`tool_end`'s `status` words: `ok` is `completed`, `error` and `transient_error` are `failed`,
 /// `needs_input` and `waiting` are `waiting`), and `Progress` from `emit_progress`.
+///
+/// # Streamed text
+///
+/// A model turn is asked for as a stream ([`ModelClient::stream`](adam_model::ModelClient::stream)) unless
+/// [`LlmAgentBuilder::stream_text`] says otherwise, and what the model writes is sent as it arrives
+/// ([`RunEvent::TextDelta`]): a piece when 200 bytes have gathered or 100 ms have passed since the last, at most
+/// [`MAX_TEXT_DELTA_BYTES`](adam_runtime::MAX_TEXT_DELTA_BYTES) at a time, in a stream that opens on the first word
+/// that is not blank and ends with a piece marked `last` (`abandoned` when the model failed). The turn is still one
+/// journaled step whose outcome is the assembled response, recorded with the stream's id (a journal written before
+/// reads as one with no stream): a replay calls no model and sends no piece, but names the same stream, and a
+/// failure, in the middle of the answer too, is the same failure as a failed
+/// [`complete`](adam_model::ModelClient::complete). The answer that ends the run names its stream in the run's output
+/// (`stream`), as `agent_text` does for the words before a tool call.
 ///
 /// # Child runs
 ///
@@ -398,6 +454,7 @@ pub struct LlmAgent {
     limits: Limits,
     extensions: Arc<Extensions>,
     wait_poll: Duration,
+    stream_text: bool,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -450,6 +507,7 @@ impl LlmAgent {
             limits: Limits::default(),
             extensions: Extensions::new(),
             wait_poll: DEFAULT_WAIT_POLL,
+            stream_text: true,
         }
     }
 
@@ -603,8 +661,12 @@ impl LlmAgent {
                 Arc::new(state.context.clone()),
             )
         });
-        let recorded: Result<ModelResponse, ModelFailure> = ctx
-            .step(&format!("model:{}", state.turns), move || async move {
+        let turn = state.turns;
+        let run = ctx.run_id();
+        let emitter = ctx.emitter();
+        let stream_text = self.stream_text;
+        let recorded: Result<Recorded, ModelFailure> = ctx
+            .step(&format!("model:{turn}"), move || async move {
                 // The sources are read here, inside the step, so that a replay of a turn whose model
                 // call is recorded does not read them again: only the answer is journaled, not the
                 // tools it was given.
@@ -612,11 +674,30 @@ impl LlmAgent {
                     let more = offered(&sources, source_ctx, &request.tools).await;
                     request.tools.extend(more);
                 }
-                model.complete(request).await.map_err(ModelFailure::from)
+                if !stream_text {
+                    return model
+                        .complete(request)
+                        .await
+                        .map(|response| Recorded {
+                            response,
+                            stream: None,
+                        })
+                        .map_err(ModelFailure::from);
+                }
+                // The words go out while they are written, under an id made here, inside the step, and
+                // recorded with the answer: a replay calls no model and sends no pieces, but it knows
+                // which stream the words were, so it says them whole under the same id.
+                text_stream::stream_response(&model, request, &emitter, || stream_id(run, turn))
+                    .await
+                    .map(|streamed| Recorded {
+                        response: streamed.response,
+                        stream: streamed.stream,
+                    })
+                    .map_err(ModelFailure::from)
             })
             .await?;
-        let response = match recorded {
-            Ok(response) => response,
+        let (response, stream) = match recorded {
+            Ok(Recorded { response, stream }) => (response, stream),
             // A recorded error is replayed forever on crash-replay, but a
             // transient retry starts at a fresh seq, so it calls again.
             Err(f) if f.retryable => {
@@ -646,18 +727,26 @@ impl LlmAgent {
             .usage
             .output_tokens
             .saturating_add(usage.output_tokens);
-        let turn = state.turns;
         state.turns += 1;
 
         let text = message.text();
+        let calls: Vec<ToolCall> = message.tool_calls().to_vec();
         if !text.is_empty() {
+            let mut payload = json!({ "text": text, "turn": turn });
+            // The words before a tool call are said whole, under the stream they were sent as, because
+            // nothing else will say them: the turn goes on to its tools. The answer that ends the run
+            // is said by the run itself, whose output names its stream (below).
+            if !calls.is_empty()
+                && let Some(stream) = &stream
+            {
+                payload["stream"] = json!(stream);
+            }
             ctx.emit(RunEvent::Custom {
-                kind: "agent_text".into(),
-                payload: json!({ "text": text, "turn": turn }),
+                kind: AGENT_TEXT_KIND.into(),
+                payload,
             })
             .await;
         }
-        let calls: Vec<ToolCall> = message.tool_calls().to_vec();
         state.messages.push(message);
 
         if calls.is_empty() {
@@ -667,6 +756,11 @@ impl LlmAgent {
             });
             if finish == FinishReason::Length {
                 output["truncated"] = json!(true);
+            }
+            // The answer was streamed: its stream is its id, so whoever read the pieces knows this text
+            // for what it is.
+            if let Some(stream) = stream {
+                output["stream"] = json!(stream);
             }
             return Ok(Flow::Done(output));
         }
@@ -707,6 +801,7 @@ impl LlmAgent {
                         tool: call.name.clone(),
                         question,
                         ui,
+                        stream: None,
                     }));
                     return Ok(Flow::Park);
                 }
@@ -1319,6 +1414,49 @@ mod failure_tests {
         let auth = ModelFailure::from(ModelError::Auth("bad key".into()));
         assert!(!auth.retryable);
         assert_eq!(auth.class.as_deref(), Some("Unauthenticated"));
+    }
+
+    /// A model call recorded before words could be streamed is a bare response: it reads as a call
+    /// whose words were not streamed; one recorded now carries the stream, and says nothing of it when
+    /// there is none.
+    #[test]
+    fn a_recorded_model_call_reads_a_journal_from_before_streaming() {
+        let bare = serde_json::to_value(ModelResponse::text("hi")).unwrap();
+        let old: Recorded = serde_json::from_value(bare.clone()).unwrap();
+        assert_eq!(old.response, ModelResponse::text("hi"));
+        assert_eq!(old.stream, None);
+
+        let streamed = Recorded {
+            response: ModelResponse::text("hi"),
+            stream: Some("run-m0-a1b2c3d4".into()),
+        };
+        let json = serde_json::to_value(&streamed).unwrap();
+        assert_eq!(json["stream"], "run-m0-a1b2c3d4");
+        assert_eq!(
+            json["message"], bare["message"],
+            "the response's members, at the top"
+        );
+        let back: Recorded = serde_json::from_value(json).unwrap();
+        assert_eq!(back.stream.as_deref(), Some("run-m0-a1b2c3d4"));
+        assert_eq!(back.response, ModelResponse::text("hi"));
+
+        // Not streamed: the record is the bare response, byte for byte, as a build without streaming
+        // would have written it (a rolling deploy reads it either way).
+        let plain = Recorded {
+            response: ModelResponse::text("hi"),
+            stream: None,
+        };
+        assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
+    }
+
+    #[test]
+    fn a_stream_id_names_the_run_the_turn_and_the_try() {
+        let run = RunId::new();
+        let (first, again) = (stream_id(run, 3), stream_id(run, 3));
+        assert!(first.starts_with(&format!("{run}-m3-")), "{first}");
+        assert_ne!(first, again, "a retry of the turn is another stream");
+        assert!(first.len() <= adam_runtime::MAX_STREAM_ID_BYTES);
+        assert!(first.is_ascii());
     }
 
     /// Journals written before hints and classes existed still decode.

@@ -484,6 +484,7 @@ async fn a_question_keeps_its_interface_while_the_run_waits() {
             tool: "ask".into(),
             question: "which one?".into(),
             ui: Some(ui.clone()),
+            stream: None,
         }))
     );
     // Where an A2A front reads it from, without knowing the type.
@@ -521,6 +522,7 @@ fn journals_and_state_written_before_the_interface_existed_still_decode() {
             tool: "ask".into(),
             question: "which?".into(),
             ui: None,
+            stream: None,
         }))
     );
     let stored = serde_json::to_value(&state).unwrap();

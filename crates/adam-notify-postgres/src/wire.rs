@@ -140,8 +140,8 @@ pub(crate) fn encode_signal(signal: &Signal) -> Option<String> {
 mod tests {
     use adam_core::RunStatus;
     use adam_runtime::{
-        MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, StepEvent, StepIcon,
-        StepKind, StepState,
+        MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, MAX_STREAM_ID_BYTES,
+        MAX_TEXT_DELTA_BYTES, StepEvent, StepIcon, StepKind, StepState,
     };
     use serde_json::json;
 
@@ -176,6 +176,13 @@ mod tests {
                 StepEvent::new("tool:c1", StepKind::Tool, "run_checks", StepState::Running)
                     .with_detail("running checks"),
             ),
+            RunEvent::TextDelta {
+                stream: "run-m0-a1b2c3d4".into(),
+                offset: 3,
+                text: "onacci ".into(),
+                last: false,
+                abandoned: false,
+            },
         ];
         for event in events {
             let Encoded::Fits(json) = encode_event(origin, run, "agent", &event) else {
@@ -215,6 +222,41 @@ mod tests {
         };
         assert!(json.len() < MAX_PAYLOAD_BYTES, "{} bytes", json.len());
         assert_eq!(decode(&json).event, RunEvent::Step(step));
+    }
+
+    /// A piece of streamed text is bounded by `MAX_TEXT_DELTA_BYTES` (what `adam-llm-agent` cuts at), so the
+    /// largest one crosses the channel whole: even a piece of control characters, which JSON writes in six
+    /// bytes each.
+    #[test]
+    fn the_largest_text_delta_fits_a_payload() {
+        for character in ['\u{0}', '\u{1f}', '"', '\\', 'a'] {
+            let delta = RunEvent::TextDelta {
+                stream: "s".repeat(MAX_STREAM_ID_BYTES),
+                offset: u64::MAX,
+                text: character.to_string().repeat(MAX_TEXT_DELTA_BYTES),
+                last: true,
+                abandoned: true,
+            };
+            let Encoded::Fits(json) =
+                encode_event(Uuid::new_v4(), RunId::new(), &"a".repeat(64), &delta)
+            else {
+                panic!("the largest text delta of {character:?} fits");
+            };
+            assert!(json.len() < MAX_PAYLOAD_BYTES, "{} bytes", json.len());
+            assert_eq!(decode(&json).event, delta);
+        }
+        // The bound is on bytes: 256 four-byte characters are as many as a thousand and twenty-four.
+        let wide = RunEvent::TextDelta {
+            stream: "s".into(),
+            offset: 0,
+            text: "🙂".repeat(MAX_TEXT_DELTA_BYTES / 4),
+            last: false,
+            abandoned: false,
+        };
+        assert!(matches!(
+            encode_event(Uuid::new_v4(), RunId::new(), "a", &wide),
+            Encoded::Fits(_)
+        ));
     }
 
     #[test]

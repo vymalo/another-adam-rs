@@ -47,6 +47,12 @@
       "description": "Reports its tool calls and its sub-agents' work as nested steps",
       "required": false,
       "params": {}
+    },
+    {
+      "uri": "https://agents.vymalo.com/a2a/extensions/text-stream/v1",
+      "description": "Streams its replies as they are written",
+      "required": false,
+      "params": {}
     }
   ]
 }

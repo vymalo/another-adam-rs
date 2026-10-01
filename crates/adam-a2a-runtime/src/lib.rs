@@ -36,6 +36,7 @@ mod convert;
 mod ids;
 mod steps;
 mod subscribe;
+mod text_stream;
 mod vymalo;
 
 pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};

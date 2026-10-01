@@ -232,3 +232,208 @@ async fn error_scenarios_map_onto_model_errors() {
         assert!(is_expected(&err), "{scenario} (keyword, stream): {err:?}");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The scripted models answer a stream as they answer a completion
+// ---------------------------------------------------------------------------------------------
+
+/// The persona lines of an agent's system prompt, which the scripts read their name and summary from.
+const PERSONA: &str = "Your name is Coder.\nIn one sentence: I take a repository you name.\n";
+
+/// What a person says when asked the three questions of `[mock:choices]`.
+const ANSWERS: &str =
+    "The person answered through the interface:\n- db: pg\n- auth: keycloak\n- deploy: compose";
+
+/// A request of `model` over `history`, as the agents send it (every tool they have is not needed:
+/// the scripts read the history).
+fn scripted(model: &str, system: &str, history: &[Message]) -> ModelRequest {
+    let mut req = ModelRequest::new(model);
+    req.system = Some(system.to_owned());
+    req.messages = history.to_vec();
+    req.max_output_tokens = Some(4096);
+    req
+}
+
+/// Plays a scripted model from `history` to its answer in words: each turn is asked as a completion and
+/// as a stream, which must say the same (the text, the tool calls, why it stopped, the usage), and
+/// the calls are answered (`ask_user` with [`ANSWERS`], the others with "ok") and asked again.
+/// Returns what the stream's text deltas were at each turn.
+async fn play(
+    client: &OpenAiCompatible,
+    model: &str,
+    system: &str,
+    mut history: Vec<Message>,
+) -> Vec<Vec<String>> {
+    let mut turns = Vec::new();
+    for turn in 0..12 {
+        let req = scripted(model, system, &history);
+        let complete = client
+            .complete(req.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{model} turn {turn} (complete): {e}"));
+        let deltas = client
+            .stream(req)
+            .await
+            .unwrap_or_else(|e| panic!("{model} turn {turn} (stream): {e}"))
+            .try_collect::<Vec<ModelDelta>>()
+            .await
+            .unwrap_or_else(|e| panic!("{model} turn {turn} (stream): {e}"));
+        let Some(ModelDelta::Finished(streamed)) = deltas.last() else {
+            panic!("{model} turn {turn}: a stream ends with Finished: {deltas:?}")
+        };
+        assert_eq!(
+            streamed, &complete,
+            "{model} turn {turn}: the stream says what the completion does"
+        );
+        let texts: Vec<String> = deltas
+            .iter()
+            .filter_map(|d| match d {
+                ModelDelta::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts.concat(),
+            complete.message.text(),
+            "{model} turn {turn}"
+        );
+        turns.push(texts);
+        let calls = complete.message.tool_calls().to_vec();
+        if calls.is_empty() {
+            return turns;
+        }
+        history.push(complete.message.clone());
+        for call in calls {
+            let result = if call.name == "ask_user" {
+                ANSWERS
+            } else {
+                "ok"
+            };
+            history.push(Message::tool_result(call.id, result));
+        }
+    }
+    panic!("{model}: the script did not end in twelve turns")
+}
+
+/// The words of a model that writes slowly are several deltas (what a screen shows growing), for the
+/// answers that end a script.
+fn grows(turns: &[Vec<String>], at_least: usize, what: &str) {
+    let last = turns.last().expect("a turn");
+    assert!(
+        last.len() >= at_least,
+        "{what}: the answer is {} deltas, not {at_least}: {last:?}",
+        last.len()
+    );
+}
+
+#[tokio::test]
+async fn the_scripted_models_stream_what_they_complete() {
+    let Some(root) = mock_url() else {
+        eprintln!("skipping: ADAM_TEST_MOCK_OPENAI_URL not set");
+        return;
+    };
+    let client = client(&format!("{root}/v1"), None);
+    let user = |text: &str| vec![Message::user_text(text)];
+
+    // The coder: a greeting, then a task from the first call to the pull request (with OpenCode, and
+    // without), and a task that asks three questions at once.
+    let greeting = play(&client, "mock-coder", PERSONA, user("Hi")).await;
+    assert_eq!(greeting.len(), 1);
+    grows(&greeting, 6, "the coder's greeting");
+
+    let task = "In http://git-server:8080/local/sandbox.git (base branch main), add hello.txt containing hello.";
+    let with_opencode = play(&client, "mock-coder", "x", user(task)).await;
+    assert_eq!(
+        with_opencode.len(),
+        6,
+        "five calls, the last the pull request, then the answer"
+    );
+    grows(&with_opencode, 6, "the coder's last answer");
+    let without = play(
+        &client,
+        "mock-coder",
+        "x",
+        user(&format!("{task} [mock:no-opencode]")),
+    )
+    .await;
+    assert_eq!(without.len(), 5, "four calls, then the answer");
+    grows(&without, 6, "the coder's last answer without OpenCode");
+
+    let choices = play(
+        &client,
+        "mock-coder",
+        "x",
+        user("[mock:choices] set up the project"),
+    )
+    .await;
+    assert_eq!(choices.len(), 2, "the form, then the answer");
+    grows(&choices, 2, "the coder's answer to the form");
+
+    // The general agent: answered in role, and once a tool result is in.
+    let chat = play(&client, "mock-assistant", PERSONA, user("Hi")).await;
+    grows(&chat, 2, "the assistant's greeting");
+    let looked = vec![
+        Message::user_text("Hi"),
+        Message::Assistant {
+            content: vec![],
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "search__web_search".into(),
+                arguments: json!({}),
+            }],
+        },
+        Message::tool_result("c1", "1. A"),
+    ];
+    let after_tool = play(&client, "mock-assistant", "x", looked).await;
+    assert_eq!(after_tool.len(), 1);
+    grows(&after_tool, 2, "the assistant's answer after a tool");
+
+    // The researcher: the sources as cards, then the answer in words.
+    let cards = play(
+        &client,
+        "mock-researcher",
+        "x",
+        user("[mock:cards] what is async rust?"),
+    )
+    .await;
+    assert_eq!(cards.len(), 2);
+    grows(&cards, 2, "the researcher's answer");
+}
+
+/// A script's answer is written over about two seconds, not all at once: a screen that shows words as
+/// they come has something to show (and a test that reads the pieces has more than one to read).
+#[tokio::test]
+async fn the_coders_last_answer_arrives_over_time() {
+    let Some(root) = mock_url() else {
+        eprintln!("skipping: ADAM_TEST_MOCK_OPENAI_URL not set");
+        return;
+    };
+    let client = client(&format!("{root}/v1"), None);
+    let mut history = vec![Message::user_text("add hello.txt")];
+    history.push(Message::Assistant {
+        content: vec![],
+        tool_calls: vec![ToolCall {
+            id: "coder-call-5".into(),
+            name: "open_pull_request".into(),
+            arguments: json!({}),
+        }],
+    });
+    history.push(Message::tool_result("coder-call-5", "ok"));
+    let started = std::time::Instant::now();
+    let mut stream = client
+        .stream(scripted("mock-coder", "x", &history))
+        .await
+        .expect("stream");
+    let mut arrivals = Vec::new();
+    while let Some(delta) = futures::StreamExt::next(&mut stream).await {
+        if let ModelDelta::Text(_) = delta.expect("delta") {
+            arrivals.push(started.elapsed());
+        }
+    }
+    assert!(arrivals.len() >= 6, "{} text deltas", arrivals.len());
+    let (first, last) = (arrivals[0], *arrivals.last().expect("an arrival"));
+    assert!(
+        last.saturating_sub(first) >= Duration::from_millis(1000),
+        "the words come over time, not at once: {first:?} to {last:?}"
+    );
+}

@@ -79,10 +79,12 @@ another `v`, or one that does not parse, is ignored (debug log).
   text is in the run itself);
 * a `Step` is bounded by its constructors (an id of at most 128 bytes, a label of at most 200 characters, a detail of
   at most 1000: about 5 KiB at four bytes a character, a unit test builds the largest), so it always fits;
+* a `TextDelta` (a piece of the model's answer as it is written) holds at most `MAX_TEXT_DELTA_BYTES` of `adam-runtime`
+  (1024 bytes) and a stream id of at most 128 bytes: even a piece of control characters, which JSON writes in six bytes
+  each, is about 6.5 KiB, and a unit test builds the largest of each kind, so it always fits and crosses whole;
 * any other oversize event (`Progress`, `Custom`, `Artifact`) is not sent to
   other processes (debug log). Artifacts still reach subscribers through the
-  durable poll, which reads `RunView::artifacts`. **There is no new `RunEvent`
-  variant and no events table**: a table would make events replayable but add a
+  durable poll, which reads `RunView::artifacts`. **There is no events table**: a table would make events replayable but add a
   write, a schema, a sequence and a retention job to every event, for a
   best-effort stream whose durable half (status and artifacts) is already the
   run record. That option was considered and rejected;
@@ -153,7 +155,7 @@ forwarded to `sqlx`. No environment variables at runtime.
 
 | File | What |
 |---|---|
-| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes. Offline |
+| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step and the largest piece of streamed text fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes. Offline |
 | `tests/conformance.rs` | `adam-notify-testkit`'s `notifier_conformance!` with two `PgNotify` on separate pools, plus one case at the exact 7 999-byte limit |
 | `tests/two_runtimes.rs` | a front (starter only) and a worker, each with its own pools, `PgNotify` and `Runtime`, poll interval 30 s: a start and a deliver wake an idle worker; a step's `Progress` reaches the front exactly once and before the `Parked` status; a cancel reaches the step within 2 s; terminating the listener's backend gives a `Resync` within 5 s, a run started meanwhile completes, and a later signal arrives |
 

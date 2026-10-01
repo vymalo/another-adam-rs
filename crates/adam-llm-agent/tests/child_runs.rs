@@ -152,21 +152,30 @@ struct GateModel {
     gate: Arc<Gate>,
 }
 
-#[async_trait]
-impl ModelClient for GateModel {
-    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+impl GateModel {
+    /// Holds the call this model was told to hold, until the gate is released.
+    async fn hold(&self) {
         let n = self.calls.fetch_add(1, SeqCst);
         if n == self.hold_on && self.armed.swap(false, SeqCst) {
             self.gate.reached.notify_one();
             self.gate.release.notified().await;
         }
+    }
+}
+
+#[async_trait]
+impl ModelClient for GateModel {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.hold().await;
         self.inner.complete(req).await
     }
 
+    // The agent streams its model calls: the gate holds those too.
     async fn stream(
         &self,
         req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        self.hold().await;
         self.inner.stream(req).await
     }
 }
@@ -1124,6 +1133,7 @@ mod cases {
                 tool: "ask".into(),
                 question: "which environment?".into(),
                 ui: None,
+                stream: None,
             }))
         );
 
@@ -1211,6 +1221,7 @@ mod cases {
                 tool: "ask".into(),
                 question: "which one?".into(),
                 ui: None,
+                stream: None,
             }))
         );
     }

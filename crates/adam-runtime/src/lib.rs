@@ -92,6 +92,7 @@ mod notify;
 mod retry;
 mod runtime;
 mod step;
+mod text;
 mod worker;
 
 pub use adam_error::{Classify, ErrorClass};
@@ -111,3 +112,4 @@ pub use step::{
     MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, StepEvent, StepIcon, StepKind,
     StepState,
 };
+pub use text::{AGENT_TEXT_KIND, MAX_STREAM_ID_BYTES, MAX_TEXT_DELTA_BYTES, floor_boundary};

@@ -85,16 +85,22 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
 * Unit tests: `src/errors.rs` (`status_mapping`), `src/lib.rs`
   (`config_error_class_table`) and `src/wire.rs` (the request shape, including several text parts
   sent as one string).
+* `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
+  streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`)
+  played from its first request to its final answer both as a completion and as a stream, which must say the same, with the
+  coder's last answer arriving over time: the guard that the SSE twins of `dev/wiremock/mock-openai` do not drift from the
+  scripts they copy. Passes without doing anything unless `ADAM_TEST_MOCK_OPENAI_URL` is set (CI's `compose` job sets it).
 * `tests/live.rs`: optional, against a real endpoint. Passes without doing
   anything unless the variables are set.
 
 | Variable | Meaning |
 |---|---|
+| `ADAM_TEST_MOCK_OPENAI_URL` | the root of `mock-openai` (without `/v1`, for example `http://127.0.0.1:8081`); enables `tests/wiremock_compose.rs` |
 | `ADAM_TEST_OPENAI_BASE_URL` | endpoint (with `/v1`); with the key, enables `tests/live.rs` |
 | `ADAM_TEST_OPENAI_API_KEY` | its key |
 | `ADAM_TEST_OPENAI_MODEL` | model alias (default `gpt-4o-mini`) |
 
-Not run in CI. No conformance testkit exists for `ModelClient` yet.
+`tests/live.rs` is not run in CI. No conformance testkit exists for `ModelClient` yet.
 
 ## See also
 

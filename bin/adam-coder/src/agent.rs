@@ -516,11 +516,19 @@ async fn stop_as_question(
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let question = match text.trim() {
-        "" if prepared => EMPTY_STOP_QUESTION_AFTER_WORK.to_owned(),
-        "" => EMPTY_STOP_QUESTION.to_owned(),
-        said => said.to_owned(),
+    let (question, said) = match text.trim() {
+        "" if prepared => (EMPTY_STOP_QUESTION_AFTER_WORK.to_owned(), false),
+        "" => (EMPTY_STOP_QUESTION.to_owned(), false),
+        said => (said.to_owned(), true),
     };
+    // The question is the model's own words, which were sent as they were written when the model
+    // streamed (`output.stream`): the question says which stream they were, so that whoever read the
+    // pieces knows this text for what they were. A question the coder made up has no stream.
+    let stream = output
+        .get("stream")
+        .and_then(Value::as_str)
+        .filter(|_| said)
+        .map(str::to_owned);
     let call = ToolCall {
         id: stop_call_id(state.turns),
         name: adam_ui::ASK_USER.to_owned(),
@@ -543,6 +551,7 @@ async fn stop_as_question(
             tool: call.name.clone(),
             question,
             ui: None,
+            stream,
         },
     ));
     state.pending_calls = vec![call];

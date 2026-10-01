@@ -12,8 +12,12 @@
 #     postgres mock-openai mock-github git-server coder
 #
 # The script resets mock-github's request journal, sends the task with
-# SendStreamingMessage, reads the stream until the task ends, and checks:
+# SendStreamingMessage (activating `text-stream/v1`, which the coder's card lists), reads the
+# stream until the task ends, and checks:
 #   * the task is TASK_STATE_COMPLETED (not FAILED, and it ends within TIMEOUT);
+#   * the coder's last answer arrived as at least two `reply` chunks, before the status that ends
+#     the task, each beginning where the one before ended (UTF-8 bytes), the last marked, that add
+#     up to the text of that status, which names the stream (`metadata.streamId`);
 #   * the `checks`, `branch` and `pull_request` artifacts are there, and the last `checks`
 #     (bound to the pushed commit, emitted before `branch`) passed on exactly the
 #     branch artifact's commit, with a 40-hex tree;
@@ -44,6 +48,8 @@ gitserver=${GIT_SERVER_URL:-http://127.0.0.1:${GIT_SERVER_PORT:-8083}}
 gitserver=${gitserver%/}
 timeout=${TIMEOUT:-300}
 repo_path=local/sandbox
+# The extension that makes the coder send its answer as it is written (its card lists it).
+text_stream=https://agents.vymalo.com/a2a/extensions/text-stream/v1
 # The address the coder (inside the compose network) uses for the repository.
 repo_url=http://git-server:8080/$repo_path.git
 
@@ -81,6 +87,7 @@ curl_rc=0
 code=$(curl -sN --max-time "$timeout" -o "$stream" -w '%{http_code}' \
   -X POST "$coder/" \
   -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+  -H "A2A-Extensions: $text_stream" \
   -d "$rpc") || curl_rc=$?
 if [ "$curl_rc" = 28 ]; then
   bad "the task did not end within ${timeout}s"
@@ -107,6 +114,34 @@ case "$state" in
     ;;
   *) bad "the task did not complete (last state: '${state:-none}')" ;;
 esac
+
+# --- the answer, as it was written ---------------------------------------------------------
+# The last answer of the script is a text the mock model dribbles over about two seconds: the
+# coder sends it as `reply` chunks, and the status that ends the task says it whole.
+all=$tmp/all.json
+jq -s '.' "$events" > "$all" 2>/dev/null || echo '[]' > "$all"
+chunks=$(jq '[.[] | select(.result.artifactUpdate.artifact.name == "reply") | .result.artifactUpdate]' "$all")
+n_chunks=$(printf '%s' "$chunks" | jq 'length')
+if [ "$n_chunks" -ge 2 ]; then ok "the answer arrived as $n_chunks chunks"; else bad "the answer arrived as $n_chunks chunk(s), want at least 2"; fi
+done_text=$(jq -r '[.[] | select(.result.statusUpdate.status.state == "TASK_STATE_COMPLETED")] | last | .result.statusUpdate.status.message.parts[0].text // empty' "$all")
+joined=$(printf '%s' "$chunks" | jq -r 'map(.artifact.parts[0].text) | join("")')
+if [ -n "$done_text" ] && [ "$joined" = "$done_text" ]; then ok "the chunks add up to the text of the status that ends the task"; else bad "the chunks say '$joined', the status that ends the task says '$done_text'"; fi
+# Each chunk begins where the one before ended, in UTF-8 bytes, and only the last one ends the stream.
+chain=$(printf '%s' "$chunks" | jq -r '
+  reduce .[] as $c ({at: 0, bad: 0};
+    .bad += (if ($c.artifact.metadata["'"$text_stream"'"].offset == .at) then 0 else 1 end)
+    | .at += ($c.artifact.parts[0].text | utf8bytelength)) | .bad')
+if [ "$chain" = 0 ]; then ok "every chunk begins where the one before ended"; else bad "$chain chunk(s) do not begin where the one before ended"; fi
+ends=$(printf '%s' "$chunks" | jq '[.[] | select(.lastChunk == true)] | length')
+last_is_last=$(printf '%s' "$chunks" | jq '(last | .lastChunk) == true')
+if [ "$ends" = 1 ] && [ "$last_is_last" = true ]; then ok "only the last chunk ends the stream"; else bad "$ends chunk(s) end the stream, and the last one does ${last_is_last}"; fi
+stream_id=$(printf '%s' "$chunks" | jq -r '.[0].artifact.artifactId // empty')
+said_id=$(jq -r --arg u "$text_stream" '[.[] | select(.result.statusUpdate.status.state == "TASK_STATE_COMPLETED")] | last | .result.statusUpdate.status.message.metadata[$u].streamId // empty' "$all")
+if [ -n "$stream_id" ] && [ "$stream_id" = "$said_id" ]; then ok "the status that ends the task names the stream of the chunks"; else bad "the stream of the chunks is '$stream_id', the status that ends the task names '$said_id'"; fi
+# All the chunks come before that status.
+order=$(jq '([to_entries[] | select(.value.result.artifactUpdate.artifact.name == "reply") | .key] | max)
+  < ([to_entries[] | select(.value.result.statusUpdate.status.state == "TASK_STATE_COMPLETED") | .key] | max)' "$all")
+if [ "$order" = true ]; then ok "the chunks came before the end of the task"; else bad "a chunk came after the status that ends the task"; fi
 
 # --- artifacts ---------------------------------------------------------------------
 artifact() { # artifact <name> <jq path under .parts[0].data> -> value ("" if absent)

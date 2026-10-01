@@ -905,12 +905,13 @@ sequenceDiagram
         alt already recorded (replay)
             DB-->>X: recorded entry, the effect does not run again
         else not recorded
-            X->>M: complete(request)
-            M-->>X: response, or ModelError
-            X->>DB: journal_put(run, entry), first writer wins
+            X->>M: stream(request), or complete(request) when stream_text is off
+            M-->>X: text deltas, then the response, or a ModelError
+            X->>K: emit TextDelta pieces while the model writes (streamed text)
+            X->>DB: journal_put(run, entry): the response and the stream's id, first writer wins
         end
         X-->>A: the recorded outcome
-        A->>K: emit Custom agent_text
+        A->>K: emit Custom agent_text (with the stream's id for words before a tool call)
         loop each tool call of the turn
             A->>K: emit Step tool:call id running
             A->>X: step("tool:call id", run the tool)
@@ -937,7 +938,8 @@ sequenceDiagram
 What the diagram cannot say:
 
 * **One step is one model turn.** `LlmAgent::step` calls the model once (in the
-  journaled step `model:N`, non-streaming `complete`), runs the tools that call
+  journaled step `model:N`, as a stream whose words are sent while it writes, or `complete`
+  when `stream_text` is off), runs the tools that call
   asked for (each in a journaled step `tool:<call id>`), and returns
   `Continue`. Every turn is committed before the next begins.
 * **The journal makes replay safe, not effects exactly-once.** A recorded
@@ -1109,6 +1111,59 @@ stateDiagram-v2
 The events are live, as every event is: a subscription attached after they were emitted, or in another process with
 no event sink, sees only the durable record of the task. What is durable about steps is what the orchestration layer
 logs of them (it keeps a start, a few updates and an end per step).
+
+### Streamed text: the words as the model writes them
+
+A model turn is a **stream** by default (`LlmAgentBuilder::stream_text`): the journaled step `model:<turn>` calls
+`ModelClient::stream` and, while the model writes, sends what it has written as `RunEvent::TextDelta` events, the
+pieces of one stream ([ADR 0007](decisions/0007-progress-as-steps-and-streamed-text.md)). The subscription of a client
+that **activated `text-stream/v1`** turns each into a chunk (an artifact update whose artifact is the stream, with the
+piece's byte offset in its metadata), and the whole text is stated once: by a `working` status for the words before a
+tool call, and by the status that ends the turn: the `completed` status of the answer that ends the run, whose message
+names its stream (`output.stream` in the run, `{streamId}` in the message's metadata), or the `input-required` status of
+a reply the agent turned into a question (the coder's: `PendingQuestion::stream`). The orchestration layer relays the chunks to the
+screens and logs only the final text.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant B as Subscription
+    participant K as BroadcastSink
+    participant A as LlmAgent (step model:N)
+    participant M as Model
+    C->>B: SendStreamingMessage, A2A-Extensions: text-stream/v1
+    A->>M: stream(request)
+    M-->>A: Text deltas
+    A->>A: coalesce: 200 bytes or 100 ms, at most 1024 bytes a piece
+    A->>K: TextDelta(stream, offset, text)
+    K-->>B: RunEvent::TextDelta
+    alt the caller activated text-stream/v1
+        B-->>C: artifact update: the piece, its offset, append, lastChunk
+    else it did not
+        B->>B: nothing: the whole reply comes with the turn
+    end
+    M-->>A: Finished(response)
+    A->>K: TextDelta(last)
+    A->>A: journal the response and the stream id, then Done with output.stream
+    B-->>C: completed: the whole text, metadata {streamId}
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Streaming: the first word that is not blank
+    Streaming --> Streaming: a piece (200 bytes, or 100 ms since the last)
+    Streaming --> Ended: the model finished: the last piece
+    Streaming --> Abandoned: the model failed: the last piece, abandoned
+    Ended --> Stated: output.stream (the answer), or agent_text with the stream (words before a tool call)
+    Stated --> [*]
+    Abandoned --> [*]: the run fails or retries as another stream
+```
+
+What the diagrams cannot say: the pieces are live and meant to be lost (a replay of a recorded step sends none, and says
+the same words whole under the recorded stream id); a failure in the middle of the answer is the call's failure
+(`ModelFailure`, the same retry and the same failed run as a `complete` that failed); a chunk is at most 1024 bytes so
+the event fits a `NOTIFY` payload between processes; and a client that did not activate the extension, and a blocking
+`message/send`, get the whole reply with the turn as ever.
 
 ## The run lifecycle
 
@@ -1663,8 +1718,8 @@ sequenceDiagram
 
     C->>A: SendStreamingMessage "in repo X (base main), do Y"
     loop each model turn
-        A->>M: complete(history + 6 tool specs)
-        M-->>A: text or tool calls
+        A->>M: stream(history + 6 tool specs)
+        M-->>A: text deltas, then the response: text or tool calls
     end
     Note over A,M: The turns below are the model's tool calls, in the order it picks.
 

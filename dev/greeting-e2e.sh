@@ -17,7 +17,10 @@
 #   1. SendStreamingMessage "Hi": the task ends TASK_STATE_INPUT_REQUIRED (it waits for the
 #      person), and the question it asks is a greeting that says the agent's name and the
 #      one-sentence summary, both read here from the folder the stack mounts (bin/adam-coder/agent),
-#      and asks which repository and what to change. No tool ran: there is no artifact.
+#      and asks which repository and what to change. No tool ran: there is no artifact. The greeting
+#      was written as it arrived (`text-stream/v1`, which the script activates): at least two `reply`
+#      chunks that add up to the question, and the question names the stream of the chunks. The
+#      `reply` chunks are the answer's words, not a tool's artifact: they do not count as one.
 #   2. A message to the same task names http://git-server:8080/local/sandbox.git: the run goes on
 #      with the script and ends TASK_STATE_COMPLETED with a `branch` and a `pull_request` artifact.
 #   3. (unless NO_RESTART=1) a copy of the folder with `display_name: Cody` is mounted in its place
@@ -46,6 +49,8 @@ token=${CODER_TOKEN:-dev-token}
 timeout=${TIMEOUT:-300}
 agent_dir=${AGENT_DIR:-bin/adam-coder/agent}
 repo_url=http://git-server:8080/local/sandbox.git
+# The extension that makes the coder send its answer as it is written (its card lists it).
+text_stream=https://agents.vymalo.com/a2a/extensions/text-stream/v1
 
 fail=0
 ok() { echo "ok   $1"; }
@@ -107,6 +112,7 @@ send() {
   code=$(curl -sN --max-time "$timeout" -o "$stream" -w '%{http_code}' \
     -X POST "$coder/" \
     -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    -H "A2A-Extensions: $text_stream" \
     -d "$rpc") || curl_rc=$?
   if [ "$curl_rc" = 28 ]; then
     bad "the task did not stop within ${timeout}s"
@@ -127,8 +133,10 @@ last_state() {
 words_of() {
   jq -r --arg s "$1" 'select((.result.statusUpdate.status.state // .result.task.status.state) == $s) | [.. | .text? // empty] | join(" ")' "$tmp/events.jsonl" | tail -n 1
 }
+# The names of the artifacts the run made. The `reply` chunks are not among them: they are the
+# words of the answer sent as they are written (`text-stream/v1`), not something a tool made.
 artifact_names() {
-  jq -r 'select(.result.artifactUpdate) | .result.artifactUpdate.artifact.name' "$tmp/events.jsonl" | sort -u | tr '\n' ' '
+  jq -r 'select(.result.artifactUpdate and .result.artifactUpdate.artifact.name != "reply") | .result.artifactUpdate.artifact.name' "$tmp/events.jsonl" | sort -u | tr '\n' ' '
 }
 
 # greets <name> <summary>: the last `send` was "Hi" and the answer is the greeting of that persona.
@@ -150,6 +158,20 @@ greets() {
   esac
   names=$(artifact_names)
   if [ -z "$names" ]; then ok "no tool ran: no artifact"; else bad "a greeting produced artifacts: $names"; fi
+  written_as_it_arrived "$said"
+}
+
+# written_as_it_arrived <the question>: the greeting came as `reply` chunks that add up to the
+# question the task waits on, and that question names the stream of the chunks.
+written_as_it_arrived() {
+  chunks=$(jq -s '[.[] | select(.result.artifactUpdate.artifact.name == "reply") | .result.artifactUpdate]' "$tmp/events.jsonl")
+  n_chunks=$(printf '%s' "$chunks" | jq 'length')
+  if [ "$n_chunks" -ge 2 ]; then ok "the greeting arrived as $n_chunks chunks"; else bad "the greeting arrived as $n_chunks chunk(s), want at least 2"; fi
+  joined=$(printf '%s' "$chunks" | jq -r 'map(.artifact.parts[0].text) | join("")')
+  if [ "$joined" = "$1" ]; then ok "the chunks add up to the question"; else bad "the chunks say '$joined', the question says '$1'"; fi
+  stream_id=$(printf '%s' "$chunks" | jq -r '.[0].artifact.artifactId // empty')
+  said_id=$(jq -r --arg u "$text_stream" 'select(.result.statusUpdate.status.state == "TASK_STATE_INPUT_REQUIRED") | .result.statusUpdate.status.message.metadata[$u].streamId // empty' "$tmp/events.jsonl" | tail -n 1)
+  if [ -n "$stream_id" ] && [ "$stream_id" = "$said_id" ]; then ok "the question names the stream of the chunks"; else bad "the stream of the chunks is '$stream_id', the question names '$said_id'"; fi
 }
 
 # --- 1. "Hi" gets a greeting ---------------------------------------------------------

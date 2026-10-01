@@ -1737,21 +1737,30 @@ struct HangingModel {
     reached: Arc<Notify>,
 }
 
-#[async_trait]
-impl ModelClient for HangingModel {
-    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+impl HangingModel {
+    /// Hangs the call this model was told to hang, for ever.
+    async fn hang(&self) {
         let n = self.calls.fetch_add(1, SeqCst);
         if n == self.hang_on && self.armed.swap(false, SeqCst) {
             self.reached.notify_one();
             std::future::pending::<()>().await;
         }
+    }
+}
+
+#[async_trait]
+impl ModelClient for HangingModel {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.hang().await;
         self.inner.complete(req).await
     }
 
+    // The coder streams its model calls: the hang is there too.
     async fn stream(
         &self,
         req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        self.hang().await;
         self.inner.stream(req).await
     }
 }
@@ -2217,7 +2226,7 @@ impl Respond for RateLimitedOnce {
             )
         } else {
             match self.replies.get(turn) {
-                Some(reply) => (200, ResponseTemplate::new(200).set_body_json(reply)),
+                Some(reply) => (200, common::chat_response(request, reply)),
                 None => (
                     500,
                     ResponseTemplate::new(500).set_body_string("script exhausted"),

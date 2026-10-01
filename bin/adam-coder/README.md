@@ -86,11 +86,25 @@ reported, like every other line. A client that did not activate steps reads the 
 a tool call when it starts, `<title>: done` or `<title>: failed: <output>` when it ends, the lines of OpenCode's reply
 and its plan as they are, and `OpenCode: done` when the call ends (`tests/e2e.rs`, `tests/tools.rs`).
 
+### Streamed answers: the words as the model writes them
+
+The coder **streams its model calls** (`LlmAgentBuilder::stream_text`, on by default), and its card lists `text-stream/v1`
+([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md); the contract is the orchestration layer's
+`docs/api/text-stream-v1.md`). A client that activates it reads each answer as chunks while the model writes (artifact updates
+named `reply`, each with where it begins in UTF-8 bytes, the last marked `lastChunk`), then the status that ends the turn (`completed`, or `input-required` for a reply that delivers nothing, which the coder
+turns into a question: `PendingQuestion::stream` says which stream the question is), whose message is the whole text
+and names the stream (`metadata["https://agents.vymalo.com/a2a/extensions/text-stream/v1"] =
+{"streamId": ..}`); the words the model writes before a tool call are stated by a `working` status of their own, the same
+way. A client that does not activate it reads the whole reply with the turn, as before, and a blocking `message/send` is
+unchanged. The chunks are live and not stored, like every event: what the run records is the final text. The scripted
+models of `dev/wiremock/mock-openai` answer a stream as they answer a completion, and `dev/coder-e2e.sh` and
+`dev/greeting-e2e.sh` check that the answer arrives as chunks that add up to it.
+
 ### Asking with choices
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
 (`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
-`thread-tools/v1`; `agent_card_from` adds them, with `steps/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
+`thread-tools/v1`; `agent_card_from` adds them, with `steps/v1` and `text-stream/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, choices? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, and the
 person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
@@ -966,7 +980,7 @@ database of its own, so the role needs `CREATEDB`):
   another agent's name, a worker whose folder cannot be assembled (exit 78, names the var; Postgres), a control
   plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the
   embedded copy logged as `source=embedded`.
-* `src/tools/delegate.rs` (unit): OpenCode's tool calls as child steps (the kind and icon of each ACP kind, the state of each status, a call moved and ended by its updates, what OpenCode says scrubbed and cut, a call that never ended closed with the turn) and `tests/tools.rs`' `delegate_to_opencode_streams_updates_and_returns_the_summary` (the call is a `subagent` step labelled OpenCode, the fake agent's tool call is a child with the edit icon that ends `completed`, its reply is a `message` child and the progress lines are updates of the call's own step); `tests/agent_files.rs` and the card golden pin `steps/v1` on the card.
+* `src/tools/delegate.rs` (unit): OpenCode's tool calls as child steps (the kind and icon of each ACP kind, the state of each status, a call moved and ended by its updates, what OpenCode says scrubbed and cut, a call that never ended closed with the turn) and `tests/tools.rs`' `delegate_to_opencode_streams_updates_and_returns_the_summary` (the call is a `subagent` step labelled OpenCode, the fake agent's tool call is a child with the edit icon that ends `completed`, its reply is a `message` child and the progress lines are updates of the call's own step); `tests/agent_files.rs` and the card golden pin `steps/v1` and `text-stream/v1` on the card. The tests' models stream too (the agent calls `stream`): a model that does its work in `complete` only is not asked for it any more, so `HangingModel` of `tests/e2e.rs` and the greeting model of `tests/agent_files.rs` do it in `stream` as well.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, malformed arguments,
   `prepare_workspace` refusing a repository the person did not name (the refusal names

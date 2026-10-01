@@ -6,8 +6,8 @@ use std::time::Duration;
 use a2a::{
     Message, Part, Role, TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
-use adam_a2a::{BackendError, Caller, STEPS_EXTENSION, TaskEvent};
-use adam_runtime::{RunEvent, RunSubscription, RunView, StepEvent, StepState};
+use adam_a2a::{BackendError, Caller, STEPS_EXTENSION, TEXT_STREAM_EXTENSION, TaskEvent};
+use adam_runtime::{AGENT_TEXT_KIND, RunEvent, RunSubscription, RunView, StepEvent, StepState};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::json;
@@ -18,6 +18,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::convert::{StatusKey, artifact_id, artifact_of, status_key, status_of, task_from_view};
 use crate::steps::step_message;
+use crate::text_stream;
 
 /// Consecutive failed reads of the durable run before a subscription gives up.
 const MAX_READ_FAILURES: u32 = 20;
@@ -59,6 +60,10 @@ struct Tracker {
     steps: bool,
     /// The state each open step last reported to this subscriber, and when (only with `steps`).
     reported: HashMap<String, (StepState, Instant)>,
+    /// The request activated `text-stream/v1`: the model's words go out as chunks as they are
+    /// written, and the words before a tool call as a status of their own. Without it the whole
+    /// reply arrives with the turn, as it always did.
+    text_stream: bool,
 }
 
 impl Tracker {
@@ -124,7 +129,37 @@ impl Tracker {
                 }
                 vec![working(step_message(&step, self.steps))]
             }
+            RunEvent::TextDelta {
+                stream,
+                offset,
+                text,
+                last,
+                abandoned,
+            } => {
+                if !self.text_stream {
+                    return Vec::new();
+                }
+                text_stream::chunk(
+                    &self.task_id,
+                    &self.context_id,
+                    &stream,
+                    offset,
+                    text,
+                    last,
+                    abandoned,
+                )
+                .map(|chunk| vec![TaskEvent::Artifact(chunk)])
+                .unwrap_or_default()
+            }
             RunEvent::Custom { kind, payload } => {
+                // The words of a turn that were streamed, said whole: a status of their own, with the
+                // stream's id, so the chunks they are the text of are known by it.
+                if self.text_stream
+                    && kind == AGENT_TEXT_KIND
+                    && let Some((stream, text)) = text_stream::words_of(&payload)
+                {
+                    return vec![working(text_stream::words_message(stream, text.to_owned()))];
+                }
                 let part = Part::data(json!({ "kind": kind, "payload": payload }));
                 vec![working(Message::new(Role::Agent, vec![part]))]
             }
@@ -214,6 +249,7 @@ async fn pump(
         last: status_key(&task.status),
         steps: caller.has_extension(STEPS_EXTENSION),
         reported: HashMap::new(),
+        text_stream: caller.has_extension(TEXT_STREAM_EXTENSION),
     };
     let ends = task.status.state.is_terminal()
         || matches!(
