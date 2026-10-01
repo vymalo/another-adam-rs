@@ -401,8 +401,10 @@ jobs:
       - name: A rootless Podman service beside a directory it shares with the test
         run: |
           set -eu
-          work="$RUNNER_TEMP/adam-devcontainer"
-          sock="$RUNNER_TEMP/adam-podman"
+          # Outside the runner's home (/home/runner is mode 0750): uid 10001 must reach both, and the
+          # test binary that runs as uid 10001 is copied into the first.
+          work=/tmp/adam-devcontainer
+          sock=/tmp/adam-podman
           sudo install -d -o 10001 -g 10001 -m 0755 "$work" "$sock"
           {
             echo "PODMAN_SOCKET_DIR=$sock"
@@ -419,7 +421,7 @@ jobs:
           test -x "$bin"
           # The service runs as uid 10001, so does the test: what a container makes in the shared
           # directory is then the test's own outside. It runs from that directory (the runner's home
-          # may not be open to another user), and with this job's PATH (sudo's own has no node, which
+          # is not open to another user), and with this job's PATH (sudo's own has no node, which
           # the devcontainer CLI is a script of).
           sudo install -o 10001 -g 10001 -m 0755 "$bin" "$PODMAN_WORK/podman-test"
           sudo -E setpriv --reuid 10001 --regid 10001 --clear-groups env \
