@@ -33,7 +33,8 @@ use adam_workspace::Environment;
 let mut settings = Settings::new("/work");
 settings.runtime = Runtime::Podman;
 settings.container_host = "unix:///run/podman/podman.sock".to_owned();
-settings.default_image = "mcr.microsoft.com/devcontainers/base:2.2.1-trixie@sha256:1f851004...".to_owned();
+// By digest only: the devcontainer CLI cannot parse a reference with both a tag and a digest.
+settings.default_image = "mcr.microsoft.com/devcontainers/base@sha256:1f851004...".to_owned();
 let environment = DevContainer::new(settings);
 // environment.ensure(&run_workspace, &progress).await? gives the session of the run.
 ```

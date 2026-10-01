@@ -65,9 +65,10 @@ services:
     environment:
       DEVCONTAINER_RUNTIME: podman
       CONTAINER_HOST: unix:///run/podman/podman.sock
-      # The small base image of the devcontainers.dev project, pinned by tag and digest (367 MiB). A
-      # deployment uses the `workspace` image of another-agentic-images instead.
-      DEVCONTAINER_DEFAULT_IMAGE: ${DEVCONTAINER_DEFAULT_IMAGE:-mcr.microsoft.com/devcontainers/base:2.2.1-trixie@sha256:1f851004adcd3dff3776b4a1da86727cf52280b0fdc9d5b0568c9c7d74274286}
+      # The small base image of the devcontainers.dev project, 2.2.1-trixie (367 MiB), pinned by digest only:
+      # the devcontainer CLI cannot parse a reference with both a tag and a digest. A deployment uses the
+      # `workspace` image of another-agentic-images instead.
+      DEVCONTAINER_DEFAULT_IMAGE: ${DEVCONTAINER_DEFAULT_IMAGE:-mcr.microsoft.com/devcontainers/base@sha256:1f851004adcd3dff3776b4a1da86727cf52280b0fdc9d5b0568c9c7d74274286}
       WORKSPACE_SWEEP_SECS: "10"
     volumes:
       - ${PODMAN_SOCKET_DIR:-podman-socket}:/run/podman

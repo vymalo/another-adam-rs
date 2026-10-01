@@ -31,7 +31,9 @@ use adam_workspace::{
 };
 use tokio::io::AsyncWriteExt;
 
-const BASE: &str = "mcr.microsoft.com/devcontainers/base:2.2.1-trixie@sha256:1f851004adcd3dff3776b4a1da86727cf52280b0fdc9d5b0568c9c7d74274286";
+// devcontainers/base 2.2.1-trixie, by digest only: the devcontainer CLI (0.89.0) cannot parse a reference
+// with both a tag and a digest, and then skips the image's metadata (its `remoteUser`).
+const BASE: &str = "mcr.microsoft.com/devcontainers/base@sha256:1f851004adcd3dff3776b4a1da86727cf52280b0fdc9d5b0568c9c7d74274286";
 
 #[derive(Default)]
 struct Steps(std::sync::Mutex<Vec<EnvStep>>);
