@@ -7,7 +7,7 @@
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
 //! | `run_checks { command }` | [`checks`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
-//! | `ask_user { question }` | [`ask`] |
+//! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}` | [`adam_ui`]: the person's screen as tools |
 //!
 //! # Retry safety
 //!
@@ -48,17 +48,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use adam::mcp::McpPolicy;
 use adam::prelude::*;
 use adam::{DynTool, StateKey};
 use adam_error::{Classify, report};
 use adam_model::ToolSpec;
+use adam_ui::Ui;
 use adam_workspace::{DynCodeHost, GitIdentity, WorkspaceError, Workspaces, Worktree};
 use serde_json::Value;
 
 use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 
-pub mod ask;
+/// What the description of `ask_user` opens with: the coder's own words about when to ask.
+const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific.";
+
 pub mod checks;
 pub mod delegate;
 mod gitcli;
@@ -135,6 +139,11 @@ pub struct ToolEnv {
     /// Removes the process's secrets from everything a tool returns, reports
     /// or fails with. Empty (a no-op) until [`ToolEnv::with_redactor`].
     pub redactor: Redactor,
+    /// The person's screen as tools (`ask_user` with choices, `show`, `ui_catalog`) and as a
+    /// tool source (the tools of the conversation's endpoint): the catalogs this process has read
+    /// are shared by the tools and the source, so both come from this one value. Under the
+    /// default [`McpPolicy`] until [`ToolEnv::with_mcp_policy`].
+    pub ui: Ui,
 }
 
 impl ToolEnv {
@@ -147,7 +156,17 @@ impl ToolEnv {
             settings,
             notes,
             redactor: Redactor::default(),
+            ui: Ui::new(McpPolicy::default()).with_ask_lead(ASK_LEAD),
         }
+    }
+
+    /// Reach the conversation's tool endpoint under `policy` (the deployment's
+    /// `MCP_ALLOW_INSECURE` and timeouts): the URL a message announces is checked like the URL of
+    /// any MCP server. The catalogs read so far are forgotten (a new [`Ui`]).
+    #[must_use]
+    pub fn with_mcp_policy(mut self, policy: McpPolicy) -> Self {
+        self.ui = Ui::new(policy).with_ask_lead(ASK_LEAD);
+        self
     }
 
     /// Scrub the values `redactor` knows from every tool result, tool error and
@@ -198,7 +217,8 @@ impl ToolEnv {
     }
 }
 
-/// Every coder tool, in the order they are offered to the model.
+/// Every coder tool, in the order they are offered to the model: the six of the coding workflow,
+/// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
 /// [`ToolEnv::redactor`] first. The tools read `env` from the agent's state:
@@ -219,8 +239,8 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         checks::RunChecks,
         publish::CommitAndPush,
         publish::OpenPullRequest,
-        ask::AskUser,
     ]
+    .extend(env.ui.tools())
     .wrap(Redacting::layer(env.redactor.clone()))
 }
 

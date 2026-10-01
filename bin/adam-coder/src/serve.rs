@@ -84,7 +84,13 @@ async fn build_agent(
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 
-    let env = Arc::new(ToolEnv::new(workspaces, code_host, settings).with_redactor(redactor));
+    let env = Arc::new(
+        ToolEnv::new(workspaces, code_host, settings)
+            .with_redactor(redactor)
+            // The URL a message announces for the conversation's tools is an MCP server's: the
+            // deployment's policy (MCP_ALLOW_INSECURE, timeouts) decides.
+            .with_mcp_policy(worker.mcp.policy()),
+    );
     // The MCP servers the folder's `mcp.json` names are connected now, at startup, before the
     // agent is bound: a server that is down, a local process the policy does not allow, a
     // `${VAR}` that is unset are startup errors with their own exit code (69 or 78), never
@@ -154,7 +160,10 @@ pub async fn serve(
                 .options(options_of(worker))
         }
         None => Agents::new(AGENT_NAME, |builder| builder.starter(CoderStarter)),
-    };
+    }
+    // The person's screen is the sender: their answers through a form, and the catalog and the
+    // tools of the conversation, reach the run (the extensions the card lists).
+    .inbound(adam_a2a_runtime::vymalo_inbound);
     // The card of the files this process runs, like the workers' agent.
     let card = match &config.service.public_url {
         Some(public_url) => Some(

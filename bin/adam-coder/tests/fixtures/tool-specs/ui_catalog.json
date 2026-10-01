@@ -1,0 +1,8 @@
+{
+  "name": "ui_catalog",
+  "description": "List the components the person's screen can draw: for each its name, what it is for and the JSON Schema of its properties. Call it before `show`. The list is the screen's, so it can differ from one conversation to the next.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

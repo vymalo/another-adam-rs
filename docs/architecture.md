@@ -230,8 +230,8 @@ The layers, from the bottom:
   * `adam-coder` is the coder agent. It is a composition
     root: it wires the pieces below it, and `adam-service` runs the process.
   * `adam-agent` is the general binary: it serves **any agent folder** (instructions, card, skills,
-    subagents and `mcp.json` tools, read at startup from `ADAM_AGENT_DIR`) with `ask_user` as its only tool of
-    its own, over the same `adam-service`. It has no embedded agent and requires the folder
+    subagents and `mcp.json` tools, read at startup from `ADAM_AGENT_DIR`) with the screen's tools of `adam-ui`
+    (`ask_user`, `show`, `ui_catalog`) as its only tools of its own, over the same `adam-service`. It has no embedded agent and requires the folder
     ([ADR 0005](decisions/0005-one-binary-serves-any-agent-folder.md), [README](../bin/adam-agent/README.md)).
   * [`adam-ui`](../crates/adam-ui/README.md) turns the screen's UI catalog into model tools for any agent:
     `ask_user` with `choices` (one form, the answers back as the result), `show` (blocks of the screen's
@@ -480,8 +480,9 @@ classDiagram
 
 Each box is a crate (underscores stand for hyphens). The seven coder tools are
 `prepare_workspace`, `run_command`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
-`open_pull_request` and `ask_user`. An eighth type, `Redacting`, wraps each of
-them to scrub secrets (`bin/adam-coder/src/tools/mod.rs`). `CoderAgent`
+`open_pull_request` and `ask_user` (the tool of `adam-ui`, under the coder's own words about when to ask), and
+`adam-ui` adds `show` and `ui_catalog` and a source of the tools of the conversation's endpoint. An eighth type,
+`Redacting`, wraps each of them to scrub secrets (`bin/adam-coder/src/tools/mod.rs`). `CoderAgent`
 wraps the `LlmAgent` that `adam-assembly` builds from `bin/adam-coder/agent/instructions.md` (the prompt, the
 limits and the A2A card are that file) and adds its completion rule. `FnTool` is a tool made from a closure. A tool
 reads shared dependencies with `ToolCtx::state::<T>()` (given to the agent with
@@ -1707,7 +1708,8 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
 
 * **The tools** (`tools/`): `prepare_workspace`, `run_command` (looking around: no check, no cycle,
   changes to HEAD, the branch, the working tree, refs and git configuration are undone), `delegate_to_opencode`, `run_checks` (the project's own checks only),
-  `commit_and_push`, `open_pull_request` and `ask_user`.
+  `commit_and_push`, `open_pull_request` and `ask_user`, then the screen's `show` and `ui_catalog` (all three
+  of `adam-ui`: `Ui::tools()`).
 * **The prompt and the card** (`agent/instructions.md`, embedded by `build.rs`, or read at startup from the
   folder `ADAM_AGENT_DIR` names): the agent says its name (`vars.display_name`, `Coder`; the card says it too),
   answers a greeting with a greeting and "what can you do?" in plain words (adam-rs#55); the system prompt with its `{{max_check_cycles}}`, the loop's limits and the
@@ -1952,6 +1954,10 @@ flowchart LR
   `docker compose --profile app up -d coder`, no rebuild. `dev/greeting-e2e.sh` runs "hi" through the stack (the
   scripted `mock-coder` greets from the two persona lines of the prompt: its name and a one-sentence summary), lets
   the same task go on to a pull request, and restarts the coder on an edited copy of the folder.
+  `dev/coder-choices-e2e.sh` asks the coder, with the screen's catalog in the message's metadata, for three questions
+  at once: the status carries the question and an `application/a2ui+json` form, the person's answers go back as one
+  A2UI action and the coder's next words quote them (the mock `mock-coder` scripts it for a task that carries
+  `[mock:choices]`); on a screen it cannot read the options are text ([ADR 0006](decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md)).
 * The coder waits until `postgres`, `mock-openai`, `mock-github` and `git-server`
   are healthy.
 * The service `agent` is [`adam-agent`](../bin/adam-agent/README.md) from the **coder's image** with the entrypoint
@@ -1970,7 +1976,7 @@ flowchart LR
   real clients (`OpenAiCompatible`, `GitHub`) against them, so the mappings
   cannot rot. The `image` job of `.github/workflows/coder.yml` builds the coder image once, smoke-tests both
   binaries in it (`docker/coder/test/container-smoke.sh`, `agent-smoke.sh`) and runs the scenarios against the
-  stack, `dev/agent-e2e.sh` among them.
+  stack, `dev/agent-e2e.sh` and `dev/coder-choices-e2e.sh` among them.
 
 ## The generic agent
 
@@ -1978,7 +1984,7 @@ flowchart LR
 serves **any agent folder** and has no agent of its own. Its `serve` (`bin/adam-agent/src/serve.rs`) reads the
 folder `ADAM_AGENT_DIR` names, which is required by every role (`folder::load`, `AgentFolder::load`), logs the same
 `agent files` line as the coder, makes the card from it (`card_of`), and, for the roles that run workers, assembles
-the agent (`assemble`: `AgentDef::connect_mcp` under the `MCP_ALLOW_*` policy, `bind` with `ask_user`, `model`) and
+the agent (`assemble`: `AgentDef::connect_mcp` under the `MCP_ALLOW_*` policy, `bind` with the tools of `adam-ui`, `model`) and
 registers it (`Assembly::register`: the root and its subagents); a control plane registers the start-only half
 (`LlmStarter`). Then it hands `Agents { name, card, register, options }` to `adam_service::serve`, which is the process
 of [How a binary composes them](#how-a-binary-composes-them). The sequence and the lifecycle of that startup are in
@@ -1988,7 +1994,7 @@ its [README](../bin/adam-agent/README.md#the-process) and in
 What the diagrams cannot say:
 
 * **There is no embedded agent and no default**: without `ADAM_AGENT_DIR` no role starts (exit 78).
-* **The agent's tools are its folder's**: `ask_user`, the tools of its MCP servers (`<server>__<tool>`), the
+* **The agent's tools are its folder's**: `ask_user`, `show` and `ui_catalog` (the screen's, of `adam-ui`), the tools of its MCP servers (`<server>__<tool>`), the
   skills' tools and one per subagent. Nothing in the binary touches a filesystem, a shell or git.
 * **Runs are scoped by the agent's name**, so several `adam-agent` services with different folders share one
   database (`RuntimeTaskBackend` refuses another agent's runs, a worker claims only what it registered). They are

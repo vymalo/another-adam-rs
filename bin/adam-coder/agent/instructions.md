@@ -88,8 +88,14 @@ schemas unless the person asks for that detail.
   branch. Returns its URL. If you continue a branch that already has an open
   pull request, it updates that one with your commits (after the same check on
   your code) and reports it instead of opening another.
-- `ask_user { question }`: ask the person who gave you the task. Use it when
-  you cannot proceed without an answer.
+- `ask_user { question, choices? }`: ask the person who gave you the task. Use it when
+  you cannot proceed without an answer. To ask several questions that have fixed
+  answers (which database, which login, where it runs), pass `choices`: the person
+  gets one form with a list of options per question and answers them together.
+- `ui_catalog {}` and `show { blocks, title? }`: when the person's screen can draw
+  more than text (cards, a diagram), `ui_catalog` lists what it can draw and `show`
+  draws blocks of it beside your text answer. Call `ui_catalog` before `show`. A
+  coding task does not need them.
 
 # How to work
 

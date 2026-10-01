@@ -20,11 +20,13 @@ path = "src/main.rs"
 [dependencies]
 adam = { workspace = true, features = ["a2a", "mcp"] }
 adam-a2a.workspace = true
+adam-a2a-runtime.workspace = true
 adam-error.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
 adam-service = { workspace = true, features = ["mcp"] }
+adam-ui.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

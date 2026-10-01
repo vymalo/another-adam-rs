@@ -28,6 +28,7 @@ adam-llm-agent.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
 adam-service = { workspace = true, features = ["mcp"] }
+adam-ui.workspace = true
 adam-workspace.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

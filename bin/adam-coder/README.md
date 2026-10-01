@@ -47,18 +47,66 @@ sequenceDiagram
 | `run_checks { command, cwd? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
 | `commit_and_push { message }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
 | `open_pull_request { title, body, accept_red_checks? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
-| `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. Declared `#[tool(asks_user)]`, so `adam-assembly` refuses to give it to a subagent |
+| `ask_user { question, choices? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions of 2 to 8 options, as one form) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
+| `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the seven.
+folder](#mcp-tools-from-the-folder)); they are not part of the nine. The tools the conversation's endpoint lists
+(`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
+this crate (see [Asking with choices](#asking-with-choices)).
 
-Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Six tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the six is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
 `CoderAgent` gives the agent the `ToolEnv` as state (`LlmAgentBuilder::state`), which is where the tools read it.
 The specs the model sees are pinned by `tests/fixtures/tool-specs/*.json` (see [Tests](#tests)); tool names and the
 journal's `tool:<call id>` step names are unchanged, so a run started before the port replays.
+
+### Asking with choices
+
+The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
+(`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
+`thread-tools/v1`; `agent_card_from` adds them, `tests/fixtures/agent/card.json` pins them), reads A2A messages as one from
+a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, choices? }`:
+three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, and the
+person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
+
+```mermaid
+sequenceDiagram
+  participant S as Screen (orchestrator)
+  participant C as Coder (A2A server and worker)
+  participant M as Model
+  participant E as Thread tools endpoint
+  S->>C: message: text, ui-catalog/v1 {version, digest}, the catalog inline or only referenced, thread-tools/v1 {url, token}
+  C->>E: tools/list (at every model turn, with the grant)
+  E-->>C: get_ui_catalog and the tools attached since
+  C->>M: the coder's tools, ask_user, show, ui_catalog, then the listed ones
+  M->>C: ask_user {question, choices: [db, auth, deploy]}
+  C->>C: the catalog: inline, held by digest, or get_ui_catalog once (digest checked)
+  C-->>S: input-required: the question and an application/a2ui+json surface (one Choices)
+  S->>C: an A2UI action: answers db=pg, auth=keycloak, deploy=compose
+  C->>M: the tool result "The person answered through the interface: - db: pg ..."
+  M-->>C: "Going with Postgres, Keycloak and Compose."
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Asking: the model calls ask_user with choices
+  Asking --> Form: the screen's catalog is read and has Choices
+  Asking --> TextQuestion: no catalog, none with Choices, or it cannot be read now
+  Form --> Waiting: input-required with the surface
+  TextQuestion --> Waiting: input-required, the options listed in the text
+  Waiting --> Answered: the A2UI action (or the person's words)
+  Answered --> [*]: the answers are the tool result
+```
+
+What the deployment decides: the URL a message announces for the conversation's tools is an MCP server's, so
+**`MCP_ALLOW_INSECURE=true` is needed when the orchestrator is reached over plain `http` on another host** (a compose
+stack: `http://orchestrator:8080`); https and loopback need nothing. Without a usable grant (none, expired, refused) the
+coder offers no thread tools and asks in text; none of it fails a run. The mock model asks the three questions for a
+task that carries `[mock:choices]` (`dev/wiremock/mock-openai/mappings/coder-choices.json`), and
+`dev/coder-choices-e2e.sh` runs the chain through the compose stack. How a *live* model uses `choices` is *unverified*.
 
 ### Artifacts
 
@@ -836,6 +884,13 @@ database of its own, so the role needs `CREATEDB`):
   (run fails after the retry budget, with the child's stderr) and once
   (retried, completes); two concurrent tasks on one repository (two branches,
   two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`).
+  Asking with choices, over A2A with the screen's real catalog (a copy of the web's, in
+  `adam-ui`'s fixtures): three questions as one form (`input-required` with the question as text and one
+  `application/a2ui+json` part, a Choices of db, auth and deploy under the screen's `catalogId`), the person's
+  A2UI action as the answer, the model's next words and the run going on to the end; the catalog read again
+  over a fake thread-tools endpoint when the message only names its digest, and the tools of that endpoint offered
+  to the model and called; a screen the coder cannot read (no inline catalog, no grant) getting the options as
+  text, with no A2UI part.
 * `tests/binary.rs`: the `adam-coder` binary as a process. All problems of a
   bad configuration reported together with exit 78; Postgres unreachable at boot
   (a clear "connecting to Postgres: ..." chain in exactly one `adam-coder failed`

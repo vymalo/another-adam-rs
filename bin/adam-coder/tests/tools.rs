@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use adam_coder::ToolEnv;
 use adam_coder::opencode::OpenCodeLaunch;
-use adam_coder::tools::ask::AskUser;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::delegate::DelegateToOpenCode;
 use adam_coder::tools::inspect::RunCommand;
@@ -1262,11 +1261,15 @@ async fn a_crashing_opencode_is_a_transient_error_and_a_missing_one_is_permanent
 #[tokio::test]
 async fn ask_user_needs_input_with_the_question() {
     let rig = Rig::new().await;
-    let out = AskUser
+    // The coder's `ask_user` is the screen's (`adam-ui`), under the coder's own words about when to
+    // ask: with no choices it is the question, as text.
+    let ask = rig.fx.env.ui.tools().get("ask_user").cloned().unwrap();
+    assert!(ask.asks_user());
+    let out = ask
         .call(&rig.ctx, json!({"question": " Which repo? "}))
         .await;
     assert_eq!(out, Err(ToolError::needs_input("Which repo?")));
-    assert!(is_error(&AskUser.call(&rig.ctx, Value::Null).await));
+    assert!(is_error(&ask.call(&rig.ctx, Value::Null).await));
 }
 
 /// Arguments the schema does not allow are the model's mistake, not the run's: it gets the reason

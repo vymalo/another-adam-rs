@@ -14,9 +14,10 @@ A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/ \
 
 It is the second binary over [`adam-service`](../../crates/adam-service/README.md), the first being
 [`adam-coder`](../adam-coder/README.md); the process (the store, the roles, the notifications, the exit
-codes) is the same code. What is different is the agent: `adam-coder` has an embedded one and seven tools
+codes) is the same code. What is different is the agent: `adam-coder` has an embedded one and six tools of its own
 written in Rust (a worktree, OpenCode, checks, a pull request); `adam-agent` has **none of its own**, and the
-only tool it brings is `ask_user`. Everything else an agent can do comes from its folder.
+only tools it brings are the person's screen: `ask_user`, `show` and `ui_catalog`
+([`adam-ui`](../../crates/adam-ui/README.md)). Everything else an agent can do comes from its folder.
 
 ## The agent folder
 
@@ -34,16 +35,32 @@ applies at the next start, and a restart is a deploy.
 | `limits:` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens` |
 | `model:` | the model alias of the agent, when it should not be `MODEL` |
 | `vars:` | `{{placeholders}}` of the prompt. **Every var needs a value in the file**: nothing in this binary supplies one, so a var declared without a value (or one the prompt does not use, or a placeholder `vars` does not declare) stops the process at startup, naming it |
-| `tools:` | optional; selects among the tools the agent has (`ask_user`, the MCP tools `<server>__<tool>`, the skills' tools, the subagents). `linear__*` takes a server's tools. A name that is none of them is refused with a suggestion |
+| `tools:` | optional; selects among the tools the agent has (`ask_user`, `show`, `ui_catalog`, the MCP tools `<server>__<tool>`, the skills' tools, the subagents). `linear__*` takes a server's tools. A name that is none of them is refused with a suggestion |
 | the body | the system prompt |
 | `skills/` | Agent Skills: a catalog the model loads from on demand (`load_skill`, `read_skill_file`) |
 | `subagents/` | assembled and **registered beside the agent** (`<name>/<subagent>`): one tool per subagent, a child run with its own prompt and tools. A subagent gets only the tools it lists, and not `ask_user` (nobody would answer it) |
 | `mcp.json` | MCP servers whose tools the agent gets, see [below](#mcp-servers-from-the-folder). Connected by the **workers** |
 | `schedules/` | read, not run: a warning says so |
 
-The built-in tool is `ask_user { question }`: the run parks, A2A reports `input-required` with the question,
-and the person's answer resumes it. It is the same tool `adam-coder` has, with a description that fits any
-agent.
+The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/README.md)), and the same ones
+`adam-coder` has, with descriptions that fit any agent:
+
+* `ask_user { question, choices? }`: the run parks, A2A reports `input-required` with the question, and the person's
+  answer resumes it. With `choices` (up to 8 questions of 2 to 8 options) and a screen that can draw a form, the
+  question carries one Choices surface and the answers come back as the result (`- db: pg`); otherwise the options
+  are listed in the question's text. `asks_user` is `true`, so a subagent never has it.
+* `show { blocks, title? }` and `ui_catalog {}`: draw blocks of the components the person's screen has (cards, a
+  diagram), and list them. They answer "answer in text" when the screen sent no catalog. A folder that does not want
+  them lists the tools it does want in `tools:`.
+* **The conversation's tools.** A message from the orchestration layer's chat announces one MCP endpoint for the
+  conversation (`thread-tools/v1`); whatever it lists is offered to the model at every turn under its listed name
+  (`get_ui_catalog` today; the relayed tools of attached servers later), through a `ToolSource` that `assemble`
+  gives every agent. The URL is an MCP server's: **`MCP_ALLOW_INSECURE=true`** lets it be plain `http` on another
+  host (a compose stack); https and loopback need nothing. No grant, or an expired one, offers nothing.
+
+The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1` and `thread-tools/v1`
+(`card_of`), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
+whose messages carry none of that is not affected.
 
 A folder that follows the **persona convention** (the body opens with `Your name is {{display_name}}.` and a line
 `In one sentence: <summary>.`, the summary without `"` and ending at its first period) is greeted by the mock
@@ -159,7 +176,7 @@ sequenceDiagram
   M->>S: serve(Config, shutdown)
   S->>F: load(ADAM_AGENT_DIR), log `agent files`
   alt a role that runs workers
-    S->>A: connect_mcp(policy), bind(ask_user), model(client, alias)
+    S->>A: connect_mcp(policy), bind(ask_user, show, ui_catalog) and the thread-tools source, model(client, alias)
     A-->>S: Agents { the whole agent }
   else control plane
     S->>A: the start-only half (name and init)
@@ -203,10 +220,9 @@ The binary is `main.rs` over a small library, so everything it does is testable 
 | `serve(config, shutdown)` | the process: folder, card, assembly, then `adam_service::serve` |
 | `folder::load(path)`, `folder::log(&folder)` | read the folder (every diagnostic in the error), say which files run |
 | `card_of(&def, &public_url)` | the A2A card the files declare |
-| `assemble(def, model, alias, &policy)` | connect the MCP servers, bind `ask_user`, give the root and each subagent the model: the `Assembly` |
+| `assemble(def, model, alias, &policy)` | connect the MCP servers, bind `ask_user`, `show` and `ui_catalog` and the thread-tools source (the `policy` is also the one for the thread-tools URL), give the root and each subagent the model: the `Assembly` |
 | `agents(def, card, workers)` | the `Agents` for `adam_service::serve` or a composition of your own: the whole agent with `workers: Some(WorkerParts)`, its starter with `None` |
 | `AgentError`, `exit_code(&err)` | why a step failed, and the exit code of a chain of causes |
-| `tools::ask_user` (`AskUser`) | the one built-in tool |
 
 ## Image and compose
 
@@ -241,10 +257,10 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 ## Tests
 
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
-  a control plane that needs no model, secrets hidden from `Debug`. `src/tools.rs`: the spec of `ask_user`.
+  a control plane that needs no model, secrets hidden from `Debug`. 
 * `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's; **a chat
   folder answers "hi" in role over A2A** (the task completes with the greeting its two persona lines give, the
-  model is sent the folder's rendered prompt and `ask_user` only); an edited folder says the edited words; `ask_user`
+  model is sent the folder's rendered prompt and the screen's three tools only); an edited folder says the edited words; `ask_user`
   parks the run as `input-required` and the answer resumes it; a control plane starts a run that a worker over the
   same store completes; the tools of an `mcp.json` server are offered and a call reaches the server with the
   token from the environment; `${VAR}` in a URL is refused unless allowed; the exit code of a server that is down
