@@ -708,3 +708,11 @@ pub fn edit_instructions(folder: &TempDir, edit: impl FnOnce(String) -> String) 
     let text = std::fs::read_to_string(&path).unwrap();
     std::fs::write(path, edit(text)).unwrap();
 }
+
+/// The JSON of a raw HTTP response (see [`raw`]): from the first `{` to the last `}`, which skips
+/// the status line and the headers and any chunked-encoding framing.
+pub fn json_of(response: &str) -> Value {
+    let start = response.find('{').expect("a JSON body");
+    let end = response.rfind('}').expect("a JSON body");
+    serde_json::from_str(&response[start..=end]).expect("the body is JSON")
+}

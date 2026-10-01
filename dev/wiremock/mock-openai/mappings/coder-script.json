@@ -1,8 +1,129 @@
 {
   "mappings": [
     {
-      "name": "coder script 0: prepare_workspace",
+      "name": "coder script: greeting",
       "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "doesNotContain": "[mock:no-opencode]"
+          },
+          {
+            "doesNotContain": "tool_call_id"
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.messages[1].content",
+              "matches": "(?is)^\\s*(hi|hello|hey)\\b.*"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-greeting",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "Hi! I'm {{regexExtract (jsonPath request.body '$.messages[0].content') 'Your name is ([A-Za-z0-9 _-]+)' 'name'}}{{name.0}}. {{regexExtract (jsonPath request.body '$.messages[0].content') 'In one sentence: ([^.]+)' 'summary'}}{{summary.0}}. Which repository should I work on, and what should I change?"
+              },
+              "logprobs": null,
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script 0b: prepare_workspace after a greeting",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "doesNotContain": "[mock:no-opencode]"
+          },
+          {
+            "contains": "stop0000"
+          },
+          {
+            "doesNotContain": "coder-call-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-coder-call-1",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "coder-call-1",
+                    "type": "function",
+                    "function": {
+                      "name": "prepare_workspace",
+                      "arguments": "{\"repo_url\":\"http://git-server:8080/local/sandbox.git\",\"base_branch\":\"main\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script 0: prepare_workspace",
+      "priority": 2,
       "request": {
         "method": "POST",
         "urlPathPattern": "(/v1)?/chat/completions",
@@ -659,7 +780,7 @@
     },
     {
       "name": "coder script: off-script request is a 404",
-      "priority": 2,
+      "priority": 3,
       "request": {
         "method": "POST",
         "urlPathPattern": "(/v1)?/chat/completions",

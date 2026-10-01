@@ -41,8 +41,8 @@ if [ "$code" = 200 ]; then ok "GET /healthz is 200"; else bad "GET /healthz is $
 
 # The agent card is public (no token) and names the agent and its skill.
 code=$(status "$base/.well-known/agent-card.json")
-if [ "$code" = 200 ] && [ "$(jq -r '.name' "$body")" = adam-coder ]; then
-  ok "the agent card is public and names adam-coder"
+if [ "$code" = 200 ] && [ "$(jq -r '.name' "$body")" = Coder ]; then
+  ok "the agent card is public and names the agent Coder"
 else
   bad "agent card: status $code, name $(jq -r '.name' "$body" 2>/dev/null || echo '?')"
 fi

@@ -264,10 +264,11 @@ mod tests {
         })
     }
 
-    /// The card is the one the Rust literal used to build. The golden file was captured from that
-    /// literal before it was deleted; only the version follows the crate's.
+    /// The card is the golden `tests/fixtures/agent/card.json`: the one the Rust literal used to
+    /// build, with the name `Coder` since #55 (the golden changes in the same commit as the file);
+    /// only the version follows the crate's.
     #[test]
-    fn the_card_from_the_agent_file_equals_the_old_literal() {
+    fn the_card_from_the_agent_file_equals_the_golden() {
         let mut golden: Value =
             serde_json::from_str(include_str!("../tests/fixtures/agent/card.json"))
                 .expect("the golden card is JSON");

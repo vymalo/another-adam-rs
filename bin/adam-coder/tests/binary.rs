@@ -449,7 +449,7 @@ async fn serves_card_and_healthz_then_stops_cleanly_on_sigterm() {
     let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
     assert_eq!(status, 200, "{card}");
     assert!(card.contains(PUBLIC_URL), "{card}");
-    assert!(card.contains("adam-coder"), "{card}");
+    assert_eq!(common::json_of(&card)["name"], "Coder", "{card}");
     let (status, _) = common::raw(addr, "POST", "/", None).await;
     assert_eq!(status, 401, "an unauthenticated call is refused");
     assert!(
@@ -631,7 +631,7 @@ async fn a_control_plane_serves_the_card_of_its_agent_folder() {
     let tmp = tempfile::tempdir().unwrap();
     let agent = folder();
     edit_instructions(&agent, |text| {
-        text.replacen("name: adam-coder", "name: Cody", 1).replacen(
+        text.replacen("  name: Coder", "  name: Cody", 1).replacen(
             "limits:",
             "favourite_colour: green\nlimits:",
             1,
@@ -647,8 +647,7 @@ async fn a_control_plane_serves_the_card_of_its_agent_folder() {
 
     let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
     assert_eq!(status, 200, "{card}");
-    assert!(card.contains("Cody"), "{card}");
-    assert!(!card.contains("adam-coder"), "{card}");
+    assert_eq!(common::json_of(&card)["name"], "Cody", "{card}");
     assert!(card.contains(PUBLIC_URL), "{card}");
 
     let line = p

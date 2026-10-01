@@ -2644,7 +2644,8 @@ async fn wrong_token_on_the_coder_router_is_401(store: DynStore) {
 
     let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
     assert_eq!(status, 200, "{card}");
-    assert!(card.contains("adam-coder") && card.contains(&format!("http://{addr}/")));
+    assert_eq!(common::json_of(&card)["name"], "Coder", "{card}");
+    assert!(card.contains(&format!("http://{addr}/")));
     let (status, _) = common::raw(addr, "GET", "/healthz", None).await;
     assert_eq!(status, 200);
 

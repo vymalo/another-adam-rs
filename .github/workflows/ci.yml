@@ -263,6 +263,25 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"model":"mock-coder","messages":[{"role":"user","content":"add hello.txt"}]}' \
             | jq -e '.choices[0].message.tool_calls[0].function.name == "prepare_workspace"' > /dev/null
+          # mock-openai, model mock-coder: a greeting is answered with the name and the one-sentence
+          # summary that the two persona lines of the system prompt give (what the coder's
+          # `agent/instructions.md` opens with), not with the workspace script ...
+          want="I'm Coder. I take a repository you name. Which repository should I work on"
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-coder","messages":[{"role":"system","content":"Your name is Coder.\nIn one sentence: I take a repository you name.\n"},{"role":"user","content":"Hi"}]}' \
+            | jq -e --arg want "$want" '.choices[0].finish_reason == "stop" and (.choices[0].message.content | contains($want))' > /dev/null
+          # ... a persona that is edited gives another answer, with no rebuild ...
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-coder","messages":[{"role":"system","content":"Your name is Cody.\nIn one sentence: I only fix typos.\n"},{"role":"user","content":"hello there"}]}' \
+            | jq -e '.choices[0].message.content | contains("Cody. I only fix typos.")' > /dev/null
+          # ... and once the person has answered (the stop is the `ask_user` call stop00001 in the
+          # history), the script goes on with the workspace.
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-coder","messages":[{"role":"system","content":"x"},{"role":"user","content":"Hi"},{"role":"assistant","content":"Hi!","tool_calls":[{"id":"stop00001","type":"function","function":{"name":"ask_user","arguments":"{}"}}]},{"role":"tool","tool_call_id":"stop00001","content":"http://git-server:8080/local/sandbox.git, add hello.txt"}]}' \
+            | jq -e '.choices[0].message.tool_calls[0] | .id == "coder-call-1" and .function.name == "prepare_workspace"' > /dev/null
           # mock-github: no open pull requests; creating one answers 201.
           test "$(curl -fsS 'http://127.0.0.1:8082/repos/local/sandbox/pulls?head=local:agent/x&state=open')" = '[]'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/repos/local/sandbox/pulls \

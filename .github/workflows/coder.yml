@@ -8,7 +8,9 @@ name: coder
 # The image is built on pull requests too and smoke-tested as a container (a
 # Postgres service, a stub model, a real start under tini), then run through
 # the compose stack (scripted models, a git remote, a mock GitHub) with a task
-# that must end in a branch and one pull request (dev/coder-e2e.sh). On main
+# that must end in a branch and one pull request (dev/coder-e2e.sh), and with
+# "Hi", which must get a greeting that says the agent's name, and with a changed
+# agent folder mounted in place of the default one (dev/greeting-e2e.sh). On main
 # the very image that passed is the one pushed.
 #
 # The bump follows the pattern of vymalo/another-agentic-system#11 (deploy-bump):
@@ -239,6 +241,8 @@ jobs:
             postgres mock-openai mock-github git-server coder
           NO_OPENCODE=1 sh dev/coder-e2e.sh
           sh dev/coder-e2e.sh
+          # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
+          sh dev/greeting-e2e.sh
       - name: Compose e2e logs
         if: failure() && steps.guard.outputs.ready == 'true'
         run: docker compose --profile app logs --no-color

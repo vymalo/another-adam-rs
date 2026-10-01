@@ -103,8 +103,9 @@ stateDiagram-v2
 
 * **Editing `instructions.md` in the mounted folder changes the answer after a restart, with no build.**
   `bin/adam-coder/tests/agent_files.rs` shows the model being sent the edited prompt; `tests/binary.rs`
-  shows the card of a folder served by a control plane and every refusal; the root README ("Changing
-  what the coder says") shows the compose way.
+  shows the card of a folder served by a control plane and every refusal; `dev/greeting-e2e.sh` does it
+  through the stack (a restart on an edited copy of the folder, "hi" answered with the other name, the default
+  folder put back); the root README ("Changing what the coder says") has the compose way.
 * **The embedded copy is the default and the fallback**, so an image that is run with no mount, and every
   existing deployment, behaves as before. The Helm chart is not changed and does not expose the variable
   yet: it has no volume for a folder, so mounting a ConfigMap at a path is a chart change of its own
