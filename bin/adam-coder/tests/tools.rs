@@ -16,6 +16,7 @@ use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::notes::PushedBranch;
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
+use adam_coder::tools::scratch::{PublishScratch, StartScratch};
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
 use adam_runtime::{
     CancelToken, CollectingSink, RunEvent, StepEvent, StepIcon, StepKind, StepState,
@@ -3415,4 +3416,808 @@ async fn a_run_that_began_in_the_old_layout_keeps_working() {
         .await
         .unwrap();
     assert_eq!(in_old.content, "wip\n");
+}
+
+// ------------------------------------------------------------------ scratch projects
+
+/// The empty tree: what the first commit of a repository that was just created holds.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// The directory of the slot `dir` of the rig's run.
+fn slot_of(rig: &Rig, dir: &str) -> std::path::PathBuf {
+    common::slot_dir(&rig.fx.root, &rig.ctx.run_id().to_string())
+        .parent()
+        .unwrap()
+        .join(dir)
+}
+
+async fn start_scratch(rig: &Rig, name: &str) -> ToolOutput {
+    let out = StartScratch
+        .call(&rig.ctx, json!({"name": name}))
+        .await
+        .expect("start_scratch");
+    assert!(!out.is_error, "{}", out.content);
+    out
+}
+
+/// A scratch project that holds a script and the check that proves it: what the model builds
+/// before any repository is named.
+async fn build_fib(rig: &Rig, repo: Option<&str>) {
+    let at = |extra: Value| {
+        let mut args = extra;
+        if let Some(repo) = repo {
+            args["repo"] = json!(repo);
+        }
+        args
+    };
+    for (path, content) in [
+        ("fib.sh", "echo 0 1 1 2 3 5 8\n"),
+        ("check.sh", "test \"$(sh fib.sh)\" = \"0 1 1 2 3 5 8\"\n"),
+    ] {
+        let out = WriteFile
+            .call(&rig.ctx, at(json!({"path": path, "content": content})))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+    }
+}
+
+#[tokio::test]
+async fn a_scratch_project_is_built_checked_and_committed_locally() {
+    let rig = Rig::new().await;
+    let started = start_scratch(&rig, "fib").await;
+    assert!(
+        started.content.contains("slot: fib\n"),
+        "{}",
+        started.content
+    );
+    assert!(
+        started.content.contains("temporary") && started.content.contains("publish_scratch"),
+        "the model is told it is temporary: {}",
+        started.content
+    );
+    let dir = slot_of(&rig, "fib");
+    assert!(dir.join(".git").is_dir(), "a repository of its own");
+    // Asking again is the same project.
+    assert_eq!(start_scratch(&rig, "fib").await.content, started.content);
+
+    // The file tools, the checks and the looking around work in it (one slot: `repo` may be left out).
+    build_fib(&rig, None).await;
+    let read = ReadFile
+        .call(&rig.ctx, json!({"path": "fib.sh"}))
+        .await
+        .unwrap();
+    assert_eq!(read.content, "echo 0 1 1 2 3 5 8\n");
+    WriteFile
+        .call(&rig.ctx, json!({"path": "notes.txt", "content": "draft\n"}))
+        .await
+        .unwrap();
+    let patched = ApplyPatch
+        .call(
+            &rig.ctx,
+            json!({"patch": one_line_patch("notes.txt", "draft", "final")}),
+        )
+        .await
+        .unwrap();
+    assert!(!patched.is_error, "{}", patched.content);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+        "final\n"
+    );
+    let listing = RunCommand
+        .call(&rig.ctx, json!({"command": "ls"}))
+        .await
+        .unwrap();
+    assert!(
+        listing.content.contains("fib.sh") && listing.content.contains("check.sh"),
+        "{}",
+        listing.content
+    );
+    // What looks around may not change the project: the change is undone, as in a worktree.
+    let changed = RunCommand
+        .call(&rig.ctx, json!({"command": "touch stray.txt"}))
+        .await
+        .unwrap();
+    assert!(changed.is_error, "{}", changed.content);
+    assert!(!dir.join("stray.txt").exists(), "the change was undone");
+    let moved = RunCommand
+        .call(
+            &rig.ctx,
+            json!({"command": "git -c user.name=x -c user.email=x@y commit --allow-empty -m sneaky"}),
+        )
+        .await
+        .unwrap();
+    assert!(moved.is_error, "HEAD may not move: {}", moved.content);
+    assert_eq!(
+        common::git(&dir, &["rev-list", "--count", "HEAD"]),
+        "1",
+        "the sneaky commit was undone"
+    );
+
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "sh ./check.sh"}))
+        .await
+        .unwrap();
+    assert!(!checked.is_error, "{}", checked.content);
+    let report = checks_of(&checked);
+    assert_eq!(report["passed"], true, "{report}");
+    assert_eq!(report["commit"], head_of(&dir).as_str());
+    assert!(
+        report["tree"].as_str().is_some_and(|t| t.len() == 40),
+        "the project's tree is what the gate binds: {report}"
+    );
+    assert!(
+        report.get("repository").is_none(),
+        "a scratch project has no repository: {report}"
+    );
+
+    // OpenCode works in it too, and the changed files are the project's.
+    let delegated = DelegateToOpenCode
+        .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
+        .await
+        .unwrap();
+    assert!(!delegated.is_error, "{}", delegated.content);
+    assert!(
+        delegated.content.contains("hello.txt"),
+        "the files OpenCode changed in the project: {}",
+        delegated.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("hello.txt")).unwrap(),
+        "hello\n"
+    );
+
+    // `commit_and_push` there is a commit and nothing else: no push, no artifact, no `branch`.
+    let committed = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: fib"}))
+        .await
+        .unwrap();
+    assert!(!committed.is_error, "{}", committed.content);
+    assert!(
+        committed.content.contains("locally") && committed.content.contains("publish_scratch"),
+        "{}",
+        committed.content
+    );
+    assert!(committed.artifacts.is_empty(), "{:?}", committed.artifacts);
+    assert_eq!(common::git(&dir, &["rev-list", "--count", "HEAD"]), "2");
+    assert!(rig.fx.agent_branches().is_empty(), "nothing was pushed");
+    let again = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: fib"}))
+        .await
+        .unwrap();
+    assert!(
+        again.content.contains("Nothing new to commit") && again.artifacts.is_empty(),
+        "{}",
+        again.content
+    );
+    assert_eq!(common::git(&dir, &["rev-list", "--count", "HEAD"]), "2");
+
+    // No pull request comes from a project that has no remote, and the way out is named.
+    let pr = OpenPullRequest
+        .call(&rig.ctx, json!({"title": "feat: fib", "body": "b"}))
+        .await;
+    assert!(is_error(&pr), "{pr:?}");
+    assert!(text(pr).contains("publish_scratch"));
+    assert!(rig.fx.created_pulls().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_scratch_project_needs_a_plain_name_that_no_repository_has() {
+    let rig = Rig::new().await;
+    for bad in ["Fib", "a b", "x.git", "../x", ".hidden", "a/b"] {
+        let out = StartScratch.call(&rig.ctx, json!({"name": bad})).await;
+        assert!(is_error(&out), "{bad:?}: {out:?}");
+        assert!(
+            text(out).contains("Give the project another name"),
+            "{bad:?}"
+        );
+    }
+    assert!(
+        !rig.fx.root.join("workspaces").exists(),
+        "a refused name made nothing"
+    );
+    // A blank name is no name: the default.
+    let blank = StartScratch
+        .call(&rig.ctx, json!({"name": "  "}))
+        .await
+        .unwrap();
+    assert!(
+        blank.content.contains("slot: scratch\n"),
+        "{}",
+        blank.content
+    );
+    // A repository of the workspace that has the name.
+    rig.prepare().await;
+    let taken = StartScratch.call(&rig.ctx, json!({"name": "remote"})).await;
+    assert!(is_error(&taken), "{taken:?}");
+    assert!(text(taken).contains("already called remote"));
+    // Two slots now: the tools ask which, and the list says what each is.
+    let out = ReadFile.call(&rig.ctx, json!({"path": "x"})).await;
+    let message = text(out);
+    assert!(
+        message.contains("a scratch project") && message.contains("`remote`"),
+        "{message}"
+    );
+}
+
+/// The person names the repository a scratch project goes to, or the tool refuses before it asks
+/// a remote anything.
+#[tokio::test]
+async fn publish_scratch_works_only_on_a_repository_the_person_named() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "fib").await;
+    build_fib(&rig, None).await;
+    let empty = rig.fx.empty_remote("fibonacci");
+    let url = empty.to_string_lossy().into_owned();
+
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await;
+    assert!(is_error(&out), "{out:?}");
+    let message = text(out);
+    assert!(
+        message.contains("not a repository the person named")
+            && message.contains("ask_user")
+            && message.contains("publish_scratch"),
+        "{message}"
+    );
+    assert!(!message.contains("prepare_workspace"), "{message}");
+    assert!(
+        common::git(&empty, &["for-each-ref"]).is_empty(),
+        "the repository was not touched"
+    );
+    assert!(
+        !rig.fx.root.join("git").exists(),
+        "no mirror was made for a repository nobody named"
+    );
+    // Not a repository at all: the workspace says so, with nothing made either.
+    let nonsense = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": "not a url"}))
+        .await;
+    assert!(is_error(&nonsense), "{nonsense:?}");
+    // Once the person has named it (what the agent records before each step), it goes through.
+    rig.say(&url).await;
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+}
+
+/// The whole path of the issue: a project is built and checked before any repository is named,
+/// then published to a repository that was just created (empty), and what was checked is what is
+/// pushed: the verdict bound to the pushed commit is the one the project earned.
+#[tokio::test]
+async fn a_scratch_project_published_to_an_empty_repository_keeps_the_checks_it_passed() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "fib").await;
+    build_fib(&rig, None).await;
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "sh ./check.sh"}))
+        .await
+        .unwrap();
+    let scratch_report = checks_of(&checked);
+    assert_eq!(scratch_report["passed"], true);
+
+    let empty = rig.fx.empty_remote("fibonacci");
+    let url = empty.to_string_lossy().into_owned();
+    rig.say(&format!("Publish it to {url}")).await;
+    assert!(common::git(&empty, &["for-each-ref"]).is_empty());
+
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let said = &out.content;
+    for needle in [
+        "Published the scratch project `fib`",
+        "slot: fibonacci\n",
+        "base branch: main\n",
+        "The repository was empty: it now has an empty first commit on main",
+        "copied (2): check.sh, fib.sh",
+        "The checks passed on exactly this code (`sh ./check.sh`, run in `fib`): commit_and_push now.",
+        "`repo: fibonacci`",
+    ] {
+        assert!(said.contains(needle), "lost {needle:?}: {said}");
+    }
+    assert!(
+        rig.progress()
+            .iter()
+            .any(|p| p.starts_with("giving ") && p.contains("its first commit on main")),
+        "{:?}",
+        rig.progress()
+    );
+    // The only push outside `agent/*`: an empty root commit, never anything of the project.
+    assert_eq!(common::git(&empty, &["rev-list", "--count", "main"]), "1");
+    assert_eq!(
+        common::git(&empty, &["rev-parse", "main^{tree}"]),
+        EMPTY_TREE
+    );
+    let repo_dir = slot_of(&rig, "fibonacci");
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("fib.sh")).unwrap(),
+        "echo 0 1 1 2 3 5 8\n"
+    );
+    // Two slots now: the tools must be told which.
+    let lost = CommitAndPush.call(&rig.ctx, json!({"message": "m"})).await;
+    assert!(is_error(&lost), "{lost:?}");
+    assert!(text(lost).contains("2 slots"));
+
+    // The same code: the check that passed on the project binds the commit in the repository.
+    let pushed = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({"message": "feat: fib", "repo": "fibonacci"}),
+        )
+        .await
+        .unwrap();
+    assert!(!pushed.is_error, "{}", pushed.content);
+    let (bound, branch) = commit_artifacts(&pushed);
+    assert_eq!(bound["passed"], true, "{bound}");
+    assert_eq!(bound["tree"], scratch_report["tree"], "{bound}");
+    assert_eq!(bound["repository"], url.as_str());
+    assert_eq!(branch["repository"], url.as_str());
+    assert_eq!(branch["base_branch"], "main");
+    let branches: Vec<String> = common::git(
+        &empty,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/agent",
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    assert_eq!(
+        bound["commit"],
+        common::git(&empty, &["rev-parse", &branches[0]]).as_str()
+    );
+    // One commit on top of the empty first commit, which holds the project.
+    assert_eq!(
+        common::git(
+            &empty,
+            &["rev-list", "--count", &format!("main..{}", branches[0])]
+        ),
+        "1"
+    );
+    assert_eq!(
+        common::git(&empty, &["show", &format!("{}:fib.sh", branches[0])]),
+        "echo 0 1 1 2 3 5 8"
+    );
+
+    let pr = OpenPullRequest
+        .call(
+            &rig.ctx,
+            json!({"title": "feat: fib", "body": "Adds fib.sh.\n\n## Verification\n- `sh ./check.sh`: passed", "repo": "fibonacci"}),
+        )
+        .await
+        .unwrap();
+    assert!(!pr.is_error, "{}", pr.content);
+    assert_eq!(pr.artifacts[0].data["repository"], url.as_str());
+    let pulls = rig.fx.created_pulls().await;
+    assert_eq!(pulls.len(), 1);
+    assert_eq!(pulls[0]["base"], "main", "against the empty first commit");
+
+    // The project was left as it was, and says where it went: what changes in it is not the pull
+    // request's, and the tools that change it say so.
+    let wrote = WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "late.txt", "content": "x\n", "repo": "fib"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        wrote.content.contains("was published to") && wrote.content.contains(&url),
+        "{}",
+        wrote.content
+    );
+    let committed = CommitAndPush
+        .call(&rig.ctx, json!({"message": "wip", "repo": "fib"}))
+        .await
+        .unwrap();
+    assert!(
+        committed.content.contains("was published to") && committed.artifacts.is_empty(),
+        "{}",
+        committed.content
+    );
+    let started = StartScratch
+        .call(&rig.ctx, json!({"name": "fib"}))
+        .await
+        .unwrap();
+    assert!(
+        started.content.contains("was published to"),
+        "{}",
+        started.content
+    );
+}
+
+/// A repeated call (a crash before the result was journaled) finds the repository's slot, copies
+/// nothing new and pushes nothing.
+#[tokio::test]
+async fn publishing_twice_is_the_same_publication() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "fib").await;
+    build_fib(&rig, None).await;
+    let empty = rig.fx.empty_remote("fibonacci");
+    let url = empty.to_string_lossy().into_owned();
+    rig.say(&url).await;
+    let first = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await
+        .unwrap();
+    assert!(!first.is_error, "{}", first.content);
+    let tip = common::git(&empty, &["rev-parse", "main"]);
+
+    let second = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await
+        .unwrap();
+    assert!(!second.is_error, "{}", second.content);
+    assert!(
+        second.content.contains("unchanged (2): check.sh, fib.sh")
+            && second.content.contains("copied (0)")
+            && !second.content.contains("The repository was empty"),
+        "{}",
+        second.content
+    );
+    assert_eq!(
+        common::git(&empty, &["rev-parse", "main"]),
+        tip,
+        "nothing was pushed"
+    );
+    assert_eq!(common::git(&empty, &["rev-list", "--count", "main"]), "1");
+}
+
+/// A crash between the first commit and the slot: the remote is not empty any more, but its only
+/// commit holds nothing, so it is not "a repository that already has files".
+#[tokio::test]
+async fn a_publication_that_died_after_the_first_commit_goes_on() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "fib").await;
+    build_fib(&rig, None).await;
+    let empty = rig.fx.empty_remote("fibonacci");
+    let url = empty.to_string_lossy().into_owned();
+    rig.say(&url).await;
+    // What the first try did before it died.
+    rig.fx
+        .env
+        .workspaces
+        .initialize_empty(
+            &adam_workspace::RepoRef::new(&url, "main"),
+            &rig.fx.env.settings.identity,
+        )
+        .await
+        .unwrap();
+
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("copied (2)"), "{}", out.content);
+    assert_eq!(common::git(&empty, &["rev-list", "--count", "main"]), "1");
+}
+
+#[tokio::test]
+async fn a_repository_that_has_files_needs_a_directory_or_permission_to_overwrite() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "fib").await;
+    build_fib(&rig, None).await;
+    let lib = rig
+        .fx
+        .extra_remote("lib", &[("README.md", "lib\n"), ("fib.sh", "echo old\n")]);
+    let url = lib.to_string_lossy().into_owned();
+    rig.say(&url).await;
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "sh ./check.sh"}))
+        .await
+        .unwrap();
+    assert!(!checked.is_error);
+
+    // Not into the root of somebody's project on the model's say-so.
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await;
+    assert!(is_error(&out), "{out:?}");
+    let message = text(out);
+    assert!(
+        message.contains("already has files")
+            && message.contains("`path`")
+            && message.contains("overwrite")
+            && message.contains("ask_user"),
+        "{message}"
+    );
+    let repo_dir = slot_of(&rig, "lib");
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("fib.sh")).unwrap(),
+        "echo old\n",
+        "nothing was copied"
+    );
+    // (The repository is in the workspace, as prepare_workspace would have it.)
+    assert!(repo_dir.join("README.md").is_file());
+
+    // Into a directory of it: fine, and the code is not what was checked, so the model is told.
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url, "path": "apps/fib"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("not the code the checks ran on")
+            && out.content.contains("run the checks again in `lib`"),
+        "{}",
+        out.content
+    );
+    assert!(repo_dir.join("apps/fib/fib.sh").is_file());
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("fib.sh")).unwrap(),
+        "echo old\n"
+    );
+    // A hostile directory is refused by the workspace, and nothing moves.
+    for bad in ["../x", "/etc", ".git/hooks", "a/.GIT/b"] {
+        let out = PublishScratch
+            .call(&rig.ctx, json!({"repo_url": url, "path": bad}))
+            .await;
+        assert!(is_error(&out), "{bad}: {out:?}");
+    }
+
+    // The same files, a changed one: a collision lists it, changes nothing, and says what to ask.
+    std::fs::write(slot_of(&rig, "fib").join("fib.sh"), "echo new\n").unwrap();
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url, "path": "apps/fib"}))
+        .await;
+    assert!(is_error(&out), "{out:?}");
+    let message = text(out);
+    assert!(
+        message.contains("Nothing was copied")
+            && message.contains("fib.sh: the repository has a file here with other content")
+            && message.contains("overwrite: true"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("apps/fib/fib.sh")).unwrap(),
+        "echo 0 1 1 2 3 5 8\n"
+    );
+    // With permission it replaces what differs, and only that.
+    let out = PublishScratch
+        .call(
+            &rig.ctx,
+            json!({"repo_url": url, "path": "apps/fib", "overwrite": true}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("copied (1): fib.sh"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("apps/fib/fib.sh")).unwrap(),
+        "echo new\n"
+    );
+    // `overwrite` is also the person's word for the root of a repository with files, and it
+    // replaces `fib.sh` there.
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url, "overwrite": true}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("fib.sh")).unwrap(),
+        "echo new\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("README.md")).unwrap(),
+        "lib\n",
+        "what the project does not have is left alone"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_project_is_not_published_and_leaves_the_repository_empty() {
+    let rig = Rig::new().await;
+    // No project at all.
+    let empty = rig.fx.empty_remote("fibonacci");
+    let url = empty.to_string_lossy().into_owned();
+    rig.say(&url).await;
+    let none = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await;
+    assert!(is_error(&none), "{none:?}");
+    assert!(text(none).contains("start_scratch"));
+    // A project with nothing in it.
+    start_scratch(&rig, "fib").await;
+    let nothing = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await;
+    assert!(is_error(&nothing), "{nothing:?}");
+    assert!(text(nothing).contains("has no files yet"));
+    assert!(
+        common::git(&empty, &["for-each-ref"]).is_empty(),
+        "an empty project does not even give the repository its first commit"
+    );
+}
+
+#[tokio::test]
+async fn which_scratch_project_to_publish_is_said_when_there_are_several() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "fib").await;
+    start_scratch(&rig, "sort").await;
+    for (repo, content) in [("fib", "fib\n"), ("sort", "sort\n")] {
+        WriteFile
+            .call(
+                &rig.ctx,
+                json!({"path": format!("{repo}.txt"), "content": content, "repo": repo}),
+            )
+            .await
+            .unwrap();
+    }
+    let empty = rig.fx.empty_remote("algorithms");
+    let url = empty.to_string_lossy().into_owned();
+    rig.say(&url).await;
+    let which = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await;
+    assert!(is_error(&which), "{which:?}");
+    let message = text(which);
+    assert!(
+        message.contains("2 scratch projects")
+            && message.contains("`fib`")
+            && message.contains("`sort`"),
+        "{message}"
+    );
+    let unknown = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url, "scratch": "nope"}))
+        .await;
+    assert!(is_error(&unknown), "{unknown:?}");
+    assert!(text(unknown).contains("is not a scratch project"));
+    assert!(common::git(&empty, &["for-each-ref"]).is_empty());
+
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url, "scratch": "sort"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let repo_dir = slot_of(&rig, "algorithms");
+    assert!(repo_dir.join("sort.txt").is_file() && !repo_dir.join("fib.txt").exists());
+    // A repository slot is not a project.
+    let not_a_project = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url, "scratch": "algorithms"}))
+        .await;
+    assert!(is_error(&not_a_project), "{not_a_project:?}");
+}
+
+#[tokio::test]
+async fn a_cancelled_run_publishes_nothing() {
+    let mut rig = Rig::new().await;
+    let token = CancelToken::new();
+    rig.ctx = rig.ctx.with_cancel_token(token.clone());
+    start_scratch(&rig, "fib").await;
+    build_fib(&rig, None).await;
+    let empty = rig.fx.empty_remote("fibonacci");
+    let url = empty.to_string_lossy().into_owned();
+    rig.say(&url).await;
+    token.cancel();
+
+    let out = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await;
+    assert!(
+        matches!(&out, Err(ToolError::Permanent(m)) if m.contains("cancelled")),
+        "{out:?}"
+    );
+    assert!(
+        common::git(&empty, &["for-each-ref"]).is_empty(),
+        "not even the first commit was pushed"
+    );
+}
+
+/// Scratch history is not carried (ADR 0008): the pull request holds the commits made in the
+/// repository, and the project's own commits stay in the project.
+#[tokio::test]
+async fn the_history_of_the_project_is_not_carried_into_the_repository() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "fib").await;
+    build_fib(&rig, None).await;
+    CommitAndPush
+        .call(&rig.ctx, json!({"message": "wip: fib"}))
+        .await
+        .unwrap();
+    let empty = rig.fx.empty_remote("fibonacci");
+    let url = empty.to_string_lossy().into_owned();
+    rig.say(&url).await;
+    PublishScratch
+        .call(&rig.ctx, json!({"repo_url": url}))
+        .await
+        .unwrap();
+    let repo_dir = slot_of(&rig, "fibonacci");
+    assert_eq!(
+        common::git(&repo_dir, &["rev-list", "--count", "HEAD"]),
+        "1",
+        "the worktree starts from the empty first commit alone"
+    );
+    assert_eq!(
+        common::git(&slot_of(&rig, "fib"), &["rev-list", "--count", "HEAD"]),
+        "2",
+        "the project keeps its own"
+    );
+}
+
+/// Credentials that mint a token the redactor has never heard of, as a GitHub App's do.
+struct Minting;
+
+#[async_trait::async_trait]
+impl adam_workspace::GitCredentials for Minting {
+    async fn token_for(
+        &self,
+        _repo: &adam_workspace::RepoRef,
+    ) -> Result<secrecy::SecretString, adam_workspace::WorkspaceError> {
+        Ok(secrecy::SecretString::from("ghs_runtimeMinted0123456789"))
+    }
+}
+
+/// An installation token only exists once it is minted, so it cannot be registered at startup: the
+/// credentials register it as they hand it out, and the tools' results, which share the redactor,
+/// scrub it from then on.
+#[tokio::test]
+async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_return() {
+    use adam_coder::{RedactingCredentials, Redactor, coder_tools};
+    use adam_workspace::{DynGitCredentials, RepoRef, Workspaces};
+
+    let fx = Fixture::new("hello\n").await;
+    let redactor = Redactor::default();
+    let creds: DynGitCredentials = Arc::new(RedactingCredentials::new(
+        Arc::new(Minting),
+        redactor.clone(),
+    ));
+    let env = Arc::new(
+        ToolEnv::new(
+            Workspaces::new(fx.tmp.path().join("minting-work"), creds.clone()),
+            fx.env.code_host.clone(),
+            fx.env.settings.clone(),
+        )
+        .with_redactor(redactor),
+    );
+    let sink = CollectingSink::new();
+    let ctx = ToolCtx::detached("tool", "call-1", Arc::new(sink)).with_state(env.clone());
+    let tools: Vec<_> = coder_tools(&env).into_iter().collect();
+    let tool = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t.spec().name == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))
+            .clone()
+    };
+    tool("start_scratch")
+        .call(&ctx, json!({"name": "notes"}))
+        .await
+        .unwrap();
+    tool("write_file")
+        .call(
+            &ctx,
+            json!({"path": "t.txt", "content": "push with ghs_runtimeMinted0123456789 please\n"}),
+        )
+        .await
+        .unwrap();
+    let read = || async { text(tool("read_file").call(&ctx, json!({"path": "t.txt"})).await) };
+    assert_eq!(
+        read().await,
+        "push with ghs_runtimeMinted0123456789 please\n",
+        "not known yet: nothing to scrub"
+    );
+
+    let token = creds
+        .token_for(&RepoRef::new("https://github.com/o/r", "main"))
+        .await
+        .unwrap();
+    assert_eq!(
+        secrecy::ExposeSecret::expose_secret(&token),
+        "ghs_runtimeMinted0123456789"
+    );
+    assert_eq!(read().await, "push with [redacted] please\n");
 }

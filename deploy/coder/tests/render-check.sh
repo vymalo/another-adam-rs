@@ -8,7 +8,8 @@ set -eu
 
 chart="$(dirname "$0")/.."
 out=$(mktemp)
-trap 'rm -f "$out"' EXIT
+vals=$(mktemp)
+trap 'rm -f "$out" "$vals"' EXIT
 fail=0
 
 check() { # check <description> <command...>
@@ -323,5 +324,97 @@ for p in affinity shared; do
 done
 check "an empty placement string is the unset default" \
   helm template coder "$chart" --namespace coder-ns --set workspace.placement=
+
+# github.auth: a personal access token (the default) or a GitHub App installation (ADR 0009).
+app_env='name: (GITHUB_APP_ID|GITHUB_APP_INSTALLATION_ID|GITHUB_APP_PRIVATE_KEY_PATH)$'
+helm_app() { # the three values an App needs, then any more
+  helm template coder "$chart" --namespace coder-ns --set github.auth=app --set github.app.id=1234567 \
+    --set github.app.installationId=98765432 --set github.app.privateKeySecret=coder-github-app "$@"
+}
+
+helm template coder "$chart" --namespace coder-ns > "$out"
+check "token (default): no GitHub App variable, volume or mount" lacks "$app_env|github-app"
+check "token (default): GITHUB_TOKEN is in the pod, its Secret reference and the ExternalSecret" count 'GITHUB_TOKEN$' 3
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set github.auth=token > "$out"
+check "github.auth=token renders the golden" cmp -s "$out" "$golden"
+
+helm_app > "$out"
+check "app: the pod gets the App's ID, installation and key path" count "$app_env" 3
+check "app: GITHUB_APP_ID is values-driven" dhas StatefulSet '^              value: "1234567"$'
+check "app: GITHUB_APP_INSTALLATION_ID is values-driven" dhas StatefulSet '^              value: "98765432"$'
+check "app: the key is a file under /var/run/secrets/github-app" \
+  dhas StatefulSet '^              value: /var/run/secrets/github-app/private-key.pem$'
+check "app: no GITHUB_TOKEN, in the pod or in the ExternalSecret" lacks 'GITHUB_TOKEN'
+check "app: the ExternalSecret keeps the model key and the A2A tokens" dcount ExternalSecret 'secretKey:' 2
+check "app: the key comes from the named Secret, read-only" \
+  dhas StatefulSet '^            secretName: coder-github-app$'
+check "app: the Secret is mounted read-only, and only the key" \
+  dcount StatefulSet '^              (mountPath: /var/run/secrets/github-app|readOnly: true)$' 2
+check "app: the key file is group-readable only" dhas StatefulSet '^            defaultMode: 288$|^            defaultMode: 0440$'
+check "app: the per-pod /work volume is untouched" dhas StatefulSet '^  volumeClaimTemplates:$'
+check "app: no Secret object and no key in the render" lacks '^kind: Secret$|PRIVATE KEY'
+check "app: still never exposed" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$|type: (LoadBalancer|NodePort)'
+check "app: the model, workspace and check settings are unchanged" dcount StatefulSet "$workspace_and_checks" 10
+check "app: the model settings stay (the token is the only one gone)" count "$model_and_github" 4
+helm_app --set externalSecrets.properties.githubToken=null > "$out"
+check "app: externalSecrets.properties.githubToken is not needed" count "$app_env" 3
+
+# A number from a values file is a float64 to Helm: it must not print as 1.234567e+06.
+cat > "$vals" <<'YAML'
+github:
+  auth: app
+  app:
+    id: 1234567
+    installationId: 98765432
+    privateKeySecret: coder-github-app
+YAML
+helm template coder "$chart" --namespace coder-ns -f "$vals" > "$out"
+check "app: numbers from a values file keep their digits" has '^              value: "(1234567|98765432)"$'
+check "app: no number is written in exponent form" lacks 'value: "[0-9.]+e\+[0-9]+"'
+helm_app --set github.app.id=Iv1.abc123 > "$out"
+check "app: a client ID is used as it is" dhas StatefulSet '^              value: "Iv1.abc123"$'
+
+# The roles: a control plane renders no GitHub setting, and needs none of the three values.
+helm_app --set config.role=control-plane > "$out"
+check "app: a control plane gets no App variable and no key volume" lacks "$app_env|github-app"
+helm template coder "$chart" --namespace coder-ns --set github.auth=app --set config.role=control-plane > "$out"
+check "app: a control plane renders without the three values" lacks "$app_env|github-app"
+for role in all worker; do
+  helm_app --set config.role=$role > "$out"
+  check "app: the $role role gets the App's variables and the key volume" count "$app_env" 3
+done
+
+# topology=split: the worker has the key; the front has none of it.
+helm_app --set topology=split > "$out"
+check "split + app: the worker gets the App's variables" dcount StatefulSet "$app_env" 3
+check "split + app: the worker mounts the key Secret" dhas StatefulSet '^            secretName: coder-github-app$'
+check "split + app: the front has no App variable, volume or mount" dlacks Deployment "$app_env|github-app|volumes:|volumeMounts:"
+check "split + app: the StatefulSet identity equals the combined one (the PVC is reused)" \
+  [ "$(sts_identity "$out")" = "$(sts_identity "$golden")" ]
+check "split + app without the three values fails (the worker needs them)" \
+  fails helm template coder "$chart" --namespace coder-ns --set topology=split --set github.auth=app
+
+# A shared volume and the key are two volumes of one pod.
+helm_app --set workspace.placement=shared --set workspace.sharedVolume.storageClass=$rwx_class --set replicaCount=3 > "$out"
+check "shared + app: the pod mounts the shared claim and the key Secret" \
+  dcount StatefulSet '^        - name: (work|github-app)$' 2
+check "shared + app: the claim is still coder-work" dhas StatefulSet '^            claimName: coder-work$'
+check "shared + app: still no per-pod volumeClaimTemplates" dlacks StatefulSet 'volumeClaimTemplates:'
+
+# Guards.
+message=$(helm template coder "$chart" --namespace coder-ns --set github.auth=bogus 2>&1 || true)
+check "an unknown github.auth fails" fails helm template coder "$chart" --namespace coder-ns --set github.auth=bogus
+check "the unknown-github.auth error says token or app and shows the value" says "$message" 'must be token or app.*"bogus"'
+for missing in id installationId privateKeySecret; do
+  message=$(helm_app --set "github.app.$missing=" 2>&1 || true)
+  check "app without github.app.$missing fails" fails helm_app --set "github.app.$missing="
+  check "app without github.app.$missing: the error names it" says "$message" "github.app.$missing"
+done
+for bad in 0 -5 abc 12x 1.5; do
+  check "app with installationId=$bad fails" fails helm_app --set-string "github.app.installationId=$bad"
+done
+check "app with a numeric installationId from --set renders" helm_app --set github.app.installationId=42
+check "token mode ignores the github.app values" \
+  helm template coder "$chart" --namespace coder-ns --set github.app.id= --set github.app.installationId=nope
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

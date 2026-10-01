@@ -64,7 +64,10 @@ async fn build_agent(
         root = %root.display(),
         "workspace placement"
     );
-    let (workspaces, creds) = workspaces_for(worker);
+    // The tokens of the GitHub credentials (an App's installation tokens are minted as the run goes)
+    // are registered with the redactor as they are handed out, so it is shared with them.
+    let (workspaces, creds) =
+        workspaces_for(worker, &redactor).context("building the GitHub credentials")?;
     let code_host: DynCodeHost = Arc::new(
         GitHub::new(creds)
             .context("building the GitHub client")?
@@ -88,6 +91,8 @@ async fn build_agent(
     let env = Arc::new(
         ToolEnv::new(workspaces, code_host, settings)
             .with_redactor(redactor)
+            // What a rejected credential tells the model to check depends on which kind they are.
+            .with_credentials_hint(worker.github.check_hint())
             // The URL a message announces for the conversation's tools is an MCP server's: the
             // deployment's policy (MCP_ALLOW_INSECURE, timeouts) decides.
             .with_mcp_policy(worker.mcp.policy()),

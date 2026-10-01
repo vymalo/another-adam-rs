@@ -27,7 +27,7 @@ use crate::workspace::{
     Inner, Meta, SLOT_META_VERSION, ScratchMeta, SlotMeta, Workspaces, exists,
     remove_dir_if_exists, remove_file_if_exists, slot_name,
 };
-use crate::worktree::{GitIdentity, Worktree, commit_all_in};
+use crate::worktree::{ChangedFile, GitIdentity, Worktree, commit_all_in, parse_porcelain};
 
 /// Longest directory name of a scratch slot.
 const MAX_SCRATCH_DIR: usize = 64;
@@ -125,6 +125,7 @@ pub struct Scratch {
     run: String,
     dir: String,
     path: PathBuf,
+    published_to: Option<String>,
 }
 
 impl fmt::Debug for Scratch {
@@ -148,8 +149,63 @@ impl Scratch {
         &self.dir
     }
 
+    /// The repository the project's files were last copied into
+    /// ([`set_published_to`](Self::set_published_to)), as its url was written then: `None` for a
+    /// project that was never published. As the slot was listed: a later call changes the next
+    /// listing, not this value.
+    pub fn published_to(&self) -> Option<&str> {
+        self.published_to.as_deref()
+    }
+
+    /// Record that the project's files were copied into the repository `url` (see [`copy_into`]):
+    /// what a caller says to the model that goes on editing the project afterwards, whose changes
+    /// no longer reach that repository. Kept in the slot's metadata, so it survives a restart, and
+    /// replaced by a later call (a project may be copied into more than one repository). Takes the
+    /// run's lock, as every change to the run's slots does.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::NotFound`] when the project is no longer a slot of its run (the workspace
+    /// was removed), and I/O failures.
+    #[tracing::instrument(skip(self, url), fields(run = %self.run, dir = %self.dir))]
+    pub async fn set_published_to(&self, url: &str) -> WorkspaceResult<()> {
+        let inner = &self.ws;
+        let _run = inner.lock_path(&inner.run_dir(&self.run)).await?;
+        let path = inner.slot_meta_path(&self.run, &self.dir);
+        let Some(SlotMeta::Scratch(mut meta)) = inner
+            .read_slot_metas(&self.run)
+            .await?
+            .into_iter()
+            .find(|m| m.dir() == self.dir && matches!(m, SlotMeta::Scratch(_)))
+        else {
+            return Err(WorkspaceError::NotFound(format!(
+                "{} is not a scratch project of this workspace any more",
+                self.dir
+            )));
+        };
+        meta.published_to = Some(url.to_owned());
+        inner.write_meta_at(&path, &meta).await
+    }
+
     fn git(&self) -> GitCmd {
         self.ws.git().cwd(&self.path)
+    }
+
+    /// The files that differ from the last commit: staged, unstaged and untracked ones (each
+    /// listed), from `git status --porcelain=v1 -z`. What [`Worktree::status`] says for a
+    /// repository's slot.
+    ///
+    /// # Errors
+    ///
+    /// A git failure.
+    #[tracing::instrument(skip(self), fields(run = %self.run, dir = %self.dir))]
+    pub async fn status(&self) -> WorkspaceResult<Vec<ChangedFile>> {
+        let out = self
+            .git()
+            .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .run()
+            .await?;
+        Ok(parse_porcelain(&out.stdout))
     }
 
     /// Stage everything (`git add -A`) and commit as `author`, locally: the sha of the new commit,
@@ -260,6 +316,7 @@ impl RunWorkspace {
                         run: self.run.clone(),
                         dir: m.dir.clone(),
                         path: path.clone(),
+                        published_to: m.published_to.clone(),
                     }),
                     path,
                 }))
@@ -491,6 +548,7 @@ impl RunWorkspace {
                 dir: dir.to_owned(),
                 seq,
                 kind: "scratch".to_owned(),
+                published_to: None,
             };
             inner
                 .write_meta_at(&inner.slot_meta_path(&self.run, dir), &meta)
@@ -498,11 +556,16 @@ impl RunWorkspace {
             seq
         };
         let path = inner.slot_path(&self.run, dir);
+        let published_to = metas.iter().find_map(|m| match m {
+            SlotMeta::Scratch(m) if m.dir == dir => m.published_to.clone(),
+            _ => None,
+        });
         let scratch = Scratch {
             ws: Arc::clone(inner),
             run: self.run.clone(),
             dir: dir.to_owned(),
             path: path.clone(),
+            published_to,
         };
         scratch.init(identity).await?;
         Ok(Slot {

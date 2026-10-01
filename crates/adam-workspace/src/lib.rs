@@ -63,15 +63,19 @@ mod error;
 mod git;
 #[cfg(feature = "github")]
 mod github;
+#[cfg(feature = "github")]
+mod github_app;
 mod repo;
 mod run_workspace;
+#[cfg(all(feature = "github", feature = "test-util"))]
+pub mod testing;
 mod workspace;
 mod worktree;
 
 #[cfg(feature = "test-util")]
 pub use code_host::MemoryCodeHost;
 pub use code_host::{CodeHost, DynCodeHost, NewPullRequest, PullRequest};
-pub use credentials::{DynGitCredentials, GitCredentials, ScopedToken, StaticToken};
+pub use credentials::{DynGitCredentials, GitCredentials, HostScoped, ScopedToken, StaticToken};
 pub use environment::{
     DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress, EnvSession, EnvStep,
     EnvStepState, Environment, ExecId, ExecSpec, Local, LocalSession, NoProgress, PreparedCommand,
@@ -80,6 +84,8 @@ pub use environment::{
 pub use error::{WorkspaceError, WorkspaceResult};
 #[cfg(feature = "github")]
 pub use github::GitHub;
+#[cfg(feature = "github")]
+pub use github_app::{AppKey, GitHubApp};
 pub use repo::{RepoLocation, RepoRef};
 pub use run_workspace::{Collision, CopyReport, RunWorkspace, Scratch, Slot, SlotKind, copy_into};
 pub use workspace::Workspaces;

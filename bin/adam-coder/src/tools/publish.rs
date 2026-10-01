@@ -10,7 +10,7 @@ use super::checks::ChecksReport;
 use super::gitcli::{commits_ahead, head_sha, head_tree};
 use super::named::key_of_argument;
 use super::notes::{PullRequestNote, PushedBranch};
-use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, workspace_error};
+use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, scratch, workspace_error};
 
 /// The name of [`commit_and_push`], which the agent also needs to tell its results apart in the
 /// conversation (see [`pushed_in`]).
@@ -38,7 +38,8 @@ pub(crate) fn pushed_in(text: &str) -> Option<(String, String)> {
         .then(|| (repository.to_owned(), branch.to_owned()))
 }
 
-// Commits everything in the worktree and pushes the run's branch.
+// Commits everything in the worktree and pushes the run's branch. In a scratch project it commits
+// locally and does nothing else (`scratch::commit_locally`).
 //
 // Idempotent by construction: with no changes `commit_all` does nothing, the
 // reported commit is `HEAD`, and pushing a commit the remote already has is a
@@ -53,7 +54,8 @@ pub(crate) fn pushed_in(text: &str) -> Option<(String, String)> {
 /// Commit every change in the worktree with the given message and push the
 /// branch. Use a Conventional Commit message (feat(scope): ..., fix: ...).
 /// Make small, focused commits: call it after each coherent piece of work. With several
-/// repositories in the workspace, say which with `repo`.
+/// repositories in the workspace, say which with `repo`. In a scratch project it only commits,
+/// locally: nothing is pushed.
 #[tool]
 pub async fn commit_and_push(
     env: State<ToolEnv>,
@@ -69,8 +71,8 @@ pub async fn commit_and_push(
     let Some(message) = non_empty(&message) else {
         return Ok(ToolOutput::error("message is required"));
     };
-    let wt = match env.worktree(ctx, repo.as_deref()).await {
-        Ok(wt) => wt,
+    let slot = match env.slot(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
     let run = ctx.run_id().to_string();
@@ -81,6 +83,19 @@ pub async fn commit_and_push(
              pushed. Stop now and report what you did and which check still fails.",
         ));
     }
+    // A scratch project has no remote: the commit is local, and nothing else happens (no push,
+    // no `branch`, no verdict bound to a pushed commit).
+    let Some(wt) = slot.worktree().cloned() else {
+        return match slot.scratch() {
+            Some(scratch) => {
+                scratch::commit_locally(&slot, scratch, message, &env.settings.identity).await
+            }
+            None => Ok(ToolOutput::error(format!(
+                "`{}` is not a repository: nothing can be committed there",
+                slot.dir()
+            ))),
+        };
+    };
 
     let committed = match wt.commit_all(message, &env.settings.identity).await {
         Ok(sha) => sha,
@@ -267,9 +282,18 @@ pub async fn open_pull_request(
         return Ok(ToolOutput::error("title and body are required"));
     };
     let accept_red = accept_red_checks.unwrap_or(false);
-    let wt = match env.worktree(ctx, repo.as_deref()).await {
-        Ok(wt) => wt,
+    let slot = match env.slot(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
         Err(outcome) => return outcome,
+    };
+    let Some(wt) = slot.worktree().cloned() else {
+        return Ok(ToolOutput::error(format!(
+            "`{}` is a scratch project: it has no remote, so nothing is pushed from it and there \
+             is no pull request to open from it. Once the person names a repository, publish the \
+             project there with publish_scratch, then commit_and_push and open_pull_request with \
+             `repo` set to the slot it makes.",
+            slot.dir()
+        )));
     };
     let run = ctx.run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;

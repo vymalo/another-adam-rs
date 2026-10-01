@@ -123,11 +123,12 @@ pub async fn delegate_to_opencode(
     let Some(instructions) = non_empty(&instructions) else {
         return Ok(ToolOutput::error("instructions is required"));
     };
-    let wt = match env.worktree(ctx, repo.as_deref()).await {
-        Ok(wt) => wt,
+    // OpenCode works in a repository's worktree or in a scratch project alike.
+    let slot = match env.slot(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    let dir = wt.path().to_path_buf();
+    let dir = slot.path().to_path_buf();
 
     ctx.emit_progress("starting OpenCode").await;
     // OpenCode runs where the run's processes run, and the command is the one that environment
@@ -246,7 +247,7 @@ pub async fn delegate_to_opencode(
     }
 
     let stop_reason = stop_reason.unwrap_or_else(|| "unknown".to_owned());
-    let changed = match wt.status().await {
+    let changed = match super::scratch::changed_files(&slot).await {
         Ok(files) => files,
         Err(e) => return Err(super::workspace_error(&e)),
     };

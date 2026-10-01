@@ -659,6 +659,15 @@ fn listed(paths: &[String]) -> String {
     line
 }
 
+/// What a change to a scratch project that was already published adds to the tool's result: the
+/// change does not reach the repository ([`published_note`](super::scratch::published_note)).
+fn push_published_note(text: &mut String, slot: &adam_workspace::Slot) {
+    if let Some(note) = super::scratch::published_note(slot) {
+        text.push('\n');
+        text.push_str(&note);
+    }
+}
+
 /// Read a text file of your worktree. Give `path` relative to the root of the worktree. Without
 /// a range you get the whole file (cut at 256 KiB, and the cut is marked); with `start_line` and
 /// `end_line` you get just those lines, each behind its number. A binary file is not shown. Use it
@@ -725,11 +734,13 @@ pub async fn write_file(
         Ok(done) => {
             ctx.emit_progress(format!("wrote {path} ({})", slot.dir()))
                 .await;
-            Ok(ToolOutput::text(format!(
+            let mut text = format!(
                 "{} {path} ({} bytes). Run the checks again before you commit.",
                 if done.created { "Created" } else { "Replaced" },
                 done.bytes
-            )))
+            );
+            push_published_note(&mut text, &slot);
+            Ok(ToolOutput::text(text))
         }
         Err(reason) => Ok(ToolOutput::error(reason)),
     }
@@ -761,11 +772,13 @@ pub async fn apply_patch(
         Ok(paths) => {
             ctx.emit_progress(format!("patched {} ({})", listed(&paths), slot.dir()))
                 .await;
-            Ok(ToolOutput::text(format!(
+            let mut text = format!(
                 "Applied the patch to {} file(s): {}. Run the checks again before you commit.",
                 paths.len(),
                 listed(&paths)
-            )))
+            );
+            push_published_note(&mut text, &slot);
+            Ok(ToolOutput::text(text))
         }
         Err(PatchError::Refused(reason) | PatchError::Unreadable(reason)) => {
             Ok(ToolOutput::error(reason))

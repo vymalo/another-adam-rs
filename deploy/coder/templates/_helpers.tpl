@@ -49,6 +49,31 @@ plane starts runs without them (see docs/architecture.md, "Roles").
 {{- if ne (default "" .Values.config.role | trim | lower) "control-plane" -}}true{{- end -}}
 {{- end -}}
 
+{{/*
+Whether this pod authenticates to GitHub as an App installation: github.auth=app, and the role runs workers
+(a control plane never talks to GitHub). Renders "true" or nothing, like coder.runsWorkers.
+*/}}
+{{- define "coder.githubApp" -}}
+{{- if and (eq (toString .Values.github.auth) "app") (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+GITHUB_APP_ID: the application ID or the client ID. A number from a values file is a float64 to Helm
+and would print as 1.234567e+06, so numbers go through int64; a string (a client ID, or a quoted ID) is
+used as it is.
+*/}}
+{{- define "coder.githubAppId" -}}
+{{- $id := .Values.github.app.id -}}
+{{- if kindIs "string" $id -}}{{- trim $id -}}{{- else if gt (int64 $id) 0 -}}{{- int64 $id -}}{{- end -}}
+{{- end -}}
+
+{{/* GITHUB_APP_INSTALLATION_ID: a positive integer, from a number or a string; 0 when it is neither. */}}
+{{- define "coder.githubAppInstallationId" -}}
+{{- $n := .Values.github.app.installationId -}}
+{{- if kindIs "string" $n -}}{{- $n = trim $n -}}{{- end -}}
+{{- if and (kindIs "string" $n) (not (regexMatch "^[0-9]+$" $n)) -}}0{{- else -}}{{- int64 $n -}}{{- end -}}
+{{- end -}}
+
 {{/* The URL clients use for the JSON-RPC endpoint (the agent card advertises it). */}}
 {{- define "coder.publicUrl" -}}
 {{- if .Values.config.publicUrl -}}

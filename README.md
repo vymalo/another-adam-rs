@@ -149,8 +149,8 @@ docker compose down -v             # stop and forget all state (volumes included
 | `postgres` | `127.0.0.1:5432` | PostgreSQL 16, database `adam_test`, user and password `postgres` |
 | `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone |
 | `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder`, `mock-opencode`, `mock-assistant` and `mock-researcher` are scripted (see "Scripted models") |
-| `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) |
-| `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git`; no authentication |
+| `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) and the GitHub App token trade (`POST /app/installations/{id}/access_tokens`: a JWT for an installation token that lasts four minutes) |
+| `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git` and creating an empty repository on first use for the owners of `AUTO_CREATE_OWNERS` (`scratch` in the compose file); no authentication |
 | `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token`; its agent files are the folder `bin/adam-coder/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`, see "Changing what the coder says") |
 | `agent` (profile `app`) | `http://127.0.0.1:8084/` | the general agent: `adam-agent` from the **coder's image** (`entrypoint: ["tini", "--", "adam-agent"]`, so there is no second image), bearer token `dev-token`, serving the folder `dev/agents/assistant/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`); model `mock-assistant`; shares the coder's database (runs are scoped by the agent's name). See "A general agent from a folder" |
 
@@ -230,6 +230,15 @@ name. It has no authentication (any credentials are accepted) and its
 repositories live in the `git-data` volume. The layout is
 `/<owner>/<repo>.git`, the shape `adam-workspace` and the mock GitHub expect.
 
+It is seeded with every directory `dev/git-server/seed/<owner>/<name>/` (today `local/sandbox`), each
+once. And it behaves like a place where repositories can be **created**: a request for
+`/<owner>/<name>.git` of an owner in `AUTO_CREATE_OWNERS` (a comma or space list; `scratch` in
+`compose.yaml`, empty means none) makes the bare repository first, empty, on branch `main`, with pushes
+enabled (`dev/git-server/cgi.sh`, in front of `git-http-backend`), so it is what a repository that was
+just created on GitHub is: it exists, and it has no ref. Any other missing repository is a 404.
+`GET /__repos/` (and `/__repos/<owner>/`) lists what is there as JSON, read-only. The `scratch`
+scenario below publishes a project to `http://git-server:8080/scratch/fib-<id>.git`.
+
 ### Running the coder against the mocks
 
 ```sh
@@ -253,6 +262,7 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 sh dev/coder-e2e.sh                 # OpenCode makes the change
 NO_OPENCODE=1 sh dev/coder-e2e.sh   # the check command makes it, OpenCode is not started
 SCENARIO=files sh dev/coder-e2e.sh  # the coder reads and writes the file itself (read_file, write_file)
+SCENARIO=scratch sh dev/coder-e2e.sh  # no repository is named: a scratch project, published to one named later
 ```
 
 The script sends the task with `SendStreamingMessage`, waits for
@@ -262,6 +272,40 @@ artifacts are there, that `mock-github` saw exactly one
 `git-server` has the branch with `hello.txt` containing `hello`. `TIMEOUT`,
 `CODER_URL`, `CODER_TOKEN`, `MOCK_GITHUB_URL` and `GIT_SERVER_URL` override the
 defaults (see the script's header).
+
+`SCENARIO=scratch` is two messages. The task names no repository ("Write a fib.sh that prints the first 7
+Fibonacci numbers. I'll give you the repo later."), so the coder builds `fib.sh` and its check in a scratch
+slot and asks which repository to publish it to: the script checks that the task waits
+(`TASK_STATE_INPUT_REQUIRED`) with that question, that no pull request was opened and that `git-server`
+has not been asked for the repository (its `/__repos/scratch/` listing). It then sends the answer to the
+task, `Publish it to http://git-server:8080/scratch/fib-<id>.git`, an empty repository that git-server makes
+on first use, and checks everything above for that repository (the pull request, the branch, the artifacts),
+plus that `main` is the one empty commit the coder gave it, that `fib.sh` is on the branch, and that the
+**tree** the checks ran on in the scratch project is the tree of the pushed commit: what was checked is what
+was pushed. `<id>` is new on every run, so a rerun on one stack never meets the last one's repository.
+
+#### The coder as a GitHub App installation
+
+An installation is a token or a GitHub App, never both
+([ADR 0009](docs/decisions/0009-github-per-installation-read-through-mcp.md)). The compose file runs the
+token. The override `dev/compose.github-app.yaml` runs the same coder as an App: an init service makes a
+throwaway RSA key into a volume (`openssl genrsa`; no key is committed), `GITHUB_TOKEN` is turned off, and the
+coder gets `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_PATH`. It signs a JWT,
+trades it at `mock-github` for an installation token and gives that to `git` and to the REST calls.
+
+```sh
+docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app up -d --build --wait \
+  postgres mock-openai mock-github git-server coder
+GITHUB_AUTH=app sh dev/coder-e2e.sh                  # likewise NO_OPENCODE=1, SCENARIO=files, SCENARIO=scratch
+```
+
+With `GITHUB_AUTH=app` the script asserts, besides everything above, that `mock-github` saw at least one
+`POST /app/installations/67890/access_tokens` and that **every** call to `/repos/...` (the pull request's
+included) carried `Bearer ghs_mockinstallationtoken...` and never the JWT. With the default `token` it asserts
+that every such call carried the dummy token. WireMock cannot check an RS256 signature, so the mock accepts any
+bearer that looks like a JWT; the signature, `iss` and lifetime are checked by
+`cargo test -p adam-workspace --test github_app` against a key made for the test. CI runs the four scenarios a
+second time this way (`.github/workflows/coder.yml`, step "Compose e2e").
 
 #### Saying hello, and the coder's name
 
@@ -385,6 +429,7 @@ request gets the same answer and the script cannot drift out of step.
 | `mock-coder`, the person's first message is a greeting (`hi`, `hello` or `hey`, then anything) | same file | a text answer (`stop`): `Hi! I'm <name>. <summary>. Which repository should I work on, and what should I change?`, **built from the first two lines of the system prompt** (`messages[0]`: `Your name is <name>.` and `In one sentence: <summary>.`, the persona lines the coder's `agent/instructions.md` opens with), so editing the instructions, or mounting another folder, changes the mocked answer. The run then waits for the person (`input-required`); the answer to it (the synthetic `ask_user` call `stop0000N` is in the history) continues with `prepare_workspace` (`coder-call-1`) and the script above. A greeting needs a system message first: a request with the user message alone is not one. |
 | `mock-coder`, task text contains `[mock:no-opencode]` | same file | `prepare_workspace` (`nc-call-1`), `run_checks` with `echo hello > hello.txt && sh ./check.sh` (the check command makes the change, `nc-call-2`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started: deterministic where OpenCode's own behaviour is not the subject. |
 | `mock-coder`, task text contains `[mock:files]` | same file | the coder edits the files itself, ids `fl-call-N`: `prepare_workspace` (`fl-call-1`), `read_file` `README.md` (`fl-call-2`), `write_file` `hello.txt` with `hello` (`fl-call-3`), `run_checks` (`sh ./check.sh`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started. `dev/coder-e2e.sh` runs it with `SCENARIO=files`. |
+| `mock-coder`, task text contains `[mock:scratch] fib-<hex>` | same file | no repository is named, ids `sc-call-N`: `start_scratch` (`fib`), `write_file` `fib.sh` and `check.sh`, `run_checks` (`repo: fib`, `sh ./check.sh`), then a **text question** (which repository should I publish it to), which parks the run. Once the person's answer holds `Publish it to` (and the stop's `ask_user` call is in the history, which the greeting's second step also reads: that step excludes this switch): `publish_scratch` (`http://git-server:8080/scratch/fib-<hex>.git`, the repository named in the task text with `regexExtract`, so reruns on one stack never collide), `commit_and_push` and `open_pull_request` (both `repo: fib-<hex>`, the slot of the new repository), final text. OpenCode is never started. `dev/coder-e2e.sh` runs it with `SCENARIO=scratch`, and `wiremock_compose` plays it, in both forms, with the answer in the shape the coder gives it. |
 | `mock-coder`, task text contains `[mock:choices]` | `mappings/coder-choices.json` | `ask_user` (`choices-call-1`) with the question `Three quick questions before I start` and three `choices`: `db` (`pg`, `sqlite`), `auth` (`keycloak`, `none`), `deploy` (`k8s`, `compose`), priority 1; once its result holds `db: pg` (how the person's answers read to the model) the text `Going with Postgres, Keycloak and Compose.` (`stop`), priority 1; any other answers, `Thanks, I have your answers.`, priority 2. No workspace or repository is touched. `dev/coder-choices-e2e.sh` runs it through the stack. |
 | `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |
 | `mock-assistant` | `mappings/agent-script.json` | for the general agent (`adam-agent`), stateless: a request that holds a tool result (`role: tool`) gets a fixed text (`I looked into it with the tool you gave me. ...`), priority 1; any other request gets `Hi! I'm <name>. <summary>.`, **built from the first two lines of the system prompt** (`Your name is <name>.` and `In one sentence: <summary>.`), priority 2. Also as a stream (see below). It answers in role whatever is asked: it proves that the folder reaches the model, not what a model does with it. `dev/agent-e2e.sh` runs it through the stack. |

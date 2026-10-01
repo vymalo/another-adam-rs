@@ -16,7 +16,10 @@
 //! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker` |
 //! | `MODEL` | model alias of the agent itself | required for `all` and `worker` |
 //! | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
-//! | `GITHUB_TOKEN` | git push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required for `all` and `worker` |
+//! | `GITHUB_TOKEN` | git push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | one of this or the App's three, for `all` and `worker` |
+//! | `GITHUB_APP_ID` | the GitHub App's application ID or client ID (the JWT's `iss`); App mode, instead of `GITHUB_TOKEN` | required with the App's other two |
+//! | `GITHUB_APP_INSTALLATION_ID` | the installation's ID, a positive integer | required in App mode |
+//! | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 or PKCS#8), as a file or inline (`\n` escapes accepted); exactly one; parsed at startup | one required in App mode |
 //! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them; the first is the host `owner/name` stands for | `github.com` |
 //! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
 //! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
@@ -46,7 +49,8 @@
 //!   the agent's name and its `init` ([`CoderStarter`](crate::CoderStarter)), so it holds no model
 //!   or GitHub configuration.
 //! * **The workers** (`all`, `worker`) need everything a step uses, the `MODEL_*`, `MODEL`
-//!   and `GITHUB_TOKEN` variables, and read the rest of the table above (the workspace, the
+//!   variables and a GitHub credential (`GITHUB_TOKEN`, or the `GITHUB_APP_*` variables: both, or a
+//!   partial App set, is refused with every problem listed), and read the rest of the table above (the workspace, the
 //!   checks, the commit identity, OpenCode, what MCP servers a folder may start or reach). They arrive in [`Config::worker`] as a
 //!   [`WorkerConfig`], which is `Some` exactly when [`Role::runs_workers`](adam_host::Role::runs_workers).
 //!
@@ -83,7 +87,8 @@ use adam::AGENT_DIR_ENV;
 use adam_host::Placement;
 pub use adam_service::{ConfigError, McpSettings};
 use adam_service::{ModelConfig, ServiceConfig, WorkerSettings, parse_flag, parse_or};
-use secrecy::SecretString;
+use adam_workspace::{AppKey, WorkspaceError};
+use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
 
 /// The binary's configuration.
@@ -117,8 +122,8 @@ pub struct WorkerConfig {
     pub model: ModelConfig,
     /// `OPENCODE_MODEL`.
     pub opencode_model: String,
-    /// `GITHUB_TOKEN`.
-    pub github_token: SecretString,
+    /// How the coder authenticates to GitHub: `GITHUB_TOKEN`, or the `GITHUB_APP_*` variables.
+    pub github: GitHubAuth,
     /// `ALLOWED_REPO_HOSTS`, lowercased.
     pub allowed_repo_hosts: Vec<String>,
     /// `ALLOW_LOCAL_REPOS`.
@@ -154,11 +159,198 @@ pub struct WorkerConfig {
     pub mcp: McpSettings,
 }
 
+/// How the coder authenticates to GitHub, chosen per installation: **exactly one** of a personal
+/// access token and a GitHub App.
+#[derive(Clone)]
+pub enum GitHubAuth {
+    /// `GITHUB_TOKEN`: one token for every repository, for as long as it is valid.
+    Token(SecretString),
+    /// `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and a private key: installation access tokens,
+    /// minted as they are needed and good for an hour.
+    App(GitHubAppConfig),
+}
+
+/// The GitHub App of [`GitHubAuth::App`].
+#[derive(Clone)]
+pub struct GitHubAppConfig {
+    /// `GITHUB_APP_ID`: the App's application ID, or its client ID (the JWT's `iss`).
+    pub app_id: String,
+    /// `GITHUB_APP_INSTALLATION_ID`: a positive integer.
+    pub installation_id: u64,
+    /// The private key, parsed at startup (`GITHUB_APP_PRIVATE_KEY_PATH` or `GITHUB_APP_PRIVATE_KEY`).
+    pub key: AppKey,
+    /// The PEM the key was read from, kept so that the redactor can register it.
+    pub pem: SecretString,
+}
+
+impl GitHubAuth {
+    /// The secrets of this way of authenticating that are known at startup, for the redactor: the
+    /// token, or the App's PEM and the base64 body of it (what a log line that flattened it would
+    /// carry). The installation tokens an App mints are only known when they are minted.
+    pub fn secrets(&self) -> Vec<String> {
+        match self {
+            Self::Token(token) => vec![token.expose_secret().to_owned()],
+            Self::App(app) => {
+                let pem = app.pem.expose_secret();
+                let body: String = pem
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+                    .collect();
+                vec![pem.trim().to_owned(), body]
+            }
+        }
+    }
+
+    /// What to tell a model (and a person) to check when GitHub rejects the credentials: the
+    /// variables of this way of authenticating.
+    pub fn check_hint(&self) -> &'static str {
+        match self {
+            Self::Token(_) => {
+                "GITHUB_TOKEN is valid and may push and open pull requests for the repository"
+            }
+            Self::App(_) => {
+                "the GitHub App's credentials (GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and the \
+                 private key) are valid and that the App is installed on the repository with write \
+                 access to its contents and pull requests"
+            }
+        }
+    }
+
+    /// Read the variables: `GITHUB_TOKEN` for a personal access token, or the three `GITHUB_APP_*`
+    /// for an App. One of the two, never both and never a part of the App's. Every problem is added
+    /// to `problems` and names its variable, never a value; `None` only after one was.
+    fn parse(get: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Option<Self> {
+        let token = get("GITHUB_TOKEN");
+        let app_id = get("GITHUB_APP_ID");
+        let installation = get("GITHUB_APP_INSTALLATION_ID");
+        let key_path = get("GITHUB_APP_PRIVATE_KEY_PATH");
+        let key_inline = get("GITHUB_APP_PRIVATE_KEY");
+        let any_app = app_id.is_some()
+            || installation.is_some()
+            || key_path.is_some()
+            || key_inline.is_some();
+        match (token, any_app) {
+            (Some(token), false) => Some(Self::Token(SecretString::from(token))),
+            (None, false) => {
+                problems.push(
+                    "GITHUB_TOKEN is required (a personal access token), or GITHUB_APP_ID, \
+                     GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY_PATH (a GitHub App)"
+                        .into(),
+                );
+                None
+            }
+            (Some(_), true) => {
+                problems.push(
+                    "GITHUB_TOKEN and the GITHUB_APP_* variables are both set: configure one way, \
+                     a personal access token or a GitHub App (leave GITHUB_TOKEN unset or empty \
+                     for an App)"
+                        .into(),
+                );
+                None
+            }
+            (None, true) => Self::parse_app(app_id, installation, key_path, key_inline, problems),
+        }
+    }
+
+    fn parse_app(
+        app_id: Option<String>,
+        installation: Option<String>,
+        key_path: Option<String>,
+        key_inline: Option<String>,
+        problems: &mut Vec<String>,
+    ) -> Option<Self> {
+        let before = problems.len();
+        let app_id = app_id.map(|id| id.trim().to_owned());
+        if app_id.is_none() {
+            problems.push("GITHUB_APP_ID is required for a GitHub App".into());
+        }
+        let installation_id = match installation.as_deref().map(str::trim) {
+            None => {
+                problems.push("GITHUB_APP_INSTALLATION_ID is required for a GitHub App".into());
+                None
+            }
+            Some(raw) => match raw.parse::<u64>() {
+                Ok(id) if id > 0 => Some(id),
+                _ => {
+                    problems.push("GITHUB_APP_INSTALLATION_ID must be a positive integer".into());
+                    None
+                }
+            },
+        };
+        // Exactly one source of the key. The file is what a deployment mounts; the variable holds
+        // the PEM itself, often with its newlines written as `\n` by a secret store or an env file.
+        let (var, pem) = match (key_path, key_inline) {
+            (Some(_), Some(_)) => {
+                problems.push(
+                    "GITHUB_APP_PRIVATE_KEY_PATH and GITHUB_APP_PRIVATE_KEY are both set: use one"
+                        .into(),
+                );
+                return None;
+            }
+            (None, None) => {
+                problems.push(
+                    "GITHUB_APP_PRIVATE_KEY_PATH (a file) or GITHUB_APP_PRIVATE_KEY (the PEM) is \
+                     required for a GitHub App"
+                        .into(),
+                );
+                return None;
+            }
+            (Some(path), None) => match std::fs::read_to_string(path.trim()) {
+                Ok(pem) => ("GITHUB_APP_PRIVATE_KEY_PATH", pem),
+                Err(e) => {
+                    problems.push(format!(
+                        "GITHUB_APP_PRIVATE_KEY_PATH {:?} cannot be read as text ({})",
+                        path.trim(),
+                        e.kind()
+                    ));
+                    return None;
+                }
+            },
+            (None, Some(inline)) => ("GITHUB_APP_PRIVATE_KEY", inline.replace("\\n", "\n")),
+        };
+        let key = match AppKey::from_pem(&pem) {
+            Ok(key) => Some(key),
+            Err(WorkspaceError::Invalid(why) | WorkspaceError::Auth(why)) => {
+                problems.push(format!("{var}: {why}"));
+                None
+            }
+            Err(e) => {
+                problems.push(format!("{var}: {e}"));
+                None
+            }
+        };
+        if problems.len() > before {
+            return None;
+        }
+        Some(Self::App(GitHubAppConfig {
+            app_id: app_id?,
+            installation_id: installation_id?,
+            key: key?,
+            pem: SecretString::from(pem),
+        }))
+    }
+}
+
+impl std::fmt::Debug for GitHubAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Token(_) => f.write_str("GitHubAuth::Token(<redacted>)"),
+            Self::App(app) => f
+                .debug_struct("GitHubAuth::App")
+                .field("app_id", &app.app_id)
+                .field("installation_id", &app.installation_id)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 impl std::fmt::Debug for WorkerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerConfig")
             .field("model", &self.model)
             .field("opencode_model", &self.opencode_model)
+            .field("github", &self.github)
             .field("allowed_repo_hosts", &self.allowed_repo_hosts)
             .field("allow_local_repos", &self.allow_local_repos)
             .field("github_api_url", &self.github_api_url.as_str())
@@ -257,14 +449,7 @@ impl WorkerConfig {
         settings: &WorkerSettings,
         problems: &mut Vec<String>,
     ) -> Option<Self> {
-        let mut required = |name: &str| {
-            let value = get(name);
-            if value.is_none() {
-                problems.push(format!("{name} is required"));
-            }
-            value.unwrap_or_default()
-        };
-        let github_token = required("GITHUB_TOKEN");
+        let github = GitHubAuth::parse(get, problems);
         let model = ModelConfig::parse(lookup, problems);
 
         let opencode_model = get("OPENCODE_MODEL").unwrap_or_else(|| model.alias.clone());
@@ -350,12 +535,13 @@ impl WorkerConfig {
             .map(str::to_owned)
             .collect();
 
-        // `github_api_url` is `None` only after a problem was recorded above.
+        // `github` and `github_api_url` are `None` only after a problem was recorded above.
+        let github = github?;
         let github_api_url = github_api_url?;
         Some(Self {
             model,
             opencode_model,
-            github_token: SecretString::from(github_token),
+            github,
             allowed_repo_hosts,
             allow_local_repos,
             github_api_url,
@@ -1048,5 +1234,294 @@ mod tests {
             with_agent_dir("control-plane", dir.path().to_str().unwrap()).unwrap()
         );
         assert!(shown.contains("agent_dir"), "{shown}");
+    }
+
+    // ------------------------------------------------------------------ GitHub credentials
+
+    use adam_workspace::testing::TestAppKey;
+
+    /// `full()` without the token, as owned strings, plus `extra`.
+    fn without_token(extra: &[(&str, String)]) -> HashMap<String, String> {
+        let mut vars: HashMap<String, String> = full()
+            .into_iter()
+            .filter(|(k, _)| *k != "GITHUB_TOKEN")
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        vars.extend(extra.iter().map(|(k, v)| ((*k).to_owned(), v.clone())));
+        vars
+    }
+
+    fn parse_owned(vars: &HashMap<String, String>) -> Result<Config, ConfigError> {
+        Config::from_lookup(|k| vars.get(k).cloned())
+    }
+
+    /// The problems of `vars`, which must not be valid.
+    fn problems_of(vars: &HashMap<String, String>) -> Vec<String> {
+        parse_owned(vars)
+            .expect_err("the variables are not valid")
+            .problems
+    }
+
+    fn app_vars(key_var: (&str, String)) -> Vec<(&'static str, String)> {
+        vec![
+            ("GITHUB_APP_ID", "12345".to_owned()),
+            ("GITHUB_APP_INSTALLATION_ID", "67890".to_owned()),
+            (
+                match key_var.0 {
+                    "GITHUB_APP_PRIVATE_KEY" => "GITHUB_APP_PRIVATE_KEY",
+                    _ => "GITHUB_APP_PRIVATE_KEY_PATH",
+                },
+                key_var.1,
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_personal_access_token_is_one_way_to_authenticate() {
+        let c = parse(&full()).unwrap().worker.unwrap();
+        let GitHubAuth::Token(token) = &c.github else {
+            panic!("a token: {:?}", c.github)
+        };
+        assert_eq!(token.expose_secret(), "ghp_secret");
+        assert!(!format!("{c:?}").contains("ghp_secret"), "Debug hides it");
+        assert_eq!(c.github.secrets(), ["ghp_secret"]);
+        assert!(c.github.check_hint().starts_with("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn a_github_app_is_the_other_way_with_a_key_from_a_file_or_from_the_variable() {
+        let key = TestAppKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.pem");
+        std::fs::write(&file, &key.pkcs1_pem).unwrap();
+        // A file, in GitHub's form; the variable in PKCS#8, with its newlines written as `\n`
+        // (what a secret store or an env file does to a PEM); and the same with real newlines.
+        let flattened = key.pkcs8_pem.trim().replace('\n', "\\n");
+        for (label, key_var, pem) in [
+            (
+                "file",
+                (
+                    "GITHUB_APP_PRIVATE_KEY_PATH",
+                    file.to_string_lossy().into_owned(),
+                ),
+                &key.pkcs1_pem,
+            ),
+            (
+                "escaped",
+                ("GITHUB_APP_PRIVATE_KEY", flattened),
+                &key.pkcs8_pem,
+            ),
+            (
+                "multi-line",
+                ("GITHUB_APP_PRIVATE_KEY", key.pkcs8_pem.clone()),
+                &key.pkcs8_pem,
+            ),
+        ] {
+            let mut extra = app_vars(key_var);
+            // An empty token is no token: a deployment that sets both to blank for the other way.
+            extra.push(("GITHUB_TOKEN", "  ".to_owned()));
+            let c = parse_owned(&without_token(&extra)).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let GitHubAuth::App(app) = &c.worker.as_ref().unwrap().github else {
+                panic!("{label}: an App")
+            };
+            assert_eq!(app.app_id, "12345");
+            assert_eq!(app.installation_id, 67890);
+            assert_eq!(app.pem.expose_secret().trim(), pem.trim(), "{label}");
+            // What the redactor must know: the PEM, and its body on one line.
+            let secrets = c.worker.as_ref().unwrap().github.secrets();
+            assert_eq!(secrets.len(), 2, "{label}");
+            assert!(secrets[0].starts_with("-----BEGIN"), "{label}");
+            assert!(
+                !secrets[1].contains(['\n', '-']) && secrets[1].len() > 1000,
+                "{label}"
+            );
+            // Nothing of the key, or of the App's secrets, in Debug output.
+            let debug = format!("{c:?}");
+            assert!(
+                !debug.contains("BEGIN") && !debug.contains(&secrets[1][..40]),
+                "{label}: {debug}"
+            );
+            assert!(debug.contains("installation_id: 67890"), "{debug}");
+            assert!(
+                c.worker
+                    .unwrap()
+                    .github
+                    .check_hint()
+                    .contains("GITHUB_APP_ID")
+            );
+        }
+        // The App's id may be a client id.
+        let mut extra = app_vars((
+            "GITHUB_APP_PRIVATE_KEY_PATH",
+            file.to_string_lossy().into_owned(),
+        ));
+        extra[0].1 = "Iv23liClientId".to_owned();
+        let c = parse_owned(&without_token(&extra)).unwrap();
+        let GitHubAuth::App(app) = &c.worker.unwrap().github else {
+            panic!("an App")
+        };
+        assert_eq!(app.app_id, "Iv23liClientId");
+    }
+
+    #[test]
+    fn exactly_one_way_every_problem_at_once_and_never_a_value() {
+        let key = TestAppKey::generate();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.pem");
+        std::fs::write(&file, &key.pkcs1_pem).unwrap();
+        let file = file.to_string_lossy().into_owned();
+        let full_app = || app_vars(("GITHUB_APP_PRIVATE_KEY_PATH", file.clone()));
+        let said = |problems: &[String], name: &str| problems.iter().any(|p| p.starts_with(name));
+
+        // Neither: both ways are named.
+        let problems = problems_of(&without_token(&[]));
+        assert!(said(&problems, "GITHUB_TOKEN is required"), "{problems:?}");
+        assert!(problems[0].contains("GITHUB_APP_ID"), "{problems:?}");
+        // Both, and a token with a part of an App: the same refusal.
+        let mut both = full_app();
+        both.push(("GITHUB_TOKEN", "ghp_secret".to_owned()));
+        for extra in [
+            both,
+            vec![
+                ("GITHUB_TOKEN", "ghp_secret".to_owned()),
+                ("GITHUB_APP_ID", "1".to_owned()),
+            ],
+        ] {
+            let problems = problems_of(&without_token(&extra));
+            assert!(
+                said(&problems, "GITHUB_TOKEN and the GITHUB_APP_*"),
+                "{problems:?}"
+            );
+            assert!(
+                problems.iter().all(|p| !p.contains("ghp_secret")),
+                "{problems:?}"
+            );
+        }
+        // A part of an App: everything that is missing, in one report, with the other problems.
+        let mut vars = without_token(&[
+            ("GITHUB_APP_ID", "1".to_owned()),
+            ("GITHUB_API_URL", "garbage".to_owned()),
+        ]);
+        let problems = problems_of(&vars);
+        for name in [
+            "GITHUB_APP_INSTALLATION_ID is required",
+            "GITHUB_APP_PRIVATE_KEY_PATH (a file)",
+            "GITHUB_API_URL",
+        ] {
+            assert!(said(&problems, name), "{name}: {problems:?}");
+        }
+        vars.remove("GITHUB_APP_ID");
+        vars.insert("GITHUB_APP_INSTALLATION_ID".into(), "7".into());
+        let problems = problems_of(&vars);
+        assert!(said(&problems, "GITHUB_APP_ID is required"), "{problems:?}");
+        // The installation id is a positive integer.
+        for bad in ["abc", "0", "-5", "1.5", "12 34"] {
+            let mut extra = full_app();
+            extra[1].1 = bad.to_owned();
+            let problems = problems_of(&without_token(&extra));
+            assert!(
+                said(
+                    &problems,
+                    "GITHUB_APP_INSTALLATION_ID must be a positive integer"
+                ),
+                "{bad}: {problems:?}"
+            );
+        }
+        // One key source.
+        let mut extra = full_app();
+        extra.push(("GITHUB_APP_PRIVATE_KEY", key.pkcs8_pem.clone()));
+        let problems = problems_of(&without_token(&extra));
+        assert!(
+            said(
+                &problems,
+                "GITHUB_APP_PRIVATE_KEY_PATH and GITHUB_APP_PRIVATE_KEY are both set"
+            ),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().all(|p| !p.contains("BEGIN")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_used_is_refused_at_startup_naming_the_variable_and_not_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let ec = "-----BEGIN EC PRIVATE KEY-----\nTOPSECRETBODYofAnECkey\n-----END EC PRIVATE KEY-----\n";
+        let junk = "TOPSECRETnotAPemAtAll";
+        let truncated = "-----BEGIN RSA PRIVATE KEY-----\nTOPSECRETtruncatedBody\n";
+        let cases = [
+            (
+                "a missing file",
+                (
+                    "GITHUB_APP_PRIVATE_KEY_PATH",
+                    dir.path().join("nope.pem").to_string_lossy().into_owned(),
+                ),
+                "GITHUB_APP_PRIVATE_KEY_PATH",
+            ),
+            (
+                "a directory",
+                (
+                    "GITHUB_APP_PRIVATE_KEY_PATH",
+                    dir.path().to_string_lossy().into_owned(),
+                ),
+                "GITHUB_APP_PRIVATE_KEY_PATH",
+            ),
+            (
+                "an EC key",
+                ("GITHUB_APP_PRIVATE_KEY_PATH", write("ec.pem", ec)),
+                "GITHUB_APP_PRIVATE_KEY_PATH: the GitHub App's private key is not usable",
+            ),
+            (
+                "junk in a file",
+                ("GITHUB_APP_PRIVATE_KEY_PATH", write("junk.pem", junk)),
+                "GITHUB_APP_PRIVATE_KEY_PATH: the GitHub App's private key is not usable",
+            ),
+            (
+                "a truncated key",
+                ("GITHUB_APP_PRIVATE_KEY_PATH", write("cut.pem", truncated)),
+                "GITHUB_APP_PRIVATE_KEY_PATH: the GitHub App's private key is not usable",
+            ),
+            (
+                "junk in the variable",
+                ("GITHUB_APP_PRIVATE_KEY", junk.to_owned()),
+                "GITHUB_APP_PRIVATE_KEY: the GitHub App's private key is not usable",
+            ),
+            (
+                "an EC key in the variable",
+                ("GITHUB_APP_PRIVATE_KEY", ec.replace('\n', "\\n")),
+                "GITHUB_APP_PRIVATE_KEY: the GitHub App's private key is not usable",
+            ),
+        ];
+        for (what, key_var, expected) in cases {
+            let problems = problems_of(&without_token(&app_vars(key_var)));
+            assert!(
+                problems.iter().any(|p| p.starts_with(expected)),
+                "{what}: {problems:?}"
+            );
+            let all = problems.join("\n");
+            assert!(
+                !all.contains("TOPSECRET"),
+                "{what}: the key is not in the message: {all}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_control_plane_reads_no_github_variables_not_even_bad_ones() {
+        let mut vars = without_token(&[
+            ("ROLE", "control-plane".to_owned()),
+            ("GITHUB_APP_ID", "1".to_owned()),
+            ("GITHUB_APP_PRIVATE_KEY", "junk".to_owned()),
+            ("GITHUB_TOKEN", "x".to_owned()),
+        ]);
+        assert!(parse_owned(&vars).is_ok());
+        vars.insert("ROLE".into(), "worker".into());
+        assert!(parse_owned(&vars).is_err(), "a worker does");
     }
 }

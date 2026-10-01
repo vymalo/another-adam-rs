@@ -51,6 +51,48 @@ fn workspace_dir(fx: &Fixture, run: &str) -> std::path::PathBuf {
     fx.root.join("workspaces").join(run)
 }
 
+/// A scratch project is lost with its run on purpose (it is not kept unless it was published):
+/// a cancelled (failed) run's project is deleted, a parked run's is kept with its files, and what
+/// was published stays on the remote.
+#[tokio::test]
+async fn a_scratch_project_goes_with_its_run_unless_the_run_is_waiting() {
+    let fx = Fixture::new("hello\n").await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let cancelled = run_in(&store, RunStatus::Failed).await.to_string();
+    let parked = run_in(&store, RunStatus::Parked).await.to_string();
+    for run in [&cancelled, &parked] {
+        let workspace = fx.env.workspaces.run(run).unwrap();
+        let slot = workspace
+            .add_scratch("fib", &fx.env.settings.identity)
+            .await
+            .unwrap();
+        std::fs::write(slot.path().join("fib.sh"), "echo 0\n").unwrap();
+    }
+    // The cancelled run also has a repository in its workspace, beside the project.
+    workspace_of(&fx, &cancelled).await;
+
+    let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)));
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert_eq!(
+        report.removed,
+        std::slice::from_ref(&cancelled),
+        "{report:?}"
+    );
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(!workspace_dir(&fx, &cancelled).exists());
+    assert!(
+        !fx.root.join("meta").join(&cancelled).exists(),
+        "the metadata of its slots is gone too"
+    );
+    assert!(
+        workspace_dir(&fx, &parked).join("fib/fib.sh").is_file(),
+        "a run that waits for the person keeps its project"
+    );
+    assert!(workspace_dir(&fx, &parked).join("fib/.git").is_dir());
+}
+
 #[tokio::test]
 async fn a_sweep_removes_what_is_over_and_keeps_what_is_open() {
     let fx = Fixture::new("hello\n").await;

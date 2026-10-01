@@ -485,7 +485,7 @@ pub struct MirrorLock {
 
 /// Parse `git status --porcelain=v1 -z`: `XY <path>\0`, plus an extra
 /// `<orig-path>\0` entry after renames and copies.
-fn parse_porcelain(bytes: &[u8]) -> Vec<ChangedFile> {
+pub(crate) fn parse_porcelain(bytes: &[u8]) -> Vec<ChangedFile> {
     let mut files = Vec::new();
     let mut entries = bytes.split(|b| *b == 0).filter(|e| !e.is_empty());
     while let Some(entry) = entries.next() {

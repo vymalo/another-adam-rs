@@ -214,6 +214,10 @@ pub(crate) struct ScratchMeta {
     pub(crate) seq: u32,
     /// `"scratch"`.
     pub(crate) kind: String,
+    /// The repository whose slot the project's files were last copied into (its url as the
+    /// caller wrote it, never a credential). Absent for a project that was never published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_to: Option<String>,
 }
 
 /// What one metadata file of a slot says.

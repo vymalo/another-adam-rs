@@ -496,6 +496,8 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
         names,
         [
             "prepare_workspace",
+            "start_scratch",
+            "publish_scratch",
             "run_command",
             "read_file",
             "write_file",
@@ -621,6 +623,158 @@ async fn the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request(stor
     assert_eq!(bound["passed"], true, "{bound}");
     assert_eq!(bound["commit"], pushed.as_str(), "{bound}");
     assert_eq!(fx.created_pulls().await.len(), 1);
+}
+
+/// The issue's path, through the runtime: the person gives a task and no repository, the coder
+/// builds and checks the project in a scratch project and asks where to put it (the run parks),
+/// the person names an empty repository, and the project is published there, checked, pushed and
+/// opened as a pull request: the pull request is for the code the checks passed on.
+async fn a_scratch_project_is_published_to_the_repository_the_person_names(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let empty = fx.empty_remote("fibonacci");
+    let url = empty.to_string_lossy().into_owned();
+    let mock = Arc::new(MockModel::new());
+    let question = "fib.sh is written and its check passes. The project is temporary: which \
+                    repository should I publish it to?";
+    mock.push_tool_calls(vec![call("s1", "start_scratch", json!({"name": "fib"}))])
+        .push_tool_calls(vec![call(
+            "s2",
+            "write_file",
+            json!({"path": "fib.sh", "content": "echo 0 1 1 2 3 5 8\n"}),
+        )])
+        .push_tool_calls(vec![call(
+            "s3",
+            "write_file",
+            json!({"path": "check.sh", "content": "test \"$(sh fib.sh)\" = \"0 1 1 2 3 5 8\"\n"}),
+        )])
+        .push_tool_calls(vec![call(
+            "s4",
+            "run_checks",
+            json!({"command": "sh ./check.sh", "repo": "fib"}),
+        )])
+        .push_text(question)
+        .push_tool_calls(vec![call(
+            "s5",
+            "publish_scratch",
+            json!({"repo_url": url}),
+        )])
+        .push_tool_calls(vec![call(
+            "s6",
+            "commit_and_push",
+            json!({"message": "feat: print the first fibonacci numbers", "repo": "fibonacci"}),
+        )])
+        .push_tool_calls(vec![call(
+            "s7",
+            "open_pull_request",
+            json!({
+                "title": "feat: print the first fibonacci numbers",
+                "body": "Adds fib.sh.\n\n## Verification\n- `sh ./check.sh`: passed",
+                "repo": "fibonacci",
+            }),
+        )])
+        .push_text("Opened the pull request.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(
+        &server,
+        "Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you the repo later.",
+    )
+    .await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    assert!(seen.saw_message(question), "{:#?}", seen.messages);
+    // The lines of the first steps (`wrote fib.sh (fib)`) are progress, which is not kept: a
+    // stream attaches to it after the task is made, and `start_scratch` and `write_file` can be
+    // done before it does. What the model was told about them is checked below instead.
+    // While it waits, the project is local: nothing was pushed, and no pull request exists.
+    assert!(
+        common::git(&empty, &["for-each-ref"]).is_empty(),
+        "the repository the person has not named yet is untouched"
+    );
+    assert!(fx.created_pulls().await.is_empty());
+    let run = run_id(&seen.task_id);
+
+    // The person names the repository.
+    let mut follow = user(&format!("Publish it to {url}"));
+    follow.task_id = Some(seen.task_id.clone());
+    let response = server.client.send_message(&request(follow)).await.unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("a task expected")
+    };
+    assert_ne!(task.status.state, TaskState::Failed, "resumed");
+    let done = wait_for(&server.coder.runtime, run, "the run to finish", |v| {
+        v.status.is_terminal()
+    })
+    .await;
+    worker.stop().await;
+    assert_eq!(done.status, RunStatus::Done, "{:?}", done.error);
+
+    // What the model was told about the publication.
+    let requests = mock.requests();
+    let result_of = |id: &str| -> String {
+        requests
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .find_map(|m| match m {
+                adam_model::Message::Tool {
+                    call_id, content, ..
+                } if call_id == id => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no result for {id}"))
+    };
+    assert!(result_of("s1").contains("temporary"), "{}", result_of("s1"));
+    for (id, file) in [("s2", "fib.sh"), ("s3", "check.sh")] {
+        assert!(
+            result_of(id).starts_with(&format!("Created {file} (")),
+            "{}",
+            result_of(id)
+        );
+    }
+    let published = result_of("s5");
+    assert!(
+        published.contains("slot: fibonacci")
+            && published.contains("The repository was empty")
+            && published.contains("The checks passed on exactly this code"),
+        "{published}"
+    );
+    // The repository: its first commit is empty, and the branch the work went through has the files.
+    assert_eq!(common::git(&empty, &["rev-list", "--count", "main"]), "1");
+    assert_eq!(
+        common::git(&empty, &["rev-parse", "main^{tree}"]),
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    );
+    let branches: Vec<String> = common::git(
+        &empty,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/agent",
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    assert_eq!(
+        common::git(&empty, &["show", &format!("{}:fib.sh", branches[0])]),
+        "echo 0 1 1 2 3 5 8"
+    );
+    let pulls = fx.created_pulls().await;
+    assert_eq!(pulls.len(), 1, "{pulls:?}");
+    assert_eq!(pulls[0]["base"], "main");
+    assert_eq!(
+        done.artifacts
+            .iter()
+            .filter(|a| a.name == "pull_request")
+            .count(),
+        1
+    );
 }
 
 // ------------------------------------------------------------------ input-required
@@ -2752,6 +2906,44 @@ async fn a_github_401_fails_the_run_with_a_clear_message(store: DynStore) {
     assert!(fx.created_pulls().await.is_empty());
 }
 
+/// The same, for a process that is a GitHub App: GitHub (or the mint) refuses it, and what the run
+/// ends with names the App's variables, not `GITHUB_TOKEN`.
+async fn a_refused_github_app_fails_the_run_naming_its_own_variables(store: DynStore) {
+    let fx = Fixture::new("hello\n").await.with_credentials_hint(
+        "the GitHub App's credentials (GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and the private \
+         key) are valid and that the App is installed on the repository with write access to its \
+         contents and pull requests",
+    );
+    common::github_fails_with(&fx.github, 401, "Bad credentials").await;
+    let mock = Arc::new(MockModel::new());
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:#?}",
+        seen.messages
+    );
+    let error = seen
+        .messages
+        .iter()
+        .find(|m| m.contains("Bad credentials"))
+        .unwrap_or_else(|| panic!("the GitHub message is reported: {:#?}", seen.messages));
+    assert!(
+        error.contains("GITHUB_APP_ID") && error.contains("GITHUB_APP_INSTALLATION_ID"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("GITHUB_TOKEN"),
+        "not the other way's variable: {error}"
+    );
+}
+
 // ------------------------------------------------------------- the A2A front
 
 /// The coder's own router (not just `adam-a2a`'s) refuses a missing or wrong
@@ -3315,6 +3507,7 @@ macro_rules! coder_suite {
             coder_suite!(@cases $make;
                 add_hello_txt_streams_working_progress_checks_artifact_completed,
                 the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request,
+                a_scratch_project_is_published_to_the_repository_the_person_names,
                 ask_user_parks_and_an_a2a_follow_up_resumes,
                 a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,
                 a_question_is_answered_from_a_look_around_and_costs_no_check_cycles,
@@ -3339,6 +3532,7 @@ macro_rules! coder_suite {
                 cancel_during_opencode_turn_cancels_without_push_or_pr,
                 two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs,
                 a_github_401_fails_the_run_with_a_clear_message,
+                a_refused_github_app_fails_the_run_naming_its_own_variables,
                 secrets_in_opencode_stderr_never_reach_the_client,
                 secrets_in_check_output_never_reach_the_client,
                 wrong_token_on_the_coder_router_is_401,

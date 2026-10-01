@@ -1,0 +1,32 @@
+{
+  "name": "publish_scratch",
+  "description": "Put the files of a scratch project into a repository the person named, so that the usual tools can check, commit, push and open a pull request there. The repository is added to your workspace as a slot, as prepare_workspace does, and a brand-new empty repository is first given an empty first commit on its base branch, so that the pull request has a base. The files are copied all or nothing: a file that is already there with other content stops the copy unless `overwrite` is true. A repository that already has files needs `path` (the directory of the repository to put the project in, for example `apps/fib`) or `overwrite`: ask the person which with ask_user, do not guess. It works only on a repository the person named. Afterwards the result says whether the checks you ran on the project still hold for the code in the repository: if not, run them again in the new slot, then commit_and_push and open_pull_request with `repo` set to that slot.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo_url": {
+        "type": "string",
+        "description": "https://github.com/<owner>/<repo>: a repository the person named"
+      },
+      "scratch": {
+        "type": "string",
+        "description": "The scratch project to publish: its name. Leave out when the workspace has one."
+      },
+      "base_branch": {
+        "type": "string",
+        "description": "Branch the pull request will be against. Leave out for the repository's default branch (`main` for an empty repository)."
+      },
+      "path": {
+        "type": "string",
+        "description": "Directory of the repository to put the files in, relative to its root (for example `apps/fib`). Leave out for the root; a repository that already has files needs it, or `overwrite`."
+      },
+      "overwrite": {
+        "type": "boolean",
+        "description": "Replace files that are already there with other content. Set true ONLY when the person said the files may be replaced. Never set it on your own judgement."
+      }
+    },
+    "required": [
+      "repo_url"
+    ]
+  }
+}

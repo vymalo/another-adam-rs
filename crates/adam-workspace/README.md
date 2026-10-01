@@ -10,7 +10,7 @@ The **workspace and code-host layer** of the coder agent, used by
 [`adam-coder`](../../bin/adam-coder/README.md) (and by anything that wants isolated
 worktrees). It defines three ports, `GitCredentials`, `CodeHost` and `Environment` (where a run's
 processes run, [below](#where-a-runs-processes-run-the-environment-port)), and ships
-their implementations in the same crate (`StaticToken`, `ScopedToken`,
+their implementations in the same crate (`StaticToken`, `ScopedToken`, `HostScoped`, `GitHubApp`,
 `GitHub`; `MemoryCodeHost` for tests; `Local`). Nothing implementation-specific appears
 in a trait signature. It shells out to the `git` CLI so mirrors, worktrees and
 authentication behave like the real tool.
@@ -20,7 +20,7 @@ authentication behave like the real tool.
 | Item | What |
 |---|---|
 | `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, **`run(run)`** (a run's workspace, below), **`runs()`** (the runs that have one on disk), **`remote_is_empty(url)`**, **`initialize_empty(&RepoRef, &GitIdentity)`**, **`wait_reachable(url, Duration)`**, `default_branch(url)`, `remove(run)` (everything of the run's workspace, the legacy worktree included), and the single-repository helpers `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `open_existing(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
-| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, `remove()`; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)` and `files()` |
+| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, `remove()`; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)`, `files()`, `status()`, `published_to()` and `set_published_to(url)` |
 | `copy_into(&Scratch, &Worktree, path, overwrite)`, `CopyReport`, `Collision` | the files of a scratch project into a worktree, all or nothing: `copied`, `unchanged`, `collisions` |
 | `Environment` (trait), `DynEnvironment`, `Local` | where a run's processes run: `ensure(&RunWorkspace, &dyn EnvProgress)` gives the run's `EnvSession` (made on first need, then the same), `release(run)` (idempotent), `held_runs()`. `Local` is the caller's own container and holds nothing |
 | `EnvSession` (trait), `LocalSession` | `describe()`, `prepare(&ExecSpec)` (the command to spawn), `kill(&ExecId)`, `secret_ref(name)` |
@@ -33,6 +33,8 @@ authentication behave like the real tool.
 | `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files |
 | `GitCredentials` (trait), `DynGitCredentials` | `token_for(&RepoRef) -> SecretString` |
 | `StaticToken`, `ScopedToken` | one token for any host, or bound to named hosts (`from_env(..)` for both) |
+| `HostScoped<C>` | any credentials, issued only for named hosts: `new(hosts, inner)` checks the host of the repository (and refuses a local one) **before** `inner` is asked, as `ScopedToken` does for its token |
+| `GitHubApp`, `AppKey` | credentials of a GitHub App installation (feature `github`): `AppKey::from_pem(&str)` parses the App's RSA key once; `GitHubApp::new(api_base, app_id, installation_id, key)` mints installation access tokens and keeps each until five minutes before it expires ([below](#github-app-credentials)); `with_clock(..)` moves its clock |
 | `CodeHost` (trait), `DynCodeHost` | `open_pull_request`, `find_pull_request` (matches the head **and** `repo.base_branch`), `find_pull_request_on_head` (the head alone, whatever the base: for a continued branch), `comment_on_pull_request`; `NewPullRequest`, `PullRequest` |
 | `GitHub` | GitHub REST `CodeHost`: `new(creds)`, `with_api_base(url)`; idempotent (returns the open pull request of the same head and base) |
 | `MemoryCodeHost` | in-memory `CodeHost` that records pull requests and comments (`comments()`), feature `test-util` |
@@ -107,7 +109,8 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
 <root>/workspaces/<run>/<dir>/          a slot: a worktree on agent/<run-short-id>, or a scratch project
 <root>/workspaces/<run>.lock            the run's lock, beside its directory
 <root>/meta/<run>/<dir>.json            the slot's metadata, version 2: dir, seq, kind ("repo" | "scratch"),
-                                        and for a repository url, base_branch, branch, remote_branch (no secrets)
+                                        for a repository url, base_branch, branch, remote_branch, for a scratch
+                                        project published_to (no secrets)
 <root>/worktrees/<run>                  legacy (one worktree per run): read as a slot, removed by remove(),
 <root>/meta/<run>.json                  made only by prepare / prepare_continuing
 ```
@@ -120,7 +123,11 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
 * **A scratch slot** is a git repository on `main` with an empty root commit (so `HEAD` exists), made by
   `add_scratch(dir, identity)` (`^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`; again it returns the same project; a
   crash between `git init` and the first commit is finished by the next call). `Scratch::commit_all` commits locally;
-  `Scratch::files` lists tracked files and untracked ones that `.gitignore` does not exclude.
+  `Scratch::files` lists tracked files and untracked ones that `.gitignore` does not exclude; `Scratch::status` lists what
+  differs from the last commit, as `Worktree::status` does. **`set_published_to(url)`** records, in the slot's metadata and
+  under the run's lock, the repository the project's files were last copied into (a later call replaces it; it survives a
+  restart and `add_scratch` of the same name), and **`published_to()`** says it as the slot was listed: what a caller tells
+  a model that goes on editing the project, whose changes no longer reach that repository.
 * **Order.** Every slot records `seq`, the place it joined the run, from 1; the legacy worktree is 0.
   `slots()` lists the legacy worktree first and then by directory; `slots_in_join_order()` by `seq`, whose first
   element is "the first repository". A slot whose directory is gone is not listed.
@@ -172,6 +179,68 @@ stateDiagram-v2
   RepoBacked --> Removed: remove, pushed branches remain
   Removed --> [*]
 ```
+
+## GitHub App credentials
+
+`GitHubApp` is a `GitCredentials` for one installation of a GitHub App
+([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md)). Wrap it in
+`HostScoped` so the host is checked before anything is signed; the coder does.
+
+```rust,ignore
+let key = AppKey::from_pem(&std::fs::read_to_string("app.pem")?)?;   // PKCS#1 or PKCS#8, parsed once
+let app = GitHubApp::new("https://api.github.com", "12345", 67890, key)?;
+let creds = Arc::new(HostScoped::new(["github.com"], app));
+let workspaces = Workspaces::new(root, creds.clone());
+let github = GitHub::new(creds)?;                                        // the same tokens for the REST calls
+```
+
+```mermaid
+sequenceDiagram
+  participant C as caller (git, GitHub)
+  participant H as HostScoped
+  participant A as GitHubApp
+  participant G as GitHub API
+  C->>H: token_for(repo)
+  H->>H: host allowed? (else Invalid, nothing is signed)
+  H->>A: token_for(repo)
+  alt a cached token has more than 5 minutes left
+    A-->>C: it
+  else none, or about to expire (one caller at a time, the others wait for it)
+    A->>A: JWT: RS256, iat now-60s, exp now+540s, iss the App
+    A->>G: POST /app/installations/{id}/access_tokens (Bearer JWT)
+    G-->>A: 201 {token, expires_at}
+    A-->>C: the new token
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Empty
+  Empty --> Fresh: minted
+  Fresh --> Expiring: 5 minutes or less left
+  Expiring --> Fresh: minted
+  Empty --> Empty: mint failed, nothing cached
+  Expiring --> Expiring: mint failed, the next call tries again
+```
+
+* **The key is parsed once**, in `AppKey::from_pem`: the first private key in the PEM, which must be an unencrypted RSA
+  key of 2048 to 8192 bits, PKCS#1 (`BEGIN RSA PRIVATE KEY`, what GitHub lets the owner download) or PKCS#8. Anything else is
+  `Invalid`, with a message that never carries the key, so a deployment finds a bad key at startup.
+* **Single flight.** The cache is behind a `tokio` mutex held while a token is minted, so 16 callers that arrive together make
+  one request and share its token. A mint that fails is not cached.
+* **`iss`** is the App's application ID or its client ID: a number when the ID is one, a string otherwise.
+* **Errors.** `401`, `403` and `404` are `Auth` (the message names `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and the key
+  variables of the coder, and what GitHub said, with the JWT scrubbed), `429` and a `403` with no rate limit left are
+  `RateLimited` (with `Retry-After`), `5xx`, a transport failure and an answer that cannot be read are `Transient`. Neither the JWT
+  nor a token is in an error, a `Debug` output or a log line.
+* **The token is not shaped.** Nothing reads its length or characters: GitHub began a staged rollout of a longer, stateless
+  token format on 2026-04-27 (*verified 2026-10-01*, docs.github.com), and a token is good for an hour.
+* *Verified 2026-10-01 against docs.github.com:* the JWT is `RS256` with `iat` best set 60 seconds in the past, `exp` at most
+  ten minutes ahead and `iss` the client ID or application ID; the endpoint answers `201 {token, expires_at}`; the token is
+  the password of `x-access-token` for git over HTTPS and a bearer for REST. *Unverified:* GitHub Enterprise Server's endpoint
+  (it is read from `api_base`, `https://<host>/api/v3`) and a live App.
+* **`testing::TestAppKey`** (features `github` and `test-util`) makes an RSA key at run time (`pkcs1_pem`, `pkcs8_pem`) and
+  verifies a JWT's signature (`verify_jwt`), so no test needs a committed key.
 
 ## Where a run's processes run: the environment port
 
@@ -295,8 +364,8 @@ token, and a message does not repeat its source.
 
 | Feature | Default | Effect |
 |---|---|---|
-| `github` | yes | the `GitHub` code host (pulls in `reqwest`) |
-| `test-util` | no | `MemoryCodeHost` for downstream tests |
+| `github` | yes | the `GitHub` code host and the `GitHubApp` credentials (pull in `reqwest`, and `aws-lc-rs`, `rustls-pki-types` and `chrono` to sign and read the App's JWT and key; `aws-lc-rs` and `rustls-pki-types` are already in the tree under `rustls`) |
+| `test-util` | no | `MemoryCodeHost` for downstream tests, and with `github` also `testing::TestAppKey` |
 
 The only environment variable the crate reads is the one you name in
 `StaticToken::from_env` / `ScopedToken::from_env` (for example `GITHUB_TOKEN`).
@@ -325,7 +394,8 @@ Offline. The `git` CLI must be on `PATH`.
   lost (made again on its branch, with its commit), a refused repository (nothing created, no lock file, bad run ids);
   scratch (a repository on `main` with one root commit by the given identity, no sample hooks, `files` without ignored or
   deleted files, `commit_all` once and then nothing, idempotent, bad names, a name that is a repository's, a lost root
-  commit made again); `remote_is_empty` and `initialize_empty` (the empty tree, `Initial commit`, a `Conflict` the second
+  commit made again; `status`, and `published_to` kept in the metadata across a new handle on the root and across
+  `add_scratch`, replaced by a later publication, and refused for a workspace that was removed); `remote_is_empty` and `initialize_empty` (the empty tree, `Initial commit`, a `Conflict` the second
   time and for a remote with refs, also under another base, nothing forced, a worktree of it from the new base);
   `wait_reachable` (found at once, `NotFound` after the time, found when the repository appears meanwhile, a refused URL at
   once); `copy_into` (files, the executable bit, a link kept, ignored files left, no temporary file, again all unchanged;
@@ -339,6 +409,15 @@ Offline. The `git` CLI must be on `PATH`.
   was hidden, a program and its arguments as they are, an empty `argv` refused, an id of its own for each command,
   `describe`, `secret_ref`, nothing held, `release` twice), `PreparedCommand::command` (what is hidden stays hidden even
   when the spec sets it; `env_clear` starts from nothing), the error classes, and `login_shell`.
+* `tests/github_app.rs`: `GitHubApp` against a `wiremock` server that verifies what it is sent: the JWT is signed by the key
+  (`TestAppKey::verify_jwt`) with `iat` a minute ago, `exp` nine minutes ahead and `iss` the App, the token is what the REST
+  client then sends; a client ID is the issuer as a string and a PKCS#8 key signs too; a token is kept until five minutes before
+  it expires (a clock the test moves) and then replaced; sixteen callers at once make one request; a foreign host is refused
+  before anything is minted (no request at all); a refusal names the variables and is not retried; `429`, a rate-limited `403`
+  and a `5xx` are what they should be, an unreachable GitHub is transient; a failed mint is tried again and the JWT is never in
+  the error. `tests/wiremock_compose.rs` (gated by `ADAM_TEST_MOCK_GITHUB_URL`) trades a JWT at the compose mock and opens a
+  pull request with the token it gives. Unit tests of `src/github_app.rs` (keys in either form, nothing else) and
+  `src/credentials.rs` (`HostScoped`).
 * `tests/github.rs`: the `GitHub` code host against a `wiremock` server,
   including the match on head and base and the comment on a pull request, error classes, `Retry-After` and transport source chains.
 * Unit tests in `src/error.rs` (`class_table` and the source-chain checks) and

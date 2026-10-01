@@ -71,7 +71,12 @@ pub async fn prepare_workspace(
         if let Some(key) = &key
             && !notes.named_repos.contains(key)
         {
-            return Ok(ToolOutput::error(not_named(url, &notes.named_repos)));
+            return Ok(ToolOutput::error(not_named(
+                url,
+                &notes.named_repos,
+                "work on (and which base branch), then call prepare_workspace with the one \
+                 they name.",
+            )));
         }
         if let Some(branch) = continuing {
             if !key.as_deref().is_some_and(|k| notes.has_pushed(k, branch)) {
@@ -228,8 +233,10 @@ fn not_pushed(branch: &str, url: &str, notes: &RunNotes, key: Option<&str>) -> S
     )
 }
 
-/// What the model is told when it picks a repository the person did not name.
-fn not_named(url: &str, named: &[String]) -> String {
+/// What the model is told when it picks a repository the person did not name: `then` finishes the
+/// sentence "Ask the person with ask_user which repository to ..." (what to ask, and which tool the
+/// answer goes to).
+pub(super) fn not_named(url: &str, named: &[String], then: &str) -> String {
     // Only what the person wrote is ever listed, and not the words that are files.
     let named = listed(named);
     let said = if named.is_empty() {
@@ -239,14 +246,15 @@ fn not_named(url: &str, named: &[String]) -> String {
     };
     format!(
         "Refused: {url} is not a repository the person named in their messages. {said} Do not \
-         choose or guess a repository. Ask the person with ask_user which repository to work on \
-         (and which base branch), then call prepare_workspace with the one they name."
+         choose or guess a repository. Ask the person with ask_user which repository to {then}"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const THEN: &str = "work on, then call prepare_workspace with the one they name.";
 
     #[test]
     fn the_branch_refusal_lists_only_what_was_pushed_for_that_repository() {
@@ -278,18 +286,23 @@ mod tests {
 
     #[test]
     fn the_refusal_names_the_way_out() {
-        let none = not_named("https://github.com/rust-lang/rust-clippy", &[]);
+        let none = not_named("https://github.com/rust-lang/rust-clippy", &[], THEN);
         assert!(none.contains("ask_user"), "{none}");
         assert!(none.contains("has not named any repository"), "{none}");
         assert!(none.contains("rust-clippy"), "{none}");
         let some = not_named(
             "https://github.com/a/b",
             &["github.com/acme/widgets".into()],
+            THEN,
         );
         assert!(some.contains("github.com/acme/widgets"), "{some}");
         assert!(some.contains("ask_user"), "{some}");
         // A word that is a file is not offered as a repository.
-        let file = not_named("https://github.com/a/b", &["github.com/src/main.rs".into()]);
+        let file = not_named(
+            "https://github.com/a/b",
+            &["github.com/src/main.rs".into()],
+            THEN,
+        );
         assert!(file.contains("has not named any repository"), "{file}");
         assert!(!file.contains("main.rs"), "{file}");
     }

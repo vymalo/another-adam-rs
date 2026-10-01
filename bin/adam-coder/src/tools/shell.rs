@@ -21,6 +21,7 @@ pub use adam_workspace::login_shell;
 /// repository code (build scripts, tests), which is untrusted.
 const HIDDEN_FROM_CHECKS: &[&str] = &[
     "GITHUB_TOKEN",
+    "GITHUB_APP_PRIVATE_KEY",
     "DATABASE_URL",
     "A2A_BEARER_TOKENS",
     "MODEL_API_KEY",
@@ -269,7 +270,7 @@ pub fn project_dependency_hint(dirs: &[&Path], name: &str) -> Option<String> {
 }
 
 /// The spec of a command of the project's (a check, a look around): the shell command `command`
-/// in `dir`, without the secrets of this process (`GITHUB_TOKEN`, `DATABASE_URL`, `A2A_BEARER_TOKENS`
+/// in `dir`, without the secrets of this process (`GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS`
 /// and `MODEL_API_KEY`: a check runs repository code, which is untrusted).
 pub fn shell_spec(dir: &Path, command: &str) -> ExecSpec {
     ExecSpec::shell(command, dir).hide(HIDDEN_FROM_CHECKS.iter().copied())
@@ -517,9 +518,10 @@ mod tests {
         // process's environment: what a spec hides is hidden even when the spec sets it.
         let spec = shell_spec(
             dir.path(),
-            "env | grep -c -E '^(GITHUB_TOKEN|DATABASE_URL|A2A_BEARER_TOKENS|MODEL_API_KEY)=' || true; echo kept=$KEPT",
+            "env | grep -c -E '^(GITHUB_TOKEN|GITHUB_APP_PRIVATE_KEY|DATABASE_URL|A2A_BEARER_TOKENS|MODEL_API_KEY)=' || true; echo kept=$KEPT",
         )
         .env("GITHUB_TOKEN", "a")
+        .env("GITHUB_APP_PRIVATE_KEY", "e")
         .env("DATABASE_URL", "b")
         .env("A2A_BEARER_TOKENS", "c")
         .env("MODEL_API_KEY", "d")

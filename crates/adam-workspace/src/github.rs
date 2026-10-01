@@ -314,7 +314,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 
 /// How long the host asked us to wait: `Retry-After` in seconds, else the moment its rate limit
 /// resets (`x-ratelimit-reset`, epoch seconds) minus `now`. `None` when it said neither.
-fn retry_after(
+pub(crate) fn retry_after(
     headers: &reqwest::header::HeaderMap,
     now: std::time::SystemTime,
 ) -> Option<Duration> {
@@ -332,7 +332,7 @@ fn retry_after(
 
 /// GitHub's `{"message": .., "errors": [{"message": .., "code": ..}]}`
 /// flattened into one line; falls back to the (truncated) raw body.
-fn api_message(body: &str) -> String {
+pub(crate) fn api_message(body: &str) -> String {
     #[derive(Deserialize)]
     struct ApiError {
         message: Option<String>,

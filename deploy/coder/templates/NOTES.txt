@@ -20,3 +20,10 @@ Workspace placement: {{ . }}
   the workers in or delete a worker's volume: the runs it owns are stranded.
 {{- end }}
 {{- end }}
+
+{{- if include "coder.githubApp" . }}
+
+GitHub: App {{ include "coder.githubAppId" . }}, installation {{ include "coder.githubAppInstallationId" . }}. The coder trades a JWT signed with
+the key in Secret {{ .Values.github.app.privateKeySecret }} (key private-key.pem) for installation access tokens, and renews
+them before they run out. It reads the key at startup: after rotating it, restart the pods.
+{{- end }}

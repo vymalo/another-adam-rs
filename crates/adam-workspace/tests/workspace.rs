@@ -1961,6 +1961,62 @@ async fn a_scratch_project_that_lost_its_root_commit_gets_one_again() {
 }
 
 #[tokio::test]
+async fn a_scratch_project_remembers_where_it_was_published_and_what_changed_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_scratch("fib", &me()).await.unwrap();
+    let scratch = slot.scratch().unwrap();
+    assert_eq!(scratch.published_to(), None);
+    assert!(scratch.status().await.unwrap().is_empty());
+
+    std::fs::write(scratch.path().join("fib.sh"), "echo 0\n").unwrap();
+    let status = scratch.status().await.unwrap();
+    assert_eq!(
+        status
+            .iter()
+            .map(|f| (f.path.as_str(), f.status))
+            .collect::<Vec<_>>(),
+        [("fib.sh", adam_workspace::FileStatus::Untracked)]
+    );
+    scratch.commit_all("fib", &me()).await.unwrap();
+    assert!(scratch.status().await.unwrap().is_empty());
+
+    scratch
+        .set_published_to("http://git-server:8080/scratch/fib.git")
+        .await
+        .unwrap();
+    // The value a listing gives is the one in the metadata, which survives a new handle on the
+    // root (a restart), and is replaced by a later publication.
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let listed = run.slot("fib").await.unwrap().unwrap();
+    assert_eq!(
+        listed.scratch().unwrap().published_to(),
+        Some("http://git-server:8080/scratch/fib.git")
+    );
+    listed
+        .scratch()
+        .unwrap()
+        .set_published_to("http://git-server:8080/scratch/other.git")
+        .await
+        .unwrap();
+    let again = run.add_scratch("fib", &me()).await.unwrap();
+    assert_eq!(
+        again.scratch().unwrap().published_to(),
+        Some("http://git-server:8080/scratch/other.git"),
+        "asking for the project again does not forget where it went"
+    );
+    assert_eq!(again.seq(), 1, "and does not move it in the order");
+
+    // A workspace that was removed has no project to say it of.
+    let scratch = again.scratch().unwrap().clone();
+    run.remove().await.unwrap();
+    let err = scratch.set_published_to("http://x/y/z.git").await;
+    assert!(matches!(err, Err(WorkspaceError::NotFound(_))), "{err:?}");
+}
+
+#[tokio::test]
 async fn an_empty_remote_is_given_its_first_commit_and_only_then() {
     let tmp = tempfile::tempdir().unwrap();
     let (remote, repo) = empty_remote(tmp.path(), "scratch", "fib");

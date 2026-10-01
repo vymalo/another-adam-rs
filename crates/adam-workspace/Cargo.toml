@@ -10,16 +10,20 @@ rust-version.workspace = true
 
 [features]
 default = ["github"]
-# The GitHub REST `CodeHost` (pulls in `reqwest`).
-github = ["dep:reqwest"]
+# The GitHub REST `CodeHost` and the GitHub App credentials (pull in `reqwest`, and `aws-lc-rs` and
+# `rustls-pki-types` to sign the App's JWT).
+github = ["dep:reqwest", "dep:aws-lc-rs", "dep:chrono", "dep:rustls-pki-types"]
 # Test doubles (`MemoryCodeHost`) for downstream crates' tests.
 test-util = []
 
 [dependencies]
 adam-error.workspace = true
 async-trait.workspace = true
+aws-lc-rs = { workspace = true, optional = true }
 base64.workspace = true
+chrono = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

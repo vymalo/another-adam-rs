@@ -128,21 +128,80 @@ impl fmt::Debug for ScopedToken {
 #[async_trait]
 impl GitCredentials for ScopedToken {
     async fn token_for(&self, repo: &RepoRef) -> Result<SecretString, WorkspaceError> {
-        let loc = repo.locate()?;
-        if loc.is_local() {
-            return Err(WorkspaceError::Invalid(
-                "credentials are only issued for http(s) hosts, not local repositories".to_owned(),
-            ));
+        check_host(&self.hosts, repo)?;
+        Ok(self.token.clone())
+    }
+}
+
+/// Refuse `repo` unless it is on one of `hosts` (names, any port, or `name:port`): never a local
+/// repository. What [`ScopedToken`] and [`HostScoped`] check before they issue anything.
+fn check_host(hosts: &[String], repo: &RepoRef) -> WorkspaceResult<()> {
+    let loc = repo.locate()?;
+    if loc.is_local() {
+        return Err(WorkspaceError::Invalid(
+            "credentials are only issued for http(s) hosts, not local repositories".to_owned(),
+        ));
+    }
+    if hosts.iter().any(|h| loc.matches_host(h)) {
+        Ok(())
+    } else {
+        Err(WorkspaceError::Invalid(format!(
+            "no credentials for the host of {}; they are only valid for: {}",
+            repo.url,
+            hosts.join(", ")
+        )))
+    }
+}
+
+/// Credentials that are only issued for certain hosts: `inner`'s, after the host of the repository
+/// has been checked, so that whatever mints or fetches a token (a GitHub App's installation
+/// token, say) is never asked to for a URL an untrusted party chose.
+///
+/// [`token_for`](GitCredentials::token_for) refuses, with [`WorkspaceError::Invalid`] and before
+/// `inner` is called, every repository whose host is not one of the hosts, and every filesystem
+/// remote. A host entry is a name (any port) or `name:port`, compared case-insensitively. This is
+/// [`ScopedToken`]'s rule for any credentials.
+#[derive(Clone)]
+pub struct HostScoped<C> {
+    hosts: Vec<String>,
+    inner: C,
+}
+
+impl<C> HostScoped<C> {
+    /// `inner`, valid for `hosts` only.
+    pub fn new<I, S>(hosts: I, inner: C) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            hosts: hosts
+                .into_iter()
+                .map(|h| h.into().trim().to_ascii_lowercase())
+                .collect(),
+            inner,
         }
-        if self.hosts.iter().any(|h| loc.matches_host(h)) {
-            Ok(self.token.clone())
-        } else {
-            Err(WorkspaceError::Invalid(format!(
-                "no credentials for the host of {}; this token is only valid for: {}",
-                repo.url,
-                self.hosts.join(", ")
-            )))
-        }
+    }
+
+    /// The hosts these credentials are valid for.
+    pub fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+}
+
+impl<C> fmt::Debug for HostScoped<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostScoped")
+            .field("hosts", &self.hosts)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl<C: GitCredentials> GitCredentials for HostScoped<C> {
+    async fn token_for(&self, repo: &RepoRef) -> Result<SecretString, WorkspaceError> {
+        check_host(&self.hosts, repo)?;
+        self.inner.token_for(repo).await
     }
 }
 

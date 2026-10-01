@@ -4,7 +4,8 @@ The coder agent: a coding task in, a verified pull request out, over A2A.
 
 Given "in repo X, do Y" it
 
-1. prepares a git worktree of X in the run's workspace (`adam-workspace`; a workspace holds several repositories),
+1. prepares a git worktree of X in the run's workspace (`adam-workspace`; a workspace holds several repositories, and
+   a task that names none starts in a **scratch project** that is published to the repository the person names later),
 2. makes the change: small, well-located edits itself (`read_file`, `write_file`, `apply_patch`), broad ones
    through OpenCode over ACP (`adam-acp`),
 3. runs the project's own checks, at most `MAX_CHECK_CYCLES` failing cycles,
@@ -43,23 +44,25 @@ sequenceDiagram
 | Tool | Does |
 |---|---|
 | `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
+| `start_scratch { name? }` | `RunWorkspace::add_scratch` for the run (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. The result says the project is **temporary** (it exists only while the task is open, nothing is kept unless it is published) and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
+| `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **the person named** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
 | `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
 | `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
 | `delegate_to_opencode { instructions, repo? }` | spawns the ACP agent in the worktree of the slot, as the run's environment prepared the command ([below](#where-the-processes-of-a-run-run); `ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
 | `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
-| `commit_and_push { message, repo? }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
-| `open_pull_request { title, body, accept_red_checks?, repo? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
+| `commit_and_push { message, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository). In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
+| `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question, choices? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions of 2 to 8 options, as one form) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the twelve. The tools the conversation's endpoint lists
+folder](#mcp-tools-from-the-folder)); they are not part of the fourteen. The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)).
 
-Nine tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the nine is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Eleven tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the eleven is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
@@ -167,7 +170,7 @@ subscriber sees it once.
 |---|---|---|
 | `passed` | bool | the command exited 0 in time **and** `commit` was determined |
 | `commit` | string | the 40-hex SHA of a commit: for `run_checks`, the `HEAD` of the run's worktree when the command ran (`""` only when it could not be read); for `commit_and_push`, the pushed commit |
-| `repository` | string, optional | the URL of the repository of the slot the command ran in; for the verdict `commit_and_push` binds to a pushed commit, the repository it was pushed to. Absent from a report of an older coder |
+| `repository` | string, optional | the URL of the repository of the slot the command ran in; for the verdict `commit_and_push` binds to a pushed commit, the repository it was pushed to. Absent for a check that ran in a scratch project (it has none), and from a report of an older coder |
 | `tree` | string, optional | the 40-hex git tree id of the code that was checked: the worktree as `commit_and_push` would commit it (`git add -A`: tracked changes and untracked files, minus what `.gitignore` excludes), computed in a temporary index. Absent when it could not be computed |
 | `summary` | string, optional | one line: `` `cmd` passed ``, or `` `cmd` failed: exit code 2 `` / `timed out after 900s` / `killed by a signal`. Says so when the worktree had uncommitted changes on top of `commit`, or that the tree was checked before it was committed |
 | `findings` | `[{check, message}]`, optional | one entry per failing check: `check` is the command, `message` is how it ended, then the tail of its output |
@@ -249,7 +252,8 @@ make them hold:
   checks, the check-cycle budget used up and no pull request fails instead of
   completing, whatever the model says. So does a run that ends without a pull
   request because GitHub or git rejected the credentials (the model cannot fix a
-  bad token): the error names `GITHUB_TOKEN`. Anything else is a **question,
+  bad token, or an App that is not installed there): the error names `GITHUB_TOKEN`, or the `GITHUB_APP_*`
+  variables in App mode. Anything else is a **question,
   not a completion** (red checks with cycles left included: fixing or asking is
   the model's call): the model
   that answers "Hi! I need a repository and a task" in plain text asked
@@ -267,6 +271,11 @@ make them hold:
   something else or stop it. The exits are a pull request, a failure (the rules
   above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
   and CancelTask (a chat's Stop).
+* **A scratch project is temporary, and what is published is what was checked.** It lives as long as the run (the
+  janitor deletes it with the rest of the workspace; the instructions and the tool's result tell the model to say so),
+  `commit_and_push` there is a local commit and `open_pull_request` is refused, so nothing leaves the process until
+  `publish_scratch` copies the files into a repository the person named. The gate does not change: the checks that ran
+  on the project are bound to the pushed commit only when its tree is the same ([below](#scratch-projects)).
 * **The file tools stay in the worktree.** `read_file`, `write_file` and `apply_patch` check every path with `confine`
   (no `..`, no absolute path, nothing inside `.git`, no write through a symlink, no read that leaves the worktree) and
   `apply_patch` checks the paths git itself reads from the patch, so a hostile path is a refusal the model is told, never a
@@ -296,8 +305,9 @@ make them hold:
 * **A question is answered, not worked on.** The prompt says that a greeting or a question about the
   repository ("List all branches") gets a direct answer (after `prepare_workspace`, with `run_command`) and ends
   the turn; the run then parks as a question like any stop without a pull request, and the chat goes on.
-* **Only a repository the person named.** `prepare_workspace` refuses a
-  repository that is not named in the person's own messages of the run: the
+* **Only a repository the person named.** `prepare_workspace` and `publish_scratch` refuse a
+  repository that is not named in the person's own messages of the run (a scratch project is published
+  only to one the person named: nothing is copied, pushed or even asked of a remote otherwise): the
   task, and every answer delivered to it (user messages and the results of
   `ask_user`, paired with the question by position in the history, because
   providers that send no call ids get `call_0`, `call_1` again in every turn; what
@@ -482,6 +492,72 @@ stateDiagram-v2
   Swept --> [*]: the notes and the branches stay
 ```
 
+### Scratch projects
+
+A task that names no repository ("write a script that prints the first seven Fibonacci numbers; I'll give you the
+repository later") used to end in a question. `start_scratch` makes a **scratch slot**: a local git repository (branch
+`main`, an empty root commit) in the run's workspace, where the model writes the files, runs the checks it writes for
+them and commits as it goes, with the tools it has in a repository. Nothing leaves the process: `commit_and_push` there
+is a local commit and `open_pull_request` is refused. When the person names a repository, `publish_scratch` puts the
+project into it:
+
+1. **The grant.** The repository must be one the person named, as for `prepare_workspace`.
+2. **The slot.** The repository's slot is found, or made: a remote with **no ref at all** (a repository that was just
+   created) is first given an empty-tree `Initial commit` on its base branch, so that the pull request has a base; then
+   `add_repository` makes its worktree. A repository that **already has files** (the tree of its base is not empty) is
+   refused unless the call has `path` or `overwrite`, which are the person's to give: the result tells the model to ask.
+3. **The copy.** `copy_into(project, worktree, path, overwrite)`: all or nothing, with every collision listed.
+4. **The next step.** The result says which slot to use and whether the checks that ran on the project still hold:
+   the **tree** of the worktree after the copy is looked up in the run's check history (`RunNotes::checked`). The same
+   tree (the files landed unchanged in an empty repository) means the check that passed on the project is the check of
+   the code that will be pushed, so `commit_and_push` binds it to the pushed commit and the pull request is allowed;
+   any other tree is *not checked* until `run_checks` runs in the new slot, and the result says so.
+
+The project is left as it is and remembers where it went (`published_to`); the tools that change it afterwards
+(`write_file`, `apply_patch`, `commit_and_push`, `start_scratch` again) say that the change does not reach the repository,
+and a second `publish_scratch` copies it again (a file that differs needs `overwrite`). The scratch history is **not**
+carried: the pull request holds the commits made in the repository's worktree (ADR 0008, decision 5).
+
+```mermaid
+sequenceDiagram
+  participant P as Person
+  participant M as Model
+  participant T as Tools
+  participant W as RunWorkspace
+  participant G as Git remote
+  P->>M: a task, no repository
+  M->>T: start_scratch(fib)
+  T->>W: add_scratch
+  M->>T: write_file, run_checks(repo: fib)
+  T->>W: the check and its tree, recorded in the notes
+  M->>P: asks which repository to publish it to (the run parks)
+  P->>M: "Publish it to <repository>"
+  M->>T: publish_scratch(repository)
+  T->>T: the repository is named by the person
+  T->>G: ls-remote: no ref at all?
+  T->>G: push an empty first commit as main
+  T->>W: add_repository, copy_into
+  T-->>M: slot, copied files, did the checks run on this code
+  M->>T: commit_and_push, open_pull_request (repo: the new slot)
+  T->>G: push agent/run, pull request
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Empty: the run starts
+  Empty --> Scratch: start_scratch
+  Scratch --> Scratch: write_file, run_checks, commit_and_push (local)
+  Scratch --> Refused: publish_scratch to a repository nobody named
+  Refused --> Scratch: nothing was touched
+  Scratch --> Published: publish_scratch (named; empty, or path / overwrite)
+  Published --> Pushed: run_checks if the tree changed, commit_and_push, open_pull_request in the new slot
+  Scratch --> Deleted: the run ends, nothing published (the janitor)
+  Published --> Released: the run ends (the janitor), the pushed branch stays
+  Deleted --> [*]
+  Pushed --> Released
+  Released --> [*]
+```
+
 ### Where the processes of a run run
 
 `run_command`, `run_checks` and `delegate_to_opencode` do not spawn a process themselves: each asks the run's
@@ -528,8 +604,9 @@ stateDiagram-v2
   `fs_root` and the git snapshots of `run_command` need no mapping. The file tools and all git work stay in this process.
 * **No secret in a spec.** `ExecSpec.env` carries the OpenCode configuration (which names the key as `{env:MODEL_API_KEY}`) and
   never a value of a secret; what the process must not see of this process's own environment is `ExecSpec.hide`:
-  `GITHUB_TOKEN`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY` for the project's commands, the first three for
-  OpenCode (which reads the model key from its environment). A name in `hide` stays hidden even when a spec sets it.
+  `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY` for the project's commands,
+  the first four for OpenCode (which reads the model key from its environment). The App's key as a *file*
+  (`GITHUB_APP_PRIVATE_KEY_PATH`) is a path, not a secret, and the file is readable by the user the checks run as. A name in `hide` stays hidden even when a spec sets it.
 * **A failure to make the environment is a result for the model**, worded `the work environment: <reason>` (the end of a
   failed build's output follows, scrubbed): permanent for a configuration or a build that is wrong, transient for a runtime
   that is down or too slow. Nothing ran, no check cycle was used, no `checks` artifact was emitted. A cancel of the run ends
@@ -882,7 +959,9 @@ way; every problem is reported at once at startup):
 | `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required by `all` and `worker` (key may be empty) |
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
-| `GITHUB_TOKEN` | push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required by `all` and `worker` |
+| `GITHUB_TOKEN` | push and pull request token (a personal access token); only ever sent to the `ALLOWED_REPO_HOSTS`. Must be unset or empty in App mode | one of this or the App's variables, for `all` and `worker` |
+| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` | GitHub App mode: the App's application ID or client ID (the JWT's `iss`), and the installation's ID (a positive integer). See [GitHub credentials](#github-credentials-a-token-or-an-app-installation) | both required in App mode, unset in token mode |
+| `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 as GitHub gives it, or PKCS#8): a file, or inline (`\n` escapes accepted). Exactly one. Parsed at startup | one required in App mode |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
@@ -910,7 +989,7 @@ OpenCode's configuration is generated at startup into
 `MODEL_BASE_URL`, model `OPENCODE_MODEL`, key by reference `{env:MODEL_API_KEY}`,
 never inlined) together with `OPENCODE_DISABLE_AUTOUPDATE=1`; see
 `src/opencode.rs` for what was verified against the OpenCode sources. The
-OpenCode child does not see `GITHUB_TOKEN`, `DATABASE_URL` or
+OpenCode child does not see `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` or
 `A2A_BEARER_TOKENS`, and the checks do not see those or `MODEL_API_KEY`.
 
 ### Workspace placement
@@ -991,7 +1070,7 @@ By default any worker may lease any run at any step. Several workers therefore n
 |---|---|---|---|
 | `DATABASE_URL` | yes | yes | yes |
 | `A2A_BEARER_TOKENS`, `PUBLIC_URL` | yes | yes | not read |
-| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `GITHUB_TOKEN` | yes | not read | yes |
+| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, and `GITHUB_TOKEN` or the `GITHUB_APP_*` variables | yes | not read | yes |
 | the rest of the table above (`OPENCODE_*`, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `WORKSPACE_PLACEMENT`, `WORKER_ID`, `WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
 
 A missing required value is a configuration error (exit 78) listed with every other problem.
@@ -1015,7 +1094,8 @@ own stops the others and ends the process with a `HostError`, exit 70.
 ### Which repositories, and where the token goes
 
 The repository URL comes from the model, which took it from the user, so it
-is treated as hostile input. `GITHUB_TOKEN` is bound to `ALLOWED_REPO_HOSTS`
+is treated as hostile input. The GitHub credential (the token, or the App's installation
+token) is bound to `ALLOWED_REPO_HOSTS`
 twice over, and a third layer decides whether the repository may be used at all:
 
 0. **Only a repository the person named.** `prepare_workspace` refuses, before
@@ -1028,21 +1108,88 @@ twice over, and a third layer decides whether the repository may be used at all:
    anything that is not `https://<host>/<owner>/<repo>` are refused by the
    parser, and git is handed the URL rebuilt from the parsed parts, never the
    raw string.
-2. The credentials are a `ScopedToken` for the same hosts, which refuses
+2. The credentials are a `ScopedToken` for the same hosts (a `HostScoped<GitHubApp>` in App mode, which
+   checks the host *before* it signs anything or calls GitHub), which refuses
    every other host even if a caller forgot the check.
 
 Local paths, `file://` and plain `http://` are refused unless
 `ALLOW_LOCAL_REPOS=true`, which exists for development and tests; local
 remotes never receive the token.
 
+### GitHub credentials: a token or an App installation
+
+A worker authenticates to GitHub one of two ways, **exactly one**
+([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md)):
+
+| | token | GitHub App installation |
+|---|---|---|
+| Variables | `GITHUB_TOKEN` | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and one of `GITHUB_APP_PRIVATE_KEY_PATH` (a file) or `GITHUB_APP_PRIVATE_KEY` (the PEM; `\n` escapes accepted) |
+| `GITHUB_TOKEN` | required | must be unset or empty |
+| Whose | a person's, until it is revoked | the App's, scoped to what the App was granted on the installation; its tokens last an hour |
+| Credentials | `ScopedToken` for `ALLOWED_REPO_HOSTS` | `HostScoped<GitHubApp>` for the same hosts |
+
+Both set, an App set that is partial (`GITHUB_APP_ID` without the installation or the key, a key with both its
+file and its variable), an installation ID that is not a positive integer, a key file that cannot be read, and a
+key that is not an unencrypted RSA key in PEM form (PKCS#1, as GitHub lets the owner download it, or PKCS#8) are
+configuration errors: exit 78, every problem listed, the name of the variable and never a value. The key is
+**parsed at startup**, so a deployment learns of a bad one when it rolls out, not at the first push. A rotated
+key needs a restart. `GITHUB_APP_ID` is the App's application ID or its client ID (the JWT's `iss`).
+
+```mermaid
+sequenceDiagram
+  participant S as a step (clone, push, pull request)
+  participant C as credentials (HostScoped, then GitHubApp)
+  participant G as GITHUB_API_URL
+  participant R as the redactor
+  S->>C: token_for(repository)
+  C->>C: the host is in ALLOWED_REPO_HOSTS? (else refused, nothing is signed)
+  alt a cached token has more than 5 minutes left
+    C-->>S: the cached token
+  else none, or about to expire (one caller at a time)
+    C->>G: POST /app/installations/{id}/access_tokens (Bearer: a JWT, RS256, iat now-60s, exp now+540s)
+    G-->>C: 201 {token, expires_at}
+    C->>R: add(token)
+    C-->>S: the new token
+  end
+  S->>G: git: x-access-token:token, REST: Bearer token
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Empty: startup, the key is parsed
+  Empty --> Fresh: minted
+  Fresh --> Expiring: 5 minutes or less left
+  Expiring --> Fresh: minted
+  Empty --> Empty: a mint failed, nothing cached
+  Expiring --> Expiring: a mint failed, the next call tries again
+```
+
+A token the App minted is a secret from the moment it exists: the redactor is shared, and the credentials add
+each token they hand out (at most 16 are remembered, oldest forgotten first), so a tool result, an error or a
+log line that quotes one is scrubbed (the App's PEM and its Base64 body are registered at startup). The key is
+hidden from OpenCode and from the project's commands as `GITHUB_TOKEN` is; a key file is a path, and sits
+wherever the deployment mounted it (the chart: `/var/run/secrets/github-app/private-key.pem`, read-only, mode
+0440, group `fsGroup`).
+
+A refused mint is told to the person as it is for a bad token: `401`, `403` and `404` from GitHub are an
+authentication error that names `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and the key, and a run that ends at
+one fails naming them (and that the App must be installed on the repository, with write access to its contents
+and pull requests). A rate limit is a rate limit (with the wait GitHub asked for), and a `5xx` or a transport
+failure is transient. The token endpoint is `{GITHUB_API_URL}/app/installations/{id}/access_tokens`, so GitHub
+Enterprise Server and a mock need no other variable. The deployment's own example is
+`dev/compose.github-app.yaml` (an init service makes a throwaway key; the mock gives an installation token that
+lasts four minutes, so the coder renews it all the time) and `deploy/coder` (`github.auth: app`).
+
 ### Secrets in output
 
 Text from things this process does not control (OpenCode's stderr tail in an
 "ACP agent exited" error, a check's output, a provider's error body) reaches
 clients as run errors, events and tool results. A `Redactor` built from the
-configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN` (both only where the role holds them), every
+configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN` or the App's private key (the PEM and its
+Base64 body), each only where the role holds them, every
 `A2A_BEARER_TOKENS` entry and the `DATABASE_URL` password (and their Base64
-forms) with `[redacted]` in tool results and errors, in OpenCode's and the
+forms), and every installation token an App mints, from the moment it is minted (the redactor is shared, and
+the credentials add each token they hand out, up to 16 at a time), with `[redacted]` in tool results and errors, in OpenCode's and the
 checks' progress lines, in the `checks` artifact's findings and summary, in the agent's final
 failure message, and in the process's own `adam-coder failed` log line.
 A failed step's error crosses one boundary (`boundary_error` in
@@ -1083,7 +1230,7 @@ workspace, the agent files and their assembly):
 | 69 (`EX_UNAVAILABLE`) | a dependency is unreachable; restart later | a `Transient`, `RateLimited` or `Conflict` one of those, such as Postgres at boot |
 | 71 (`EX_OSERR`) | the OS refused something | an `io::Error` with no typed error above it: a listener that cannot bind |
 | 70 (`EX_SOFTWARE`) | internal | `HostError` (a component stopped, panicked or ended before shutdown, whatever its own cause), a panicked task, or a `Corrupt` or `Internal` typed error (including `OpenAiConfigError::Client`) |
-| 1 | anything else | for example `NotFound`, `Rejected`, `Unauthenticated` (a bad `GITHUB_TOKEN`) or an untyped error |
+| 1 | anything else | for example `NotFound`, `Rejected`, `Unauthenticated` (a bad `GITHUB_TOKEN`, or a refused App) or an untyped error |
 
 The typed errors it looks for are `StoreError`, `OpenAiConfigError`,
 `WorkspaceError`, `RuntimeError`, `HostError`, `AgentFilesError` and the assembly's (including an MCP server
@@ -1123,7 +1270,9 @@ database of its own, so the role needs `CREATEDB`):
   commit (the one bound to the pushed commit is emitted once), the same worktree; OpenCode crashing on every attempt
   (run fails after the retry budget, with the child's stderr) and once
   (retried, completes); two concurrent tasks on one repository (two branches,
-  two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`).
+  two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`, or the `GITHUB_APP_*` variables when the coder is an App
+  installation); an App installation token that is minted, used for every call to the repositories' API and never
+  echoed (a tool result that quotes it is scrubbed).
   Asking with choices, over A2A with the screen's real catalog (a copy of the web's, in
   `adam-ui`'s fixtures): three questions as one form (`input-required` with the question as text and one
   `application/a2ui+json` part, a Choices of db, auth and deploy under the screen's `catalogId`), the person's
@@ -1213,6 +1362,36 @@ database of its own, so the role needs `CREATEDB`):
   (`the_janitor_removes_the_workspace_of_a_finished_run_and_keeps_an_open_one`, with Postgres: the process sweeps on its
   own, a run that finishes later loses its workspace, SIGTERM stops it with exit 0; `a_sweep_of_zero_seconds_turns_the_janitor_off`;
   a bad `WORKSPACE_SWEEP_SECS` exits 78 with the other problems) and `src/config.rs`.
+* GitHub credentials: the unit tests of `src/config.rs` (a token is one way; an App is the other, with the key from a
+  file or from the variable, in PKCS#1 or PKCS#8, `\n` escapes accepted; both, a partial App set, an installation ID that is
+  not a positive integer and a key given twice are every problem at once and never a value; a key that cannot be used is
+  refused at startup naming the variable and not the key; a control plane reads none of it, bad values included), of
+  `src/redact.rs` (a secret added later is scrubbed by every clone, only the latest 16 are kept, a token is registered as it is
+  handed out, an App's key is redacted as its PEM and as its body) and of `src/repos.rs` (an App mints at the API root, for the
+  allowed hosts only); in `tests/binary.rs`, `a_github_app_configuration_is_checked_at_startup_and_exits_78_with_every_problem`
+  and `a_github_app_installation_gets_its_token_minted_and_opens_the_pull_request` (with Postgres: the real binary against a
+  mock that hands a token for a JWT, every call to the repositories' API carries it, and no secret is in the output); in
+  `tests/tools.rs`, `a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_return`; in `tests/e2e.rs`
+  (per store), `a_refused_github_app_fails_the_run_naming_its_own_variables`. The compose scenarios run twice, the second time
+  as an App (`GITHUB_AUTH=app`, `-f dev/compose.github-app.yaml`: an init service makes a throwaway key), and assert that the
+  mock saw the trade and that every call to `/repos/...` carried the installation token and never the JWT.
+* Scratch projects: `tests/tools.rs` (`a_scratch_project_is_built_checked_and_committed_locally`: the file tools, `run_checks`
+  (an artifact with no `repository`), `run_command` (a stray file and a sneaky commit are undone, as in a worktree) and OpenCode
+  work in it, `commit_and_push` is a local commit with no artifact and no remote branch, `open_pull_request` is refused and
+  points to `publish_scratch`; `a_scratch_project_needs_a_plain_name_that_no_repository_has`;
+  `publish_scratch_works_only_on_a_repository_the_person_named`: refused before any mirror is made;
+  `a_scratch_project_published_to_an_empty_repository_keeps_the_checks_it_passed`: the empty first commit is all `main`
+  holds, the verdict bound to the pushed commit is the one the project earned (the same tree), the pull request is against
+  `main`, and the project says where it went when it is changed afterwards; `publishing_twice_is_the_same_publication`;
+  `a_publication_that_died_after_the_first_commit_goes_on`; `a_repository_that_has_files_needs_a_directory_or_permission_to_overwrite`
+  (a hostile `path` is refused, a collision lists what is in the way and changes nothing, `overwrite` replaces what differs and
+  nothing else); `an_empty_project_is_not_published_and_leaves_the_repository_empty`; which project to publish when there are
+  several; `a_cancelled_run_publishes_nothing`; `the_history_of_the_project_is_not_carried_into_the_repository`),
+  `tests/e2e.rs`' `a_scratch_project_is_published_to_the_repository_the_person_names` (per store: build and check, the run parks
+  on the question with nothing pushed, the answer names an empty repository, publish, push, pull request),
+  `tests/janitor.rs`' `a_scratch_project_goes_with_its_run_unless_the_run_is_waiting`, and the compose scenario
+  `SCENARIO=scratch sh dev/coder-e2e.sh` (the `[mock:scratch]` script, which `wiremock_compose` of `adam-model-openai` plays
+  against a real WireMock).
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, malformed arguments,
   `prepare_workspace` refusing a repository the person did not name (the refusal names

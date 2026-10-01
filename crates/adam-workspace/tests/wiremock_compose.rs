@@ -13,9 +13,12 @@
 
 use std::sync::Arc;
 
+use adam_workspace::testing::TestAppKey;
 use adam_workspace::{
-    CodeHost, GitHub, NewPullRequest, PullRequest, RepoRef, StaticToken, WorkspaceError,
+    AppKey, CodeHost, GitCredentials, GitHub, GitHubApp, HostScoped, NewPullRequest, PullRequest,
+    RepoRef, StaticToken, WorkspaceError,
 };
+use secrecy::ExposeSecret as _;
 
 fn repo() -> RepoRef {
     // The same shape the coder gets from the `git-server` service:
@@ -151,4 +154,34 @@ async fn pull_requests_and_scenarios_against_the_mock() {
         matches!(err, WorkspaceError::Transient { .. }),
         "server-error: {err:?}"
     );
+
+    // A GitHub App: a JWT signed with a key made just now is traded at the mock for the installation
+    // token the mock gives (`ghs_mockinstallationtoken...`, good for an hour), which then opens a
+    // pull request like any token. A JWT-less request is refused by the mock, so this also proves the
+    // coder's request is shaped as GitHub's is (a three-part `Bearer eyJ...`). Last, because the
+    // scenarios above are a state machine inside the mock.
+    let key = TestAppKey::generate();
+    let app = GitHubApp::new(
+        &root,
+        "12345",
+        67890,
+        AppKey::from_pem(&key.pkcs1_pem).expect("the key is read"),
+    )
+    .expect("the App");
+    let scoped = HostScoped::new(["git-server"], app);
+    let token = scoped.token_for(&repo()).await.expect("a token is minted");
+    assert!(
+        token
+            .expose_secret()
+            .starts_with("ghs_mockinstallationtoken"),
+        "the mock's installation token"
+    );
+    let with_app = GitHub::new(Arc::new(scoped))
+        .expect("client")
+        .with_api_base(&root);
+    let pr = with_app
+        .open_pull_request(new_pr("agent/app", "Opened by a GitHub App"))
+        .await
+        .expect("open with an installation token");
+    assert_eq!(pr.head, "agent/app");
 }

@@ -3,6 +3,7 @@
 //! | Tool | Module |
 //! |---|---|
 //! | `prepare_workspace { repo_url, base_branch?, branch? }` | [`prepare`] |
+//! | `start_scratch { name? }`, `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | [`scratch`] |
 //! | `run_command { command, cwd? }` | [`inspect`] |
 //! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `apply_patch { patch }` | [`files`] |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
@@ -20,6 +21,11 @@
 //!
 //! * `prepare_workspace`: `RunWorkspace::add_repository` (or `add_repository_continuing`) returns the
 //!   slot the run already has for the repository, with whatever is in it.
+//! * `start_scratch`: `RunWorkspace::add_scratch` returns the project the run already has under
+//!   that name, with whatever is in it.
+//! * `publish_scratch`: the repository's slot, once there, is found and not made again; an empty
+//!   remote is given its first commit only while it has no ref at all, so a repeat that finds the
+//!   first commit there goes on to the copy, which skips what is already the same.
 //! * `commit_and_push`: `commit_all` is a no-op without changes and the push of
 //!   a commit the remote already has is a no-op; the reported sha is `HEAD`.
 //! * `open_pull_request`: moving the continued branch to the pushed commit is a no-op the second
@@ -30,8 +36,8 @@
 //!
 //! # The rules, in code
 //!
-//! The prompt tells the model the rules; these make them hold: `prepare_workspace` refuses a
-//! repository the person did not name ([`named`]; the agent records the repositories of the
+//! The prompt tells the model the rules; these make them hold: `prepare_workspace` and
+//! `publish_scratch` refuse a repository the person did not name ([`named`]; the agent records the repositories of the
 //! person's own messages in the run notes before each step; it continues a branch only if a
 //! `commit_and_push` of the conversation recorded it in the notes, which the agent carries from
 //! the run it continues, and as a fallback read from the result text, `publish::pushed_in`),
@@ -59,7 +65,7 @@ use adam_model::ToolSpec;
 use adam_ui::Ui;
 use adam_workspace::{
     DynCodeHost, DynEnvironment, EnvError, EnvProgress, EnvSession, EnvStep, EnvStepState,
-    GitIdentity, Local, Slot, WorkspaceError, Workspaces, Worktree,
+    GitIdentity, Local, Slot, WorkspaceError, Workspaces,
 };
 use serde_json::Value;
 
@@ -78,6 +84,7 @@ pub mod named;
 pub mod notes;
 pub mod prepare;
 pub mod publish;
+pub mod scratch;
 pub mod shell;
 
 pub use notes::{NotesStore, RunNotes};
@@ -155,6 +162,10 @@ pub struct ToolEnv {
     /// OpenCode. [`Local`], this container, until [`ToolEnv::with_environment`]. The file tools and
     /// everything git does stay in this process whatever it is: they act on the shared files.
     pub environment: DynEnvironment,
+    /// What a run that ends on rejected GitHub credentials says to check: the variables of the kind
+    /// of credentials the process has (a token, or a GitHub App). `GITHUB_TOKEN` until
+    /// [`ToolEnv::with_credentials_hint`].
+    pub credentials_hint: &'static str,
 }
 
 impl ToolEnv {
@@ -169,7 +180,16 @@ impl ToolEnv {
             redactor: Redactor::default(),
             ui: Ui::new(McpPolicy::default()).with_ask_lead(ASK_LEAD),
             environment: Arc::new(Local),
+            credentials_hint: "GITHUB_TOKEN is valid and may push and open pull requests for the repository",
         }
+    }
+
+    /// Say `hint` when the GitHub credentials are rejected, as the end of "check that ...": see
+    /// [`GitHubAuth::check_hint`](crate::GitHubAuth::check_hint).
+    #[must_use]
+    pub fn with_credentials_hint(mut self, hint: &'static str) -> Self {
+        self.credentials_hint = hint;
+        self
     }
 
     /// Run the processes of runs in `environment` instead of this container. The janitor of the
@@ -208,8 +228,8 @@ impl ToolEnv {
             let recorded = async {
                 let mut notes = self.notes.load(&run).await?;
                 notes.blocker = Some(format!(
-                    "the credentials were rejected ({e}); check that GITHUB_TOKEN is valid and \
-                     may push and open pull requests for the repository"
+                    "the credentials were rejected ({e}); check that {}",
+                    self.credentials_hint
                 ));
                 self.notes.save(&run, &notes).await
             }
@@ -290,24 +310,6 @@ impl ToolEnv {
         resolve_slot(slots, repo, &self.settings.default_repo_host)
             .map_err(|why| Ok(ToolOutput::error(why)))
     }
-
-    /// The worktree of the slot a tool acts in ([`slot`](Self::slot)), for the tools that need a
-    /// repository: a scratch project has none to push to.
-    pub(crate) async fn worktree(
-        &self,
-        ctx: &ToolCtx,
-        repo: Option<&str>,
-    ) -> Result<Worktree, Outcome> {
-        let slot = self.slot(ctx, repo).await?;
-        match slot.worktree() {
-            Some(worktree) => Ok(worktree.clone()),
-            None => Err(Ok(ToolOutput::error(format!(
-                "`{}` is a scratch project, not a repository: there is nothing here to check, \
-                 commit or push",
-                slot.dir()
-            )))),
-        }
-    }
 }
 
 /// The slot `repo` names among `slots` (see [`ToolEnv::slot`]), or what to tell the model.
@@ -323,7 +325,11 @@ pub(crate) fn resolve_slot(
     default_host: &str,
 ) -> Result<Slot, String> {
     if slots.is_empty() {
-        return Err("there is no workspace yet: call prepare_workspace first".to_owned());
+        return Err(
+            "there is no workspace yet: call prepare_workspace (a repository the person \
+             named) or start_scratch (a project to build before there is a repository) first"
+                .to_owned(),
+        );
     }
     let listed = |slots: &[Slot]| {
         slots
@@ -372,7 +378,7 @@ pub(crate) fn resolve_slot(
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the nine of the coding workflow,
+/// Every coder tool, in the order they are offered to the model: the eleven of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
@@ -389,6 +395,8 @@ pub(crate) fn resolve_slot(
 pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
     tools![
         prepare::PrepareWorkspace,
+        scratch::StartScratch,
+        scratch::PublishScratch,
         inspect::RunCommand,
         files::ReadFile,
         files::WriteFile,

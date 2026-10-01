@@ -8,7 +8,9 @@ name: coder
 # The image is built on pull requests too and smoke-tested as a container (a
 # Postgres service, a stub model, a real start under tini), then run through
 # the compose stack (scripted models, a git remote, a mock GitHub) with a task
-# that must end in a branch and one pull request (dev/coder-e2e.sh), and with
+# that must end in a branch and one pull request (dev/coder-e2e.sh; also a task that names no
+# repository, which ends in a pull request on a repository named later; and all of them again with
+# the coder as a GitHub App installation, dev/compose.github-app.yaml), and with
 # "Hi", which must get a greeting that says the agent's name, and with a changed
 # agent folder mounted in place of the default one (dev/greeting-e2e.sh). The same
 # image carries the general agent binary too (adam-agent, which serves any agent
@@ -110,6 +112,16 @@ jobs:
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set workspace.placement=shared --set workspace.sharedVolume.storageClass=longhorn \
             --set topology=split --set replicaCount=3 > "$RUNNER_TEMP/rendered-shared-split.yaml"
+          # github.auth=app: the key Secret is a second volume of the pod, beside the per-pod claim
+          # template, and beside the shared claim.
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set github.auth=app --set github.app.id=1234567 --set github.app.installationId=98765432 \
+            --set github.app.privateKeySecret=coder-github-app > "$RUNNER_TEMP/rendered-app.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set github.auth=app --set github.app.id=1234567 --set github.app.installationId=98765432 \
+            --set github.app.privateKeySecret=coder-github-app --set workspace.placement=shared \
+            --set workspace.sharedVolume.storageClass=longhorn --set replicaCount=3 \
+            > "$RUNNER_TEMP/rendered-app-shared.yaml"
           for attempt in 1 2 3; do
             status=0
             "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
@@ -118,6 +130,7 @@ jobs:
                 "$RUNNER_TEMP/rendered.yaml" "$RUNNER_TEMP/rendered-control-plane.yaml" \
                 "$RUNNER_TEMP/rendered-split.yaml" "$RUNNER_TEMP/rendered-isolated.yaml" \
                 "$RUNNER_TEMP/rendered-affinity.yaml" "$RUNNER_TEMP/rendered-shared-split.yaml" \
+                "$RUNNER_TEMP/rendered-app.yaml" "$RUNNER_TEMP/rendered-app-shared.yaml" \
                 > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
             cat "$RUNNER_TEMP/kubeconform.out"
             if [ "$status" -eq 0 ]; then exit 0; fi
@@ -238,9 +251,12 @@ jobs:
       # The image that just passed, in the compose stack: the coder gets a task
       # over A2A, its scripted model drives prepare -> OpenCode (also scripted)
       # -> checks -> commit and push -> pull request, and dev/coder-e2e.sh
-      # checks the artifacts, mock-github's journal and git-server. Run three times:
-      # without OpenCode (the check command makes the change), with it, and with the coder
-      # writing the file itself (SCENARIO=files).
+      # checks the artifacts, mock-github's journal and git-server. Run four times:
+      # without OpenCode (the check command makes the change), with it, with the coder
+      # writing the file itself (SCENARIO=files), and with no repository named at all
+      # (SCENARIO=scratch: a project is built in a scratch slot, the coder asks where to put
+      # it, and the answer names an empty repository that git-server makes on first use). Then
+      # the same four again with the coder as a GitHub App installation.
       # The job's own Postgres service holds 5432, so the stack's Postgres
       # moves to POSTGRES_PORT.
       - name: Compose e2e
@@ -257,6 +273,9 @@ jobs:
           sh dev/coder-e2e.sh
           # The coder edits the files itself (read_file, write_file), and OpenCode is not started.
           SCENARIO=files sh dev/coder-e2e.sh
+          # No repository is named: the project is built in a scratch slot, the task waits for the
+          # person to name one, and what was checked is what is pushed to it.
+          SCENARIO=scratch sh dev/coder-e2e.sh
           # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
           sh dev/greeting-e2e.sh
           # The general agent: "hi" answered in role by its folder, and an edited folder changes the
@@ -270,12 +289,23 @@ jobs:
           # mock-researcher, and puts the default back): sources as cards and a graph on a screen with
           # catalog version 3, words only on one without Cards or without a catalog.
           sh dev/agent-cards-e2e.sh
+          # The same coder scenarios again, the coder now a GitHub App installation instead of a token
+          # (dev/compose.github-app.yaml: an init service makes a throwaway key, GITHUB_TOKEN is off).
+          # Last, because the scripts above restart the coder without the override. Each asserts that
+          # the coder traded a JWT for an installation token at mock-github and that every call to the
+          # repositories' API carried that token.
+          export GITHUB_AUTH=app
+          docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app up -d --no-build --wait coder
+          NO_OPENCODE=1 sh dev/coder-e2e.sh
+          sh dev/coder-e2e.sh
+          SCENARIO=files sh dev/coder-e2e.sh
+          SCENARIO=scratch sh dev/coder-e2e.sh
       - name: Compose e2e logs
         if: failure() && steps.guard.outputs.ready == 'true'
-        run: docker compose --profile app logs --no-color
+        run: docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app logs --no-color
       - name: Compose e2e teardown
         if: always() && steps.guard.outputs.ready == 'true'
-        run: docker compose --profile app down -v
+        run: docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app down -v
       - uses: docker/login-action@v3
         if: steps.guard.outputs.push == 'true'
         with:

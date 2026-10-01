@@ -47,11 +47,12 @@ pub async fn run_command(
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
     };
-    let wt = match env.worktree(ctx, repo.as_deref()).await {
-        Ok(wt) => wt,
+    // A repository's worktree or a scratch project: both are looked at the same way.
+    let slot = match env.slot(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    let dir = match resolve_cwd(wt.path(), cwd.as_deref().and_then(non_empty)) {
+    let dir = match resolve_cwd(slot.path(), cwd.as_deref().and_then(non_empty)) {
         Ok(dir) => dir,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
@@ -60,7 +61,7 @@ pub async fn run_command(
     let environment = env.session(ctx).await?;
 
     // What the worktree is before the command: nothing it does may change it.
-    let Some(before) = Snapshot::take(wt.path()).await else {
+    let Some(before) = Snapshot::take(slot.path()).await else {
         return Ok(ToolOutput::error(
             "Cannot read the state of the worktree, so nothing was run (a command that might \
              change it cannot be undone). Try again; if it persists, tell the person.",
@@ -81,9 +82,9 @@ pub async fn run_command(
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
 
     // Did it change anything it should not have?
-    let after = Snapshot::take(wt.path()).await;
+    let after = Snapshot::take(slot.path()).await;
     if after.as_ref() != Some(&before) {
-        let restored = before.restore(&wt).await;
+        let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("undid a change made by: {shown}"))
             .await;
         return Ok(ToolOutput::error(changed_the_worktree(
@@ -94,7 +95,7 @@ pub async fn run_command(
     if let Some(missing) = missing_tool(&outcome, command) {
         ctx.emit_progress("the workspace lacks a tool".to_owned())
             .await;
-        let said = missing_tool_answer(&env, ctx, &missing, &[dir.as_path(), wt.path()]).await?;
+        let said = missing_tool_answer(&env, ctx, &missing, &[dir.as_path(), slot.path()]).await?;
         return Ok(ToolOutput::error(said));
     }
     Ok(ToolOutput::text(render(&shown, &outcome)))
@@ -147,8 +148,8 @@ impl Snapshot {
     }
 
     /// Put it all back; `true` when the worktree is exactly as it was.
-    async fn restore(&self, wt: &adam_workspace::Worktree) -> bool {
-        let dir = wt.path();
+    async fn restore(&self, slot: &adam_workspace::Slot) -> bool {
+        let dir = slot.path();
         if let Some(text) = &self.dot_git
             && tokio::fs::read_to_string(dir.join(".git"))
                 .await
@@ -167,9 +168,13 @@ impl Snapshot {
             return false;
         }
         // The configuration and the refs are the mirror's, shared by every run: written by one at
-        // a time.
-        let Ok(_lock) = wt.lock_mirror().await else {
-            return false;
+        // a time. A scratch project's are its own: nobody shares them, so there is nothing to lock.
+        let _lock = match slot.worktree() {
+            Some(wt) => match wt.lock_mirror().await {
+                Ok(lock) => Some(lock),
+                Err(_) => return false,
+            },
+            None => None,
         };
         let repo = restore_repo_state(dir, &self.repo).await;
         let Some(tree) = &self.tree else {

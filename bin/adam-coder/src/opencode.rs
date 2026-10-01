@@ -61,7 +61,12 @@ pub const PROVIDER_ID: &str = "gateway";
 pub const CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 
 /// Variables of this process that the OpenCode child must not see.
-const HIDDEN_FROM_CHILD: &[&str] = &["GITHUB_TOKEN", "DATABASE_URL", "A2A_BEARER_TOKENS"];
+const HIDDEN_FROM_CHILD: &[&str] = &[
+    "GITHUB_TOKEN",
+    "GITHUB_APP_PRIVATE_KEY",
+    "DATABASE_URL",
+    "A2A_BEARER_TOKENS",
+];
 
 /// The inline OpenCode configuration for `model` behind `base_url`, with the
 /// key read from the environment variable `api_key_env` by OpenCode itself.
@@ -223,6 +228,10 @@ mod tests {
             Some("1")
         );
         assert_eq!(cmd.env.get("GITHUB_TOKEN").map(String::as_str), Some(""));
+        assert_eq!(
+            cmd.env.get("GITHUB_APP_PRIVATE_KEY").map(String::as_str),
+            Some("")
+        );
         assert_eq!(cmd.env.get("DATABASE_URL").map(String::as_str), Some(""));
         assert_eq!(
             cmd.env.get("A2A_BEARER_TOKENS").map(String::as_str),
@@ -249,7 +258,12 @@ mod tests {
         );
         assert_eq!(
             spec.hide,
-            ["GITHUB_TOKEN", "DATABASE_URL", "A2A_BEARER_TOKENS"]
+            [
+                "GITHUB_TOKEN",
+                "GITHUB_APP_PRIVATE_KEY",
+                "DATABASE_URL",
+                "A2A_BEARER_TOKENS"
+            ]
         );
         assert!(!spec.hide.iter().any(|name| name == "MODEL_API_KEY"));
         assert!(!spec.env.contains_key("MODEL_API_KEY"));

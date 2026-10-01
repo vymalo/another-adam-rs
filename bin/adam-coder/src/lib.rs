@@ -94,11 +94,11 @@ pub mod tools;
 
 pub use agent::{AGENT_NAME, CoderAgent, CoderStarter};
 pub use app::{Coder, LiveSignals, RuntimeOptions, agent_card, agent_card_from};
-pub use config::{Config, ConfigError, McpSettings, WorkerConfig};
+pub use config::{Config, ConfigError, GitHubAppConfig, GitHubAuth, McpSettings, WorkerConfig};
 pub use exit::exit_code;
 pub use files::{AgentFiles, AgentFilesError};
 pub use janitor::Janitor;
-pub use redact::Redactor;
+pub use redact::{RedactingCredentials, Redactor};
 pub use repos::workspaces_for;
 pub use serve::serve;
 pub use tools::{CoderSettings, ToolEnv, coder_tools};
