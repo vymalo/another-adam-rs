@@ -5,6 +5,7 @@
 #   dev/coder-e2e.sh                  # OpenCode (model mock-opencode) makes the change
 #   NO_OPENCODE=1 dev/coder-e2e.sh    # the check command makes it; OpenCode is not started
 #   SCENARIO=files dev/coder-e2e.sh   # the coder reads and writes the files itself; no OpenCode
+#   SCENARIO=scratch dev/coder-e2e.sh # no repository is named: a scratch project, then published
 #
 # Start the stack first (the coder's models are the scripts in
 # dev/wiremock/mock-openai/mappings/coder-script.json and opencode-script.json):
@@ -27,6 +28,16 @@
 #   * git-server has the branch, and hello.txt on it is `hello`;
 #   * SCENARIO=files also: the stream says `read README.md (sandbox)` and `wrote hello.txt (sandbox)`
 #     (the coder's file tools ran, in the slot of the repository) and never `starting OpenCode`.
+#   * SCENARIO=scratch is two messages. The task names no repository, so the coder builds `fib.sh`
+#     in a scratch project and asks where to put it (the task is TASK_STATE_INPUT_REQUIRED, with the
+#     question; nothing was pushed or opened, and git-server has not even heard of the repository).
+#     The answer, "Publish it to <the repository>" (the scratch owner of git-server, which makes an
+#     empty repository on first use, as a repository just created on GitHub is), is sent to the task;
+#     then every check above holds for `scratch/fib-<id>` (the slot is called after it), and also:
+#     `main` is one commit with the empty tree (the first commit the coder gave the empty
+#     repository), `fib.sh` is on the branch, and the last `checks` artifact is bound to the pushed
+#     commit with the tree the checks ran on in the scratch project (the code that was checked is
+#     the code that was pushed).
 # It prints one "ok" or "FAIL" line per check and exits 1 if any failed.
 #
 # Environment (defaults match compose.yaml on one machine):
@@ -36,8 +47,10 @@
 #   GIT_SERVER_URL   http://127.0.0.1:${GIT_SERVER_PORT:-8083}   (from the host)
 #   TIMEOUT          300     seconds to wait for the task to end
 #   NO_OPENCODE      unset   1 = the [mock:no-opencode] script (no OpenCode)
-#   SCENARIO         default `default` (the script above) or `files` (the [mock:files] script:
-#                    read_file, write_file; every check above holds, and so do the two lines)
+#   SCENARIO         default `default` (the script above), `files` (the [mock:files] script:
+#                    read_file, write_file; every check above holds, and so do the two lines) or
+#                    `scratch` (the [mock:scratch] script, above)
+#   REPO_BASE_URL    http://git-server:8080   where the coder (inside the compose network) finds git-server
 #
 # Needs curl, jq and git. Verified by CI only in the compose run of
 # .github/workflows/coder.yml; the mock scripts were also run against the real
@@ -55,8 +68,10 @@ timeout=${TIMEOUT:-300}
 repo_path=local/sandbox
 # The extension that makes the coder send its answer as it is written (its card lists it).
 text_stream=https://agents.vymalo.com/a2a/extensions/text-stream/v1
-# The address the coder (inside the compose network) uses for the repository.
-repo_url=http://git-server:8080/$repo_path.git
+# The address the coder (inside the compose network) uses for git-server, and for the repository.
+repo_base=${REPO_BASE_URL:-http://git-server:8080}
+repo_base=${repo_base%/}
+repo_url=$repo_base/$repo_path.git
 
 fail=0
 ok() { echo "ok   $1"; }
@@ -64,13 +79,11 @@ bad() { echo "FAIL $1"; fail=1; }
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-stream=$tmp/stream.sse
-: > "$stream"
 
 scenario=${SCENARIO:-default}
 case "$scenario" in
-  default | files) ;;
-  *) echo "SCENARIO must be default or files, not '$scenario'" >&2; exit 2 ;;
+  default | files | scratch) ;;
+  *) echo "SCENARIO must be default, files or scratch, not '$scenario'" >&2; exit 2 ;;
 esac
 if [ "$scenario" != default ] && [ "${NO_OPENCODE:-}" = 1 ]; then
   echo "NO_OPENCODE=1 and SCENARIO=$scenario are two different scripts: set one" >&2
@@ -78,7 +91,18 @@ if [ "$scenario" != default ] && [ "${NO_OPENCODE:-}" = 1 ]; then
 fi
 
 text="In $repo_url (base branch main), add hello.txt containing hello."
-if [ "$scenario" = files ]; then
+slot=${repo_path##*/}
+if [ "$scenario" = scratch ]; then
+  # A repository of this run's own (the stack keeps its repositories between runs, and the mock
+  # model takes the name from the task text): `scratch` is the owner git-server makes repositories
+  # for on first use. The task names none; the person names this one when the coder asks.
+  name=fib-$(printf '%x%x' "$(date +%s)" "$$")
+  repo_path=scratch/$name
+  repo_url=$repo_base/$repo_path.git
+  slot=$name
+  text="Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you the repo later. [mock:scratch] $name"
+  echo "variant: no repository is named, a scratch project is published to $repo_path ([mock:scratch])"
+elif [ "$scenario" = files ]; then
   text="$text [mock:files]"
   echo "variant: the coder edits the files itself ([mock:files])"
 elif [ "${NO_OPENCODE:-}" = 1 ]; then
@@ -94,37 +118,84 @@ if [ "$code" = 200 ]; then ok "mock-github journal reset"; else bad "mock-github
 
 # The message id names the task (same agent, no context: same id, same task), so
 # it must differ between runs, including two variants started in one second.
-message_id="e2e-$scenario-${NO_OPENCODE:-0}-$(date +%s)-$$"
-rpc=$(jq -n --arg id "$message_id" --arg text "$text" '{
-  jsonrpc: "2.0", id: "1", method: "SendStreamingMessage",
-  params: {message: {messageId: $id, role: "ROLE_USER", parts: [{text: $text}]}}}')
+run_id="e2e-$scenario-${NO_OPENCODE:-0}-$(date +%s)-$$"
 
-# The server closes the stream when the task reaches a final state, so curl
-# returns then; --max-time is the TIMEOUT.
-curl_rc=0
-code=$(curl -sN --max-time "$timeout" -o "$stream" -w '%{http_code}' \
-  -X POST "$coder/" \
-  -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-  -H "A2A-Extensions: $text_stream" \
-  -d "$rpc") || curl_rc=$?
-if [ "$curl_rc" = 28 ]; then
-  bad "the task did not end within ${timeout}s"
-elif [ "$curl_rc" != 0 ]; then
-  bad "SendStreamingMessage: curl exit $curl_rc"
-elif [ "$code" != 200 ]; then
-  bad "SendStreamingMessage: HTTP $code: $(head -c 300 "$stream")"
+# send_message <number> <text> [task id]: SendStreamingMessage, read until the server closes the
+# stream (the task reached a final state, or it waits for the person: the --max-time is the
+# TIMEOUT), into $tmp/stream-<number>.sse and, one JSON-RPC response per line, $tmp/events-<number>.jsonl.
+# A message with a task id goes to that task: it is the answer to the question the task waits on.
+send_message() {
+  rpc=$(jq -n --arg id "$run_id-$1" --arg text "$2" --arg task "${3:-}" '{
+    jsonrpc: "2.0", id: "1", method: "SendStreamingMessage",
+    params: {message: ({messageId: $id, role: "ROLE_USER", parts: [{text: $text}]}
+      + (if $task == "" then {} else {taskId: $task} end))}}')
+  curl_rc=0
+  code=$(curl -sN --max-time "$timeout" -o "$tmp/stream-$1.sse" -w '%{http_code}' \
+    -X POST "$coder/" \
+    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    -H "A2A-Extensions: $text_stream" \
+    -d "$rpc") || curl_rc=$?
+  if [ "$curl_rc" = 28 ]; then
+    bad "the task did not end within ${timeout}s"
+  elif [ "$curl_rc" != 0 ]; then
+    bad "SendStreamingMessage: curl exit $curl_rc"
+  elif [ "$code" != 200 ]; then
+    bad "SendStreamingMessage: HTTP $code: $(head -c 300 "$tmp/stream-$1.sse")"
+  fi
+  # Every event is one `data: <json-rpc response>` line.
+  sed -n 's/^data: //p' "$tmp/stream-$1.sse" 2>/dev/null | jq -c '.' > "$tmp/events-$1.jsonl" 2>/dev/null || : > "$tmp/events-$1.jsonl"
+  rpc_error=$(jq -r 'select(.error) | .error | "\(.code): \(.message)"' "$tmp/events-$1.jsonl" | head -n 1)
+  if [ -n "$rpc_error" ]; then bad "the server answered with a JSON-RPC error: $rpc_error"; fi
+}
+
+# listed <name.git>: how often git-server's listing of the scratch owner (`/__repos/scratch/`, JSON)
+# has it; 0 when the owner has no repository at all yet (the listing is a 404 until one is made).
+listed() {
+  listing_code=$(curl -s -o "$tmp/listing.json" -w '%{http_code}' --max-time 30 "$gitserver/__repos/scratch/" || true)
+  case "$listing_code" in
+    404) echo 0 ;;
+    200) jq -r --arg n "$1" '[.[]? | select(.name == $n)] | length' "$tmp/listing.json" 2>/dev/null || echo '?' ;;
+    *) echo '?' ;;
+  esac
+}
+
+# The state of the last status update (or of the task itself) of an event file.
+state_of() {
+  jq -r '(.result.statusUpdate.status.state // .result.task.status.state) // empty' "$1" | tail -n 1
+}
+
+# --- send the task ---------------------------------------------------------------
+send_message 1 "$text"
+events=$tmp/events-1.jsonl
+every_event=$tmp/events-1.jsonl
+
+if [ "$scenario" = scratch ]; then
+  # The task names no repository: the coder builds the project, then asks where to put it, and the
+  # task waits for the answer. Until then nothing may have left the coder: no push, no pull
+  # request, and git-server has not even been asked for the repository.
+  state=$(state_of "$events")
+  if [ "$state" = TASK_STATE_INPUT_REQUIRED ]; then ok "the task waits for the person (TASK_STATE_INPUT_REQUIRED)"; else bad "the task is '${state:-none}', want TASK_STATE_INPUT_REQUIRED"; fi
+  jq -r '.. | .text? // empty' "$events" > "$tmp/lines-1.txt" 2>/dev/null || : > "$tmp/lines-1.txt"
+  if grep -q 'which repository should I publish it to' "$tmp/lines-1.txt"; then ok "the coder asks which repository to publish it to"; else bad "the stream has no question about where to publish"; fi
+  if grep -qx 'wrote fib.sh (fib)' "$tmp/lines-1.txt"; then ok "the project was built in the scratch slot (wrote fib.sh (fib))"; else bad "no 'wrote fib.sh (fib)' line before the question"; fi
+  posts=$(curl -s --max-time 30 -X POST "$github/__admin/requests/find" -H 'Content-Type: application/json' \
+    -d '{"method":"POST","urlPathPattern":"/repos/.*/pulls"}' | jq -r '.requests | length' 2>/dev/null || echo '?')
+  if [ "$posts" = 0 ]; then ok "no pull request was opened before the person named a repository"; else bad "$posts pull request(s) were opened before the person named a repository"; fi
+  known=$(listed "$name.git")
+  if [ "$known" = 0 ]; then ok "git-server has not been asked for $repo_path yet"; else bad "git-server knows $repo_path before the person named it ($known)"; fi
+  task_id=$(jq -r '(.result.task.id // .result.statusUpdate.taskId // .result.artifactUpdate.taskId) // empty' "$events" | head -n 1)
+  if [ -z "$task_id" ]; then
+    bad "the stream does not say which task it is"
+  else
+    # The person names the repository, in their own words: that is what lets the coder publish there.
+    send_message 2 "Publish it to $repo_url" "$task_id"
+    events=$tmp/events-2.jsonl
+    every_event=$tmp/events-all.jsonl
+    cat "$tmp/events-1.jsonl" "$tmp/events-2.jsonl" > "$every_event"
+  fi
 fi
 
-# --- read the stream -----------------------------------------------------------
-# Every event is one `data: <json-rpc response>` line.
-events=$tmp/events.jsonl
-sed -n 's/^data: //p' "$stream" | jq -c '.' > "$events" 2>/dev/null || true
-
-rpc_error=$(jq -r 'select(.error) | .error | "\(.code): \(.message)"' "$events" | head -n 1)
-if [ -n "$rpc_error" ]; then bad "the server answered with a JSON-RPC error: $rpc_error"; fi
-
-# The state of the last status update (or of the task itself).
-state=$(jq -r '(.result.statusUpdate.status.state // .result.task.status.state) // empty' "$events" | tail -n 1)
+state=$(state_of "$events")
 case "$state" in
   TASK_STATE_COMPLETED) ok "the task ended TASK_STATE_COMPLETED" ;;
   TASK_STATE_FAILED)
@@ -163,18 +234,25 @@ if [ "$order" = true ]; then ok "the chunks came before the end of the task"; el
 
 # --- the file tools (SCENARIO=files) -------------------------------------------------
 # A client that did not activate `steps/v1` reads a tool's progress as lines of text.
-if [ "$scenario" = files ]; then
+if [ "$scenario" = files ] || [ "$scenario" = scratch ]; then
   lines=$tmp/lines.txt
-  jq -r '.. | .text? // empty' "$events" > "$lines" 2>/dev/null || : > "$lines"
-  slot=${repo_path##*/}
-  if grep -qx "read README.md ($slot)" "$lines"; then ok "the coder read README.md itself"; else bad "no 'read README.md ($slot)' line in the stream"; fi
-  if grep -qx "wrote hello.txt ($slot)" "$lines"; then ok "the coder wrote hello.txt itself"; else bad "no 'wrote hello.txt ($slot)' line in the stream"; fi
+  jq -r '.. | .text? // empty' "$every_event" > "$lines" 2>/dev/null || : > "$lines"
+  if [ "$scenario" = files ]; then
+    if grep -qx "read README.md ($slot)" "$lines"; then ok "the coder read README.md itself"; else bad "no 'read README.md ($slot)' line in the stream"; fi
+    if grep -qx "wrote hello.txt ($slot)" "$lines"; then ok "the coder wrote hello.txt itself"; else bad "no 'wrote hello.txt ($slot)' line in the stream"; fi
+  else
+    # The project's files were written in the scratch slot `fib`; the repository was given its first
+    # commit, and the files were copied into its slot, which is called after it.
+    if grep -qx 'wrote check.sh (fib)' "$lines"; then ok "the coder wrote check.sh in the scratch project"; else bad "no 'wrote check.sh (fib)' line in the stream"; fi
+    if grep -q "^giving .*$name.git its first commit on main\$" "$lines"; then ok "the empty repository was given its first commit on main"; else bad "no 'giving $repo_url its first commit on main' line in the stream"; fi
+    if grep -qx "copying fib into $slot (.)" "$lines"; then ok "the project was copied into the slot of the repository"; else bad "no 'copying fib into $slot (.)' line in the stream"; fi
+  fi
   if grep -q 'starting OpenCode' "$lines"; then bad "OpenCode was started, and this script does not delegate"; else ok "OpenCode was not started"; fi
 fi
 
 # --- artifacts ---------------------------------------------------------------------
 artifact() { # artifact <name> <jq path under .parts[0].data> -> value ("" if absent)
-  jq -r --arg n "$1" "select(.result.artifactUpdate.artifact.name == \$n) | .result.artifactUpdate.artifact.parts[0].data | $2 // empty" "$events" | tail -n 1
+  jq -r --arg n "$1" "select(.result.artifactUpdate.artifact.name == \$n) | .result.artifactUpdate.artifact.parts[0].data | $2 // empty" "$every_event" | tail -n 1
 }
 checks_passed=$(artifact checks '.passed | tostring')
 checks_commit=$(artifact checks .commit)
@@ -213,13 +291,39 @@ if [ -n "$branch" ]; then
     bad "the branch is at ${remote%%[[:space:]]*}, the artifact says $commit"
   fi
   if git clone -q --depth 1 --branch "$branch" "$gitserver/$repo_path.git" "$tmp/clone" 2>"$tmp/clone.err"; then
-    content=$(cat "$tmp/clone/hello.txt" 2>/dev/null || echo '<missing>')
-    if [ "$content" = hello ]; then ok "hello.txt on the branch is 'hello'"; else bad "hello.txt on the branch is '$content', want 'hello'"; fi
+    if [ "$scenario" = scratch ]; then
+      content=$(cat "$tmp/clone/fib.sh" 2>/dev/null || echo '<missing>')
+      if [ "$content" = 'echo 0 1 1 2 3 5 8' ]; then ok "fib.sh on the branch is the project's"; else bad "fib.sh on the branch is '$content', want 'echo 0 1 1 2 3 5 8'"; fi
+      if [ "$(sh "$tmp/clone/fib.sh" 2>/dev/null)" = '0 1 1 2 3 5 8' ]; then ok "fib.sh prints the first 7 Fibonacci numbers"; else bad "fib.sh does not print '0 1 1 2 3 5 8'"; fi
+    else
+      content=$(cat "$tmp/clone/hello.txt" 2>/dev/null || echo '<missing>')
+      if [ "$content" = hello ]; then ok "hello.txt on the branch is 'hello'"; else bad "hello.txt on the branch is '$content', want 'hello'"; fi
+    fi
   else
     bad "cannot clone the branch: $(head -c 300 "$tmp/clone.err")"
   fi
 else
   bad "no branch to look for on git-server"
+fi
+
+# The repository was empty: the coder gave it a first commit, of nothing, to be the base of the
+# pull request, and that is all `main` holds (the work went to the branch above, behind the gate).
+if [ "$scenario" = scratch ]; then
+  if git clone -q --branch main "$gitserver/$repo_path.git" "$tmp/main" 2>"$tmp/main.err"; then
+    root_tree=$(git -C "$tmp/main" rev-parse 'HEAD^{tree}' 2>/dev/null || true)
+    n_commits=$(git -C "$tmp/main" rev-list --count HEAD 2>/dev/null || echo '?')
+    if [ "$root_tree" = 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ] && [ "$n_commits" = 1 ]; then ok "main is the one empty commit the coder gave the new repository"; else bad "main has $n_commits commit(s) and the tree '$root_tree', want the one empty commit"; fi
+  else
+    bad "cannot clone main: $(head -c 300 "$tmp/main.err")"
+  fi
+  # What was checked is what was pushed: the tree of the last `checks` artifact is the tree of the
+  # pushed commit (the checks ran in the scratch project, and the files landed unchanged).
+  if [ -n "$commit" ]; then
+    pushed_tree=$(git -C "$tmp/clone" rev-parse 'HEAD^{tree}' 2>/dev/null || true)
+    if [ -n "$pushed_tree" ] && [ "$pushed_tree" = "$checks_tree" ]; then ok "the tree that was checked in the scratch project is the tree that was pushed"; else bad "the pushed tree is '$pushed_tree', the checks ran on '$checks_tree'"; fi
+  fi
+  known=$(listed "$name.git")
+  if [ "$known" = 1 ]; then ok "git-server lists $repo_path now"; else bad "git-server lists $repo_path $known time(s), want 1"; fi
 fi
 
 if [ "$fail" -eq 0 ]; then echo "coder e2e passed"; else echo "coder e2e FAILED"; exit 1; fi

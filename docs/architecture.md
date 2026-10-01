@@ -482,10 +482,10 @@ classDiagram
     PermissionPrompt <|.. StaticPrompt
 ```
 
-Each box is a crate (underscores stand for hyphens). The ten coder tools are
-`prepare_workspace`, `run_command`, `read_file`, `write_file`, `apply_patch`, `delegate_to_opencode`, `run_checks`,
+Each box is a crate (underscores stand for hyphens). The twelve coder tools are
+`prepare_workspace`, `start_scratch`, `publish_scratch`, `run_command`, `read_file`, `write_file`, `apply_patch`, `delegate_to_opencode`, `run_checks`,
 `commit_and_push`, `open_pull_request` and `ask_user` (the tool of `adam-ui`, under the coder's own words about when to ask), and
-`adam-ui` adds `show` and `ui_catalog` and a source of the tools of the conversation's endpoint. An eleventh type,
+`adam-ui` adds `show` and `ui_catalog` and a source of the tools of the conversation's endpoint. A thirteenth type,
 `Redacting`, wraps each of them to scrub secrets (`bin/adam-coder/src/tools/mod.rs`). `CoderAgent`
 wraps the `LlmAgent` that `adam-assembly` builds from `bin/adam-coder/agent/instructions.md` (the prompt, the
 limits and the A2A card are that file) and adds its completion rule. `FnTool` is a tool made from a closure. A tool
@@ -705,7 +705,8 @@ repository with an empty root commit where work can start before anyone has name
 has at most one slot per repository, called the repository's name (`<name>-<owner>` when another
 repository of the run has it), and slots keep the order they joined the run. The workspace lives as
 long as the run and is deleted when it ends (the coder's janitor, below); the run's notes and its `agent/*` branches stay.
-`copy_into` is the only way a scratch project's files reach a repository, all or nothing, and
+`copy_into` is the only way a scratch project's files reach a repository, all or nothing (the coder's
+`publish_scratch` calls it, for a repository the person named, and the project remembers where it went), and
 `initialize_empty` gives a repository that has no branch its first commit, an empty one, the only push
 outside `agent/*`. A workspace made before slots existed (one worktree in `<root>/worktrees/<run>`) is
 read as a slot and removed with the rest. For the orchestration layer's open question 24, the MVP
@@ -1813,6 +1814,7 @@ sequenceDiagram
     G->>G: git worktree add, new branch agent/short-run-id from origin/base
     A-->>C: progress: worktree ready
     Note over A,G: a second repository the person named is a second slot of the run's workspace, and the tools then say which one with repo
+    Note over A,G: with no repository named, start_scratch makes a scratch slot to build and check in (commit_and_push there is local), and once the person names a repository, publish_scratch copies the files into its slot (an empty repository first gets an empty first commit) and the checks that ran on the same tree carry over
 
     alt a small, well-located change
         A->>W: read_file(path), then write_file(path, content) or apply_patch(diff)
@@ -1875,6 +1877,10 @@ stateDiagram-v2
     [*] --> NoWorkspace
     NoWorkspace --> NoWorkspace: prepare_workspace refuses a repository the person did not name, the model asks
     NoWorkspace --> WorktreeReady: prepare_workspace on a repository the person named
+    NoWorkspace --> ScratchReady: start_scratch, no repository is named
+    ScratchReady --> Edited: write_file, apply_patch or delegate_to_opencode, a local commit with commit_and_push
+    ScratchReady --> InputRequired: the model asks which repository to publish to
+    ScratchReady --> WorktreeReady: publish_scratch to a repository the person named
     WorktreeReady --> WorktreeReady: prepare_workspace on another repository the person named, a new slot
     WorktreeReady --> Edited: write_file, apply_patch or delegate_to_opencode
     Edited --> ChecksGreen: run_checks passes
@@ -1913,7 +1919,9 @@ pushed sha, pull request) and the worktree.
 
 What the diagrams cannot say (`bin/adam-coder/src/`):
 
-* **The tools** (`tools/`): `prepare_workspace`, `run_command` (looking around: no check, no cycle,
+* **The tools** (`tools/`): `prepare_workspace`, `start_scratch` and `publish_scratch` (a scratch project to start in
+  before a repository is named, and its copy into the repository the person names later: see
+  [the coder README](../bin/adam-coder/README.md#scratch-projects)), `run_command` (looking around: no check, no cycle,
   changes to HEAD, the branch, the working tree, refs and git configuration are undone), `read_file`, `write_file` and
   `apply_patch` (small changes made in the coder's own process, confined to the worktree: see
   [the coder README](../bin/adam-coder/README.md#reading-and-changing-files-itself)), `delegate_to_opencode`, `run_checks` (the project's own checks only),
@@ -1945,6 +1953,11 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     may be left out while there is one slot and is refused with the list of slots when there are several.
     A check and a push are of one slot; the gate does not change: `open_pull_request` wants the most recent
     check of the pushed tree, whichever slot ran it, and the run notes keep the last 32 check records for it.
+  * **A scratch project** is temporary and has no remote: `commit_and_push` there is a local commit with no `branch`
+    and no bound `checks`, and `open_pull_request` refuses. `publish_scratch` works only on a repository the person
+    named (the rule of `prepare_workspace`), gives an empty repository an empty first commit (the only push outside
+    `agent/*`), asks for a `path` or `overwrite` for one that has files, and copies all or nothing. The gate does not
+    change: the checks that ran on the project bind the pushed commit only when its tree is the same.
   * The file tools (`read_file`, `write_file`, `apply_patch`) refuse a path that is empty, absolute, goes up with `..`,
     names `.git` (any case), leaves the worktree through a symlink (read) or goes through a symlink (write); a patch is
     checked by the paths `git apply --numstat -z` reports and refused if it creates a symlink or a submodule; a hunk that
@@ -1959,14 +1972,17 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
   * Any other stop without a pull request is a question, not a completion: the
     run parks as `ask_user` would (`input-required`, the model's text as the
     question) and the person's answer resumes it.
-  * `prepare_workspace` refuses a repository the person did not name in their
+  * `prepare_workspace` and `publish_scratch` refuse a repository the person did not name in their
     own messages of the run (recorded in the run notes before each step from the
     conversation, never from the model's argument alone; text quoted in
     `untrusted` fences does not count), with a tool error that sends the model
     to `ask_user`.
 * **Safe to repeat.** A tool call that dies before its result is journaled
   runs again, so each tool is safe to repeat. `prepare_workspace` reuses the
-  run's slot of that repository, `commit_and_push` does nothing when there is nothing new,
+  run's slot of that repository, `start_scratch` returns the project of that name, `publish_scratch` finds
+  the repository's slot (a repository that holds only the empty first commit it was given is not "a repository
+  with files") and skips the files that are already what the project has,
+  `commit_and_push` does nothing when there is nothing new,
   `open_pull_request` returns the open pull request of the same branch, and
   failed checks are counted per call id.
 * **Where state lives.** Conversation, journal and run state are in Postgres.

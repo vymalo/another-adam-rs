@@ -4,7 +4,8 @@ The coder agent: a coding task in, a verified pull request out, over A2A.
 
 Given "in repo X, do Y" it
 
-1. prepares a git worktree of X in the run's workspace (`adam-workspace`; a workspace holds several repositories),
+1. prepares a git worktree of X in the run's workspace (`adam-workspace`; a workspace holds several repositories, and
+   a task that names none starts in a **scratch project** that is published to the repository the person names later),
 2. makes the change: small, well-located edits itself (`read_file`, `write_file`, `apply_patch`), broad ones
    through OpenCode over ACP (`adam-acp`),
 3. runs the project's own checks, at most `MAX_CHECK_CYCLES` failing cycles,
@@ -43,23 +44,25 @@ sequenceDiagram
 | Tool | Does |
 |---|---|
 | `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
+| `start_scratch { name? }` | `RunWorkspace::add_scratch` for the run (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. The result says the project is **temporary** (it exists only while the task is open, nothing is kept unless it is published) and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
+| `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **the person named** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
 | `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
 | `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
 | `delegate_to_opencode { instructions, repo? }` | spawns the ACP agent in the worktree of the slot, as the run's environment prepared the command ([below](#where-the-processes-of-a-run-run); `ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
 | `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
-| `commit_and_push { message, repo? }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
-| `open_pull_request { title, body, accept_red_checks?, repo? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
+| `commit_and_push { message, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository). In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
+| `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question, choices? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions of 2 to 8 options, as one form) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the twelve. The tools the conversation's endpoint lists
+folder](#mcp-tools-from-the-folder)); they are not part of the fourteen. The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)).
 
-Nine tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the nine is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Eleven tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the eleven is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
@@ -167,7 +170,7 @@ subscriber sees it once.
 |---|---|---|
 | `passed` | bool | the command exited 0 in time **and** `commit` was determined |
 | `commit` | string | the 40-hex SHA of a commit: for `run_checks`, the `HEAD` of the run's worktree when the command ran (`""` only when it could not be read); for `commit_and_push`, the pushed commit |
-| `repository` | string, optional | the URL of the repository of the slot the command ran in; for the verdict `commit_and_push` binds to a pushed commit, the repository it was pushed to. Absent from a report of an older coder |
+| `repository` | string, optional | the URL of the repository of the slot the command ran in; for the verdict `commit_and_push` binds to a pushed commit, the repository it was pushed to. Absent for a check that ran in a scratch project (it has none), and from a report of an older coder |
 | `tree` | string, optional | the 40-hex git tree id of the code that was checked: the worktree as `commit_and_push` would commit it (`git add -A`: tracked changes and untracked files, minus what `.gitignore` excludes), computed in a temporary index. Absent when it could not be computed |
 | `summary` | string, optional | one line: `` `cmd` passed ``, or `` `cmd` failed: exit code 2 `` / `timed out after 900s` / `killed by a signal`. Says so when the worktree had uncommitted changes on top of `commit`, or that the tree was checked before it was committed |
 | `findings` | `[{check, message}]`, optional | one entry per failing check: `check` is the command, `message` is how it ended, then the tail of its output |
@@ -267,6 +270,11 @@ make them hold:
   something else or stop it. The exits are a pull request, a failure (the rules
   above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
   and CancelTask (a chat's Stop).
+* **A scratch project is temporary, and what is published is what was checked.** It lives as long as the run (the
+  janitor deletes it with the rest of the workspace; the instructions and the tool's result tell the model to say so),
+  `commit_and_push` there is a local commit and `open_pull_request` is refused, so nothing leaves the process until
+  `publish_scratch` copies the files into a repository the person named. The gate does not change: the checks that ran
+  on the project are bound to the pushed commit only when its tree is the same ([below](#scratch-projects)).
 * **The file tools stay in the worktree.** `read_file`, `write_file` and `apply_patch` check every path with `confine`
   (no `..`, no absolute path, nothing inside `.git`, no write through a symlink, no read that leaves the worktree) and
   `apply_patch` checks the paths git itself reads from the patch, so a hostile path is a refusal the model is told, never a
@@ -296,8 +304,9 @@ make them hold:
 * **A question is answered, not worked on.** The prompt says that a greeting or a question about the
   repository ("List all branches") gets a direct answer (after `prepare_workspace`, with `run_command`) and ends
   the turn; the run then parks as a question like any stop without a pull request, and the chat goes on.
-* **Only a repository the person named.** `prepare_workspace` refuses a
-  repository that is not named in the person's own messages of the run: the
+* **Only a repository the person named.** `prepare_workspace` and `publish_scratch` refuse a
+  repository that is not named in the person's own messages of the run (a scratch project is published
+  only to one the person named: nothing is copied, pushed or even asked of a remote otherwise): the
   task, and every answer delivered to it (user messages and the results of
   `ask_user`, paired with the question by position in the history, because
   providers that send no call ids get `call_0`, `call_1` again in every turn; what
@@ -480,6 +489,72 @@ stateDiagram-v2
   SeveralSlots --> Swept: the run is done or failed, the janitor sweeps
   NoWorkspace --> Swept: the store does not know the run
   Swept --> [*]: the notes and the branches stay
+```
+
+### Scratch projects
+
+A task that names no repository ("write a script that prints the first seven Fibonacci numbers; I'll give you the
+repository later") used to end in a question. `start_scratch` makes a **scratch slot**: a local git repository (branch
+`main`, an empty root commit) in the run's workspace, where the model writes the files, runs the checks it writes for
+them and commits as it goes, with the tools it has in a repository. Nothing leaves the process: `commit_and_push` there
+is a local commit and `open_pull_request` is refused. When the person names a repository, `publish_scratch` puts the
+project into it:
+
+1. **The grant.** The repository must be one the person named, as for `prepare_workspace`.
+2. **The slot.** The repository's slot is found, or made: a remote with **no ref at all** (a repository that was just
+   created) is first given an empty-tree `Initial commit` on its base branch, so that the pull request has a base; then
+   `add_repository` makes its worktree. A repository that **already has files** (the tree of its base is not empty) is
+   refused unless the call has `path` or `overwrite`, which are the person's to give: the result tells the model to ask.
+3. **The copy.** `copy_into(project, worktree, path, overwrite)`: all or nothing, with every collision listed.
+4. **The next step.** The result says which slot to use and whether the checks that ran on the project still hold:
+   the **tree** of the worktree after the copy is looked up in the run's check history (`RunNotes::checked`). The same
+   tree (the files landed unchanged in an empty repository) means the check that passed on the project is the check of
+   the code that will be pushed, so `commit_and_push` binds it to the pushed commit and the pull request is allowed;
+   any other tree is *not checked* until `run_checks` runs in the new slot, and the result says so.
+
+The project is left as it is and remembers where it went (`published_to`); the tools that change it afterwards
+(`write_file`, `apply_patch`, `commit_and_push`, `start_scratch` again) say that the change does not reach the repository,
+and a second `publish_scratch` copies it again (a file that differs needs `overwrite`). The scratch history is **not**
+carried: the pull request holds the commits made in the repository's worktree (ADR 0008, decision 5).
+
+```mermaid
+sequenceDiagram
+  participant P as Person
+  participant M as Model
+  participant T as Tools
+  participant W as RunWorkspace
+  participant G as Git remote
+  P->>M: a task, no repository
+  M->>T: start_scratch(fib)
+  T->>W: add_scratch
+  M->>T: write_file, run_checks(repo: fib)
+  T->>W: the check and its tree, recorded in the notes
+  M->>P: asks which repository to publish it to (the run parks)
+  P->>M: "Publish it to <repository>"
+  M->>T: publish_scratch(repository)
+  T->>T: the repository is named by the person
+  T->>G: ls-remote: no ref at all?
+  T->>G: push an empty first commit as main
+  T->>W: add_repository, copy_into
+  T-->>M: slot, copied files, did the checks run on this code
+  M->>T: commit_and_push, open_pull_request (repo: the new slot)
+  T->>G: push agent/run, pull request
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Empty: the run starts
+  Empty --> Scratch: start_scratch
+  Scratch --> Scratch: write_file, run_checks, commit_and_push (local)
+  Scratch --> Refused: publish_scratch to a repository nobody named
+  Refused --> Scratch: nothing was touched
+  Scratch --> Published: publish_scratch (named; empty, or path / overwrite)
+  Published --> Pushed: run_checks if the tree changed, commit_and_push, open_pull_request in the new slot
+  Scratch --> Deleted: the run ends, nothing published (the janitor)
+  Published --> Released: the run ends (the janitor), the pushed branch stays
+  Deleted --> [*]
+  Pushed --> Released
+  Released --> [*]
 ```
 
 ### Where the processes of a run run
@@ -1213,6 +1288,23 @@ database of its own, so the role needs `CREATEDB`):
   (`the_janitor_removes_the_workspace_of_a_finished_run_and_keeps_an_open_one`, with Postgres: the process sweeps on its
   own, a run that finishes later loses its workspace, SIGTERM stops it with exit 0; `a_sweep_of_zero_seconds_turns_the_janitor_off`;
   a bad `WORKSPACE_SWEEP_SECS` exits 78 with the other problems) and `src/config.rs`.
+* Scratch projects: `tests/tools.rs` (`a_scratch_project_is_built_checked_and_committed_locally`: the file tools, `run_checks`
+  (an artifact with no `repository`), `run_command` (a stray file and a sneaky commit are undone, as in a worktree) and OpenCode
+  work in it, `commit_and_push` is a local commit with no artifact and no remote branch, `open_pull_request` is refused and
+  points to `publish_scratch`; `a_scratch_project_needs_a_plain_name_that_no_repository_has`;
+  `publish_scratch_works_only_on_a_repository_the_person_named`: refused before any mirror is made;
+  `a_scratch_project_published_to_an_empty_repository_keeps_the_checks_it_passed`: the empty first commit is all `main`
+  holds, the verdict bound to the pushed commit is the one the project earned (the same tree), the pull request is against
+  `main`, and the project says where it went when it is changed afterwards; `publishing_twice_is_the_same_publication`;
+  `a_publication_that_died_after_the_first_commit_goes_on`; `a_repository_that_has_files_needs_a_directory_or_permission_to_overwrite`
+  (a hostile `path` is refused, a collision lists what is in the way and changes nothing, `overwrite` replaces what differs and
+  nothing else); `an_empty_project_is_not_published_and_leaves_the_repository_empty`; which project to publish when there are
+  several; `a_cancelled_run_publishes_nothing`; `the_history_of_the_project_is_not_carried_into_the_repository`),
+  `tests/e2e.rs`' `a_scratch_project_is_published_to_the_repository_the_person_names` (per store: build and check, the run parks
+  on the question with nothing pushed, the answer names an empty repository, publish, push, pull request),
+  `tests/janitor.rs`' `a_scratch_project_goes_with_its_run_unless_the_run_is_waiting`, and the compose scenario
+  `SCENARIO=scratch sh dev/coder-e2e.sh` (the `[mock:scratch]` script, which `wiremock_compose` of `adam-model-openai` plays
+  against a real WireMock).
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, malformed arguments,
   `prepare_workspace` refusing a repository the person did not name (the refusal names

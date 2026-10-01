@@ -3,8 +3,8 @@
 Status: **Accepted** (2026-10-01). The defaults are the ones the slice 7 plan proposed (its D7.2,
 D7.3, D7.4, D7.5 and the open question 24 default); the owner may revisit them. This record covers
 the workspace model, which `adam-workspace` builds. The coder's use of it (a second repository, the
-janitor) and its scratch tools are built by later changes of the slice, and the status notes at the
-end say which are.
+janitor, the scratch tools) is built by changes of the slice, and the status notes at the end say
+which are.
 
 ## Context
 
@@ -66,7 +66,8 @@ The orchestration layer's vision says the same from its side: a workspace lives 
    if somebody pushed in between). The coder's gate is unchanged: what reaches the base branch is an
    empty commit, and the work goes through `agent/*` and a pull request.
 7. **The metadata has a version.** A slot is recorded in `<root>/meta/<run>/<dir>.json` (version 2:
-   `dir`, `seq`, `kind`, and for a repository the url, base branch and branch, never a credential).
+   `dir`, `seq`, `kind`, for a repository the url, base branch and branch, and for a scratch project
+   the repository its files were last copied into (`published_to`), never a credential).
    The legacy worktree and its `<root>/meta/<run>.json` (version 1) are **read as a slot** named after
    the repository, removed with the rest by `RunWorkspace::remove`, and never made again by a
    `RunWorkspace`; `Workspaces::prepare` and `open_existing` stay as single-repository helpers and
@@ -182,3 +183,16 @@ janitor of decision 2, a worker component of the host (`Agents::worker_component
 300 by default and `0` for off). Not built yet: the scratch tools, the coder's question about a
 repository the person did not name (decision 9; until then the rule is the one that was already there,
 the person named it), the creation of a repository, and `copy_into` as a tool.*
+
+*2026-10-01: the scratch tools are built (`bin/adam-coder/README.md`, "Scratch projects"). `start_scratch`
+makes a scratch slot, and every tool that works in a slot works in it (the file tools, `run_command`,
+`run_checks`, `delegate_to_opencode`); `commit_and_push` there is a local commit and `open_pull_request` is
+refused. `publish_scratch` puts the project into a repository **the person named** (the coder's rule of
+decision 9, the one `prepare_workspace` applies, until the tool that asks the person for another repository
+exists): an empty remote is given its first commit (decision 6), a repository that already has files needs a
+`path` or `overwrite`, which the person decides, and the files are copied all or nothing (decision 5). The
+project records `published_to` (decision 7), and says so to the model that goes on editing it. The gate is
+unchanged, and it is what carries the project's checks over: they bind the pushed commit when the worktree
+after the copy has the same tree, so a project that lands unchanged in an empty repository needs no second
+check, and any other tree is unchecked until `run_checks` has run on it. Not built yet: the coder's question
+about a repository the person did not name (decision 9), and the creation of a repository.*

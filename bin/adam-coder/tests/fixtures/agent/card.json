@@ -14,7 +14,8 @@
         "pull-request"
       ],
       "examples": [
-        "In https://github.com/acme/widgets (base branch main), add a hello.txt containing hi."
+        "In https://github.com/acme/widgets (base branch main), add a hello.txt containing hi.",
+        "Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you the repository later."
       ]
     }
   ],

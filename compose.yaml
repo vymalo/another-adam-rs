@@ -76,10 +76,15 @@ services:
   # A git remote for the coder: bare repositories over smart HTTP, seeded with
   # local/sandbox.git (a README and a `just check` script). No authentication.
   # Clone URL: http://127.0.0.1:8083/local/sandbox.git
+  # A repository of an owner in AUTO_CREATE_OWNERS is created, empty, the first time anything asks
+  # for it: what a repository that was just created on GitHub is like (the scratch scenario of
+  # dev/coder-e2e.sh publishes a project to http://git-server:8080/scratch/<name>.git).
   git-server:
     build:
       context: ./dev/git-server
     restart: unless-stopped
+    environment:
+      AUTO_CREATE_OWNERS: scratch
     ports: ["127.0.0.1:${GIT_SERVER_PORT:-8083}:8080"]
     volumes:
       - git-data:/srv/git

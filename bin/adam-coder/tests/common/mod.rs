@@ -466,6 +466,18 @@ impl Fixture {
         remote
     }
 
+    /// A bare remote with no ref at all, `<tmp>/other/<name>.git`: a repository that was just
+    /// created. Returns its path.
+    pub fn empty_remote(&self, name: &str) -> PathBuf {
+        let remote = self.tmp.path().join("other").join(format!("{name}.git"));
+        std::fs::create_dir_all(&remote).unwrap();
+        git(
+            &remote,
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
+        );
+        remote
+    }
+
     /// Branches on the remote other than `main`.
     pub fn agent_branches(&self) -> Vec<String> {
         git(

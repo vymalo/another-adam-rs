@@ -264,9 +264,20 @@ async fn play(
     system: &str,
     mut history: Vec<Message>,
 ) -> Vec<Vec<String>> {
+    play_on(client, model, system, &mut history).await
+}
+
+/// [`play`] over `history`, which keeps what was said (the model's messages and the answers to its
+/// calls), so that a script that stops to ask can be played on once the person has answered.
+async fn play_on(
+    client: &OpenAiCompatible,
+    model: &str,
+    system: &str,
+    history: &mut Vec<Message>,
+) -> Vec<Vec<String>> {
     let mut turns = Vec::new();
     for turn in 0..12 {
-        let req = scripted(model, system, &history);
+        let req = scripted(model, system, history);
         let complete = client
             .complete(req.clone())
             .await
@@ -414,6 +425,81 @@ async fn the_scripted_models_stream_what_they_complete() {
     .await;
     assert_eq!(cards.len(), 2);
     grows(&cards, 2, "the researcher's answer");
+}
+
+/// The scratch script: a project is built and checked, the model asks where to put it (the run
+/// parks on that text), and once the person names a repository it publishes there, commits, pushes
+/// and opens the pull request, in that repository's slot. The repository is named in the task
+/// text (`fib-<hex>`), so a second run on the same stack never meets the first one's.
+#[tokio::test]
+async fn the_scratch_script_asks_where_to_publish_and_goes_on_when_told() {
+    let Some(root) = mock_url() else {
+        eprintln!("skipping: ADAM_TEST_MOCK_OPENAI_URL not set");
+        return;
+    };
+    let client = client(&format!("{root}/v1"), None);
+    let id = "fib-1a2b3c4d5e";
+    let task = format!(
+        "Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you the repo later. [mock:scratch] {id}"
+    );
+    let mut history = vec![Message::user_text(task)];
+    let first = play_on(&client, "mock-coder", "x", &mut history).await;
+    assert_eq!(first.len(), 5, "four calls, then the question");
+    let question = first.last().expect("a turn").concat();
+    assert!(
+        question.contains("which repository should I publish it to"),
+        "{question}"
+    );
+    grows(&first, 2, "the question");
+
+    // What the coder makes of a text stop: the text is the question of an `ask_user` call (its id is
+    // `stop` and the turn), and the person's answer is that call's result.
+    let Message::Assistant { content, .. } = Message::assistant_text(&question) else {
+        unreachable!("an assistant message")
+    };
+    history.push(Message::Assistant {
+        content,
+        tool_calls: vec![ToolCall {
+            id: "stop00004".into(),
+            name: "ask_user".into(),
+            arguments: json!({"question": question}),
+        }],
+    });
+    history.push(Message::tool_result(
+        "stop00004",
+        format!("Publish it to http://git-server:8080/scratch/{id}.git"),
+    ));
+    let second = play_on(&client, "mock-coder", "x", &mut history).await;
+    assert_eq!(second.len(), 4, "three calls, then the answer");
+    grows(&second, 6, "the coder's last answer after publishing");
+
+    let calls: Vec<(String, serde_json::Value)> = history
+        .iter()
+        .flat_map(|m| m.tool_calls().to_vec())
+        .filter(|c| c.name != "ask_user")
+        .map(|c| (c.name, c.arguments))
+        .collect();
+    let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "start_scratch",
+            "write_file",
+            "write_file",
+            "run_checks",
+            "publish_scratch",
+            "commit_and_push",
+            "open_pull_request"
+        ]
+    );
+    assert_eq!(calls[3].1["repo"], "fib", "the check runs in the project");
+    assert_eq!(
+        calls[4].1["repo_url"],
+        format!("http://git-server:8080/scratch/{id}.git").as_str()
+    );
+    for (name, args) in &calls[5..] {
+        assert_eq!(args["repo"], id, "{name} works in the repository's slot");
+    }
 }
 
 /// A script's answer is written over about two seconds, not all at once: a screen that shows words as

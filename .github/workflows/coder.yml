@@ -8,7 +8,8 @@ name: coder
 # The image is built on pull requests too and smoke-tested as a container (a
 # Postgres service, a stub model, a real start under tini), then run through
 # the compose stack (scripted models, a git remote, a mock GitHub) with a task
-# that must end in a branch and one pull request (dev/coder-e2e.sh), and with
+# that must end in a branch and one pull request (dev/coder-e2e.sh; also a task that names no
+# repository, which ends in a pull request on a repository named later), and with
 # "Hi", which must get a greeting that says the agent's name, and with a changed
 # agent folder mounted in place of the default one (dev/greeting-e2e.sh). The same
 # image carries the general agent binary too (adam-agent, which serves any agent
@@ -238,9 +239,11 @@ jobs:
       # The image that just passed, in the compose stack: the coder gets a task
       # over A2A, its scripted model drives prepare -> OpenCode (also scripted)
       # -> checks -> commit and push -> pull request, and dev/coder-e2e.sh
-      # checks the artifacts, mock-github's journal and git-server. Run three times:
-      # without OpenCode (the check command makes the change), with it, and with the coder
-      # writing the file itself (SCENARIO=files).
+      # checks the artifacts, mock-github's journal and git-server. Run four times:
+      # without OpenCode (the check command makes the change), with it, with the coder
+      # writing the file itself (SCENARIO=files), and with no repository named at all
+      # (SCENARIO=scratch: a project is built in a scratch slot, the coder asks where to put
+      # it, and the answer names an empty repository that git-server makes on first use).
       # The job's own Postgres service holds 5432, so the stack's Postgres
       # moves to POSTGRES_PORT.
       - name: Compose e2e
@@ -257,6 +260,9 @@ jobs:
           sh dev/coder-e2e.sh
           # The coder edits the files itself (read_file, write_file), and OpenCode is not started.
           SCENARIO=files sh dev/coder-e2e.sh
+          # No repository is named: the project is built in a scratch slot, the task waits for the
+          # person to name one, and what was checked is what is pushed to it.
+          SCENARIO=scratch sh dev/coder-e2e.sh
           # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
           sh dev/greeting-e2e.sh
           # The general agent: "hi" answered in role by its folder, and an edited folder changes the

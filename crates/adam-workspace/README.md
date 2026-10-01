@@ -20,7 +20,7 @@ authentication behave like the real tool.
 | Item | What |
 |---|---|
 | `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, **`run(run)`** (a run's workspace, below), **`runs()`** (the runs that have one on disk), **`remote_is_empty(url)`**, **`initialize_empty(&RepoRef, &GitIdentity)`**, **`wait_reachable(url, Duration)`**, `default_branch(url)`, `remove(run)` (everything of the run's workspace, the legacy worktree included), and the single-repository helpers `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `open_existing(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
-| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, `remove()`; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)` and `files()` |
+| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, `remove()`; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)`, `files()`, `status()`, `published_to()` and `set_published_to(url)` |
 | `copy_into(&Scratch, &Worktree, path, overwrite)`, `CopyReport`, `Collision` | the files of a scratch project into a worktree, all or nothing: `copied`, `unchanged`, `collisions` |
 | `Environment` (trait), `DynEnvironment`, `Local` | where a run's processes run: `ensure(&RunWorkspace, &dyn EnvProgress)` gives the run's `EnvSession` (made on first need, then the same), `release(run)` (idempotent), `held_runs()`. `Local` is the caller's own container and holds nothing |
 | `EnvSession` (trait), `LocalSession` | `describe()`, `prepare(&ExecSpec)` (the command to spawn), `kill(&ExecId)`, `secret_ref(name)` |
@@ -107,7 +107,8 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
 <root>/workspaces/<run>/<dir>/          a slot: a worktree on agent/<run-short-id>, or a scratch project
 <root>/workspaces/<run>.lock            the run's lock, beside its directory
 <root>/meta/<run>/<dir>.json            the slot's metadata, version 2: dir, seq, kind ("repo" | "scratch"),
-                                        and for a repository url, base_branch, branch, remote_branch (no secrets)
+                                        for a repository url, base_branch, branch, remote_branch, for a scratch
+                                        project published_to (no secrets)
 <root>/worktrees/<run>                  legacy (one worktree per run): read as a slot, removed by remove(),
 <root>/meta/<run>.json                  made only by prepare / prepare_continuing
 ```
@@ -120,7 +121,11 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
 * **A scratch slot** is a git repository on `main` with an empty root commit (so `HEAD` exists), made by
   `add_scratch(dir, identity)` (`^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`; again it returns the same project; a
   crash between `git init` and the first commit is finished by the next call). `Scratch::commit_all` commits locally;
-  `Scratch::files` lists tracked files and untracked ones that `.gitignore` does not exclude.
+  `Scratch::files` lists tracked files and untracked ones that `.gitignore` does not exclude; `Scratch::status` lists what
+  differs from the last commit, as `Worktree::status` does. **`set_published_to(url)`** records, in the slot's metadata and
+  under the run's lock, the repository the project's files were last copied into (a later call replaces it; it survives a
+  restart and `add_scratch` of the same name), and **`published_to()`** says it as the slot was listed: what a caller tells
+  a model that goes on editing the project, whose changes no longer reach that repository.
 * **Order.** Every slot records `seq`, the place it joined the run, from 1; the legacy worktree is 0.
   `slots()` lists the legacy worktree first and then by directory; `slots_in_join_order()` by `seq`, whose first
   element is "the first repository". A slot whose directory is gone is not listed.
@@ -325,7 +330,8 @@ Offline. The `git` CLI must be on `PATH`.
   lost (made again on its branch, with its commit), a refused repository (nothing created, no lock file, bad run ids);
   scratch (a repository on `main` with one root commit by the given identity, no sample hooks, `files` without ignored or
   deleted files, `commit_all` once and then nothing, idempotent, bad names, a name that is a repository's, a lost root
-  commit made again); `remote_is_empty` and `initialize_empty` (the empty tree, `Initial commit`, a `Conflict` the second
+  commit made again; `status`, and `published_to` kept in the metadata across a new handle on the root and across
+  `add_scratch`, replaced by a later publication, and refused for a workspace that was removed); `remote_is_empty` and `initialize_empty` (the empty tree, `Initial commit`, a `Conflict` the second
   time and for a remote with refs, also under another base, nothing forced, a worktree of it from the new base);
   `wait_reachable` (found at once, `NotFound` after the time, found when the repository appears meanwhile, a refused URL at
   once); `copy_into` (files, the executable bit, a link kept, ignored files left, no temporary file, again all unchanged;

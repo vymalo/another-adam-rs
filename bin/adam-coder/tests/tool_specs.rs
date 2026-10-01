@@ -22,8 +22,10 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 12] = [
+const TOOLS: [&str; 14] = [
     "prepare_workspace",
+    "start_scratch",
+    "publish_scratch",
     "run_command",
     "read_file",
     "write_file",
@@ -155,6 +157,10 @@ async fn only_the_optional_arguments_are_nullable() {
             "open_pull_request.repo",
             "prepare_workspace.base_branch",
             "prepare_workspace.branch",
+            "publish_scratch.base_branch",
+            "publish_scratch.overwrite",
+            "publish_scratch.path",
+            "publish_scratch.scratch",
             "read_file.end_line",
             "read_file.repo",
             "read_file.start_line",
@@ -162,6 +168,7 @@ async fn only_the_optional_arguments_are_nullable() {
             "run_checks.repo",
             "run_command.cwd",
             "run_command.repo",
+            "start_scratch.name",
             "write_file.repo",
         ]
     );

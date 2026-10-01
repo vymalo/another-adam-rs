@@ -1,0 +1,13 @@
+{
+  "name": "start_scratch",
+  "description": "Start a scratch project: a new local git repository in your workspace, to build and test something in when the person has named no repository yet (or before one exists). Write the files with write_file, apply_patch or delegate_to_opencode and run the real checks with run_checks, passing `repo` with the project's name when the workspace has more than one slot. A scratch project is temporary: it exists only while this task is open, and nothing in it is kept unless it is published to a repository the person names, with publish_scratch. Tell the person so. Calling it again with the same name is harmless.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Name of the project, which is also the name of its directory (`repo` in the other tools): lowercase letters, digits, `.`, `_` and `-`, starting with a letter or a digit, at most 64 characters, not ending in `.git`. Leave out for `scratch`."
+      }
+    }
+  }
+}

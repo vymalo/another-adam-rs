@@ -487,11 +487,12 @@ pub async fn run_checks(
         )));
     }
 
-    let wt = match env.worktree(ctx, repo.as_deref()).await {
-        Ok(wt) => wt,
+    // A repository's worktree or a scratch project: the checks run on either.
+    let slot = match env.slot(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    let dir = match resolve_cwd(wt.path(), cwd.as_deref().and_then(non_empty)) {
+    let dir = match resolve_cwd(slot.path(), cwd.as_deref().and_then(non_empty)) {
         Ok(dir) => dir,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
@@ -521,15 +522,15 @@ pub async fn run_checks(
     if let Some(missing) = missing_tool(&outcome, command) {
         ctx.emit_progress(format!("the workspace lacks a tool: {shown}"))
             .await;
-        let said = missing_tool_answer(&env, ctx, &missing, &[dir.as_path(), wt.path()]).await?;
+        let said = missing_tool_answer(&env, ctx, &missing, &[dir.as_path(), slot.path()]).await?;
         return Ok(ToolOutput::error(said));
     }
 
     // The code the command just ran on, so a pull request can be tied to
     // the exact tree that was verified.
-    let tree = super::gitcli::working_tree_id(wt.path()).await;
-    let head = super::gitcli::head_sha(wt.path()).await;
-    let dirty = match (&tree, super::gitcli::head_tree(wt.path()).await) {
+    let tree = super::gitcli::working_tree_id(slot.path()).await;
+    let head = super::gitcli::head_sha(slot.path()).await;
+    let dirty = match (&tree, super::gitcli::head_tree(slot.path()).await) {
         (Some(tree), Some(head_tree)) => *tree != head_tree,
         _ => false,
     };
@@ -541,7 +542,8 @@ pub async fn run_checks(
         head: head.as_deref(),
         dirty,
         tree: tree.as_deref(),
-        repository: Some(&wt.repo().url),
+        // A scratch project has no repository (yet).
+        repository: slot.worktree().map(|wt| wt.repo().url.as_str()),
     })
     .scrubbed(redactor);
     let artifact = report.clone().into_artifact(redactor);
@@ -554,7 +556,7 @@ pub async fn run_checks(
         tail: outcome.tail.clone(),
         tree,
         report: Some(report),
-        slot: Some(wt.dir().to_owned()),
+        slot: Some(slot.dir().to_owned()),
     });
     env.notes
         .save(&run, &notes)
