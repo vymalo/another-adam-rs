@@ -2016,6 +2016,15 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     gets to the shared `Redactor`, so a minted token is a secret from the moment it exists. The sequence and the
     states of the cached token are in the ADR and in the
     [`adam-workspace` README](../crates/adam-workspace/README.md#github-app-credentials).
+  * **GitHub is read through the official GitHub MCP server, read-only**
+    ([ADR 0009](decisions/0009-github-per-installation-read-through-mcp.md), decision 8). The coder's shipped
+    `agent/mcp.json` starts `github-mcp-server stdio --read-only` as a child process (the image carries it, pinned
+    by tag and digest, and sets `MCP_ALLOW_STDIO=true`), hands it the coder's own credentials by the names it reads
+    (`GITHUB_TOKEN` as `GITHUB_PERSONAL_ACCESS_TOKEN`, or the App's id, installation and key *file*; the other mode
+    is an empty variable, which the server counts as unset) and offers the model twelve of its tools as
+    `github__<name>`. Everything that writes stays the coder's own, behind the gate. The dev stack points the coder at
+    a WireMock of the server's HTTP endpoint instead (`dev/coder-agent/mcp.json`, `mock-github-mcp`). See
+    [`bin/adam-coder`](../bin/adam-coder/README.md#github-over-mcp-read-only).
   * OpenCode's child process gets `MODEL_API_KEY` through its environment (its
     config says `{env:MODEL_API_KEY}`, so the key is not inlined). `GITHUB_TOKEN`,
     `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child (they are the names the

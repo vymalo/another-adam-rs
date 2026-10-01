@@ -189,7 +189,7 @@
       }
     },
     {
-      "name": "coder script 1: delegate_to_opencode",
+      "name": "coder script 1a: github__list_branches",
       "priority": 1,
       "request": {
         "method": "POST",
@@ -203,6 +203,67 @@
           },
           {
             "contains": "coder-call-1"
+          },
+          {
+            "doesNotContain": "coder-gh-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-coder-gh-1",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "coder-gh-1",
+                    "type": "function",
+                    "function": {
+                      "name": "github__list_branches",
+                      "arguments": "{\"owner\":\"local\",\"repo\":\"sandbox\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script 1: delegate_to_opencode",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "coder-gh-1"
           },
           {
             "doesNotContain": "coder-call-2"

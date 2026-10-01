@@ -146,6 +146,48 @@
       }
     },
     {
+      "name": "coder script 1a: github__list_branches (stream)",
+      "priority": 0,
+      "metadata": {
+        "twinOf": "coder script 1a: github__list_branches"
+      },
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "coder-call-1"
+          },
+          {
+            "doesNotContain": "coder-gh-1"
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        },
+        "body": "data: {\"id\":\"chatcmpl-coder-script-coder-gh-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"coder-gh-1\",\"type\":\"function\",\"function\":{\"name\":\"github__list_branches\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-gh-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"owner\\\":\\\"local\\\",\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-gh-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"repo\\\":\\\"sandbox\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-gh-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-coder-script-coder-gh-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\ndata: [DONE]\n\n",
+        "transformers": [
+          "response-template"
+        ]
+      }
+    },
+    {
       "name": "coder script 1: delegate_to_opencode (stream)",
       "priority": 0,
       "metadata": {
@@ -162,7 +204,7 @@
             }
           },
           {
-            "contains": "coder-call-1"
+            "contains": "coder-gh-1"
           },
           {
             "doesNotContain": "coder-call-2"

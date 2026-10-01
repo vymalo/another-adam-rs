@@ -321,5 +321,12 @@ per test): none relies on another test's runtime to reap a process or to install
   that exits mid-call (error result, then a new process); dropping the servers kills the child, also outside a
   runtime and after it; a later server failing kills the children already started; the child's stderr is logged
   without the expanded secret.
+* `tests/wiremock_compose.rs` (gated by `ADAM_TEST_MOCK_GITHUB_MCP_URL`, the endpoint of the compose service
+  `mock-github-mcp`; CI's compose job runs it): the WireMock stand-in for the GitHub MCP server's HTTP endpoint is a
+  server this client can use. The bearer is written as the coder's dev `mcp.json` writes it; `McpServers::connect`
+  lists the twelve tools of the coder's allow-list in order, calls `list_branches` and `get_me`, and gets an error
+  result for a tool the mock does not script; a tool the server lacks is a startup error; no bearer is a `401`, which
+  fails startup (`Transient`). It skips itself without the variable. (The real server, over stdio, is exercised by
+  the coder's `tests/binary.rs`.)
 * Property test (`adam-agent-fs`): `split_env_references` and the scanner it replaced agree on any text, and the
   segments write back to the text.

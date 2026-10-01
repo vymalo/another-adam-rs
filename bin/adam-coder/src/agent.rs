@@ -159,7 +159,14 @@ impl CoderAgent {
     /// The steps are the ones any agent written as files takes: the embedded definition, the value
     /// of the `max_check_cycles` var (the prompt tells the model the limit the tools enforce), the
     /// tools, the state they read and the model. It is
-    /// [`try_from_files`](Self::try_from_files) over the embedded copy.
+    /// [`try_from_files`](Self::try_from_files) over the embedded copy, **with no MCP tools**.
+    ///
+    /// The embedded copy declares the GitHub MCP server (`agent/mcp.json`, read-only), and
+    /// connecting a server is async and a deployment's decision (`MCP_ALLOW_STDIO`), so this sync
+    /// constructor connects nothing: the agent has the tools it is given and no `github__*` ones,
+    /// and the bind says so with a warning. A process that wants them does what `serve` does:
+    /// [`AgentFiles::def`] (the embedded copy), `AgentDef::connect_mcp`, then
+    /// [`try_from_def`](Self::try_from_def).
     ///
     /// # Errors
     ///
@@ -171,7 +178,10 @@ impl CoderAgent {
         env: Arc<ToolEnv>,
         tools: impl IntoIterator<Item = DynTool>,
     ) -> Result<Self, Box<AssemblyError>> {
-        Self::try_from_files(&AgentFiles::Embedded, model, model_alias, env, tools)
+        let def = AgentFiles::Embedded
+            .def()?
+            .mcp_tools(AGENT_NAME, ToolSet::new());
+        Self::try_from_def(def, model, model_alias, env, tools)
     }
 
     /// The coder assembled from `files`: the embedded copy, or the folder the process read at
@@ -181,8 +191,9 @@ impl CoderAgent {
     /// A folder is held to what the code supplies and registers: the `max_check_cycles` var
     /// (`vars` must declare it, or the bind fails naming it), the coder's tools (`tools:` may
     /// narrow them, and a name that is not one is refused with a suggestion), and the state they read.
-    /// Every subagent the folder has is assembled too ([`subagents`](Self::subagents)). A folder
-    /// with an `mcp.json` is refused here: its servers are connected first, which is async
+    /// Every subagent the folder has is assembled too ([`subagents`](Self::subagents)). Files
+    /// whose `mcp.json` lists servers are refused here, the embedded copy's too (it names the
+    /// GitHub server): the servers are connected first, which is async
     /// ([`try_from_def`](Self::try_from_def)).
     ///
     /// # Errors

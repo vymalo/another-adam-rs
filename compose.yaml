@@ -73,6 +73,19 @@ services:
       - ./dev/wiremock/mock-github/mappings:/home/wiremock/mappings:ro
       - ./dev/wiremock/mock-github/__files:/home/wiremock/__files:ro
 
+  # The GitHub MCP server's streamable HTTP endpoint, as the coder reads GitHub through it (ADR 0009):
+  # `initialize`, `tools/list` (the twelve read tools of the coder's allow-list) and `tools/call` of
+  # `get_me` and `list_branches`, behind a bearer. The production coder starts the real server as a
+  # child process; the dev stack points the coder at this mock instead (dev/coder-agent/mcp.json,
+  # mounted over the coder's mcp.json), so no GitHub and no second binary are needed.
+  # Endpoint: http://127.0.0.1:8085/mcp
+  mock-github-mcp:
+    <<: *wiremock
+    command: ["--global-response-templating"]
+    ports: ["127.0.0.1:${MOCK_GITHUB_MCP_PORT:-8085}:8080"]
+    volumes:
+      - ./dev/wiremock/mock-github-mcp/mappings:/home/wiremock/mappings:ro
+
   # A git remote for the coder: bare repositories over smart HTTP, seeded with
   # local/sandbox.git (a README and a `just check` script). No authentication.
   # Clone URL: http://127.0.0.1:8083/local/sandbox.git
@@ -93,7 +106,7 @@ services:
 
   # The coder agent (A2A server + workers), built from the repository root and
   # wired to the mocks: model = mock-openai, pull requests = mock-github,
-  # remote = git-server (use http://git-server:8080/local/sandbox.git as the
+  # remote = git-server, GitHub read over MCP = mock-github-mcp (use http://git-server:8080/local/sandbox.git as the
   # repository in a task). Needs the workspace base image of
   # docker/coder/Dockerfile to be pullable.
   #
@@ -127,6 +140,8 @@ services:
         condition: service_healthy
       git-server:
         condition: service_healthy
+      mock-github-mcp:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/adam_test
       MODEL_BASE_URL: http://mock-openai:8080/v1
@@ -150,10 +165,17 @@ services:
       ALLOW_LOCAL_REPOS: "true"
       # The mounted folder below: what the agent says and offers, read at startup.
       ADAM_AGENT_DIR: /etc/adam/agent
+      # The folder's mcp.json is replaced (below) by one that reaches mock-github-mcp over plain
+      # http, which a deployment must allow: development only, never set it in production.
+      MCP_ALLOW_INSECURE: "true"
     ports: ["127.0.0.1:${CODER_PORT:-8080}:8080"]
     volumes:
       - coder-work:/work
       - ${CODER_AGENT_DIR:-./bin/adam-coder/agent}:/etc/adam/agent:ro
+      # The shipped mcp.json starts the real github-mcp-server (a child process, in the image); the dev
+      # stack reads GitHub through the mock instead. This file goes over the folder's mcp.json, so the
+      # folder in CODER_AGENT_DIR must have one (a copy of the shipped folder does).
+      - ./dev/coder-agent/mcp.json:/etc/adam/agent/mcp.json:ro
     healthcheck:
       # Plain TCP connect: the image is not guaranteed to ship curl.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]

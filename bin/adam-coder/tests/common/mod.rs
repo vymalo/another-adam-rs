@@ -851,6 +851,18 @@ pub fn folder() -> TempDir {
     tmp
 }
 
+/// [`folder`] without its `agent/mcp.json`: the shipped agent as a deployment that connects no MCP
+/// server mounts it. The shipped file names the GitHub server, a local process that only starts
+/// with `MCP_ALLOW_STDIO` and the `github-mcp-server` binary (the coder image has both), so a test
+/// that starts a worker on a folder, or assembles one, takes this and says itself which servers it
+/// connects (`tests/binary.rs`, `tests/agent_files.rs`); the shipped file is tested as it is.
+pub fn plain_folder() -> TempDir {
+    let tmp = folder();
+    std::fs::remove_file(tmp.path().join("agent/mcp.json"))
+        .expect("the shipped agent has an mcp.json");
+    tmp
+}
+
 /// `agent/instructions.md` of a folder made by [`folder`], rewritten by `edit`.
 pub fn edit_instructions(folder: &TempDir, edit: impl FnOnce(String) -> String) {
     let path = folder.path().join("agent/instructions.md");

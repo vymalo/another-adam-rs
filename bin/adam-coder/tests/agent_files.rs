@@ -37,7 +37,9 @@ use adam_model::{
 };
 use adam_runtime::Runtime;
 use async_trait::async_trait;
-use common::{Fixture, edit_instructions, folder};
+// A folder here is the shipped agent without its `mcp.json` (the shipped one names the GitHub
+// server, a local process: see `common::plain_folder`); the tests of `mcp.json` write their own.
+use common::{Fixture, edit_instructions, plain_folder as folder};
 use futures::stream::BoxStream;
 use serde_json::json;
 
@@ -311,10 +313,18 @@ fn files_of(folder: &tempfile::TempDir) -> AgentFiles {
     AgentFiles::load(Some(folder.path())).expect("the folder loads")
 }
 
+/// The coder assembled from `files`, as the sync path does it: no server of an `mcp.json` is
+/// connected, so the agent has the coder's tools and no MCP ones (the embedded copy names the
+/// GitHub server, and a definition that names servers and was not given tools is refused:
+/// `an_mcp_json_that_was_not_connected_is_refused_at_assembly`).
 fn coder_from(files: &AgentFiles, fx: &Fixture, mock: &Arc<MockModel>) -> CoderAgent {
     let model: DynModel = mock.clone();
     let tools = coder_tools(&fx.env);
-    CoderAgent::try_from_files(files, model, "test-model", fx.env.clone(), tools)
+    let def = files
+        .def()
+        .expect("the files make a definition")
+        .mcp_tools(AGENT_NAME, adam_llm_agent::ToolSet::new());
+    CoderAgent::try_from_def(def, model, "test-model", fx.env.clone(), tools)
         .expect("the files assemble")
 }
 
@@ -366,7 +376,8 @@ fn options() -> RuntimeOptions {
 async fn a_copy_of_the_shipped_folder_is_the_embedded_agent() {
     let fx = Fixture::new("hello\n").await;
     let mock = Arc::new(MockModel::new());
-    let tmp = folder();
+    // The shipped files as they are, `mcp.json` included: the digest covers it.
+    let tmp = common::folder();
     let files = files_of(&tmp);
     assert_eq!(files.describe().source, "folder");
     assert_eq!(files.describe().agent, AGENT_NAME);
@@ -639,8 +650,12 @@ async fn a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says() {
         async move {
             let model = PersonaModel::new();
             let dynamic: DynModel = model.clone();
-            let agent = CoderAgent::try_from_files(
-                &files,
+            let def = files
+                .def()
+                .unwrap()
+                .mcp_tools(AGENT_NAME, adam_llm_agent::ToolSet::new());
+            let agent = CoderAgent::try_from_def(
+                def,
                 dynamic,
                 "test-model",
                 fx.env.clone(),
@@ -809,6 +824,108 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// The twelve read tools of the shipped `mcp.json`, in its order: what the model may call of the
+/// GitHub MCP server, and all of it (`tools:` is an allow-list, and the server is also started
+/// with `--read-only`).
+const GITHUB_TOOLS: [&str; 12] = [
+    "get_me",
+    "search_repositories",
+    "get_file_contents",
+    "list_branches",
+    "list_commits",
+    "get_commit",
+    "search_code",
+    "list_issues",
+    "issue_read",
+    "search_issues",
+    "list_pull_requests",
+    "pull_request_read",
+];
+
+/// The shipped `mcp.json` is the official GitHub MCP server over stdio, read-only, with the four
+/// toolsets the coder reads and the twelve tools above and no others, and it hands the child the
+/// credentials the coder already has and nothing else: a token or the App's id, installation and key
+/// *file* (never the key itself), and the host. The values are `${VAR:-}`, so an unset variable is
+/// an empty one, which the server counts as unset (verified against v1.12.2, ADR 0009).
+#[test]
+fn the_shipped_mcp_json_names_the_github_server_read_only() {
+    use adam::agent_fs::McpServer;
+
+    let def = AgentFiles::Embedded.def().unwrap();
+    let config = def
+        .manifest()
+        .mcp
+        .as_ref()
+        .expect("the shipped agent has an mcp.json");
+    assert_eq!(config.servers.keys().collect::<Vec<_>>(), ["github"]);
+    let McpServer::Stdio {
+        command,
+        args,
+        env,
+        tools,
+    } = &config.servers["github"]
+    else {
+        panic!(
+            "the GitHub server is a local process: {:?}",
+            config.servers["github"]
+        );
+    };
+    assert_eq!(command, "github-mcp-server");
+    assert_eq!(
+        args,
+        &[
+            "stdio",
+            "--read-only",
+            "--toolsets",
+            "context,repos,issues,pull_requests"
+        ]
+    );
+    assert_eq!(tools.as_deref(), Some(&GITHUB_TOOLS.map(String::from)[..]));
+    // Nothing that writes: every name is a read, and none of the verbs of the server's write tools.
+    for tool in GITHUB_TOOLS {
+        for verb in [
+            "create_", "update_", "delete_", "push_", "merge_", "add_", "fork_", "request_",
+            "assign_", "dismiss_", "enable_", "disable_", "set_", "remove_", "resolve_", "submit_",
+        ] {
+            assert!(!tool.starts_with(verb), "{tool} writes");
+        }
+    }
+    // The credentials the coder holds, by the names the server reads, and the host.
+    let passed: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(
+        passed,
+        [
+            ("GITHUB_APP_ID", "${GITHUB_APP_ID:-}"),
+            (
+                "GITHUB_APP_INSTALLATION_ID",
+                "${GITHUB_APP_INSTALLATION_ID:-}"
+            ),
+            (
+                "GITHUB_APP_PRIVATE_KEY_PATH",
+                "${GITHUB_APP_PRIVATE_KEY_PATH:-}"
+            ),
+            ("GITHUB_HOST", "${GITHUB_MCP_HOST:-}"),
+            ("GITHUB_PERSONAL_ACCESS_TOKEN", "${GITHUB_TOKEN:-}"),
+        ],
+        "the key itself (GITHUB_APP_PRIVATE_KEY) is not handed to a child"
+    );
+}
+
+/// A deployment that does not allow local processes does not get the GitHub server, and says so
+/// at startup, naming the variable that decides (78); the image allows them (`MCP_ALLOW_STDIO`).
+#[tokio::test]
+async fn the_shipped_mcp_json_starts_no_local_process_unless_the_deployment_allows_it() {
+    let error = AgentFiles::Embedded
+        .def()
+        .unwrap()
+        .connect_mcp(&McpPolicy::default())
+        .await
+        .expect_err("a local process is not allowed by default");
+    assert!(error.to_string().contains("local process"), "{error}");
+    assert!(error.to_string().contains("github"), "{error}");
+    assert_eq!(error.class(), ErrorClass::Invalid);
 }
 
 /// A folder whose `mcp.json` lists servers that were never connected is refused at assembly, not

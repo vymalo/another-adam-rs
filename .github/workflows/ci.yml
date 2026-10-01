@@ -161,6 +161,17 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
+      # The coder's test against the real GitHub MCP server (bin/adam-coder/tests/binary.rs) needs the
+      # binary the coder image carries: the same image, by the same tag and digest as
+      # docker/coder/Dockerfile (keep the two in step). Without it that test skips itself.
+      - name: The GitHub MCP server of the coder image
+        run: |
+          set -eu
+          id=$(docker create ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6)
+          docker cp "$id:/server/github-mcp-server" "$RUNNER_TEMP/github-mcp-server"
+          docker rm "$id" > /dev/null
+          "$RUNNER_TEMP/github-mcp-server" --version
+          echo "ADAM_TEST_GITHUB_MCP_SERVER=$RUNNER_TEMP/github-mcp-server" >> "$GITHUB_ENV"
       - name: Tests (memory, Postgres, MongoDB, coder end to end)
         run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
       # Run the database suites a second time: this pass exercises migrate() on
@@ -244,7 +255,7 @@ jobs:
           docker compose config -q
           docker compose --profile app config -q
       - name: Start postgres and the mocks
-        run: docker compose up -d --build --wait postgres mock-openai mock-github git-server
+        run: docker compose up -d --build --wait postgres mock-openai mock-github mock-github-mcp git-server
       - name: Smoke-test each service
         run: |
           set -eu
@@ -325,6 +336,12 @@ jobs:
           test "$(curl -fsS 'http://127.0.0.1:8082/repos/local/sandbox/pulls?head=local:agent/x&state=open')" = '[]'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/repos/local/sandbox/pulls \
             -d '{"title":"t","head":"agent/x","base":"main"}')" = 201
+          # mock-github-mcp (the GitHub MCP server's endpoint): turned away without a bearer, and
+          # `tools/list` lists the twelve read tools of the coder's allow-list.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8085/mcp \
+            -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')" = 401
+          curl -fsS http://127.0.0.1:8085/mcp -H 'Authorization: Bearer x' -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -e '.result.tools | length == 12' > /dev/null
           # git-server: clone, push a branch, see it on the remote.
           git clone -q http://127.0.0.1:8083/local/sandbox.git "$RUNNER_TEMP/sandbox"
           cd "$RUNNER_TEMP/sandbox"
@@ -339,7 +356,8 @@ jobs:
         env:
           ADAM_TEST_MOCK_OPENAI_URL: http://127.0.0.1:8081
           ADAM_TEST_MOCK_GITHUB_URL: http://127.0.0.1:8082
-        run: cargo test -p adam-model-openai -p adam-workspace --test wiremock_compose
+          ADAM_TEST_MOCK_GITHUB_MCP_URL: http://127.0.0.1:8085/mcp
+        run: cargo test -p adam-model-openai -p adam-workspace -p adam-mcp --test wiremock_compose
       - name: Logs
         if: failure()
         run: docker compose logs --no-color

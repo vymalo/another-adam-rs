@@ -58,7 +58,9 @@ sequenceDiagram
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the fourteen. The tools the conversation's endpoint lists
+folder](#mcp-tools-from-the-folder)); they are not part of the fourteen. The shipped folder's own `mcp.json` adds
+twelve **read-only** tools of GitHub, `github__get_me`, `github__get_file_contents`, `github__list_branches` and the
+rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)).
 
@@ -912,8 +914,10 @@ rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
   another machine needs `MCP_ALLOW_INSECURE=true` (development only); `https` and loopback need nothing.
 * **A server that is down** at startup stops the process with exit 69, so a supervisor restarts it until the server
   is up; a mistake in the files or the policy is 78. A tool call that fails is an error result the model reads.
-* A folder without an `mcp.json` connects nothing (the embedded copy has none). A **control plane** serves the card
-  and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
+* A folder without an `mcp.json` connects nothing. **The embedded copy has one**: it names the GitHub MCP server, a
+  local process (see [GitHub over MCP](#github-over-mcp-read-only)), so a coder on the embedded files needs
+  `MCP_ALLOW_STDIO=true` and `github-mcp-server` on its `PATH`, which the image has. A **control plane** serves the
+  card and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
 
 ### Retry safety
 
@@ -975,7 +979,7 @@ way; every problem is reported at once at startup):
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
-| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server | `false` |
+| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. **The coder image sets it** (it ships `github-mcp-server`, which the shipped `mcp.json` starts), so an `adam-agent` run from that image allows it too: set `MCP_ALLOW_STDIO=false` there to refuse local processes | `false` (the image: `true`) |
 | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
 | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills, subagents and `mcp.json`, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
@@ -1180,6 +1184,77 @@ Enterprise Server and a mock need no other variable. The deployment's own exampl
 `dev/compose.github-app.yaml` (an init service makes a throwaway key; the mock gives an installation token that
 lasts four minutes, so the coder renews it all the time) and `deploy/coder` (`github.auth: app`).
 
+### GitHub over MCP: read-only
+
+The coder **reads** GitHub (the files, branches, commits, issues and pull requests of any repository its credentials
+can see, including repositories it was not given) through the official
+[GitHub MCP server](https://github.com/github/github-mcp-server), and **writes** only through its own tools. The
+shipped `agent/mcp.json` ([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md),
+decision 8):
+
+```json
+{ "mcpServers": { "github": {
+  "command": "github-mcp-server",
+  "args": ["stdio", "--read-only", "--toolsets", "context,repos,issues,pull_requests"],
+  "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN:-}", "GITHUB_APP_ID": "${GITHUB_APP_ID:-}",
+           "GITHUB_APP_INSTALLATION_ID": "${GITHUB_APP_INSTALLATION_ID:-}",
+           "GITHUB_APP_PRIVATE_KEY_PATH": "${GITHUB_APP_PRIVATE_KEY_PATH:-}", "GITHUB_HOST": "${GITHUB_MCP_HOST:-}" },
+  "tools": ["get_me", "search_repositories", "get_file_contents", "list_branches", "list_commits", "get_commit",
+            "search_code", "list_issues", "issue_read", "search_issues", "list_pull_requests", "pull_request_read"] } } }
+```
+
+* **Read-only twice over.** The server is started with `--read-only` (it offers no write tool) and the `tools`
+  allow-list names twelve reads, so the model sees `github__get_me`, `github__search_repositories`,
+  `github__get_file_contents`, `github__list_branches`, `github__list_commits`, `github__get_commit`,
+  `github__search_code`, `github__list_issues`, `github__issue_read`, `github__search_issues`,
+  `github__list_pull_requests` and `github__pull_request_read`, after the coder's own tools, and nothing that
+  writes. Pushes and pull requests go through `commit_and_push` and `open_pull_request`, behind the gate. Reading a
+  repository there does not put it in the workspace and does not make it one the person named: it still cannot be
+  pushed to ([the rules](#the-rules-in-code)). A tool the server does not list stops the coder at startup (the
+  allow-list is checked), so a change of the server's tool names cannot go unseen.
+* **The credentials are the coder's.** The same variables, by the names the server reads, in either mode: a
+  **token** (`GITHUB_TOKEN`, handed over as `GITHUB_PERSONAL_ACCESS_TOKEN`) or a **GitHub App installation**
+  (`GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`; the server signs its own JWT and
+  trades it for an installation token). The mode that is not in use is an empty variable, which the server counts
+  as unset (*verified* 2026-10-01 against v1.12.2, by source and by running it in both modes), so no variable is
+  conditional. `GITHUB_MCP_HOST` (empty: github.com) is the server's `GITHUB_HOST`, for GitHub Enterprise
+  (`https://<host>`; the coder's own `GITHUB_API_URL` is separate).
+* **The App's key must be a file.** `GITHUB_APP_PRIVATE_KEY` (the key in a variable) is not handed to a child
+  process. A server that has an App and no key does not start, and the coder stops at startup (exit 69, with a "cannot
+  connect ... Broken pipe" message that does not say why: run the server by hand to read its own complaint);
+  the chart mounts the key as a file (`GITHUB_APP_PRIVATE_KEY_PATH`) and needs nothing. A deployment that keeps the key in a
+  variable has no GitHub MCP server: mount a copy of the folder without that server (`ADAM_AGENT_DIR`).
+* **A deployment must allow it.** The server is a local process: `MCP_ALLOW_STDIO=true` and the binary on `PATH`
+  (the image has both; a control plane connects nothing). Without the variable the process stops at startup with
+  exit 78 naming it, and with it and no binary with exit 69, never in the middle of a run, and no message holds a
+  credential. The image pins the binary by tag and digest (v1.12.2) and its build and the container smoke test list
+  its tools over stdio, with no credential at all (the server lists tools without calling GitHub, *verified*; a
+  *call* with no credential starts its OAuth login, so no credential is never a way to run).
+* **Development and the e2e do not start it.** The compose file mounts `dev/coder-agent/mcp.json` over the folder's
+  `mcp.json`: the same twelve tools from `mock-github-mcp`, a WireMock of the server's streamable HTTP endpoint over
+  plain `http` (`MCP_ALLOW_INSECURE=true`), behind a bearer. The default script of `mock-coder` reads
+  `github__list_branches` of `local/sandbox` right after `prepare_workspace`, and `dev/coder-e2e.sh` asserts the mock
+  saw `initialize`, `tools/list` and exactly one such call, and that the model was given the answer.
+
+```mermaid
+sequenceDiagram
+  participant P as the coder process (worker)
+  participant S as github-mcp-server (child, stdio)
+  participant G as GitHub
+  participant M as the model
+  P->>P: MCP_ALLOW_STDIO set? (else exit 78), the command on PATH? (else exit 69)
+  P->>S: start, env: the coder's credentials by the server's names
+  P->>S: initialize, tools/list
+  S-->>P: 25 tools (read-only, four toolsets): the twelve of the allow-list must all be there
+  Note over P,S: serving: the model is offered the twelve as github__<name>
+  M->>P: github__list_branches {owner, repo}
+  P->>S: tools/call
+  S->>G: REST or GraphQL, the token or the installation token
+  G-->>S: the answer
+  S-->>P: the result (an error result is the model's to read)
+  P-->>M: the tool result
+```
+
 ### Secrets in output
 
 Text from things this process does not control (OpenCode's stderr tail in an
@@ -1303,6 +1378,19 @@ database of its own, so the role needs `CREATEDB`):
   `completed`, and a `working` update carrying the text of the worker's progress line (an update of
   its `prepare_workspace` step, `preparing a worktree of ...`), which exists only as a live event and so proves events
   crossed the two processes over `NOTIFY`. Both processes log `listening for notifications`.
+* **GitHub over MCP** ([above](#github-over-mcp-read-only)). `tests/agent_files.rs`: the shipped `mcp.json` is the
+  GitHub server over stdio with `--read-only`, four toolsets and exactly the twelve reads (none starts with a verb
+  that writes), and hands the child only the credentials the coder holds (never the key itself); a deployment that
+  does not allow local processes does not get it and is told which variable decides. `tests/binary.rs`: the worker
+  on the embedded files stops with 78 without `MCP_ALLOW_STDIO` and 69 without the binary, naming the server and
+  never a credential; and, with `ADAM_TEST_GITHUB_MCP_SERVER` set to a `github-mcp-server` (CI copies it out of the
+  image the Dockerfile pins; the case skips itself without it), the whole binary connects the **real** server as a
+  child and a call reaches a mock of GitHub with the right credential: the model is offered the twelve tools in
+  order after the coder's own and none that writes, `github__get_me` returns the mock's user, no secret is in a log,
+  in both modes (a token, and an App with an empty token variable, where the server trades a JWT at the
+  installation's token endpoint). The other tests of those two files use the shipped folder without its `mcp.json`
+  (`common::plain_folder`), since a test machine has no such binary; `adam-mcp`'s `wiremock_compose` connects
+  `mock-github-mcp`; `dev/coder-e2e.sh` and `docker/coder/test/*.sh` check the stack and the image.
 * `tests/agent_files.rs`: the prompt, limits and card in `agent/instructions.md`, against the Rust they replaced and
   against the instruction snapshot. `the_prompt_carries_the_rules_the_code_relies_on` runs on the assembled prompt;
   `the_prompt_gives_the_agent_a_name_and_asks_for_plain_words` pins what #55 added (the persona lines first, the

@@ -125,6 +125,17 @@ schemas unless the person asks for that detail.
   you cannot proceed without an answer. To ask several questions that have fixed
   answers (which database, which login, where it runs), pass `choices`: the person
   gets one form with a list of options per question and answers them together.
+- `github__get_me`, `github__search_repositories`, `github__get_file_contents`,
+  `github__list_branches`, `github__list_commits`, `github__get_commit`,
+  `github__search_code`, `github__list_issues`, `github__issue_read`,
+  `github__search_issues`, `github__list_pull_requests` and `github__pull_request_read`:
+  read GitHub itself, the repositories, files, branches, commits, issues and pull
+  requests that your credentials can see, including those of repositories you were not
+  given. They only read. A repository you read there is not in your workspace and not one
+  the person named: you cannot push to it or put it in your workspace because you read
+  it. Pushes and pull requests go through `commit_and_push` and `open_pull_request`,
+  never through these. Use them to look something up (the issue the person mentions, how
+  another repository does a thing), not instead of the worktree.
 - `ui_catalog {}` and `show { blocks, title? }`: when the person's screen can draw
   more than text (cards, a diagram), `ui_catalog` lists what it can draw and `show`
   draws blocks of it beside your text answer. Call `ui_catalog` before `show`. A

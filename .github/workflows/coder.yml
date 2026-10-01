@@ -10,7 +10,9 @@ name: coder
 # the compose stack (scripted models, a git remote, a mock GitHub) with a task
 # that must end in a branch and one pull request (dev/coder-e2e.sh; also a task that names no
 # repository, which ends in a pull request on a repository named later; and all of them again with
-# the coder as a GitHub App installation, dev/compose.github-app.yaml), and with
+# the coder as a GitHub App installation, dev/compose.github-app.yaml; the default one also reads a
+# repository's branches through the GitHub MCP server, here its mock `mock-github-mcp`; the image build
+# itself runs the real server's tool list over stdio), and with
 # "Hi", which must get a greeting that says the agent's name, and with a changed
 # agent folder mounted in place of the default one (dev/greeting-e2e.sh). The same
 # image carries the general agent binary too (adam-agent, which serves any agent
@@ -268,7 +270,7 @@ jobs:
           docker tag coder:smoke adam-rs/coder:dev
           docker compose --profile app build git-server
           docker compose --profile app up -d --no-build --wait \
-            postgres mock-openai mock-github git-server coder agent
+            postgres mock-openai mock-github mock-github-mcp git-server coder agent
           NO_OPENCODE=1 sh dev/coder-e2e.sh
           sh dev/coder-e2e.sh
           # The coder edits the files itself (read_file, write_file), and OpenCode is not started.

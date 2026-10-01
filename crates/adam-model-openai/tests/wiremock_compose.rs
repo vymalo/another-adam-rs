@@ -353,11 +353,36 @@ async fn the_scripted_models_stream_what_they_complete() {
     grows(&greeting, 6, "the coder's greeting");
 
     let task = "In http://git-server:8080/local/sandbox.git (base branch main), add hello.txt containing hello.";
-    let with_opencode = play(&client, "mock-coder", "x", user(task)).await;
+    let mut history = user(task);
+    let with_opencode = play_on(&client, "mock-coder", "x", &mut history).await;
+    // The default script reads the repository's branches through the GitHub MCP server right after
+    // preparing the workspace (the mock of dev/coder-agent/mcp.json answers it).
+    let calls: Vec<(String, serde_json::Value)> = history
+        .iter()
+        .flat_map(|m| m.tool_calls().to_vec())
+        .map(|c| (c.name, c.arguments))
+        .collect();
+    let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "prepare_workspace",
+            "github__list_branches",
+            "delegate_to_opencode",
+            "run_checks",
+            "commit_and_push",
+            "open_pull_request"
+        ]
+    );
+    assert_eq!(
+        calls[1].1,
+        json!({"owner": "local", "repo": "sandbox"}),
+        "the branches of the repository the task names"
+    );
     assert_eq!(
         with_opencode.len(),
-        6,
-        "five calls, the last the pull request, then the answer"
+        7,
+        "six calls (the second reads the repository's branches over MCP, `github__list_branches`), the last the pull request, then the answer"
     );
     grows(&with_opencode, 6, "the coder's last answer");
     let without = play(

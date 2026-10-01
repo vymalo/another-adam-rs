@@ -39,6 +39,13 @@
 #     repository), `fib.sh` is on the branch, and the last `checks` artifact is bound to the pushed
 #     commit with the tree the checks ran on in the scratch project (the code that was checked is
 #     the code that was pushed).
+#   * the coder reads GitHub through the GitHub MCP server, here the mock of dev/coder-agent/mcp.json
+#     (mock-github-mcp). Its journal is not reset: the coder connects the server when it starts,
+#     before this script. So the journal holds at least one `initialize` and one `tools/list`, and
+#     the default scenario (OpenCode; its script reads the repository's branches with
+#     `github__list_branches` right after preparing the workspace) added exactly one `tools/call` of
+#     `list_branches` to it, with the bearer of the dev file, and the model was given its answer;
+#     every other scenario adds none.
 #   * the coder's GitHub credentials, as the stack was started with them (GITHUB_AUTH):
 #       token (default): every call the coder made to mock-github's `/repos/...` carried
 #         `Authorization: Bearer dev-github-token` (MOCK_GITHUB_TOKEN, the compose file's dummy);
@@ -53,6 +60,8 @@
 #   CODER_URL        http://127.0.0.1:${CODER_PORT:-8080}
 #   CODER_TOKEN      dev-token
 #   MOCK_GITHUB_URL  http://127.0.0.1:${MOCK_GITHUB_PORT:-8082}
+#   MOCK_GITHUB_MCP_URL  http://127.0.0.1:${MOCK_GITHUB_MCP_PORT:-8085}   (the mock's admin API; the endpoint is /mcp)
+#   MOCK_OPENAI_URL  http://127.0.0.1:${MOCK_OPENAI_PORT:-8081}   (its journal: the model was given the branches)
 #   GIT_SERVER_URL   http://127.0.0.1:${GIT_SERVER_PORT:-8083}   (from the host)
 #   TIMEOUT          300     seconds to wait for the task to end
 #   NO_OPENCODE      unset   1 = the [mock:no-opencode] script (no OpenCode)
@@ -73,6 +82,10 @@ coder=${coder%/}
 token=${CODER_TOKEN:-dev-token}
 github=${MOCK_GITHUB_URL:-http://127.0.0.1:${MOCK_GITHUB_PORT:-8082}}
 github=${github%/}
+github_mcp=${MOCK_GITHUB_MCP_URL:-http://127.0.0.1:${MOCK_GITHUB_MCP_PORT:-8085}}
+github_mcp=${github_mcp%/}
+openai=${MOCK_OPENAI_URL:-http://127.0.0.1:${MOCK_OPENAI_PORT:-8081}}
+openai=${openai%/}
 gitserver=${GIT_SERVER_URL:-http://127.0.0.1:${GIT_SERVER_PORT:-8083}}
 gitserver=${gitserver%/}
 timeout=${TIMEOUT:-300}
@@ -131,6 +144,29 @@ fi
 # --- reset the journal, then send the task ------------------------------------
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE "$github/__admin/requests" || true)
 if [ "$code" = 200 ]; then ok "mock-github journal reset"; else bad "mock-github journal reset: HTTP $code"; fi
+
+# mock-github-mcp's journal is kept (the coder connected the server at its start, and the stack's other
+# runs are in it): what this run added is the count now minus the count here.
+# mcp_count <JSON-RPC method> [tool name]: requests the mock saw with that method (and tool).
+mcp_count() {
+  patterns=$(jq -nc --arg m "$1" --arg t "${2:-}" '
+    [{matchesJsonPath: {expression: "$.method", equalTo: $m}}]
+    + (if $t == "" then [] else [{matchesJsonPath: {expression: "$.params.name", equalTo: $t}}] end)')
+  curl -s --max-time 30 -X POST "$github_mcp/__admin/requests/count" \
+    -H 'Content-Type: application/json' \
+    -d "{\"method\":\"POST\",\"urlPath\":\"/mcp\",\"bodyPatterns\":$patterns}" | jq -r '.count' 2>/dev/null || echo '?'
+}
+branches_before=$(mcp_count tools/call list_branches)
+calls_before=$(mcp_count tools/call)
+# model_saw_branches: requests the scripted model got whose history holds the answer of the
+# `github__list_branches` call (the tool message of call `coder-gh-1`, which names the branch main).
+model_saw_branches() {
+  curl -s --max-time 30 -X POST "$openai/__admin/requests/count" \
+    -H 'Content-Type: application/json' \
+    -d '{"method":"POST","urlPathPattern":"(/v1)?/chat/completions","bodyPatterns":[{"matchesJsonPath":{"expression":"$.messages[?(@.tool_call_id == '"'"'coder-gh-1'"'"')].content","contains":"main"}}]}' \
+    | jq -r '.count' 2>/dev/null || echo '?'
+}
+saw_before=$(model_saw_branches)
 
 # The message id names the task (same agent, no context: same id, same task), so
 # it must differ between runs, including two variants started in one second.
@@ -285,6 +321,39 @@ if printf '%s' "$checks_tree" | grep -Eq '^[0-9a-f]{40}$'; then ok "checks artif
 if [ -n "$branch" ] && [ -n "$commit" ]; then ok "branch artifact: $branch at $(printf '%s' "$commit" | cut -c1-10)"; else bad "no branch artifact (with a commit)"; fi
 if [ -n "$pr_url" ]; then ok "pull_request artifact: $pr_url"; else bad "no pull_request artifact (with a url)"; fi
 if [ -n "$branch" ] && [ "$pr_branch" = "$branch" ]; then ok "the pull request is for the pushed branch"; else bad "pull_request branch '$pr_branch' is not the pushed branch '$branch'"; fi
+
+# --- the GitHub MCP server (mock-github-mcp) ----------------------------------------------
+# The coder connected it when it started: `initialize`, then `tools/list`.
+inits=$(mcp_count initialize)
+lists=$(mcp_count tools/list)
+if [ "$inits" != '?' ] && [ "$inits" -ge 1 ]; then ok "mock-github-mcp saw initialize ($inits)"; else bad "mock-github-mcp saw $inits initialize, want at least 1 (is the stack started with the dev mcp.json mounted?)"; fi
+if [ "$lists" != '?' ] && [ "$lists" -ge 1 ]; then ok "mock-github-mcp saw tools/list ($lists)"; else bad "mock-github-mcp saw $lists tools/list, want at least 1"; fi
+branches_after=$(mcp_count tools/call list_branches)
+calls_after=$(mcp_count tools/call)
+if [ "$scenario" = default ] && [ "${NO_OPENCODE:-}" != 1 ]; then
+  # The default script reads the branches of the repository right after preparing the workspace.
+  if [ "$branches_before" != '?' ] && [ "$branches_after" != '?' ] && [ $((branches_after - branches_before)) -eq 1 ]; then
+    ok "mock-github-mcp saw exactly one tools/call of list_branches in this run"
+  else
+    bad "mock-github-mcp saw $branches_before then $branches_after tools/call of list_branches, want exactly one more"
+  fi
+  # The call carried the bearer of the dev mcp.json (GITHUB_MCP_TOKEN, or its default).
+  want_bearer="Bearer ${GITHUB_MCP_TOKEN:-dev-github-mcp-token}"
+  wrong=$(curl -s --max-time 30 -X POST "$github_mcp/__admin/requests/find" \
+    -H 'Content-Type: application/json' \
+    -d '{"method":"POST","urlPath":"/mcp"}' \
+    | jq -r --arg want "$want_bearer" '[.requests[] | .headers | with_entries(.key |= ascii_downcase) | select(.authorization != $want)] | length' 2>/dev/null || echo '?')
+  if [ "$wrong" = 0 ]; then ok "every request to mock-github-mcp carried '$want_bearer'"; else bad "$wrong request(s) to mock-github-mcp did not carry '$want_bearer'"; fi
+  # And the model was given what it answered: the branch main.
+  saw_after=$(model_saw_branches)
+  if [ "$saw_before" != '?' ] && [ "$saw_after" != '?' ] && [ "$saw_after" -gt "$saw_before" ]; then
+    ok "the model was given the answer of github__list_branches (the branch main)"
+  else
+    bad "the model was not given the answer of github__list_branches ($saw_before then $saw_after requests with it)"
+  fi
+else
+  if [ "$calls_before" != '?' ] && [ "$calls_after" = "$calls_before" ]; then ok "this scenario's script reads nothing over MCP: mock-github-mcp saw no tools/call"; else bad "mock-github-mcp saw tools/call go from $calls_before to $calls_after, want no change"; fi
+fi
 
 # --- mock-github's journal -------------------------------------------------------------
 found=$tmp/found.json
