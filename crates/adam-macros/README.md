@@ -22,4 +22,4 @@ Dependencies: `syn` 3, `quote`, `proc-macro2`. The UI tests (`trybuild`) live in
 
 ## Tests
 
-`cargo test -p adam-macros`: the unit tests of `expand.rs`.
+`cargo test -p adam-macros`: the unit tests of `expand.rs`, among them the expansion of `step`, `label` and `icon` (each alone and together, every kind and icon the contract has accepted and nothing else, the error that lists the words, an empty label, the options given once). The words are listed here (`STEP_KINDS`, `STEP_ICONS`) and in `adam-runtime`; `crates/adam/tests/tool_macro.rs` checks that they are the same.

@@ -20,17 +20,30 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::{StreamExt, future};
 
+use crate::activation::{self, HEADER};
 use crate::auth::CALLER_HEADER;
 use crate::backend::{BackendError, Caller, DynTaskBackend, TaskEvent};
 
 /// Serves the A2A 1.0 JSON-RPC methods on top of a [`TaskBackend`](crate::TaskBackend).
 pub(crate) struct BackendHandler {
     backend: DynTaskBackend,
+    /// The URIs the card declares: what a request may activate.
+    declared: Vec<String>,
 }
 
 impl BackendHandler {
-    pub(crate) fn new(backend: DynTaskBackend) -> Arc<Self> {
-        Arc::new(Self { backend })
+    pub(crate) fn new(backend: DynTaskBackend, declared: Vec<String>) -> Arc<Self> {
+        Arc::new(Self { backend, declared })
+    }
+
+    /// The caller of this request: who the auth middleware vouched for, with the extensions the
+    /// request activated (`message` is the extensions a message it sends names).
+    fn caller(&self, params: &ServiceParams, message: &[String]) -> Result<Caller, A2AError> {
+        let caller = caller(params)?;
+        let header = params.get(HEADER).into_iter().flatten().map(String::as_str);
+        let extensions =
+            activation::activated(&self.declared, header, message.iter().map(String::as_str));
+        Ok(caller.with_extensions(extensions))
     }
 }
 
@@ -90,6 +103,11 @@ fn a2a_stream(
     }))
 }
 
+/// The extensions the message of a send request names.
+fn message_extensions(request: &SendMessageRequest) -> &[String] {
+    request.message.extensions.as_deref().unwrap_or_default()
+}
+
 /// A message must say something, and only users send messages to agents.
 fn validate(request: &SendMessageRequest) -> Result<(), A2AError> {
     if request.message.parts.is_empty() {
@@ -122,7 +140,7 @@ impl RequestHandler for BackendHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
-        let caller = caller(params)?;
+        let caller = self.caller(params, message_extensions(&req))?;
         let config = req.configuration.clone();
         let history_length = config.as_ref().and_then(|c| c.history_length);
         let return_immediately = config
@@ -161,7 +179,7 @@ impl RequestHandler for BackendHandler {
         params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let caller = caller(params)?;
+        let caller = self.caller(params, message_extensions(&req))?;
         let task = self.submit(caller.clone(), req).await?;
         // The subscription opens with an atomic snapshot, so events between
         // `submit` returning and this call are folded into it, never lost.
@@ -174,7 +192,7 @@ impl RequestHandler for BackendHandler {
         params: &ServiceParams,
         req: GetTaskRequest,
     ) -> Result<Task, A2AError> {
-        let caller = caller(params)?;
+        let caller = self.caller(params, &[])?;
         let task = self
             .backend
             .get(&caller, &req.id)
@@ -200,7 +218,7 @@ impl RequestHandler for BackendHandler {
         params: &ServiceParams,
         req: CancelTaskRequest,
     ) -> Result<Task, A2AError> {
-        let caller = caller(params)?;
+        let caller = self.caller(params, &[])?;
         Ok(self.backend.cancel(&caller, &req.id).await?)
     }
 
@@ -210,7 +228,7 @@ impl RequestHandler for BackendHandler {
         params: &ServiceParams,
         req: SubscribeToTaskRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
-        let caller = caller(params)?;
+        let caller = self.caller(params, &[])?;
         // Resolve existence and terminality up front so the client gets a
         // proper JSON-RPC error instead of an error frame inside a 200 stream.
         let task = self

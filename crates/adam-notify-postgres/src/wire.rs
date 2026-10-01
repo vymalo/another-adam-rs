@@ -139,6 +139,10 @@ pub(crate) fn encode_signal(signal: &Signal) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use adam_core::RunStatus;
+    use adam_runtime::{
+        MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, StepEvent, StepIcon,
+        StepKind, StepState,
+    };
     use serde_json::json;
 
     use super::*;
@@ -168,6 +172,10 @@ mod tests {
                 mime_type: None,
                 data: json!("x"),
             },
+            RunEvent::Step(
+                StepEvent::new("tool:c1", StepKind::Tool, "run_checks", StepState::Running)
+                    .with_detail("running checks"),
+            ),
         ];
         for event in events {
             let Encoded::Fits(json) = encode_event(origin, run, "agent", &event) else {
@@ -181,6 +189,32 @@ mod tests {
             );
             assert_eq!(back.event, event);
         }
+    }
+
+    /// A step is bounded by its constructors (an id, a label, a detail), so the largest one a tool can make
+    /// crosses the channel whole, even in the characters that take four bytes.
+    #[test]
+    fn the_largest_step_event_fits_a_payload() {
+        let step = StepEvent::new(
+            "i".repeat(MAX_STEP_ID_BYTES),
+            StepKind::Subagent,
+            "🙂".repeat(MAX_STEP_LABEL_CHARS),
+            StepState::Failed,
+        )
+        .under("p".repeat(MAX_STEP_ID_BYTES))
+        .with_icon(StepIcon::Execute)
+        .with_detail("🙂".repeat(MAX_STEP_DETAIL_CHARS));
+        // Four bytes a character, escaped as nothing (JSON keeps them): about 5 KiB.
+        let Encoded::Fits(json) = encode_event(
+            Uuid::new_v4(),
+            RunId::new(),
+            &"a".repeat(64),
+            &RunEvent::Step(step.clone()),
+        ) else {
+            panic!("the largest step fits");
+        };
+        assert!(json.len() < MAX_PAYLOAD_BYTES, "{} bytes", json.len());
+        assert_eq!(decode(&json).event, RunEvent::Step(step));
     }
 
     #[test]

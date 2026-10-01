@@ -21,9 +21,10 @@ instructions + a model + a toolset. It is served over A2A by
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
-| `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) |
+| `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "OpenCode", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) |
 | `ToolOutput` | `text`, `error`, `with_artifact` |
-| `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `emit_progress`, `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), and for tests `detached(..).with_state(..).with_context(..)` |
+| `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
+| `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `step_id()` (`tool:<call id>`), `report_step(StepEvent)` (a step that runs under this call's), `emit_progress` (an update of the call's own step, the text in its detail), `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), and for tests `detached(..).with_state(..).with_context(..)` |
 | `ToolError` | `Transient`, `Permanent`, `NeedsInput { question, ui }` (parks the run; A2A reports `input-required`; `ui` is an interface that comes with the question; build one with `ToolError::needs_input(q)` or `needs_input_with_ui(q, ui)`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer); `#[non_exhaustive]`, see *Errors* |
 | `LlmAgentBuilder::state`, `try_build`, `tools` | `state(Arc<T>)` shares a value with the tools (one per type); `try_build() -> Result<LlmAgent, BuildError>` fails on a tool whose `required_state` was not given (`BuildError::MissingState`) or on two tools with one name (`BuildError::DuplicateTool`); `tools(ToolSet)` registers a group. `build()` is unchanged (last duplicate wins, no state check) |
 | `State<T>`, `StateKey`, `Extensions` | a cheap `Arc` handle that derefs to `T`; the key of a state type; the typed map behind them |
@@ -174,6 +175,40 @@ stateDiagram-v2
     Absent --> [*]
 ```
 
+## Steps
+
+Every tool call is a **step** ([`RunEvent::Step`](../adam-runtime/README.md#steps), the vocabulary of the orchestration
+layer's `steps/v1`; [ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md)). The agent reports the
+step `tool:<call id>` as `running` before the tool runs and, after it, `completed` (a result), `failed` (an error
+result, a `Permanent` error, an unknown tool, or a `Transient` failure the run retries) or `waiting` (the tool asked
+the person with `NeedsInput`, or the run parked on a child run or a remote task); a `waiting` step ends when the
+answer, the child's outcome or the remote task's result arrives (`completed`, or `failed` for an error result). The
+agent never puts a tool's output in the step: a step is shown to the person, and a result is for the model.
+
+A tool chooses how its call is drawn with `Tool::step_style` (`StepStyle { kind, label, icon }`; the default is kind
+`tool`, the tool's name as the label, no icon) and says more while it runs:
+
+```rust
+#[tool(step = "subagent", label = "OpenCode", icon = "agent")]      // or `fn step_style` by hand
+async fn delegate(ctx: &ToolCtx, task: String) -> Result<String, ToolError> {
+    ctx.emit_progress("starting OpenCode").await;               // an update of the call's own step
+    ctx.report_step(
+        StepEvent::new(format!("acp:{}:1", ctx.call_id()), StepKind::Command, "npm test", StepState::Running)
+            .with_icon(StepIcon::Execute),                       // runs under the call's step
+    )
+    .await;
+    // ... and later the same id in `Failed`/`Completed`, with `.with_detail("1 failed")`
+    Ok("done".into())
+}
+```
+
+`report_step` puts the step under the call's own (`ToolCtx::step_id()`) unless it says `.under(id)` another step the
+call reported; ids must be unique within the run, so put the call id in them. A step the call leaves open when it
+returns is closed by whoever shows the tree. These replace the `Custom` events `tool_start` and `tool_end` and
+the `Progress` of `emit_progress` that earlier versions emitted (a breaking change of the events, ADR 0007):
+`tool_end`'s `ok` is `completed`, `error` and `transient_error` are `failed`, `needs_input` and `waiting` are `waiting`.
+`adam-a2a-runtime` serves steps to a client that activated `steps/v1` and as lines of text to one that did not.
+
 ## Child runs
 
 A tool that delegates returns `Err(ToolError::AwaitRun { run })` after starting the child:
@@ -190,8 +225,8 @@ and answers the call; if that message is lost, the timer wakes the parent and it
 child's `output.text` (or its output as JSON); a child that failed, was cancelled or was purged gives an error
 result (`the run failed: ..`) and the run goes on. The message is matched to the wait by the child's run id, so
 copies and strays are dropped; user messages that arrive meanwhile queue behind the result. Cancelling the parent
-does not cancel the child. Events: `awaiting_run` and `tool_end` with status `waiting`, then the final `tool_end`
-(`ok` or `error`). The design and the failure interleavings are in
+does not cancel the child. Events: `awaiting_run`, the call's step `waiting`, then the step's end
+(`completed` or `failed`). The design and the failure interleavings are in
 [`docs/architecture.md`](../../docs/architecture.md#child-runs).
 
 The tool needs no `Runtime` of its own: `ToolCtx::start_child(agent, message)` starts the child on the runtime
@@ -229,7 +264,7 @@ step named `poll:<call id>`: a replay sees the recorded answer and never asks th
 wait is older (by the journaled clock) and the tool is not asked again. `task` is stored in the run's state:
 put no secret in it. The tool is looked up by the name in the wait, so a definition that lost the tool answers
 the call with an error result. A user message that arrives meanwhile wakes the run for one look and queues
-behind the result. Events: `awaiting_remote` and `tool_end` with status `waiting`, then the final `tool_end`.
+behind the result. Events: `awaiting_remote`, the call's step `waiting`, then the step's end (`completed` or `failed`).
 Cancelling the run does not cancel the remote task. This is what `adam-assembly`'s remote subagents do; the
 design is in [`docs/architecture.md`](../../docs/architecture.md#remote-tasks-the-same-wait-without-a-message).
 
@@ -305,7 +340,7 @@ through the starter).
 
 `tests/llm_agent.rs` is a behavioural suite over a scripted `MockModel` and
 `MemoryStore` (`a_starter_inits_exactly_like_the_agent`, tool loop, retries and rate limits, limits, replay after a
-crash, `NeedsInput` parking, cancellation, history truncation). Property tests
+crash, `NeedsInput` parking, cancellation, history truncation, and **steps**: a tool is a step in its own style and the steps it reports run under it, a plain tool is labelled with its name and an unknown one fails, a question keeps the step `waiting` until the answer ends it, a detached context reports to its sink). Property tests
 of the truncation are in `src/history.rs`; the journal record of a model
 failure is tested in `src/agent.rs`
 (`a_journaled_failure_keeps_the_class_the_hint_and_the_whole_chain`,

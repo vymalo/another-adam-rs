@@ -44,9 +44,22 @@ struct Options {
     classify: bool,
     asks_user: bool,
     krate: Option<Path>,
+    step: Option<LitStr>,
+    label: Option<LitStr>,
+    icon: Option<LitStr>,
 }
 
-const OPTIONS: &str = "name, type, strict, classify, asks_user, crate";
+const OPTIONS: &str = "name, type, strict, classify, asks_user, crate, step, label, icon";
+
+/// The kinds a step may have (`steps/v1`): `adam_runtime::StepKind`, whose variants these are the
+/// words of. The `adam` crate's tests check that the two lists are the same.
+const STEP_KINDS: &[&str] = &["subagent", "tool", "command", "message"];
+
+/// The icons a step may have (`steps/v1`): `adam_runtime::StepIcon`, in the same order.
+const STEP_ICONS: &[&str] = &[
+    "agent", "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "web", "git",
+    "test", "file", "tool",
+];
 
 impl Parse for Options {
     fn parse(input: ParseStream) -> Result<Self> {
@@ -66,6 +79,18 @@ impl Parse for Options {
                 "crate" => {
                     input.parse::<Token![=]>()?;
                     opts.krate.replace(Path::parse_mod_style(input)?).is_some()
+                }
+                "step" => {
+                    input.parse::<Token![=]>()?;
+                    opts.step.replace(input.parse()?).is_some()
+                }
+                "label" => {
+                    input.parse::<Token![=]>()?;
+                    opts.label.replace(input.parse()?).is_some()
+                }
+                "icon" => {
+                    input.parse::<Token![=]>()?;
+                    opts.icon.replace(input.parse()?).is_some()
                 }
                 "strict" => opts.strict.replace(key.span()).is_some(),
                 "classify" => std::mem::replace(&mut opts.classify, true),
@@ -117,6 +142,13 @@ impl Errors {
         }
     }
 
+    fn push_error(&mut self, e: Error) {
+        match &mut self.0 {
+            Some(all) => all.combine(e),
+            None => self.0 = Some(e),
+        }
+    }
+
     fn finish(self) -> Result<()> {
         self.0.map_or(Ok(()), Err)
     }
@@ -152,7 +184,44 @@ struct Analysis {
     strict: bool,
     classify: bool,
     asks_user: bool,
+    /// `step`, `label` and `icon`, checked: how a call is drawn as a step.
+    step_style: Option<StepStyle>,
     return_span: Span,
+}
+
+/// What `#[tool(step = .., label = .., icon = ..)]` says about how a call is drawn as a step.
+struct StepStyle {
+    /// The `StepKind` variant, `Tool` when only a label or an icon was given.
+    kind: Ident,
+    label: Option<LitStr>,
+    /// The `StepIcon` variant.
+    icon: Option<Ident>,
+}
+
+/// `word` of the closed list `known` as the `UpperCamelCase` name of its variant, or the error that
+/// lists the words there are.
+fn variant(option: &str, word: &LitStr, known: &[&str]) -> Result<Ident> {
+    let value = word.value();
+    if !known.contains(&value.as_str()) {
+        return Err(Error::new(
+            word.span(),
+            format!(
+                "unknown `{option}` `{value}` in `#[tool]`; expected one of: {}",
+                known.join(", ")
+            ),
+        ));
+    }
+    let mut name = String::new();
+    let mut upper = true;
+    for c in value.chars() {
+        if upper {
+            name.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            name.push(c);
+        }
+    }
+    Ok(Ident::new(&name, word.span()))
 }
 
 fn analyse(func: &ItemFn, opts: Options) -> Result<Analysis> {
@@ -241,6 +310,7 @@ fn analyse(func: &ItemFn, opts: Options) -> Result<Analysis> {
             "`strict` has no effect with `#[args]`; put `#[serde(deny_unknown_fields)]` on the struct",
         );
     }
+    let step_style = analyse_step_style(&opts, &mut errors);
     errors.finish()?;
 
     let return_span = match &sig.output {
@@ -258,7 +328,40 @@ fn analyse(func: &ItemFn, opts: Options) -> Result<Analysis> {
         strict: opts.strict.is_some(),
         classify: opts.classify,
         asks_user: opts.asks_user,
+        step_style,
         return_span,
+    })
+}
+
+/// The checked `step`, `label` and `icon` options; `None` when none was given. Every mistake is
+/// pushed on `errors`.
+fn analyse_step_style(opts: &Options, errors: &mut Errors) -> Option<StepStyle> {
+    if opts.step.is_none() && opts.label.is_none() && opts.icon.is_none() {
+        return None;
+    }
+    let mut kind = Ident::new("Tool", Span::call_site());
+    if let Some(word) = &opts.step {
+        match variant("step", word, STEP_KINDS) {
+            Ok(found) => kind = found,
+            Err(e) => errors.push_error(e),
+        }
+    }
+    let mut icon = None;
+    if let Some(word) = &opts.icon {
+        match variant("icon", word, STEP_ICONS) {
+            Ok(found) => icon = Some(found),
+            Err(e) => errors.push_error(e),
+        }
+    }
+    if let Some(label) = &opts.label
+        && label.value().trim().is_empty()
+    {
+        errors.push(label.span(), "`label` in `#[tool]` must not be empty");
+    }
+    Some(StepStyle {
+        kind,
+        label: opts.label.clone(),
+        icon,
     })
 }
 
@@ -602,6 +705,20 @@ impl Analysis {
             }
         });
 
+        let step_style = self.step_style.as_ref().map(|style| {
+            let kind = &style.kind;
+            let label = style.label.as_ref().map(|l| quote!(.with_label(#l)));
+            let icon = style
+                .icon
+                .as_ref()
+                .map(|i| quote!(.with_icon(#krate::StepIcon::#i)));
+            quote! {
+                fn step_style(&self) -> #krate::StepStyle {
+                    #krate::StepStyle::new(#krate::StepKind::#kind) #label #icon
+                }
+            }
+        });
+
         let asks_user = self.asks_user.then(|| {
             quote! {
                 fn asks_user(&self) -> bool {
@@ -673,6 +790,8 @@ impl Analysis {
                 #required_state
 
                 #asks_user
+
+                #step_style
 
                 async fn call(
                     &self,
@@ -1006,6 +1125,116 @@ mod tests {
     }
 
     #[test]
+    fn step_label_and_icon_say_how_a_call_is_drawn_as_a_step() {
+        let out = ok(
+            quote!(step = "subagent", label = "OpenCode", icon = "agent"),
+            quote! {
+                /// Hand the task to OpenCode.
+                async fn delegate(task: String) -> String { task }
+            },
+        );
+        has(
+            &out,
+            "fnstep_style(&self)->::adam::StepStyle{::adam::StepStyle::new(::adam::StepKind::Subagent).with_label(\"OpenCode\").with_icon(::adam::StepIcon::Agent)}",
+        );
+        // Each alone: a label makes a plain tool step, an icon too.
+        let out = ok(
+            quote!(label = "Search"),
+            quote! {
+                /// Look.
+                async fn look(q: String) -> String { q }
+            },
+        );
+        has(
+            &out,
+            "::adam::StepStyle::new(::adam::StepKind::Tool).with_label(\"Search\")}",
+        );
+        let out = ok(
+            quote!(icon = "web", crate = ::adam_llm_agent),
+            quote! {
+                /// Look.
+                async fn look(q: String) -> String { q }
+            },
+        );
+        has(
+            &out,
+            "::adam_llm_agent::StepStyle::new(::adam_llm_agent::StepKind::Tool).with_icon(::adam_llm_agent::StepIcon::Web)}",
+        );
+        // Without any of them the trait's default stands.
+        let out = ok(
+            quote!(),
+            quote! {
+                /// Look.
+                async fn look(q: String) -> String { q }
+            },
+        );
+        lacks(&out, "step_style");
+    }
+
+    #[test]
+    fn every_kind_and_icon_the_contract_has_is_accepted_and_nothing_else() {
+        for kind in STEP_KINDS {
+            let out = ok(
+                quote!(step = #kind),
+                quote! {
+                    /// D.
+                    async fn f() -> String { todo!() }
+                },
+            );
+            has(
+                &out,
+                &format!("StepKind::{}", kind[..1].to_uppercase() + &kind[1..]),
+            );
+        }
+        for icon in STEP_ICONS {
+            let out = ok(
+                quote!(icon = #icon),
+                quote! {
+                    /// D.
+                    async fn f() -> String { todo!() }
+                },
+            );
+            has(
+                &out,
+                &format!("StepIcon::{}", icon[..1].to_uppercase() + &icon[1..]),
+            );
+        }
+        let item = quote! {
+            /// D.
+            async fn f() -> String { todo!() }
+        };
+        let msg = err(quote!(step = "agent"), item.clone());
+        assert_eq!(
+            msg,
+            "unknown `step` `agent` in `#[tool]`; expected one of: subagent, tool, command, message"
+        );
+        let msg = err(quote!(icon = "rocket"), item.clone());
+        assert!(
+            msg.starts_with(
+                "unknown `icon` `rocket` in `#[tool]`; expected one of: agent, read, edit,"
+            ) && msg.ends_with("file, tool"),
+            "{msg}"
+        );
+        // The mistakes of both options are in one error, and so is an empty label.
+        let msg = err(quote!(step = "x", icon = "y", label = "  "), item.clone());
+        assert!(
+            msg.contains("unknown `step` `x`")
+                && msg.contains("unknown `icon` `y`")
+                && msg.contains("`label` in `#[tool]` must not be empty"),
+            "{msg}"
+        );
+        // A word is not a path, and the options are given once.
+        assert!(err(quote!(icon = agent), item.clone()).contains("expected string literal"));
+        for repeated in [
+            quote!(step = "tool", step = "tool"),
+            quote!(label = "a", label = "b"),
+            quote!(icon = "web", icon = "web"),
+        ] {
+            assert!(err(repeated, item.clone()).ends_with("is given twice in `#[tool]`"));
+        }
+    }
+
+    #[test]
     fn lint_attributes_stay_on_the_kept_parameter_only() {
         let out = ok(
             quote!(),
@@ -1309,7 +1538,7 @@ mod tests {
         );
         assert_eq!(
             msg,
-            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, crate"
+            "unknown `#[tool]` option `aproval`; expected one of: name, type, strict, classify, asks_user, crate, step, label, icon"
         );
         for repeated in [
             quote!(name = "a", name = "b"),

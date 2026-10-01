@@ -722,7 +722,8 @@ sequenceDiagram
     alt missing, wrong or duplicated credentials
         S-->>C: 401 + WWW-Authenticate: Bearer<br/>JSON-RPC error -32000
     end
-    S->>H: request + trusted Caller (token-N)
+    S->>H: request + trusted Caller (token-N) + A2A-Extensions header
+    H->>H: Caller.extensions = the named extensions the card declares
     H->>H: validate: parts not empty, role ROLE_USER
     H->>B: submit(caller, message, task_id, context_id)
     B->>B: default_inbound(message) gives an Inbound<br/>conversation = subject:context id
@@ -771,6 +772,11 @@ What the diagram cannot say:
 * **Ownership needs no side table.** The caller's subject is part of the run's
   conversation id (`subject:context id`), and that is durable. A task that
   belongs to someone else looks exactly like one that does not exist.
+* **A request names the extensions it wants; the card decides.** The `A2A-Extensions` header (and `message.extensions`
+  of a message) lists extension URIs. The handler hands the backend, in `Caller::extensions`, only the ones the card
+  declares (each once, in the order named), and echoes them in the response's `A2A-Extensions` header. An extension is
+  therefore optional on both sides: an agent behaves as plain A2A for a client that names none, and a client cannot
+  switch on what the card never declared ([ADR 0008 of the orchestration layer](https://github.com/vymalo/another-agentic-system/blob/main/docs/decisions/0008-platform-integration-via-a2a-extension.md)).
 * **Follow-ups.** A message that carries a `taskId` is delivered to the run
   with `Runtime::deliver`, and only while the task is `input-required`. Any
   other state gives `-32602`. A message with a `contextId` and no `taskId`
@@ -906,14 +912,16 @@ sequenceDiagram
         X-->>A: the recorded outcome
         A->>K: emit Custom agent_text
         loop each tool call of the turn
+            A->>K: emit Step tool:call id running
             A->>X: step("tool:call id", run the tool)
             X->>DB: journal_get(run, seq)
             opt not recorded
                 X->>L: call(ctx, args)
                 L->>E: git, OpenCode over ACP, shell checks, pull request
-                L->>K: emit Progress and Artifact events
+                L->>K: emit Step updates (emit_progress, report_step) and Artifact events
                 X->>DB: journal_put(run, entry)
             end
+            A->>K: emit Step tool:call id completed, failed or waiting
         end
         A-->>T: Transition (Continue, Park, Done, Fail) or AgentError
         T->>DB: commit_run(run, version, update), compare-and-swap
@@ -1057,6 +1065,50 @@ connection was down. In the runtime (`crates/adam-runtime/src/worker.rs`) it mak
 the worker poll at once and re-read every run it is stepping, firing the cancel
 token of those that finished. `LISTEN` is active before the `Resync` is sent, so
 what happens after the catch-up is heard.
+
+### Steps: what a run's work looks like to a client
+
+A tool call, the work it hands to another agent and the commands that agent runs are **steps**: `RunEvent::Step`
+([ADR 0007](decisions/0007-progress-as-steps-and-streamed-text.md)). The agent reports `tool:<call id>` before and after
+every call, in the style of `Tool::step_style`; a tool says more with `ToolCtx::emit_progress` and
+`ToolCtx::report_step`, whose steps run under the call's. The subscription of a client that **activated `steps/v1`**
+(the request named the extension and the card declares it, so `Caller::extensions` has it) turns each into a
+`working` status whose message carries the report in its metadata; any other client reads the same step as a line of
+text.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as A2A server
+    participant B as Subscription
+    participant K as BroadcastSink
+    participant A as LlmAgent
+    C->>S: SendStreamingMessage, A2A-Extensions: steps/v1
+    S->>S: Caller.extensions = named and declared by the card
+    S->>B: subscribe(caller, task)
+    S-->>C: header A2A-Extensions: steps/v1
+    A->>K: Step tool:c1 running
+    K-->>B: RunEvent::Step
+    alt the caller activated steps/v1
+        B->>B: admit: the first report of a state, a change of state, or an end
+        B-->>C: working, one text part + the report in metadata
+    else it did not
+        B-->>C: working, one line of text
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Reported: the first report of a state of a step goes out
+    Reported --> Held: the same state again within a second (only for an activated client)
+    Held --> Reported: a second has passed
+    Reported --> Reported: a change of state goes out at once
+    Reported --> [*]: an end goes out, and the step is forgotten
+```
+
+The events are live, as every event is: a subscription attached after they were emitted, or in another process with
+no event sink, sees only the durable record of the task. What is durable about steps is what the orchestration layer
+logs of them (it keeps a start, a few updates and an end per step).
 
 ## The run lifecycle
 

@@ -12,7 +12,7 @@ use adam_model::{
 };
 use adam_runtime::{
     Agent, AgentError, AgentStarter, ChildStatus, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent,
-    Transition,
+    StepState, Transition,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -26,7 +26,7 @@ use crate::conversation::{
 use crate::history::fit_history;
 use crate::source::{DynToolSource, SourceCtx, ToolSource, offered};
 use crate::state::Extensions;
-use crate::tool::{DynTool, RemotePoll, Tool, ToolCtx, ToolError, ToolOutput};
+use crate::tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use crate::toolset::ToolSet;
 
 /// Bounds on one run. When a limit trips the run fails with a message naming
@@ -324,17 +324,25 @@ impl LlmAgentBuilder {
 ///
 /// All best effort, through `Ctx::emit`:
 /// * `Custom { kind: "agent_text", payload: {text, turn} }` for each model turn with text;
-/// * `Custom { kind: "tool_start", payload: {name, call_id, status: "running"} }` and
-///   `Custom { kind: "tool_end", payload: {name, call_id, status} }` where `status` is
-///   `ok`, `error`, `needs_input` or `transient_error`;
-/// * `Progress` from [`ToolCtx::emit_progress`];
+/// * `Step` for each tool call: a [`StepEvent`](adam_runtime::StepEvent) with the id `tool:<call id>`, the
+///   kind, label and icon of [`Tool::step_style`] (the tool's name by default), `running` before
+///   the tool runs and, after it, `completed` (a result), `failed` (an error result, or a failure
+///   the run retries), or `waiting` (the tool asked the person a question, or the run parked on a
+///   child run or a remote task: the end comes when the answer does);
+/// * `Step` again from [`ToolCtx::emit_progress`] (an update of the call's own step, the text in its
+///   detail) and from [`ToolCtx::report_step`] (steps that run under the call's: a command, a tool
+///   of the agent the call drives);
 /// * `Artifact` for each artifact a tool returns (also durable);
 /// * `Custom { kind: "input_required", payload: {question, call_id} }` before parking;
 /// * `Custom { kind: "awaiting_run", payload: {call_id, run} }` before parking on a child run,
-///   followed by a `tool_end` with status `waiting` (not final), and later by the final
-///   `tool_end` with `ok` or `error` when the child's outcome becomes the result;
+///   followed by the call's step `waiting` (not final), and later by the final `completed` or
+///   `failed` when the child's outcome becomes the result;
 /// * `Custom { kind: "awaiting_remote", payload: {call_id, task} }` before parking on a remote
-///   task, with the same `tool_end` sequence.
+///   task, with the same step sequence.
+///
+/// `Step` replaces the `Custom` events `tool_start` and `tool_end` that earlier versions emitted
+/// (`tool_end`'s `status` words: `ok` is `completed`, `error` and `transient_error` are `failed`,
+/// `needs_input` and `waiting` are `waiting`), and `Progress` from `emit_progress`.
 ///
 /// # Child runs
 ///
@@ -518,17 +526,13 @@ impl LlmAgent {
             .unwrap_or(DateTime::<Utc>::MAX_UTC))
     }
 
-    /// The child's outcome as the result of the call that waited for it. Returns the status word
-    /// the `tool_end` event carries.
-    fn answer_run(
-        state: &mut Conversation,
-        wait: &PendingRun,
-        child: &ChildStatus,
-    ) -> &'static str {
+    /// The child's outcome as the result of the call that waited for it. Returns the state the end of
+    /// the call's step carries.
+    fn answer_run(state: &mut Conversation, wait: &PendingRun, child: &ChildStatus) -> StepState {
         let (message, status) = match (&child.status, &child.error) {
             (RunStatus::Done, _) => (
                 Message::tool_result(wait.call_id.clone(), render_output(child.output.as_ref())),
-                "ok",
+                StepState::Completed,
             ),
             (_, error) => (
                 Message::tool_error(
@@ -538,7 +542,7 @@ impl LlmAgent {
                         error.as_deref().unwrap_or("no reason given")
                     ),
                 ),
-                "error",
+                StepState::Failed,
             ),
         };
         state.messages.push(message);
@@ -718,12 +722,14 @@ impl LlmAgent {
                             payload: json!({ "call_id": call.id, "run": run }),
                         })
                         .await;
-                        ctx.emit(tool_end(&call.name, &call.id, "waiting")).await;
+                        ctx.emit(self.step_event(&call.name, &call.id, StepState::Waiting))
+                            .await;
                         state.pending_wait = Some(PendingWait::Run(wait));
                         return Ok(Flow::Wait);
                     };
-                    let status = Self::answer_run(state, &wait, child);
-                    ctx.emit(tool_end(&call.name, &call.id, status)).await;
+                    let outcome = Self::answer_run(state, &wait, child);
+                    ctx.emit(self.step_event(&call.name, &call.id, outcome))
+                        .await;
                     continue;
                 }
                 ToolResult::AwaitRemote { task, timeout_ms } => {
@@ -738,7 +744,8 @@ impl LlmAgent {
                         payload: json!({ "call_id": call.id, "task": task }),
                     })
                     .await;
-                    ctx.emit(tool_end(&call.name, &call.id, "waiting")).await;
+                    ctx.emit(self.step_event(&call.name, &call.id, StepState::Waiting))
+                        .await;
                     state.pending_wait = Some(PendingWait::Remote(PendingRemote {
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
@@ -762,12 +769,8 @@ impl LlmAgent {
         context: &Map<String, Value>,
         call: &ToolCall,
     ) -> Result<ToolResult, AgentError> {
-        let start = |status: &'static str| RunEvent::Custom {
-            kind: "tool_start".into(),
-            payload: json!({ "name": call.name, "call_id": call.id, "status": status }),
-        };
-        let end = |status: &'static str| tool_end(&call.name, &call.id, status);
-        ctx.emit(start("running")).await;
+        let end = |state: StepState| self.step_event(&call.name, &call.id, state);
+        ctx.emit(end(StepState::Running)).await;
 
         let tool_ctx = self.tool_ctx(ctx, context, &call.id, &call.name);
         let args = call.arguments.clone();
@@ -781,7 +784,7 @@ impl LlmAgent {
             // A name that is none of the agent's own: an agent with no source says so at once,
             // one with sources asks them, inside the step that records the answer.
             None if self.sources.is_empty() => {
-                ctx.emit(end("error")).await;
+                ctx.emit(end(StepState::Failed)).await;
                 return Ok(ToolResult::Answered {
                     message: Message::tool_error(call.id.clone(), self.unknown_tool(&call.name)),
                     artifacts: Vec::new(),
@@ -805,29 +808,29 @@ impl LlmAgent {
 
         match outcome {
             Ok(output) => {
-                let (message, artifacts, status) = output_message(ctx, &call.id, output).await;
-                ctx.emit(end(status)).await;
+                let (message, artifacts, outcome) = output_message(ctx, &call.id, output).await;
+                ctx.emit(end(outcome)).await;
                 Ok(ToolResult::Answered { message, artifacts })
             }
             Err(ToolError::Permanent(reason)) => {
-                ctx.emit(end("error")).await;
+                ctx.emit(end(StepState::Failed)).await;
                 Ok(ToolResult::Answered {
                     message: Message::tool_error(call.id.clone(), reason),
                     artifacts: Vec::new(),
                 })
             }
             Err(ToolError::Transient(reason)) => {
-                ctx.emit(end("transient_error")).await;
+                ctx.emit(end(StepState::Failed)).await;
                 Err(AgentError::transient(format!(
                     "tool `{}` failed: {reason}",
                     call.name
                 )))
             }
             Err(ToolError::NeedsInput { question, ui }) => {
-                ctx.emit(end("needs_input")).await;
+                ctx.emit(end(StepState::Waiting)).await;
                 Ok(ToolResult::NeedsInput { question, ui })
             }
-            // No end event yet: `run_pending` says "waiting", or the final status when the
+            // No end event yet: `run_pending` says "waiting", or the final state when the
             // child's message is already here.
             Err(ToolError::AwaitRun { run }) => Ok(ToolResult::AwaitRun(run)),
             Err(ToolError::AwaitRemote { task, timeout_ms }) => {
@@ -855,7 +858,19 @@ impl LlmAgent {
             Arc::clone(&self.extensions),
             Some(ctx.child_starter()),
             Arc::new(context.clone()),
+            self.style_of(tool).event(tool, call_id, StepState::Running),
         )
+    }
+
+    /// How a call of the tool `name` is drawn as a step: the tool's own [`Tool::step_style`], or the
+    /// default for a name that is none of the agent's own tools (a source's tool, one nobody has).
+    fn style_of(&self, name: &str) -> StepStyle {
+        self.tool(name).map(|t| t.step_style()).unwrap_or_default()
+    }
+
+    /// The report that the call `call_id` of the tool `tool` is in `state`.
+    fn step_event(&self, tool: &str, call_id: &str, state: StepState) -> RunEvent {
+        RunEvent::Step(self.style_of(tool).event(tool, call_id, state))
     }
 
     /// What the model is told when it calls a tool nobody has.
@@ -872,8 +887,8 @@ impl LlmAgent {
     }
 
     /// Where the remote task a run waits for stands. `Ok(None)`: still going, park again.
-    /// `Ok(Some(status))`: the call is answered (the result is in the state) and `status` is the
-    /// word the final `tool_end` carries.
+    /// `Ok(Some(outcome))`: the call is answered (the result is in the state) and `outcome` is the
+    /// state the end of the call's step carries.
     ///
     /// The look is one journaled step (`poll:<call id>`), so a replay of this transition sees what
     /// the first run saw. When the wait has a deadline the clock is read through the journal too
@@ -883,7 +898,7 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         wait: &PendingRemote,
-    ) -> Result<Option<&'static str>, AgentError> {
+    ) -> Result<Option<StepState>, AgentError> {
         let owed = |state: &mut Conversation, message: Message| {
             state.messages.push(message);
             if state
@@ -906,7 +921,7 @@ impl LlmAgent {
                      running there, and its result is lost to this call",
                 ),
             );
-            return Ok(Some("error"));
+            return Ok(Some(StepState::Failed));
         }
         let Some(tool) = self.tool(&wait.tool).cloned() else {
             owed(
@@ -916,7 +931,7 @@ impl LlmAgent {
                     format!("the tool `{}` that started this task is gone", wait.tool),
                 ),
             );
-            return Ok(Some("error"));
+            return Ok(Some(StepState::Failed));
         };
         let tool_ctx = self.tool_ctx(ctx, &state.context, &wait.call_id, &wait.tool);
         let task = wait.task.clone();
@@ -928,10 +943,11 @@ impl LlmAgent {
         match polled {
             Ok(RemotePoll::Working) => Ok(None),
             Ok(RemotePoll::Ready(output)) => {
-                let (message, artifacts, status) = output_message(ctx, &wait.call_id, output).await;
+                let (message, artifacts, outcome) =
+                    output_message(ctx, &wait.call_id, output).await;
                 state.artifacts.extend(artifacts);
                 owed(state, message);
-                Ok(Some(status))
+                Ok(Some(outcome))
             }
             Err(ToolError::Transient(reason)) => Err(AgentError::transient(format!(
                 "tool `{}` failed while polling its remote task: {reason}",
@@ -939,7 +955,7 @@ impl LlmAgent {
             ))),
             Err(ToolError::Permanent(reason)) => {
                 owed(state, Message::tool_error(wait.call_id.clone(), reason));
-                Ok(Some("error"))
+                Ok(Some(StepState::Failed))
             }
             Err(other) => {
                 owed(
@@ -949,21 +965,25 @@ impl LlmAgent {
                         format!("polling the remote task went wrong: {other}"),
                     ),
                 );
-                Ok(Some("error"))
+                Ok(Some(StepState::Failed))
             }
         }
     }
 }
 
 /// A tool's output as the message that answers `call_id`, with the references to its artifacts and
-/// the status word for the `tool_end` event. The artifacts are emitted here (and recorded with the
+/// the state the end of the call's step carries. The artifacts are emitted here (and recorded with the
 /// transition's commit).
 async fn output_message(
     ctx: &Ctx,
     call_id: &str,
     output: ToolOutput,
-) -> (Message, Vec<ArtifactRef>, &'static str) {
-    let status = if output.is_error { "error" } else { "ok" };
+) -> (Message, Vec<ArtifactRef>, StepState) {
+    let outcome = if output.is_error {
+        StepState::Failed
+    } else {
+        StepState::Completed
+    };
     let refs: Vec<ArtifactRef> = output
         .artifacts
         .iter()
@@ -980,7 +1000,7 @@ async fn output_message(
         content: output.content,
         is_error: output.is_error,
     };
-    (message, refs, status)
+    (message, refs, outcome)
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -1079,13 +1099,6 @@ enum ToolResult {
     },
 }
 
-fn tool_end(name: &str, call_id: &str, status: &'static str) -> RunEvent {
-    RunEvent::Custom {
-        kind: "tool_end".into(),
-        payload: json!({ "name": name, "call_id": call_id, "status": status }),
-    }
-}
-
 /// A child's output as the text of the tool result. An `LlmAgent` child finishes with
 /// `{"text": ..., "artifacts": [...]}` and the parent's model gets the text (the same reading the
 /// A2A adapter has of an output); another string is passed as it is, and anything else as JSON.
@@ -1154,12 +1167,23 @@ impl Agent for LlmAgent {
                 notice
             })
             .collect();
+        let asked = match &state.pending_wait {
+            Some(PendingWait::Question(q)) => Some((q.tool.clone(), q.call_id.clone())),
+            _ => None,
+        };
         if !self.absorb_inbox(&mut state, inbox) {
             // Woken without an answer (nothing usable arrived): keep waiting.
             return Ok(Transition::Park {
                 state,
                 wake_at: None,
             });
+        }
+        // The person answered: the step of the call that asked, which has been `waiting` since, ends.
+        if let Some((tool, call_id)) = asked
+            && state.pending_wait.is_none()
+        {
+            ctx.emit(self.step_event(&tool, &call_id, StepState::Completed))
+                .await;
         }
         // A credential in the context does not outlive its expiry in the store.
         let expired = state.drop_expired_context(ctx.now());
@@ -1174,8 +1198,9 @@ impl Agent for LlmAgent {
         if let Some(PendingWait::Run(wait)) = state.pending_wait.clone() {
             match Self::settle(ctx, &wait, &notices).await? {
                 Some(child) => {
-                    let status = Self::answer_run(&mut state, &wait, &child);
-                    ctx.emit(tool_end(&wait.tool, &wait.call_id, status)).await;
+                    let outcome = Self::answer_run(&mut state, &wait, &child);
+                    ctx.emit(self.step_event(&wait.tool, &wait.call_id, outcome))
+                        .await;
                 }
                 None => {
                     let wake_at = Some(self.next_poll(ctx));
@@ -1189,8 +1214,9 @@ impl Agent for LlmAgent {
         // answers the call or parks again.
         if let Some(PendingWait::Remote(wait)) = state.pending_wait.clone() {
             match self.poll_remote(ctx, &mut state, &wait).await? {
-                Some(status) => {
-                    ctx.emit(tool_end(&wait.tool, &wait.call_id, status)).await;
+                Some(outcome) => {
+                    ctx.emit(self.step_event(&wait.tool, &wait.call_id, outcome))
+                        .await;
                 }
                 None => {
                     let wake_at = Some(self.next_poll(ctx));

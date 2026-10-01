@@ -22,7 +22,7 @@ use adam_model::{
 };
 use adam_runtime::{
     Clock, CollectingSink, Inbound, ManualClock, RUN_FINISHED_KIND, RetryPolicy, RunEvent, RunView,
-    Runtime, RuntimeBuilder, RuntimeError, child_run_id,
+    Runtime, RuntimeBuilder, RuntimeError, StepEvent, StepKind, StepState, child_run_id,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -404,11 +404,21 @@ fn custom(kind: &str, payload: Value) -> RunEvent {
     }
 }
 
+/// The report that the call `id` of the tool `sub` is in the state `status` names: `waiting`, `ok`
+/// (completed) or `error` (failed).
 fn tool_end(id: &str, status: &str) -> RunEvent {
-    custom(
-        "tool_end",
-        json!({"name": "sub", "call_id": id, "status": status}),
-    )
+    let state = match status {
+        "waiting" => StepState::Waiting,
+        "ok" => StepState::Completed,
+        "error" => StepState::Failed,
+        other => panic!("no such status {other}"),
+    };
+    RunEvent::Step(StepEvent::new(
+        format!("tool:{id}"),
+        StepKind::Tool,
+        "sub",
+        state,
+    ))
 }
 
 /// The tool results the parent's history holds, in order.

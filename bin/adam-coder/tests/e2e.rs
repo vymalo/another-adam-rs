@@ -296,14 +296,25 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
         "{:#?}",
         seen.messages
     );
+    // OpenCode's tool call is a child step, which a client that did not ask for steps reads as lines:
+    // its title when it starts, and how it ended.
     assert!(
-        seen.saw_message("opencode: edit: Write"),
-        "OpenCode's tool call is streamed as progress: {:#?}",
+        seen.messages
+            .iter()
+            .any(|m| m.starts_with("Write ") && m.ends_with("hello.txt")),
+        "OpenCode's tool call is streamed as a step: {:#?}",
         seen.messages
     );
     assert!(
-        seen.saw_message("opencode: tool call tc-1 completed"),
+        seen.messages
+            .iter()
+            .any(|m| m.starts_with("Write ") && m.ends_with("hello.txt: done")),
         "{:#?}",
+        seen.messages
+    );
+    assert!(
+        seen.saw_message("OpenCode: done"),
+        "the call's own step ends: {:#?}",
         seen.messages
     );
     assert!(
@@ -316,7 +327,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
     let opencode = seen
         .messages
         .iter()
-        .position(|m| m.contains("opencode:"))
+        .position(|m| m == "starting OpenCode")
         .unwrap();
     let checks = seen
         .messages
@@ -2084,7 +2095,7 @@ async fn opencode_crashing_every_time_fails_the_run_with_its_stderr(store: DynSt
     let transient = |seen: &Seen| {
         seen.messages
             .iter()
-            .filter(|m| m.contains("delegate_to_opencode") && m.contains("transient_error"))
+            .filter(|m| m.as_str() == "OpenCode: failed")
             .count()
     };
     assert_eq!(
@@ -2161,7 +2172,7 @@ async fn opencode_crashing_once_is_retried_and_completes(store: DynStore) {
     assert_eq!(
         seen.messages
             .iter()
-            .filter(|m| m.contains("delegate_to_opencode") && m.contains("transient_error"))
+            .filter(|m| m.as_str() == "OpenCode: failed")
             .count(),
         1,
         "the client sees the first attempt fail: {:#?}",

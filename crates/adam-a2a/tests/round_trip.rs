@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use a2a::{
@@ -16,8 +16,8 @@ use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::{A2AClient, A2AClientFactory, Transport};
 use adam_a2a::{
-    A2aServer, AgentCardConfig, AuthConfig, Caller, InMemoryBackend, InMemoryConfig, ServerOptions,
-    SkillConfig, TaskBackend,
+    A2aServer, AgentCardConfig, AuthConfig, BackendError, Caller, ExtensionConfig, InMemoryBackend,
+    InMemoryConfig, ServerOptions, SkillConfig, TaskBackend, TaskEvent,
 };
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -853,6 +853,307 @@ async fn tasks_are_private_to_their_caller_and_identity_cannot_be_forged() {
         owner.get_task(&get_request(&task.id)).await.unwrap().id,
         task.id
     );
+}
+
+// ------------------------------------------------------------ extensions
+
+const EXT_A: &str = "https://example.org/extensions/a/v1";
+const EXT_B: &str = "https://example.org/extensions/b/v1";
+const EXT_UNDECLARED: &str = "https://example.org/extensions/undeclared/v1";
+
+/// The reference backend, remembering the caller of every call it gets.
+#[derive(Clone)]
+struct Recording {
+    inner: InMemoryBackend,
+    seen: Arc<Mutex<Vec<(&'static str, Caller)>>>,
+}
+
+impl Recording {
+    fn note(&self, call: &'static str, caller: &Caller) {
+        self.seen.lock().unwrap().push((call, caller.clone()));
+    }
+
+    /// The extensions the caller of the last `call` carried.
+    fn last(&self, call: &str) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(c, _)| *c == call)
+            .unwrap_or_else(|| panic!("no {call} call was made"))
+            .1
+            .extensions
+            .clone()
+    }
+
+    fn subjects(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, c)| c.subject.clone())
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskBackend for Recording {
+    async fn submit(
+        &self,
+        caller: Caller,
+        message: Message,
+        task_id: Option<String>,
+        context_id: Option<String>,
+    ) -> Result<Task, BackendError> {
+        self.note("submit", &caller);
+        self.inner
+            .submit(caller, message, task_id, context_id)
+            .await
+    }
+
+    async fn get(&self, caller: &Caller, task_id: &str) -> Result<Option<Task>, BackendError> {
+        self.note("get", caller);
+        self.inner.get(caller, task_id).await
+    }
+
+    async fn cancel(&self, caller: &Caller, task_id: &str) -> Result<Task, BackendError> {
+        self.note("cancel", caller);
+        self.inner.cancel(caller, task_id).await
+    }
+
+    fn subscribe(
+        &self,
+        caller: &Caller,
+        task_id: &str,
+    ) -> BoxStream<'static, Result<TaskEvent, BackendError>> {
+        self.note("subscribe", caller);
+        self.inner.subscribe(caller, task_id)
+    }
+}
+
+/// A server whose card declares `declared` extensions, over a [`Recording`] backend.
+async fn start_declaring(declared: &[&str]) -> (SocketAddr, Recording) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut card = AgentCardConfig::new(
+        "echo-agent",
+        "Echoes messages",
+        format!("http://{addr}/").parse().unwrap(),
+        "0.1.0",
+    );
+    for uri in declared {
+        card = card.with_extension(ExtensionConfig::new(*uri));
+    }
+    let backend = Recording {
+        inner: InMemoryBackend::default(),
+        seen: Arc::default(),
+    };
+    let app = A2aServer::router(card, Arc::new(backend.clone()), TestServer::bearer());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, backend)
+}
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// `SendMessage` as a client that names `message_extensions` in the message sends it.
+fn send_naming(message_extensions: &[&str]) -> String {
+    rpc(
+        "SendMessage",
+        serde_json::json!({
+            "message": {
+                "messageId": "m-1", "role": "ROLE_USER", "parts": [{"text": "hello"}],
+                "extensions": message_extensions,
+            },
+            "configuration": {"returnImmediately": true}
+        }),
+    )
+}
+
+#[tokio::test]
+async fn a_request_activates_the_extensions_its_header_and_its_message_name_that_the_card_declares()
+{
+    let (addr, backend) = start_declaring(&[EXT_A, EXT_B]).await;
+    let auth = bearer(TOKEN);
+    let named = format!("{EXT_A}, {EXT_UNDECLARED}");
+    let response = raw(
+        addr,
+        "POST",
+        "/",
+        &[("Authorization", &auth), ("A2A-Extensions", &named)],
+        &send_naming(&[EXT_B, EXT_A]),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+
+    // The backend sees the declared ones, once each, in the order they were named (the header
+    // first); the one the card never declared is not switched on.
+    assert_eq!(backend.last("submit"), [EXT_A, EXT_B]);
+    // The response says which were activated.
+    assert!(
+        response
+            .headers
+            .contains(&format!("a2a-extensions: {EXT_A}, {EXT_B}").to_lowercase()),
+        "{}",
+        response.headers
+    );
+    // Who the caller is does not change.
+    assert_eq!(backend.subjects(), ["token-0"]);
+}
+
+#[tokio::test]
+async fn nothing_is_activated_unless_the_request_asks_and_the_card_declares() {
+    let (addr, backend) = start_declaring(&[EXT_A]).await;
+    let auth = bearer(TOKEN);
+
+    // Declared, but not asked for: no header, a message that names none.
+    let response = raw(
+        addr,
+        "POST",
+        "/",
+        &[("Authorization", &auth)],
+        &send_naming(&[]),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert!(backend.last("submit").is_empty());
+    assert!(
+        !response.headers.contains("a2a-extensions"),
+        "no echo for nothing: {}",
+        response.headers
+    );
+
+    // Asked for, but not declared (a near miss included): not activated, not echoed.
+    for named in [
+        EXT_UNDECLARED,
+        "https://example.org/extensions/a/v2",
+        "HTTPS://EXAMPLE.ORG/EXTENSIONS/A/V1",
+    ] {
+        let response = raw(
+            addr,
+            "POST",
+            "/",
+            &[("Authorization", &auth), ("A2A-Extensions", named)],
+            &send_naming(&[named]),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert!(backend.last("submit").is_empty(), "{named}");
+        assert!(!response.headers.contains("a2a-extensions"), "{named}");
+    }
+
+    // A card that declares nothing activates nothing, however much is asked.
+    let (addr, backend) = start_declaring(&[]).await;
+    let response = raw(
+        addr,
+        "POST",
+        "/",
+        &[("Authorization", &auth), ("A2A-Extensions", EXT_A)],
+        &send_naming(&[EXT_A]),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert!(backend.last("submit").is_empty());
+    assert!(!response.headers.contains("a2a-extensions"));
+}
+
+#[tokio::test]
+async fn a_resubscribe_a_poll_and_a_cancel_activate_for_themselves() {
+    let (addr, backend) = start_declaring(&[EXT_A]).await;
+    let auth = bearer(TOKEN);
+    // A task that stays working, so that it can be subscribed to.
+    let held = rpc(
+        "SendMessage",
+        serde_json::json!({
+            "message": {"messageId": "m-1", "role": "ROLE_USER", "parts": [{"text": "[hold]"}]},
+            "configuration": {"returnImmediately": true}
+        }),
+    );
+    let sent = raw(addr, "POST", "/", &[("Authorization", &auth)], &held).await;
+    let task: serde_json::Value = serde_json::from_str(&sent.body).unwrap();
+    let id = task["result"]["task"]["id"].as_str().unwrap().to_owned();
+    assert!(backend.last("submit").is_empty());
+
+    let headers = [("Authorization", auth.as_str()), ("A2A-Extensions", EXT_A)];
+    let polled = raw(
+        addr,
+        "POST",
+        "/",
+        &headers,
+        &rpc("GetTask", serde_json::json!({"id": id})),
+    )
+    .await;
+    assert_eq!(polled.status, 200);
+    assert_eq!(backend.last("get"), [EXT_A]);
+    assert!(
+        polled
+            .headers
+            .contains(&format!("a2a-extensions: {EXT_A}").to_lowercase())
+    );
+
+    // The same task, without the header: the backend gets a caller with none, and the task is the
+    // same task (ownership is the subject's).
+    let polled = raw(
+        addr,
+        "POST",
+        "/",
+        &[("Authorization", &auth)],
+        &rpc("GetTask", serde_json::json!({"id": id})),
+    )
+    .await;
+    let polled: serde_json::Value = serde_json::from_str(&polled.body).unwrap();
+    assert_eq!(polled["result"]["id"], id, "{polled}");
+    assert!(backend.last("get").is_empty());
+
+    // A resubscribe (the stream ends when the task is released) names it again.
+    let subscribe = {
+        let headers = headers.map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let body = rpc("SubscribeToTask", serde_json::json!({"id": id}));
+        tokio::spawn(async move {
+            let headers: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            raw(addr, "POST", "/", &headers, &body).await
+        })
+    };
+    for _ in 0..200 {
+        if backend
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(c, _)| *c == "subscribe")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(backend.last("subscribe"), [EXT_A]);
+
+    let canceled = raw(
+        addr,
+        "POST",
+        "/",
+        &headers,
+        &rpc("CancelTask", serde_json::json!({"id": id})),
+    )
+    .await;
+    assert_eq!(canceled.status, 200);
+    assert_eq!(backend.last("cancel"), [EXT_A]);
+    let ended = subscribe.await.unwrap();
+    assert_eq!(ended.status, 200);
+    assert!(
+        ended
+            .headers
+            .contains(&format!("a2a-extensions: {EXT_A}").to_lowercase())
+    );
+    // Every call was the same person's.
+    assert!(backend.subjects().iter().all(|s| s == "token-0"));
 }
 
 // ------------------------------------------------- keepalive & disconnects

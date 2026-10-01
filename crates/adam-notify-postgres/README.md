@@ -77,6 +77,8 @@ another `v`, or one that does not parse, is ignored (debug log).
 * a `Status` whose payload is too big keeps its status and loses the tail of its
   `detail`, cut at a character boundary as little as possible (the full failure
   text is in the run itself);
+* a `Step` is bounded by its constructors (an id of at most 128 bytes, a label of at most 200 characters, a detail of
+  at most 1000: about 5 KiB at four bytes a character, a unit test builds the largest), so it always fits;
 * any other oversize event (`Progress`, `Custom`, `Artifact`) is not sent to
   other processes (debug log). Artifacts still reach subscribers through the
   durable poll, which reads `RunView::artifacts`. **There is no new `RunEvent`

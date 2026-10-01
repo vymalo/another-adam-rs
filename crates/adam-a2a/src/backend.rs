@@ -12,32 +12,61 @@ use adam_error::{BoxError, Classify, ErrorClass, report};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-/// The authenticated principal on whose behalf a request runs.
+/// The authenticated principal on whose behalf a request runs, and the extensions the request
+/// activated.
 ///
-/// Built by the server's auth layer, never from client-supplied data.
-/// Backends use it to scope tasks to their owner.
+/// Built by the server's auth layer and the handler, never from client-supplied data about who
+/// the caller *is*. Backends use [`subject`](Self::subject) to scope tasks to their owner; ownership
+/// never looks at [`extensions`](Self::extensions), which describe the request and not the person.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Caller {
     /// A stable, non-secret identifier: `token-<index>` for the matched bearer
     /// token, or `"anonymous"` under [`AuthConfig::AllowAnonymous`](crate::AuthConfig).
     /// Never the token itself.
     pub subject: String,
+    /// The URIs of the extensions this request activated: the ones the client asked for (the
+    /// `A2A-Extensions` header, and `message.extensions` of a message it sends) **that the card
+    /// declares**, each once, in the order the client named them. A URI the client names and the
+    /// card does not declare is not here: a client cannot switch on behaviour the agent never
+    /// advertised. Empty for a caller built with [`Caller::new`] and for a request that named none.
+    ///
+    /// The request that is being served carries it: a backend that streams a task to a client
+    /// reads it from the caller of the `subscribe` call, which is the caller of that very
+    /// request (a resubscribe activates for itself).
+    pub extensions: Vec<String>,
 }
 
 impl Caller {
     /// The subject used when authentication is explicitly disabled.
     pub const ANONYMOUS: &'static str = "anonymous";
 
-    /// A caller with the given subject.
+    /// A caller with the given subject, and no extension activated.
     pub fn new(subject: impl Into<String>) -> Self {
         Self {
             subject: subject.into(),
+            extensions: Vec::new(),
         }
     }
 
     /// The anonymous caller (local development only).
     pub fn anonymous() -> Self {
         Self::new(Self::ANONYMOUS)
+    }
+
+    /// This caller with `extensions` activated (a test, or a backend that calls another).
+    #[must_use]
+    pub fn with_extensions<I, S>(mut self, extensions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extensions = extensions.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Whether the request activated the extension `uri`.
+    pub fn has_extension(&self, uri: &str) -> bool {
+        self.extensions.iter().any(|e| e == uri)
     }
 }
 

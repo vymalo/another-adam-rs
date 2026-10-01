@@ -1,4 +1,5 @@
 use adam::prelude::*;
+use adam::{StepIcon, StepKind};
 use adam::error::{Classify, ErrorClass};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -47,6 +48,12 @@ async fn asker() -> Result<&'static str, Nope> {
     Err(Nope)
 }
 
+/// Drawn as a sub-agent step.
+#[tool(step = "subagent", label = "OpenCode", icon = "agent")]
+async fn delegator() -> String {
+    String::new()
+}
+
 /// The context first, state absent, nothing else.
 #[tool]
 async fn context_only(_ctx: &ToolCtx) -> String {
@@ -59,5 +66,9 @@ fn main() {
     assert!(StrictOne.spec().parameters["properties"].get("type").is_some());
     assert!(StrictOne.spec().parameters["properties"].get("n").is_some());
     assert!(Asker.asks_user());
+    let style = Delegator.step_style();
+    assert_eq!(style.kind, StepKind::Subagent);
+    assert_eq!(style.label.as_deref(), Some("OpenCode"));
+    assert_eq!(style.icon, Some(StepIcon::Agent));
     let _ = tools![Searcher, StrictOne, Classified, ContextOnly, Asker];
 }

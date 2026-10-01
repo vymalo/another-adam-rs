@@ -87,6 +87,7 @@ mod events;
 mod notify;
 mod retry;
 mod runtime;
+mod step;
 mod worker;
 
 pub use adam_error::{Classify, ErrorClass};
@@ -102,3 +103,7 @@ pub use events::{
 pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};
+pub use step::{
+    MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, StepEvent, StepIcon, StepKind,
+    StepState,
+};

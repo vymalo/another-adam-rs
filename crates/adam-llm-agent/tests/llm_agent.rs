@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter, MAX_CARRIED_BYTES,
-    OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, TRUNCATION_MARKER_PREFIX, Tool, ToolCtx,
-    ToolError, ToolOutput, user_message,
+    OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepStyle, TRUNCATION_MARKER_PREFIX, Tool,
+    ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
     ContentPart, DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError,
@@ -19,7 +19,7 @@ use adam_model::{
 };
 use adam_runtime::{
     Agent, AgentStarter, CancelToken, Clock, CollectingSink, Inbound, ManualClock, RetryPolicy,
-    RunEvent, RunView, Runtime, RuntimeBuilder,
+    RunEvent, RunView, Runtime, RuntimeBuilder, StepEvent, StepIcon, StepKind, StepState,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -226,18 +226,31 @@ fn custom(kind: &str, payload: Value) -> RunEvent {
     }
 }
 
+/// The report that the call `id` of the tool `name` started.
 fn tool_start(name: &str, id: &str) -> RunEvent {
-    custom(
-        "tool_start",
-        json!({"name": name, "call_id": id, "status": "running"}),
-    )
+    step_of(name, id, StepState::Running)
 }
 
+/// The report that the call `id` of the tool `name` is in the state `status` names, in the words
+/// the events had before they were steps: `ok` (completed), `error` and `transient_error`
+/// (failed), `needs_input` and `waiting`.
 fn tool_end(name: &str, id: &str, status: &str) -> RunEvent {
-    custom(
-        "tool_end",
-        json!({"name": name, "call_id": id, "status": status}),
-    )
+    let state = match status {
+        "ok" => StepState::Completed,
+        "error" | "transient_error" => StepState::Failed,
+        "needs_input" | "waiting" => StepState::Waiting,
+        other => panic!("no such status {other}"),
+    };
+    step_of(name, id, state)
+}
+
+fn step_of(name: &str, id: &str, state: StepState) -> RunEvent {
+    RunEvent::Step(StepEvent::new(
+        format!("tool:{id}"),
+        StepKind::Tool,
+        name,
+        state,
+    ))
 }
 
 async fn notified(n: &Notify, what: &str) {
@@ -468,10 +481,11 @@ async fn unknown_tool_and_tool_errors_go_back_to_the_model() {
     assert_eq!(results[2], Message::tool_error("c3", "disk on fire"));
     assert_eq!(view.output.expect("output")["text"], "I see the errors");
 
+    // The call's step, after it started: all three ended in failure.
     let ends: Vec<RunEvent> = h
         .events(run)
         .into_iter()
-        .filter(|e| matches!(e, RunEvent::Custom { kind, .. } if kind == "tool_end"))
+        .filter(|e| matches!(e, RunEvent::Step(step) if step.state.is_end()))
         .collect();
     assert_eq!(
         ends,
@@ -546,9 +560,11 @@ async fn artifacts_progress_and_context_reach_observers() {
         h.events(run),
         vec![
             tool_start("async_tool", "c1"),
-            RunEvent::Progress {
-                message: "halfway".into()
-            },
+            // `emit_progress` is an update of the call's own step, the text in its detail.
+            RunEvent::Step(
+                StepEvent::new("tool:c1", StepKind::Tool, "async_tool", StepState::Running)
+                    .with_detail("halfway")
+            ),
             RunEvent::Artifact {
                 name: "report.md".into(),
                 mime_type: Some("text/markdown".into()),
@@ -1031,12 +1047,40 @@ async fn needs_input_parks_and_the_answer_becomes_the_tool_result() {
         "input_required",
         json!({"question": "which environment?", "call_id": "c1"})
     )));
+    // The call's step is waiting for the person, and stays open until the answer.
+    let steps = |h: &Harness| -> Vec<(String, StepState)> {
+        h.events(run)
+            .into_iter()
+            .filter_map(|e| match e {
+                RunEvent::Step(step) => Some((step.id, step.state)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        steps(&h),
+        [
+            ("tool:c1".to_owned(), StepState::Running),
+            ("tool:c1".to_owned(), StepState::Waiting),
+        ]
+    );
 
     rt.deliver(run, user_message("prod"))
         .await
         .expect("deliver");
     let view = wait_done(&rt, run).await;
     worker.stop().await;
+    // The answer ended it, before the next call began.
+    assert_eq!(
+        steps(&h),
+        [
+            ("tool:c1".to_owned(), StepState::Running),
+            ("tool:c1".to_owned(), StepState::Waiting),
+            ("tool:c1".to_owned(), StepState::Completed),
+            ("tool:c2".to_owned(), StepState::Running),
+            ("tool:c2".to_owned(), StepState::Completed),
+        ]
+    );
 
     assert_eq!(echo_calls.load(SeqCst), 1);
     let state = conversation(&view);
@@ -1850,5 +1894,192 @@ fn state_stored_before_continuation_existed_can_be_continued() {
         [Message::User {
             content: vec![ContentPart::text("deploy"), ContentPart::text("and then?")]
         }]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Steps
+// ---------------------------------------------------------------------------
+
+/// A tool that drives another agent: its own style (a sub-agent, labelled and drawn as one), a progress
+/// line, and steps it reports that run under its own and under each other.
+struct Driver;
+
+#[async_trait]
+impl Tool for Driver {
+    fn spec(&self) -> ToolSpec {
+        spec("driver")
+    }
+
+    fn step_style(&self) -> StepStyle {
+        StepStyle::new(StepKind::Subagent)
+            .with_label("OpenCode")
+            .with_icon(StepIcon::Agent)
+    }
+
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        assert_eq!(ctx.step_id(), "tool:c1");
+        ctx.emit_progress("starting OpenCode").await;
+        ctx.report_step(
+            StepEvent::new(
+                "acp:c1:1",
+                StepKind::Command,
+                "npm test",
+                StepState::Running,
+            )
+            .with_icon(StepIcon::Execute),
+        )
+        .await;
+        ctx.report_step(
+            StepEvent::new("acp:c1:1", StepKind::Command, "npm test", StepState::Failed)
+                .with_detail("1 failed"),
+        )
+        .await;
+        // A step under one the call reported, not under the call.
+        ctx.report_step(
+            StepEvent::new("acp:c1:2", StepKind::Tool, "edit", StepState::Completed)
+                .under("acp:c1:1"),
+        )
+        .await;
+        Ok(ToolOutput::text("done"))
+    }
+}
+
+#[tokio::test]
+async fn a_tool_is_a_step_in_its_own_style_and_reports_the_steps_that_run_under_it() {
+    let h = Harness::new();
+    let agent = h.agent().tool(Driver).build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "driver", json!({}))])
+        .push_text("all done");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let own = |state| {
+        RunEvent::Step(
+            StepEvent::new("tool:c1", StepKind::Subagent, "OpenCode", state)
+                .with_icon(StepIcon::Agent),
+        )
+    };
+    assert_eq!(
+        h.events(run),
+        vec![
+            own(StepState::Running),
+            // The progress line is an update of the call's own step, in its style.
+            RunEvent::Step(
+                StepEvent::new(
+                    "tool:c1",
+                    StepKind::Subagent,
+                    "OpenCode",
+                    StepState::Running
+                )
+                .with_icon(StepIcon::Agent)
+                .with_detail("starting OpenCode")
+            ),
+            // Reported steps run under the call's step ...
+            RunEvent::Step(
+                StepEvent::new(
+                    "acp:c1:1",
+                    StepKind::Command,
+                    "npm test",
+                    StepState::Running
+                )
+                .under("tool:c1")
+                .with_icon(StepIcon::Execute)
+            ),
+            RunEvent::Step(
+                StepEvent::new("acp:c1:1", StepKind::Command, "npm test", StepState::Failed)
+                    .under("tool:c1")
+                    .with_detail("1 failed")
+            ),
+            // ... unless they say they run under another one.
+            RunEvent::Step(
+                StepEvent::new("acp:c1:2", StepKind::Tool, "edit", StepState::Completed)
+                    .under("acp:c1:1")
+            ),
+            own(StepState::Completed),
+            custom("agent_text", json!({"text": "all done", "turn": 1})),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_tool_that_says_nothing_is_a_plain_step_labelled_with_its_name() {
+    let h = Harness::new();
+    let (plain, _) = CountingTool::new("lookup");
+    let agent = h.agent().tool(plain).build();
+    h.mock
+        .push_tool_calls(vec![
+            call("c1", "lookup", json!({})),
+            call("c2", "nobody_has_this", json!({})),
+        ])
+        .push_text("ok");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let steps: Vec<StepEvent> = h
+        .events(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) => Some(step),
+            _ => None,
+        })
+        .collect();
+    let plain = |id: &str, name: &str, state| StepEvent::new(id, StepKind::Tool, name, state);
+    assert_eq!(
+        steps,
+        [
+            plain("tool:c1", "lookup", StepState::Running),
+            plain("tool:c1", "lookup", StepState::Completed),
+            // A name that is none of the agent's tools is a failed step with that name.
+            plain("tool:c2", "nobody_has_this", StepState::Running),
+            plain("tool:c2", "nobody_has_this", StepState::Failed),
+        ]
+    );
+    assert!(
+        steps
+            .iter()
+            .all(|s| s.parent.is_none() && s.icon.is_none() && s.detail.is_none())
+    );
+}
+
+#[tokio::test]
+async fn a_detached_context_reports_its_steps_to_the_sink() {
+    let sink = CollectingSink::new();
+    let ctx = ToolCtx::detached("shell", "c7", Arc::new(sink.clone()));
+    assert_eq!(ctx.step_id(), "tool:c7");
+    ctx.emit_progress("running: ls").await;
+    ctx.report_step(StepEvent::new(
+        "sh:c7:1",
+        StepKind::Command,
+        "ls",
+        StepState::Running,
+    ))
+    .await;
+    let events: Vec<RunEvent> = sink.events().into_iter().map(|e| e.event).collect();
+    assert_eq!(
+        events,
+        [
+            RunEvent::Step(
+                StepEvent::new("tool:c7", StepKind::Tool, "shell", StepState::Running)
+                    .with_detail("running: ls")
+            ),
+            RunEvent::Step(
+                StepEvent::new("sh:c7:1", StepKind::Command, "ls", StepState::Running)
+                    .under("tool:c7")
+            ),
+        ]
     );
 }
