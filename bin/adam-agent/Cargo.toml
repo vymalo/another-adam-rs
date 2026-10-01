@@ -1,0 +1,53 @@
+[package]
+name = "adam-agent"
+description = "One binary that serves any agent folder over A2A: instructions, card, skills, subagents and MCP tools are files, read when the process starts"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "adam_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adam-agent"
+path = "src/main.rs"
+
+[dependencies]
+adam = { workspace = true, features = ["a2a", "mcp"] }
+adam-a2a.workspace = true
+adam-error.workspace = true
+adam-llm-agent.workspace = true
+adam-model.workspace = true
+adam-runtime.workspace = true
+adam-service = { workspace = true, features = ["mcp"] }
+anyhow.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+a2a-client-lf.workspace = true
+a2a-lf.workspace = true
+adam-core.workspace = true
+adam-host.workspace = true
+adam-mcp-testkit.workspace = true
+adam-store-postgres.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+futures.workspace = true
+secrecy.workspace = true
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+tempfile.workspace = true
+uuid.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

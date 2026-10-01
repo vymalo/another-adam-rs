@@ -182,6 +182,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-agent"
+version = "0.1.0"
+dependencies = [
+ "a2a-client-lf",
+ "a2a-lf",
+ "adam",
+ "adam-a2a",
+ "adam-core",
+ "adam-error",
+ "adam-host",
+ "adam-llm-agent",
+ "adam-mcp-testkit",
+ "adam-model",
+ "adam-runtime",
+ "adam-service",
+ "adam-store-postgres",
+ "anyhow",
+ "async-trait",
+ "axum",
+ "futures",
+ "secrecy",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "adam-agent-fixture"
 version = "0.1.0"
 dependencies = [

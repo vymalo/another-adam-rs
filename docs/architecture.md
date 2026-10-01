@@ -24,6 +24,7 @@ Contents:
 * [The run lifecycle](#the-run-lifecycle)
 * [The error tree](#the-error-tree)
 * [The coder agent](#the-coder-agent)
+* [The generic agent](#the-generic-agent)
 * [Where to go next](#where-to-go-next)
 * [Verified and unverified](#verified-and-unverified)
 
@@ -48,6 +49,7 @@ flowchart TB
     end
     subgraph agents["Agents"]
         coder["adam-coder"]
+        agent["adam-agent"]
         llm["adam-llm-agent"]
     end
     subgraph runtime["Runtime"]
@@ -87,6 +89,12 @@ flowchart TB
     coder --> service
     coder --> ws
     coder --> host
+    agent --> a2a
+    agent --> adam
+    agent --> llm
+    agent --> model
+    agent --> rt
+    agent --> service
     service --> a2a
     service --> a2art
     service --> core
@@ -138,6 +146,9 @@ flowchart TB
     asm -.-> fixture
     coder -.-> openai
     coder -.-> pg
+    agent -.-> core
+    agent -.-> host
+    agent -.-> pg
 
     a2a --> err
     adam --> err
@@ -145,6 +156,7 @@ flowchart TB
     acp --> err
     coder --> err
     service --> err
+    agent --> err
     core --> err
     llm --> err
     openai --> err
@@ -158,7 +170,7 @@ flowchart TB
     host --> err
     pgn --> err
 
-    linkStyle 61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78 stroke:#999,stroke-width:1px
+    linkStyle 70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -209,8 +221,12 @@ The layers, from the bottom:
 * **Agents.**
   * `adam-llm-agent` is a reusable model-and-tools loop written as an
     `adam_runtime::Agent`.
-  * `adam-coder` is the coder agent and the only binary. It is a composition
+  * `adam-coder` is the coder agent. It is a composition
     root: it wires the pieces below it, and `adam-service` runs the process.
+  * `adam-agent` is the general binary: it serves **any agent folder** (instructions, card, skills,
+    subagents and `mcp.json` tools, read at startup from `ADAM_AGENT_DIR`) with `ask_user` as its only tool of
+    its own, over the same `adam-service`. It has no embedded agent and requires the folder
+    ([ADR 0005](decisions/0005-one-binary-serves-any-agent-folder.md), [README](../bin/adam-agent/README.md)).
 * **Authoring.**
   * `adam-macros` is the `#[tool]` attribute macro: a proc-macro crate whose
     expansion is a pure function over token streams. It depends on `syn`,
@@ -263,7 +279,7 @@ tests. That adds no new crate edge.
 
 The workspace is `crates/*` and `bin/*` (see the root `Cargo.toml`): libraries
 live in `crates/`, binaries (the agents you can run) in `bin/`, so a new crate or
-binary joins by adding a directory. `adam-coder` is the one binary today.
+binary joins by adding a directory. `adam-coder` and `adam-agent` are the binaries today.
 
 ## Ports and implementations
 
@@ -504,7 +520,7 @@ GitHub, the workspaces, the MCP servers of the folder) and hands it to
 [`adam-service`](../crates/adam-service/README.md)'s `serve`, which is the rest of the process; `main` is
 `serve(Config::from_env(), sigterm)`. To use MongoDB, another model client or
 another code host, write another root that builds the same pieces. A second binary,
-over another agent, is the same two steps with another agent.
+over another agent, is the same two steps with another agent: `adam-agent` is that binary for any agent folder.
 
 `adam_service::serve` does not supervise anything by hand. It builds the pieces, registers what
 the process runs as components of an `adam_host::Host`, and calls `run`. The
@@ -1929,6 +1945,30 @@ flowchart LR
   real clients (`OpenAiCompatible`, `GitHub`) against them, so the mappings
   cannot rot.
 
+## The generic agent
+
+`adam-agent` (`bin/adam-agent`) is a second composition root over [`adam-service`](../crates/adam-service/README.md): it
+serves **any agent folder** and has no agent of its own. Its `serve` (`bin/adam-agent/src/serve.rs`) reads the
+folder `ADAM_AGENT_DIR` names, which is required by every role (`folder::load`, `AgentFolder::load`), logs the same
+`agent files` line as the coder, makes the card from it (`card_of`), and, for the roles that run workers, assembles
+the agent (`assemble`: `AgentDef::connect_mcp` under the `MCP_ALLOW_*` policy, `bind` with `ask_user`, `model`) and
+registers it (`Assembly::register`: the root and its subagents); a control plane registers the start-only half
+(`LlmStarter`). Then it hands `Agents { name, card, register, options }` to `adam_service::serve`, which is the process
+of [How a binary composes them](#how-a-binary-composes-them). The sequence and the lifecycle of that startup are in
+its [README](../bin/adam-agent/README.md#the-process) and in
+[ADR 0005](decisions/0005-one-binary-serves-any-agent-folder.md).
+
+What the diagrams cannot say:
+
+* **There is no embedded agent and no default**: without `ADAM_AGENT_DIR` no role starts (exit 78).
+* **The agent's tools are its folder's**: `ask_user`, the tools of its MCP servers (`<server>__<tool>`), the
+  skills' tools and one per subagent. Nothing in the binary touches a filesystem, a shell or git.
+* **Runs are scoped by the agent's name**, so several `adam-agent` services with different folders share one
+  database (`RuntimeTaskBackend` refuses another agent's runs, a worker claims only what it registered). They are
+  not pinned to a worker (`ClaimScope::Any`): there is no workspace.
+* **It ships inside the coder image** (decision 8 of the ADR): the entrypoint stays `adam-coder`, and a service that
+  runs a folder overrides it with `adam-agent`.
+
 ## Where to go next
 
 | Crate | Layer | README |
@@ -1946,7 +1986,9 @@ flowchart LR
 | `adam-runtime` | runtime | [crates/adam-runtime](../crates/adam-runtime/README.md) |
 | `adam-a2a-runtime` | runtime | [crates/adam-a2a-runtime](../crates/adam-a2a-runtime/README.md) |
 | `adam-llm-agent` | agent | [crates/adam-llm-agent](../crates/adam-llm-agent/README.md) |
+| `adam-service` | runtime | [crates/adam-service](../crates/adam-service/README.md) |
 | `adam-coder` | agent, binary | [bin/adam-coder](../bin/adam-coder/README.md) |
+| `adam-agent` | agent, binary | [bin/adam-agent](../bin/adam-agent/README.md) |
 | `adam-macros` | authoring, proc-macro | [crates/adam-macros](../crates/adam-macros/README.md) |
 | `adam` | authoring, facade | [crates/adam](../crates/adam/README.md) |
 | `adam-store-testkit` | test kit | [crates/adam-store-testkit](../crates/adam-store-testkit/README.md) |
