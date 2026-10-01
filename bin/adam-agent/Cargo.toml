@@ -1,7 +1,8 @@
 [package]
-name = "adam-coder"
-description = "Coder agent over A2A: takes a coding task to a verified pull request (worktree, OpenCode over ACP, checks, push, PR)"
+name = "adam-agent"
+description = "One binary that serves any agent folder over A2A: instructions, card, skills, subagents and MCP tools are files, read when the process starts"
 readme = "README.md"
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,50 +10,40 @@ repository.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "adam_coder"
+name = "adam_agent"
 path = "src/lib.rs"
 
 [[bin]]
-name = "adam-coder"
+name = "adam-agent"
 path = "src/main.rs"
 
 [dependencies]
 adam = { workspace = true, features = ["a2a", "mcp"] }
 adam-a2a.workspace = true
-adam-a2a-runtime.workspace = true
-adam-acp.workspace = true
-adam-core.workspace = true
 adam-error.workspace = true
-adam-host.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
 adam-service = { workspace = true, features = ["mcp"] }
-adam-workspace.workspace = true
 anyhow.workspace = true
-async-trait.workspace = true
-axum.workspace = true
-base64.workspace = true
-futures.workspace = true
-secrecy.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "signal"] }
+tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 
-[build-dependencies]
-adam-agent-fs = { workspace = true, features = ["build"] }
-
 [dev-dependencies]
 a2a-client-lf.workspace = true
 a2a-lf.workspace = true
+adam-core.workspace = true
+adam-host.workspace = true
 adam-mcp-testkit.workspace = true
-adam-model-openai.workspace = true
 adam-store-postgres.workspace = true
-adam-workspace = { workspace = true, features = ["test-util"] }
+async-trait.workspace = true
+axum.workspace = true
+futures.workspace = true
+secrecy.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile.workspace = true
 uuid.workspace = true

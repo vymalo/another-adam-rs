@@ -3,15 +3,16 @@
 //! The binary is `serve` under an [`anyhow`] chain: every I/O step adds a `.context()`, and the
 //! root cause is a typed error somewhere down the chain. [`exit_code`] walks the chain from the
 //! outside in and returns the first code that fits, so a supervisor can tell a deployment that is
-//! misconfigured (do not restart) from one whose database is down (restart later) from a bug.
+//! misconfigured (do not restart) from one whose database is down (restart later) from a bug. The
+//! walk itself, and the codes, are those of every agent binary ([`adam_service::exit_code_with`]).
 //!
 //! | Code | Name | Root cause |
 //! |---|---|---|
 //! | 0 | | clean shutdown after a signal (not an error) |
-//! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, [`AgentFilesError`] (a folder that cannot be read or is not the coder's), an assembly error (the files and the code disagree), or any error whose class is `Invalid` |
+//! | 78 | `EX_CONFIG` | `ConfigError`, `OpenAiConfigError`, [`AgentFilesError`] (a folder that cannot be read or is not the coder's), an assembly error (the files and the code disagree), or any error whose class is `Invalid` |
 //! | 69 | `EX_UNAVAILABLE` | a dependency is unreachable: a `Transient`, `RateLimited` or `Conflict` error, such as Postgres |
 //! | 71 | `EX_OSERR` | an [`std::io::Error`]: a listener that cannot bind, a directory that cannot be created |
-//! | 70 | `EX_SOFTWARE` | [`HostError`] (a component of the process stopped, panicked or ended while still needed), a panicked task, or a `Corrupt` or `Internal` error |
+//! | 70 | `EX_SOFTWARE` | `HostError` (a component of the process stopped, panicked or ended while still needed), a panicked task, or a `Corrupt` or `Internal` error |
 //! | 1 | | anything else |
 //!
 //! The values are those of BSD `sysexits.h`, *unverified* (from memory; the header is not part of
@@ -20,64 +21,24 @@
 use std::error::Error;
 
 use adam::AssemblyError;
-use adam_core::StoreError;
 use adam_error::{Classify, ErrorClass};
-use adam_host::HostError;
-use adam_model_openai::OpenAiConfigError;
-use adam_runtime::RuntimeError;
 use adam_workspace::WorkspaceError;
 
-use crate::{AgentFilesError, ConfigError};
+use crate::AgentFilesError;
 
-/// `EX_CONFIG`: the configuration is wrong; restarting will not help.
-pub const EX_CONFIG: u8 = 78;
-/// `EX_UNAVAILABLE`: a dependency is unreachable; restarting later may help.
-pub const EX_UNAVAILABLE: u8 = 69;
-/// `EX_OSERR`: the operating system refused something (a port, a directory).
-pub const EX_OSERR: u8 = 71;
-/// `EX_SOFTWARE`: an internal error: a bug, or a component of the process that stopped.
-pub const EX_SOFTWARE: u8 = 70;
-/// Anything else.
-pub const EX_GENERAL: u8 = 1;
+pub use adam_service::{EX_CONFIG, EX_GENERAL, EX_OSERR, EX_SOFTWARE, EX_UNAVAILABLE};
 
 /// The exit code for `err`, found by walking its chain from the outside in. See the module docs.
+///
+/// The walk is [`adam_service::exit_code_with`]: the errors of the service (configuration, the
+/// store, the model client, the runtime, the host) are known there, and the coder adds its own
+/// (a workspace, the agent files and their assembly).
 pub fn exit_code(err: &anyhow::Error) -> u8 {
-    // A context layer is not part of `chain()`'s downcastable items, so ask for it directly.
-    if err.downcast_ref::<HostError>().is_some() {
-        return EX_SOFTWARE;
-    }
-    for cause in err.chain() {
-        if cause.is::<ConfigError>() {
-            return EX_CONFIG;
-        }
-        if let Some(class) = class_of(cause) {
-            return match class {
-                ErrorClass::Invalid => EX_CONFIG,
-                ErrorClass::Transient | ErrorClass::RateLimited | ErrorClass::Conflict => {
-                    EX_UNAVAILABLE
-                }
-                ErrorClass::Corrupt | ErrorClass::Internal => EX_SOFTWARE,
-                _ => EX_GENERAL,
-            };
-        }
-        if cause.is::<tokio::task::JoinError>() {
-            return EX_SOFTWARE;
-        }
-        if cause.is::<std::io::Error>() {
-            return EX_OSERR;
-        }
-    }
-    EX_GENERAL
+    adam_service::exit_code_with(err.as_ref(), class_of)
 }
 
-/// The class of `cause` when it is one of the typed errors the binary's steps can return.
+/// The class of `cause` when it is one of the typed errors of the coder's own steps.
 fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
-    if let Some(e) = cause.downcast_ref::<StoreError>() {
-        return Some(e.class());
-    }
-    if let Some(e) = cause.downcast_ref::<OpenAiConfigError>() {
-        return Some(e.class());
-    }
     if let Some(e) = cause.downcast_ref::<WorkspaceError>() {
         return Some(e.class());
     }
@@ -86,18 +47,16 @@ fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
     if let Some(e) = cause.downcast_ref::<AgentFilesError>() {
         return Some(e.class());
     }
-    if let Some(e) = cause.downcast_ref::<AssemblyError>() {
-        return Some(e.class());
-    }
-    if let Some(e) = cause.downcast_ref::<RuntimeError>() {
-        return Some(e.class());
-    }
-    cause.downcast_ref::<HostError>().map(Classify::class)
+    cause.downcast_ref::<AssemblyError>().map(Classify::class)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adam_core::StoreError;
+    use adam_host::HostError;
+    use adam_model_openai::OpenAiConfigError;
+    use adam_service::ConfigError;
     use anyhow::Context as _;
 
     fn coded(e: impl Error + Send + Sync + 'static) -> u8 {
@@ -106,9 +65,7 @@ mod tests {
 
     #[test]
     fn a_configuration_problem_is_78() {
-        let e = ConfigError {
-            problems: vec!["DATABASE_URL is required".into()],
-        };
+        let e = ConfigError::new(vec!["DATABASE_URL is required".into()]);
         assert_eq!(
             exit_code(
                 &Err::<(), _>(e)

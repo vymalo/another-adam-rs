@@ -1,5 +1,10 @@
 //! Configuration of the `adam-coder` binary, read from the environment.
 //!
+//! The variables every agent binary shares (`ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`,
+//! `LISTEN_ADDR`, `WORKERS`, `WORKER_ID`, `MODEL_*`, `MCP_ALLOW_*`) are read by
+//! [`adam_service`] (`ServiceConfig`, `ModelConfig`, `McpSettings`), with the same names, defaults and
+//! messages for every binary; the coder reads its own beside them.
+//!
 //! | Variable | Meaning | Default |
 //! |---|---|---|
 //! | `ROLE` | what this process runs: `all`, `control-plane` or `worker` ([`adam_host::Role`]) | `all` |
@@ -25,6 +30,9 @@
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 //! | `PR_DRAFT` | open pull requests as drafts (`true`/`false`) | `false` |
 //! | `OPENCODE_COMMAND` | program that speaks ACP on stdio (arguments follow, whitespace-separated) | `opencode acp` |
+//! | `MCP_ALLOW_STDIO` | let an agent folder's `mcp.json` start local processes (`command` servers) | `false` |
+//! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
+//! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
 //!
 //! # Roles
@@ -38,8 +46,8 @@
 //!   or GitHub configuration.
 //! * **The workers** (`all`, `worker`) need everything a step uses, the `MODEL_*`, `MODEL`
 //!   and `GITHUB_TOKEN` variables, and read the rest of the table above (the workspace, the
-//!   checks, the commit identity, OpenCode). They arrive in [`Config::worker`] as a
-//!   [`WorkerConfig`], which is `Some` exactly when [`Role::runs_workers`].
+//!   checks, the commit identity, OpenCode, what MCP servers a folder may start or reach). They arrive in [`Config::worker`] as a
+//!   [`WorkerConfig`], which is `Some` exactly when [`Role::runs_workers`](adam_host::Role::runs_workers).
 //!
 //! # Workspace placement
 //!
@@ -67,66 +75,36 @@
 //! in one round trip. Secrets are wrapped in [`SecretString`] and never appear
 //! in `Debug` output.
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use adam::AGENT_DIR_ENV;
-use adam_error::{Classify, ErrorClass};
-use adam_host::{Placement, Role};
+use adam_host::Placement;
+pub use adam_service::{ConfigError, McpSettings};
+use adam_service::{ModelConfig, ServiceConfig, WorkerSettings, parse_flag, parse_or};
 use secrecy::SecretString;
 use url::Url;
-
-/// One or more environment variables are missing or unusable.
-///
-/// Classified as [`ErrorClass::Invalid`]: the same environment never works. It lists every
-/// problem at once and never a secret's value.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-#[error("invalid configuration:\n  - {}", problems.join("\n  - "))]
-pub struct ConfigError {
-    /// One line per problem.
-    pub problems: Vec<String>,
-}
-
-impl Classify for ConfigError {
-    fn class(&self) -> ErrorClass {
-        ErrorClass::Invalid
-    }
-}
 
 /// The binary's configuration.
 #[derive(Clone)]
 pub struct Config {
-    /// `ROLE`: which halves this process runs.
-    pub role: Role,
-    /// `DATABASE_URL`.
-    pub database_url: SecretString,
-    /// `A2A_BEARER_TOKENS`. Empty unless [`Role::runs_control_plane`].
-    pub a2a_bearer_tokens: Vec<SecretString>,
-    /// `PUBLIC_URL`. `Some` exactly when [`Role::runs_control_plane`].
-    pub public_url: Option<Url>,
-    /// `LISTEN_ADDR`: the A2A server, or the `/healthz` listener of a worker.
-    pub listen_addr: SocketAddr,
+    /// What every agent binary reads: the role, the database, how the process is reached.
+    pub service: ServiceConfig,
     /// `ADAM_AGENT_DIR`: the folder the agent's files are read from, an existing directory.
     /// `None`: the copy embedded in the binary. Every role reads it.
     pub agent_dir: Option<PathBuf>,
     /// What stepping a run needs: the model, GitHub, the workspaces and the checks. `Some` exactly
-    /// when [`Role::runs_workers`]; a control plane holds none of it.
+    /// when [`Role::runs_workers`](adam_host::Role::runs_workers); a control plane holds none of it.
     pub worker: Option<WorkerConfig>,
 }
 
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
-            .field("role", &self.role)
-            .field("database_url", &"[REDACTED]")
-            .field("a2a_bearer_tokens", &self.a2a_bearer_tokens.len())
-            .field("public_url", &self.public_url.as_ref().map(Url::as_str))
-            .field("listen_addr", &self.listen_addr)
+            .field("service", &self.service)
             .field("agent_dir", &self.agent_dir)
             .field("worker", &self.worker)
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -134,12 +112,8 @@ impl std::fmt::Debug for Config {
 /// coder uses.
 #[derive(Clone)]
 pub struct WorkerConfig {
-    /// `MODEL_BASE_URL`.
-    pub model_base_url: String,
-    /// `MODEL_API_KEY`.
-    pub model_api_key: SecretString,
-    /// `MODEL`.
-    pub model: String,
+    /// `MODEL_BASE_URL`, `MODEL_API_KEY` and `MODEL`.
+    pub model: ModelConfig,
     /// `OPENCODE_MODEL`.
     pub opencode_model: String,
     /// `GITHUB_TOKEN`.
@@ -172,12 +146,13 @@ pub struct WorkerConfig {
     pub pr_draft: bool,
     /// `OPENCODE_COMMAND`, split into program and arguments.
     pub opencode_command: Vec<String>,
+    /// `MCP_ALLOW_*`: what the MCP servers of the agent folder's `mcp.json` may be.
+    pub mcp: McpSettings,
 }
 
 impl std::fmt::Debug for WorkerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerConfig")
-            .field("model_base_url", &self.model_base_url)
             .field("model", &self.model)
             .field("opencode_model", &self.opencode_model)
             .field("allowed_repo_hosts", &self.allowed_repo_hosts)
@@ -192,6 +167,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("check_output_tail", &self.check_output_tail)
             .field("pr_draft", &self.pr_draft)
             .field("opencode_command", &self.opencode_command)
+            .field("mcp", &self.mcp)
             .finish_non_exhaustive()
     }
 }
@@ -215,69 +191,9 @@ impl Config {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let mut problems = Vec::new();
         let get = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
-        let role = match Role::from_optional(lookup("ROLE").as_deref()) {
-            Ok(role) => role,
-            Err(e) => {
-                problems.push(format!("ROLE is invalid: {e}"));
-                Role::default()
-            }
-        };
 
-        let mut required = |name: &str| {
-            let value = get(name);
-            if value.is_none() {
-                problems.push(format!("{name} is required"));
-            }
-            value.unwrap_or_default()
-        };
-
-        let database_url = required("DATABASE_URL");
-        // The front's variables: only a role that serves A2A needs them.
-        let front = role.runs_control_plane();
-        let public_url_raw = if front {
-            required("PUBLIC_URL")
-        } else {
-            String::new()
-        };
-        let tokens_raw = if front {
-            required("A2A_BEARER_TOKENS")
-        } else {
-            String::new()
-        };
-
-        let public_url = if front {
-            match Url::parse(&public_url_raw) {
-                Ok(u) if matches!(u.scheme(), "http" | "https") => Some(u),
-                Ok(_) => {
-                    problems.push("PUBLIC_URL must be an http(s) URL".into());
-                    None
-                }
-                Err(e) if !public_url_raw.is_empty() => {
-                    problems.push(format!("PUBLIC_URL is not a URL: {e}"));
-                    None
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-        let a2a_bearer_tokens: Vec<SecretString> = tokens_raw
-            .split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|t| SecretString::from(t.to_owned()))
-            .collect();
-        if a2a_bearer_tokens.is_empty() && !tokens_raw.is_empty() {
-            problems.push("A2A_BEARER_TOKENS has no usable token".into());
-        }
-
-        let listen_addr = parse_or(
-            &get,
-            "LISTEN_ADDR",
-            SocketAddr::from(([0, 0, 0, 0], 8080)),
-            &mut problems,
-        );
+        // The role, the database, the front and the worker settings: the same for every binary.
+        let service = ServiceConfig::parse(&lookup, &mut problems);
 
         let agent_dir = match get(AGENT_DIR_ENV) {
             None => None,
@@ -297,21 +213,14 @@ impl Config {
         };
 
         // The workers' variables: a control plane neither needs nor validates them.
-        let worker = if role.runs_workers() {
-            WorkerConfig::parse(&lookup, &get, &mut problems)
-        } else {
-            None
+        let worker = match &service.worker {
+            Some(settings) => WorkerConfig::parse(&lookup, &get, settings, &mut problems),
+            None => None,
         };
 
-        if !problems.is_empty() {
-            return Err(ConfigError { problems });
-        }
+        ConfigError::check(problems)?;
         Ok(Self {
-            role,
-            database_url: SecretString::from(database_url),
-            a2a_bearer_tokens,
-            public_url,
-            listen_addr,
+            service,
             agent_dir,
             worker,
         })
@@ -335,10 +244,12 @@ impl WorkerConfig {
     }
 
     /// Read the workers' variables, adding one line to `problems` per missing or malformed one.
+    /// `settings` are `WORKERS` and `WORKER_ID`, which the service read (and checked) already.
     /// `None` only after a problem was recorded.
     fn parse(
         lookup: &impl Fn(&str) -> Option<String>,
         get: &impl Fn(&str) -> Option<String>,
+        settings: &WorkerSettings,
         problems: &mut Vec<String>,
     ) -> Option<Self> {
         let mut required = |name: &str| {
@@ -348,20 +259,10 @@ impl WorkerConfig {
             }
             value.unwrap_or_default()
         };
-        let model_base_url = required("MODEL_BASE_URL");
-        let model = required("MODEL");
         let github_token = required("GITHUB_TOKEN");
-        let model_api_key = match lookup("MODEL_API_KEY") {
-            Some(v) => v,
-            None => {
-                problems.push(
-                    "MODEL_API_KEY is required (set it empty for a gateway without auth)".into(),
-                );
-                String::new()
-            }
-        };
+        let model = ModelConfig::parse(lookup, problems);
 
-        let opencode_model = get("OPENCODE_MODEL").unwrap_or_else(|| model.clone());
+        let opencode_model = get("OPENCODE_MODEL").unwrap_or_else(|| model.alias.clone());
         let workspace_root =
             PathBuf::from(get("WORKSPACE_ROOT").unwrap_or_else(|| "/work".to_owned()));
 
@@ -380,22 +281,15 @@ impl WorkerConfig {
                 Placement::default()
             }
         };
-        let worker_id = get("WORKER_ID").map(|id| id.trim().to_owned());
-        match &worker_id {
-            Some(id) if !is_worker_id(id) => problems.push(format!(
-                "WORKER_ID {id:?} is not usable: 1 to 128 letters, digits, `.`, `_` or `-`, not starting with `.`"
-            )),
-            None if placement.pins_runs() => problems.push(format!(
+        // A pinning placement needs an id that survives a restart (the format was checked with
+        // the other service variables).
+        if settings.worker_id.is_none() && placement.pins_runs() {
+            problems.push(format!(
                 "WORKER_ID is required when WORKSPACE_PLACEMENT is {placement}: a run stays on the \
                  worker that owns it, so the id must be stable across restarts (a StatefulSet pod name)"
-            )),
-            _ => {}
+            ));
         }
 
-        let workers = parse_or(get, "WORKERS", 4usize, problems);
-        if workers == 0 {
-            problems.push("WORKERS must be at least 1".into());
-        }
         let max_check_cycles = parse_or(get, "MAX_CHECK_CYCLES", 3u32, problems);
         if max_check_cycles == 0 {
             problems.push("MAX_CHECK_CYCLES must be at least 1".into());
@@ -404,17 +298,9 @@ impl WorkerConfig {
             Duration::from_secs(parse_or(get, "CHECK_TIMEOUT_SECS", 900u64, problems).max(1));
         let check_output_tail =
             parse_or(get, "CHECK_OUTPUT_TAIL_BYTES", 16_384usize, problems).max(256);
-        let mut flag = |name: &str| match get(name).as_deref() {
-            None => false,
-            Some(v) if v.eq_ignore_ascii_case("true") || v == "1" => true,
-            Some(v) if v.eq_ignore_ascii_case("false") || v == "0" => false,
-            Some(v) => {
-                problems.push(format!("{name} must be true or false, got {v:?}"));
-                false
-            }
-        };
-        let pr_draft = flag("PR_DRAFT");
-        let allow_local_repos = flag("ALLOW_LOCAL_REPOS");
+        let pr_draft = parse_flag(get, "PR_DRAFT", problems);
+        let allow_local_repos = parse_flag(get, "ALLOW_LOCAL_REPOS", problems);
+        let mcp = McpSettings::parse(lookup, problems);
         let allowed_repo_hosts = match get("ALLOWED_REPO_HOSTS") {
             None => vec![DEFAULT_REPO_HOST.to_owned()],
             Some(raw) => {
@@ -459,8 +345,6 @@ impl WorkerConfig {
         // `github_api_url` is `None` only after a problem was recorded above.
         let github_api_url = github_api_url?;
         Some(Self {
-            model_base_url,
-            model_api_key: SecretString::from(model_api_key),
             model,
             opencode_model,
             github_token: SecretString::from(github_token),
@@ -469,8 +353,8 @@ impl WorkerConfig {
             github_api_url,
             workspace_root,
             placement,
-            worker_id,
-            workers,
+            worker_id: settings.worker_id.clone(),
+            workers: settings.workers,
             max_check_cycles,
             check_timeout,
             check_output_tail,
@@ -479,6 +363,7 @@ impl WorkerConfig {
                 .unwrap_or_else(|| "adam-coder@users.noreply.github.com".to_owned()),
             pr_draft,
             opencode_command,
+            mcp,
         })
     }
 }
@@ -487,16 +372,6 @@ impl WorkerConfig {
 const DEFAULT_REPO_HOST: &str = "github.com";
 /// API root used when `GITHUB_API_URL` is unset.
 const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
-
-/// A worker id is a lease identity and, with `affinity`, a folder name: no separator, no `..`.
-fn is_worker_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && !id.starts_with('.')
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
 
 /// `name` or `name:port`: letters, digits, dots and dashes, nothing that could
 /// smuggle a scheme, path, userinfo or wildcard into an allowlist.
@@ -513,28 +388,12 @@ fn is_host_entry(entry: &str) -> bool {
         && port.is_none_or(|p| !p.is_empty() && p.parse::<u16>().is_ok())
 }
 
-fn parse_or<T: std::str::FromStr>(
-    get: &impl Fn(&str) -> Option<String>,
-    name: &str,
-    default: T,
-    problems: &mut Vec<String>,
-) -> T
-where
-    T::Err: std::fmt::Display,
-{
-    match get(name) {
-        None => default,
-        Some(raw) => raw.trim().parse().unwrap_or_else(|e| {
-            problems.push(format!("{name} is invalid ({raw:?}): {e}"));
-            default
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
+    use adam_error::{Classify, ErrorClass};
+    use adam_host::Role;
     use secrecy::ExposeSecret;
 
     use super::*;
@@ -558,8 +417,9 @@ mod tests {
     #[test]
     fn defaults_apply_and_tokens_are_split() {
         let c = parse(&full()).expect("valid");
-        assert_eq!(c.listen_addr, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(c.service.listen_addr, "0.0.0.0:8080".parse().unwrap());
         let tokens: Vec<_> = c
+            .service
             .a2a_bearer_tokens
             .iter()
             .map(|t| t.expose_secret().to_owned())
@@ -689,6 +549,74 @@ mod tests {
         assert!(parse(&vars).is_err());
     }
 
+    #[test]
+    fn the_mcp_flags_are_off_by_default_and_each_one_is_read() {
+        let w = worker(&full());
+        assert_eq!(w.mcp, McpSettings::default());
+        let policy = w.mcp.policy();
+        assert!(!policy.stdio_allowed());
+        assert!(!policy.insecure_allowed());
+        assert!(!policy.url_secrets_allowed());
+
+        let mut vars = full();
+        vars.insert("MCP_ALLOW_STDIO", "true");
+        vars.insert("MCP_ALLOW_INSECURE", "1");
+        vars.insert("MCP_ALLOW_URL_VARS", "TRUE");
+        let w = worker(&vars);
+        assert_eq!(
+            w.mcp,
+            McpSettings {
+                allow_stdio: true,
+                allow_insecure: true,
+                allow_url_vars: true
+            }
+        );
+        let policy = w.mcp.policy();
+        assert!(
+            policy.stdio_allowed() && policy.insecure_allowed() && policy.url_secrets_allowed()
+        );
+
+        // One at a time: each variable maps to its own flag.
+        for (name, expected) in [
+            ("MCP_ALLOW_STDIO", (true, false, false)),
+            ("MCP_ALLOW_INSECURE", (false, true, false)),
+            ("MCP_ALLOW_URL_VARS", (false, false, true)),
+        ] {
+            let mut vars = full();
+            vars.insert(name, "true");
+            let m = worker(&vars).mcp;
+            assert_eq!(
+                (m.allow_stdio, m.allow_insecure, m.allow_url_vars),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_mcp_flag_names_the_variable() {
+        let mut vars = full();
+        vars.insert("MCP_ALLOW_STDIO", "sometimes");
+        vars.insert("MCP_ALLOW_INSECURE", "yes");
+        vars.insert("MCP_ALLOW_URL_VARS", "2");
+        let err = parse(&vars).unwrap_err();
+        for name in [
+            "MCP_ALLOW_STDIO",
+            "MCP_ALLOW_INSECURE",
+            "MCP_ALLOW_URL_VARS",
+        ] {
+            assert!(
+                err.problems
+                    .iter()
+                    .any(|p| p.starts_with(name) && p.contains("true or false")),
+                "{name} missing from {:?}",
+                err.problems
+            );
+        }
+        // A control plane connects no MCP servers, so it does not validate them.
+        vars.insert("ROLE", "control-plane");
+        assert!(parse(&vars).is_ok());
+    }
+
     fn with_role(role: &'static str) -> HashMap<&'static str, &'static str> {
         let mut vars = full();
         vars.insert("ROLE", role);
@@ -697,15 +625,15 @@ mod tests {
 
     #[test]
     fn the_role_defaults_to_all_and_each_value_parses() {
-        assert_eq!(parse(&full()).unwrap().role, Role::All);
+        assert_eq!(parse(&full()).unwrap().service.role, Role::All);
         // Blank counts as unset, like every other variable.
-        assert_eq!(parse(&with_role("  ")).unwrap().role, Role::All);
+        assert_eq!(parse(&with_role("  ")).unwrap().service.role, Role::All);
         for role in Role::VALUES {
-            assert_eq!(parse(&with_role(role.as_str())).unwrap().role, role);
+            assert_eq!(parse(&with_role(role.as_str())).unwrap().service.role, role);
         }
         // `adam_host` trims and ignores ASCII case.
         assert_eq!(
-            parse(&with_role(" Control-Plane ")).unwrap().role,
+            parse(&with_role(" Control-Plane ")).unwrap().service.role,
             Role::ControlPlane
         );
     }
@@ -733,9 +661,9 @@ mod tests {
         vars.remove("A2A_BEARER_TOKENS");
         vars.remove("PUBLIC_URL");
         let c = parse(&vars).expect("a worker serves no A2A");
-        assert_eq!(c.role, Role::Worker);
-        assert!(c.a2a_bearer_tokens.is_empty());
-        assert!(c.public_url.is_none());
+        assert_eq!(c.service.role, Role::Worker);
+        assert!(c.service.a2a_bearer_tokens.is_empty());
+        assert!(c.service.public_url.is_none());
 
         // What a worker does not use is not validated either: a chart may set it for all roles.
         vars.insert("PUBLIC_URL", "ftp://not-used");
@@ -762,8 +690,11 @@ mod tests {
             vars.insert("A2A_BEARER_TOKENS", " , ");
             assert!(parse(&vars).is_err(), "{role}");
             let c = parse(&with_role(role)).unwrap();
-            assert_eq!(c.a2a_bearer_tokens.len(), 2);
-            assert_eq!(c.public_url.unwrap().as_str(), "http://coder.svc:8080/");
+            assert_eq!(c.service.a2a_bearer_tokens.len(), 2);
+            assert_eq!(
+                c.service.public_url.unwrap().as_str(),
+                "http://coder.svc:8080/"
+            );
         }
     }
 
@@ -802,10 +733,10 @@ mod tests {
             vars.remove(name);
         }
         let c = parse(&vars).expect("a control plane starts runs, it does not step them");
-        assert_eq!(c.role, Role::ControlPlane);
+        assert_eq!(c.service.role, Role::ControlPlane);
         assert!(c.worker.is_none());
-        assert_eq!(c.a2a_bearer_tokens.len(), 2);
-        assert!(c.public_url.is_some());
+        assert_eq!(c.service.a2a_bearer_tokens.len(), 2);
+        assert!(c.service.public_url.is_some());
 
         // What only a worker uses is not validated either: a chart may set it for every role.
         vars.insert("GITHUB_API_URL", "garbage");

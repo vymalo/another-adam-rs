@@ -1,9 +1,9 @@
 # Local development stack: databases, WireMock mocks of the external systems,
-# a local git remote, and (profile `app`) the coder wired to all of them.
+# a local git remote, and (profile `app`) the coder and a general agent wired to all of them.
 # Everything binds to 127.0.0.1 only; every credential in here is a dummy.
 #
 #   docker compose up -d --wait          # postgres, mongodb and the mocks
-#   docker compose --profile app up -d --build --wait   # ... and the coder
+#   docker compose --profile app up -d --build --wait   # ... and the coder and the agent
 #   docker compose down -v               # stop and forget all state
 #
 # See "Local development" in README.md for the endpoints, the environment
@@ -146,6 +146,52 @@ services:
     volumes:
       - coder-work:/work
       - ${CODER_AGENT_DIR:-./bin/adam-coder/agent}:/etc/adam/agent:ro
+    healthcheck:
+      # Plain TCP connect: the image is not guaranteed to ship curl.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  # A general agent: `adam-agent` serving the folder mounted at /etc/adam/agent (ADAM_AGENT_DIR), a
+  # chat persona by default (dev/agents/assistant/agent). It runs from the coder's image, which carries
+  # both binaries: only the entrypoint differs (`adam-agent` for `adam-coder`), so there is no second
+  # image to build or publish. The agent is files, read at startup: edit the folder, or point
+  # AGENT_FOLDER at a copy, and `docker compose --profile app up -d agent` (a restart, no rebuild). It
+  # has no tools of its own but `ask_user`, no workspace and no GitHub: its model is `mock-assistant`,
+  # which greets from the two persona lines of the prompt (`Your name is <name>.` and `In one
+  # sentence: <summary>.`). It shares the coder's database: runs are scoped by the agent's name.
+  # A fourth agent is a folder and these lines. CI runs dev/agent-e2e.sh against it.
+  agent:
+    profiles: ["app"]
+    image: ${CODER_IMAGE:-adam-rs/coder:dev}
+    build:
+      context: .
+      dockerfile: docker/coder/Dockerfile
+    entrypoint: ["tini", "--", "adam-agent"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-openai:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/adam_test
+      MODEL_BASE_URL: http://mock-openai:8080/v1
+      MODEL_API_KEY: mock-api-key # dummy: the mock accepts anything
+      # Scripted by the persona lines of the folder (see above).
+      MODEL: ${AGENT_MODEL:-mock-assistant}
+      # Dummy bearer token for the A2A endpoint; never reuse it anywhere real.
+      A2A_BEARER_TOKENS: dev-token
+      PUBLIC_URL: http://127.0.0.1:${AGENT_PORT:-8084}/
+      # The mounted folder below: what the agent says and offers, read at startup.
+      ADAM_AGENT_DIR: /etc/adam/agent
+      # What an `mcp.json` in the folder may name: nothing but https and loopback unless set here.
+      # MCP_ALLOW_INSECURE: "true" # development only: plain http to another container
+    ports: ["127.0.0.1:${AGENT_PORT:-8084}:8080"]
+    volumes:
+      - ${AGENT_FOLDER:-./dev/agents/assistant/agent}:/etc/adam/agent:ro
     healthcheck:
       # Plain TCP connect: the image is not guaranteed to ship curl.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]

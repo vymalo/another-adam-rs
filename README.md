@@ -39,6 +39,8 @@ table below links each README, wherever it is.
 | [`adam`](crates/adam/README.md) | The facade for writing an agent: `use adam::prelude::*` gives `#[tool]`, `tools!`, `Tool`, `State`, `LlmAgent`, ... (feature `macros`, on by default), `adam::include_agent!()` for the agent directory embedded by `build.rs`, `AgentDef` to bind it (feature `a2a` for the card, feature `dev` for dev reload), and re-exports the model, runtime, core, error, agent-fs and assembly crates |
 | [`adam-agent-fixture`](crates/adam-agent-fixture/README.md) | Test fixture, not published: a crate whose `build.rs` embeds an agent directory and whose tests compare the embedded manifest with the directory |
 | [`adam-a2a-runtime`](crates/adam-a2a-runtime/README.md) | `RuntimeTaskBackend`: the A2A `TaskBackend` over `adam-runtime` (task = run, ownership per caller, `input-required` from parked runs); subscriptions are rebuilt from the store, so they survive restarts. Reusable by any agent |
+| [`adam-service`](crates/adam-service/README.md) | The A2A service every agent binary shares: `serve(&ServiceConfig, Agents, shutdown)` connects Postgres, builds the runtime, the A2A router and the `LISTEN`/`NOTIFY` signals and runs the components of a `ROLE`; the configuration the binaries have in common (`ServiceConfig`, `ModelConfig`, `McpSettings`) and the exit codes. A binary hands it the agent's name, card and a registration closure |
+| [`adam-agent`](bin/adam-agent/README.md) | One binary that serves **any agent folder** over A2A: `ADAM_AGENT_DIR` names a folder of files (instructions, card, skills, subagents, `mcp.json` tools), read at startup; `ask_user` is its only tool of its own. No embedded agent, one agent per process, any number of services over one database. Library and the `adam-agent` binary (`ROLE`), over `adam-service`; ships inside the coder image |
 | [`adam-coder`](bin/adam-coder/README.md) | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary, which runs the A2A server, the workers or both (`ROLE`); image in `docker/coder`, chart in `deploy/coder` |
 
 ## The model
@@ -133,7 +135,7 @@ external systems the code talks to, and a local git remote. Ports bind to
 
 ```sh
 docker compose up -d --wait        # postgres, mongodb, mock-openai, mock-github, git-server
-docker compose --profile app up -d --build --wait   # ... plus the coder, wired to the mocks
+docker compose --profile app up -d --build --wait   # ... plus the coder and the general agent, wired to the mocks
 docker compose down -v             # stop and forget all state (volumes included)
 ```
 
@@ -141,13 +143,14 @@ docker compose down -v             # stop and forget all state (volumes included
 |---|---|---|
 | `postgres` | `127.0.0.1:5432` | PostgreSQL 16, database `adam_test`, user and password `postgres` |
 | `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone |
-| `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder` and `mock-opencode` are scripted (see "Scripted models") |
+| `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder`, `mock-opencode` and `mock-assistant` are scripted (see "Scripted models") |
 | `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) |
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git`; no authentication |
 | `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token`; its agent files are the folder `bin/adam-coder/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`, see "Changing what the coder says") |
+| `agent` (profile `app`) | `http://127.0.0.1:8084/` | the general agent: `adam-agent` from the **coder's image** (`entrypoint: ["tini", "--", "adam-agent"]`, so there is no second image), bearer token `dev-token`, serving the folder `dev/agents/assistant/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`); model `mock-assistant`; shares the coder's database (runs are scoped by the agent's name). See "A general agent from a folder" |
 
 Host ports can be moved with `POSTGRES_PORT`, `MONGODB_PORT`, `MOCK_OPENAI_PORT`,
-`MOCK_GITHUB_PORT`, `GIT_SERVER_PORT` and `CODER_PORT` (for example in a `.env`
+`MOCK_GITHUB_PORT`, `GIT_SERVER_PORT`, `CODER_PORT` and `AGENT_PORT` (for example in a `.env`
 file next to `compose.yaml`).
 
 ### Pointing the code at the mocks
@@ -189,7 +192,7 @@ mappings are in `dev/wiremock/mock-openai/`.
 | `unauthorized` | `401` `invalid_api_key` |
 | `context-length` | `400` `context_length_exceeded` |
 
-The scenarios above apply to every model except `mock-coder` and `mock-opencode`,
+The scenarios above apply to every model except `mock-coder`, `mock-opencode` and `mock-assistant`,
 which follow their scripts (see "Scripted models" below). The error scenarios
 apply to streaming and non-streaming requests alike and persist as long as the
 header or keyword is sent.
@@ -292,11 +295,34 @@ To run a prebuilt image instead of building one, set `CODER_IMAGE` (default
 `adam-rs/coder:dev`) and pass `--no-build`. `CODER_MODEL=mock-model` brings back
 the canned answers: text only, no tool call, so no pull request.
 
+#### A general agent from a folder
+
+The service `agent` runs `adam-agent` ([`bin/adam-agent/README.md`](bin/adam-agent/README.md)) from the
+same image: the `coder` image carries both binaries, its entrypoint stays `adam-coder`, and the service
+overrides it. The agent is a folder of files, `dev/agents/assistant/agent` (a chat persona, no tools but
+`ask_user`), read at startup from `ADAM_AGENT_DIR` (`/etc/adam/agent`); `AGENT_FOLDER=<copy>` mounts another one.
+Its model `mock-assistant` answers every request in role: the greeting is built from the two persona lines of the
+system prompt (see "Scripted models"), so the mocked answer follows the folder. There is no workspace, no
+GitHub and no worktree, and the same database holds the coder's runs and the agent's, each under its own name.
+
+```sh
+docker compose --profile app up -d --build --wait postgres mock-openai agent
+sh dev/agent-e2e.sh        # NO_RESTART=1 skips the step that restarts the agent on an edited copy of the folder
+```
+
+`dev/agent-e2e.sh` checks the card of the folder, that "hi" ends `TASK_STATE_COMPLETED` (a chat agent answers, it
+does not wait) with the name and the one-sentence summary of the folder, and that a copy of the folder with
+another name and summary, mounted in its place, changes the card and the answer after a restart, with no rebuild.
+A fourth agent is a folder and about twelve lines of `compose.yaml` (copy the `agent` service, change the
+folder, the port and the token). How a folder declares MCP servers for its tools (a researcher on a web-search
+server) is in [`bin/adam-agent/README.md`](bin/adam-agent/README.md#mcp-servers-from-the-folder). How a *live*
+model behaves with the folder is *unverified*, as for the coder.
+
 ### Scripted models
 
 The coder's model is `mock-coder` and OpenCode's is `mock-opencode` (`MODEL` and
 `OPENCODE_MODEL` in `compose.yaml`, moved with `CODER_MODEL` and
-`CODER_OPENCODE_MODEL`). Both are in `mock-openai`, selected by the `model` of the
+`CODER_OPENCODE_MODEL`); the general agent's is `mock-assistant` (`AGENT_MODEL`). All three are in `mock-openai`, selected by the `model` of the
 request, and both are **stateless**: the answer is chosen by which scripted
 tool-call ids the request's history already holds, so a retried or replayed
 request gets the same answer and the script cannot drift out of step.
@@ -307,6 +333,7 @@ request gets the same answer and the script cannot drift out of step.
 | `mock-coder`, the person's first message is a greeting (`hi`, `hello` or `hey`, then anything) | same file | a text answer (`stop`): `Hi! I'm <name>. <summary>. Which repository should I work on, and what should I change?`, **built from the first two lines of the system prompt** (`messages[0]`: `Your name is <name>.` and `In one sentence: <summary>.`, the persona lines the coder's `agent/instructions.md` opens with), so editing the instructions, or mounting another folder, changes the mocked answer. The run then waits for the person (`input-required`); the answer to it (the synthetic `ask_user` call `stop0000N` is in the history) continues with `prepare_workspace` (`coder-call-1`) and the script above. A greeting needs a system message first: a request with the user message alone is not one. |
 | `mock-coder`, task text contains `[mock:no-opencode]` | same file | `prepare_workspace` (`nc-call-1`), `run_checks` with `echo hello > hello.txt && sh ./check.sh` (the check command makes the change, `nc-call-2`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started: deterministic where OpenCode's own behaviour is not the subject. |
 | `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |
+| `mock-assistant` | `mappings/agent-script.json` | for the general agent (`adam-agent`), stateless: a request that holds a tool result (`role: tool`) gets a fixed text (`I looked into it with the tool you gave me. ...`), priority 1; any other request gets `Hi! I'm <name>. <summary>.`, **built from the first two lines of the system prompt** (`Your name is <name>.` and `In one sentence: <summary>.`), priority 2. Not streamed. It answers in role whatever is asked: it proves that the folder reaches the model, not what a model does with it. `dev/agent-e2e.sh` runs it through the stack. |
 
 The steps mirror the reference script of `bin/adam-coder/tests/binary.rs`. The greeting mapping has priority 1 and
 the first step of the script (`prepare_workspace` on a first request) priority 2, so a greeting is never taken for a

@@ -49,6 +49,9 @@ sequenceDiagram
 | `open_pull_request { title, body, accept_red_checks? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. Declared `#[tool(asks_user)]`, so `adam-assembly` refuses to give it to a subagent |
 
+A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
+folder](#mcp-tools-from-the-folder)); they are not part of the seven.
+
 Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
@@ -499,6 +502,7 @@ The contract of a folder:
 | `description` or `card.description` | one of them: the card needs it (exit 78 for a control plane otherwise) |
 | `tools:` | optional; may narrow the coder's seven tools, and a name that is not one is refused with a suggestion. Without it the agent gets all seven |
 | `subagents/` | assembled and **registered beside the coder** (`coder/<name>`, `CoderAgent::subagents`). A subagent runs as a child run with its own run id, so the tools that work on the worktree of the run that calls them find none in it: give it tools that need no worktree |
+| `mcp.json` | optional: the MCP servers whose tools the agent gets, named `<server>__<tool>` after its seven (see [MCP tools](#mcp-tools-from-the-folder)). Connected by the **workers** at startup |
 | `schedules/` | read, not run: a warning says so |
 | the rest | skills, `limits`, `model:` and the card follow the [authoring layer](../../docs/authoring.md) |
 
@@ -510,6 +514,42 @@ agents under `agents/`) stops the process before it connects, exit code 78, with
 `/etc/adam` for `ADAM_AGENT_DIR=/etc/adam/agent`), `digest`
 (`sha256:...`; the shipped `agent/` read from disk has the digest of the embedded copy), `agent` and `warnings`. The
 folder must be readable by the runtime user (uid 10001 in the image).
+
+#### MCP tools from the folder
+
+An `agent/mcp.json` in the folder (and one next to each subagent's file) names MCP servers; every worker
+connects them once at startup, before it serves, and gives the agent their tools beside its seven, named
+`<server>__<tool>` (`tools:` in the frontmatter selects among all of them: `linear__*` takes a server's tools).
+Servers are streamable HTTP (`type: http`) or local processes (`command`); `type: sse` is refused. The format and the
+rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
+[MCP tools at run time](../../docs/authoring.md#mcp-tools-at-run-time-built-feature-mcp).
+
+```json
+{
+  "mcpServers": {
+    "search": {
+      "type": "http",
+      "url": "https://search.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${SEARCH_TOKEN}" },
+      "tools": ["web_search"]
+    }
+  }
+}
+```
+
+* **`${VAR}` and `${VAR:-default}`** in `headers`, `args` and `env` read the process environment (`SEARCH_TOKEN`
+  above): put credentials there. A variable that is unset (and has no default) stops the process with exit 78
+  naming the variable, never its value.
+* **`${VAR}` in a `url`** is refused (exit 78 naming the variable) unless the deployment sets
+  `MCP_ALLOW_URL_VARS=true`: the MCP client library logs the URL it dials, so a secret there would reach the logs.
+  A URL that is not a secret (`"url": "${SEARCH_URL}"`, so that one folder serves a stack and a cluster) is what the
+  flag is for.
+* **Which kinds are allowed** is the deployment's: a local process needs `MCP_ALLOW_STDIO=true`, plain `http` to
+  another machine needs `MCP_ALLOW_INSECURE=true` (development only); `https` and loopback need nothing.
+* **A server that is down** at startup stops the process with exit 69, so a supervisor restarts it until the server
+  is up; a mistake in the files or the policy is 78. A tool call that fails is an error result the model reads.
+* A folder without an `mcp.json` connects nothing (the embedded copy has none). A **control plane** serves the card
+  and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
 
 ### Retry safety
 
@@ -540,8 +580,10 @@ crash after it was posted and before the call was journaled posts it again when 
 
 ## Configuration
 
-Environment variables (`src/config.rs` is the reference; every problem is
-reported at once at startup):
+Environment variables (`src/config.rs` is the reference for the coder's own, and
+[`adam-service`](../../crates/adam-service/README.md#environment) for `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`,
+`PUBLIC_URL`, `LISTEN_ADDR`, `WORKERS`, `WORKER_ID`, `MODEL_*` and `MCP_ALLOW_*`, which every agent binary reads the same
+way; every problem is reported at once at startup):
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -566,10 +608,13 @@ reported at once at startup):
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
-| `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills and subagents, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
+| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server | `false` |
+| `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
+| `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
+| `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills, subagents and `mcp.json`, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
 
 Everything from `MODEL_BASE_URL` down, except `ADAM_AGENT_DIR` (every role reads that one), is read by the roles that run workers (`all`, `worker`)
-only, and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.
+only (the `MCP_ALLOW_*` flags too: a control plane connects no MCP server), and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.
 A control plane neither needs nor validates any of it (see [Roles](#roles)).
 
 OpenCode's configuration is generated at startup into
@@ -595,8 +640,8 @@ its files and whether a run stays on one worker
 | `a2a-only` | | refused: every tool of the coder needs a workspace | |
 
 * A pinning placement (`affinity`, `isolated`) makes `serve` build the runtime with
-  `ClaimScope::Pinned` and `worker_id = WORKER_ID` (`RuntimeOptions::claim_scope`,
-  `RuntimeOptions::worker_id`). The id must survive restarts (a StatefulSet pod name): a run stays
+  `ClaimScope::Pinned` (`adam_service::claim_scope_for`) and `worker_id = WORKER_ID` (`RuntimeOptions::claim_scope`,
+  `RuntimeOptions::worker_id`); a worker logs its `placement`, `worker_id` and `root` (`workspace placement`). The id must survive restarts (a StatefulSet pod name): a run stays
   with the worker of that name. Without `WORKER_ID` the process exits 78, naming the variable.
 * `a2a-only` exits 78 for `all` and `worker`: a host whose agents only call remote agents (the
   orchestrator) can use the placement, the coder cannot. A `control-plane` reads neither variable.
@@ -611,7 +656,10 @@ its files and whether a run stays on one worker
 `ROLE` is parsed with `adam_host::Role` (`all`, `control-plane`, `worker`; case-insensitive;
 unset or blank means `all`). Anything else is a configuration error (exit 78) that names
 `ROLE` and the accepted values. The process registers its parts as components of an
-`adam_host::Host`, which starts only those the role runs.
+`adam_host::Host`, which starts only those the role runs. The components, the store, the
+notifications and the drain are [`adam-service`](../../crates/adam-service/README.md#the-process)'s
+`serve`, shared with every agent binary; `adam-coder` reads its files, builds its agent and hands it over
+(`src/serve.rs`).
 
 | Role | Starts | Listener | Workspace root |
 |---|---|---|---|
@@ -637,7 +685,7 @@ are still sent; a control-plane component in `control-plane`). It logs
 * The control plane's A2A stream carries the `Progress`, `Custom` and `Artifact` events of a
   run a worker steps as they happen, not only the states and artifacts it finds by polling.
 
-It is Postgres only (MongoDB has no equivalent here, and `adam-coder` is Postgres only), needs
+It is Postgres only (MongoDB has no equivalent here, and `adam-service` is Postgres only), needs
 no variable, and changes nothing about correctness: `NOTIFY` is at most once and not durable,
 polling stays on at 250 ms, and a run completes with the listener gone, only later. The
 listener holds one connection of the store's pool, and needs a direct or session-mode
@@ -666,7 +714,7 @@ What a role does not read it does not validate either: a worker ignores `A2A_BEA
 agent's name and its `init`, which `CoderStarter` provides (`CoderAgent::init` delegates to it, so
 the two cannot disagree). `serve` builds the model client, the GitHub client, the workspaces and
 the `CoderAgent` (`build_agent`, which also creates the workspace root) only when
-`Config::worker` is `Some`; otherwise it composes `Coder::control_plane`. A control plane
+`Config::worker` is `Some`; otherwise it registers the starter only (`Coder::control_plane`). A control plane
 never steps a run, so a `run_worker` on it would claim nothing (`adam-runtime` claims only
 registered agents, not starters). The library keeps `Coder::new(store, CoderAgent, ..)` for
 processes that step runs. See [ADR 0001](../../docs/decisions/0001-library-first-host-roles.md),
@@ -736,7 +784,9 @@ or the workers) is an `adam_host::HostError`, which names the component and is
 A failure ends the process with one structured log line, `adam-coder failed`
 (JSON on stdout, fields `error`, the whole scrubbed cause chain, and `code`),
 and nothing on stderr. The exit code (`src/exit.rs`, `exit_code`) comes from
-walking the `anyhow` chain from the outside in and taking the first match:
+walking the `anyhow` chain from the outside in and taking the first match (the walk is
+`adam_service::exit_code_with`, which knows the errors of the service; `src/exit.rs` adds the coder's own, a
+workspace, the agent files and their assembly):
 
 | Exit code | Meaning | Root cause |
 |---|---|---|
@@ -748,7 +798,8 @@ walking the `anyhow` chain from the outside in and taking the first match:
 | 1 | anything else | for example `NotFound`, `Rejected`, `Unauthenticated` (a bad `GITHUB_TOKEN`) or an untyped error |
 
 The typed errors it looks for are `StoreError`, `OpenAiConfigError`,
-`WorkspaceError`, `RuntimeError` and `HostError`. Because the walk goes
+`WorkspaceError`, `RuntimeError`, `HostError`, `AgentFilesError` and the assembly's (including an MCP server
+that is down: 69). Because the walk goes
 outside in, an unreachable Postgres is 69 although an `io::Error` is at the
 bottom of its chain. The values are BSD `sysexits.h`'s, *unverified* (from
 memory).
@@ -831,7 +882,8 @@ database of its own, so the role needs `CREATEDB`):
   answer; `the_display_name_var_is_the_name_in_the_prompt` renames the prompt. The unit tests of `src/files.rs` (a missing folder, every diagnostic
   of a broken one in the message once, another name, warnings), `src/config.rs` (`ADAM_AGENT_DIR` read by every role,
   must be a directory, reported with the other problems) and `src/exit.rs` (78 for the files and their assembly)
-  cover the rest. In `tests/binary.rs`: a missing folder (exit 78, names the variable), a folder with two broken
+  cover the rest (the exit-code walk, the shared configuration, the roles' components and the Postgres-backed `serve`
+  are tested in [`adam-service`](../../crates/adam-service/README.md#tests); here only what the coder adds). In `tests/binary.rs`: a missing folder (exit 78, names the variable), a folder with two broken
   subagents (exit 78 for every role, before anything connects, both findings as `path:line` in the one failure line),
   another agent's name, a worker whose folder cannot be assembled (exit 78, names the var; Postgres), a control
   plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the

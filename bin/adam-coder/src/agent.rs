@@ -3,13 +3,14 @@
 
 use std::sync::Arc;
 
-use adam::{Assembly, AssemblyError};
+use adam::{AgentDef, Assembly, AssemblyError};
 use adam_core::RunId;
 use adam_error::report;
 use adam_llm_agent::{Conversation, DynTool, LlmStarter, ToolSet};
 use adam_model::{DynModel, Message, ToolCall};
 use adam_runtime::{
-    Agent, AgentError, AgentStarter, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent, Transition,
+    Agent, AgentError, AgentStarter, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent, RuntimeBuilder,
+    Transition,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -180,7 +181,9 @@ impl CoderAgent {
     /// A folder is held to what the code supplies and registers: the `max_check_cycles` var
     /// (`vars` must declare it, or the bind fails naming it), the coder's tools (`tools:` may
     /// narrow them, and a name that is not one is refused with a suggestion), and the state they read.
-    /// Every subagent the folder has is assembled too ([`subagents`](Self::subagents)).
+    /// Every subagent the folder has is assembled too ([`subagents`](Self::subagents)). A folder
+    /// with an `mcp.json` is refused here: its servers are connected first, which is async
+    /// ([`try_from_def`](Self::try_from_def)).
     ///
     /// # Errors
     ///
@@ -194,8 +197,27 @@ impl CoderAgent {
         env: Arc<ToolEnv>,
         tools: impl IntoIterator<Item = DynTool>,
     ) -> Result<Self, Box<AssemblyError>> {
-        let assembly = files
-            .def()?
+        Self::try_from_def(files.def()?, model, model_alias, env, tools)
+    }
+
+    /// The coder assembled from `def`: [`try_from_files`](Self::try_from_files) with a definition
+    /// the caller has already prepared. `serve` uses it to connect the MCP servers of the folder's
+    /// `mcp.json` first (`AgentDef::connect_mcp`, which is async); a definition whose `mcp.json`
+    /// lists servers and that was not connected (or given tools by hand) is refused here, as it
+    /// is by any bind (`McpNotConnected`: fail closed).
+    ///
+    /// # Errors
+    ///
+    /// As [`try_from_files`](Self::try_from_files), and the MCP errors of the bind (a tool named
+    /// like one of the coder's, for instance).
+    pub fn try_from_def(
+        def: AgentDef,
+        model: DynModel,
+        model_alias: impl Into<String>,
+        env: Arc<ToolEnv>,
+        tools: impl IntoIterator<Item = DynTool>,
+    ) -> Result<Self, Box<AssemblyError>> {
+        let assembly = def
             .var("max_check_cycles", env.settings.max_check_cycles)
             .bind(tools.into_iter().collect::<ToolSet>())?
             .state(env.clone())
@@ -211,6 +233,17 @@ impl CoderAgent {
     /// tools that need no worktree.
     pub fn subagents(&self) -> &[adam_llm_agent::LlmAgent] {
         self.assembly.agents().get(1..).unwrap_or_default()
+    }
+
+    /// Register the agent on a runtime builder: the coder, and the subagents of its folder beside it
+    /// ([`subagents`](Self::subagents)). What [`Coder::new_with`](crate::Coder::new_with) and the
+    /// binary's `serve` put on the runtime of a process that steps runs.
+    pub fn register(self, builder: RuntimeBuilder) -> RuntimeBuilder {
+        let builder = self
+            .subagents()
+            .iter()
+            .fold(builder, |builder, sub| builder.agent(sub.clone()));
+        builder.agent(self)
     }
 
     /// What the agent was assembled from: the prompt the model sees, the limits, the tools it is

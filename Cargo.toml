@@ -28,11 +28,13 @@ adam-host = { path = "crates/adam-host", version = "0.1.0" }
 adam-llm-agent = { path = "crates/adam-llm-agent", version = "0.1.0" }
 adam-macros = { path = "crates/adam-macros", version = "0.1.0" }
 adam-mcp = { path = "crates/adam-mcp", version = "0.1.0" }
+adam-mcp-testkit = { path = "crates/adam-mcp-testkit", version = "0.1.0" }
 adam-model = { path = "crates/adam-model", version = "0.1.0" }
 adam-model-openai = { path = "crates/adam-model-openai", version = "0.1.0" }
 adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.1.0" }
 adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.1.0" }
 adam-runtime = { path = "crates/adam-runtime", version = "0.1.0" }
+adam-service = { path = "crates/adam-service", version = "0.1.0" }
 adam-store-postgres = { path = "crates/adam-store-postgres", version = "0.1.0" }
 adam-store-testkit = { path = "crates/adam-store-testkit", version = "0.1.0" }
 adam-workspace = { path = "crates/adam-workspace", version = "0.1.0" }

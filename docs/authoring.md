@@ -3,7 +3,7 @@
 Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
 facade), S3 (`adam-coder` tools through `#[tool]`), S4 (`adam-agent-fs`, the parser and validator of
 agent directories), S5 (the `build.rs` codegen and `adam::include_agent!()`), S6 (`adam-assembly`,
-which binds a manifest to `LlmAgent`s), S6b (the coder's prompt and card from `agent/`), S7 (skills at run time), S8 (durable child runs in the runtime), S9 (subagents as tools), S9b (remote A2A subagents), S10 (dev reload), S11 (`mcp.json` tools) and S12 (run-time folders: `ADAM_AGENT_DIR`) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+which binds a manifest to `LlmAgent`s), S6b (the coder's prompt and card from `agent/`), S7 (skills at run time), S8 (durable child runs in the runtime), S9 (subagents as tools), S9b (remote A2A subagents), S10 (dev reload), S11 (`mcp.json` tools), S12 (run-time folders: `ADAM_AGENT_DIR`) and S13 (`adam-agent`, one binary for any folder) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
 the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
@@ -886,6 +886,14 @@ stateDiagram-v2
   `McpPolicy::allow_url_secrets(true)`, and then the `rmcp` log target must be filtered. A secret in a stdio `args`
   is visible to every process of the machine (`/proc/*/cmdline`, `ps`): use `env`. Tool descriptions and answers are text the server
   controls and go into the model's context: the allow-list is the mitigation.
+* **In the binaries.** `adam-coder` and `adam-agent` read the folder at startup
+  ([ADR 0004](decisions/0004-agent-folders-at-run-time.md), [ADR 0005](decisions/0005-one-binary-serves-any-agent-folder.md))
+  and call `connect_mcp` in every role that runs workers,
+  with the policy of three variables: `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE` and `MCP_ALLOW_URL_VARS` (each
+  `McpPolicy` opt-in above, all off by default). `${VAR}` in `headers`, `args` and `env` reads the process
+  environment. A server that is down is exit code 69, anything the files or the policy get wrong is 78; see
+  [the coder's README](../bin/adam-coder/README.md#mcp-tools-from-the-folder) and
+  [`adam-agent`'s](../bin/adam-agent/README.md#mcp-servers-from-the-folder).
 * **Reload.** Connections are made once, at startup, and outlive dev reloads (`LiveBuilder::connect_mcp`, features
   `dev` and `mcp`; a reload is synchronous and may run on the watcher's thread, so it never connects). An edit of
   an `mcp.json` is refused with a message saying to restart: tools are discovered once, and a run in flight may
@@ -1076,6 +1084,11 @@ warnings returned, errors refused, plus the digest of what was read), `agent_dir
 was, and the next start applies an edit (a restart is a deploy: see the ADR for what that means for runs in
 flight). The dev reload above is still the tool for editing while the process runs.
 
+**An agent with no Rust at all.** `adam-agent` ([ADR 0005](decisions/0005-one-binary-serves-any-agent-folder.md)) is the
+binary that serves *any* folder: instructions, card, skills, subagents and `mcp.json` tools are the whole agent, and
+`ask_user` is the one tool it brings. A chat assistant or a researcher on a web-search MCP server is a folder (the
+repository ships `dev/agents/assistant/agent/`), not a crate, and its only deployment step is mounting it.
+
 ## Dogfood: `adam-coder` (S3 and S6b)
 
 `adam-coder` is written with the layer it documents, in two steps, neither of which changed what the
@@ -1140,3 +1153,4 @@ being sent the edit (`tests/agent_files.rs`), and run the binary on folders with
 | S10 | dev reload: feature `dev`, `LiveAssembly`, `reload`, `watch`, the swap at step boundaries, the replay rule | built |
 | S11 | `mcp.json` tools: `adam-mcp`, `adam-mcp-testkit`, feature `mcp` of `adam-assembly` and `adam`, `AgentDef::connect_mcp` and `mcp_tools`, `LiveBuilder::connect_mcp` | built |
 | S12 | run-time folders: `AgentFolder`, `agent_dir_from_env`, `Error::NotOneAgent` in `adam-assembly`; `ADAM_AGENT_DIR` and the embedded fallback in `adam-coder` (see [Run-time folders](#run-time-folders-built-adam_agent_dir)) | built |
+| S13 | `adam-agent`: one binary that serves any agent folder (no embedded default, `ask_user` and the folder's MCP tools), over `adam-service` ([ADR 0005](decisions/0005-one-binary-serves-any-agent-folder.md)) | built |

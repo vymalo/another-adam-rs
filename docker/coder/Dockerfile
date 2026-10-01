@@ -1,13 +1,19 @@
 # syntax=docker/dockerfile:1
 #
 # ghcr.io/vymalo/another-adam-rs/coder: the coder agent (bin/adam-coder) on
-# the workspace toolchain image. Build from the REPOSITORY ROOT:
+# the workspace toolchain image, and beside it the general agent binary
+# (bin/adam-agent, which serves any agent folder). Build from the REPOSITORY ROOT:
 #
 #   docker buildx build -f docker/coder/Dockerfile .
 #
-# Stage 1 compiles the binary on a Debian trixie Rust image, so its glibc
+# The entrypoint is adam-coder. A service that serves an agent folder runs the
+# same image with the entrypoint `tini -- adam-agent` and the folder mounted at
+# ADAM_AGENT_DIR (compose.yaml, service `agent`): one image and one package, so
+# there is nothing else to publish or to make public.
+#
+# Stage 1 compiles both binaries on a Debian trixie Rust image, so their glibc
 # matches the runtime image (debian:trixie-slim). Stage 2 is the workspace
-# image (Rust, Flutter/Dart, Node, git, tini, OpenCode) with the binary added.
+# image (Rust, Flutter/Dart, Node, git, tini, OpenCode) with the binaries added.
 
 # Rust builder, pinned by tag and digest.
 # Verified 2026-09-29: HEAD on registry-1.docker.io/v2/library/rust/manifests/1.94-trixie
@@ -26,25 +32,26 @@ ARG WORKSPACE_TAG=1.98.1-bc97d51
 FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS build
 WORKDIR /src
 # The workspace is `crates/*` and `bin/*`, so every member's manifest is needed to
-# resolve the lockfile even though only adam-coder is built. Only a C compiler is needed
+# resolve the lockfile even though only the two binaries are built. Only a C compiler is needed
 # (aws-lc-sys uses its pregenerated sources; the vendored protoc covers a2a-pb).
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY bin bin
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p adam-coder --bin adam-coder \
- && install -D -m 0755 target/release/adam-coder /out/adam-coder
+    cargo build --release --locked -p adam-coder --bin adam-coder -p adam-agent --bin adam-agent \
+ && install -D -m 0755 target/release/adam-coder /out/adam-coder \
+ && install -D -m 0755 target/release/adam-agent /out/adam-agent
 
 FROM ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}
 
 LABEL org.opencontainers.image.source="https://github.com/vymalo/another-adam-rs" \
-      org.opencontainers.image.description="adam-coder: coding task to verified pull request over A2A" \
+      org.opencontainers.image.description="adam-coder: coding task to verified pull request over A2A; adam-agent: any agent folder over A2A (entrypoint override)" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 # hadolint ignore=DL3066
 USER root
-COPY --from=build /out/adam-coder /usr/local/bin/adam-coder
+COPY --from=build /out/adam-coder /out/adam-agent /usr/local/bin/
 # /work holds mirrors and worktrees; the deployment mounts a volume there. The
 # base image already creates it owned by uid 10001, as does this line for a
 # base that does not.
@@ -60,15 +67,18 @@ USER 10001
 WORKDIR /work
 EXPOSE 8080
 
-# Smoke test in a login shell as uid 10001: the binary starts and rejects an
-# empty environment (it fails closed) instead of crashing, and the tools the
-# agent shells out to are on PATH.
+# Smoke test in a login shell as uid 10001: both binaries start and reject an
+# empty environment (they fail closed) instead of crashing, adam-agent names the
+# folder it needs, and the tools the agent shells out to are on PATH.
 RUN bash -lc 'set -e; \
       test "$(id -u)" = 10001; \
-      command -v adam-coder git opencode tini; \
+      command -v adam-coder adam-agent git opencode tini; \
       out="$(env -i PATH="$PATH" adam-coder 2>&1 || true)"; \
-      echo "$out" | grep -q "invalid configuration"'
+      echo "$out" | grep -q "invalid configuration"; \
+      out="$(env -i PATH="$PATH" adam-agent 2>&1 || true)"; \
+      echo "$out" | grep -q "ADAM_AGENT_DIR is required"'
 
 # tini as PID 1 reaps the shells and git processes the agent spawns and
-# forwards SIGTERM, which starts a graceful shutdown.
+# forwards SIGTERM, which starts a graceful shutdown. `adam-agent` is run with
+# `--entrypoint tini` (compose: `entrypoint: ["tini", "--", "adam-agent"]`).
 ENTRYPOINT ["tini", "--", "adam-coder"]

@@ -22,6 +22,7 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use adam::mcp::McpPolicy;
 use adam_coder::{
     AGENT_NAME, AgentFiles, AgentFilesError, Coder, CoderAgent, RuntimeOptions, agent_card,
     agent_card_from, coder_tools,
@@ -29,6 +30,7 @@ use adam_coder::{
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_error::{Classify, ErrorClass};
 use adam_llm_agent::{Limits, user_message};
+use adam_mcp_testkit::TestHttpServer;
 use adam_model::{
     DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
     ToolCall,
@@ -676,4 +678,189 @@ async fn the_display_name_var_is_the_name_in_the_prompt() {
     );
     assert!(prompt.contains("You are Cody."), "{prompt}");
     assert!(!prompt.contains("Coder"), "{prompt}");
+}
+
+// ------------------------------------------------------------------ mcp.json tools
+
+/// The token the test MCP server wants, and the variable a folder's `mcp.json` reads it from.
+const MCP_TOKEN: &str = "mcp-tok-7d1c4e90-secret";
+const MCP_TOKEN_VAR: &str = "TEST_MCP_TOKEN";
+
+/// `agent/mcp.json` of `folder`: one server `test` at `url` that takes the token from
+/// `${TEST_MCP_TOKEN}` and offers only `echo`.
+fn write_mcp_json(folder: &tempfile::TempDir, url: &str) {
+    std::fs::write(
+        folder.path().join("agent/mcp.json"),
+        format!(
+            r#"{{"mcpServers": {{"test": {{"type": "http", "url": "{url}",
+                "headers": {{"Authorization": "Bearer ${{{MCP_TOKEN_VAR}}}"}},
+                "tools": ["echo"]}}}}}}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// The folder's definition with the servers of its `mcp.json` connected, as `serve` does it. The
+/// token is given in code (`AgentDef::env`), so no test touches the process environment.
+async fn connected_def(
+    files: &AgentFiles,
+    policy: &McpPolicy,
+) -> Result<adam::AgentDef, Box<adam::AssemblyError>> {
+    files
+        .def()?
+        .env(MCP_TOKEN_VAR, MCP_TOKEN)
+        .connect_mcp(policy)
+        .await
+        .map_err(Box::new)
+}
+
+/// A folder with an `mcp.json` gives the coder the tools of its servers, named `<server>__<tool>`
+/// after its seven, and a call by the model reaches the server and comes back as the tool's
+/// result. The token reaches the server from `${TEST_MCP_TOKEN}`.
+#[tokio::test]
+async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
+    let fx = Fixture::new("hello\n").await;
+    let server = TestHttpServer::start(Some(MCP_TOKEN)).await;
+    let tmp = folder();
+    write_mcp_json(&tmp, &server.url());
+    let files = files_of(&tmp);
+
+    let def = connected_def(&files, &McpPolicy::default()).await.unwrap();
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "m1".into(),
+        name: "test__echo".into(),
+        arguments: json!({"text": "ping"}),
+    }])
+    .push_text("The server said ping.");
+    let model: DynModel = mock.clone();
+    let agent = CoderAgent::try_from_def(
+        def,
+        model,
+        "test-model",
+        fx.env.clone(),
+        coder_tools(&fx.env),
+    )
+    .expect("the folder assembles with its MCP tools");
+    let tools = &agent.assembly().info()[0].tools;
+    assert_eq!(tools.len(), TOOLS.len() + 1, "{tools:?}");
+    assert_eq!(&tools[..TOOLS.len()], TOOLS);
+    assert_eq!(tools.last().map(String::as_str), Some("test__echo"));
+
+    let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
+    run_to_a_question(&coder, "echo ping").await;
+
+    assert_eq!(server.calls(), 1, "the call reached the server");
+    assert!(
+        server
+            .authorizations()
+            .iter()
+            .all(|a| a == &format!("Bearer {MCP_TOKEN}")),
+        "{:?}",
+        server.authorizations()
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0].tools.iter().any(|t| t.name == "test__echo"),
+        "the model is offered the tool"
+    );
+    match requests[1].messages.last().unwrap() {
+        Message::Tool {
+            call_id,
+            content,
+            is_error,
+        } => {
+            assert_eq!(call_id, "m1");
+            assert_eq!(content, "ping");
+            assert!(!is_error);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A folder whose `mcp.json` lists servers that were never connected is refused at assembly, not
+/// bound without them (fail closed): `try_from_files` is the sync path and cannot connect.
+#[tokio::test]
+async fn an_mcp_json_that_was_not_connected_is_refused_at_assembly() {
+    let fx = Fixture::new("hello\n").await;
+    let tmp = folder();
+    write_mcp_json(&tmp, "http://127.0.0.1:9/mcp");
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let error = CoderAgent::try_from_files(
+        &files_of(&tmp),
+        model,
+        "test-model",
+        fx.env.clone(),
+        coder_tools(&fx.env),
+    )
+    .err()
+    .expect("servers that were not connected are refused");
+    let text = error.to_string();
+    assert!(text.contains("mcp.json"), "{text}");
+    assert_eq!(error.class(), ErrorClass::Invalid);
+}
+
+/// What the deployment's policy refuses is refused before anything starts, with the class that
+/// decides the exit code: a local process, a `${VAR}` in a URL and an unset variable are the
+/// deployment's mistakes (78); a server that is down may be up later (69).
+#[tokio::test]
+async fn the_policy_and_the_servers_decide_what_a_folder_may_connect() {
+    let tmp = folder();
+    std::fs::write(
+        tmp.path().join("agent/mcp.json"),
+        r#"{"mcpServers": {"local": {"command": "adam-mcp-test-server"}}}"#,
+    )
+    .unwrap();
+    let files = files_of(&tmp);
+    let error = connected_def(&files, &McpPolicy::default())
+        .await
+        .expect_err("a local process is not allowed by default");
+    assert!(error.to_string().contains("local process"), "{error}");
+    assert_eq!(error.class(), ErrorClass::Invalid);
+
+    // A `${VAR}` in a URL: refused unless the deployment opts in (MCP_ALLOW_URL_VARS), and then
+    // read from the variables like a header is.
+    let server = TestHttpServer::start(Some(MCP_TOKEN)).await;
+    let tmp = folder();
+    write_mcp_json(&tmp, "${TEST_MCP_URL}");
+    let files = files_of(&tmp);
+    let with_url = |files: &AgentFiles| {
+        files
+            .def()
+            .unwrap()
+            .env(MCP_TOKEN_VAR, MCP_TOKEN)
+            .env("TEST_MCP_URL", server.url())
+    };
+    let error = with_url(&files)
+        .connect_mcp(&McpPolicy::default())
+        .await
+        .expect_err("a variable in a URL is refused by default");
+    assert!(error.to_string().contains("TEST_MCP_URL"), "{error}");
+    assert!(!error.to_string().contains(&server.url()), "{error}");
+    assert_eq!(error.class(), ErrorClass::Invalid);
+    with_url(&files)
+        .connect_mcp(&McpPolicy::default().allow_url_secrets(true))
+        .await
+        .expect("and read from the variables once the deployment opts in");
+
+    // A variable nobody set.
+    let error = files
+        .def()
+        .unwrap()
+        .env("TEST_MCP_URL", server.url())
+        .connect_mcp(&McpPolicy::default().allow_url_secrets(true))
+        .await
+        .expect_err("the token variable is unset");
+    assert!(error.to_string().contains(MCP_TOKEN_VAR), "{error}");
+    assert_eq!(error.class(), ErrorClass::Invalid);
+
+    // A server that is down: transient, so exit 69 and a supervisor retries.
+    let tmp = folder();
+    write_mcp_json(&tmp, "http://127.0.0.1:1/mcp");
+    let error = connected_def(&files_of(&tmp), &McpPolicy::default())
+        .await
+        .expect_err("nothing listens on port 1");
+    assert_eq!(error.class(), ErrorClass::Transient, "{error}");
 }
