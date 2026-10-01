@@ -368,8 +368,8 @@ jobs:
 
   # The devcontainer environment (crates/adam-devcontainer, ADR 0010) against a real rootless Podman
   # service and the real devcontainer CLI: dev/podman/README.md says what the service is given and why,
-  # and what in this job was not verified before it ran here for the first time (the sysctl, podman-remote
-  # from the distribution against a Podman 5.8.7 server, Compose resolving the relative seccomp path).
+  # and what in this job was not verified before it ran here for the first time (the sysctl, Compose
+  # resolving the relative seccomp path).
   # The test (crates/adam-devcontainer/tests/podman.rs) is gated; ADAM_TEST_REQUIRE_DEVCONTAINER makes
   # it fail instead of skipping, so a typo in the variables cannot turn the job green.
   devcontainer:
@@ -377,6 +377,8 @@ jobs:
     timeout-minutes: 40
     env:
       DEVCONTAINERS_CLI_VERSION: "0.89.0"
+      PODMAN_REMOTE_VERSION: "5.8.7"
+      PODMAN_REMOTE_SHA256: 01b5ac597de2f7d55a7d52ba82c8e59df9e90355c5331849d6b7dbecf2345e7e
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -395,8 +397,15 @@ jobs:
           set -eu
           npm install -g --no-fund --no-audit "@devcontainers/cli@${DEVCONTAINERS_CLI_VERSION}"
           devcontainer --version
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends podman-remote
+          # The client must match the service (5.8.7, dev/podman/Containerfile): the distribution's 4.9.3
+          # pulls and inspects, but a build against the 5.x service hung for the job's whole timeout. The
+          # static client of the same release, pinned by its sha256 (podman's own `shasums`, verified
+          # 2026-10-01).
+          curl -fsSL -o "$RUNNER_TEMP/podman-remote.tgz" \
+            "https://github.com/containers/podman/releases/download/v${PODMAN_REMOTE_VERSION}/podman-remote-static-linux_amd64.tar.gz"
+          echo "${PODMAN_REMOTE_SHA256}  $RUNNER_TEMP/podman-remote.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/podman-remote.tgz" -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/bin/podman-remote-static-linux_amd64" /usr/local/bin/podman-remote
           podman-remote --version
       - name: A rootless Podman service beside a directory it shares with the test
         run: |
@@ -441,9 +450,11 @@ jobs:
         run: |
           docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app logs --no-color podman
           # What the service holds and what was still running when the test gave up.
-          podman-remote --url "unix://$PODMAN_SOCKET_DIR/podman.sock" ps -a || true
-          podman-remote --url "unix://$PODMAN_SOCKET_DIR/podman.sock" images || true
-          docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app exec -T podman ps -ef || true
+          # The socket is 0600 and uid 10001's.
+          sudo setpriv --reuid 10001 --regid 10001 --clear-groups \
+            podman-remote --url "unix://$PODMAN_SOCKET_DIR/podman.sock" ps -a || true
+          sudo setpriv --reuid 10001 --regid 10001 --clear-groups \
+            podman-remote --url "unix://$PODMAN_SOCKET_DIR/podman.sock" images || true
           pgrep -a -f 'devcontainer|podman|node' || true
           sudo find "$PODMAN_WORK" -name build.log -exec sh -c 'echo "== $1"; cat "$1"' _ {} \; || true
       - name: Tear down

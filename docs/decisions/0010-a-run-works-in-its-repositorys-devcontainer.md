@@ -80,9 +80,11 @@ bind-mounted directory stay 10001's outside), `--network=none` and the shared ne
 
 * Ubuntu 24.04 runners set `kernel.apparmor_restrict_unprivileged_userns=1`, which the service needs off (a secondary
   source, marcioapm/lux#35). Where it stays on, the coder falls back to `Local` with a step: it degrades, it does not break.
-* Podman's remote client of the distribution (`podman-remote` 5.4.x in Debian trixie; an older one in other distributions) against the
-  5.8.7 server. The fallbacks: the static client of containers/podman's releases, pinned by sha256, or the server pinned to
-  a 5.4 tag.
+* ~~Podman's remote client of the distribution against the 5.8.7 server.~~ *Settled 2026-10-01 by the CI job:* Ubuntu
+  24.04's `podman-remote` is 4.9.3; it pulled and inspected, but the CLI's image build against the 5.8.7 service hung until
+  the timeout. The client is the static `podman-remote` of the same release as the service (containers/podman v5.8.7,
+  `podman-remote-static-linux_amd64.tar.gz`, sha256 `01b5ac59…5e7e` from the release's `shasums`, *verified 2026-10-01*),
+  in CI and in the coder's image.
 * That Compose resolves the relative path `seccomp=./dev/podman/seccomp.json` (`PODMAN_SECCOMP` overrides it).
 * DNS to a compose service name from a devcontainer in the service's network namespace; egress from nested containers.
 * That the inspect check does not refuse a container for a `SecurityOpt` the service's `containers.conf` adds (the check
