@@ -688,13 +688,9 @@ async fn a_scratch_project_is_published_to_the_repository_the_person_names(store
         seen.labels
     );
     assert!(seen.saw_message(question), "{:#?}", seen.messages);
-    for line in ["wrote fib.sh (fib)", "wrote check.sh (fib)"] {
-        assert!(
-            seen.messages.iter().any(|m| m == line),
-            "{line}: {:#?}",
-            seen.messages
-        );
-    }
+    // The lines of the first steps (`wrote fib.sh (fib)`) are progress, which is not kept: a
+    // stream attaches to it after the task is made, and `start_scratch` and `write_file` can be
+    // done before it does. What the model was told about them is checked below instead.
     // While it waits, the project is local: nothing was pushed, and no pull request exists.
     assert!(
         common::git(&empty, &["for-each-ref"]).is_empty(),
@@ -733,6 +729,13 @@ async fn a_scratch_project_is_published_to_the_repository_the_person_names(store
             .unwrap_or_else(|| panic!("no result for {id}"))
     };
     assert!(result_of("s1").contains("temporary"), "{}", result_of("s1"));
+    for (id, file) in [("s2", "fib.sh"), ("s3", "check.sh")] {
+        assert!(
+            result_of(id).starts_with(&format!("Created {file} (")),
+            "{}",
+            result_of(id)
+        );
+    }
     let published = result_of("s5");
     assert!(
         published.contains("slot: fibonacci")

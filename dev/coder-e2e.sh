@@ -193,7 +193,9 @@ if [ "$scenario" = scratch ]; then
   if [ "$state" = TASK_STATE_INPUT_REQUIRED ]; then ok "the task waits for the person (TASK_STATE_INPUT_REQUIRED)"; else bad "the task is '${state:-none}', want TASK_STATE_INPUT_REQUIRED"; fi
   jq -r '.. | .text? // empty' "$events" > "$tmp/lines-1.txt" 2>/dev/null || : > "$tmp/lines-1.txt"
   if grep -q 'which repository should I publish it to' "$tmp/lines-1.txt"; then ok "the coder asks which repository to publish it to"; else bad "the stream has no question about where to publish"; fi
-  if grep -qx 'wrote fib.sh (fib)' "$tmp/lines-1.txt"; then ok "the project was built in the scratch slot (wrote fib.sh (fib))"; else bad "no 'wrote fib.sh (fib)' line before the question"; fi
+  # The lines of the first steps (`wrote fib.sh (fib)`) are progress, which is not kept: the stream
+  # attaches to it after the task is made, and the first tool calls can be done before it does.
+  # What they made is checked below, on the pushed branch.
   posts=$(curl -s --max-time 30 -X POST "$github/__admin/requests/find" -H 'Content-Type: application/json' \
     -d '{"method":"POST","urlPathPattern":"/repos/.*/pulls"}' | jq -r '.requests | length' 2>/dev/null || echo '?')
   if [ "$posts" = 0 ]; then ok "no pull request was opened before the person named a repository"; else bad "$posts pull request(s) were opened before the person named a repository"; fi
@@ -257,9 +259,8 @@ if [ "$scenario" = files ] || [ "$scenario" = scratch ]; then
     if grep -qx "read README.md ($slot)" "$lines"; then ok "the coder read README.md itself"; else bad "no 'read README.md ($slot)' line in the stream"; fi
     if grep -qx "wrote hello.txt ($slot)" "$lines"; then ok "the coder wrote hello.txt itself"; else bad "no 'wrote hello.txt ($slot)' line in the stream"; fi
   else
-    # The project's files were written in the scratch slot `fib`; the repository was given its first
-    # commit, and the files were copied into its slot, which is called after it.
-    if grep -qx 'wrote check.sh (fib)' "$lines"; then ok "the coder wrote check.sh in the scratch project"; else bad "no 'wrote check.sh (fib)' line in the stream"; fi
+    # The repository was given its first commit, and the project's files were copied from the scratch
+    # slot `fib` into the repository's slot, which is called after it.
     if grep -q "^giving .*$name.git its first commit on main\$" "$lines"; then ok "the empty repository was given its first commit on main"; else bad "no 'giving $repo_url its first commit on main' line in the stream"; fi
     if grep -qx "copying fib into $slot (.)" "$lines"; then ok "the project was copied into the slot of the repository"; else bad "no 'copying fib into $slot (.)' line in the stream"; fi
   fi
