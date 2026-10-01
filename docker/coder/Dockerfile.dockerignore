@@ -1,4 +1,4 @@
-# Keep the build context small; the build needs only Cargo.toml, Cargo.lock and crates/.
+# Keep the build context small; the build needs only Cargo.toml, Cargo.lock, crates/ and bin/.
 **/target
 .git
 .github
@@ -8,7 +8,8 @@ docs
 compose.yaml
 dev
 **/*.md
-# The coder's prompt and A2A card, embedded by crates/adam-coder/build.rs (`agent/instructions.md`).
-!crates/adam-coder/agent/**
+# The coder's prompt and A2A card, embedded by bin/adam-coder/build.rs (`agent/instructions.md`).
+!bin/adam-coder/agent/**
 # Crate READMEs are compiled in as rustdoc (`#![doc = include_str!("../README.md")]`).
 !crates/*/README.md
+!bin/*/README.md

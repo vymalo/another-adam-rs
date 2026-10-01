@@ -1073,7 +1073,7 @@ agent does.
 of the hand-written tools.
 
 **S6b, prompt, limits and card.** They are one file,
-[`crates/adam-coder/agent/instructions.md`](../crates/adam-coder/agent/instructions.md): the frontmatter has the
+[`bin/adam-coder/agent/instructions.md`](../bin/adam-coder/agent/instructions.md): the frontmatter has the
 `name`, `description`, `limits`, `vars.max_check_cycles` (default 3) and the `card:` (name `adam-coder`, one
 skill `coding-task`); the body is the system prompt with `{{max_check_cycles}}`. `build.rs` embeds it
 (`adam_agent_fs::build("agent").emit()`), the crate includes it (`adam::include_agent!()`), and
@@ -1093,7 +1093,7 @@ wrapper around the assembled agent for policy**. The A2A card comes from the sam
 process that has the assembly, `AgentDef::card` (added for this slice) for a control plane, which has no
 model or tools and serves the same card.
 
-The proof is in `crates/adam-coder/tests/agent_files.rs` and `src/app.rs`, against goldens captured from the Rust
+The proof is in `bin/adam-coder/tests/agent_files.rs` and `src/app.rs`, against goldens captured from the Rust
 code before it was deleted (`tests/fixtures/agent/prompt.txt`, `card.json`): the assembled prompt equals the old
 prompt for any limit (but for its final newline, which every loaded body loses); the card equals the old
 literal; the limits, the tool order, the model request (system prompt, tools, `max_output_tokens`) and the
@@ -1112,7 +1112,7 @@ what the model does and needs a comparison with a live model; it is not a slice.
 | S4 | `adam-agent-fs`: parse and validate agent directories | built |
 | S5 | `build.rs` codegen and `adam::include_agent!()` | built |
 | S6 | `adam-assembly`: `AgentDef`, templating, tool binding, models, the card | built |
-| S6b | `adam-coder`: prompt, limits and card from `crates/adam-coder/agent/instructions.md`, no behaviour change (see [Dogfood](#dogfood-adam-coder-s3-and-s6b)) | built |
+| S6b | `adam-coder`: prompt, limits and card from `bin/adam-coder/agent/instructions.md`, no behaviour change (see [Dogfood](#dogfood-adam-coder-s3-and-s6b)) | built |
 | S7 | skills at run time: the catalog, `load_skill`, `read_skill_file`, `preload_skills` | built |
 | S8 | child runs in the runtime: `start_child`, the finished message, `Ctx::child_status`, `ToolError::AwaitRun`, `pending_wait` | built |
 | S9 | subagents: `SubagentTool`, its binding, name-clash and asks-user checks, `ToolCtx::start_child` | built |

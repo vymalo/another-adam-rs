@@ -2,7 +2,7 @@
 //   1. every ```mermaid block parses with the pinned Mermaid version, and
 //   2. every relative Markdown link points at a file or directory that exists, and
 //   3. every `#fragment` of a link to a Markdown file names a heading that exists, and
-//   4. every Rust crate (a directory with a Cargo.toml under crates/) has a README.md
+//   4. every Rust crate (a directory with a Cargo.toml under crates/ or bin/) has a README.md
 //      next to it.
 // Usage (from the repo root):  npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs
 // Exits 1 on any failure, listing file:line for each.
@@ -108,7 +108,7 @@ for (const file of markdownFiles(root)) {
 // Every crate documents itself: a directory under these roots with a Cargo.toml needs a
 // README.md, updated in the same change as any change to its public API, environment
 // variables or tests (see "Development" in README.md).
-const crateRoots = ['crates'];
+const crateRoots = ['crates', 'bin'];
 let crates = 0;
 for (const crateRoot of crateRoots) {
   const dir = path.join(root, crateRoot);

@@ -12,7 +12,7 @@ call is a journaled `Ctx::step`, so a restarted worker replays what already
 happened instead of repeating a side effect. An adam-rs agent is then
 instructions + a model + a toolset. It is served over A2A by
 [`adam-a2a-runtime`](../adam-a2a-runtime/README.md); the coder agent
-([`adam-coder`](../adam-coder/README.md)) is built on it.
+([`adam-coder`](../../bin/adam-coder/README.md)) is built on it.
 
 ## API at a glance
 
@@ -249,5 +249,5 @@ as a `ToolOutput::error`; `src/schema.rs` tests the generated schema (run them w
 
 [`adam-runtime`](../adam-runtime/README.md),
 [`adam-model`](../adam-model/README.md),
-[`adam-coder`](../adam-coder/README.md),
+[`adam-coder`](../../bin/adam-coder/README.md),
 [`adam-error`](../adam-error/README.md).

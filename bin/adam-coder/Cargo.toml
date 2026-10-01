@@ -17,19 +17,19 @@ name = "adam-coder"
 path = "src/main.rs"
 
 [dependencies]
-adam = { path = "../adam", version = "0.1.0", features = ["a2a"] }
-adam-a2a = { path = "../adam-a2a", version = "0.1.0" }
-adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.1.0" }
-adam-acp = { path = "../adam-acp", version = "0.1.0" }
+adam = { workspace = true, features = ["a2a"] }
+adam-a2a.workspace = true
+adam-a2a-runtime.workspace = true
+adam-acp.workspace = true
 adam-core.workspace = true
 adam-error.workspace = true
-adam-host = { path = "../adam-host", version = "0.1.0" }
-adam-llm-agent = { path = "../adam-llm-agent", version = "0.1.0" }
+adam-host.workspace = true
+adam-llm-agent.workspace = true
 adam-model.workspace = true
-adam-model-openai = { path = "../adam-model-openai", version = "0.1.0" }
-adam-notify-postgres = { path = "../adam-notify-postgres", version = "0.1.0" }
+adam-model-openai.workspace = true
+adam-notify-postgres.workspace = true
 adam-runtime.workspace = true
-adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
+adam-store-postgres.workspace = true
 adam-workspace.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

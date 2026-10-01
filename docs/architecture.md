@@ -243,8 +243,9 @@ show that a task which continues another gives the model the earlier messages. `
 `adam-workspace` and `adam-coder` also enable their own `test-util` feature in
 tests. That adds no new crate edge.
 
-The workspace is `crates/*` (see the root `Cargo.toml`), so a new crate joins by
-adding a directory.
+The workspace is `crates/*` and `bin/*` (see the root `Cargo.toml`): libraries
+live in `crates/`, binaries (the agents you can run) in `bin/`, so a new crate or
+binary joins by adding a directory. `adam-coder` is the one binary today.
 
 ## Ports and implementations
 
@@ -433,8 +434,8 @@ classDiagram
 Each box is a crate (underscores stand for hyphens). The seven coder tools are
 `prepare_workspace`, `run_command`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
 `open_pull_request` and `ask_user`. An eighth type, `Redacting`, wraps each of
-them to scrub secrets (`crates/adam-coder/src/tools/mod.rs`). `CoderAgent`
-wraps the `LlmAgent` that `adam-assembly` builds from `crates/adam-coder/agent/instructions.md` (the prompt, the
+them to scrub secrets (`bin/adam-coder/src/tools/mod.rs`). `CoderAgent`
+wraps the `LlmAgent` that `adam-assembly` builds from `bin/adam-coder/agent/instructions.md` (the prompt, the
 limits and the A2A card are that file) and adds its completion rule. `FnTool` is a tool made from a closure. A tool
 reads shared dependencies with `ToolCtx::state::<T>()` (given to the agent with
 `LlmAgentBuilder::state`), declares them in `Tool::required_state`, and
@@ -480,7 +481,7 @@ Rules the code follows, from the crate docs:
 ### How a binary composes them
 
 `adam-coder` is the composition root. Its `serve` function
-(`crates/adam-coder/src/serve.rs`) is the whole process, and `main` is
+(`bin/adam-coder/src/serve.rs`) is the whole process, and `main` is
 `serve(Config::from_env(), sigterm)`. To use MongoDB, another model client or
 another code host, write another root that builds the same pieces.
 
@@ -551,7 +552,7 @@ needs the agent's name and its `init` and nothing else, so the control plane reg
 `CoderStarter` (an `adam_runtime::AgentStarter`, `RuntimeBuilder::starter`) instead of the
 `CoderAgent`, and `Config::worker` is `None` for it: no model client, GitHub client or
 workspaces are built, and none of their variables is read
-(`crates/adam-coder/src/serve.rs`, `config.rs`). The runtime claims only registered agents, so
+(`bin/adam-coder/src/serve.rs`, `config.rs`). The runtime claims only registered agents, so
 a control plane never steps a run even if `run_worker` were called. `CoderAgent::init`
 delegates to `CoderStarter`, so both start a run with the same state. The two roles meet in the Postgres store: the run record with its version
 compare-and-swap, and leases, which is what makes them correct. They also meet in `NOTIFY`
@@ -589,7 +590,7 @@ by `adam-coder` from `WORKSPACE_PLACEMENT`:
 | `a2a-only` | none | `Any` | refused by `adam-coder` (its tools need a workspace) |
 
 `serve` maps `Placement::pins_runs()` to `RuntimeOptions::claim_scope`
-(`crates/adam-coder/src/serve.rs`), and `RuntimeBuilder::claim_scope` to the claim. The store keeps
+(`bin/adam-coder/src/serve.rs`), and `RuntimeBuilder::claim_scope` to the claim. The store keeps
 the **owner** of a run beside its lease (`runs.owner` in Postgres, `owner` in MongoDB), set by the
 first pinned claim and never cleared by a release or a commit:
 
@@ -803,7 +804,7 @@ What the diagram cannot say:
   conversation recorded for that repository, in the run notes by the tool itself) and, once its checks have
   passed, `open_pull_request` moves that branch to the run's commits, which updates the same pull request,
   and reports it as already open. See the
-  [coder's README](../crates/adam-coder/README.md#a-task-that-continues-a-task).
+  [coder's README](../bin/adam-coder/README.md#a-task-that-continues-a-task).
 
 ### The worker: claim, step, journal, commit
 
@@ -970,7 +971,7 @@ What the diagram cannot say:
   transaction-mode pooler in front of it.
 * **Not built here:** MongoDB has no equivalent (no change streams on a standalone
   `mongod`), so it keeps polling; `adam-coder` is Postgres only and uses the crate in
-  every role (`crates/adam-coder/src/serve.rs`, and its `binary.rs` test of a control plane
+  every role (`bin/adam-coder/src/serve.rs`, and its `binary.rs` test of a control plane
   and a worker in two processes, which sees the worker's progress in the front's stream).
 
 The listener's lifecycle (`crates/adam-notify-postgres/src/lib.rs`, `listen_loop`
@@ -1496,7 +1497,7 @@ Where each decision is made:
   `BackendError::NotCancelable`, which the backend raises when `CancelTask`
   targets a task that is finished and not already canceled.
 * **The exit code** is chosen by `adam_coder::exit_code`
-  (`crates/adam-coder/src/exit.rs`). It walks the `anyhow` chain from the
+  (`bin/adam-coder/src/exit.rs`). It walks the `anyhow` chain from the
   outside in and takes the first match. A `ConfigError` is 78. A typed error
   (`StoreError`, `OpenAiConfigError`, `WorkspaceError`, `RuntimeError`,
   `StoppedUnexpectedly`) is decided by its class, as in the diagram. A panicked
@@ -1596,7 +1597,7 @@ Every `run_checks` that ran its command also reports an artifact `checks` (`pass
 `summary` and `findings`), and `commit_and_push` emits, before `branch`, a `checks` bound to the pushed commit:
 the last run's report if it ran on the tree that was pushed, else `passed: false` with a finding saying the
 pushed tree was not checked. An orchestrator gates on the last `checks` whose `commit` is the pushed SHA. The
-schema, caps, binding rule and redaction are in the [coder README](../crates/adam-coder/README.md#artifacts).
+schema, caps, binding rule and redaction are in the [coder README](../bin/adam-coder/README.md#artifacts).
 
 The same flow as states, from the point of view of the run notes and the
 tools' guards:
@@ -1641,7 +1642,7 @@ something else or stop it. The states are not stored as an enum:
 they follow from the per-run notes (failures counted, last check and its tree,
 pushed sha, pull request) and the worktree.
 
-What the diagrams cannot say (`crates/adam-coder/src/`):
+What the diagrams cannot say (`bin/adam-coder/src/`):
 
 * **The tools** (`tools/`): `prepare_workspace`, `run_command` (looking around: no check, no cycle,
   changes to HEAD, the branch, the working tree, refs and git configuration are undone), `delegate_to_opencode`, `run_checks` (the project's own checks only),
@@ -1697,8 +1698,8 @@ What the diagrams cannot say (`crates/adam-coder/src/`):
 * **Cancel.** When a run is cancelled while OpenCode works, the tool sends ACP
   `session/cancel`, waits 2 seconds, then kills OpenCode and its process group.
 * **Configuration** is environment variables only. The table is in
-  `crates/adam-coder/src/config.rs` and the
-  [crate README](../crates/adam-coder/README.md). Every problem is reported at
+  `bin/adam-coder/src/config.rs` and the
+  [crate README](../bin/adam-coder/README.md). Every problem is reported at
   once as `invalid configuration`.
 
 ### How it is deployed
@@ -1782,7 +1783,7 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   (`ROLE=worker`), which keeps the combined StatefulSet's name, selector and volume claim, so
   switching topology reuses the same PVC. The front holds only `DATABASE_URL` and the A2A
   tokens; the worker holds the model and GitHub secrets and the volume. Deploy-only: no
-  binary changed. Verified 2026-09-29: `crates/adam-coder/src/config.rs` requires
+  binary changed. Verified 2026-09-29: `bin/adam-coder/src/config.rs` requires
   `A2A_BEARER_TOKENS` and `PUBLIC_URL` only for the roles that serve A2A.
 * **More than one worker needs a placement.** Runs move between workers at every step
   (`adam-runtime`'s worker), while a worktree lives in one worker's `/work`. A second worker
@@ -1877,7 +1878,7 @@ flowchart LR
   does not end in a pull request. A complete run needs a model that can call
   tools. The git remote and the pull request API can still be `git-server` and
   `mock-github`. See the root README for this caveat and for the live smoke
-  test in the [`adam-coder` README](../crates/adam-coder/README.md).
+  test in the [`adam-coder` README](../bin/adam-coder/README.md).
 * The `compose` job in `.github/workflows/ci.yml` starts the mocks and runs the
   real clients (`OpenAiCompatible`, `GitHub`) against them, so the mappings
   cannot rot.
@@ -1899,7 +1900,7 @@ flowchart LR
 | `adam-runtime` | runtime | [crates/adam-runtime](../crates/adam-runtime/README.md) |
 | `adam-a2a-runtime` | runtime | [crates/adam-a2a-runtime](../crates/adam-a2a-runtime/README.md) |
 | `adam-llm-agent` | agent | [crates/adam-llm-agent](../crates/adam-llm-agent/README.md) |
-| `adam-coder` | agent, binary | [crates/adam-coder](../crates/adam-coder/README.md) |
+| `adam-coder` | agent, binary | [bin/adam-coder](../bin/adam-coder/README.md) |
 | `adam-macros` | authoring, proc-macro | [crates/adam-macros](../crates/adam-macros/README.md) |
 | `adam` | authoring, facade | [crates/adam](../crates/adam/README.md) |
 | `adam-store-testkit` | test kit | [crates/adam-store-testkit](../crates/adam-store-testkit/README.md) |
@@ -1949,7 +1950,7 @@ behind it are quoted in the ADR.
 * How the SDK frames SSE, and that it sends a keepalive comment every 15 seconds,
   is taken from the `adam-a2a` docs, not re-tested.
 * OpenCode's behaviour (ACP over stdio, `{env:VAR}` substitution in its
-  inline config) is as recorded in `crates/adam-coder/src/opencode.rs`, which
+  inline config) is as recorded in `bin/adam-coder/src/opencode.rs`, which
   cites the OpenCode source at `sst/opencode@7945de2`. It was not re-checked
   here, and a live run against a real gateway is not covered by CI.
 * The chart was rendered but, per its README, not applied to a cluster or

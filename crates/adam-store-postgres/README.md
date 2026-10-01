@@ -7,7 +7,7 @@
 An **adapter** of the store port in [`adam-core`](../adam-core/README.md),
 checked by [`adam-store-testkit`](../adam-store-testkit/README.md). Nothing in
 `adam-core` or `adam-runtime` names it; a binary chooses it at composition
-time (for example [`adam-coder`](../adam-coder/README.md)).
+time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 
 ## API at a glance
 

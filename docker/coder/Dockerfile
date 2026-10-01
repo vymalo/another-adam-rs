@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# ghcr.io/vymalo/another-adam-rs/coder: the coder agent (crates/adam-coder) on
+# ghcr.io/vymalo/another-adam-rs/coder: the coder agent (bin/adam-coder) on
 # the workspace toolchain image. Build from the REPOSITORY ROOT:
 #
 #   docker buildx build -f docker/coder/Dockerfile .
@@ -25,11 +25,12 @@ ARG WORKSPACE_TAG=1.98.1-bc97d51
 
 FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS build
 WORKDIR /src
-# The workspace is `crates/*`, so every member's manifest is needed to resolve
-# the lockfile even though only adam-coder is built. Only a C compiler is needed
+# The workspace is `crates/*` and `bin/*`, so every member's manifest is needed to
+# resolve the lockfile even though only adam-coder is built. Only a C compiler is needed
 # (aws-lc-sys uses its pregenerated sources; the vendored protoc covers a2a-pb).
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+COPY bin bin
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p adam-coder --bin adam-coder \

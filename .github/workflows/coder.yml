@@ -1,6 +1,6 @@
 name: coder
 
-# The coder agent (crates/adam-coder + crates/adam-a2a-runtime): checks on pull
+# The coder agent (bin/adam-coder + crates/adam-a2a-runtime): checks on pull
 # requests, an image on main, and a tag bump in the deploy chart. The Rust
 # checks (fmt, clippy, tests, MSRV, coverage) run for every pull request in
 # ci.yml; this workflow covers what only the image and the chart can show.
@@ -27,6 +27,7 @@ on:
   pull_request:
     paths:
       - crates/**
+      - bin/**
       - Cargo.toml
       - Cargo.lock
       - deploy/coder/**

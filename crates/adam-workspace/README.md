@@ -6,7 +6,7 @@ durable artifact: a run's result is a pushed branch and a pull request.
 ## Where it sits
 
 The **workspace and code-host layer** of the coder agent, used by
-[`adam-coder`](../adam-coder/README.md) (and by anything that wants isolated
+[`adam-coder`](../../bin/adam-coder/README.md) (and by anything that wants isolated
 worktrees). It defines two ports, `GitCredentials` and `CodeHost`, and ships
 their implementations in the same crate (`StaticToken`, `ScopedToken`,
 `GitHub`; `MemoryCodeHost` for tests). Nothing implementation-specific appears
@@ -173,6 +173,6 @@ No conformance testkit exists for `CodeHost` or `GitCredentials` yet.
 
 ## See also
 
-[`adam-coder`](../adam-coder/README.md),
+[`adam-coder`](../../bin/adam-coder/README.md),
 [`adam-acp`](../adam-acp/README.md),
 [`adam-error`](../adam-error/README.md).

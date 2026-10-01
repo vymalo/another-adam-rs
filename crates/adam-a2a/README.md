@@ -8,7 +8,7 @@ over a small backend seam, with bearer authentication that fails closed.
 The **server-side adapter for the A2A protocol**, independent of the agent
 runtime. It defines its own port, `TaskBackend`; the durable implementation is
 [`adam-a2a-runtime`](../adam-a2a-runtime/README.md), and
-[`adam-coder`](../adam-coder/README.md) mounts the result. This crate holds no
+[`adam-coder`](../../bin/adam-coder/README.md) mounts the result. This crate holds no
 task state. JSON-RPC parsing, ProtoJSON and SSE framing are the official SDK's
 (`a2a-lf`, `a2a-server-lf`); this crate implements the SDK's `RequestHandler`
 on top of `TaskBackend` instead of using its `DefaultRequestHandler`, whose
@@ -109,5 +109,5 @@ dev-dependency turns on `test-util`. Offline, no environment variables.
 ## See also
 
 [`adam-a2a-runtime`](../adam-a2a-runtime/README.md),
-[`adam-coder`](../adam-coder/README.md),
+[`adam-coder`](../../bin/adam-coder/README.md),
 [`adam-error`](../adam-error/README.md).
