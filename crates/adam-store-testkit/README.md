@@ -13,16 +13,17 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (26
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (27
   cases: create/load, state round trip, CAS conflicts, concurrent commits,
-  journal ordering and first-writer-wins, claim rules and exclusivity, lease
-  expiry/renew/release, pinned claims and the run owner, one open run per
-  conversation, purge).
+  journal ordering and first-writer-wins, claim rules and exclusivity, busy runs
+  that a claim leaves alone, lease expiry/renew/release, pinned claims and the
+  run owner, one open run per conversation, purge).
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.
 * `fault::FaultyStore`: wraps a `DynStore` and fails scripted calls
-  (`fail`, `fail_always`, `fail_after_apply`, `heal`, `calls`, `injected`; and `fail_run` /
+  (`fail`, `fail_always`, `fail_after_apply`, `heal`, `calls`, `injected`, and `claimed(run)`, how many times
+  `claim_due` handed a run to its caller; and `fail_run` /
   `fail_run_after_apply`, which strike only the calls about one run, to break one link of a chain such as
   the message a finished child sends its parent), with
   `fault::Method` and `fault::Mode` selecting the method and whether the
@@ -49,6 +50,8 @@ failure (see `adam_core::testing`).
 ## Tests
 
 * `tests/memory.rs`: runs the suite against `MemoryStore` (always on).
+* `claim_skips_busy_runs` (both scopes): runs named as `busy` are not claimed, with a live lease or an expired one,
+  take no slot of the limit, and are not leased by the call that skipped them.
 * Pinned-claim cases (`ClaimScope::Pinned`): an owned run is never given to another worker, not
   after a release, a commit or an expired lease; the first pinned claim sets the owner and an
   `Any` claim neither reads nor sets it; 4 workers racing on 48 runs split them exactly once and

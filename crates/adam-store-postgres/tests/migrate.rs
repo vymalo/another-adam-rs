@@ -139,7 +139,7 @@ async fn a_version_1_schema_migrates_to_2_and_keeps_its_runs() {
             // A commit makes a run due at the time of the commit, so look a moment ahead.
             let at = now() + chrono::Duration::seconds(1);
             store
-                .claim_due(&agents, worker, scope, at, ttl, 10)
+                .claim_due(&agents, worker, scope, &[], at, ttl, 10)
                 .await
                 .unwrap()
         }

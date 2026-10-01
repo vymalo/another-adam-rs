@@ -570,6 +570,7 @@ impl Store for MongoStore {
         agents: &[String],
         worker: &str,
         scope: ClaimScope,
+        busy: &[RunId],
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,
@@ -579,8 +580,10 @@ impl Store for MongoStore {
         }
         let now = truncate_ms(now);
         let until = add_ttl(now, ttl);
+        let busy: Vec<Bson> = busy.iter().map(|id| uuid(*id)).collect();
         let mut claimable = doc! {
             "agent": { "$in": agents },
+            "_id": { "$nin": &busy },
             "sched_at": { "$lte": date(now) },
             "$or": [ { "lease_until": Bson::Null }, { "lease_until": { "$lte": date(now) } } ],
         };

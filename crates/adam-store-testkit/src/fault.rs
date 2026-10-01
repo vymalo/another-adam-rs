@@ -91,6 +91,8 @@ struct Plan {
     run_rules: HashMap<(Method, RunId), Rule>,
     calls: HashMap<Method, u64>,
     injected: HashMap<Method, u64>,
+    /// Times `claim_due` handed each run to its caller.
+    claimed: HashMap<RunId, u64>,
 }
 
 /// The error a fault produces: the source of a transient [`StoreError::Backend`], with the
@@ -201,6 +203,13 @@ impl FaultyStore {
     /// How many calls of `method` were failed by a fault.
     pub fn injected(&self, method: Method) -> u64 {
         self.plan().injected.get(&method).copied().unwrap_or(0)
+    }
+
+    /// How many times [`Store::claim_due`] returned `run` to its caller: a worker that is told
+    /// "the run is yours" counts, whether or not it then steps it. A claim reported as failed
+    /// ([`Mode::After`]) does not count, its caller never learned of it.
+    pub fn claimed(&self, run: RunId) -> u64 {
+        self.plan().claimed.get(&run).copied().unwrap_or(0)
     }
 
     /// Count the call and decide whether it fails, and how. A call about a run meets the rule
@@ -326,16 +335,24 @@ impl Store for FaultyStore {
         agents: &[String],
         worker: &str,
         scope: ClaimScope,
+        busy: &[RunId],
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,
     ) -> StoreResult<Vec<Lease>> {
-        self.run(
-            Method::ClaimDue,
-            None,
-            self.inner.claim_due(agents, worker, scope, now, ttl, limit),
-        )
-        .await
+        let leases = self
+            .run(
+                Method::ClaimDue,
+                None,
+                self.inner
+                    .claim_due(agents, worker, scope, busy, now, ttl, limit),
+            )
+            .await?;
+        let mut plan = self.plan();
+        for lease in &leases {
+            *plan.claimed.entry(lease.run.id).or_default() += 1;
+        }
+        Ok(leases)
     }
 
     async fn renew_lease(
@@ -522,6 +539,7 @@ mod tests {
                 &["fault-test".to_owned()],
                 "w",
                 adam_core::ClaimScope::Any,
+                &[],
                 adam_core::store::now(),
                 Duration::from_secs(5),
                 1,
@@ -529,6 +547,7 @@ mod tests {
             .await
             .expect("claim passes through");
         assert_eq!(claimed.len(), 1);
+        assert_eq!(store.claimed(claimed[0].run.id), 1);
         assert_eq!(store.injected(Method::CreateRun), 1);
     }
 

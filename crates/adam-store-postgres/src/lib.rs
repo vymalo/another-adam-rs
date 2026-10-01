@@ -336,8 +336,9 @@ impl Sql {
     }
 }
 
-/// The claiming statement. `$1` agents, `$2` now, `$3` limit, `$4` worker, `$5` lease end.
-/// The pinned form filters on `owner` and sets it (`COALESCE` keeps an existing owner).
+/// The claiming statement. `$1` agents, `$2` now, `$3` limit, `$4` worker, `$5` lease end, `$6` the
+/// runs the caller is stepping, which are never claimed. The pinned form filters on `owner` and
+/// sets it (`COALESCE` keeps an existing owner).
 fn claim_due_sql(runs: &str, scope: ClaimScope) -> String {
     let (filter, set_owner) = match scope {
         ClaimScope::Any => ("", ""),
@@ -350,6 +351,7 @@ fn claim_due_sql(runs: &str, scope: ClaimScope) -> String {
         "WITH due AS (
             SELECT id FROM {runs}
              WHERE agent = ANY($1)
+               AND id <> ALL($6)
                AND sched_at <= $2
                AND (lease_until IS NULL OR lease_until <= $2)
                {filter}
@@ -583,6 +585,7 @@ impl Store for PgStore {
         agents: &[String],
         worker: &str,
         scope: ClaimScope,
+        busy: &[RunId],
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,
@@ -596,12 +599,14 @@ impl Store for PgStore {
             ClaimScope::Any => &self.sql.claim_due_any,
             ClaimScope::Pinned => &self.sql.claim_due_pinned,
         };
+        let busy: Vec<Uuid> = busy.iter().map(|id| id.0).collect();
         let rows = sqlx::query(safe(statement))
             .bind(agents)
             .bind(now)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .bind(worker)
             .bind(until)
+            .bind(busy)
             .fetch_all(&self.pool)
             .await
             .map_err(classify)?;

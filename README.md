@@ -60,6 +60,9 @@ and a replay that asks for a different step name at the same `seq` fails with
 **Leases** stop two workers from advancing the same run at once. They are an
 efficiency mechanism; the version CAS is what guarantees correctness, so a
 worker whose lease expired mid-step still cannot overwrite newer state.
+A worker never claims a run it is stepping itself, even once the lease on it has
+lapsed (`claim_due` takes those runs as `busy`): a second lease on the run would
+come with a snapshot that its own step is about to make stale.
 A claim can also be **pinned**: a run then has an *owner*, the worker that first
 claimed it, and only that worker claims it again (`ClaimScope::Pinned`, used by the
 `affinity` and `isolated` workspace placements; see
@@ -107,6 +110,7 @@ let run = store.commit_run(run.id, run.version, RunUpdate::new(RunStatus::Parked
 | Commit CAS | `UPDATE .. WHERE version = $n RETURNING` | `findOneAndUpdate({_id, version: n}, {$inc: {version: 1}})` |
 | Journal first-writer-wins | `INSERT .. ON CONFLICT DO NOTHING`, read winner | `insertOne` with `_id = "<run>:<seq>"`, duplicate key → read winner |
 | Exclusive claiming | `FOR UPDATE SKIP LOCKED` in one statement | read candidates, `updateMany` re-checking due/lease in the filter with a claim token, read back by token |
+| Busy runs (`claim_due(.., busy, ..)`) never claimed | `AND id <> ALL($busy)` in the claiming statement | `_id: { $nin: busy }` in the candidate filter |
 | Pinned claiming (`owner`, schema version 2) | `AND (owner IS NULL OR owner = $w)` and `owner = COALESCE(owner, $w)` in the claiming `UPDATE` | the same condition in both the candidate and the `updateMany` filter (a missing field is `null`), `$set` of `owner` in the `updateMany` |
 | One open run per conversation | partial unique index | plain unique index on `open_key`; closed runs get `~<run id>`, so no partial/sparse index is needed |
 | Journal deleted with run | `ON DELETE CASCADE` | journal deleted first, then runs, in batches |
@@ -485,10 +489,10 @@ errors the macro produces itself always run, and the ones rustc words itself run
 `ADAM_TRYBUILD=1`, in the CI job `ui` pinned to one toolchain (see the
 [`adam` README](crates/adam/README.md#tests)).
 
-The suite (26 cases) covers: exact JSON roundtrip (unicode, i64 bounds,
+The suite (27 cases) covers: exact JSON roundtrip (unicode, i64 bounds,
 floats, special keys), CAS conflicts, 16-way concurrent commits with a single
 winner, journal ordering, first-writer-wins and 16-way races,
-non-determinism detection, due rules, agent filtering and limits, 8 workers
+non-determinism detection, due rules, agent filtering and limits, busy runs left unclaimed, 8 workers
 claiming 60 runs with no double lease, lease expiry and takeover, renew and
 release, pinned claims (an owned run never goes to another worker, the owner is set by the
 first pinned claim and only by it, 4 workers racing), one-open-run-per-conversation including a 16-way race, and purging.

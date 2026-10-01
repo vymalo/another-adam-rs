@@ -453,11 +453,21 @@ pub trait Store: Send + Sync + 'static {
     /// [`ClaimScope::Pinned`] a run that another worker owns is skipped, and
     /// the first claim of a run without an owner makes `worker` its owner.
     /// [`Store::release_lease`] never clears the owner.
+    ///
+    /// `busy` names runs the caller is stepping right now. They are never claimed, whatever
+    /// their lease says, and do not count against `limit`. A step can outlive its lease (a
+    /// renewal that failed, a clock that jumped), and claiming such a run again would lease
+    /// it a second time to the worker that holds it: the caller would get back a snapshot of
+    /// the run that its own step is about to make stale, or clear the new lease with the
+    /// release at the end of the step. Another worker is not affected: it claims the run
+    /// once the lease has expired, as always.
+    #[allow(clippy::too_many_arguments)] // one claim, described by its parts; every store matches on all of them
     async fn claim_due(
         &self,
         agents: &[String],
         worker: &str,
         scope: ClaimScope,
+        busy: &[RunId],
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,

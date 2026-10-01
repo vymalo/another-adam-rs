@@ -893,8 +893,8 @@ sequenceDiagram
     participant K as EventSink
 
     loop until shutdown
-        W->>DB: claim_due(agents, worker id, claim scope, now, lease ttl, free slots)
-        DB-->>W: leases: due runs with no live lease (and, if pinned, not owned by another worker), earliest first
+        W->>DB: claim_due(agents, worker id, claim scope, runs in flight here, now, lease ttl, free slots)
+        DB-->>W: leases: due runs with no live lease, not in flight here (and, if pinned, not owned by another worker), earliest first
         W->>T: spawn advance(lease), at most concurrency at once
         T->>T: start lease renewer (every ttl/3)<br/>and cancel watch (every poll interval)
         T->>T: decode the Envelope, build a Ctx<br/>with seq, inbox and attempt
@@ -1154,6 +1154,7 @@ stateDiagram-v2
     Leased --> Unleased: release_lease after the commit, or after a rejected commit
     Leased --> Expired: worker died or hung, or renewal kept failing
     Leased --> Expired: store trouble while stepping, lease kept and not released
+    Leased --> Expired: a step outlives its lease, for example a clock that jumped
     Expired --> Leased: claim_due by any worker (a pinned claim: only by the run's owner)
     Unleased --> [*]: run reached Done or Failed
 ```
@@ -1173,6 +1174,12 @@ How the two fit:
   hint is capped at 24 hours (`MAX_RETRY_AFTER`). When `attempt` reaches
   `RetryPolicy::max_attempts` the run is `Failed` with "gave up after N
   attempts".
+* **A lease that lapses under a step.** The worker still holds the run in flight, so it passes it in
+  every `claim_due` as `busy` and the store never gives it back to the same worker: that would lease
+  the run a second time, with a snapshot that the running step is about to make stale, and the release
+  at the end of the step (it matches the worker, not the claim) would clear the new lease. The worker
+  releases the lease before it counts the run as free. Another worker claims the run once the lease
+  has expired, and the compare-and-swap rejects the commit that comes second.
 * **Store trouble.** If the store fails while a step runs, the class decides.
   `Corrupt` and `Invalid` fail the run, because a row that can never be read
   must not be leased for ever. Any other class commits nothing and keeps the

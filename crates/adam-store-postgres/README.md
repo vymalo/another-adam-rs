@@ -30,7 +30,8 @@ let store: DynStore = Arc::new(store);
 
 Tables are `<prefix>runs` (state as `JSONB`), `<prefix>journal` (primary key
 `(run_id, seq)`, `ON DELETE CASCADE`) and `<prefix>meta`. Claiming is
-`FOR UPDATE SKIP LOCKED`; one open run per conversation is a partial unique
+`FOR UPDATE SKIP LOCKED`, and it leaves out the runs the caller says it is stepping (`AND id <> ALL($busy)`,
+see [`adam-core`](../adam-core/README.md#runs-the-caller-is-stepping)); one open run per conversation is a partial unique
 index. No transaction is held open while agent code runs. `JSONB` cannot hold
 `\u0000`: such state is rejected with `StoreError::InvalidInput`. The guarantee
 table is in the [root README](../../README.md#how-each-adapter-guarantees-the-contract).
@@ -45,7 +46,7 @@ the `schema_version` row to 2. It never lowers it: a process of an older release
 against a newer database leaves the number alone. The pinned claim adds
 `AND (owner IS NULL OR owner = $worker)` to the claiming statement and
 `owner = COALESCE(owner, $worker)` to its `UPDATE`; `release_lease` does not touch `owner`. The
-`Any` claim is the old statement, unchanged. There is no index on `owner`: the `runs_due` partial
+`Any` claim has no owner filter and never writes `owner`. There is no index on `owner`: the `runs_due` partial
 index does the range scan and the owner is a filter on those rows.
 
 ## Errors

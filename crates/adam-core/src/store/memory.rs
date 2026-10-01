@@ -189,6 +189,7 @@ impl Store for MemoryStore {
         agents: &[String],
         worker: &str,
         scope: ClaimScope,
+        busy: &[RunId],
         now: DateTime<Utc>,
         ttl: Duration,
         limit: usize,
@@ -200,6 +201,7 @@ impl Store for MemoryStore {
             .runs
             .values()
             .filter(|s| agents.contains(&s.run.agent))
+            .filter(|s| !busy.contains(&s.run.id))
             .filter(|s| s.run.sched_at().is_some_and(|at| at <= now))
             .filter(|s| s.lease.as_ref().is_none_or(|(_, u)| *u <= now))
             .filter(|s| match scope {

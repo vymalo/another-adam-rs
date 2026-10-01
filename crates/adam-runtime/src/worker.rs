@@ -84,12 +84,24 @@ impl Runtime {
 
             let free = inner.cfg.concurrency.saturating_sub(tasks.len());
             if free > 0 && !agents.is_empty() {
+                // What we are stepping is not offered to the claim, even when its lease has
+                // lapsed under a slow step. Only this loop adds to the set, so a run outside it
+                // now is still outside it when the claim returns, and a step that left it has
+                // committed and released before: no claim returns a snapshot that is older than
+                // what this worker wrote, and none is cleared by the release of an earlier step.
+                let busy: Vec<RunId> = in_flight
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .copied()
+                    .collect();
                 let claimed = inner
                     .store
                     .claim_due(
                         &agents,
                         &inner.cfg.worker_id,
                         inner.cfg.claim_scope,
+                        &busy,
                         inner.clock.now(),
                         inner.cfg.lease_ttl,
                         free,
@@ -104,13 +116,11 @@ impl Runtime {
                                 .unwrap_or_else(PoisonError::into_inner)
                                 .insert(run)
                             {
-                                // Our lease on it expired while we are still
-                                // stepping it (renewal off or failing). Do
-                                // not start a second step, and do not quietly
-                                // extend the lease by claiming it again:
-                                // hand it back so another worker may take
-                                // over. The version CAS settles who wins.
-                                tracing::warn!(%run, "re-claimed a run that is still in flight, releasing it");
+                                // A store that honours `busy` never returns a run we are
+                                // stepping. One that does not must not make us step it twice:
+                                // hand the lease back, so it is not extended behind the
+                                // step's back. The version CAS settles who wins.
+                                tracing::error!(%run, "the store claimed a run that is still in flight, releasing it");
                                 if let Err(e) =
                                     inner.store.release_lease(run, &inner.cfg.worker_id).await
                                 {
@@ -295,10 +305,13 @@ async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
     drop(watch);
     drop(tracked);
     drop(renewer);
-    drop(guard);
+    // Release while the run is still in flight here. Nothing claims it until the guard is
+    // dropped, so no claim of ours can have taken a new lease that this release, which matches
+    // on the worker and not on the claim, would then clear.
     if release && let Err(e) = inner.store.release_lease(run, &inner.cfg.worker_id).await {
         tracing::warn!(%run, error = %e, "releasing the lease failed; it will expire");
     }
+    drop(guard);
 }
 
 /// What to commit after a transition.
