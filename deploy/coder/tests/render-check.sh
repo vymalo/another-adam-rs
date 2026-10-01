@@ -109,7 +109,7 @@ check "the probes still use /healthz for a worker" count 'path: /healthz' 3
 # The model and GitHub settings belong to the roles that run workers. A control plane only starts,
 # delivers to, cancels and views runs, so it gets none of them (and needs neither secret).
 model_and_github='name: (MODEL_API_KEY|GITHUB_TOKEN|MODEL_BASE_URL|MODEL|OPENCODE_MODEL)$'
-workspace_and_checks='name: (WORKSPACE_ROOT|WORKERS|MAX_CHECK_CYCLES|CHECK_TIMEOUT_SECS|ALLOWED_REPO_HOSTS|GITHUB_API_URL|PR_DRAFT|GIT_AUTHOR_NAME|GIT_AUTHOR_EMAIL)$'
+workspace_and_checks='name: (WORKSPACE_ROOT|WORKSPACE_SWEEP_SECS|WORKERS|MAX_CHECK_CYCLES|CHECK_TIMEOUT_SECS|ALLOWED_REPO_HOSTS|GITHUB_API_URL|PR_DRAFT|GIT_AUTHOR_NAME|GIT_AUTHOR_EMAIL)$'
 secrets_of_workers='secretKey: (MODEL_API_KEY|GITHUB_TOKEN)$'
 front='name: (A2A_BEARER_TOKENS|DATABASE_URL|PUBLIC_URL)$'
 
@@ -138,7 +138,7 @@ for role in "" all worker; do
   label=${role:-default}
   helm template coder "$chart" --namespace coder-ns "$@" > "$out"
   check "the $label role gets the model, GitHub and OpenCode settings" count "$model_and_github" 5
-  check "the $label role gets the workspace and check settings" count "$workspace_and_checks" 9
+  check "the $label role gets the workspace and check settings" count "$workspace_and_checks" 10
   check "the $label role gets both worker secrets, in the pod and in the ExternalSecret" count "$secrets_of_workers" 2
   check "the $label role reads both worker secrets from the Secret" count '^                  key: (MODEL_API_KEY|GITHUB_TOKEN)$' 2
   for property in modelApiKey githubToken; do
@@ -170,7 +170,7 @@ check "split: the worker mounts /work" dhas StatefulSet 'mountPath: /work'
 check "split: the worker has neither the A2A tokens nor the public URL" dlacks StatefulSet 'name: (A2A_BEARER_TOKENS|PUBLIC_URL)$'
 check "split: the worker keeps the database" dhas StatefulSet 'name: DATABASE_URL$'
 check "split: the worker gets the model, GitHub and OpenCode settings" dcount StatefulSet "$model_and_github" 5
-check "split: the worker gets the workspace and check settings" dcount StatefulSet "$workspace_and_checks" 9
+check "split: the worker gets the workspace and check settings" dcount StatefulSet "$workspace_and_checks" 10
 check "split: the worker keeps one replica" dhas StatefulSet '^  replicas: 1$'
 check "split: the StatefulSet identity equals the combined one (the PVC is reused)" \
   [ "$(sts_identity "$out")" = "$(sts_identity "$golden")" ]
@@ -219,7 +219,7 @@ for p in isolated affinity shared; do
     check "$p x$n: WORKSPACE_PLACEMENT=$p" dhas StatefulSet "^              value: \"$p\"$"
     check "$p x$n: exactly one WORKSPACE_PLACEMENT" dcount StatefulSet 'name: WORKSPACE_PLACEMENT$' 1
     check "$p x$n: /work is still the workspace root and mount" dhas StatefulSet 'mountPath: /work'
-    check "$p x$n: the workspace and check settings are unchanged" dcount StatefulSet "$workspace_and_checks" 9
+    check "$p x$n: the workspace and check settings are unchanged" dcount StatefulSet "$workspace_and_checks" 10
     check "$p x$n: still never exposed" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$|type: (LoadBalancer|NodePort)'
   done
 done

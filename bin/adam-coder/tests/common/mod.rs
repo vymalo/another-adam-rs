@@ -38,6 +38,16 @@ pub const DB_PASSWORD: &str = "pg-pa55w0rd-very-secret";
 /// Every secret value above.
 pub const SECRETS: [&str; 4] = [GITHUB_TOKEN, MODEL_KEY, A2A_TOKEN, DB_PASSWORD];
 
+/// The directory of the slot of the fixture's repository (`remote.git`) in a run's workspace: the
+/// repository's name.
+pub const SLOT: &str = "remote";
+
+/// The worktree of the repository `remote.git` in the workspace of `run`, under `root`:
+/// `<root>/workspaces/<run>/remote`.
+pub fn slot_dir(root: &Path, run: &str) -> PathBuf {
+    root.join("workspaces").join(run).join(SLOT)
+}
+
 /// URL of pull request `number` of the mock repository.
 pub fn pull_url(number: u64) -> String {
     format!("https://github.com/octo/widgets/pull/{number}")
@@ -417,6 +427,31 @@ impl Fixture {
             &["commit", "--quiet", "-m", &format!("seed {file}")],
         );
         git(&clone, &["push", "--quiet", "origin", "main"]);
+    }
+
+    /// Another bare remote, `<tmp>/other/<name>.git`, on `main` with `files`: the second repository
+    /// of a workspace. Returns its path.
+    pub fn extra_remote(&self, name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let remote = self.tmp.path().join("other").join(format!("{name}.git"));
+        let seed = self.tmp.path().join(format!("seed-{name}"));
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&seed).unwrap();
+        git(
+            &remote,
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
+        );
+        git(&seed, &["init", "--quiet", "--initial-branch=main"]);
+        for (file, content) in files {
+            std::fs::write(seed.join(file), content).unwrap();
+        }
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "--quiet", "-m", "seed"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "--quiet", "origin", "main"]);
+        remote
     }
 
     /// Branches on the remote other than `main`.

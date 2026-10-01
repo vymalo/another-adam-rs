@@ -7,6 +7,10 @@
       "instructions": {
         "type": "string",
         "description": "What OpenCode should do"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot OpenCode works in: its name, or the repository's address. Leave out when the workspace has one."
       }
     },
     "required": [

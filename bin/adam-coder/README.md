@@ -4,7 +4,7 @@ The coder agent: a coding task in, a verified pull request out, over A2A.
 
 Given "in repo X, do Y" it
 
-1. prepares a git worktree of X (`adam-workspace`),
+1. prepares a git worktree of X in the run's workspace (`adam-workspace`; a workspace holds several repositories),
 2. makes the change: small, well-located edits itself (`read_file`, `write_file`, `apply_patch`), broad ones
    through OpenCode over ACP (`adam-acp`),
 3. runs the project's own checks, at most `MAX_CHECK_CYCLES` failing cycles,
@@ -42,15 +42,15 @@ sequenceDiagram
 
 | Tool | Does |
 |---|---|
-| `prepare_workspace { repo_url, base_branch?, branch? }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
-| `run_command { command, cwd? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. The same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
-| `read_file { path, start_line?, end_line? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path>` |
-| `write_file { path, content }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path>` |
-| `apply_patch { patch }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files>` |
-| `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
-| `run_checks { command, cwd? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
-| `commit_and_push { message }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
-| `open_pull_request { title, body, accept_red_checks? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
+| `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
+| `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. The same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
+| `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
+| `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
+| `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
+| `delegate_to_opencode { instructions, repo? }` | spawns the ACP agent in the worktree of the slot (`ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
+| `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
+| `commit_and_push { message, repo? }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
+| `open_pull_request { title, body, accept_red_checks?, repo? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question, choices? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions of 2 to 8 options, as one form) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
@@ -167,6 +167,7 @@ subscriber sees it once.
 |---|---|---|
 | `passed` | bool | the command exited 0 in time **and** `commit` was determined |
 | `commit` | string | the 40-hex SHA of a commit: for `run_checks`, the `HEAD` of the run's worktree when the command ran (`""` only when it could not be read); for `commit_and_push`, the pushed commit |
+| `repository` | string, optional | the URL of the repository of the slot the command ran in; for the verdict `commit_and_push` binds to a pushed commit, the repository it was pushed to. Absent from a report of an older coder |
 | `tree` | string, optional | the 40-hex git tree id of the code that was checked: the worktree as `commit_and_push` would commit it (`git add -A`: tracked changes and untracked files, minus what `.gitignore` excludes), computed in a temporary index. Absent when it could not be computed |
 | `summary` | string, optional | one line: `` `cmd` passed ``, or `` `cmd` failed: exit code 2 `` / `timed out after 900s` / `killed by a signal`. Says so when the worktree had uncommitted changes on top of `commit`, or that the tree was checked before it was committed |
 | `findings` | `[{check, message}]`, optional | one entry per failing check: `check` is the command, `message` is how it ended, then the tail of its output |
@@ -199,7 +200,7 @@ subscriber sees it once.
   is cut, and the finished artifact is scrubbed again on its way out, like every tool result.
 * **Replay-safe.** Both artifacts are part of their tool's journaled result and hold nothing that varies between
   executions (no timestamps, no ids of their own), so a replayed step re-emits identical artifacts. The last
-  report and its tree are kept in the run's notes (the file next to the worktree that also holds the cycle count),
+  report and its tree, and the 32 before it, are kept in the run's notes (the file next to the workspace that also holds the cycle count),
   written before the tool's result is journaled; the bound report is a pure function of the notes, the pushed SHA
   and its tree. A `commit_and_push` that ran twice (a crash before its result was journaled) commits nothing the
   second time, sees the same `HEAD` and tree, and emits the same `checks` once.
@@ -220,8 +221,8 @@ make them hold:
   `open_pull_request` refuse too. The run then ends `failed` with the findings
   (the output of the last failing check) and no pull request.
 * **No PR on red checks.** `open_pull_request` opens a pull request only if the
-  last check run passed **on exactly the code the pull request contains** (the
-  tree of the pushed `HEAD`, compared with the tree the check ran on), and the
+  most recent check run **on exactly the code the pull request contains** (the
+  tree of the pushed `HEAD`, compared with the tree the check ran on, in whichever slot it ran) passed, and the
   branch is pushed. The single override is `accept_red_checks: true`, which the
   prompt reserves for explicit user consent obtained with `ask_user`; a pull
   request opened that way says so in its body, and one that was already open says
@@ -411,6 +412,72 @@ Limits: 256 KiB of a file read, 1 MiB of content or patch. The checks and the wr
 a run are called one at a time and what a command leaves running is killed with it, and a write goes to a new file that is
 renamed over its target, which replaces a symlink that appeared meanwhile instead of following it.
 
+### The workspace of a run
+
+A run's files are a **workspace**: a directory of slots, `<WORKSPACE_ROOT>/workspaces/<run>/<dir>/`
+([ADR 0008](../../docs/decisions/0008-a-workspace-holds-several-repositories.md), built in
+[`adam-workspace`](../../crates/adam-workspace/README.md#a-runs-workspace-slots-scratch-projects-and-the-copy-between-them)).
+Each repository the person names is a **slot**, a worktree on the run's own branch, called after the repository
+(`sandbox`; `<name>-<owner>` if two repositories of the run share a name). `prepare_workspace` adds one (a repository
+that is already there returns its slot), and every tool that works in a repository takes `repo`: the slot's name or
+the repository's address (`https://github.com/acme/lib`, `acme/lib`, a path). **With one slot `repo` may be left out;
+with several, leaving it out is an error result that lists the slots** (and a `repo` that matches none lists them too).
+A run that began before slots existed has its one worktree in the old layout (`<root>/worktrees/<run>`): it is read as a
+slot, and may be joined by others.
+
+* **The gate binds by tree, across slots.** `run_checks` records its result with the slot it ran in, in the notes'
+  history of the last 32 runs (`RunNotes::checks.history`; `last` stays beside it). For a commit with tree *T*, in any
+  slot, the deciding check is **the most recent run, from any slot, whose tree is *T*** (`RunNotes::checked`): a tree id
+  is a content address, so the same tree is the same code, and the most recent check of that code wins (a green then a red
+  on it reads as red). No such run means "unchecked". `commit_and_push` binds that run's report to the pushed commit
+  (`commit` the pushed SHA, `repository` the slot's repository) and `open_pull_request` refuses unless that check passed.
+  Pushing to two repositories in one job leaves the orchestration layer's gate judging only the last `branch`
+  (its open question 40). The cycle budget stays per run.
+* **The janitor** (`src/janitor.rs`, a worker component of the process: roles `all` and `worker`) sweeps once at startup
+  and then every `WORKSPACE_SWEEP_SECS` (300; `0` turns it off): for each run that has a workspace on this worker's volume
+  (`Workspaces::runs`), a run the store reports `done` or `failed` (a cancel is `failed`), or does not know, loses its
+  workspace (`RunWorkspace::remove`: every slot, the legacy worktree, the metadata); a **`runnable` or `parked` run is
+  never swept**, so a run waiting a week for an answer keeps its files; a directory that is not a run id is left alone.
+  The run's notes (`<root>/coder/<run>.json`) and its `agent/*` branches in the mirrors stay: the branch is the work.
+  Errors are logged and never stop the process.
+
+```mermaid
+sequenceDiagram
+  participant M as Model
+  participant T as Tools
+  participant W as RunWorkspace
+  participant N as Run notes
+  participant J as Janitor
+  participant S as Store
+  M->>T: prepare_workspace(lib), prepare_workspace(app)
+  T->>W: add_repository, add_repository
+  T-->>M: slot: lib, slot: app
+  M->>T: write_file(repo: lib) and run_checks(repo: lib)
+  T->>W: the slot's worktree
+  T->>N: the check, with its slot and its tree
+  M->>T: commit_and_push(repo: app)
+  T->>N: the most recent check on the pushed tree, any slot
+  N-->>T: bound to the commit, or unchecked
+  T-->>M: checks and branch artifacts, with the repository
+  loop every WORKSPACE_SWEEP_SECS
+    J->>S: load_run for each run with a workspace
+    S-->>J: open, finished or unknown
+    J->>W: remove, for a finished or unknown run
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> NoWorkspace: the run starts
+  NoWorkspace --> OneSlot: prepare_workspace on a repository the person named
+  OneSlot --> SeveralSlots: prepare_workspace on another repository the person named
+  SeveralSlots --> SeveralSlots: the tools take repo
+  OneSlot --> Swept: the run is done or failed, the janitor sweeps
+  SeveralSlots --> Swept: the run is done or failed, the janitor sweeps
+  NoWorkspace --> Swept: the store does not know the run
+  Swept --> [*]: the notes and the branches stay
+```
+
 ### Looking around, and what it may not do
 
 `run_command` is the only tool that runs a model's command outside the check gate, so changes it makes
@@ -547,7 +614,7 @@ stateDiagram-v2
   Refused --> [*]: check budget spent, the run fails: the pull request was not updated
 ```
 
-The old run's worktree is not removed by this (nothing removes finished runs' worktrees yet); the branch
+The old run's workspace is not removed by this task: the janitor removes it when that run is over ([below](#the-workspace-of-a-run)); the branch
 that was pushed is what carries the work, so the new worktree does not depend on it.
 
 ### Who it is
@@ -758,7 +825,8 @@ way; every problem is reported at once at startup):
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
-| `WORKSPACE_ROOT` | mirrors, worktrees, run notes | `/work` |
+| `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
+| `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs ([below](#the-workspace-of-a-run)); `0` turns it off | `300` |
 | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` (`a2a-only` is refused; see [Workspace placement](#workspace-placement)) | `shared` |
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
@@ -1068,6 +1136,22 @@ database of its own, so the role needs `CREATEDB`):
   `the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request` (per store): `read_file`, `apply_patch`,
   `run_checks`, `commit_and_push` and `open_pull_request` over A2A with OpenCode unavailable, the checks artifact bound
   to the pushed commit. The compose scenario is `SCENARIO=files sh dev/coder-e2e.sh` (the `[mock:files]` script).
+* The workspace of several slots: `tests/tools.rs` (`a_second_repository_joins_the_workspace_and_repo_says_which_one`: a
+  second repository is added next to the first, a missing `repo` with two slots is an error that lists them, a slot is chosen by
+  name and by the repository's address, a file of one slot is not in the other, writes and patches go where `repo` says,
+  progress lines name the slot, asking for a repository again keeps its slot and its work;
+  `checks_and_pushes_are_per_slot_and_the_gate_binds_by_the_tree`: each push goes to its own remote, the `checks` artifact
+  names its repository, the same tree checked in one slot binds a commit in the other and a different tree does not;
+  `a_pull_request_needs_the_most_recent_check_of_its_code_whichever_slot_ran_it`: green in the other slot opens it, a red
+  afterwards on the same code refuses it; `a_run_that_began_in_the_old_layout_keeps_working`), the unit tests of
+  `src/tools/notes.rs` (the most recent check on a tree decides whatever slot ran it, the history keeps 32 and a replayed call
+  replaces its own record, notes from before the history decide by `last`);
+  `tests/janitor.rs` (what a sweep removes and keeps: done, failed and unknown runs, the legacy worktree; open runs, a
+  directory that is not a run, the notes, the mirror and the run's branch; a cancelled sweep; the component sweeping at start and
+  again and stopping when told to; a janitor that is off waiting for the stop); `tests/binary.rs`
+  (`the_janitor_removes_the_workspace_of_a_finished_run_and_keeps_an_open_one`, with Postgres: the process sweeps on its
+  own, a run that finishes later loses its workspace, SIGTERM stops it with exit 0; `a_sweep_of_zero_seconds_turns_the_janitor_off`;
+  a bad `WORKSPACE_SWEEP_SECS` exits 78 with the other problems) and `src/config.rs`.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, malformed arguments,
   `prepare_workspace` refusing a repository the person did not name (the refusal names

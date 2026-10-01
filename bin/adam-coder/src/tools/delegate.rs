@@ -116,11 +116,13 @@ pub async fn delegate_to_opencode(
     ctx: &ToolCtx,
     /// What OpenCode should do
     instructions: String,
+    /// The slot OpenCode works in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
 ) -> Outcome {
     let Some(instructions) = non_empty(&instructions) else {
         return Ok(ToolOutput::error("instructions is required"));
     };
-    let wt = match env.worktree(ctx).await {
+    let wt = match env.worktree(ctx, repo.as_deref()).await {
         Ok(wt) => wt,
         Err(outcome) => return outcome,
     };

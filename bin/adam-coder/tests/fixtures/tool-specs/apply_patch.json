@@ -7,6 +7,10 @@
       "patch": {
         "type": "string",
         "description": "The unified diff, at most 1 MiB, with `a/` and `b/` before the paths"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to patch: its name, or the repository's address. Leave out when the workspace has one."
       }
     },
     "required": [

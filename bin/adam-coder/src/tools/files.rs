@@ -673,16 +673,19 @@ pub async fn read_file(
     start_line: Option<u32>,
     /// Last line to show. Leave out to read to the end of the file (or of what fits).
     end_line: Option<u32>,
+    /// The slot to read in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
 ) -> Outcome {
     let Some(path) = non_empty(&path) else {
         return Ok(ToolOutput::error("path is required"));
     };
-    let wt = match env.worktree(ctx).await {
-        Ok(wt) => wt,
+    let slot = match env.slot(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    ctx.emit_progress(format!("read {path}")).await;
-    let (root, rel) = (wt.path().to_path_buf(), path.to_owned());
+    ctx.emit_progress(format!("read {path} ({})", slot.dir()))
+        .await;
+    let (root, rel) = (slot.path().to_path_buf(), path.to_owned());
     let read = tokio::task::spawn_blocking(move || read_in(&root, &rel, start_line, end_line))
         .await
         .map_err(|e| ToolError::Transient(format!("the read was interrupted: {e}")))?;
@@ -704,21 +707,24 @@ pub async fn write_file(
     path: String,
     /// The whole new content of the file (at most 1 MiB)
     content: String,
+    /// The slot to write in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
 ) -> Outcome {
     let Some(path) = non_empty(&path) else {
         return Ok(ToolOutput::error("path is required"));
     };
-    let wt = match env.worktree(ctx).await {
-        Ok(wt) => wt,
+    let slot = match env.slot(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    let (root, rel) = (wt.path().to_path_buf(), path.to_owned());
+    let (root, rel) = (slot.path().to_path_buf(), path.to_owned());
     let written = tokio::task::spawn_blocking(move || write_in(&root, &rel, &content))
         .await
         .map_err(|e| ToolError::Transient(format!("the write was interrupted: {e}")))?;
     match written {
         Ok(done) => {
-            ctx.emit_progress(format!("wrote {path}")).await;
+            ctx.emit_progress(format!("wrote {path} ({})", slot.dir()))
+                .await;
             Ok(ToolOutput::text(format!(
                 "{} {path} ({} bytes). Run the checks again before you commit.",
                 if done.created { "Created" } else { "Replaced" },
@@ -741,17 +747,19 @@ pub async fn apply_patch(
     ctx: &ToolCtx,
     /// The unified diff, at most 1 MiB, with `a/` and `b/` before the paths
     patch: String,
+    /// The slot to patch: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
 ) -> Outcome {
     if non_empty(&patch).is_none() {
         return Ok(ToolOutput::error("patch is required"));
     }
-    let wt = match env.worktree(ctx).await {
-        Ok(wt) => wt,
+    let slot = match env.slot(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    match apply_in(wt.path(), &patch).await {
+    match apply_in(slot.path(), &patch).await {
         Ok(paths) => {
-            ctx.emit_progress(format!("patched {}", listed(&paths)))
+            ctx.emit_progress(format!("patched {} ({})", listed(&paths), slot.dir()))
                 .await;
             Ok(ToolOutput::text(format!(
                 "Applied the patch to {} file(s): {}. Run the checks again before you commit.",

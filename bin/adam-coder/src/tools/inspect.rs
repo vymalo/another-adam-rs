@@ -1,4 +1,4 @@
-//! `run_command { command, cwd? }`: look around in the worktree.
+//! `run_command { command, cwd?, repo? }`: look around in the worktree.
 //!
 //! The model explores a repository with commands (`git branch -r`, `ls`, `cat README.md`,
 //! `git log`). Doing that through `run_checks` made every look around a check run: it reported a
@@ -41,11 +41,13 @@ pub async fn run_command(
     command: String,
     /// Optional sub-directory of the worktree to run in (relative, inside the worktree)
     cwd: Option<String>,
+    /// The slot to run in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
 ) -> Outcome {
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
     };
-    let wt = match env.worktree(ctx).await {
+    let wt = match env.worktree(ctx, repo.as_deref()).await {
         Ok(wt) => wt,
         Err(outcome) => return outcome,
     };

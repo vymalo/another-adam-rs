@@ -2,9 +2,9 @@
 
 Status: **Accepted** (2026-10-01). The defaults are the ones the slice 7 plan proposed (its D7.2,
 D7.3, D7.4, D7.5 and the open question 24 default); the owner may revisit them. This record covers
-the workspace model, which `adam-workspace` builds. The coder's tools that use it (a scratch project
-to start in, a second repository, the janitor) are built by the changes that follow it, and the
-status note at the end says which are.
+the workspace model, which `adam-workspace` builds. The coder's use of it (a second repository, the
+janitor) and its scratch tools are built by later changes of the slice, and the status notes at the
+end say which are.
 
 ## Context
 
@@ -170,5 +170,15 @@ stateDiagram-v2
 ## Status notes
 
 *2026-10-01: built in `adam-workspace` (`RunWorkspace`, `Slot`, `Scratch`, `copy_into`, the remote
-helpers, the version 2 metadata; `crates/adam-workspace/README.md`). The coder's use of it, the
-janitor and the scratch tools are the following changes of the slice.*
+helpers, the version 2 metadata; `crates/adam-workspace/README.md`).*
+
+*2026-10-01: the coder uses it (`bin/adam-coder/README.md`, "The workspace of a run"). Built: the slots
+of a run (`prepare_workspace` adds one for each repository the person named, as it always required);
+the optional `repo` argument of `run_command`, the file tools, `delegate_to_opencode`, `run_checks`,
+`commit_and_push` and `open_pull_request`; the checks recorded per slot, with the gate of
+`open_pull_request` unchanged (the most recent check of the pushed tree, from any slot, out of the last
+32 records of the run's notes); a run that began in the legacy layout, which keeps working; and the
+janitor of decision 2, a worker component of the host (`Agents::worker_component`, `WORKSPACE_SWEEP_SECS`,
+300 by default and `0` for off). Not built yet: the scratch tools, the coder's question about a
+repository the person did not name (decision 9; until then the rule is the one that was already there,
+the person named it), the creation of a repository, and `copy_into` as a tool.*

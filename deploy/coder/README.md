@@ -149,7 +149,7 @@ refuses a non-empty `config.role`. See the crate README (`bin/adam-coder/README.
 
 A control plane needs no model, GitHub or workspace configuration, so with
 `config.role=control-plane` the chart leaves out `MODEL_BASE_URL`, `MODEL`, `OPENCODE_MODEL`,
-`WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
+`WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `WORKSPACE_SWEEP_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
 `PR_DRAFT`, `GIT_AUTHOR_*`, `WORKSPACE_ROOT` and the two secrets above (the helper
 `coder.runsWorkers` in `templates/_helpers.tpl`). The render of `all` and `worker` is unchanged.
 A `combined` control plane still mounts the `work` volume, because a StatefulSet's

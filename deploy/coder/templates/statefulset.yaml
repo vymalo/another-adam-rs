@@ -84,6 +84,8 @@ spec:
               value: {{ .Values.config.maxCheckCycles | quote }}
             - name: CHECK_TIMEOUT_SECS
               value: {{ .Values.config.checkTimeoutSecs | quote }}
+            - name: WORKSPACE_SWEEP_SECS
+              value: {{ .Values.config.workspaceSweepSecs | quote }}
             - name: ALLOWED_REPO_HOSTS
               value: {{ join "," .Values.config.allowedRepoHosts | quote }}
             - name: GITHUB_API_URL

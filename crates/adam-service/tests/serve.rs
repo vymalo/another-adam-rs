@@ -310,6 +310,49 @@ async fn a_worker_serves_only_health_and_a_control_plane_serves_a2a() {
     running.finish().await;
 }
 
+/// A component the binary adds (the coder's sweep of finished workspaces) runs in the roles that
+/// run workers, with the store `serve` connected, and stops with the workers; a control plane does
+/// not start it.
+#[tokio::test]
+async fn a_component_of_the_binary_runs_with_the_workers_and_stops_with_them() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    let Some(url) = database() else { return };
+    for (role, runs) in [("all", true), ("worker", true), ("control-plane", false)] {
+        let (started, stopped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (on_start, on_stop) = (started.clone(), stopped.clone());
+        let name = unique("serve-component");
+        let port = free_port().await;
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let cfg = config(&url, role, port);
+        let agents = agents(&name, &cfg).worker_component("probe", move |store, stop| async move {
+            // The store is the one `serve` connected: this run is not there.
+            assert!(store.load_run(RunId::new()).await?.is_none());
+            on_start.fetch_add(1, SeqCst);
+            stop.cancelled().await;
+            on_stop.fetch_add(1, SeqCst);
+            Ok(())
+        });
+        let running = Running::start(config(&url, role, port), agents);
+        until_ok(addr, "/healthz", &running.handle).await;
+        for _ in 0..100 {
+            if started.load(SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(started.load(SeqCst), usize::from(runs), "{role}");
+        assert_eq!(
+            stopped.load(SeqCst),
+            0,
+            "{role}: it runs until the host stops it"
+        );
+        running.finish().await;
+        assert_eq!(stopped.load(SeqCst), usize::from(runs), "{role}");
+    }
+}
+
 /// An address that is taken is `ServeError::Bind`, exit 71, and nothing is left running.
 #[tokio::test]
 async fn an_address_that_is_taken_is_a_bind_error_and_exit_71() {

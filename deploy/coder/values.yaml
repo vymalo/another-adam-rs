@@ -67,6 +67,9 @@ config:
   maxCheckCycles: 3
   # Time limit of one run_checks command, in seconds.
   checkTimeoutSecs: 900
+  # How often the janitor removes the workspaces of finished runs (done, failed or cancelled; a
+  # run that waits for an answer is never swept), in seconds. 0 turns it off.
+  workspaceSweepSecs: 300
   # Hosts repositories may live on (a name for any port, or name:port). The
   # GitHub token is only ever sent to these; a repository URL on any other host
   # is refused before git runs. GitHub Enterprise: add its host.

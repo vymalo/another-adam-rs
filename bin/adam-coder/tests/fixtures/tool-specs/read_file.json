@@ -19,6 +19,10 @@
         "format": "uint32",
         "minimum": 0,
         "description": "Last line to show. Leave out to read to the end of the file (or of what fits)."
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to read in: its name, or the repository's address. Leave out when the workspace has one."
       }
     },
     "required": [

@@ -1,4 +1,4 @@
-//! `commit_and_push { message }` and `open_pull_request { title, body }`.
+//! `commit_and_push { message, repo? }` and `open_pull_request { title, body, accept_red_checks?, repo? }`.
 
 use adam::Artifact;
 use adam::prelude::*;
@@ -52,13 +52,16 @@ pub(crate) fn pushed_in(text: &str) -> Option<(String, String)> {
 
 /// Commit every change in the worktree with the given message and push the
 /// branch. Use a Conventional Commit message (feat(scope): ..., fix: ...).
-/// Make small, focused commits: call it after each coherent piece of work.
+/// Make small, focused commits: call it after each coherent piece of work. With several
+/// repositories in the workspace, say which with `repo`.
 #[tool]
 pub async fn commit_and_push(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
     /// Commit message
     message: String,
+    /// The slot to commit and push: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
 ) -> Outcome {
     if ctx.is_cancelled() {
         return Err(cancelled("nothing was committed or pushed"));
@@ -66,7 +69,7 @@ pub async fn commit_and_push(
     let Some(message) = non_empty(&message) else {
         return Ok(ToolOutput::error("message is required"));
     };
-    let wt = match env.worktree(ctx).await {
+    let wt = match env.worktree(ctx, repo.as_deref()).await {
         Ok(wt) => wt,
         Err(outcome) => return outcome,
     };
@@ -127,8 +130,9 @@ pub async fn commit_and_push(
 
     // The verdict on exactly what was pushed, before the branch that names it.
     let pushed_tree = head_tree(wt.path()).await;
-    let checks =
-        checks_for_pushed(&notes, &sha, pushed_tree.as_deref()).into_artifact(&env.redactor);
+    let checks = checks_for_pushed(&notes, &sha, pushed_tree.as_deref())
+        .in_repository(&wt.repo().url)
+        .into_artifact(&env.redactor);
 
     let own = wt.local_branch();
     let mut summary = match &committed {
@@ -181,9 +185,12 @@ fn branch_data(
 
 /// The `checks` verdict on the pushed commit `sha`, whose tree is `tree`.
 ///
-/// If the last `run_checks` of the run ran on that very tree (the worktree as `git add -A` would
-/// commit it, which is what `commit_all` stages), its report is bound to `sha`. Otherwise the
-/// commit was not checked: `passed: false` and a finding saying which trees differ. So a green
+/// If a `run_checks` of the run ran on that very tree (the worktree as `git add -A` would
+/// commit it, which is what `commit_all` stages), the most recent such run, in any slot of the
+/// workspace, decides ([`RunNotes::checked`](super::notes::RunNotes::checked)): its report is bound
+/// to `sha`. A tree id is a content address, so it is the same code whichever slot checked it, and
+/// the most recent check of that code wins. Otherwise the commit was not checked: `passed: false`
+/// and a finding saying which trees differ (the last run's, whatever its slot). So a green
 /// report for a commit always means the code in that commit was checked.
 fn checks_for_pushed(
     notes: &super::notes::RunNotes,
@@ -191,18 +198,19 @@ fn checks_for_pushed(
     tree: Option<&str>,
 ) -> ChecksReport {
     let last = notes.checks.last.as_ref();
-    match (last, tree) {
-        (Some(last), Some(tree)) if last.tree.as_deref() == Some(tree) => match &last.report {
-            Some(report) => report.bound_to(sha, tree, last.passed),
+    match (tree.and_then(|tree| notes.checked(tree)), tree) {
+        (Some(record), Some(tree)) => match &record.report {
+            Some(report) => report.bound_to(sha, tree, record.passed),
             // Notes written before reports were kept: the verdict without the findings.
             None => ChecksReport {
-                passed: last.passed,
+                passed: record.passed,
                 commit: sha.to_owned(),
                 tree: Some(tree.to_owned()),
+                repository: None,
                 summary: Some(format!(
                     "`{}` {}; checked on the identical tree before it was committed",
-                    last.command,
-                    if last.passed { "passed" } else { "failed" }
+                    record.command,
+                    if record.passed { "passed" } else { "failed" }
                 )),
                 findings: Vec::new(),
             },
@@ -219,9 +227,9 @@ fn checks_for_pushed(
 // Opens the pull request for the pushed branch.
 //
 // Refuses unless the branch's `HEAD` was pushed by `commit_and_push` and the
-// last check run passed **on exactly the code the pull request contains** (the
-// tree of `HEAD`; a change made after the run, committed or not, is
-// unverified). The one override is `accept_red_checks: true`, which
+// most recent check run on **exactly the code the pull request contains** (the
+// tree of `HEAD`, whichever slot ran it) passed; a change made after the run, committed or not, is
+// unverified. The one override is `accept_red_checks: true`, which
 // the prompt reserves for explicit user consent; it never overrides an
 // exhausted check budget, and a pull request opened that way says so in its
 // body (on a pull request that was already open, in a comment). When the run continues a branch,
@@ -237,7 +245,8 @@ fn checks_for_pushed(
 /// this code (re-run the checks after your last change). The body must have a
 /// summary and a verification section listing the commands you ran and their
 /// results. If you continue a branch that already has an open pull request, this
-/// updates it with your commits (after the same check) instead of opening another.
+/// updates it with your commits (after the same check) instead of opening another. With several
+/// repositories in the workspace, say which one with `repo`.
 #[tool]
 pub async fn open_pull_request(
     env: State<ToolEnv>,
@@ -248,6 +257,8 @@ pub async fn open_pull_request(
     body: String,
     /// Set true ONLY when the user explicitly said, in this conversation, that a pull request with failing (or no) checks is acceptable. Never set it on your own judgement.
     accept_red_checks: Option<bool>,
+    /// The slot to open the pull request for: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
 ) -> Outcome {
     if ctx.is_cancelled() {
         return Err(cancelled("no pull request was opened"));
@@ -256,7 +267,7 @@ pub async fn open_pull_request(
         return Ok(ToolOutput::error("title and body are required"));
     };
     let accept_red = accept_red_checks.unwrap_or(false);
-    let wt = match env.worktree(ctx).await {
+    let wt = match env.worktree(ctx, repo.as_deref()).await {
         Ok(wt) => wt,
         Err(outcome) => return outcome,
     };
@@ -283,20 +294,25 @@ pub async fn open_pull_request(
         )));
     }
 
-    // "Green" means: the last check run passed, on exactly the code this
-    // pull request contains (the tree of the pushed HEAD). A change made
-    // after the checks passed, committed or not, is not verified.
+    // "Green" means: the most recent check run on exactly the code this pull request contains (the
+    // tree of the pushed HEAD, in whichever slot it ran) passed. A change made after the checks
+    // passed, committed or not, is not verified.
     let tree = head_tree(wt.path()).await;
     let verified = notes.verified_tree(tree.as_deref());
     let red = !verified;
     if red && !accept_red {
-        let why = match &notes.checks.last {
-            None => "no check was run".to_owned(),
-            Some(last) if !last.passed => format!(
+        let on_this_code = tree.as_deref().and_then(|tree| notes.checked(tree));
+        let why = match (on_this_code, &notes.checks.last) {
+            (Some(record), _) => format!(
+                "the last check run (`{}`) failed (exit code {:?})",
+                record.command, record.exit_code
+            ),
+            (None, None) => "no check was run".to_owned(),
+            (None, Some(last)) if !last.passed => format!(
                 "the last check run (`{}`) failed (exit code {:?})",
                 last.command, last.exit_code
             ),
-            Some(last) => format!(
+            (None, Some(last)) => format!(
                 "the code changed since the last passing check run (`{}`): the branch is not \
                  the code that was verified",
                 last.command

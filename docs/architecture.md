@@ -638,8 +638,8 @@ component named in the error (`HostError`, exit code 70).
 
 A run moves between workers at every step: a `Continue` is committed, the lease is released, and
 the next claim may go to any worker (`crates/adam-runtime/src/worker.rs`, `run_worker`). The
-coder keeps a worktree per run under a local root, so with two workers on two disks a run can land
-on a worker that has no worktree for it. Nothing fails: `prepare_workspace` clones again, the
+coder keeps a workspace per run (worktrees, below) under a local root, so with two workers on two disks a run can land
+on a worker that has no workspace for it. Nothing fails: `prepare_workspace` clones again, the
 branch `agent/<short>` is taken, a longer one is picked, the run notes are gone, and a second pull
 request is opened. The deployer therefore chooses a **placement**
 ([ADR 0002](decisions/0002-workspace-placement.md)), the closed enum `adam_host::Placement`, read
@@ -703,7 +703,7 @@ repository on the run's own branch `agent/<run-short-id>`, or a scratch project,
 repository with an empty root commit where work can start before anyone has named a repository. A run
 has at most one slot per repository, called the repository's name (`<name>-<owner>` when another
 repository of the run has it), and slots keep the order they joined the run. The workspace lives as
-long as the run and is deleted when it ends; the run's notes and its `agent/*` branches stay.
+long as the run and is deleted when it ends (the coder's janitor, below); the run's notes and its `agent/*` branches stay.
 `copy_into` is the only way a scratch project's files reach a repository, all or nothing, and
 `initialize_empty` gives a repository that has no branch its first commit, an empty one, the only push
 outside `agent/*`. A workspace made before slots existed (one worktree in `<root>/worktrees/<run>`) is
@@ -1725,8 +1725,9 @@ Two rules keep this tree honest (details in the
 ## The coder agent
 
 `adam-coder` turns a coding task into a pull request. A client sends
-"in repository X, do Y". The agent makes the change in a private git worktree,
-runs the project's own checks, and opens a pull request. It is an `LlmAgent`
+"in repository X, do Y". The agent makes the change in a private git worktree
+(a slot of the run's workspace, which may hold other repositories too), runs the project's
+own checks, and opens a pull request. It is an `LlmAgent`
 with ten tools and one extra rule, running on the durable runtime and served
 over A2A.
 
@@ -1760,6 +1761,7 @@ sequenceDiagram
     G->>R: git fetch --prune origin (token in the env of this one call)
     G->>G: git worktree add, new branch agent/short-run-id from origin/base
     A-->>C: progress: worktree ready
+    Note over A,G: a second repository the person named is a second slot of the run's workspace, and the tools then say which one with repo
 
     alt a small, well-located change
         A->>W: read_file(path), then write_file(path, content) or apply_patch(diff)
@@ -1822,6 +1824,7 @@ stateDiagram-v2
     [*] --> NoWorkspace
     NoWorkspace --> NoWorkspace: prepare_workspace refuses a repository the person did not name, the model asks
     NoWorkspace --> WorktreeReady: prepare_workspace on a repository the person named
+    WorktreeReady --> WorktreeReady: prepare_workspace on another repository the person named, a new slot
     WorktreeReady --> Edited: write_file, apply_patch or delegate_to_opencode
     Edited --> ChecksGreen: run_checks passes
     Edited --> ChecksRed: run_checks fails, one cycle used
@@ -1884,6 +1887,13 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     continues a pushed branch pushes to a branch of its own, and only after this
     gate does `open_pull_request` fast-forward the continued branch (never forced), so the pull
     request that is open for it never carries unverified commits.
+  * **A workspace of several slots** ([the coder README](../bin/adam-coder/README.md#the-workspace-of-a-run)):
+    `prepare_workspace` on a second repository the person named adds a slot (a repository has at most one
+    slot per run); `run_command`, the file tools, `delegate_to_opencode`, `run_checks`, `commit_and_push` and
+    `open_pull_request` take an optional `repo` (the slot's directory or the repository's address), which
+    may be left out while there is one slot and is refused with the list of slots when there are several.
+    A check and a push are of one slot; the gate does not change: `open_pull_request` wants the most recent
+    check of the pushed tree, whichever slot ran it, and the run notes keep the last 32 check records for it.
   * The file tools (`read_file`, `write_file`, `apply_patch`) refuse a path that is empty, absolute, goes up with `..`,
     names `.git` (any case), leaves the worktree through a symlink (read) or goes through a symlink (write); a patch is
     checked by the paths `git apply --numstat -z` reports and refused if it creates a symlink or a submodule; a hunk that
@@ -1905,14 +1915,22 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     to `ask_user`.
 * **Safe to repeat.** A tool call that dies before its result is journaled
   runs again, so each tool is safe to repeat. `prepare_workspace` reuses the
-  run's worktree, `commit_and_push` does nothing when there is nothing new,
+  run's slot of that repository, `commit_and_push` does nothing when there is nothing new,
   `open_pull_request` returns the open pull request of the same branch, and
   failed checks are counted per call id.
 * **Where state lives.** Conversation, journal and run state are in Postgres.
-  The mirrors, worktrees and per-run notes
+  The mirrors, the workspaces of runs (`<WORKSPACE_ROOT>/workspaces/<run>/<slot>`) and per-run notes
   (`<WORKSPACE_ROOT>/coder/<run>.json`) are files under `WORKSPACE_ROOT`. Git is
   the durable artifact: a lost database loses the run ledger, not the pushed
   branches or the pull requests.
+* **The janitor.** A workspace lives as long as its run
+  ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md)). `Janitor`, a worker component of the
+  host (`Agents::worker_component`, so in the `all` and `worker` roles), sweeps at startup and every
+  `WORKSPACE_SWEEP_SECS` (300; `0` is off): the workspace of a run that is `done` or `failed` (a cancel
+  included), or that the store does not know, is removed, every slot of it; the workspace of a run that is
+  `runnable` or `parked` stays, however long the person takes to answer. The notes and the `agent/*`
+  branches in the mirrors stay: they are the only copy of an unpushed commit. A store that does not answer
+  leaves the workspace alone, and a failed removal is logged and tried again at the next sweep.
 * **Secrets.**
   * The git token reaches `git` only through the environment of a single
     invocation, never in a remote URL or `.git/config`, and only for hosts on
@@ -1956,7 +1974,7 @@ flowchart LR
             coder --> oc
             coder --> kids
         end
-        pvc[("PVC at /work<br/>mirrors, worktrees, notes")]
+        pvc[("PVC at /work<br/>mirrors, workspaces, notes")]
         cnpg[("CloudNativePG cluster<br/>Postgres: runs and journal")]
         secret["ExternalSecret to Secret<br/>MODEL_API_KEY, GITHUB_TOKEN (not for role control-plane), A2A_BEARER_TOKENS"]
     end
@@ -2016,8 +2034,8 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   binary changed. Verified 2026-09-29: `bin/adam-coder/src/config.rs` requires
   `A2A_BEARER_TOKENS` and `PUBLIC_URL` only for the roles that serve A2A.
 * **More than one worker needs a placement.** Runs move between workers at every step
-  (`adam-runtime`'s worker), while a worktree lives in one worker's `/work`. A second worker
-  that does not have a run's worktree would continue it on a checkout that is not there, and
+  (`adam-runtime`'s worker), while a workspace lives in one worker's `/work`. A second worker
+  that does not have a run's workspace would continue it on a checkout that is not there, and
   fork it into a second pull request. The chart therefore refuses `replicaCount > 1` for the
   roles that run workers until `workspace.placement` is set
   ([ADR 0002](decisions/0002-workspace-placement.md)), and passes it to the binary as

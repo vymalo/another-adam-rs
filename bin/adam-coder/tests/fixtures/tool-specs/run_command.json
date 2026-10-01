@@ -11,6 +11,10 @@
       "cwd": {
         "type": "string",
         "description": "Optional sub-directory of the worktree to run in (relative, inside the worktree)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to run in: its name, or the repository's address. Leave out when the workspace has one."
       }
     },
     "required": [

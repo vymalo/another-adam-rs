@@ -24,12 +24,14 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig};
 use adam_a2a_runtime::InboundFn;
 use adam_core::{ClaimScope, DynStore, StoreError};
+use adam_error::BoxError;
 use adam_host::{Host, HostError, Placement};
 use adam_notify_postgres::PgNotify;
 use adam_runtime::{BroadcastSink, Runtime, RuntimeBuilder};
@@ -48,6 +50,16 @@ const SERVER_DRAIN: Duration = Duration::from_secs(10);
 /// How an agent is put on the runtime: given the builder (over the store [`serve`] connected), it
 /// returns it with the agent registered.
 pub type Register = Box<dyn FnOnce(RuntimeBuilder) -> RuntimeBuilder + Send>;
+
+/// A worker-tier component of a binary (see [`Agents::worker_component`]): given the store [`serve`]
+/// connected and the token that says "stop", the future that is the component.
+type StartComponent = Box<
+    dyn FnOnce(
+            DynStore,
+            CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>
+        + Send,
+>;
 
 /// The agent a process serves, as [`serve`] needs it. The binary builds it from its own files and
 /// configuration, before anything connects, so a mistake in them stops the process first.
@@ -70,6 +82,8 @@ pub struct Agents {
     /// sets [`vymalo_inbound`](adam_a2a_runtime::vymalo_inbound). Only the roles that serve A2A
     /// use it.
     pub inbound: Option<InboundFn>,
+    /// The components the binary adds to the worker tier ([`Agents::worker_component`]).
+    components: Vec<(String, StartComponent)>,
 }
 
 impl Agents {
@@ -84,6 +98,7 @@ impl Agents {
             register: Box::new(register),
             options: RuntimeOptions::default(),
             inbound: None,
+            components: Vec::new(),
         }
     }
 
@@ -108,6 +123,29 @@ impl Agents {
         self
     }
 
+    /// Add a component of the binary to the worker tier of the [`Host`](adam_host::Host), beside
+    /// the runtime's worker: `component` is given the store [`serve`] connected and the token the
+    /// host cancels when it stops the workers, and is the future of the component. It runs in the
+    /// roles that run workers (`all` and `worker`) and never in `control-plane`, and it follows the
+    /// rules of any host component: it must return when the token is cancelled, and a component
+    /// that returns before that, or with an error, stops the process (a host error, exit 70). A
+    /// component that has nothing to do waits for the token.
+    ///
+    /// What a binary does beside its agent that must not wait for a run: the coder's sweep of the
+    /// workspaces of finished runs.
+    #[must_use]
+    pub fn worker_component<F, Fut>(mut self, name: impl Into<String>, component: F) -> Self
+    where
+        F: FnOnce(DynStore, CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), BoxError>> + Send + 'static,
+    {
+        self.components.push((
+            name.into(),
+            Box::new(move |store, stop| Box::pin(component(store, stop))),
+        ));
+        self
+    }
+
     /// Read A2A messages with `f` instead of the default: how a message becomes the agent's
     /// input, for the roles that serve A2A. See [`Agents::inbound`](struct@Agents#structfield.inbound).
     #[must_use]
@@ -127,6 +165,14 @@ impl std::fmt::Debug for Agents {
             .field("card", &self.card.is_some())
             .field("options", &self.options)
             .field("inbound", &self.inbound.is_some())
+            .field(
+                "components",
+                &self
+                    .components
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -218,6 +264,7 @@ pub async fn serve(
         register,
         options,
         inbound,
+        components,
     } = agents;
     if role.runs_control_plane() && card.is_none() {
         return Err(ServeError::NoCard);
@@ -244,6 +291,7 @@ pub async fn serve(
     };
     let workers = role.runs_workers().then_some(options.concurrency);
     let worker_id = options.worker_id.clone();
+    let component_store = store.clone();
     let service = Service::new_with(register(Runtime::builder(store)), name, &options, live)
         .with_inbound(inbound);
 
@@ -305,6 +353,13 @@ pub async fn serve(
     } else {
         host.control_plane("notify", |stop| run_notify(notify, stop.cancelled_owned()))
     };
+
+    // The binary's own components: they run in the worker tier, so the host stops them with the
+    // workers (and never starts them in a control plane).
+    let host = components.into_iter().fold(host, |host, (name, start)| {
+        let store = component_store.clone();
+        host.worker(name, move |stop| start(store, stop))
+    });
 
     host.run(shutdown).await?;
     tracing::info!("stopped");

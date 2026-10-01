@@ -148,13 +148,21 @@ async fn only_the_optional_arguments_are_nullable() {
     assert_eq!(
         found,
         [
+            "apply_patch.repo",
+            "commit_and_push.repo",
+            "delegate_to_opencode.repo",
             "open_pull_request.accept_red_checks",
+            "open_pull_request.repo",
             "prepare_workspace.base_branch",
             "prepare_workspace.branch",
             "read_file.end_line",
+            "read_file.repo",
             "read_file.start_line",
             "run_checks.cwd",
+            "run_checks.repo",
             "run_command.cwd",
+            "run_command.repo",
+            "write_file.repo",
         ]
     );
 }

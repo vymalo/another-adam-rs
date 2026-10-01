@@ -11,6 +11,10 @@
       "content": {
         "type": "string",
         "description": "The whole new content of the file (at most 1 MiB)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to write in: its name, or the repository's address. Leave out when the workspace has one."
       }
     },
     "required": [

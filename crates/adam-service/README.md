@@ -37,7 +37,7 @@ an agent does.
 | `ConfigError { problems }` | what a non-empty list becomes (`ConfigError::check(problems)`); `Classify` gives `Invalid` |
 | `RuntimeOptions`, `LiveSignals` | how the runtime is set up (worker id, claim scope, concurrency, lease, poll), and how a process learns of other processes (`LiveSignals::local()` or the Postgres `NOTIFY` ones `serve` builds) |
 | `Service { runtime, backend }` | `Service::new(builder, name, options)`, `new_with(.., live)`, `with_inbound(Option<InboundFn>)` (how an A2A message becomes the agent's input), `router(card, auth)`, `run_worker(shutdown)`; `router(&backend, card, auth)` for a composition that holds the parts itself |
-| `Agents::new(name, register)` | the agent a process serves: its name, `.card(card)`, `.options(options)`, `.inbound(f)` (read A2A messages with `f`, e.g. `adam_a2a_runtime::vymalo_inbound` for an agent behind a screen; the default is `default_inbound`), and `register`, a closure that puts it on the runtime builder (`Assembly::register`, or the starter only for a control plane) |
+| `Agents::new(name, register)` | the agent a process serves: its name, `.card(card)`, `.options(options)`, `.inbound(f)` (read A2A messages with `f`, e.g. `adam_a2a_runtime::vymalo_inbound` for an agent behind a screen; the default is `default_inbound`), and `register`, a closure that puts it on the runtime builder (`Assembly::register`, or the starter only for a control plane); `.worker_component(name, f)` adds a component of the binary to the worker tier (below) |
 | `serve(&config, agents, shutdown)` | the whole process, until `shutdown` resolves; `ServeError` on failure |
 | `ServeError` | `Connect`, `Migrate`, `NoCard`, `Bind`, `LocalAddr`, `Host`. The message names the step; the cause is the `source`, so a chain printed whole says it once |
 | `claim_scope_for(placement)` | `Pinned` for a placement that pins runs, `Any` otherwise |
@@ -97,6 +97,12 @@ stateDiagram-v2
 | `control-plane` | `a2a-server`, `notify` | the runtime knows the agent as a starter only: no model, no tools |
 | `worker` | `worker`, `health`, `notify` | `/healthz` on `LISTEN_ADDR`, no A2A |
 
+A binary adds components of its own with `Agents::worker_component(name, |store, stop| async { .. })`: they
+join the worker tier, so they run in `all` and `worker` and never in `control-plane`, and the host stops them
+with the workers. The closure is given the store `serve` connected and the token that says "stop"; the rules
+are the host's (return when the token is cancelled; one that returns early, or with an error, stops the process
+with a host error). The coder's sweep of the workspaces of finished runs is one.
+
 `notify` is the `adam-notify-postgres` listener and publisher: live events and wake-up/cancel signals cross
 processes over `LISTEN`/`NOTIFY`, so a worker takes a run another process started at once and a control plane
 streams the progress of a run a worker steps. It is a latency optimisation: polling stays on and correctness
@@ -143,7 +149,8 @@ from a worker not a 69.
   answers, a bearer token is required, a task completes, a control plane and a worker over one store meet in it,
   and two services of different names share a store without stealing each other's runs.
 * `tests/serve.rs` (needs `ADAM_TEST_POSTGRES_URL`, skipped without it; `ADAM_TEST_REQUIRE_DB=1` makes a
-  missing URL a failure): `serve` end to end on Postgres, for each role.
+  missing URL a failure): `serve` end to end on Postgres, for each role, and a binary's own component
+  (`worker_component`) that runs with the workers and stops with them.
 
 ```sh
 docker run -d -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16

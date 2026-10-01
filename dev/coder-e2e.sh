@@ -25,8 +25,8 @@
 #   * mock-github saw exactly one POST /repos/local/sandbox/pulls, head = the
 #     branch, base = main;
 #   * git-server has the branch, and hello.txt on it is `hello`;
-#   * SCENARIO=files also: the stream says `read README.md` and `wrote hello.txt` (the coder's file
-#     tools ran) and never `starting OpenCode`.
+#   * SCENARIO=files also: the stream says `read README.md (sandbox)` and `wrote hello.txt (sandbox)`
+#     (the coder's file tools ran, in the slot of the repository) and never `starting OpenCode`.
 # It prints one "ok" or "FAIL" line per check and exits 1 if any failed.
 #
 # Environment (defaults match compose.yaml on one machine):
@@ -166,8 +166,9 @@ if [ "$order" = true ]; then ok "the chunks came before the end of the task"; el
 if [ "$scenario" = files ]; then
   lines=$tmp/lines.txt
   jq -r '.. | .text? // empty' "$events" > "$lines" 2>/dev/null || : > "$lines"
-  if grep -qx 'read README.md' "$lines"; then ok "the coder read README.md itself"; else bad "no 'read README.md' line in the stream"; fi
-  if grep -qx 'wrote hello.txt' "$lines"; then ok "the coder wrote hello.txt itself"; else bad "no 'wrote hello.txt' line in the stream"; fi
+  slot=${repo_path##*/}
+  if grep -qx "read README.md ($slot)" "$lines"; then ok "the coder read README.md itself"; else bad "no 'read README.md ($slot)' line in the stream"; fi
+  if grep -qx "wrote hello.txt ($slot)" "$lines"; then ok "the coder wrote hello.txt itself"; else bad "no 'wrote hello.txt ($slot)' line in the stream"; fi
   if grep -q 'starting OpenCode' "$lines"; then bad "OpenCode was started, and this script does not delegate"; else ok "OpenCode was not started"; fi
 fi
 

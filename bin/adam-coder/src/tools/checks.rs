@@ -1,4 +1,4 @@
-//! `run_checks { command }`, and the `checks` artifact it reports.
+//! `run_checks { command, cwd?, repo? }`, and the `checks` artifact it reports.
 //!
 //! # The `checks` artifact
 //!
@@ -14,9 +14,11 @@
 //! The data part is a [`ChecksReport`]. A consumer that sees several `checks` artifacts takes the
 //! last one for a commit.
 //!
-//! The report and the tree it checked are kept in the run's notes, so that `commit_and_push` can bind
-//! it to the commit it pushes when that commit has the same tree (see [`ChecksReport::bound_to`]),
-//! and otherwise says the commit was not checked ([`ChecksReport::unchecked`]).
+//! The report and the tree it checked are kept in the run's notes (the last one, and a short history
+//! of them, in every slot of the workspace), so that `commit_and_push` can bind the most recent
+//! report on a tree to the commit it pushes when that commit has the same tree, whichever slot ran
+//! the check (see [`ChecksReport::bound_to`] and `RunNotes::checked`), and otherwise says the commit
+//! was not checked ([`ChecksReport::unchecked`]).
 
 use adam::Artifact;
 use adam::prelude::*;
@@ -69,6 +71,7 @@ pub struct Finding {
 /// | `passed` | the check passed, and the report is complete |
 /// | `commit` | the 40-hex SHA of the `HEAD` of the run's workspace when the check ran; empty only when it could not be determined (`passed` is then `false`) |
 /// | `tree` | the git tree id (40 hex) of the code the check ran on, as `git add -A` would commit it; absent when it could not be computed |
+/// | `repository` | the URL of the repository of the slot the check ran in (for the verdict on a pushed commit, the repository it was pushed to); absent for a scratch project and in reports of an older coder |
 /// | `summary` | one line |
 /// | `findings` | the failing checks; at most [`MAX_FINDINGS`] and [`MAX_FINDINGS_BYTES`] in total, the cut marked |
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +83,9 @@ pub struct ChecksReport {
     /// The tree of the code the check ran on: the worktree as `commit_and_push` would commit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree: Option<String>,
+    /// The repository of the slot the check ran in, or the repository the commit was pushed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     /// One line about the run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -103,6 +109,8 @@ struct Run<'a> {
     dirty: bool,
     /// The tree of the worktree as it would be committed.
     tree: Option<&'a str>,
+    /// The repository of the slot the command ran in.
+    repository: Option<&'a str>,
 }
 
 impl ChecksReport {
@@ -146,9 +154,17 @@ impl ChecksReport {
             passed: passed && commit.is_some(),
             commit: commit.unwrap_or_default().to_owned(),
             tree: run.tree.filter(|t| is_sha(t)).map(str::to_owned),
+            repository: run.repository.map(str::to_owned),
             summary: Some(summary),
             findings: cap_findings(findings),
         }
+    }
+
+    /// This report for the repository `url`: what a verdict on a pushed commit names.
+    #[must_use]
+    pub fn in_repository(mut self, url: &str) -> Self {
+        self.repository = Some(url.to_owned());
+        self
     }
 
     /// This report with the values `redactor` knows scrubbed out of its text.
@@ -173,6 +189,7 @@ impl ChecksReport {
             passed: command_passed,
             commit: commit.to_owned(),
             tree: Some(tree.to_owned()),
+            repository: None,
             summary: Some(format!(
                 "{core}; checked on the identical tree before it was committed as {}",
                 &commit[..commit.len().min(10)]
@@ -200,6 +217,7 @@ impl ChecksReport {
             passed: false,
             commit: commit.to_owned(),
             tree: tree.filter(|t| is_sha(t)).map(str::to_owned),
+            repository: None,
             summary: Some(format!(
                 "the pushed commit {} was not checked",
                 &commit[..commit.len().min(10)]
@@ -428,7 +446,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 
 /// Run one of the project's own checks in your worktree (the commands its CI, README or
 /// Makefile run: `cargo test`, `pnpm test`, `just ci`) and get its exit code and the tail of
-/// its output. Only exit code 0 counts as passing. Every failed run uses up one of your limited
+/// its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited
 /// check cycles and is reported as a check: never use it to look around (use run_command). A
 /// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
 /// cycle, and is for the person to decide.
@@ -440,6 +458,8 @@ pub async fn run_checks(
     command: String,
     /// Optional sub-directory of the worktree to run in (relative, inside the worktree)
     cwd: Option<String>,
+    /// The slot to run in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
 ) -> Outcome {
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
@@ -466,7 +486,7 @@ pub async fn run_checks(
         )));
     }
 
-    let wt = match env.worktree(ctx).await {
+    let wt = match env.worktree(ctx, repo.as_deref()).await {
         Ok(wt) => wt,
         Err(outcome) => return outcome,
     };
@@ -519,6 +539,7 @@ pub async fn run_checks(
         head: head.as_deref(),
         dirty,
         tree: tree.as_deref(),
+        repository: Some(&wt.repo().url),
     })
     .scrubbed(redactor);
     let artifact = report.clone().into_artifact(redactor);
@@ -531,6 +552,7 @@ pub async fn run_checks(
         tail: outcome.tail.clone(),
         tree,
         report: Some(report),
+        slot: Some(wt.dir().to_owned()),
     });
     env.notes
         .save(&run, &notes)
@@ -591,6 +613,7 @@ mod tests {
             head,
             dirty,
             tree: Some(TREE),
+            repository: None,
         })
     }
 
@@ -692,6 +715,7 @@ mod tests {
             head: Some(SHA),
             dirty: false,
             tree: None,
+            repository: None,
         });
         let summary = r.summary.unwrap();
         assert!(!summary.contains('\n'));
@@ -769,6 +793,7 @@ mod tests {
             head: Some(SHA),
             dirty: false,
             tree: None,
+            repository: None,
         })
     }
 
