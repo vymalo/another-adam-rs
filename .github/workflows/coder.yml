@@ -10,7 +10,8 @@ name: coder
 # the compose stack (scripted models, a git remote, a mock GitHub) with a task
 # that must end in a branch and one pull request (dev/coder-e2e.sh; also a task that names no
 # repository, which ends in a pull request on a repository named later; and all of them again with
-# the coder as a GitHub App installation, dev/compose.github-app.yaml; the default one also reads a
+# the coder as a GitHub App installation, dev/compose.github-app.yaml; also a task that needs another
+# repository, which the coder may add only if the person says yes, and a no leaves it out; the default one also reads a
 # repository's branches through the GitHub MCP server, here its mock `mock-github-mcp`; the image build
 # itself runs the real server's tool list over stdio), and with
 # "Hi", which must get a greeting that says the agent's name, and with a changed
@@ -253,7 +254,8 @@ jobs:
       # The image that just passed, in the compose stack: the coder gets a task
       # over A2A, its scripted model drives prepare -> OpenCode (also scripted)
       # -> checks -> commit and push -> pull request, and dev/coder-e2e.sh
-      # checks the artifacts, mock-github's journal and git-server. Run four times:
+      # checks the artifacts, mock-github's journal and git-server. Run four times (and the second repository
+# twice, with the person's yes and no):
       # without OpenCode (the check command makes the change), with it, with the coder
       # writing the file itself (SCENARIO=files), and with no repository named at all
       # (SCENARIO=scratch: a project is built in a scratch slot, the coder asks where to put
@@ -278,6 +280,11 @@ jobs:
           # No repository is named: the project is built in a scratch slot, the task waits for the
           # person to name one, and what was checked is what is pushed to it.
           SCENARIO=scratch sh dev/coder-e2e.sh
+          # The task needs a second repository: the coder asks the person (request_repository), and
+          # only a yes adds it. With the yes the pull request has the library's greeting; with a no
+          # git-server is never asked for the library and no pull request is opened.
+          SCENARIO=second-repo ANSWER=yes sh dev/coder-e2e.sh
+          SCENARIO=second-repo ANSWER=no sh dev/coder-e2e.sh
           # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
           sh dev/greeting-e2e.sh
           # The general agent: "hi" answered in role by its folder, and an edited folder changes the
@@ -302,6 +309,8 @@ jobs:
           sh dev/coder-e2e.sh
           SCENARIO=files sh dev/coder-e2e.sh
           SCENARIO=scratch sh dev/coder-e2e.sh
+          SCENARIO=second-repo ANSWER=yes sh dev/coder-e2e.sh
+          SCENARIO=second-repo ANSWER=no sh dev/coder-e2e.sh
       - name: Compose e2e logs
         if: failure() && steps.guard.outputs.ready == 'true'
         run: docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app logs --no-color

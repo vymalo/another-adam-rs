@@ -43,10 +43,11 @@ sequenceDiagram
 
 | Tool | Does |
 |---|---|
-| `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
+| `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository that is granted**: one the person named in their own messages of the run, or agreed to add when `request_repository` asked (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `request_repository` (or to `ask_user`, when it has no repository to ask about). Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
 | `start_scratch { name? }` | `RunWorkspace::add_scratch` for the run (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. The result says the project is **temporary** (it exists only while the task is open, nothing is kept unless it is published) and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
-| `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **the person named** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
+| `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **that is granted** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
 | `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
+| `request_repository { repo_url, reason }` | **asks the person** whether another repository may join the workspace: the run parks (`input-required`) on a question **the tool writes**, which names the repository and quotes the model's `reason` (one line, at most 300 characters: `May I add the repository acme/lib (https://github.com/acme/lib) to this workspace? The agent says why: "..."`) and offers `Yes, add acme/lib` and `No`, as a form (one `Choices` question, id `consent`) on a screen that can draw it and as text on one that cannot (the same machinery as `ask_user`'s `choices`, [below](#asking-with-choices)). Only a yes adds the repository (it is then **granted**: the model calls `prepare_workspace` with it); the model never grants, see [the rules](#another-repository-only-with-the-persons-yes). A repository already granted is a result that says so (nobody is asked); one the person turned down is an error result that says not to ask again; one the workspace's policy would refuse (its host is not in `ALLOWED_REPO_HOSTS`, or it is a local path) is an error result **before** anyone is asked. `asks_user()` is `true`, so a subagent cannot have it |
 | `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
@@ -58,13 +59,13 @@ sequenceDiagram
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the fourteen. The shipped folder's own `mcp.json` adds
+folder](#mcp-tools-from-the-folder)); they are not part of the fifteen. The shipped folder's own `mcp.json` adds
 twelve **read-only** tools of GitHub, `github__get_me`, `github__get_file_contents`, `github__list_branches` and the
 rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)).
 
-Eleven tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the eleven is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Twelve tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the twelve is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
@@ -307,19 +308,21 @@ make them hold:
 * **A question is answered, not worked on.** The prompt says that a greeting or a question about the
   repository ("List all branches") gets a direct answer (after `prepare_workspace`, with `run_command`) and ends
   the turn; the run then parks as a question like any stop without a pull request, and the chat goes on.
-* **Only a repository the person named.** `prepare_workspace` and `publish_scratch` refuse a
-  repository that is not named in the person's own messages of the run (a scratch project is published
-  only to one the person named: nothing is copied, pushed or even asked of a remote otherwise): the
+* **Only a repository that is granted.** `prepare_workspace` and `publish_scratch` refuse a
+  repository whose key is not **granted** in the run's notes (`RunNotes::named_repos`; a scratch project is
+  published only to a granted one: nothing is copied, pushed or even asked of a remote otherwise). A
+  repository is granted in one of two ways. **The person named it** in their own messages of the run: the
   task, and every answer delivered to it (user messages and the results of
   `ask_user`, paired with the question by position in the history, because
   providers that send no call ids get `call_0`, `call_1` again in every turn; what
   the model or a tool wrote never counts, and neither does text quoted in a
   fence labelled `untrusted`, which is how the orchestrator's message that sends
   a job back quotes findings of checks and reviewers: its `request` fence, the
-  person's own words, does count). Before every step
+  person's own words, does count). Or **the person agreed to add it**: the model called
+  `request_repository`, the tool asked, and the answer was a yes
+  ([below](#another-repository-only-with-the-persons-yes)). Before every step
   `CoderAgent` reads those messages (and the inbox, without consuming it:
-  `Ctx::peek_inbox`) and records the repositories they name in the run notes
-  (`RunNotes::named_repos`); the tool compares the argument with them and never
+  `Ctx::peek_inbox`) and records what they grant in the run notes; the tool compares the argument with them and never
   trusts the model alone. Repositories are compared as normalised
   `host/owner/name` ([`tools::named`](src/tools/named.rs)): case-insensitive,
   without scheme, credentials, `.git` or a trailing slash; `https://host/owner/name(.git)`,
@@ -330,7 +333,8 @@ make them hold:
   it is the scheme's default, and `www.github.com` is `github.com`. The
   refusal is a tool result that says which repositories were named (only what
   the person wrote, and not words that are files such as `src/main.rs`) and tells
-  the model to ask the person with `ask_user`; it is not a run failure. The tools
+  the model to ask the person with `ask_user` which repository to work on, or, when the task needs one more,
+  to call `request_repository`; it is not a run failure. The tools
   read what `CoderAgent` records, so `coder_tools` under another agent refuses
   every repository.
   A message that continues a parked run (same `contextId`, no `taskId`, while the
@@ -355,7 +359,7 @@ stateDiagram-v2
   Canceled --> [*]
 ```
 
-Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories named, branches the
+Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories granted and the answers that granted them, branches the
 conversation pushed) lives in
 `<WORKSPACE_ROOT>/coder/<run>.json` next to the worktree, written atomically.
 
@@ -559,6 +563,61 @@ stateDiagram-v2
   Pushed --> Released
   Released --> [*]
 ```
+
+### Another repository, only with the person's yes
+
+A task names the repository it is about. When it needs another (to read a shared file from, or to change too),
+the model does not get to decide: it calls `request_repository { repo_url, reason }`, which asks the person.
+
+```mermaid
+sequenceDiagram
+  participant M as the model
+  participant T as request_repository
+  participant P as the person
+  participant A as CoderAgent (before each step)
+  participant W as prepare_workspace
+  M->>T: repo_url, reason
+  T->>T: the address is a repository, the policy allows its host, nobody has been asked yet
+  T-->>P: May I add acme/lib? [Yes, add acme/lib] [No] (a form, or the options as text)
+  Note over T,P: the run waits (input-required), nothing of acme/lib is fetched
+  P-->>A: the answer (the result of the call, or the inbox while parked)
+  A->>A: paired with the call by position, a yes grants the call's repository in the notes
+  M->>W: prepare_workspace(acme/lib)
+  W-->>M: a slot (granted), or a refusal that points back to request_repository
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> NotGranted
+  [*] --> Granted: the person named it
+  NotGranted --> Asked: request_repository
+  Asked --> Granted: the person says yes
+  Asked --> Refused: any other answer
+  Granted --> [*]: prepare_workspace and publish_scratch accept it
+  Refused --> [*]: request_repository says no more asking, prepare_workspace refuses
+```
+
+* **The question is the tool's.** It is written by the tool from the repository's address (no space
+  or control character gets into it) and the model's `reason`, which is quoted on one line and cut at 300
+  characters. The same tool that `ask_user` is draws it, so a client sees one kind of question: a form of one
+  `Choices` question with the options `yes` and `no` on a screen that has the component, the options in the text
+  on any other.
+* **The model never grants.** What is recorded is the person's **answer to that call**: the result of a
+  `request_repository` call that did not fail, or, while the run is parked on it, the message waiting in the inbox
+  (`Ctx::peek_inbox`). It is paired with the call by position (providers repeat ids), and it grants the repository
+  of **that call's** argument, which is the one the question named. A yes to a question the model wrote with
+  `ask_user`, however it is worded, grants nothing; neither does anything a tool printed, and an error
+  result of `request_repository` is the tool's own words and counts for nothing, not even as the person naming a
+  repository (it may quote an address the model chose).
+* **What is a yes.** The form's option `yes` (the answer comes back as `- consent: yes`), or, in words, exactly
+  `yes`, `y` or `Yes, add acme/lib`, whatever the case. Anything else is not agreement: `yes please`, `no`, `no, use
+  acme/other` (which does name `acme/other`, as every word of the person does).
+* **Replays are the same.** Before every step the agent reads the answers from the history again and records them
+  (`RunNotes::consents`, `Consent { call_id, tool, subject, agreed }`; the same call, tool and subject is not
+  recorded twice, and a refusal is kept): a restarted worker, or another one, reaches the same grants, and a task
+  that continues this one reads them from the carried history.
+* **Asked once.** A repository the person turned down is not asked about again in the run: `request_repository`
+  answers that they declined.
 
 ### Where the processes of a run run
 
@@ -1102,9 +1161,9 @@ is treated as hostile input. The GitHub credential (the token, or the App's inst
 token) is bound to `ALLOWED_REPO_HOSTS`
 twice over, and a third layer decides whether the repository may be used at all:
 
-0. **Only a repository the person named.** `prepare_workspace` refuses, before
-   anything else, a repository that is not named in the person's own messages
-   of the run (see [the rules](#the-rules-in-code)); quoted findings do not name
+0. **Only a repository that is granted.** `prepare_workspace` refuses, before
+   anything else, a repository that the person did not name in their own messages
+   of the run and did not agree to add (see [the rules](#the-rules-in-code)); quoted findings do not name
    one.
 1. `Workspaces::allow_hosts` refuses any other host before a process is
    spawned, a request is made or a credential is asked for (the model gets the
@@ -1378,6 +1437,21 @@ database of its own, so the role needs `CREATEDB`):
   `completed`, and a `working` update carrying the text of the worker's progress line (an update of
   its `prepare_workspace` step, `preparing a worktree of ...`), which exists only as a live event and so proves events
   crossed the two processes over `NOTIFY`. Both processes log `listening for notifications`.
+* **Another repository, only with the person's yes** ([above](#another-repository-only-with-the-persons-yes)).
+  `src/agent.rs` (unit): a yes is a consent for the repository of *that call's* argument whatever the answer says
+  (the forms `yes`, `y`, the option's label and the form's `- consent: yes`; `yes please`, `no`, `yes, add
+  acme/other` and the form's `no` are not); an `ask_user` the model wrote, a tool's result, an error result of the
+  tool and a call whose argument is no repository grant nothing and name nothing; the pairing holds when a provider
+  sends `call_0` again; an answer in the inbox while the run is parked on the question is recorded (and a finished-child
+  notice, or a run parked on another tool, records none); recording the same consents again changes nothing, a
+  refusal is kept and the same id for another repository is another consent. `src/tools/consent.rs` (unit): what a yes
+  is, the reason cut at 300 characters and made one line, the question's two options. `tests/e2e.rs` (per store):
+  the second repository is not fetched while the question waits, the question names it, quotes the reason and
+  carries a form with a yes and a no, a yes picked on the form lets `prepare_workspace` add it and the notes say
+  so; `yes please` adds nothing, the refusal points back to the tool, asking again is refused and nothing was ever
+  fetched; a yes to a question the model wrote with `ask_user` grants nothing. `tests/tool_specs.rs` pins the
+  tool's spec and that it is one of the two tools that ask the person. `dev/coder-e2e.sh` (`SCENARIO=second-repo`,
+  with `ANSWER=yes` and `ANSWER=no`) runs the chain through the stack.
 * **GitHub over MCP** ([above](#github-over-mcp-read-only)). `tests/agent_files.rs`: the shipped `mcp.json` is the
   GitHub server over stdio with `--read-only`, four toolsets and exactly the twelve reads (none starts with a verb
   that writes), and hands the child only the credentials the coder holds (never the key itself); a deployment that

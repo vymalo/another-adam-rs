@@ -332,6 +332,19 @@ impl Workspaces {
         &self.inner.root
     }
 
+    /// Whether the policy ([`allow_hosts`](Self::allow_hosts), [`allow_local`](Self::allow_local))
+    /// accepts `repo`: the check every operation that takes a repository makes first, for a caller
+    /// that wants to refuse (or to ask a person about) a repository before anything else happens.
+    /// Nothing is spawned, requested or written.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Invalid`] when the repository's address cannot be read or its host or kind
+    /// is not allowed, with the reason.
+    pub fn check_repository(&self, repo: &RepoRef) -> WorkspaceResult<()> {
+        self.check_repo(repo).map(|_| ())
+    }
+
     /// `repo`'s location, once the policy has accepted it: a refused repository is an error
     /// before any process is spawned or any credential is requested.
     pub(crate) fn check_repo(&self, repo: &RepoRef) -> WorkspaceResult<RepoLocation> {

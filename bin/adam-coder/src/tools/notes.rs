@@ -132,6 +132,25 @@ pub struct PushedBranch {
     pub base: Option<String>,
 }
 
+/// What the person answered to a question a tool wrote for them (see [`consent`](super::consent)):
+/// the answer to `request_repository` ("may this repository join the workspace?").
+///
+/// Recorded by the agent before each step from the conversation, never from what the model says,
+/// and kept whether or not the person agreed: a refusal is remembered so that the tool does not ask
+/// again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Consent {
+    /// The tool call that asked. A provider may send the same id again in a later turn, so a
+    /// consent is told apart by its `subject` and `tool` as well.
+    pub call_id: String,
+    /// The tool that asked.
+    pub tool: String,
+    /// What the person was asked about: the repository's [`named`](super::named) key.
+    pub subject: String,
+    /// Whether the answer was a yes (`consent::agrees`).
+    pub agreed: bool,
+}
+
 /// Everything remembered about one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunNotes {
@@ -149,11 +168,17 @@ pub struct RunNotes {
     /// (see `CoderAgent`) instead of completing.
     #[serde(default)]
     pub blocker: Option<String>,
-    /// The repositories the person named in their own messages of this run (the task and every
-    /// answer), as [`named`](super::named) keys. `prepare_workspace` works on no other. Filled by
-    /// the agent before each step from the conversation, never from what the model says.
+    /// The repositories that may be in this run's workspace, as [`named`](super::named) keys:
+    /// **granted** keys. `prepare_workspace` and `publish_scratch` work on no other. A key is
+    /// granted when the person named it in their own messages of this run (the task and every
+    /// answer), or agreed to the question `request_repository` wrote for it ([`consents`](Self::consents)).
+    /// Filled by the agent before each step from the conversation, never from what the model says.
     #[serde(default)]
     pub named_repos: Vec<String>,
+    /// The answers the person gave to the questions of `request_repository`, in order. Filled by
+    /// the agent before each step from the conversation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consents: Vec<Consent>,
     /// The branches that this run and the earlier tasks of the conversation pushed work for, which
     /// `prepare_workspace` may continue with its `branch`. `commit_and_push` writes its own; the
     /// agent adds, before each step, the ones in the notes of the run this one continues (and,
@@ -213,6 +238,39 @@ impl RunNotes {
             }
         }
         added
+    }
+
+    /// Remember the answers `consents` of the person, and grant the repository of every one that
+    /// agreed to `request_repository`'s question; returns whether anything was new. A consent is
+    /// the same as one already held when its call, tool and subject are, so recording the answers
+    /// of the whole conversation again at every step changes nothing.
+    pub fn record_consents(&mut self, consents: impl IntoIterator<Item = Consent>) -> bool {
+        let mut added = false;
+        for consent in consents {
+            if consent.agreed && consent.tool == super::consent::REQUEST_REPOSITORY {
+                added |= self.name_repos([consent.subject.clone()]);
+            }
+            let known = self.consents.iter().any(|c| {
+                c.call_id == consent.call_id
+                    && c.tool == consent.tool
+                    && c.subject == consent.subject
+            });
+            if !known {
+                self.consents.push(consent);
+                added = true;
+            }
+        }
+        added
+    }
+
+    /// Whether the person was asked about `subject` by `tool` and said no (and has not said yes
+    /// since: the latest answer decides).
+    pub fn declined(&self, tool: &str, subject: &str) -> bool {
+        self.consents
+            .iter()
+            .rev()
+            .find(|c| c.tool == tool && c.subject == subject)
+            .is_some_and(|c| !c.agreed)
     }
 
     /// Remember the branches `pushed` names; returns whether anything was new.

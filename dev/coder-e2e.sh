@@ -6,6 +6,8 @@
 #   NO_OPENCODE=1 dev/coder-e2e.sh    # the check command makes it; OpenCode is not started
 #   SCENARIO=files dev/coder-e2e.sh   # the coder reads and writes the files itself; no OpenCode
 #   SCENARIO=scratch dev/coder-e2e.sh # no repository is named: a scratch project, then published
+#   SCENARIO=second-repo dev/coder-e2e.sh            # another repository joins the workspace, the person says yes
+#   SCENARIO=second-repo ANSWER=no dev/coder-e2e.sh  # ... and with a no it does not
 #   GITHUB_AUTH=app dev/coder-e2e.sh  # the stack runs the coder as a GitHub App (see below)
 #
 # Start the stack first (the coder's models are the scripts in
@@ -39,6 +41,16 @@
 #     repository), `fib.sh` is on the branch, and the last `checks` artifact is bound to the pushed
 #     commit with the tree the checks ran on in the scratch project (the code that was checked is
 #     the code that was pushed).
+#   * SCENARIO=second-repo is two messages. The task names `local/sandbox` and asks for the shared greeting,
+#     which lives in `local/library`: the coder prepares the sandbox, then asks the person whether it may
+#     add that repository (`request_repository`): the task waits (TASK_STATE_INPUT_REQUIRED) with a
+#     question that names `local/library` and lists a yes and a no, no pull request exists, and git-server
+#     has not been asked for `local/library` since the script began (the repository is seeded, so its
+#     log is what tells: GIT_SERVER_LOGS). The answer (ANSWER, `yes` by default) is sent to the task.
+#       yes: the task completes, hello.txt on the branch holds the library's greeting, and git-server was
+#         asked for `local/library` after the answer, and every check above holds for the sandbox;
+#       no: the task waits again (TASK_STATE_INPUT_REQUIRED, the coder could not use the library),
+#         git-server was never asked for `local/library`, and no pull request was opened.
 #   * the coder reads GitHub through the GitHub MCP server, here the mock of dev/coder-agent/mcp.json
 #     (mock-github-mcp). Its journal is not reset: the coder connects the server when it starts,
 #     before this script. So the journal holds at least one `initialize` and one `tools/list`, and
@@ -66,8 +78,13 @@
 #   TIMEOUT          300     seconds to wait for the task to end
 #   NO_OPENCODE      unset   1 = the [mock:no-opencode] script (no OpenCode)
 #   SCENARIO         default `default` (the script above), `files` (the [mock:files] script:
-#                    read_file, write_file; every check above holds, and so do the two lines) or
-#                    `scratch` (the [mock:scratch] script, above)
+#                    read_file, write_file; every check above holds, and so do the two lines),
+#                    `scratch` (the [mock:scratch] script, above) or `second-repo` (the
+#                    [mock:second-repo] script, above)
+#   ANSWER           yes     with SCENARIO=second-repo: the person's answer, `yes` or `no`
+#   GIT_SERVER_LOGS  docker compose logs --no-color git-server   a command that prints git-server's access log
+#                    (second-repo: which repositories it was asked for); without docker, set it to a command
+#                    that reads the log of your git-server, or the check is skipped
 #   REPO_BASE_URL    http://git-server:8080   where the coder (inside the compose network) finds git-server
 #   GITHUB_AUTH      token   how the stack was started: `token` or `app` (see the assertions above)
 #   MOCK_GITHUB_TOKEN dev-github-token   the token of `token` mode (compose.yaml's `${MOCK_GITHUB_TOKEN-dev-github-token}`)
@@ -111,8 +128,13 @@ case "$github_auth" in
 esac
 scenario=${SCENARIO:-default}
 case "$scenario" in
-  default | files | scratch) ;;
-  *) echo "SCENARIO must be default, files or scratch, not '$scenario'" >&2; exit 2 ;;
+  default | files | scratch | second-repo) ;;
+  *) echo "SCENARIO must be default, files, scratch or second-repo, not '$scenario'" >&2; exit 2 ;;
+esac
+answer=${ANSWER:-yes}
+case "$answer" in
+  yes | no) ;;
+  *) echo "ANSWER must be yes or no, not '$answer'" >&2; exit 2 ;;
 esac
 if [ "$scenario" != default ] && [ "${NO_OPENCODE:-}" = 1 ]; then
   echo "NO_OPENCODE=1 and SCENARIO=$scenario are two different scripts: set one" >&2
@@ -131,6 +153,9 @@ if [ "$scenario" = scratch ]; then
   slot=$name
   text="Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you the repo later. [mock:scratch] $name"
   echo "variant: no repository is named, a scratch project is published to $repo_path ([mock:scratch])"
+elif [ "$scenario" = second-repo ]; then
+  text="In $repo_url (base branch main), put our shared greeting into hello.txt. [mock:second-repo]"
+  echo "variant: another repository joins the workspace only if the person says yes, and they say $answer ([mock:second-repo])"
 elif [ "$scenario" = files ]; then
   text="$text [mock:files]"
   echo "variant: the coder edits the files itself ([mock:files])"
@@ -216,6 +241,20 @@ state_of() {
   jq -r '(.result.statusUpdate.status.state // .result.task.status.state) // empty' "$1" | tail -n 1
 }
 
+# library_requests: how many lines of git-server's access log name the library repository, or `?`
+# when the log cannot be read. The repository is seeded, so only the log tells whether it was fetched.
+library_requests() {
+  if [ -n "${GIT_SERVER_LOGS:-}" ]; then
+    logs=$(sh -c "$GIT_SERVER_LOGS" 2>/dev/null) || { echo '?'; return; }
+  elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    logs=$(docker compose logs --no-color git-server 2>/dev/null) || { echo '?'; return; }
+  else
+    echo '?'; return
+  fi
+  printf '%s\n' "$logs" | grep -c '/local/library.git' || true
+}
+if [ "$scenario" = second-repo ]; then library_before=$(library_requests); fi
+
 # --- send the task ---------------------------------------------------------------
 send_message 1 "$text"
 events=$tmp/events-1.jsonl
@@ -246,6 +285,57 @@ if [ "$scenario" = scratch ]; then
     events=$tmp/events-2.jsonl
     every_event=$tmp/events-all.jsonl
     cat "$tmp/events-1.jsonl" "$tmp/events-2.jsonl" > "$every_event"
+  fi
+fi
+
+if [ "$scenario" = second-repo ]; then
+  # The coder prepared the sandbox and asks whether it may add the library: the task waits, with a
+  # question the tool wrote (it names the repository), and nothing about the library was fetched.
+  state=$(state_of "$events")
+  if [ "$state" = TASK_STATE_INPUT_REQUIRED ]; then ok "the task waits for the person (TASK_STATE_INPUT_REQUIRED)"; else bad "the task is '${state:-none}', want TASK_STATE_INPUT_REQUIRED"; fi
+  jq -r '.. | .text? // empty' "$events" > "$tmp/lines-1.txt" 2>/dev/null || : > "$tmp/lines-1.txt"
+  if grep -q 'May I add the repository local/library' "$tmp/lines-1.txt"; then ok "the coder asks whether it may add local/library"; else bad "the stream has no question about adding local/library"; fi
+  if grep -q 'The agent says why: "the shared greeting lives in greeting.txt there"' "$tmp/lines-1.txt"; then ok "the question quotes the reason"; else bad "the question does not quote the reason"; fi
+  if grep -q 'Yes, add local/library' "$tmp/lines-1.txt"; then ok "the question offers the yes and the no"; else bad "the question does not offer 'Yes, add local/library'"; fi
+  posts=$(curl -s --max-time 30 -X POST "$github/__admin/requests/find" -H 'Content-Type: application/json' \
+    -d '{"method":"POST","urlPathPattern":"/repos/.*/pulls"}' | jq -r '.requests | length' 2>/dev/null || echo '?')
+  if [ "$posts" = 0 ]; then ok "no pull request was opened while the coder waits for the answer"; else bad "$posts pull request(s) were opened before the person answered"; fi
+  library_waiting=$(library_requests)
+  if [ "$library_before" = '?' ]; then
+    echo "skip git-server's log is not readable here (set GIT_SERVER_LOGS): not checking when local/library was fetched"
+  elif [ "$library_waiting" = "$library_before" ]; then
+    ok "git-server was not asked for local/library before the person answered"
+  else
+    bad "git-server was asked for local/library $((library_waiting - library_before)) time(s) before the person answered"
+  fi
+  task_id=$(jq -r '(.result.task.id // .result.statusUpdate.taskId // .result.artifactUpdate.taskId) // empty' "$events" | head -n 1)
+  if [ -z "$task_id" ]; then
+    bad "the stream does not say which task it is"
+  else
+    send_message 2 "$answer" "$task_id"
+    events=$tmp/events-2.jsonl
+    every_event=$tmp/events-all.jsonl
+    cat "$tmp/events-1.jsonl" "$tmp/events-2.jsonl" > "$every_event"
+  fi
+  library_after=$(library_requests)
+  if [ "$answer" = no ]; then
+    # Nothing of the library was ever fetched, no pull request was opened, and the coder says so and waits.
+    state=$(state_of "$events")
+    if [ "$state" = TASK_STATE_INPUT_REQUIRED ]; then ok "the task waits again: the coder could not use the library (TASK_STATE_INPUT_REQUIRED)"; else bad "after the no the task is '${state:-none}', want TASK_STATE_INPUT_REQUIRED"; fi
+    jq -r '.. | .text? // empty' "$events" > "$tmp/lines-2.txt" 2>/dev/null || : > "$tmp/lines-2.txt"
+    if grep -q 'I could not add the library repository' "$tmp/lines-2.txt"; then ok "the coder tells the person it could not add the library"; else bad "the coder does not say it could not add the library"; fi
+    if [ "$library_before" = '?' ]; then
+      echo "skip git-server's log is not readable here: not checking that local/library was never fetched"
+    elif [ "$library_after" = "$library_before" ]; then
+      ok "git-server was never asked for local/library"
+    else
+      bad "git-server was asked for local/library $((library_after - library_before)) time(s) after the no"
+    fi
+    posts=$(curl -s --max-time 30 -X POST "$github/__admin/requests/find" -H 'Content-Type: application/json' \
+      -d '{"method":"POST","urlPathPattern":"/repos/.*/pulls"}' | jq -r '.requests | length' 2>/dev/null || echo '?')
+    if [ "$posts" = 0 ]; then ok "no pull request was opened"; else bad "$posts pull request(s) were opened after the no"; fi
+    if [ "$fail" -eq 0 ]; then echo "coder e2e passed"; else echo "coder e2e FAILED"; exit 1; fi
+    exit 0
   fi
 fi
 
@@ -406,6 +496,16 @@ if [ -n "$branch" ]; then
       content=$(cat "$tmp/clone/fib.sh" 2>/dev/null || echo '<missing>')
       if [ "$content" = 'echo 0 1 1 2 3 5 8' ]; then ok "fib.sh on the branch is the project's"; else bad "fib.sh on the branch is '$content', want 'echo 0 1 1 2 3 5 8'"; fi
       if [ "$(sh "$tmp/clone/fib.sh" 2>/dev/null)" = '0 1 1 2 3 5 8' ]; then ok "fib.sh prints the first 7 Fibonacci numbers"; else bad "fib.sh does not print '0 1 1 2 3 5 8'"; fi
+    elif [ "$scenario" = second-repo ]; then
+      content=$(cat "$tmp/clone/hello.txt" 2>/dev/null || echo '<missing>')
+      if [ "$content" = 'hello from library' ]; then ok "hello.txt on the branch is the library's greeting"; else bad "hello.txt on the branch is '$content', want 'hello from library'"; fi
+      if [ "$library_before" = '?' ]; then
+        echo "skip git-server's log is not readable here: not checking that local/library was fetched after the answer"
+      elif [ "$library_after" -gt "$library_before" ]; then
+        ok "git-server was asked for local/library after the yes ($((library_after - library_before)) request(s))"
+      else
+        bad "git-server was never asked for local/library, although the person said yes"
+      fi
     else
       content=$(cat "$tmp/clone/hello.txt" 2>/dev/null || echo '<missing>')
       if [ "$content" = hello ]; then ok "hello.txt on the branch is 'hello'"; else bad "hello.txt on the branch is '$content', want 'hello'"; fi

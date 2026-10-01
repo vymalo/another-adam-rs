@@ -1397,6 +1397,46 @@ async fn local_paths_are_refused_unless_allowed() {
     );
 }
 
+/// `check_repository` is the first check of every operation, on its own: a caller that wants to
+/// ask a person about a repository first learns whether it could ever be added, and nothing is
+/// spawned, requested or written to find out.
+#[test]
+fn check_repository_is_the_policy_alone() {
+    let spy = Arc::new(Spy::default());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let ws = Workspaces::new(root.clone(), spy.clone())
+        .allow_hosts(["github.com"])
+        .allow_local(false);
+    let check = |url: &str| ws.check_repository(&RepoRef::new(url, "main"));
+    assert!(check("https://github.com/octo/widgets").is_ok());
+    assert!(check("https://GitHub.com/octo/widgets.git").is_ok());
+    for refused in [
+        "https://evil.example/octo/widgets",
+        "https://github.com.evil.example/octo/widgets",
+        "http://github.com/octo/widgets",
+        "/srv/git/widgets.git",
+        "not a url",
+        "https://user:pw@github.com/octo/widgets",
+    ] {
+        let err = check(refused).unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::Invalid(_)),
+            "{refused}: {err:?}"
+        );
+    }
+    let err = check("https://evil.example/octo/widgets").unwrap_err();
+    assert!(
+        err.to_string().contains("evil.example is not allowed"),
+        "{err}"
+    );
+    assert!(
+        spy.asked.lock().unwrap().is_empty(),
+        "no credential was asked for"
+    );
+    assert!(!root.exists(), "nothing was created");
+}
+
 /// A token bound to `github.com` protects even a `Workspaces` that was never
 /// given an allowlist.
 #[tokio::test]

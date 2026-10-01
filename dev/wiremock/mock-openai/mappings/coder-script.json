@@ -1801,6 +1801,605 @@
       }
     },
     {
+      "name": "coder script (second-repo) 0: prepare_workspace",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "[mock:second-repo]"
+          },
+          {
+            "doesNotContain": "tool_call_id"
+          },
+          {
+            "doesNotContain": "sr-call-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-sr-call-1",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "sr-call-1",
+                    "type": "function",
+                    "function": {
+                      "name": "prepare_workspace",
+                      "arguments": "{\"repo_url\":\"http://git-server:8080/local/sandbox.git\",\"base_branch\":\"main\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (second-repo) 1: request_repository",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "sr-call-1"
+          },
+          {
+            "doesNotContain": "sr-call-2"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-sr-call-2",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "sr-call-2",
+                    "type": "function",
+                    "function": {
+                      "name": "request_repository",
+                      "arguments": "{\"repo_url\":\"http://git-server:8080/local/library.git\",\"reason\":\"the shared greeting lives in greeting.txt there\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (second-repo) 2: prepare_workspace",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "sr-call-2"
+          },
+          {
+            "doesNotContain": "sr-call-3"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-sr-call-3",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "sr-call-3",
+                    "type": "function",
+                    "function": {
+                      "name": "prepare_workspace",
+                      "arguments": "{\"repo_url\":\"http://git-server:8080/local/library.git\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (second-repo) 3: read_file",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "sr-call-3"
+          },
+          {
+            "doesNotContain": "sr-call-4"
+          },
+          {
+            "contains": "slot: library"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-sr-call-4",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "sr-call-4",
+                    "type": "function",
+                    "function": {
+                      "name": "read_file",
+                      "arguments": "{\"path\":\"greeting.txt\",\"repo\":\"library\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (second-repo) 4: write_file",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "sr-call-4"
+          },
+          {
+            "doesNotContain": "sr-call-5"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-sr-call-5",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "sr-call-5",
+                    "type": "function",
+                    "function": {
+                      "name": "write_file",
+                      "arguments": "{\"path\":\"hello.txt\",\"content\":\"hello from library\\n\",\"repo\":\"sandbox\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (second-repo) 5: run_checks",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "sr-call-5"
+          },
+          {
+            "doesNotContain": "sr-call-6"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-sr-call-6",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "sr-call-6",
+                    "type": "function",
+                    "function": {
+                      "name": "run_checks",
+                      "arguments": "{\"command\":\"sh ./check.sh\",\"repo\":\"sandbox\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (second-repo) 6: commit_and_push",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "sr-call-6"
+          },
+          {
+            "doesNotContain": "sr-call-7"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-sr-call-7",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "sr-call-7",
+                    "type": "function",
+                    "function": {
+                      "name": "commit_and_push",
+                      "arguments": "{\"message\":\"feat: add the shared greeting\",\"repo\":\"sandbox\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (second-repo) 7: open_pull_request",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "sr-call-7"
+          },
+          {
+            "doesNotContain": "sr-call-8"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-sr-call-8",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "sr-call-8",
+                    "type": "function",
+                    "function": {
+                      "name": "open_pull_request",
+                      "arguments": "{\"title\":\"feat: add the shared greeting\",\"body\":\"## Summary\\n\\nAdds `hello.txt` with the shared greeting that lives in `greeting.txt` of the library repository, which the person agreed to add to the workspace.\\n\\n## Verification\\n\\n- `sh ./check.sh` in the repository: passed (exit code 0)\\n\",\"repo\":\"sandbox\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (second-repo) 8: final answer (granted)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "sr-call-8"
+          },
+          {
+            "doesNotContain": "sr-call-9"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-final-granted",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "Opened the pull request: the shared greeting of the library repository is in hello.txt (second-repo)."
+              },
+              "logprobs": null,
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (second-repo) 3: final question (refused)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "sr-call-3"
+          },
+          {
+            "doesNotContain": "sr-call-4"
+          },
+          {
+            "contains": "is not a repository the person named"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-final-refused",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "I could not add the library repository to the workspace, so the greeting is not in hello.txt yet. Which repository should I take it from, or should I stop?"
+              },
+              "logprobs": null,
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
       "name": "coder script: off-script request is a 404",
       "priority": 3,
       "request": {

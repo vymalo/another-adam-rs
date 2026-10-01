@@ -248,7 +248,7 @@ name. It has no authentication (any credentials are accepted) and its
 repositories live in the `git-data` volume. The layout is
 `/<owner>/<repo>.git`, the shape `adam-workspace` and the mock GitHub expect.
 
-It is seeded with every directory `dev/git-server/seed/<owner>/<name>/` (today `local/sandbox`), each
+It is seeded with every directory `dev/git-server/seed/<owner>/<name>/` (today `local/sandbox`, and `local/library`, a second repository with a `greeting.txt`, for the `second-repo` scenario below), each
 once. And it behaves like a place where repositories can be **created**: a request for
 `/<owner>/<name>.git` of an owner in `AUTO_CREATE_OWNERS` (a comma or space list; `scratch` in
 `compose.yaml`, empty means none) makes the bare repository first, empty, on branch `main`, with pushes
@@ -281,6 +281,8 @@ sh dev/coder-e2e.sh                 # OpenCode makes the change
 NO_OPENCODE=1 sh dev/coder-e2e.sh   # the check command makes it, OpenCode is not started
 SCENARIO=files sh dev/coder-e2e.sh  # the coder reads and writes the file itself (read_file, write_file)
 SCENARIO=scratch sh dev/coder-e2e.sh  # no repository is named: a scratch project, published to one named later
+SCENARIO=second-repo sh dev/coder-e2e.sh              # another repository joins the workspace, the person says yes
+SCENARIO=second-repo ANSWER=no sh dev/coder-e2e.sh    # ... and with a no it does not
 ```
 
 The script sends the task with `SendStreamingMessage`, waits for
@@ -305,6 +307,19 @@ on first use, and checks everything above for that repository (the pull request,
 plus that `main` is the one empty commit the coder gave it, that `fib.sh` is on the branch, and that the
 **tree** the checks ran on in the scratch project is the tree of the pushed commit: what was checked is what
 was pushed. `<id>` is new on every run, so a rerun on one stack never meets the last one's repository.
+
+`SCENARIO=second-repo` is two messages as well, and is about consent. The task names `local/sandbox` and asks for
+"our shared greeting", which lives in `local/library`. The coder prepares the sandbox, then calls
+`request_repository` for the library with a reason, and the task waits (`TASK_STATE_INPUT_REQUIRED`) on a question
+the tool wrote: `May I add the repository local/library ...`, with the reason quoted and the options `Yes, add
+local/library` and `No` (the script sends no screen, so they are in the text). The script checks that, that no pull
+request exists and that git-server has **not** been asked for `local/library` since the script began (the
+repository is seeded, so only git-server's access log tells: `GIT_SERVER_LOGS` is the command that prints it, by
+default `docker compose logs --no-color git-server`; the check is skipped, and says so, where that is not
+readable). Then it sends the answer, `ANSWER` (`yes` by default). With `yes` the task completes: the pull request
+is for the sandbox, `hello.txt` on its branch holds the library's `hello from library`, and git-server was asked
+for `local/library` after the answer. With `no` the task waits again (the coder says it could not add the
+library), git-server was never asked for `local/library` and no pull request was opened.
 
 #### The coder as a GitHub App installation
 
@@ -451,6 +466,7 @@ request gets the same answer and the script cannot drift out of step.
 | `mock-coder`, the person's first message is a greeting (`hi`, `hello` or `hey`, then anything) | same file | a text answer (`stop`): `Hi! I'm <name>. <summary>. Which repository should I work on, and what should I change?`, **built from the first two lines of the system prompt** (`messages[0]`: `Your name is <name>.` and `In one sentence: <summary>.`, the persona lines the coder's `agent/instructions.md` opens with), so editing the instructions, or mounting another folder, changes the mocked answer. The run then waits for the person (`input-required`); the answer to it (the synthetic `ask_user` call `stop0000N` is in the history) continues with `prepare_workspace` (`coder-call-1`) and the script above. A greeting needs a system message first: a request with the user message alone is not one. |
 | `mock-coder`, task text contains `[mock:no-opencode]` | same file | `prepare_workspace` (`nc-call-1`), `run_checks` with `echo hello > hello.txt && sh ./check.sh` (the check command makes the change, `nc-call-2`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started: deterministic where OpenCode's own behaviour is not the subject. |
 | `mock-coder`, task text contains `[mock:files]` | same file | the coder edits the files itself, ids `fl-call-N`: `prepare_workspace` (`fl-call-1`), `read_file` `README.md` (`fl-call-2`), `write_file` `hello.txt` with `hello` (`fl-call-3`), `run_checks` (`sh ./check.sh`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started. `dev/coder-e2e.sh` runs it with `SCENARIO=files`. |
+| `mock-coder`, task text contains `[mock:second-repo]` | same file | ids `sr-call-N`: `prepare_workspace` (`local/sandbox`), `request_repository` (`http://git-server:8080/local/library.git`, a reason), which parks the run on the tool's question; once the answer is in the history, `prepare_workspace` (`local/library`), and then by what that said. **Added** (its `slot: library` is in the result): `read_file` (`greeting.txt`, `repo: library`), `write_file` (`hello.txt` in the sandbox, `hello from library`), `run_checks`, `commit_and_push` and `open_pull_request` (all `repo: sandbox`), final text. **Refused** (the refusal text is in the result): a final text that says the library could not be added, which parks the run. `dev/coder-e2e.sh` runs it with `SCENARIO=second-repo` and `ANSWER=yes` or `no`, and `wiremock_compose` plays both ways, in both forms. |
 | `mock-coder`, task text contains `[mock:scratch] fib-<hex>` | same file | no repository is named, ids `sc-call-N`: `start_scratch` (`fib`), `write_file` `fib.sh` and `check.sh`, `run_checks` (`repo: fib`, `sh ./check.sh`), then a **text question** (which repository should I publish it to), which parks the run. Once the person's answer holds `Publish it to` (and the stop's `ask_user` call is in the history, which the greeting's second step also reads: that step excludes this switch): `publish_scratch` (`http://git-server:8080/scratch/fib-<hex>.git`, the repository named in the task text with `regexExtract`, so reruns on one stack never collide), `commit_and_push` and `open_pull_request` (both `repo: fib-<hex>`, the slot of the new repository), final text. OpenCode is never started. `dev/coder-e2e.sh` runs it with `SCENARIO=scratch`, and `wiremock_compose` plays it, in both forms, with the answer in the shape the coder gives it. |
 | `mock-coder`, task text contains `[mock:choices]` | `mappings/coder-choices.json` | `ask_user` (`choices-call-1`) with the question `Three quick questions before I start` and three `choices`: `db` (`pg`, `sqlite`), `auth` (`keycloak`, `none`), `deploy` (`k8s`, `compose`), priority 1; once its result holds `db: pg` (how the person's answers read to the model) the text `Going with Postgres, Keycloak and Compose.` (`stop`), priority 1; any other answers, `Thanks, I have your answers.`, priority 2. No workspace or repository is touched. `dev/coder-choices-e2e.sh` runs it through the stack. |
 | `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |

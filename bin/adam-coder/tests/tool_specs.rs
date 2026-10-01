@@ -22,10 +22,11 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 14] = [
+const TOOLS: [&str; 15] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
+    "request_repository",
     "run_command",
     "read_file",
     "write_file",
@@ -174,17 +175,20 @@ async fn only_the_optional_arguments_are_nullable() {
     );
 }
 
-/// `ask_user` is the one coder tool that asks the person, and the redacting wrapper says so too:
-/// `adam-assembly` refuses to give such a tool to a subagent (nobody could answer it).
+/// `ask_user` and `request_repository` are the coder's tools that ask the person, and the redacting
+/// wrapper says so too: `adam-assembly` refuses to give such a tool to a subagent (nobody could
+/// answer it).
 #[tokio::test]
-async fn only_ask_user_asks_the_user() {
+async fn only_the_tools_that_ask_the_person_are_marked_so() {
     let fx = Fixture::new("hello\n").await;
     let asking: Vec<String> = coder_tools(&fx.env)
         .into_iter()
         .filter(|tool| tool.asks_user())
         .map(|tool| tool.spec().name)
         .collect();
-    assert_eq!(asking, ["ask_user"]);
+    // `request_repository` asks the person a question of its own writing; a subagent may have
+    // neither (it would wait for ever for an answer only the coder's caller can give).
+    assert_eq!(asking, ["request_repository", "ask_user"]);
 }
 
 /// The tools read `ToolEnv` from the agent's state, and the agent says so when it is missing.

@@ -4,6 +4,7 @@
 //! |---|---|
 //! | `prepare_workspace { repo_url, base_branch?, branch? }` | [`prepare`] |
 //! | `start_scratch { name? }`, `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | [`scratch`] |
+//! | `request_repository { repo_url, reason }` | [`consent`] |
 //! | `run_command { command, cwd? }` | [`inspect`] |
 //! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `apply_patch { patch }` | [`files`] |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
@@ -37,8 +38,10 @@
 //! # The rules, in code
 //!
 //! The prompt tells the model the rules; these make them hold: `prepare_workspace` and
-//! `publish_scratch` refuse a repository the person did not name ([`named`]; the agent records the repositories of the
-//! person's own messages in the run notes before each step; it continues a branch only if a
+//! `publish_scratch` refuse a repository that is not **granted**: one the person named ([`named`]; the agent records
+//! the repositories of the person's own messages in the run notes before each step) or agreed to add
+//! when `request_repository` asked ([`consent`]; the agreeing answer is recorded the same way, from
+//! the conversation and never from the model). It continues a branch only if a
 //! `commit_and_push` of the conversation recorded it in the notes, which the agent carries from
 //! the run it continues, and as a fallback read from the result text, `publish::pushed_in`),
 //! after `MAX_CHECK_CYCLES` failed check runs `run_checks` refuses to run, and
@@ -76,6 +79,7 @@ use crate::redact::Redactor;
 const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific.";
 
 pub mod checks;
+pub mod consent;
 pub mod delegate;
 pub mod files;
 mod gitcli;
@@ -378,7 +382,7 @@ pub(crate) fn resolve_slot(
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the eleven of the coding workflow,
+/// Every coder tool, in the order they are offered to the model: the twelve of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
@@ -397,6 +401,7 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         prepare::PrepareWorkspace,
         scratch::StartScratch,
         scratch::PublishScratch,
+        consent::RequestRepository,
         inspect::RunCommand,
         files::ReadFile,
         files::WriteFile,

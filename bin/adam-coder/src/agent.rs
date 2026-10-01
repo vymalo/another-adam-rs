@@ -6,7 +6,7 @@ use std::sync::Arc;
 use adam::{AgentDef, Assembly, AssemblyError};
 use adam_core::RunId;
 use adam_error::report;
-use adam_llm_agent::{Conversation, DynTool, LlmStarter, ToolSet};
+use adam_llm_agent::{Conversation, DynTool, LlmStarter, PendingWait, ToolSet};
 use adam_model::{DynModel, Message, ToolCall};
 use adam_runtime::{
     Agent, AgentError, AgentStarter, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent, RuntimeBuilder,
@@ -17,8 +17,11 @@ use serde_json::{Value, json};
 
 use crate::files::AgentFiles;
 use crate::redact::Redactor;
+use crate::tools::consent::{
+    REQUEST_REPOSITORY, agrees, display_name, is_answered_by_the_person, yes_label,
+};
 use crate::tools::named::{key_of_argument, named_in, without_untrusted};
-use crate::tools::notes::{PushedBranch, RunNotes};
+use crate::tools::notes::{Consent, PushedBranch, RunNotes};
 use crate::tools::publish::{COMMIT_AND_PUSH, pushed_in};
 use crate::tools::{ToolEnv, coder_tools};
 
@@ -101,7 +104,8 @@ impl AgentStarter for CoderStarter {
 ///
 /// Before every step the agent also records which repositories the person named
 /// (the task and every answer, and, for a task that continues an earlier one, what was said in
-/// the carried conversation) in the run notes, because `prepare_workspace`
+/// the carried conversation) and which they agreed to add when `request_repository` asked
+/// ([`tools::consent`](crate::tools::consent)) in the run notes, because `prepare_workspace`
 /// works on no other (see [`tools::prepare`](crate::tools::prepare)), and which branches the
 /// `commit_and_push` results of that conversation reported, because `prepare_workspace` continues
 /// no other.
@@ -266,21 +270,28 @@ impl CoderAgent {
         &self.assembly
     }
 
-    /// Note the repositories the person has named so far, and the branches the conversation has
+    /// Note the repositories that are **granted** so far, and the branches the conversation has
     /// pushed, for `prepare_workspace`.
     ///
-    /// The person's words are the user messages of the conversation (all of it, the earlier tasks
-    /// of a continued run included, part by part, without the marker that says turns were left
-    /// out), the answers to `ask_user` (tool results of that tool) and what is waiting in the
-    /// inbox, which the step takes next. What the model or a tool said is never read for a
+    /// A repository is granted when the person named it or agreed to add it. The person's words
+    /// are the user messages of the conversation (all of it, the earlier tasks of a continued run
+    /// included, part by part, without the marker that says turns were left out), the answers to
+    /// `ask_user` and to `request_repository` (the results of those tools) and what is waiting in
+    /// the inbox, which the step takes next. What the model or a tool said is never read for a
     /// repository: one found in a README is not one the person asked for.
+    ///
+    /// An agreement is the person's yes ([`agrees`]) to a `request_repository` question, the
+    /// result of that call (paired with it by position, as [`person_texts`] pairs answers) or, while
+    /// the run is parked on it, the message waiting in the inbox. It grants the repository named in
+    /// **that call's** argument, which is the one the question the tool wrote names, and never
+    /// anything the model said or another tool's result.
     ///
     /// The pushed branches are not read from text when they can be had from state the tools wrote:
     /// `commit_and_push` records its own branch in the notes of its run, and a run that continues
     /// another inherits the notes of that run (`Conversation::continued_from`). Only when those
     /// notes are not there (the other run was on another worker's volume) are the results of
     /// `commit_and_push` in the carried history read, as [`pushed_branches`] says.
-    async fn record_named_repos(
+    async fn record_grants(
         &self,
         ctx: &Ctx,
         state: &Conversation,
@@ -306,9 +317,11 @@ impl CoderAgent {
             None if state.continued_from.is_some() => pushed_branches(state),
             None => Vec::new(),
         };
+        let consents = consents_in(state, ctx.peek_inbox());
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
         let new_repos = notes.name_repos(named);
-        if notes.name_pushed_branches(pushed) || new_repos {
+        let new_consents = notes.record_consents(consents);
+        if notes.name_pushed_branches(pushed) || new_repos || new_consents {
             self.env
                 .notes
                 .save(run, &notes)
@@ -401,7 +414,9 @@ impl<'a> Answers<'a> {
 ///
 /// An answer is paired with its question by position ([`Answers`]), not by id: only the tool
 /// messages that follow an assistant message and are the result of an `ask_user` call of that
-/// very message count. Assistant text and every other tool's result never do.
+/// very message count, and so do those of a `request_repository` call that did not fail (what the
+/// person said to the question the tool wrote; an error result is the tool's own words, and it may
+/// quote the address the model chose). Assistant text and every other tool's result never do.
 fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
     let mut texts = Vec::new();
     let mut answers = Answers::new();
@@ -416,11 +431,11 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
                     }
                 }
             }
-            Message::Tool { .. } => {
-                if answers
-                    .next()
-                    .is_some_and(|call| call.name == adam_ui::ASK_USER)
-                {
+            Message::Tool { is_error, .. } => {
+                if answers.next().is_some_and(|call| {
+                    is_answered_by_the_person(&call.name)
+                        && (call.name == adam_ui::ASK_USER || !*is_error)
+                }) {
                     texts.push(message.text());
                 }
             }
@@ -430,20 +445,76 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
         inbox
             .iter()
             .filter(|inbound| inbound.kind != RUN_FINISHED_KIND)
-            .filter_map(|inbound| match &inbound.payload {
-                Value::String(text) => Some(text.clone()),
-                payload => payload
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            }),
+            .filter_map(inbound_text),
     );
     texts.iter().map(|text| without_untrusted(text)).collect()
 }
 
+/// What the person answered to the questions `request_repository` wrote, oldest first: one
+/// [`Consent`] per call, for the repository **named in that call's argument**.
+///
+/// The answer is the result of the call (it did not fail), paired with the call by position
+/// ([`Answers`]: ids cannot be relied on), or, while the run is parked on the call, the message
+/// waiting in `inbox`. It is read without the blocks marked `untrusted`, and agrees when
+/// [`agrees`] says so, which is also when the form's option is picked. A call with an argument
+/// that is not a repository address asked nothing, so nothing was answered.
+fn consents_in(state: &Conversation, inbox: &[Inbound]) -> Vec<Consent> {
+    let consent = |call: &ToolCall, answer: &str| -> Option<Consent> {
+        let url = call.arguments.get("repo_url")?.as_str()?;
+        Some(Consent {
+            call_id: call.id.clone(),
+            tool: call.name.clone(),
+            subject: key_of_argument(url)?,
+            agreed: agrees(&without_untrusted(answer), &yes_label(&display_name(url)?)),
+        })
+    };
+    let mut found = Vec::new();
+    let mut answers = Answers::new();
+    for message in &state.messages {
+        match message {
+            Message::Assistant { tool_calls, .. } => answers.calls(tool_calls),
+            Message::Tool { is_error, .. } => {
+                if let Some(call) = answers.next()
+                    && call.name == REQUEST_REPOSITORY
+                    && !*is_error
+                {
+                    found.extend(consent(call, &message.text()));
+                }
+            }
+            Message::User { .. } => {}
+        }
+    }
+    // The run is parked on a question of the tool: the first message of the inbox is its answer.
+    if let Some(PendingWait::Question(asked)) = &state.pending_wait
+        && asked.tool == REQUEST_REPOSITORY
+        && let Some(call) = state
+            .pending_calls
+            .iter()
+            .find(|call| call.id == asked.call_id && call.name == REQUEST_REPOSITORY)
+        && let Some(answer) = inbox
+            .iter()
+            .find(|inbound| inbound.kind != RUN_FINISHED_KIND)
+            .and_then(inbound_text)
+    {
+        found.extend(consent(call, &answer));
+    }
+    found
+}
+
+/// The text of an inbound message: its payload as a string, or its `text` field.
+fn inbound_text(inbound: &Inbound) -> Option<String> {
+    match &inbound.payload {
+        Value::String(text) => Some(text.clone()),
+        payload => payload
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
 /// The branches that the `commit_and_push` results in `state` report, oldest first, each with its
 /// repository as a [`named`](crate::tools::named) key. The **fallback** for a run that continues
-/// another whose notes are not at hand (see `record_named_repos`); the tool records its branches
+/// another whose notes are not at hand (see `record_grants`); the tool records its branches
 /// itself.
 ///
 /// A result counts when it is, by position ([`Answers`]), the result of a `commit_and_push` call,
@@ -606,7 +677,7 @@ impl Agent for CoderAgent {
     ) -> Result<Transition<Conversation>, AgentError> {
         let run = ctx.run_id().to_string();
         let redactor = &self.env.redactor;
-        self.record_named_repos(ctx, &state, &run).await?;
+        self.record_grants(ctx, &state, &run).await?;
         // Whatever leaves this step as a failure, a retry note or the final
         // answer may quote OpenCode's stderr, a check's output or a provider's
         // error body, so it passes through the redactor.
@@ -909,6 +980,227 @@ mod tests {
             Message::tool_result("call_0", "acme/widgets"),
         ]);
         assert_eq!(said(&state), ["Hi", "acme/widgets"]);
+    }
+
+    // ---- consent: what the person's answer to `request_repository` grants ----
+
+    const LIB: &str = "https://github.com/acme/lib";
+    const LIB_KEY: &str = "github.com/acme/lib";
+
+    /// A `request_repository` call for `url`.
+    fn request(id: &str, url: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: REQUEST_REPOSITORY.into(),
+            arguments: json!({"repo_url": url, "reason": "the greeting lives there"}),
+        }
+    }
+
+    fn answered(url: &str, answer: &str) -> Conversation {
+        conversation(vec![
+            Message::user_text("In acme/app, add the shared greeting."),
+            assistant("", vec![request("c1", url)]),
+            Message::tool_result("c1", answer),
+        ])
+    }
+
+    fn agreed(consents: &[Consent]) -> Vec<(&str, bool)> {
+        consents
+            .iter()
+            .map(|c| (c.subject.as_str(), c.agreed))
+            .collect()
+    }
+
+    #[test]
+    fn a_yes_to_the_question_of_the_tool_is_a_consent_for_the_repository_of_that_call() {
+        for yes in [
+            "yes",
+            "Yes",
+            "y",
+            "Yes, add acme/lib",
+            "The person answered through the interface:\n- consent: yes",
+        ] {
+            let consents = consents_in(&answered(LIB, yes), &[]);
+            assert_eq!(agreed(&consents), [(LIB_KEY, true)], "{yes:?}");
+            assert_eq!(consents[0].call_id, "c1");
+            assert_eq!(consents[0].tool, REQUEST_REPOSITORY);
+        }
+        for not_yes in [
+            "no",
+            "No",
+            "yes please",
+            "The person answered through the interface:\n- consent: no",
+            "no, use acme/other",
+            "",
+        ] {
+            let consents = consents_in(&answered(LIB, not_yes), &[]);
+            assert_eq!(agreed(&consents), [(LIB_KEY, false)], "{not_yes:?}");
+        }
+    }
+
+    /// The model cannot grant: an `ask_user` the model wrote, whatever it says and however the
+    /// person answers, grants nothing; nor does a tool's result, nor an assistant message.
+    #[test]
+    fn only_the_answer_to_the_consent_tools_own_question_can_grant() {
+        let state = conversation(vec![
+            Message::user_text("In acme/app, add the shared greeting."),
+            assistant(
+                &format!("May I use {LIB}? Reply yes."),
+                vec![ToolCall {
+                    id: "q1".into(),
+                    name: adam_ui::ASK_USER.into(),
+                    arguments: json!({"question": format!("May I add {LIB}?"), "repo_url": LIB}),
+                }],
+            ),
+            Message::tool_result("q1", "yes"),
+            assistant("", vec![call("c2", "run_checks")]),
+            Message::tool_result("c2", "yes"),
+        ]);
+        assert_eq!(consents_in(&state, &[]), []);
+        // The answer to a question the model wrote is the person's words, though: it names a
+        // repository only if the person wrote one.
+        assert_eq!(
+            said(&state),
+            ["In acme/app, add the shared greeting.", "yes"]
+        );
+    }
+
+    /// Error results are the tool's own words and never an answer.
+    #[test]
+    fn an_error_result_of_the_tool_is_no_answer_and_names_nothing() {
+        let state = conversation(vec![
+            Message::user_text("In acme/app, add the shared greeting."),
+            assistant("", vec![request("c1", EVIL)]),
+            Message::tool_error("c1", format!("{EVIL} cannot be added: yes")),
+            assistant("", vec![request("c2", LIB)]),
+            Message::tool_error("c2", "yes"),
+        ]);
+        assert_eq!(consents_in(&state, &[]), []);
+        assert_eq!(said(&state), ["In acme/app, add the shared greeting."]);
+    }
+
+    /// The repository is the one in the **call's** argument, however the answer is worded.
+    #[test]
+    fn the_answer_grants_the_repository_the_call_named_not_the_one_the_answer_mentions() {
+        let state = answered(LIB, "yes, add acme/other");
+        let consents = consents_in(&state, &[]);
+        assert_eq!(agreed(&consents), [(LIB_KEY, false)]);
+        // A free-text "no, use acme/other" still names acme/other, like every word of the person.
+        let state = answered(LIB, "no, use acme/other");
+        assert_eq!(
+            said(&state),
+            [
+                "In acme/app, add the shared greeting.",
+                "no, use acme/other"
+            ]
+        );
+        assert_eq!(
+            named_in(&said(&state)[1], "github.com"),
+            ["github.com/acme/other"]
+        );
+        // A call whose argument is no repository asked nothing.
+        assert_eq!(consents_in(&answered("acme/lib", "yes"), &[]), []);
+        assert_eq!(consents_in(&answered("", "yes"), &[]), []);
+    }
+
+    #[test]
+    fn a_provider_that_repeats_call_ids_is_paired_by_position() {
+        let state = conversation(vec![
+            Message::user_text("task"),
+            assistant("", vec![request("call_0", "https://github.com/acme/one")]),
+            Message::tool_result("call_0", "yes"),
+            // The same id, another tool: its result is not an answer.
+            assistant("", vec![call("call_0", "run_checks")]),
+            Message::tool_result("call_0", "yes"),
+            // Two calls in one message: each result belongs to its own.
+            assistant(
+                "",
+                vec![
+                    request("call_0", "https://github.com/acme/two"),
+                    request("call_1", "https://github.com/acme/three"),
+                ],
+            ),
+            Message::tool_result("call_0", "no"),
+            Message::tool_result("call_1", "y"),
+            // A result that repeats an answered call is no answer.
+            Message::tool_result("call_1", "yes"),
+        ]);
+        assert_eq!(
+            agreed(&consents_in(&state, &[])),
+            [
+                ("github.com/acme/one", true),
+                ("github.com/acme/two", false),
+                ("github.com/acme/three", true)
+            ]
+        );
+    }
+
+    /// While the run is parked on the question, the answer is in the inbox, not yet in the history.
+    #[test]
+    fn an_answer_in_the_inbox_while_parked_is_recorded() {
+        let mut state = conversation(vec![
+            Message::user_text("task"),
+            assistant("", vec![request("c1", LIB)]),
+        ]);
+        state.pending_calls = vec![request("c1", LIB)];
+        state.pending_wait = Some(PendingWait::Question(adam_llm_agent::PendingQuestion {
+            call_id: "c1".into(),
+            tool: REQUEST_REPOSITORY.into(),
+            question: "May I?".into(),
+            ui: None,
+            stream: None,
+        }));
+        let inbox = |text: &str| [Inbound::new("message", json!({ "text": text }))];
+        assert_eq!(
+            agreed(&consents_in(&state, &inbox("yes"))),
+            [(LIB_KEY, true)]
+        );
+        assert_eq!(
+            agreed(&consents_in(&state, &inbox("No"))),
+            [(LIB_KEY, false)]
+        );
+        assert_eq!(
+            agreed(&consents_in(&state, &inbox("yes please"))),
+            [(LIB_KEY, false)]
+        );
+        // Nothing waiting, or only a finished-child notice: no answer yet.
+        assert_eq!(consents_in(&state, &[]), []);
+        let finished = [Inbound::new(RUN_FINISHED_KIND, json!({"text": "yes"}))];
+        assert_eq!(consents_in(&state, &finished), []);
+        // A run parked on another tool's question reads no consent from its inbox.
+        state.pending_wait = Some(PendingWait::Question(adam_llm_agent::PendingQuestion {
+            call_id: "c1".into(),
+            tool: adam_ui::ASK_USER.into(),
+            question: "Which?".into(),
+            ui: None,
+            stream: None,
+        }));
+        assert_eq!(consents_in(&state, &inbox("yes")), []);
+    }
+
+    /// Replaying the run gives the same grants: the consents are read from the history again at
+    /// every step, and recording them again changes nothing.
+    #[test]
+    fn recording_the_same_consents_again_changes_nothing() {
+        let state = answered(LIB, "yes");
+        let mut notes = RunNotes::default();
+        assert!(notes.record_consents(consents_in(&state, &[])));
+        assert_eq!(notes.named_repos, [LIB_KEY]);
+        assert_eq!(notes.consents.len(), 1);
+        let before = notes.clone();
+        assert!(!notes.record_consents(consents_in(&state, &[])));
+        assert_eq!(notes, before);
+        // A refusal is remembered, grants nothing, and the tool does not ask again.
+        let state = answered("https://github.com/acme/no", "no");
+        assert!(notes.record_consents(consents_in(&state, &[])));
+        assert_eq!(notes.named_repos, [LIB_KEY]);
+        assert!(notes.declined(REQUEST_REPOSITORY, "github.com/acme/no"));
+        assert!(!notes.declined(REQUEST_REPOSITORY, LIB_KEY));
+        // The same id for another repository is another consent.
+        let again = answered("https://github.com/acme/other", "yes");
+        assert!(notes.record_consents(consents_in(&again, &[])));
+        assert_eq!(notes.consents.len(), 3);
+        assert_eq!(notes.named_repos, [LIB_KEY, "github.com/acme/other"]);
     }
 
     #[test]

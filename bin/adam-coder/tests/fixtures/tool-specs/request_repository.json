@@ -1,0 +1,21 @@
+{
+  "name": "request_repository",
+  "description": "Ask the person whether another repository may join this workspace. Use it when the task needs a repository the person did not name: to read something from it, or to change it too. The person is asked a yes or no question that this tool writes, with your reason, and only a yes adds the repository: then call prepare_workspace with it. A no is final for this task: do not ask again for the same repository and do not look for another way to change it.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo_url": {
+        "type": "string",
+        "description": "https://github.com/<owner>/<repo>"
+      },
+      "reason": {
+        "type": "string",
+        "description": "Why the task needs this repository, in one plain sentence (at most 300 characters). The person reads it."
+      }
+    },
+    "required": [
+      "repo_url",
+      "reason"
+    ]
+  }
+}

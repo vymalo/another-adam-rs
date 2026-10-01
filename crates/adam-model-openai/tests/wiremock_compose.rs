@@ -275,6 +275,25 @@ async fn play_on(
     system: &str,
     history: &mut Vec<Message>,
 ) -> Vec<Vec<String>> {
+    play_answering(client, model, system, history, &|call| {
+        if call.name == "ask_user" {
+            ANSWERS.to_owned()
+        } else {
+            "ok".to_owned()
+        }
+    })
+    .await
+}
+
+/// [`play_on`] with the result of each call chosen by `answer`: for a script that goes one way or
+/// the other by what a tool said.
+async fn play_answering(
+    client: &OpenAiCompatible,
+    model: &str,
+    system: &str,
+    history: &mut Vec<Message>,
+    answer: &dyn Fn(&ToolCall) -> String,
+) -> Vec<Vec<String>> {
     let mut turns = Vec::new();
     for turn in 0..12 {
         let req = scripted(model, system, history);
@@ -315,11 +334,7 @@ async fn play_on(
         }
         history.push(complete.message.clone());
         for call in calls {
-            let result = if call.name == "ask_user" {
-                ANSWERS
-            } else {
-                "ok"
-            };
+            let result = answer(&call);
             history.push(Message::tool_result(call.id, result));
         }
     }
@@ -524,6 +539,92 @@ async fn the_scratch_script_asks_where_to_publish_and_goes_on_when_told() {
     );
     for (name, args) in &calls[5..] {
         assert_eq!(args["repo"], id, "{name} works in the repository's slot");
+    }
+}
+
+/// The second-repository script: the coder prepares the sandbox and asks the person whether it may
+/// add the library, then goes by what `prepare_workspace` says of it. Added (its slot is in the
+/// result): it reads the greeting, writes it in the sandbox, checks, pushes and opens the pull
+/// request. Refused: it says so, and the run waits for the person.
+#[tokio::test]
+async fn the_second_repo_script_goes_on_when_the_library_is_added_and_stops_when_it_is_not() {
+    let Some(root) = mock_url() else {
+        eprintln!("skipping: ADAM_TEST_MOCK_OPENAI_URL not set");
+        return;
+    };
+    let client = client(&format!("{root}/v1"), None);
+    let task = "In http://git-server:8080/local/sandbox.git (base branch main), put our shared greeting into hello.txt. [mock:second-repo]";
+    for added in [true, false] {
+        let mut history = vec![Message::user_text(task)];
+        let turns = play_answering(&client, "mock-coder", "x", &mut history, &|call| match (
+            call.name.as_str(),
+            call.arguments["repo_url"].as_str(),
+        ) {
+            ("request_repository", _) => "yes".to_owned(),
+            ("prepare_workspace", Some(url)) if url.contains("library") && added => {
+                "Worktree ready.\nrepository: library\nslot: library\nbase branch: main".to_owned()
+            }
+            ("prepare_workspace", Some(url)) if url.contains("library") => format!(
+                "Refused: {url} is not a repository the person named in their messages. \
+                     Call request_repository."
+            ),
+            _ => "ok".to_owned(),
+        })
+        .await;
+        let calls: Vec<(String, serde_json::Value)> = history
+            .iter()
+            .flat_map(|m| m.tool_calls().to_vec())
+            .map(|c| (c.name, c.arguments))
+            .collect();
+        let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+        let library = "http://git-server:8080/local/library.git";
+        assert_eq!(
+            calls[1].1["repo_url"], library,
+            "the model asks about the library"
+        );
+        assert!(
+            calls[1].1["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "with a reason: {:?}",
+            calls[1].1
+        );
+        assert_eq!(calls[2].1["repo_url"], library);
+        if added {
+            assert_eq!(
+                names,
+                [
+                    "prepare_workspace",
+                    "request_repository",
+                    "prepare_workspace",
+                    "read_file",
+                    "write_file",
+                    "run_checks",
+                    "commit_and_push",
+                    "open_pull_request"
+                ]
+            );
+            assert_eq!(calls[3].1["repo"], "library");
+            for (name, args) in &calls[4..] {
+                assert_eq!(
+                    args["repo"], "sandbox",
+                    "{name} works in the sandbox's slot"
+                );
+            }
+            grows(&turns, 6, "the answer after the pull request");
+        } else {
+            assert_eq!(
+                names,
+                [
+                    "prepare_workspace",
+                    "request_repository",
+                    "prepare_workspace"
+                ]
+            );
+            let said = turns.last().expect("a turn").concat();
+            assert!(
+                said.contains("I could not add the library repository"),
+                "{said}"
+            );
+        }
     }
 }
 

@@ -1943,6 +1943,12 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
   assemble with `CoderAgent::try_from_def`), and a folder's subagents are registered beside the coder. A restart applies an edit; there is no hot reload
   ([ADR 0004](decisions/0004-agent-folders-at-run-time.md)).
 * **Rules in code.**
+  * `prepare_workspace` and `publish_scratch` accept only a **granted** repository: one the person named, or
+    one the person agreed to add when `request_repository` asked
+    ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md), decision 9). The question is the tool's
+    own (it names the repository and quotes the model's reason), the grant is recorded by the agent from the
+    person's answer to that call and from nothing the model says, and a refusal is remembered so that it is not
+    asked again. See [`bin/adam-coder`](../bin/adam-coder/README.md#another-repository-only-with-the-persons-yes).
   * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`
     refuses to run. `commit_and_push` and `open_pull_request` refuse too.
   * `open_pull_request` refuses unless the pushed `HEAD` is the current commit
