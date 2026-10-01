@@ -43,7 +43,7 @@ sequenceDiagram
 |---|---|
 | `prepare_workspace { repo_url, base_branch?, branch? }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
 | `run_command { command, cwd? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. The same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
-| `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), streams its updates as progress, returns its summary and the changed files |
+| `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
 | `run_checks { command, cwd? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
 | `commit_and_push { message }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
 | `open_pull_request { title, body, accept_red_checks? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
@@ -63,11 +63,34 @@ argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_to
 The specs the model sees are pinned by `tests/fixtures/tool-specs/*.json` (see [Tests](#tests)); tool names and the
 journal's `tool:<call id>` step names are unchanged, so a run started before the port replays.
 
+### Steps: what the person sees of the work
+
+The card lists `steps/v1` ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md); the contract is
+the orchestration layer's `docs/api/steps-v1.md`), and every tool call is a step to a client that activates it. Most are
+plain steps labelled with the tool's name (`prepare_workspace`, `run_checks`, ...), whose progress lines
+(`running checks: ...`) are updates of their own step. **`delegate_to_opencode` is a `subagent` step labelled
+OpenCode** (`#[tool(step = "subagent", label = "OpenCode", icon = "agent")]`), and what OpenCode reports over ACP is the
+tree under it:
+
+| OpenCode reports | The step |
+|---|---|
+| a tool call (`ToolCall`) | a child `acp:<call id>:<ACP id>` that runs under OpenCode's step: kind `command` for ACP's `execute`, `tool` for the others; the icon is ACP's kind when the contract has one (`read`, `edit`, `delete`, `move`, `search`, `think`, `fetch`, `execute`); the label is its title |
+| an update of that call (`ToolCallUpdate`) | `completed` or `failed` ends the child, with its output as the detail (cut to 300 characters); output while it runs is an update; `in_progress` with nothing new is not reported |
+| its plan (`Plan`) | an update of OpenCode's own step: `plan: 2 of 5 done` |
+| a line of its reply (`AgentText`) | an update of OpenCode's own step, the line as the detail |
+| its reply, at the end | one `message` child, `OpenCode's summary`, the last 1000 characters as the detail |
+| a tool call that never said it ended | ended `canceled` with the turn; `failed` when the turn failed, `canceled` when the run was cancelled |
+
+Every label and detail comes from OpenCode, so it is **scrubbed of the secrets the process holds and cut** before it is
+reported, like every other line. A client that did not activate steps reads the same work as lines of text: the title of
+a tool call when it starts, `<title>: done` or `<title>: failed: <output>` when it ends, the lines of OpenCode's reply
+and its plan as they are, and `OpenCode: done` when the call ends (`tests/e2e.rs`, `tests/tools.rs`).
+
 ### Asking with choices
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
 (`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
-`thread-tools/v1`; `agent_card_from` adds them, `tests/fixtures/agent/card.json` pins them), reads A2A messages as one from
+`thread-tools/v1`; `agent_card_from` adds them, with `steps/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, choices? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, and the
 person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
@@ -730,7 +753,7 @@ are still sent; a control-plane component in `control-plane`). It logs
   once, instead of at its next poll (250 ms).
 * A cancel reaches the step running in another process at once, instead of at the worker's
   next read of the run.
-* The control plane's A2A stream carries the `Progress`, `Custom` and `Artifact` events of a
+* The control plane's A2A stream carries the `Step`, `Progress`, `Custom` and `Artifact` events of a
   run a worker steps as they happen, not only the states and artifacts it finds by polling.
 
 It is Postgres only (MongoDB has no equivalent here, and `adam-service` is Postgres only), needs
@@ -911,8 +934,8 @@ database of its own, so the role needs `CREATEDB`):
   or GitHub configuration and its log shows none; the task is sent to it before the worker
   exists and waits unclaimed (the model is not asked, the run's version does not move), then the worker starts, steps it to a
   branch and a pull request, and the control plane's stream reports the artifacts and
-  `completed`, and a `working` update carrying the text of the worker's `Progress` event
-  (`preparing a worktree of ...`), which exists only as a live event and so proves events
+  `completed`, and a `working` update carrying the text of the worker's progress line (an update of
+  its `prepare_workspace` step, `preparing a worktree of ...`), which exists only as a live event and so proves events
   crossed the two processes over `NOTIFY`. Both processes log `listening for notifications`.
 * `tests/agent_files.rs`: the prompt, limits and card in `agent/instructions.md`, against the Rust they replaced and
   against the instruction snapshot. `the_prompt_carries_the_rules_the_code_relies_on` runs on the assembled prompt;
@@ -943,6 +966,7 @@ database of its own, so the role needs `CREATEDB`):
   another agent's name, a worker whose folder cannot be assembled (exit 78, names the var; Postgres), a control
   plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the
   embedded copy logged as `source=embedded`.
+* `src/tools/delegate.rs` (unit): OpenCode's tool calls as child steps (the kind and icon of each ACP kind, the state of each status, a call moved and ended by its updates, what OpenCode says scrubbed and cut, a call that never ended closed with the turn) and `tests/tools.rs`' `delegate_to_opencode_streams_updates_and_returns_the_summary` (the call is a `subagent` step labelled OpenCode, the fake agent's tool call is a child with the edit icon that ends `completed`, its reply is a `message` child and the progress lines are updates of the call's own step); `tests/agent_files.rs` and the card golden pin `steps/v1` on the card.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, malformed arguments,
   `prepare_workspace` refusing a repository the person did not name (the refusal names
@@ -1047,8 +1071,8 @@ curl -N http://127.0.0.1:8080/ \
         "In https://github.com/you/adam-coder-sandbox (base branch main), add a file hello.txt containing hello. Run the repository checks before opening a pull request."}]}}}'
 ```
 
-Expected: a stream of status updates whose messages include `opencode: ...`
-lines and `running checks: ...`, then artifacts `checks` (twice: of `HEAD`, then bound to the pushed commit), `branch` and `pull_request`,
+Expected: a stream of status updates whose messages include OpenCode's tool calls (`Write ...`, then
+`Write ...: done`) and `running checks: ...`, then artifacts `checks` (twice: of `HEAD`, then bound to the pushed commit), `branch` and `pull_request`,
 then `TASK_STATE_COMPLETED`. Send only "Hi" instead and the task ends `TASK_STATE_INPUT_REQUIRED` with
 the model's question, which should be a greeting that says the agent's name (`Coder`) and what it does in one
 sentence and asks which repository and what to change ([Who it is](#who-it-is)); "What is your name?" and "List me all

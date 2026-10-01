@@ -150,8 +150,15 @@ pub fn agent_card_from(
     files
         .def()?
         .card(public_url.clone(), env!("CARGO_PKG_VERSION"))
-        .map(adam_ui::with_card_extensions)
+        .map(with_extensions)
         .map_err(Box::new)
+}
+
+/// `card` with the extensions the coder speaks: the screen's (A2UI, `ui-catalog/v1`,
+/// `thread-tools/v1`) and `steps/v1` (every tool call, and OpenCode's, is reported as a step to a
+/// client that activates it).
+fn with_extensions(card: AgentCardConfig) -> AgentCardConfig {
+    adam_ui::with_card_extensions(card).with_extension(adam_a2a::ExtensionConfig::steps())
 }
 
 #[cfg(test)]

@@ -41,6 +41,12 @@
       "description": "Calls the tools of the thread's endpoint",
       "required": false,
       "params": {}
+    },
+    {
+      "uri": "https://agents.vymalo.com/a2a/extensions/steps/v1",
+      "description": "Reports its tool calls and its sub-agents' work as nested steps",
+      "required": false,
+      "params": {}
     }
   ]
 }

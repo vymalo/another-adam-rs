@@ -1,8 +1,10 @@
 //! `delegate_to_opencode { instructions }`.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use adam::prelude::*;
+use adam::{StepEvent, StepIcon, StepKind, StepState};
 use adam_acp::{AcpClient, AcpError, AcpUpdate, ClientPolicy, Session};
 use adam_error::{Classify, report};
 use futures::StreamExt;
@@ -16,6 +18,12 @@ use super::{Outcome, ToolEnv, cancelled, non_empty};
 const SUMMARY_CAP: usize = 8 * 1024;
 /// Longest progress line.
 const PROGRESS_CAP: usize = 300;
+/// Longest label of a step for one of OpenCode's tool calls (its title).
+const STEP_LABEL_CAP: usize = 160;
+/// Most of a tool call's output a step carries.
+const STEP_DETAIL_CAP: usize = 300;
+/// Most of OpenCode's reply the `message` step at the end carries.
+const SUMMARY_STEP_CAP: usize = 1000;
 /// Most changed files listed in the result.
 const MAX_LISTED_FILES: usize = 40;
 /// How long OpenCode gets to end its turn after `session/cancel` before it is
@@ -84,8 +92,10 @@ fn tail(text: &str, cap: usize) -> &str {
 //
 // Starts the configured ACP program in the worktree, opens a session there and
 // sends `instructions` as one prompt. What the agent reports while it works
-// (tool calls, plan, text) becomes progress events; the result is its own
-// summary plus the files that changed. The agent may read and write files only
+// becomes steps (`steps/v1`): the call is a `subagent` step labelled OpenCode, each tool call OpenCode
+// makes is a child step (`Children`), its plan and the lines of its reply are updates of the OpenCode step,
+// and its reply is one `message` child at the end. The result is its own summary plus the files that
+// changed. The agent may read and write files only
 // under the worktree (`ClientPolicy::fs_root`), and its permission requests
 // are answered by `PermissionMode::AllowWithinRoot`.
 //
@@ -100,7 +110,7 @@ fn tail(text: &str, cap: usize) -> &str {
 /// verified. One concern per call. It reads and edits files itself; do not ask
 /// it to commit, push or open pull requests. Returns its summary and the files
 /// that changed.
-#[tool(type = DelegateToOpenCode)]
+#[tool(type = DelegateToOpenCode, step = "subagent", label = "OpenCode", icon = "agent")]
 pub async fn delegate_to_opencode(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -140,17 +150,25 @@ pub async fn delegate_to_opencode(
     let mut reply = String::new();
     let mut line = String::new();
     let mut stop_reason = None;
+    let mut children = Children::new(ctx.call_id(), &env.redactor);
     loop {
         let update = tokio::select! {
             biased;
             () = ctx.cancelled() => {
                 stop(client, Some(&session), Some(turn)).await;
+                children.close(ctx, StepState::Canceled).await;
                 return Err(cancelled("OpenCode was stopped"));
             }
             update = turn.next() => update,
         };
         let Some(update) = update else { break };
-        let update = update.map_err(|e| acp_error(&e))?;
+        let update = match update {
+            Ok(update) => update,
+            Err(e) => {
+                children.close(ctx, StepState::Failed).await;
+                return Err(acp_error(&e));
+            }
+        };
         match update {
             AcpUpdate::AgentText(chunk) => {
                 reply.push_str(&chunk);
@@ -162,22 +180,52 @@ pub async fn delegate_to_opencode(
             AcpUpdate::Thought(_) => {}
             other => {
                 flush(ctx, &env.redactor, &mut line).await;
-                if let Some(message) = describe(&other) {
-                    ctx.emit_progress(env.redactor.scrub_string(message)).await;
-                }
-                if let AcpUpdate::TurnEnded {
-                    stop_reason: reason,
-                } = other
-                {
-                    stop_reason = Some(reason);
+                match other {
+                    AcpUpdate::ToolCall {
+                        id,
+                        title,
+                        kind,
+                        status,
+                    } => children.tool_call(ctx, &id, &title, &kind, &status).await,
+                    AcpUpdate::ToolCallUpdate { id, status, output } => {
+                        children
+                            .tool_call_update(ctx, &id, &status, output.as_deref())
+                            .await;
+                    }
+                    AcpUpdate::Plan(entries) => {
+                        let done = entries.iter().filter(|e| e.status == "completed").count();
+                        ctx.emit_progress(format!("plan: {done} of {} done", entries.len()))
+                            .await;
+                    }
+                    AcpUpdate::TurnEnded {
+                        stop_reason: reason,
+                    } => stop_reason = Some(reason),
+                    AcpUpdate::AgentText(_) | AcpUpdate::Thought(_) => {}
                 }
             }
         }
     }
     flush(ctx, &env.redactor, &mut line).await;
+    // A tool call that never reported its end ended with the turn.
+    children.close(ctx, StepState::Canceled).await;
     drop(turn);
     if let Err(e) = client.shutdown().await {
         tracing::debug!(error = %e, "OpenCode did not shut down cleanly");
+    }
+
+    // Its reply, once, as a line of its own in the tree.
+    let summary = tail(reply.trim(), SUMMARY_STEP_CAP);
+    if !summary.is_empty() {
+        ctx.report_step(
+            StepEvent::new(
+                format!("acp:{}:summary", ctx.call_id()),
+                StepKind::Message,
+                "OpenCode's summary",
+                StepState::Completed,
+            )
+            .with_detail(env.redactor.scrub(summary)),
+        )
+        .await;
     }
 
     let stop_reason = stop_reason.unwrap_or_else(|| "unknown".to_owned());
@@ -215,50 +263,144 @@ pub async fn delegate_to_opencode(
     })
 }
 
+/// A line of OpenCode's reply as an update of the OpenCode step.
 async fn flush(ctx: &ToolCtx, redactor: &Redactor, line: &mut String) {
     let text = clip(&redactor.scrub(line), PROGRESS_CAP);
     line.clear();
     if !text.is_empty() {
-        ctx.emit_progress(format!("opencode: {text}")).await;
+        ctx.emit_progress(text).await;
     }
 }
 
-/// A progress line for an update worth showing.
-fn describe(update: &AcpUpdate) -> Option<String> {
-    match update {
-        AcpUpdate::ToolCall {
-            title,
-            kind,
-            status,
-            ..
-        } => Some(format!("opencode: {kind}: {} [{status}]", clip(title, 160))),
-        AcpUpdate::ToolCallUpdate { id, status, output } => {
-            if matches!(status.as_str(), "completed" | "failed") {
-                let detail = output
-                    .as_deref()
-                    .map(|o| format!(": {}", clip(o, 160)))
-                    .unwrap_or_default();
-                Some(format!("opencode: tool call {id} {status}{detail}"))
-            } else {
-                None
+/// The kind and the icon of the step for a tool call of ACP kind `kind`: a command for `execute`, a
+/// tool otherwise, and the icon of the same name when the contract has one (`switch_mode` and `other`
+/// have none).
+fn style_of(kind: &str) -> (StepKind, Option<StepIcon>) {
+    let step = if kind == "execute" {
+        StepKind::Command
+    } else {
+        StepKind::Tool
+    };
+    (step, StepIcon::parse(kind))
+}
+
+/// Where a step stands for ACP's status of a tool call: `pending` and `in_progress` are running,
+/// `completed` and `failed` end it.
+fn state_of(status: &str) -> StepState {
+    match status {
+        "completed" => StepState::Completed,
+        "failed" => StepState::Failed,
+        _ => StepState::Running,
+    }
+}
+
+/// The tool calls OpenCode makes, as steps that run under the OpenCode step: `acp:<call id>:<ACP id>`.
+/// Everything that comes from OpenCode (a title, an output) is scrubbed first, as every other line of
+/// the coder is, and cut: the steps are shown to the person.
+struct Children<'a> {
+    call_id: String,
+    redactor: &'a Redactor,
+    /// The tool calls that started and have not ended, by ACP id: what an update of one needs.
+    open: HashMap<String, Open>,
+}
+
+/// What an update needs of the tool call it is about.
+struct Open {
+    kind: StepKind,
+    label: String,
+    icon: Option<StepIcon>,
+}
+
+impl<'a> Children<'a> {
+    fn new(call_id: &str, redactor: &'a Redactor) -> Self {
+        Self {
+            call_id: call_id.to_owned(),
+            redactor,
+            open: HashMap::new(),
+        }
+    }
+
+    fn step(&self, id: &str, open: &Open, state: StepState) -> StepEvent {
+        let step = StepEvent::new(
+            format!("acp:{}:{id}", self.call_id),
+            open.kind,
+            &open.label,
+            state,
+        );
+        match open.icon {
+            Some(icon) => step.with_icon(icon),
+            None => step,
+        }
+    }
+
+    /// OpenCode started a tool call (or reported one that is already over).
+    async fn tool_call(&mut self, ctx: &ToolCtx, id: &str, title: &str, kind: &str, status: &str) {
+        let (step_kind, icon) = style_of(kind);
+        let open = Open {
+            kind: step_kind,
+            label: clip(&self.redactor.scrub(title), STEP_LABEL_CAP),
+            icon,
+        };
+        let state = state_of(status);
+        ctx.report_step(self.step(id, &open, state)).await;
+        if !state.is_end() {
+            self.open.insert(id.to_owned(), open);
+        }
+    }
+
+    /// OpenCode says how a tool call stands: nothing new, unless it ended or has output.
+    async fn tool_call_update(
+        &mut self,
+        ctx: &ToolCtx,
+        id: &str,
+        status: &str,
+        output: Option<&str>,
+    ) {
+        let state = state_of(status);
+        if !state.is_end() && output.is_none() {
+            return;
+        }
+        let known = match self.open.get(id) {
+            Some(open) => Open {
+                kind: open.kind,
+                label: open.label.clone(),
+                icon: open.icon,
+            },
+            None => Open {
+                kind: StepKind::Tool,
+                label: format!("tool call {id}"),
+                icon: None,
+            },
+        };
+        let mut step = self.step(id, &known, state);
+        if let Some(output) = output {
+            let output = clip(&self.redactor.scrub(output), STEP_DETAIL_CAP);
+            if !output.is_empty() {
+                step = step.with_detail(output);
             }
         }
-        AcpUpdate::Plan(entries) => {
-            let done = entries.iter().filter(|e| e.status == "completed").count();
-            Some(format!(
-                "opencode: plan, {done} of {} steps done",
-                entries.len()
-            ))
+        ctx.report_step(step).await;
+        if state.is_end() {
+            self.open.remove(id);
         }
-        AcpUpdate::TurnEnded { stop_reason } => {
-            Some(format!("opencode: turn ended ({stop_reason})"))
+    }
+
+    /// The turn is over (or was stopped): the tool calls that never said they ended end `state`.
+    async fn close(&mut self, ctx: &ToolCtx, state: StepState) {
+        let mut open: Vec<(String, Open)> = self.open.drain().collect();
+        open.sort_by(|a, b| a.0.cmp(&b.0));
+        for (id, open) in open {
+            ctx.report_step(self.step(&id, &open, state)).await;
         }
-        AcpUpdate::AgentText(_) | AcpUpdate::Thought(_) => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use adam_runtime::{CollectingSink, RunEvent};
+
     use super::*;
 
     #[test]
@@ -270,31 +412,180 @@ mod tests {
     }
 
     #[test]
-    fn only_finished_tool_calls_and_starts_are_described() {
-        let call = AcpUpdate::ToolCall {
-            id: "t".into(),
-            title: "Write hello.txt".into(),
-            kind: "edit".into(),
-            status: "pending".into(),
-        };
+    fn an_acp_kind_is_a_step_kind_and_the_icon_of_its_name() {
         assert_eq!(
-            describe(&call).as_deref(),
-            Some("opencode: edit: Write hello.txt [pending]")
+            style_of("execute"),
+            (StepKind::Command, Some(StepIcon::Execute))
         );
-        let running = AcpUpdate::ToolCallUpdate {
-            id: "t".into(),
-            status: "in_progress".into(),
-            output: None,
-        };
-        assert_eq!(describe(&running), None);
-        let done = AcpUpdate::ToolCallUpdate {
-            id: "t".into(),
-            status: "completed".into(),
-            output: Some("ok".into()),
+        assert_eq!(style_of("edit"), (StepKind::Tool, Some(StepIcon::Edit)));
+        for (kind, icon) in [
+            ("read", StepIcon::Read),
+            ("delete", StepIcon::Delete),
+            ("move", StepIcon::Move),
+            ("search", StepIcon::Search),
+            ("think", StepIcon::Think),
+            ("fetch", StepIcon::Fetch),
+        ] {
+            assert_eq!(style_of(kind), (StepKind::Tool, Some(icon)), "{kind}");
+        }
+        // ACP kinds the contract has no picture for.
+        assert_eq!(style_of("switch_mode"), (StepKind::Tool, None));
+        assert_eq!(style_of("other"), (StepKind::Tool, None));
+        assert_eq!(style_of(""), (StepKind::Tool, None));
+    }
+
+    #[test]
+    fn an_acp_status_is_running_until_it_completes_or_fails() {
+        assert_eq!(state_of("pending"), StepState::Running);
+        assert_eq!(state_of("in_progress"), StepState::Running);
+        assert_eq!(state_of("completed"), StepState::Completed);
+        assert_eq!(state_of("failed"), StepState::Failed);
+        assert_eq!(state_of("something new"), StepState::Running);
+    }
+
+    /// The steps `Children` reports for `calls`, with the events of the call's own step left out.
+    fn steps_of(sink: &CollectingSink) -> Vec<StepEvent> {
+        sink.events()
+            .into_iter()
+            .filter_map(|e| match e.event {
+                RunEvent::Step(step) => Some(step),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn rig(secret: &str) -> (ToolCtx, CollectingSink, Redactor) {
+        let sink = CollectingSink::new();
+        let ctx = ToolCtx::detached("delegate_to_opencode", "c2", Arc::new(sink.clone()));
+        (ctx, sink, Redactor::new([secret.to_owned()]))
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_is_a_child_step_that_its_updates_move_and_end() {
+        let (ctx, sink, redactor) = rig("hunter2-hunter2");
+        let mut children = Children::new(ctx.call_id(), &redactor);
+        children
+            .tool_call(&ctx, "tc-1", "npm test", "execute", "pending")
+            .await;
+        // Nothing new: no report.
+        children
+            .tool_call_update(&ctx, "tc-1", "in_progress", None)
+            .await;
+        // Output while it runs is an update; the end carries what it printed.
+        children
+            .tool_call_update(&ctx, "tc-1", "in_progress", Some("12 passed"))
+            .await;
+        children
+            .tool_call_update(&ctx, "tc-1", "failed", Some("1 failed"))
+            .await;
+        // An update for a call that was never announced still ends something, with a label of its own.
+        children
+            .tool_call_update(&ctx, "tc-9", "completed", None)
+            .await;
+
+        let under = "tool:c2";
+        let command = |state| {
+            StepEvent::new("acp:c2:tc-1", StepKind::Command, "npm test", state)
+                .under(under)
+                .with_icon(StepIcon::Execute)
         };
         assert_eq!(
-            describe(&done).as_deref(),
-            Some("opencode: tool call t completed: ok")
+            steps_of(&sink),
+            [
+                command(StepState::Running),
+                command(StepState::Running).with_detail("12 passed"),
+                command(StepState::Failed).with_detail("1 failed"),
+                StepEvent::new(
+                    "acp:c2:tc-9",
+                    StepKind::Tool,
+                    "tool call tc-9",
+                    StepState::Completed
+                )
+                .under(under),
+            ]
+        );
+        assert!(children.open.is_empty());
+    }
+
+    #[tokio::test]
+    async fn what_opencode_says_is_scrubbed_and_cut_before_it_is_shown() {
+        let secret = "hunter2-hunter2";
+        let (ctx, sink, redactor) = rig(secret);
+        let mut children = Children::new(ctx.call_id(), &redactor);
+        children
+            .tool_call(
+                &ctx,
+                "tc-1",
+                &format!("curl -H 'Token: {secret}' {}", "x".repeat(400)),
+                "execute",
+                "pending",
+            )
+            .await;
+        children
+            .tool_call_update(
+                &ctx,
+                "tc-1",
+                "completed",
+                Some(&format!("{secret} {}", "y".repeat(600))),
+            )
+            .await;
+        let steps = steps_of(&sink);
+        for step in &steps {
+            assert!(!format!("{step:?}").contains(secret), "{step:?}");
+        }
+        assert!(
+            steps[0].label.starts_with("curl -H 'Token: [redacted]"),
+            "{}",
+            steps[0].label
+        );
+        assert!(
+            steps[0].label.chars().count() <= STEP_LABEL_CAP + 3,
+            "{}",
+            steps[0].label.len()
+        );
+        let detail = steps[1].detail.as_deref().unwrap();
+        assert!(detail.starts_with("[redacted] yyy"), "{detail}");
+        assert!(
+            detail.chars().count() <= STEP_DETAIL_CAP + 3,
+            "{}",
+            detail.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_that_never_ended_ends_when_the_turn_does() {
+        let (ctx, sink, redactor) = rig("hunter2-hunter2");
+        let mut children = Children::new(ctx.call_id(), &redactor);
+        children
+            .tool_call(&ctx, "b", "read b", "read", "in_progress")
+            .await;
+        children
+            .tool_call(&ctx, "a", "read a", "read", "in_progress")
+            .await;
+        children
+            .tool_call(&ctx, "c", "read c", "read", "completed")
+            .await;
+        children.close(&ctx, StepState::Canceled).await;
+        let steps = steps_of(&sink);
+        let states: Vec<(&str, StepState)> =
+            steps.iter().map(|s| (s.id.as_str(), s.state)).collect();
+        assert_eq!(
+            states,
+            [
+                ("acp:c2:b", StepState::Running),
+                ("acp:c2:a", StepState::Running),
+                // A call that is over when it is announced is never open.
+                ("acp:c2:c", StepState::Completed),
+                // The rest end canceled, in a stable order.
+                ("acp:c2:a", StepState::Canceled),
+                ("acp:c2:b", StepState::Canceled),
+            ]
+        );
+        children.close(&ctx, StepState::Canceled).await;
+        assert_eq!(
+            steps_of(&sink).len(),
+            5,
+            "closing twice reports nothing more"
         );
     }
 }

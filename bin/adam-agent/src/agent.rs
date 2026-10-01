@@ -24,7 +24,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`AgentError::Card`] when the folder declares neither `description` nor `card.description`.
 pub fn card_of(def: &AgentDef, public_url: &Url) -> Result<AgentCardConfig, AgentError> {
     def.card(public_url.clone(), VERSION)
-        .map(adam_ui::with_card_extensions)
+        .map(|card| {
+            // The screen's extensions, and `steps/v1`: every tool call is reported as a step to a client
+            // that activates it.
+            adam_ui::with_card_extensions(card).with_extension(adam_a2a::ExtensionConfig::steps())
+        })
         .map_err(|e| AgentError::Card(Box::new(e)))
 }
 

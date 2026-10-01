@@ -16,7 +16,9 @@ use adam_coder::tools::notes::PushedBranch;
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
-use adam_runtime::{CancelToken, CollectingSink, RunEvent};
+use adam_runtime::{
+    CancelToken, CollectingSink, RunEvent, StepEvent, StepIcon, StepKind, StepState,
+};
 use common::{Fixture, PR_URL};
 use serde_json::{Value, json};
 
@@ -1104,17 +1106,77 @@ async fn delegate_to_opencode_streams_updates_and_returns_the_summary() {
 
     let progress = rig.progress();
     assert!(
-        progress
+        progress.contains(&"starting OpenCode".to_owned()),
+        "{progress:?}"
+    );
+    assert!(
+        progress.contains(&"write: ok".to_owned()),
+        "a line of the agent's reply is an update of the OpenCode step: {progress:?}"
+    );
+
+    // The call is a sub-agent step, and OpenCode's tool call is a child under it, ended by its
+    // update; the reply is a `message` child at the end.
+    let style = DelegateToOpenCode.step_style();
+    assert_eq!(style.kind, StepKind::Subagent);
+    assert_eq!(style.label.as_deref(), Some("OpenCode"));
+    assert_eq!(style.icon, Some(StepIcon::Agent));
+    let call = rig.ctx.step_id().to_owned();
+    let child_id = format!("acp:{}:tc-1", rig.ctx.call_id());
+    let steps: Vec<StepEvent> = rig
+        .sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            RunEvent::Step(step) => Some(step),
+            _ => None,
+        })
+        .collect();
+    let child = |state| {
+        steps
             .iter()
-            .any(|p| p.starts_with("opencode: edit: Write ")),
-        "{progress:?}"
+            .filter(|s| s.id == child_id && s.state == state)
+            .collect::<Vec<_>>()
+    };
+    let started = child(StepState::Running);
+    let ended = child(StepState::Completed);
+    assert_eq!((started.len(), ended.len()), (1, 1), "{steps:#?}");
+    for step in [started[0], ended[0]] {
+        assert_eq!(step.parent.as_deref(), Some(call.as_str()));
+        assert_eq!(
+            (step.kind, step.icon),
+            (StepKind::Tool, Some(StepIcon::Edit))
+        );
+        assert!(
+            step.label.starts_with("Write ") && step.label.ends_with("hello.txt"),
+            "{}",
+            step.label
+        );
+    }
+    let summary = steps
+        .iter()
+        .find(|s| s.id.ends_with(":summary"))
+        .unwrap_or_else(|| panic!("no summary step in {steps:#?}"));
+    assert_eq!(
+        (
+            summary.parent.as_deref(),
+            summary.kind,
+            summary.state,
+            summary.label.as_str()
+        ),
+        (
+            Some(call.as_str()),
+            StepKind::Message,
+            StepState::Completed,
+            "OpenCode's summary"
+        )
     );
     assert!(
-        progress.iter().any(|p| p.contains("opencode: write: ok")),
-        "{progress:?}"
+        summary.detail.as_deref().unwrap().contains("write: ok"),
+        "{summary:?}"
     );
+    // How the turn ended is in the result (`stop reason: end_turn`, above), not a line of its own.
     assert!(
-        progress.iter().any(|p| p.contains("turn ended (end_turn)")),
+        !progress.iter().any(|p| p.contains("turn ended")),
         "{progress:?}"
     );
 }

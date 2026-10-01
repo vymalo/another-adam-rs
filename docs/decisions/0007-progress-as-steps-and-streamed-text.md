@@ -1,6 +1,6 @@
 # 0007. Progress as steps and streamed text
 
-Status: **Accepted** (2026-10-01) for the steps (decisions 1 to 7); the streamed text (issue #51) is decided when it
+Status: **Accepted** (2026-10-01) for the steps (decisions 1 to 8); the streamed text (issue #51) is decided when it
 is built and recorded here, in [the last section](#streamed-text). Decided on the owner's delegation; the owner may
 revisit. Builds on [ADR 0001](0001-library-first-host-roles.md) (libraries first) and
 [ADR 0006](0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md) (the vymalo extensions, detected from the card). The
@@ -66,7 +66,15 @@ commit `d411249`:*
    processes (`adam-notify-postgres`) are whole.
 6. **The orchestration layer keeps the log small, not this repository.** An agent sends the reports; the orchestrator
    coalesces them (a start, a few updates and an end per step), so the agent keeps no ledger of open steps.
-7. **Nothing here is required.** The card lists the extension (`ExtensionConfig::steps()`), a client that does not
+7. **The coder reports what OpenCode does as the tree under its call** (`adam-coder`). `delegate_to_opencode` is a `subagent`
+   step labelled OpenCode; each ACP tool call is a child step `acp:<call id>:<ACP id>` (kind `command` for ACP's
+   `execute`, `tool` otherwise; the icon is ACP's kind when the contract has one; the label is its title), moved and
+   ended by its updates with the output as the detail (cut to 300 characters); the plan and the lines of its reply are
+   updates of the OpenCode step; its reply is one `message` child at the end; a call that never said it ended ends with
+   the turn. Everything OpenCode says is scrubbed of the process's secrets and cut before it is reported. This
+   **replaces** the flat `opencode: ...` lines (`describe`), which a client that did not activate steps now reads as
+   the children's titles and ends. The coder's and `adam-agent`'s cards list `steps/v1`.
+8. **Nothing here is required.** The card lists the extension (`ExtensionConfig::steps()`), a client that does not
    activate it reads plain A2A, and the orchestrator reads the card live and fails closed (its ADR 0008).
 
 ```mermaid
@@ -153,7 +161,9 @@ text only).
   style, its reports nest under it, and a question keeps it open until the answer
   (`crates/adam-llm-agent/tests/llm_agent.rs`); the words of `#[tool(step, icon)]` are the runtime's
   (`crates/adam/tests/tool_macro.rs`); the largest step event fits a `NOTIFY` payload
-  (`crates/adam-notify-postgres/src/wire.rs`).
+  (`crates/adam-notify-postgres/src/wire.rs`); OpenCode's tool calls are child steps of the call, scrubbed and cut, and
+  ended with the turn (`bin/adam-coder/src/tools/delegate.rs`, `tests/tools.rs` against the scripted fake ACP agent),
+  and the coder's card and `adam-agent`'s list `steps/v1`.
 * *Verified 2026-10-01* against the contract (`docs/api/steps-v1.md` of the orchestration layer, accepted the same day):
   the members, the vocabulary, the bounds and the one-update-a-second rule are the ones written here.
 * *Unverified*: how the orchestrator's tree reads a real coder turn (its own tests, and the compose scenario of the

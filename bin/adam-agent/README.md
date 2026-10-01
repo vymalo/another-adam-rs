@@ -58,9 +58,13 @@ The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/REA
   gives every agent. The URL is an MCP server's: **`MCP_ALLOW_INSECURE=true`** lets it be plain `http` on another
   host (a compose stack); https and loopback need nothing. No grant, or an expired one, offers nothing.
 
-The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1` and `thread-tools/v1`
+The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1` and `steps/v1`
 (`card_of`), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
-whose messages carry none of that is not affected.
+whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with the
+tool's name, running, then completed, failed or waiting for the person) to a client that activates `steps/v1` (the
+orchestration layer's chat does when the card lists it), and a line of text to one that does not
+([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md)): the MCP tools of the folder, `show`,
+`ask_user`, and its subagents, which are `subagent` steps.
 
 A folder that follows the **persona convention** (the body opens with `Your name is {{display_name}}.` and a line
 `In one sentence: <summary>.`, the summary without `"` and ending at its first period) is greeted by the mock
@@ -263,7 +267,7 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
   a control plane that needs no model, secrets hidden from `Debug`. 
-* `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's; **a chat
+* `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's, and lists the screen's three extensions and `steps/v1`; **a chat
   folder answers "hi" in role over A2A** (the task completes with the greeting its two persona lines give, the
   model is sent the folder's rendered prompt and the screen's three tools only); an edited folder says the edited words; `ask_user`
   parks the run as `input-required` and the answer resumes it; a control plane starts a run that a worker over the
