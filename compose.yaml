@@ -93,7 +93,8 @@ services:
   # docker/coder/Dockerfile to be pullable.
   #
   # The models are scripted (dev/wiremock/mock-openai/mappings/coder-script.json
-  # and opencode-script.json): the coder's model `mock-coder` prepares the
+  # and opencode-script.json; the coder streams its model calls, so each script also
+  # has an SSE twin, coder-script-stream.json): the coder's model `mock-coder` prepares the
   # workspace, delegates to OpenCode (model `mock-opencode`), runs the checks,
   # commits, pushes and opens a pull request, so a task ends in one. CI runs
   # exactly that with dev/coder-e2e.sh, on an image it has already built:

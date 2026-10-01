@@ -25,9 +25,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn card_of(def: &AgentDef, public_url: &Url) -> Result<AgentCardConfig, AgentError> {
     def.card(public_url.clone(), VERSION)
         .map(|card| {
-            // The screen's extensions, and `steps/v1`: every tool call is reported as a step to a client
-            // that activates it.
-            adam_ui::with_card_extensions(card).with_extension(adam_a2a::ExtensionConfig::steps())
+            // The screen's extensions, `steps/v1` (every tool call is reported as a step to a client
+            // that activates it) and `text-stream/v1` (the model's answers are sent as it writes
+            // them, to a client that activates it).
+            adam_ui::with_card_extensions(card)
+                .with_extension(adam_a2a::ExtensionConfig::steps())
+                .with_extension(adam_a2a::ExtensionConfig::text_stream())
         })
         .map_err(|e| AgentError::Card(Box::new(e)))
 }

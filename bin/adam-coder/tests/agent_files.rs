@@ -220,15 +220,16 @@ async fn a_model_alias_the_assembly_refuses_is_an_error_not_a_panic_for_try_new(
 async fn the_assemblys_card_is_the_card_a_control_plane_serves() {
     let (_fx, agent) = coder(3).await;
     let url: url::Url = "https://agents.example.com/coder/".parse().unwrap();
-    // The assembly knows nothing of the screen or of steps: the card of the process adds the
-    // extensions the screen's tools need, and `steps/v1`.
+    // The assembly knows nothing of the screen, of steps or of streaming: the card of the process
+    // adds the extensions the screen's tools need, `steps/v1` and `text-stream/v1`.
     let assembled = adam_ui::with_card_extensions(
         agent
             .assembly()
             .card(url.clone(), env!("CARGO_PKG_VERSION"))
             .unwrap(),
     )
-    .with_extension(adam_a2a::ExtensionConfig::steps());
+    .with_extension(adam_a2a::ExtensionConfig::steps())
+    .with_extension(adam_a2a::ExtensionConfig::text_stream());
     assert_eq!(format!("{assembled:?}"), format!("{:?}", agent_card(&url)));
 }
 
