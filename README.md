@@ -144,7 +144,7 @@ docker compose down -v             # stop and forget all state (volumes included
 |---|---|---|
 | `postgres` | `127.0.0.1:5432` | PostgreSQL 16, database `adam_test`, user and password `postgres` |
 | `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone |
-| `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder`, `mock-opencode` and `mock-assistant` are scripted (see "Scripted models") |
+| `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder`, `mock-opencode`, `mock-assistant` and `mock-researcher` are scripted (see "Scripted models") |
 | `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) |
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git`; no authentication |
 | `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token`; its agent files are the folder `bin/adam-coder/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`, see "Changing what the coder says") |
@@ -342,11 +342,34 @@ the coder cannot read (a message that only names the catalog) gets the options a
 a copy of the web's (`crates/adam-ui/tests/fixtures/catalog-v2.json`, with its lock); `CATALOG_FILE` and `CATALOG_LOCK`
 point at another. How a *live* model uses `choices` is *unverified*.
 
+#### A researcher that shows its sources
+
+The same service serves any folder, so the researcher is `AGENT_FOLDER=<copy of dev/agents/researcher/agent>`: a persona
+that searches the web through the MCP server its `mcp.json` names, answers with the sources as links, and, **when the
+screen has the components**, shows them as cards (and, for a question about how things relate, a mermaid graph) with
+`show` ([`adam-ui`](crates/adam-ui/README.md)). The folder's `mcp.json` names the web-search mock of the orchestration
+layer's stack (`mock-mcp-search`), which this stack does not have, so the scenario serves a copy without it (the
+scripted question does not search):
+
+```sh
+docker compose --profile app up -d --build --wait postgres mock-openai agent
+sh dev/agent-cards-e2e.sh    # restarts `agent` on the researcher folder and `mock-researcher`, and puts the default back
+```
+
+The script checks the card's extensions; that a question carrying `[mock:cards]` and **version 3** of the web's catalog
+inline ends `TASK_STATE_COMPLETED` with one `ui` artifact (a `createSurface` under the screen's `catalogId`, and a Column
+of a Text, a Cards of three cards each with an https link, and a Mermaid `graph TD`) and the three links in the words;
+and that the same question from a screen on **version 2** (no `Cards`) or with no catalog gets the words and no
+surface. The catalogs are copies of the web's (`crates/adam-ui/tests/fixtures/catalog-v3.json` and `catalog-v2.json`,
+each with its lock; `CATALOG_FILE`, `CATALOG_LOCK`, `OLD_CATALOG_FILE` and `OLD_CATALOG_LOCK` point at others).
+`NO_RESTART=1` skips the restart, for an agent you started yourself on the researcher folder. How a *live* model uses
+`show` is *unverified*.
+
 ### Scripted models
 
 The coder's model is `mock-coder` and OpenCode's is `mock-opencode` (`MODEL` and
 `OPENCODE_MODEL` in `compose.yaml`, moved with `CODER_MODEL` and
-`CODER_OPENCODE_MODEL`); the general agent's is `mock-assistant` (`AGENT_MODEL`). All three are in `mock-openai`, selected by the `model` of the
+`CODER_OPENCODE_MODEL`); the general agent's is `mock-assistant` (`AGENT_MODEL`, which `dev/agent-cards-e2e.sh` sets to `mock-researcher`). All four are in `mock-openai`, selected by the `model` of the
 request, and both are **stateless**: the answer is chosen by which scripted
 tool-call ids the request's history already holds, so a retried or replayed
 request gets the same answer and the script cannot drift out of step.
@@ -359,6 +382,7 @@ request gets the same answer and the script cannot drift out of step.
 | `mock-coder`, task text contains `[mock:choices]` | `mappings/coder-choices.json` | `ask_user` (`choices-call-1`) with the question `Three quick questions before I start` and three `choices`: `db` (`pg`, `sqlite`), `auth` (`keycloak`, `none`), `deploy` (`k8s`, `compose`), priority 1; once its result holds `db: pg` (how the person's answers read to the model) the text `Going with Postgres, Keycloak and Compose.` (`stop`), priority 1; any other answers, `Thanks, I have your answers.`, priority 2. No workspace or repository is touched. `dev/coder-choices-e2e.sh` runs it through the stack. |
 | `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |
 | `mock-assistant` | `mappings/agent-script.json` | for the general agent (`adam-agent`), stateless: a request that holds a tool result (`role: tool`) gets a fixed text (`I looked into it with the tool you gave me. ...`), priority 1; any other request gets `Hi! I'm <name>. <summary>.`, **built from the first two lines of the system prompt** (`Your name is <name>.` and `In one sentence: <summary>.`), priority 2. Not streamed. It answers in role whatever is asked: it proves that the folder reaches the model, not what a model does with it. `dev/agent-e2e.sh` runs it through the stack. |
+| `mock-researcher`, question text contains `[mock:cards]` | `mappings/researcher-cards.json` | `show` (`cards-call-1`) with three blocks: a `Text`, a `Cards` of three sources (`https://example.org/mock-search/1` to `/3`, each with a subtitle, a body and tags) and a `Mermaid` `graph TD`, priority 1; once the history holds `cards-call-1` (whatever the result was: drawn, or refused by a screen without `Cards`) the text `Here are the three sources I found: ...` with the three links (`stop`), priority 1. Any other request of that model gets the canned text of the default scenario (the orchestration layer's own `mock-researcher`, which searches, is a different mock, in its repository). |
 
 The steps mirror the reference script of `bin/adam-coder/tests/binary.rs`. The greeting mapping has priority 1 and
 the first step of the script (`prepare_workspace` on a first request) priority 2, so a greeting is never taken for a

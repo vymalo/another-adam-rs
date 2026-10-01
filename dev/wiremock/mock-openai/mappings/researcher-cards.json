@@ -1,0 +1,113 @@
+{
+  "mappings": [
+    {
+      "name": "researcher cards: show the sources as cards and a graph",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-researcher"
+            }
+          },
+          {
+            "contains": "[mock:cards]"
+          },
+          {
+            "doesNotContain": "cards-call-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-researcher-cards-show",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-researcher",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "cards-call-1",
+                    "type": "function",
+                    "function": {
+                      "name": "show",
+                      "arguments": "{\"blocks\":[{\"component\":\"Text\",\"text\":\"Three sources on async Rust\",\"variant\":\"h4\"},{\"component\":\"Cards\",\"title\":\"Sources\",\"layout\":\"list\",\"cards\":[{\"title\":\"The Rust language\",\"subtitle\":\"example.org\",\"body\":\"A language empowering everyone to build reliable and efficient software.\",\"url\":\"https://example.org/mock-search/1\",\"tags\":[\"rust\",\"language\"]},{\"title\":\"Async in Rust\",\"subtitle\":\"example.org\",\"body\":\"How futures work: a future does nothing until it is polled.\",\"url\":\"https://example.org/mock-search/2\",\"tags\":[\"async\"]},{\"title\":\"Tokio\",\"subtitle\":\"example.org\",\"body\":\"A runtime for writing reliable asynchronous applications.\",\"url\":\"https://example.org/mock-search/3\",\"tags\":[\"async\",\"runtime\"]}]},{\"component\":\"Mermaid\",\"title\":\"How it fits together\",\"code\":\"graph TD\\n  Future --> Executor\\n  Executor --> Future\",\"caption\":\"An executor polls a future until it is ready.\"}]}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "researcher cards: the screen has answered the show call, answer in words",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-researcher"
+            }
+          },
+          {
+            "contains": "cards-call-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-researcher-cards-answer",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-researcher",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "Here are the three sources I found: https://example.org/mock-search/1, https://example.org/mock-search/2 and https://example.org/mock-search/3."
+              },
+              "logprobs": null,
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    }
+  ]
+}

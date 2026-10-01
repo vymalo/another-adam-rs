@@ -16,9 +16,10 @@ name: coder
 # entrypoint `tini -- adam-agent` (docker/coder/test/agent-smoke.sh) and in the
 # compose stack as the service `agent`, where "hi" must be answered in role by the
 # folder it serves and a changed folder must change the answer after a restart
-# (dev/agent-e2e.sh), and the coder asks three questions as one form and goes on with the
-# answers (dev/coder-choices-e2e.sh). There is no second image. On main the very image that passed
-# is the one pushed.
+# (dev/agent-e2e.sh), the coder asks three questions as one form and goes on with the
+# answers (dev/coder-choices-e2e.sh), and the same service on the researcher folder answers with
+# source cards and a graph on a screen that draws them (dev/agent-cards-e2e.sh). There is no second
+# image. On main the very image that passed is the one pushed.
 #
 # The bump follows the pattern of vymalo/another-agentic-system#11 (deploy-bump):
 # set the image tag in the chart's values.yaml to `sha-<first 7 of the commit>`
@@ -262,6 +263,10 @@ jobs:
           # metadata), the answers come back as one A2UI action, and it goes on; on a screen it
           # cannot read, the options are text.
           sh dev/coder-choices-e2e.sh
+          # The researcher folder on the same service (it restarts `agent` on a copy of it and the model
+          # mock-researcher, and puts the default back): sources as cards and a graph on a screen with
+          # catalog version 3, words only on one without Cards or without a catalog.
+          sh dev/agent-cards-e2e.sh
       - name: Compose e2e logs
         if: failure() && steps.guard.outputs.ready == 'true'
         run: docker compose --profile app logs --no-color

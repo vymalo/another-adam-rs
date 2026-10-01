@@ -68,8 +68,13 @@ models of this repository and of `another-agentic-system` in role: they build `H
 those two lines, so editing them changes the mocked answer. A live model follows the whole prompt; what it does
 with it is not tested here.
 
-`dev/agents/assistant/agent/` is a complete example, and the folder the stack's `agent` service mounts. A
-folder of a few lines is enough:
+`dev/agents/assistant/agent/` is a complete example, and the folder the stack's `agent` service mounts.
+`dev/agents/researcher/agent/` is a second one: **a researcher** whose `mcp.json` names a web-search MCP server (the
+mock of the orchestration layer's stack) and whose instructions tell the model to search, to cite every source as a
+link, and, when the screen has the components, to show the sources as `Cards` (and how they relate as a `Mermaid`
+graph) with `show` after reading the screen with `ui_catalog`. Its files are the same as the orchestration layer's
+copy of the folder (`another-agentic-system`, `dev/agents/researcher/agent`) and are kept in step by hand. A folder
+of a few lines is enough:
 
 ```markdown
 ---
@@ -269,7 +274,14 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
   folder and a warning. **A researcher** on a stateless web-search MCP server (`tests/common`: `SearchServer`,
   `POST /mcp` with JSON responses, no session id, `405` for `GET`/`DELETE`, one tool `web_search`) gets
   `search__web_search` with the server's own schema, carries the token from the environment, and the model names
-  the source from the results; an empty search and a failing one are results the model reads.
+  the source from the results; an empty search and a failing one are results the model reads. **The researcher
+  the repository ships** (`dev/agents/researcher/agent`, its search server pointed at the test's) loads without a
+  warning and, scripted the way a good model follows its instructions (search, `ui_catalog`, `show`), **answers
+  with its sources as cards and a graph on a screen that draws them**: one `ui` artifact (`application/a2ui+json`)
+  under the screen's `catalogId` whose components all validate against version 3 of the web's catalog (a copy in
+  `crates/adam-ui/tests/fixtures`), the prompt carries the instruction to show, and the model read the screen's
+  five components; on a screen of catalog version 2 (no `Cards`) or with no catalog, `show` is refused to the
+  model as an error result, the run goes on in words, and there is no artifact.
 * `tests/binary.rs` (the binary as a process; the cases that need a database use `ADAM_TEST_POSTGRES_URL` and are
   skipped without it): no `ADAM_AGENT_DIR` (exit 78, every other problem listed with it), a missing, invalid or
   two-agent folder (78 with `path:line`, before anything connects), Postgres unreachable (69, no password in
@@ -277,6 +289,8 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
   the official A2A client against a model scripted by the prompt, and the same database after an edit and a
   restart saying the edited words**, a researcher answering with its source through a stateless MCP server, a control plane and a worker in two processes completing a task over one
   database, and the MCP cases of the section above as a process.
-* The mock model `mock-assistant` (`dev/wiremock/mock-openai/mappings/agent-script.json`) is probed by the
-  `compose` job of `ci.yml`; the container smoke test and the compose scenario (`dev/agent-e2e.sh`) run in
-  `coder.yml` (see above).
+* The mock models `mock-assistant` (`dev/wiremock/mock-openai/mappings/agent-script.json`) and `mock-researcher`
+  (`researcher-cards.json`, the script of `[mock:cards]`) are probed by the `compose` job of `ci.yml`; the container
+  smoke test and the compose scenarios (`dev/agent-e2e.sh`, and `dev/agent-cards-e2e.sh`, which serves the researcher
+  folder on `mock-researcher` and checks the cards and the graph, and the words alone on a screen without them) run
+  in `coder.yml` (see above).

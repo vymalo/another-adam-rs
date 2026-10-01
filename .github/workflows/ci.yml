@@ -309,6 +309,18 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"model":"mock-coder","messages":[{"role":"system","content":"x"},{"role":"user","content":"[mock:choices] set up the project"},{"role":"assistant","content":null,"tool_calls":[{"id":"choices-call-1","type":"function","function":{"name":"ask_user","arguments":"{}"}}]},{"role":"tool","tool_call_id":"choices-call-1","content":"The person answered through the interface:\n- db: sqlite"}]}' \
             | jq -e '.choices[0].message.content == "Thanks, I have your answers."' > /dev/null
+          # mock-openai, model mock-researcher, a question that carries [mock:cards]: the researcher
+          # shows what it found, one `show` call with a Text, a Cards of three sources and a Mermaid graph ...
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-researcher","messages":[{"role":"system","content":"x"},{"role":"user","content":"[mock:cards] what is async rust?"}]}' \
+            | jq -e '.choices[0].message.tool_calls[0] | .id == "cards-call-1" and .function.name == "show" and ((.function.arguments | fromjson | .blocks | map(.component)) == ["Text","Cards","Mermaid"]) and ((.function.arguments | fromjson | .blocks[1].cards | length) == 3)' > /dev/null
+          # ... and once the screen has answered the call (the id is in the history, whatever the result
+          # was), it answers in words with the three links.
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-researcher","messages":[{"role":"system","content":"x"},{"role":"user","content":"[mock:cards] what is async rust?"},{"role":"assistant","content":null,"tool_calls":[{"id":"cards-call-1","type":"function","function":{"name":"show","arguments":"{}"}}]},{"role":"tool","tool_call_id":"cards-call-1","content":"Shown to the person."}]}' \
+            | jq -e '.choices[0].finish_reason == "stop" and (.choices[0].message.content | contains("https://example.org/mock-search/1") and contains("https://example.org/mock-search/3"))' > /dev/null
           # mock-github: no open pull requests; creating one answers 201.
           test "$(curl -fsS 'http://127.0.0.1:8082/repos/local/sandbox/pulls?head=local:agent/x&state=open')" = '[]'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/repos/local/sandbox/pulls \

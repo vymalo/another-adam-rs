@@ -18,6 +18,11 @@ pub fn example_dir() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/agents/assistant")
 }
 
+/// The researcher folder the repository ships (`dev/agents/researcher`).
+pub fn researcher_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/agents/researcher")
+}
+
 /// A copy of the shipped example under `<tmp>/agent`: what a deployment mounts as
 /// `ADAM_AGENT_DIR`, which a test then edits the way a deployment edits it.
 pub fn assistant() -> TempDir {
@@ -114,6 +119,34 @@ Use `search__web_search` to look things up, then answer with the best source you
     .unwrap();
     folder
 }
+
+/// The researcher the repository ships (`dev/agents/researcher/agent`), copied under `<tmp>/agent`
+/// with its search server at `url` instead of the compose name the shipped `mcp.json` has. The token
+/// of the server is `${SEARCH_MCP_TOKEN}`, as shipped.
+pub fn shipped_researcher(url: &str) -> TempDir {
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    copy(&researcher_dir().join("agent"), &tmp.path().join("agent"));
+    let mcp = tmp.path().join("agent/mcp.json");
+    let shipped = std::fs::read_to_string(&mcp).unwrap();
+    assert!(shipped.contains(SHIPPED_SEARCH_URL), "{shipped}");
+    std::fs::write(&mcp, shipped.replace(SHIPPED_SEARCH_URL, url)).unwrap();
+    tmp
+}
+
+/// The URL of the web-search server in the shipped researcher's `mcp.json`: the mock of the stack.
+pub const SHIPPED_SEARCH_URL: &str = "http://mock-mcp-search:8080/mcp";
 
 /// A model that answers the way the `mock-assistant` WireMock mapping of `dev/wiremock/mock-openai`
 /// does: it reads the two persona lines at the top of its system prompt (`Your name is X.`, `In one
