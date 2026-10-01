@@ -1,0 +1,49 @@
+[
+  {
+    "version": "v0.9.1",
+    "createSurface": {
+      "surfaceId": "show-research-call-1",
+      "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat"
+    }
+  },
+  {
+    "version": "v0.9.1",
+    "updateComponents": {
+      "surfaceId": "show-research-call-1",
+      "components": [
+        {"id": "root", "component": "Column", "children": ["b1", "b2", "b3"]},
+        {"id": "b1", "component": "Text", "text": "Three sources agree: async Rust is built on futures and an executor."},
+        {
+          "id": "b2",
+          "component": "Cards",
+          "title": "Sources",
+          "layout": "list",
+          "cards": [
+            {
+              "title": "The Rust language",
+              "subtitle": "example.org",
+              "body": "A language empowering everyone to build reliable and efficient software.",
+              "url": "https://example.org/mock-search/1",
+              "tags": ["rust", "language"]
+            },
+            {
+              "title": "Async in Rust",
+              "subtitle": "example.org",
+              "body": "How futures work: a future does nothing until it is polled.",
+              "url": "https://example.org/mock-search/2",
+              "tags": ["async"]
+            },
+            {"title": "Tokio", "url": "https://example.org/mock-search/3"}
+          ]
+        },
+        {
+          "id": "b3",
+          "component": "Mermaid",
+          "title": "How it fits together",
+          "code": "graph TD\n  Future --> Executor\n  Executor --> Waker\n  Waker --> Future",
+          "caption": "A future is polled by an executor until it is ready."
+        }
+      ]
+    }
+  }
+]

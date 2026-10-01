@@ -65,7 +65,7 @@ inbound function reads a screen's action as JSON text.
 * **`show { blocks, title? }`** draws blocks of the screen's components one under the other: ids `b1`...`bn`, in a
   `Column` that is the root (a `Text` heading first when there is a title; a single block with no title is the
   root itself). Each block is `{component, ...properties}`, **validated against the component's JSON Schema**
-  (a refusal names the block, the component and the place; an unknown component lists the ones there are). A good
+  (a refusal names the block, the component and the place, and a long offending value is elided in the middle so the reason is never cut off; an unknown component lists the ones there are). A good
   call is a run **artifact** `ui` of media type `application/a2ui+json` (the A2UI messages, surface `show-<call id>`,
   stable across a replay), which the A2A server sends as a data part; the model reads `Shown to the person.`.
 * **`ui_catalog {}`** gives the components: for each its name, what it is for and the schema of its properties, as
@@ -116,8 +116,8 @@ stateDiagram-v2
 * **The digest is checked, always.** A catalog is `{catalogId, components}`; its digest is `sha256:` and the hex of
   SHA-256 over its canonical JSON (keys sorted, no whitespace, whole numbers as integers; ASCII keys and whole
   numbers only, otherwise it is refused). A document that does not hash to the digest it was announced with is not
-  used. The known-answer vector of the contract and the web's real catalog (version 2, a copy in `tests/fixtures`)
-  pin it.
+  used. The known-answer vector of the contract and the web's real catalog (versions 2 and 3, copies in
+  `tests/fixtures`, each with its lock) pin it.
 * **Doubles.** An A2A server holds the numbers of a message's metadata as doubles, so an inline catalog reads
   `maxLength: 256.0`. `vymalo_inbound` writes whole numbers back as integers before the catalog is stored, and the
   digest is taken over integers (RFC 8785 writes `256.0` as `256`).
@@ -144,6 +144,15 @@ stateDiagram-v2
   that cannot draw it; a stale digest read again once and then cached; a refetch that returns a newer catalog; an
   expired, refused, missing or malformed grant and a dead endpoint; a catalog that does not hash to its claim; `show`
   (a golden, `tests/golden/show_blocks.json`; a replay emits the same surface; every refusal) and `ui_catalog`.
+* `tests/cards.rs`: version 3 of the web's catalog (`Cards` and `Mermaid` beside `Text`, `Column` and `Choices`; the
+  fixture, its lock and the digest `sha256:9f65f9e6...` pinned, and the three components of version 2 unchanged in it):
+  what a researcher draws (a Text, three source cards and a graph) is one surface, a golden file
+  (`tests/golden/show_cards_mermaid.json`), every component of it valid for the catalog and stable across a replay;
+  one card list or one graph alone is the root; every limit of `Cards` and `Mermaid` holds at its edge and is refused
+  beyond it, with the block and the place; a card with no title, a link that is not `http(s)` (`javascript:`, `data:`,
+  a protocol-relative one), a property the schema does not have and a layout it does not list are refused;
+  `ui_catalog` lists both with what they are for. A refusal that echoes a long value (a card's body, a graph's code)
+  keeps the reason: the middle of the value is elided (`src/catalog.rs`, unit tests).
 * `tests/agent.rs`: a whole agent behind A2A over the fake thread-tools endpoint of
   [`adam-mcp-testkit`](../adam-mcp-testkit/README.md): the three questions as one form, the person's answer as an
   action and the model's next words, a tool the endpoint lists offered and called, a refetch over the thread tools,

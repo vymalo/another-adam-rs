@@ -1966,6 +1966,10 @@ flowchart LR
   two persona lines of the prompt), the same database as the coder (runs are scoped by the agent's name) and no
   workspace or GitHub. It waits for `postgres` and `mock-openai`. `dev/agent-e2e.sh` runs "hi" through it (the task
   completes with the folder's name and summary) and restarts it on an edited copy of the folder.
+  `dev/agent-cards-e2e.sh` restarts it on the researcher folder (`dev/agents/researcher/agent`, minus its search
+  server) and the model `mock-researcher`, and asks a question that carries `[mock:cards]` and the screen's catalog
+  (version 3): the run ends with one `ui` artifact, a Text, a Cards of three sources and a Mermaid graph under the
+  screen's `catalogId`; a screen on catalog version 2, or with none, gets the words only.
 * The mock model is canned: it answers in text, or calls the first declared tool
   with `{}`. So it cannot drive OpenCode through a real change, and a local run
   does not end in a pull request. A complete run needs a model that can call
@@ -1976,7 +1980,7 @@ flowchart LR
   real clients (`OpenAiCompatible`, `GitHub`) against them, so the mappings
   cannot rot. The `image` job of `.github/workflows/coder.yml` builds the coder image once, smoke-tests both
   binaries in it (`docker/coder/test/container-smoke.sh`, `agent-smoke.sh`) and runs the scenarios against the
-  stack, `dev/agent-e2e.sh` and `dev/coder-choices-e2e.sh` among them.
+  stack, `dev/agent-e2e.sh`, `dev/coder-choices-e2e.sh` and `dev/agent-cards-e2e.sh` among them.
 
 ## The generic agent
 

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "search": {
+      "type": "http",
+      "url": "http://mock-mcp-search:8080/mcp",
+      "headers": { "Authorization": "Bearer ${SEARCH_MCP_TOKEN}" },
+      "tools": ["web_search"]
+    }
+  }
+}

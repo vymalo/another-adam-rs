@@ -21,7 +21,7 @@ use adam_runtime::Runtime;
 use adam_service::{Agents, RuntimeOptions, ServeError, Service};
 use common::{
     PersonaModel, SEARCH_RESULT, SearchServer, assistant, chat, edit_instructions, folder_with,
-    researcher,
+    researcher, shipped_researcher,
 };
 use serde_json::json;
 use url::Url;
@@ -700,6 +700,236 @@ async fn an_empty_search_and_a_failing_one_are_results_the_model_reads() {
     worker.stop().await;
 }
 
+// ---------------------------------------------------- the researcher on the person's screen
+
+const CATALOG_ID: &str = "https://agents.vymalo.com/a2ui/catalogs/chat";
+/// Version 3 of the web's catalog (`Cards` and `Mermaid` among its components) and version 2 (without
+/// them), as `adam-ui`'s tests pin them: a screen of each age.
+const CATALOG_V3: (&str, &str) = (
+    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v3.json"),
+    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v3.lock.json"),
+);
+const CATALOG_V2: (&str, &str) = (
+    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.json"),
+    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.lock.json"),
+);
+
+/// The message the orchestrator sends from a screen that draws `catalog` (the document and its lock),
+/// with the catalog inline: the `ui-catalog/v1` metadata and the A2UI capabilities.
+fn from_the_screen(text: &str, (catalog, lock): (&str, &str)) -> Message {
+    let lock: serde_json::Value = serde_json::from_str(lock).unwrap();
+    let catalog: serde_json::Value = serde_json::from_str(catalog).unwrap();
+    let mut message = user(text);
+    message.metadata = Some(
+        json!({
+            adam_a2a::UI_CATALOG_EXTENSION: {
+                "catalogId": CATALOG_ID, "version": lock["version"], "digest": lock["digest"],
+                "inline": true},
+            "a2uiClientCapabilities": {"v0.9.1": {
+                "supportedCatalogIds": [CATALOG_ID], "inlineCatalogs": [catalog]}},
+        })
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect(),
+    );
+    message
+}
+
+/// One question put to the shipped researcher by `message`. The model is scripted the way a good one
+/// follows the folder's instructions: search, read what the screen can draw, show two sources as
+/// cards and how they relate as a graph, then answer in words. Returns the finished task and what the
+/// model was sent.
+async fn researcher_run(message: Message) -> (Task, Vec<adam_model::ModelRequest>) {
+    let server = SearchServer::start(Some(MCP_TOKEN)).await;
+    let folder = shipped_researcher(&server.url());
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "r1".into(),
+        name: "search__web_search".into(),
+        arguments: json!({"query": "rust async"}),
+    }])
+    .push_tool_calls(vec![ToolCall {
+        id: "r2".into(),
+        name: "ui_catalog".into(),
+        arguments: json!({}),
+    }])
+    .push_tool_calls(vec![ToolCall {
+        id: "r3".into(),
+        name: "show".into(),
+        arguments: json!({"blocks": [
+            {"component": "Cards", "title": "Sources", "cards": [
+                {"title": "The Rust language", "subtitle": "example.org",
+                 "body": "A language empowering everyone.",
+                 "url": "https://example.org/mock-search/1", "tags": ["rust"]},
+                {"title": "Async in Rust", "subtitle": "example.org",
+                 "body": "How futures work.",
+                 "url": "https://example.org/mock-search/2"}]},
+            {"component": "Mermaid", "code": "graph TD\n  Future --> Executor\n  Executor --> Future"}
+        ]}),
+    }])
+    .push_text(
+        "Async Rust is built on futures: https://example.org/mock-search/1 and https://example.org/mock-search/2.",
+    );
+    let model: DynModel = mock.clone();
+    let agents = build(
+        def_of(&folder).env("SEARCH_MCP_TOKEN", MCP_TOKEN),
+        None,
+        Some(worker_parts(model)),
+    )
+    .await
+    .expect("the shipped researcher assembles");
+    let service = service_over(agents, &store());
+    let worker = Worker::start(&service);
+    let task = service
+        .backend
+        .submit(alice(), message, None, Some("ctx".into()))
+        .await
+        .expect("submit");
+    let done = wait_for(&service, &task.id, TaskState::Completed).await;
+    worker.stop().await;
+    (done, mock.requests())
+}
+
+/// What the model read as the result of its last tool call: the content, and whether it was an error.
+fn last_tool_result(request: &adam_model::ModelRequest) -> (String, bool) {
+    match request.messages.last().unwrap() {
+        adam_model::Message::Tool {
+            content, is_error, ..
+        } => (content.clone(), *is_error),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The researcher of the repository's folder answers with its sources as cards and how they relate as
+/// a graph, on a screen whose catalog (version 3) has `Cards` and `Mermaid`: one A2UI surface as the
+/// run's `ui` artifact, every component of it valid for the catalog the screen announced, under the
+/// screen's `catalogId`, and the answer in words beside it.
+#[tokio::test]
+async fn the_researcher_answers_with_cards_and_a_graph_on_a_screen_that_draws_them() {
+    let (done, requests) = researcher_run(from_the_screen("What is async Rust?", CATALOG_V3)).await;
+    assert_eq!(
+        said(&done),
+        Some(
+            "Async Rust is built on futures: https://example.org/mock-search/1 and https://example.org/mock-search/2."
+        )
+    );
+    assert_eq!(requests.len(), 4);
+
+    // The folder tells the model to show what it found, and to look at the screen first.
+    let system = requests[0].system.as_deref().unwrap();
+    for needle in [
+        "Show what you found",
+        "`ui_catalog`",
+        "`Cards`",
+        "`Mermaid`",
+        "`show`",
+    ] {
+        assert!(
+            system.contains(needle),
+            "{needle} is not in the prompt: {system}"
+        );
+    }
+    // It read the screen's components: version 3, with the two new ones.
+    let (listed, is_error) = last_tool_result(&requests[2]);
+    assert!(!is_error, "{listed}");
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed["version"], 3);
+    let names: Vec<&str> = listed["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Cards", "Choices", "Column", "Mermaid", "Text"]);
+    assert_eq!(
+        last_tool_result(&requests[3]),
+        ("Shown to the person.".to_owned(), false)
+    );
+
+    // The surface: one `ui` artifact of A2UI messages.
+    let artifacts = done.artifacts.as_deref().unwrap_or_default();
+    assert_eq!(artifacts.len(), 1, "{artifacts:?}");
+    let artifact = &artifacts[0];
+    assert_eq!(artifact.name.as_deref(), Some("ui"));
+    let part = &artifact.parts[0];
+    assert_eq!(part.media_type.as_deref(), Some(adam_a2a::A2UI_MEDIA_TYPE));
+    let a2a::PartContent::Data(messages) = &part.content else {
+        panic!("the artifact is data: {part:?}");
+    };
+    assert_eq!(messages[0]["createSurface"]["catalogId"], CATALOG_ID);
+    let components = messages[1]["updateComponents"]["components"]
+        .as_array()
+        .unwrap();
+    let kinds: Vec<&str> = components
+        .iter()
+        .map(|c| c["component"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["Column", "Cards", "Mermaid"]);
+    let lock: serde_json::Value = serde_json::from_str(CATALOG_V3.1).unwrap();
+    let catalog = adam_ui::Catalog::from_document(
+        serde_json::from_str(CATALOG_V3.0).unwrap(),
+        &adam_ui::Claimed {
+            catalog_id: CATALOG_ID.to_owned(),
+            version: 3,
+            digest: lock["digest"].as_str().unwrap().to_owned(),
+        },
+    )
+    .unwrap();
+    for component in components {
+        catalog
+            .validate(component)
+            .unwrap_or_else(|problem| panic!("{component}: {problem}"));
+    }
+    let urls: Vec<&str> = components[1]["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        urls,
+        [
+            "https://example.org/mock-search/1",
+            "https://example.org/mock-search/2"
+        ]
+    );
+}
+
+/// A screen that cannot draw cards (a catalog of version 2, or none) gets the answer in words: `show`
+/// says so to the model, which goes on, and the run ends completed with no surface.
+#[tokio::test]
+async fn on_a_screen_without_cards_or_a_catalog_the_researcher_answers_in_words_only() {
+    for (what, message, refused) in [
+        (
+            "version 2",
+            from_the_screen("What is async Rust?", CATALOG_V2),
+            "`Cards` is not a component of this screen; the components are: Choices, Column, Text",
+        ),
+        (
+            "no catalog",
+            user("What is async Rust?"),
+            "this screen has no component catalog; answer in text",
+        ),
+    ] {
+        let (done, requests) = researcher_run(message).await;
+        assert!(
+            said(&done).is_some_and(|t| t.contains("https://example.org/mock-search/1")),
+            "{what}: {:?}",
+            said(&done)
+        );
+        assert!(
+            done.artifacts.as_deref().unwrap_or_default().is_empty(),
+            "{what}: {:?}",
+            done.artifacts
+        );
+        // The model read why, as an error result, and the run went on to its answer.
+        let (text, is_error) = last_tool_result(&requests[3]);
+        assert!(is_error && text.contains(refused), "{what}: {text}");
+    }
+}
+
 // --------------------------------------------------------------------------- subagents
 
 /// The subagents of a folder are registered beside the agent: the model calls the subagent's tool,
@@ -855,6 +1085,18 @@ async fn the_shipped_example_loads_without_a_warning() {
     // `agent/` itself names the same folder.
     let again = folder::load(&common::example_dir().join("agent")).unwrap();
     assert_eq!(again.digest.as_str(), loaded.digest.as_str());
+}
+
+/// The shipped researcher reads cleanly too, and says in its card what it does with a screen.
+#[tokio::test]
+async fn the_shipped_researcher_loads_without_a_warning() {
+    let loaded = folder::load(&common::researcher_dir()).expect("the researcher loads");
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    assert_eq!(loaded.def.name(), "researcher");
+    let card = card_of(&loaded.def, &url()).unwrap();
+    assert_eq!(card.name, "Researcher");
+    assert_eq!(card.skills[0].id, "web-research");
+    assert!(card.skills[0].description.contains("cards"));
 }
 
 /// A broken folder is refused with every finding, once, as `path:line: error: ...`, and as the

@@ -34,6 +34,10 @@ const MAX_SAFE_INTEGER: i64 = (1 << 53) - 1;
 /// The most validation problems one message about an instance lists.
 const MAX_PROBLEMS: usize = 3;
 
+/// The longest one problem may be, in bytes: the offending value is part of it, and a long one (a
+/// card's body, a graph's code) would push the reason out of the message the model reads.
+const MAX_PROBLEM_BYTES: usize = 300;
+
 /// Why a catalog was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -243,7 +247,8 @@ impl Catalog {
     ///
     /// What is wrong, for the model that wrote it: the component is not in the catalog (the ones
     /// that are are listed), or the first few violations of the schema, each with its place in the
-    /// instance.
+    /// instance. A violation that echoes a long value (a body, a graph's code) is elided in the
+    /// middle, so the reason that follows the value is never cut off.
     pub fn validate(&self, instance: &Value) -> Result<(), String> {
         let name = instance
             .get("component")
@@ -261,10 +266,11 @@ impl Catalog {
             .take(MAX_PROBLEMS + 1)
             .map(|e| {
                 let at = e.instance_path().to_string();
+                let problem = elide(&e.to_string(), MAX_PROBLEM_BYTES);
                 if at.is_empty() {
-                    e.to_string()
+                    problem
                 } else {
-                    format!("{e} (at {at})")
+                    format!("{problem} (at {at})")
                 }
             })
             .collect();
@@ -304,6 +310,24 @@ impl Catalog {
             "components": components,
         })
     }
+}
+
+/// `text` cut to about `max` bytes by dropping the middle: the start says what value it was, the end
+/// says what is wrong with it (`"AAAA..." is longer than 20000 characters`), and the end is the part
+/// a plain cut would lose.
+fn elide(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut head = max / 2;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - max / 2;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{} ... {}", &text[..head], &text[tail..])
 }
 
 /// The canonical JSON of `value`: the bytes the digest is taken over.
@@ -608,6 +632,39 @@ mod tests {
         let message = many.validate(&json!({"component": "M"})).unwrap_err();
         assert!(message.ends_with("; and more"), "{message}");
         assert_eq!(message.matches("; ").count(), 3, "{message}");
+    }
+
+    #[test]
+    fn a_long_offending_value_does_not_push_the_reason_out_of_the_message() {
+        let catalog = Catalog::from_document(vector(), &claimed(VECTOR_DIGEST)).unwrap();
+        let message = catalog
+            .validate(&json!({"component": "Note", "text": "é".repeat(5_000)}))
+            .unwrap_err();
+        assert!(
+            message.len() < 2 * MAX_PROBLEM_BYTES,
+            "{} bytes",
+            message.len()
+        );
+        assert!(
+            message.starts_with("\"éé") && message.contains(" ... "),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("is longer than 10 characters (at /text)"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn elide_keeps_both_ends_on_character_boundaries_and_short_text_whole() {
+        assert_eq!(elide("short", 300), "short");
+        let text = "é".repeat(400);
+        let cut = elide(&text, 300);
+        assert!(cut.len() <= 300 + " ... ".len(), "{}", cut.len());
+        assert!(cut.starts_with('é') && cut.ends_with('é') && cut.contains(" ... "));
+        // An odd limit that falls inside a two-byte character still cuts at a boundary.
+        let odd = elide(&text, 301);
+        assert!(odd.starts_with('é') && odd.ends_with('é'));
     }
 
     #[test]
