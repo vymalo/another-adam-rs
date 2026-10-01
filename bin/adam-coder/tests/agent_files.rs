@@ -62,11 +62,12 @@ fn expected_prompt(cycles: u32) -> String {
 }
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 15] = [
+const TOOLS: [&str; 16] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
     "request_repository",
+    "create_repository",
     "run_command",
     "read_file",
     "write_file",
@@ -136,7 +137,7 @@ async fn the_prompt_gives_the_agent_a_name_and_asks_for_plain_words() {
         "A greeting gets a greeting.",
         "\"list your tools\".**",
         "cannot do, and why:",
-        "you cannot create one",
+        "you can create one only where this deployment allows it",
         "Do not\n  list the tools.",
         // A greeting is answered, not treated as a missing task.
         "so do not call a tool for it",

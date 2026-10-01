@@ -499,6 +499,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "start_scratch",
             "publish_scratch",
             "request_repository",
+            "create_repository",
             "run_command",
             "read_file",
             "write_file",
@@ -3794,6 +3795,187 @@ async fn a_yes_to_a_question_the_model_wrote_grants_nothing(store: DynStore) {
     assert_eq!(notes.named_repos.len(), 1, "only the task's repository");
 }
 
+// -------------------------------------------------- a repository is created only with the yes
+
+/// The scratch project is built and checked; the person says a repository may be made for it; the
+/// coder asks (a question the tool writes: the repository, that it will be private and empty) and
+/// creates nothing while it waits; after the person's yes it creates it, empty and private, and
+/// the project goes into it, behind the usual gate, to a pull request.
+async fn a_repository_is_created_after_the_person_says_yes_and_the_project_goes_into_it(
+    store: DynStore,
+) {
+    let (fx, host) = Fixture::new("hello\n")
+        .await
+        .creating(&["acme"], &["acme"], None);
+    let made = host.path_of("acme", "fibonacci");
+    let url = made.to_string_lossy().into_owned();
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call("s1", "start_scratch", json!({"name": "fib"}))])
+        .push_tool_calls(vec![call(
+            "s2",
+            "write_file",
+            json!({"path": "fib.sh", "content": "echo 0 1 1 2 3 5 8\n"}),
+        )])
+        .push_tool_calls(vec![call(
+            "s3",
+            "write_file",
+            json!({"path": "check.sh", "content": "test \"$(sh fib.sh)\" = \"0 1 1 2 3 5 8\"\n"}),
+        )])
+        .push_tool_calls(vec![call(
+            "s4",
+            "run_checks",
+            json!({"command": "sh ./check.sh", "repo": "fib"}),
+        )])
+        .push_text("fib.sh is written and its check passes. Where should it go?")
+        .push_tool_calls(vec![call(
+            "c1",
+            "create_repository",
+            json!({"owner": "acme", "name": "fibonacci", "description": "The first seven Fibonacci numbers"}),
+        )])
+        .push_tool_calls(vec![call(
+            "c2",
+            "create_repository",
+            json!({"owner": "acme", "name": "fibonacci", "description": "The first seven Fibonacci numbers"}),
+        )])
+        .push_tool_calls(vec![call("c3", "publish_scratch", json!({"repo_url": url}))])
+        .push_tool_calls(vec![call(
+            "c4",
+            "commit_and_push",
+            json!({"message": "feat: print the first fibonacci numbers", "repo": "fibonacci"}),
+        )])
+        .push_tool_calls(vec![call(
+            "c5",
+            "open_pull_request",
+            json!({
+                "title": "feat: print the first fibonacci numbers",
+                "body": "Adds fib.sh.\n\n## Verification\n- `sh ./check.sh`: passed",
+                "repo": "fibonacci",
+            }),
+        )])
+        .push_text("Opened the pull request.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(
+        &server,
+        "Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you a repo later.",
+    )
+    .await;
+    assert_eq!(seen.last_state, Some(TaskState::InputRequired));
+    let run = run_id(&seen.task_id);
+    let mut parked = wait_for(&server.coder.runtime, run, "the run waits", |v| v.waiting).await;
+
+    // The person asks for one to be made. The coder asks first, in the tool's words.
+    let mut follow = user("Create acme/fibonacci for it and put it there.");
+    follow.task_id = Some(seen.task_id.clone());
+    server.client.send_message(&request(follow)).await.unwrap();
+    parked = wait_for(&server.coder.runtime, run, "the run asks to create", |v| {
+        v.waiting && v.version > parked.version && mock.requests().len() == 6
+    })
+    .await;
+    let parts = status_parts(&server, &seen.task_id).await;
+    let question = parts[0].as_text().unwrap();
+    assert!(
+        question.contains("May I create the repository acme/fibonacci on github.com? It will be private and empty.")
+            && question.contains("Description: \"The first seven Fibonacci numbers\"")
+            && question.contains("a) Create acme/fibonacci"),
+        "{question}"
+    );
+    assert!(
+        host.created().is_empty(),
+        "nothing is created while the person has not answered"
+    );
+    assert!(!made.exists());
+
+    // Their yes: the coder asks again, and now it creates.
+    let mut yes = user("yes");
+    yes.task_id = Some(seen.task_id.clone());
+    server.client.send_message(&request(yes)).await.unwrap();
+    let done = wait_for(&server.coder.runtime, run, "the run to finish", |v| {
+        v.status.is_terminal()
+            || (v.waiting && v.version > parked.version && mock.requests().len() == 12)
+    })
+    .await;
+    worker.stop().await;
+    assert_ne!(done.status, RunStatus::Failed, "{:?}", done.error);
+
+    let made_one = host.created();
+    assert_eq!(made_one.len(), 1, "created once");
+    assert!(made_one[0].private, "private by default");
+    assert_eq!(
+        made_one[0].description.as_deref(),
+        Some("The first seven Fibonacci numbers")
+    );
+    let result = |id: &str| result_of(&mock, id);
+    assert_eq!(result("c1").0, "yes");
+    let (created, is_error) = result("c2");
+    assert!(
+        !is_error && created.starts_with("Created acme/fibonacci (private, empty"),
+        "{created}"
+    );
+    let (published, is_error) = result("c3");
+    assert!(
+        !is_error
+            && published.contains("slot: fibonacci")
+            && published.contains("The repository was empty"),
+        "{published}"
+    );
+    // The repository: its first commit is empty, and the branch the work went through has the files.
+    assert_eq!(common::git(&made, &["rev-list", "--count", "main"]), "1");
+    let pulls = fx.created_pulls().await;
+    assert_eq!(pulls.len(), 1, "{pulls:?}");
+    let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
+    assert_eq!(notes.created_repos.len(), 1);
+}
+
+/// With a no nothing is made, the coder is told not to ask again and not to look for a way round,
+/// and the run waits for the person.
+async fn a_no_to_creating_a_repository_creates_nothing(store: DynStore) {
+    let (fx, host) = Fixture::new("hello\n")
+        .await
+        .creating(&["acme"], &["acme"], None);
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "c1",
+        "create_repository",
+        json!({"owner": "acme", "name": "fibonacci"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c2",
+        "create_repository",
+        json!({"owner": "acme", "name": "fibonacci"}),
+    )])
+    .push_text("Understood: I will not create it. Which repository should I use?");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = until_it_waits(
+        &server,
+        user("Make a repository for acme called fibonacci."),
+    )
+    .await;
+    assert_eq!(seen.last_state, Some(TaskState::InputRequired));
+    let run = run_id(&seen.task_id);
+    let parked = wait_for(&server.coder.runtime, run, "the run waits", |v| v.waiting).await;
+    let mut no = user("No.");
+    no.task_id = Some(seen.task_id.clone());
+    server.client.send_message(&request(no)).await.unwrap();
+    wait_for(&server.coder.runtime, run, "the run waits again", |v| {
+        v.waiting && v.version > parked.version && mock.requests().len() == 3
+    })
+    .await;
+    worker.stop().await;
+
+    let (told, is_error) = result_of(&mock, "c2");
+    assert!(
+        is_error && told.contains("declined") && told.contains("Do not ask again"),
+        "{told}"
+    );
+    assert!(host.created().is_empty());
+    let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
+    assert!(notes.created_repos.is_empty() && notes.consents.iter().all(|c| !c.agreed));
+}
+
 // ------------------------------------------------------- one suite per store
 
 /// Every case runs once per store: in memory always, and on PostgreSQL when
@@ -3841,6 +4023,8 @@ macro_rules! coder_suite {
                 another_repository_joins_the_workspace_when_the_person_says_yes_on_the_form,
                 an_answer_that_is_not_a_yes_adds_nothing_and_is_not_asked_again,
                 a_yes_to_a_question_the_model_wrote_grants_nothing,
+                a_repository_is_created_after_the_person_says_yes_and_the_project_goes_into_it,
+                a_no_to_creating_a_repository_creates_nothing,
                 a_continued_task_refuses_what_only_the_model_or_a_fence_mentions,
                 a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone,
                 a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes_are_gone,

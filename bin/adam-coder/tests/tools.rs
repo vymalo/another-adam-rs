@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 use adam_coder::ToolEnv;
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::checks::RunChecks;
+use adam_coder::tools::create::CreateRepository;
 use adam_coder::tools::delegate::DelegateToOpenCode;
 use adam_coder::tools::files::{ApplyPatch, ReadFile, WriteFile};
 use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::named::{named_in, without_untrusted};
-use adam_coder::tools::notes::PushedBranch;
+use adam_coder::tools::notes::{Consent, PushedBranch};
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
 use adam_coder::tools::scratch::{PublishScratch, StartScratch};
@@ -4220,4 +4221,309 @@ async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_r
         "ghs_runtimeMinted0123456789"
     );
     assert_eq!(read().await, "push with [redacted] please\n");
+}
+
+// -------------------------------------------------------------- create_repository
+
+/// A rig whose host creates repositories for the owner `acme` (an organisation), for `me` (a user
+/// the credentials are) and, when `login` is `None`, for organisations only.
+async fn creating(login: Option<&str>) -> (Rig, Arc<common::CreatingHost>) {
+    let (fx, host) =
+        Fixture::new("hello\n")
+            .await
+            .creating(&["acme", "me", "somebody"], &["acme"], login);
+    (Rig::from(fx), host)
+}
+
+/// The person answers the question `create_repository` asked: what the agent records from the
+/// conversation before each step.
+async fn answer(rig: &Rig, subject: &str, yes: bool) {
+    let run = rig.ctx.run_id().to_string();
+    let mut notes = rig.fx.env.notes.load(&run).await.unwrap();
+    notes.record_consents([Consent {
+        call_id: "call-1".into(),
+        tool: "create_repository".into(),
+        subject: subject.into(),
+        agreed: yes,
+    }]);
+    rig.fx.env.notes.save(&run, &notes).await.unwrap();
+}
+
+async fn create(rig: &Rig, args: Value) -> Result<ToolOutput, ToolError> {
+    CreateRepository.call(&rig.ctx, args).await
+}
+
+fn question_of(out: Result<ToolOutput, ToolError>) -> (String, bool) {
+    match out {
+        Err(ToolError::NeedsInput { question, ui }) => (question, ui.is_some()),
+        other => panic!("the person should have been asked: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn creating_is_off_unless_the_deployment_names_owners_and_never_for_another_owner() {
+    // Off: the default settings name nobody.
+    let rig = Rig::new().await;
+    let out = create(&rig, json!({"owner": "acme", "name": "fib"})).await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("switched off"));
+
+    let (rig, host) = creating(None).await;
+    let out = create(&rig, json!({"owner": "evil", "name": "fib"})).await;
+    let message = text(out);
+    assert!(
+        message.contains("only for: acme, me, somebody"),
+        "{message}"
+    );
+    // The allowed owner, in another case, is the same owner.
+    let asked = create(&rig, json!({"owner": "ACME", "name": "fib"})).await;
+    assert!(
+        matches!(asked, Err(ToolError::NeedsInput { .. })),
+        "{asked:?}"
+    );
+    for (args, needle) in [
+        (
+            json!({"owner": "acme", "name": "a/b"}),
+            "not a repository name",
+        ),
+        (
+            json!({"owner": "acme", "name": ".."}),
+            "not a repository name",
+        ),
+        (
+            json!({"owner": "acme", "name": "x.git"}),
+            "not a repository name",
+        ),
+        (json!({"owner": "acme", "name": " "}), "name is required"),
+        (json!({"owner": "", "name": "x"}), "owner is required"),
+        (
+            json!({"owner": "acme", "name": "x", "description": "d".repeat(351)}),
+            "too long",
+        ),
+    ] {
+        let out = create(&rig, args.clone()).await;
+        assert!(is_error(&out) && text(out).contains(needle), "{args}");
+    }
+    assert!(host.created().is_empty(), "nothing was created");
+}
+
+#[tokio::test]
+async fn the_person_is_asked_first_with_a_question_the_tool_wrote_and_nothing_is_created() {
+    let (rig, host) = creating(None).await;
+    let (question, has_form) = question_of(
+        create(
+            &rig,
+            json!({"owner": "acme", "name": "fib", "description": "the \"first\"\n seven numbers"}),
+        )
+        .await,
+    );
+    assert!(
+        question.contains(
+            "May I create the repository acme/fib on github.com? It will be private and empty."
+        ) && question.contains("Description: \"the 'first' seven numbers\"")
+            && question.contains("a) Create acme/fib")
+            && question.contains("b) Don't create it"),
+        "{question}"
+    );
+    assert!(
+        !has_form,
+        "no screen was announced: the options are in the text"
+    );
+    assert!(host.created().is_empty());
+    // A public one is another question, in other words.
+    answer(&rig, "acme/fib:private", true).await;
+    let (question, _) = question_of(
+        create(
+            &rig,
+            json!({"owner": "acme", "name": "fib", "private": false}),
+        )
+        .await,
+    );
+    assert!(
+        question.contains("public (anyone can see it) and empty"),
+        "{question}"
+    );
+    assert!(
+        host.created().is_empty(),
+        "a yes to the private one is no yes to the public one"
+    );
+}
+
+#[tokio::test]
+async fn after_a_yes_the_repository_is_created_empty_private_granted_and_a_repeat_is_the_same() {
+    let (rig, host) = creating(None).await;
+    answer(&rig, "acme/fib:private", true).await;
+    let first = create(
+        &rig,
+        json!({"owner": "acme", "name": "fib", "description": "Fibonacci"}),
+    )
+    .await
+    .unwrap();
+    assert!(!first.is_error, "{}", first.content);
+    let path = host.path_of("acme", "fib");
+    assert!(
+        first
+            .content
+            .starts_with("Created acme/fib (private, empty")
+            && first
+                .content
+                .contains(&format!("repository: {}", path.display())),
+        "{}",
+        first.content
+    );
+    let made = host.created();
+    assert_eq!(made.len(), 1);
+    assert!(made[0].private);
+    assert_eq!(made[0].description.as_deref(), Some("Fibonacci"));
+    assert_eq!(made[0].kind, adam_workspace::OwnerKind::Organization);
+    assert!(
+        common::git(&path, &["for-each-ref"]).is_empty(),
+        "it was created empty: no ref at all"
+    );
+    // The repository is granted (by the key of its clone URL) and recorded.
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap();
+    assert_eq!(notes.created_repos.len(), 1);
+    assert_eq!(
+        notes.named_repos,
+        [notes.created_repos[0].key.clone()],
+        "the grant is the key of the clone URL"
+    );
+    // A repeated call creates nothing and says the same.
+    let again = create(
+        &rig,
+        json!({"owner": "ACME", "name": "Fib", "description": "Fibonacci"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(again.content, first.content);
+    assert_eq!(host.created().len(), 1);
+    // And it is a repository the tools that need a grant now take: a scratch project goes in.
+    start_scratch(&rig, "fib").await;
+    build_fib(&rig, None).await;
+    let published = PublishScratch
+        .call(&rig.ctx, json!({"repo_url": path.to_string_lossy()}))
+        .await
+        .unwrap();
+    assert!(!published.is_error, "{}", published.content);
+}
+
+#[tokio::test]
+async fn a_no_is_remembered_and_nothing_is_created_or_asked_again() {
+    let (rig, host) = creating(None).await;
+    answer(&rig, "acme/fib:private", false).await;
+    let out = create(&rig, json!({"owner": "acme", "name": "fib"})).await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("declined"));
+    assert!(host.created().is_empty());
+}
+
+#[tokio::test]
+async fn a_name_that_exists_and_was_not_made_by_this_run_is_left_alone() {
+    let (rig, host) = creating(None).await;
+    host.take("acme", "fib");
+    answer(&rig, "acme/fib:private", true).await;
+    let out = create(&rig, json!({"owner": "acme", "name": "fib"})).await;
+    assert!(is_error(&out), "{out:?}");
+    let message = text(out);
+    assert!(
+        message.contains("already exists") && message.contains("did not create it"),
+        "{message}"
+    );
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap();
+    assert!(
+        notes.created_repos.is_empty() && notes.named_repos.is_empty(),
+        "no grant"
+    );
+}
+
+/// A user's repository is made for the person the credentials are, and for nobody else; an
+/// installation has no such person, so it makes organisations' only.
+#[tokio::test]
+async fn a_user_owner_needs_credentials_that_are_that_user() {
+    let (rig, host) = creating(Some("me")).await;
+    answer(&rig, "me/mine:private", true).await;
+    let ok = create(&rig, json!({"owner": "me", "name": "mine"}))
+        .await
+        .unwrap();
+    assert!(!ok.is_error, "{}", ok.content);
+    assert_eq!(host.created()[0].kind, adam_workspace::OwnerKind::User);
+    answer(&rig, "somebody/theirs:private", true).await;
+    let other = create(&rig, json!({"owner": "somebody", "name": "theirs"})).await;
+    assert!(is_error(&other), "{other:?}");
+    assert!(text(other).contains("these credentials are me's"));
+    assert_eq!(host.created().len(), 1);
+
+    // An installation (no login): a user owner is refused **before** the person is asked.
+    let (rig, host) = creating(None).await;
+    let out = create(&rig, json!({"owner": "me", "name": "mine"})).await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("GitHub App installation"));
+    assert!(host.created().is_empty());
+    // An organisation is fine either way.
+    assert!(matches!(
+        create(&rig, json!({"owner": "acme", "name": "mine"})).await,
+        Err(ToolError::NeedsInput { .. })
+    ));
+}
+
+/// What the host says the clone URL is must be somewhere the workspace may go.
+#[tokio::test]
+async fn a_clone_url_the_workspace_may_not_use_is_an_error_and_grants_nothing() {
+    let (rig, host) = creating(None).await;
+    host.clone_url_is("https://evil.example/acme/fib.git");
+    answer(&rig, "acme/fib:private", true).await;
+    let out = create(&rig, json!({"owner": "acme", "name": "fib"})).await;
+    assert!(is_error(&out), "{out:?}");
+    let message = text(out);
+    assert!(
+        message.contains("was created") && message.contains("not one this workspace may use"),
+        "{message}"
+    );
+    let notes = rig
+        .fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap();
+    assert!(notes.named_repos.is_empty() && notes.created_repos.is_empty());
+}
+
+/// A repository that is made a moment before git can see it is waited for.
+#[tokio::test]
+async fn the_tool_waits_for_the_new_repository_to_be_reachable() {
+    let (rig, host) = creating(None).await;
+    let late = host.path_of("acme", "late");
+    host.clone_url_is(&late.to_string_lossy());
+    answer(&rig, "acme/late:private", true).await;
+    let made = late.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        std::fs::create_dir_all(&made).unwrap();
+        common::git(
+            &made,
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
+        );
+    });
+    let started = Instant::now();
+    let out = create(&rig, json!({"owner": "acme", "name": "late"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        started.elapsed() >= Duration::from_millis(600),
+        "it waited for it"
+    );
 }

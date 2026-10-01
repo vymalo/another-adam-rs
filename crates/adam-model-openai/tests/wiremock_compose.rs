@@ -628,6 +628,105 @@ async fn the_second_repo_script_goes_on_when_the_library_is_added_and_stops_when
     }
 }
 
+/// The create-repository script: the project is built, the coder says it can create a repository
+/// (the run waits), the person asks for one, the coder calls `create_repository` and the run waits
+/// again for the consent, and when it asks again it goes by what the tool said: created, so the
+/// project is published there and the pull request opened; declined, so it says so and waits.
+#[tokio::test]
+async fn the_create_repo_script_publishes_to_the_new_repository_and_stops_when_the_person_declines()
+{
+    let Some(root) = mock_url() else {
+        eprintln!("skipping: ADAM_TEST_MOCK_OPENAI_URL not set");
+        return;
+    };
+    let client = client(&format!("{root}/v1"), None);
+    let id = "fib-1a2b3c4d5e";
+    let task = format!(
+        "Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you a repo later. [mock:create-repo] {id}"
+    );
+    for created in [true, false] {
+        let mut history = vec![Message::user_text(&task)];
+        let first = play_on(&client, "mock-coder", "x", &mut history).await;
+        assert_eq!(first.len(), 5, "four calls, then the question");
+        let question = first.last().expect("a turn").concat();
+        assert!(
+            question.contains("I can create a repository for it"),
+            "{question}"
+        );
+        // What the coder makes of a text stop, and the person's answer.
+        let Message::Assistant { content, .. } = Message::assistant_text(&question) else {
+            unreachable!("an assistant message")
+        };
+        history.push(Message::Assistant {
+            content,
+            tool_calls: vec![ToolCall {
+                id: "stop00004".into(),
+                name: "ask_user".into(),
+                arguments: json!({"question": question}),
+            }],
+        });
+        history.push(Message::tool_result(
+            "stop00004",
+            format!("Create scratch/{id} and put it there"),
+        ));
+        // The first call to the tool asks the person: their answer is its result. The second
+        // creates, or finds the person said no.
+        let calls = std::cell::Cell::new(0);
+        let turns = play_answering(&client, "mock-coder", "x", &mut history, &|call| {
+            if call.name != "create_repository" {
+                return "ok".to_owned();
+            }
+            calls.set(calls.get() + 1);
+            match (calls.get(), created) {
+                (1, true) => "yes".to_owned(),
+                (1, false) => "no".to_owned(),
+                (_, true) => format!(
+                    "Created scratch/{id} (private, empty: it has no commit yet).\nrepository: http://git-server:8080/scratch/{id}.git"
+                ),
+                (_, false) => "The person declined to have scratch/x created (private).".to_owned(),
+            }
+        })
+        .await;
+        let names: Vec<String> = history
+            .iter()
+            .flat_map(|m| m.tool_calls().to_vec())
+            .filter(|c| c.name != "ask_user")
+            .map(|c| c.name)
+            .collect();
+        let calls: Vec<serde_json::Value> = history
+            .iter()
+            .flat_map(|m| m.tool_calls().to_vec())
+            .filter(|c| c.name == "create_repository")
+            .map(|c| c.arguments)
+            .collect();
+        assert_eq!(calls.len(), 2, "asked, then created");
+        assert_eq!(calls[0]["owner"], "scratch");
+        assert_eq!(calls[0]["name"], id);
+        assert_eq!(calls[0], calls[1], "the same arguments both times");
+        if created {
+            assert_eq!(
+                names,
+                [
+                    "start_scratch",
+                    "write_file",
+                    "write_file",
+                    "run_checks",
+                    "create_repository",
+                    "create_repository",
+                    "publish_scratch",
+                    "commit_and_push",
+                    "open_pull_request"
+                ]
+            );
+            grows(&turns, 6, "the answer after the pull request");
+        } else {
+            assert_eq!(names.len(), 6, "{names:?}");
+            let said = turns.last().expect("a turn").concat();
+            assert!(said.contains("I did not create the repository"), "{said}");
+        }
+    }
+}
+
 /// A script's answer is written over about two seconds, not all at once: a screen that shows words as
 /// they come has something to show (and a test that reads the pieces has more than one to read).
 #[tokio::test]

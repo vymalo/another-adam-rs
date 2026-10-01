@@ -1,0 +1,29 @@
+{
+  "name": "create_repository",
+  "description": "Create a new, empty repository for a person or an organisation, after the person you are working with agrees. It works only for the owners this deployment allows, and the repository is private unless you say `private: false` (public only when the person asked for it). The person is asked a yes or no question that this tool writes; their answer comes back as the result of this call. If it was a yes, call create_repository again with the same arguments and it creates the repository; if it was a no, do not ask again and do not look for another way. The new repository is empty: put a scratch project in it with publish_scratch.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "owner": {
+        "type": "string",
+        "description": "The user or organisation that will own it, for example `acme`"
+      },
+      "name": {
+        "type": "string",
+        "description": "The repository's name: letters, digits, `.`, `_` and `-`, at most 100 characters"
+      },
+      "private": {
+        "type": "boolean",
+        "description": "Private (the default) or public. Set false only when the person asked for a public one."
+      },
+      "description": {
+        "type": "string",
+        "description": "What the repository is for, in one plain sentence (at most 350 characters)"
+      }
+    },
+    "required": [
+      "owner",
+      "name"
+    ]
+  }
+}

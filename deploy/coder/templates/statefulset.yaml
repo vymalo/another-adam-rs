@@ -91,6 +91,11 @@ spec:
               value: {{ join "," .Values.config.allowedRepoHosts | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.config.githubApiUrl | quote }}
+            {{- with .Values.github.createRepoOwners }}
+            {{- /* Off (no variable) unless owners are listed: the coder may create a repository for these, after the person agrees. */}}
+            - name: CREATE_REPO_OWNERS
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- if $githubApp }}
             {{- /* github.auth=app: no GITHUB_TOKEN; the key is a file from the Secret mounted below. */}}
             - name: GITHUB_APP_ID

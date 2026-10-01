@@ -163,6 +163,9 @@ services:
       # both are development-only settings, never set them in production.
       ALLOWED_REPO_HOSTS: git-server
       ALLOW_LOCAL_REPOS: "true"
+      # The coder may create repositories for this owner, after the person agrees (mock-github makes
+      # `scratch` an organisation, and git-server makes the repository, empty, on first use).
+      CREATE_REPO_OWNERS: scratch
       # The mounted folder below: what the agent says and offers, read at startup.
       ADAM_AGENT_DIR: /etc/adam/agent
       # The folder's mcp.json is replaced (below) by one that reaches mock-github-mcp over plain

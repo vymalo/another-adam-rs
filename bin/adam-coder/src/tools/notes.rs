@@ -151,6 +151,22 @@ pub struct Consent {
     pub agreed: bool,
 }
 
+/// A repository this run created (`create_repository`, after the person agreed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedRepo {
+    /// `owner/name`, lowercase, as the call spelled it: what a repeated call is recognised by.
+    pub full_name: String,
+    /// The repository as a [`named`](super::named) key **of its clone URL**: the grant, which is what
+    /// `prepare_workspace` and `publish_scratch` compare their argument with.
+    pub key: String,
+    /// The URL to clone and push over HTTP, as the host said.
+    pub clone_url: String,
+    /// The browser URL.
+    pub html_url: String,
+    /// Whether it was created private.
+    pub private: bool,
+}
+
 /// Everything remembered about one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunNotes {
@@ -175,10 +191,14 @@ pub struct RunNotes {
     /// Filled by the agent before each step from the conversation, never from what the model says.
     #[serde(default)]
     pub named_repos: Vec<String>,
-    /// The answers the person gave to the questions of `request_repository`, in order. Filled by
-    /// the agent before each step from the conversation.
+    /// The answers the person gave to the questions the coder's tools wrote (`request_repository`,
+    /// `create_repository`), in order. Filled by the agent before each step from the conversation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consents: Vec<Consent>,
+    /// The repositories this run created, in order. Written by `create_repository` itself, which
+    /// also grants the repository's key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_repos: Vec<CreatedRepo>,
     /// The branches that this run and the earlier tasks of the conversation pushed work for, which
     /// `prepare_workspace` may continue with its `branch`. `commit_and_push` writes its own; the
     /// agent adds, before each step, the ones in the notes of the run this one continues (and,
@@ -261,6 +281,15 @@ impl RunNotes {
             }
         }
         added
+    }
+
+    /// Whether the person agreed to `subject` when `tool` asked: the latest answer decides.
+    pub fn agreed(&self, tool: &str, subject: &str) -> bool {
+        self.consents
+            .iter()
+            .rev()
+            .find(|c| c.tool == tool && c.subject == subject)
+            .is_some_and(|c| c.agreed)
     }
 
     /// Whether the person was asked about `subject` by `tool` and said no (and has not said yes

@@ -13,10 +13,10 @@ use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::{CoderSettings, Redactor, ToolEnv};
 use adam_model::ToolCall;
 use adam_workspace::{
-    CodeHost, DynCodeHost, DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress,
-    EnvSession, EnvStep, Environment, ExecId, ExecSpec, GitHub, LocalSession, NewPullRequest,
-    PreparedCommand, PullRequest, RepoRef, RunWorkspace, ScopedToken, SecretRef, WorkspaceError,
-    Workspaces,
+    CodeHost, CreatedRepository, DynCodeHost, DynEnvironment, EnvDescription, EnvError, EnvKind,
+    EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec, GitHub, LocalSession,
+    NewPullRequest, NewRepository, OwnerKind, PreparedCommand, PullRequest, RepoRef, RunWorkspace,
+    ScopedToken, SecretRef, WorkspaceError, Workspaces,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -309,6 +309,138 @@ impl CodeHost for GithubBehindMock {
     }
 }
 
+/// A code host that can create repositories: every other call goes to the fixture's host, and a
+/// created repository is an empty bare repository under `<tmp>/created/<owner>/<name>.git` whose
+/// path is its clone URL (what a local remote is here). It records what it was asked.
+pub struct CreatingHost {
+    inner: DynCodeHost,
+    root: PathBuf,
+    organizations: Vec<String>,
+    login: Option<String>,
+    created: Mutex<Vec<NewRepository>>,
+    taken: Mutex<Vec<String>>,
+    clone_url: Mutex<Option<String>>,
+    owner_kinds_asked: Mutex<Vec<String>>,
+}
+
+impl CreatingHost {
+    /// The repositories it was asked to create, in order.
+    pub fn created(&self) -> Vec<NewRepository> {
+        self.created.lock().unwrap().clone()
+    }
+
+    /// Say that `owner/name` exists already, on the host, from before the run.
+    pub fn take(&self, owner: &str, name: &str) {
+        self.taken.lock().unwrap().push(format!("{owner}/{name}"));
+    }
+
+    /// Answer creations with `url` as the clone URL (no repository is made there).
+    pub fn clone_url_is(&self, url: &str) {
+        *self.clone_url.lock().unwrap() = Some(url.to_owned());
+    }
+
+    /// The owners it was asked the kind of.
+    pub fn owner_kinds_asked(&self) -> Vec<String> {
+        self.owner_kinds_asked.lock().unwrap().clone()
+    }
+
+    /// Where the repository `owner/name` is made.
+    pub fn path_of(&self, owner: &str, name: &str) -> PathBuf {
+        self.root
+            .join("created")
+            .join(owner)
+            .join(format!("{name}.git"))
+    }
+}
+
+#[async_trait]
+impl CodeHost for CreatingHost {
+    async fn open_pull_request(&self, pr: NewPullRequest) -> Result<PullRequest, WorkspaceError> {
+        self.inner.open_pull_request(pr).await
+    }
+
+    async fn find_pull_request(
+        &self,
+        repo: &RepoRef,
+        head: &str,
+    ) -> Result<Option<PullRequest>, WorkspaceError> {
+        self.inner.find_pull_request(repo, head).await
+    }
+
+    async fn find_pull_request_on_head(
+        &self,
+        repo: &RepoRef,
+        head: &str,
+    ) -> Result<Option<PullRequest>, WorkspaceError> {
+        self.inner.find_pull_request_on_head(repo, head).await
+    }
+
+    async fn comment_on_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<(), WorkspaceError> {
+        self.inner.comment_on_pull_request(repo, number, body).await
+    }
+
+    async fn create_repository(
+        &self,
+        new: NewRepository,
+    ) -> Result<CreatedRepository, WorkspaceError> {
+        let loc = new.repo.locate()?;
+        let full_name = format!("{}/{}", loc.owner, loc.name);
+        if self.taken.lock().unwrap().contains(&full_name) {
+            return Err(WorkspaceError::Invalid(
+                "name already exists on this account".to_owned(),
+            ));
+        }
+        let clone_url = match self.clone_url.lock().unwrap().clone() {
+            Some(url) => url,
+            None => {
+                let path = self.path_of(&loc.owner, &loc.name);
+                std::fs::create_dir_all(&path).unwrap();
+                git(
+                    &path,
+                    &["init", "--bare", "--quiet", "--initial-branch=main"],
+                );
+                path.to_string_lossy().into_owned()
+            }
+        };
+        self.taken.lock().unwrap().push(full_name.clone());
+        self.created.lock().unwrap().push(new);
+        Ok(CreatedRepository {
+            html_url: format!("https://example.invalid/{full_name}"),
+            full_name,
+            clone_url,
+            default_branch: "main".to_owned(),
+        })
+    }
+
+    async fn owner_kind(
+        &self,
+        owner: &str,
+        _host_repo: &RepoRef,
+    ) -> Result<OwnerKind, WorkspaceError> {
+        self.owner_kinds_asked
+            .lock()
+            .unwrap()
+            .push(owner.to_owned());
+        Ok(if self.organizations.iter().any(|o| o == owner) {
+            OwnerKind::Organization
+        } else {
+            OwnerKind::User
+        })
+    }
+
+    async fn authenticated_login(
+        &self,
+        _host_repo: &RepoRef,
+    ) -> Result<Option<String>, WorkspaceError> {
+        Ok(self.login.clone())
+    }
+}
+
 pub struct Fixture {
     pub tmp: TempDir,
     /// The bare remote.
@@ -389,6 +521,32 @@ impl Fixture {
             .expect("the tools are not shared yet")
             .environment = environment;
         self
+    }
+
+    /// The same fixture whose code host can create repositories ([`CreatingHost`]), for the
+    /// organisations `organizations` (any other owner is a user), acting as `login` (`None`: an
+    /// installation, which has no user), and for the owners `owners` (`CREATE_REPO_OWNERS`).
+    #[must_use]
+    pub fn creating(
+        mut self,
+        owners: &[&str],
+        organizations: &[&str],
+        login: Option<&str>,
+    ) -> (Self, Arc<CreatingHost>) {
+        let env = Arc::get_mut(&mut self.env).expect("the tools are not shared yet");
+        let host = Arc::new(CreatingHost {
+            inner: env.code_host.clone(),
+            root: self.tmp.path().to_owned(),
+            organizations: organizations.iter().map(|o| (*o).to_owned()).collect(),
+            login: login.map(str::to_owned),
+            created: Mutex::default(),
+            taken: Mutex::default(),
+            clone_url: Mutex::default(),
+            owner_kinds_asked: Mutex::default(),
+        });
+        env.code_host = host.clone();
+        env.settings.create_repo_owners = owners.iter().map(|o| (*o).to_owned()).collect();
+        (self, host)
     }
 
     /// The same fixture whose tools tell a run that GitHub rejected its credentials to check `hint`

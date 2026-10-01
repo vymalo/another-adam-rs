@@ -27,6 +27,7 @@ use adam_ui::ASK_USER;
 use adam_workspace::{RepoRef, WorkspaceError};
 use serde_json::{Value, json};
 
+use super::create::{CREATE_REPOSITORY, CREATED_PREFIX, consent_of};
 use super::named::key_of_argument;
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
@@ -54,7 +55,37 @@ pub(crate) fn is_answered_by_the_person(tool: &str) -> bool {
 
 /// Whether `tool` asks a question of its own writing, whose answer is a consent.
 pub(crate) fn is_consent_tool(tool: &str) -> bool {
-    tool == REQUEST_REPOSITORY
+    tool == REQUEST_REPOSITORY || tool == CREATE_REPOSITORY
+}
+
+/// What a call of a consent tool asked the person, from its arguments: the **subject** the answer
+/// is recorded for (the repository's key for `request_repository`, `owner/name:private|public` for
+/// `create_repository`) and the label of the question's "yes" option. `None` when the arguments
+/// are not something that could have been asked (nothing was asked, so nothing was answered).
+pub(crate) fn asked_by(tool: &str, arguments: &Value) -> Option<(String, String)> {
+    match tool {
+        REQUEST_REPOSITORY => {
+            let url = arguments.get("repo_url")?.as_str()?;
+            Some((key_of_argument(url)?, yes_label(&display_name(url)?)))
+        }
+        CREATE_REPOSITORY => consent_of(arguments),
+        _ => None,
+    }
+}
+
+/// What `request_repository` says when nobody needs to be asked.
+pub(crate) const ALREADY_GRANTED: &str =
+    "That repository is already granted: call prepare_workspace with it. Nobody needs to be asked.";
+
+/// Whether `text`, the result of a call to the consent tool `tool`, is that tool's own words (it
+/// asked nobody) and not what the person answered: such a result is neither an answer nor the
+/// person's words.
+pub(crate) fn is_tools_own_result(tool: &str, text: &str) -> bool {
+    match tool {
+        REQUEST_REPOSITORY => text == ALREADY_GRANTED,
+        CREATE_REPOSITORY => text.starts_with(CREATED_PREFIX),
+        _ => false,
+    }
 }
 
 /// How a repository is shown to the person: `owner/name` (a local repository: its name).
@@ -181,9 +212,7 @@ pub async fn request_repository(
     let run = ctx.run_id().to_string();
     let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     if notes.named_repos.contains(&key) {
-        return Ok(ToolOutput::text(
-            "That repository is already granted: call prepare_workspace with it. Nobody needs to be asked.",
-        ));
+        return Ok(ToolOutput::text(ALREADY_GRANTED));
     }
     if notes.declined(REQUEST_REPOSITORY, &key) {
         return Ok(ToolOutput::error(format!(
@@ -316,9 +345,10 @@ mod tests {
     fn only_these_tools_results_are_the_persons_words() {
         assert!(is_answered_by_the_person("ask_user"));
         assert!(is_answered_by_the_person("request_repository"));
+        assert!(is_answered_by_the_person("create_repository"));
         assert!(!is_answered_by_the_person("read_file"));
         assert!(!is_answered_by_the_person("prepare_workspace"));
-        assert!(is_consent_tool("request_repository"));
+        assert!(is_consent_tool("request_repository") && is_consent_tool("create_repository"));
         assert!(!is_consent_tool("ask_user"));
     }
 }

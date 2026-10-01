@@ -98,6 +98,11 @@ github:
   #        GITHUB_TOKEN is then neither rendered nor required, and the ExternalSecret has no
   #        githubToken entry. The key is read at startup: a rotated key needs a restart.
   auth: token
+  # The owners (users or organisations) the coder may create repositories for, after the person it
+  # works with agrees every time (ADR 0009, decision 9). Empty (default) turns the tool off. A GitHub
+  # App creates for organisations only and needs the Administration permission; a token creates
+  # for the person it belongs to and for organisations it can, with the `repo` scope.
+  createRepoOwners: []
   app:
     # The App's application ID (a number) or its client ID (`Iv1.…`): the JWT's `iss`.
     id: ""

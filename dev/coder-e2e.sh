@@ -8,6 +8,8 @@
 #   SCENARIO=scratch dev/coder-e2e.sh # no repository is named: a scratch project, then published
 #   SCENARIO=second-repo dev/coder-e2e.sh            # another repository joins the workspace, the person says yes
 #   SCENARIO=second-repo ANSWER=no dev/coder-e2e.sh  # ... and with a no it does not
+#   SCENARIO=create-repo dev/coder-e2e.sh            # a repository is created for the scratch project, the person says yes
+#   SCENARIO=create-repo ANSWER=no dev/coder-e2e.sh  # ... and with a no it is not
 #   GITHUB_AUTH=app dev/coder-e2e.sh  # the stack runs the coder as a GitHub App (see below)
 #
 # Start the stack first (the coder's models are the scripts in
@@ -51,6 +53,16 @@
 #         asked for `local/library` after the answer, and every check above holds for the sandbox;
 #       no: the task waits again (TASK_STATE_INPUT_REQUIRED, the coder could not use the library),
 #         git-server was never asked for `local/library`, and no pull request was opened.
+#   * SCENARIO=create-repo is three messages. As `scratch`, the coder builds `fib.sh` in a scratch project and
+#     says it can create a repository for it (the task waits). The person says "Create scratch/fib-<id> and put
+#     it there": the coder calls `create_repository` and the task waits again, on a question the tool wrote
+#     (`May I create the repository scratch/fib-<id> on <host>? It will be private and empty.`), and mock-github
+#     has seen no `POST /orgs/scratch/repos`. The answer (ANSWER, `yes` by default) is the third message.
+#       yes: mock-github saw exactly one `POST /orgs/scratch/repos`, for that name, private, and the task
+#         completes as `scratch` does (the project is published to the new repository, which git-server made
+#         empty on first use, `main` is the one empty commit, the pull request is for it);
+#       no: mock-github never saw the creation, git-server never heard of the repository, no pull request
+#         was opened, and the task waits for the person.
 #   * the coder reads GitHub through the GitHub MCP server, here the mock of dev/coder-agent/mcp.json
 #     (mock-github-mcp). Its journal is not reset: the coder connects the server when it starts,
 #     before this script. So the journal holds at least one `initialize` and one `tools/list`, and
@@ -80,7 +92,7 @@
 #   SCENARIO         default `default` (the script above), `files` (the [mock:files] script:
 #                    read_file, write_file; every check above holds, and so do the two lines),
 #                    `scratch` (the [mock:scratch] script, above) or `second-repo` (the
-#                    [mock:second-repo] script, above)
+#                    [mock:second-repo] script, above) or `create-repo` (the [mock:create-repo] script)
 #   ANSWER           yes     with SCENARIO=second-repo: the person's answer, `yes` or `no`
 #   GIT_SERVER_LOGS  docker compose logs --no-color git-server   a command that prints git-server's access log
 #                    (second-repo: which repositories it was asked for); without docker, set it to a command
@@ -128,8 +140,8 @@ case "$github_auth" in
 esac
 scenario=${SCENARIO:-default}
 case "$scenario" in
-  default | files | scratch | second-repo) ;;
-  *) echo "SCENARIO must be default, files, scratch or second-repo, not '$scenario'" >&2; exit 2 ;;
+  default | files | scratch | second-repo | create-repo) ;;
+  *) echo "SCENARIO must be default, files, scratch, second-repo or create-repo, not '$scenario'" >&2; exit 2 ;;
 esac
 answer=${ANSWER:-yes}
 case "$answer" in
@@ -143,7 +155,10 @@ fi
 
 text="In $repo_url (base branch main), add hello.txt containing hello."
 slot=${repo_path##*/}
-if [ "$scenario" = scratch ]; then
+# `scratch` and `create-repo` build a project in a scratch slot and publish it to `scratch/<name>`.
+scratchlike=0
+case "$scenario" in scratch | create-repo) scratchlike=1 ;; esac
+if [ "$scratchlike" = 1 ]; then
   # A repository of this run's own (the stack keeps its repositories between runs, and the mock
   # model takes the name from the task text): `scratch` is the owner git-server makes repositories
   # for on first use. The task names none; the person names this one when the coder asks.
@@ -151,8 +166,13 @@ if [ "$scenario" = scratch ]; then
   repo_path=scratch/$name
   repo_url=$repo_base/$repo_path.git
   slot=$name
-  text="Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you the repo later. [mock:scratch] $name"
-  echo "variant: no repository is named, a scratch project is published to $repo_path ([mock:scratch])"
+  if [ "$scenario" = create-repo ]; then
+    text="Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you a repo later. [mock:create-repo] $name"
+    echo "variant: no repository is named, one is created for the scratch project if the person says yes, and they say $answer ([mock:create-repo])"
+  else
+    text="Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you the repo later. [mock:scratch] $name"
+    echo "variant: no repository is named, a scratch project is published to $repo_path ([mock:scratch])"
+  fi
 elif [ "$scenario" = second-repo ]; then
   text="In $repo_url (base branch main), put our shared greeting into hello.txt. [mock:second-repo]"
   echo "variant: another repository joins the workspace only if the person says yes, and they say $answer ([mock:second-repo])"
@@ -255,6 +275,14 @@ library_requests() {
 }
 if [ "$scenario" = second-repo ]; then library_before=$(library_requests); fi
 
+# creations: how many `POST /orgs/scratch/repos` mock-github saw since the journal was reset (and the
+# one `private`, and the name, of the first).
+creations() {
+  curl -s --max-time 30 -X POST "$github/__admin/requests/find" -H 'Content-Type: application/json' \
+    -d '{"method":"POST","urlPath":"/orgs/scratch/repos"}' > "$tmp/creations.json" || true
+  jq -r '.requests | length' "$tmp/creations.json" 2>/dev/null || echo '?'
+}
+
 # --- send the task ---------------------------------------------------------------
 send_message 1 "$text"
 events=$tmp/events-1.jsonl
@@ -285,6 +313,56 @@ if [ "$scenario" = scratch ]; then
     events=$tmp/events-2.jsonl
     every_event=$tmp/events-all.jsonl
     cat "$tmp/events-1.jsonl" "$tmp/events-2.jsonl" > "$every_event"
+  fi
+fi
+
+if [ "$scenario" = create-repo ]; then
+  # 1. The project is built and checked, and the coder says it can create a repository for it.
+  state=$(state_of "$events")
+  if [ "$state" = TASK_STATE_INPUT_REQUIRED ]; then ok "the task waits for the person (TASK_STATE_INPUT_REQUIRED)"; else bad "the task is '${state:-none}', want TASK_STATE_INPUT_REQUIRED"; fi
+  task_id=$(jq -r '(.result.task.id // .result.statusUpdate.taskId // .result.artifactUpdate.taskId) // empty' "$events" | head -n 1)
+  if [ -z "$task_id" ]; then
+    bad "the stream does not say which task it is"
+  else
+    # 2. The person asks for a repository; the coder asks for the person's consent first.
+    send_message 2 "Create scratch/$name and put it there" "$task_id"
+    state=$(state_of "$tmp/events-2.jsonl")
+    if [ "$state" = TASK_STATE_INPUT_REQUIRED ]; then ok "the task waits again, on the question about creating the repository"; else bad "after the request the task is '${state:-none}', want TASK_STATE_INPUT_REQUIRED"; fi
+    jq -r '.. | .text? // empty' "$tmp/events-2.jsonl" > "$tmp/lines-2.txt" 2>/dev/null || : > "$tmp/lines-2.txt"
+    if grep -q "May I create the repository scratch/$name on .*It will be private and empty" "$tmp/lines-2.txt"; then ok "the question names the repository and says it will be private and empty"; else bad "the stream has no question about creating scratch/$name"; fi
+    if grep -q "Create scratch/$name" "$tmp/lines-2.txt"; then ok "the question offers the yes and the no"; else bad "the question does not offer 'Create scratch/$name'"; fi
+    made=$(creations)
+    if [ "$made" = 0 ]; then ok "nothing was created while the person had not answered"; else bad "mock-github saw $made repository creation(s) before the person answered"; fi
+    known=$(listed "$name.git")
+    if [ "$known" = 0 ]; then ok "git-server has not heard of $repo_path yet"; else bad "git-server knows $repo_path before it was created ($known)"; fi
+    # 3. The answer.
+    send_message 3 "$answer" "$task_id"
+    events=$tmp/events-3.jsonl
+    every_event=$tmp/events-all.jsonl
+    cat "$tmp/events-1.jsonl" "$tmp/events-2.jsonl" "$tmp/events-3.jsonl" > "$every_event"
+    made=$(creations)
+    if [ "$answer" = no ]; then
+      state=$(state_of "$events")
+      if [ "$state" = TASK_STATE_INPUT_REQUIRED ]; then ok "the task waits again: nothing was created (TASK_STATE_INPUT_REQUIRED)"; else bad "after the no the task is '${state:-none}', want TASK_STATE_INPUT_REQUIRED"; fi
+      jq -r '.. | .text? // empty' "$events" > "$tmp/lines-3.txt" 2>/dev/null || : > "$tmp/lines-3.txt"
+      if grep -q 'I did not create the repository' "$tmp/lines-3.txt"; then ok "the coder says it did not create the repository"; else bad "the coder does not say it did not create the repository"; fi
+      if [ "$made" = 0 ]; then ok "mock-github never saw a repository creation"; else bad "mock-github saw $made repository creation(s) after the no"; fi
+      known=$(listed "$name.git")
+      if [ "$known" = 0 ]; then ok "git-server never heard of $repo_path"; else bad "git-server knows $repo_path ($known) although it was not created"; fi
+      posts=$(curl -s --max-time 30 -X POST "$github/__admin/requests/find" -H 'Content-Type: application/json' \
+        -d '{"method":"POST","urlPathPattern":"/repos/.*/pulls"}' | jq -r '.requests | length' 2>/dev/null || echo '?')
+      if [ "$posts" = 0 ]; then ok "no pull request was opened"; else bad "$posts pull request(s) were opened after the no"; fi
+      if [ "$fail" -eq 0 ]; then echo "coder e2e passed"; else echo "coder e2e FAILED"; exit 1; fi
+      exit 0
+    fi
+    # yes: exactly one creation, private, for that name.
+    if [ "$made" = 1 ]; then ok "mock-github saw exactly one POST /orgs/scratch/repos, after the answer"; else bad "mock-github saw $made POST /orgs/scratch/repos, want exactly 1"; fi
+    created_name=$(jq -r '.requests[0].body | fromjson | .name // empty' "$tmp/creations.json" 2>/dev/null || true)
+    created_private=$(jq -r '.requests[0].body | fromjson | .private | tostring' "$tmp/creations.json" 2>/dev/null || true)
+    created_init=$(jq -r '.requests[0].body | fromjson | .auto_init | tostring' "$tmp/creations.json" 2>/dev/null || true)
+    if [ "$created_name" = "$name" ]; then ok "the repository created is $name"; else bad "the repository created is '$created_name', want '$name'"; fi
+    if [ "$created_private" = true ]; then ok "it was created private"; else bad "private is '$created_private', want true"; fi
+    if [ "$created_init" = false ]; then ok "it was created empty (auto_init false)"; else bad "auto_init is '$created_init', want false"; fi
   fi
 fi
 
@@ -378,7 +456,7 @@ if [ "$order" = true ]; then ok "the chunks came before the end of the task"; el
 
 # --- the file tools (SCENARIO=files) -------------------------------------------------
 # A client that did not activate `steps/v1` reads a tool's progress as lines of text.
-if [ "$scenario" = files ] || [ "$scenario" = scratch ]; then
+if [ "$scenario" = files ] || [ "$scratchlike" = 1 ]; then
   lines=$tmp/lines.txt
   jq -r '.. | .text? // empty' "$every_event" > "$lines" 2>/dev/null || : > "$lines"
   if [ "$scenario" = files ]; then
@@ -492,7 +570,7 @@ if [ -n "$branch" ]; then
     bad "the branch is at ${remote%%[[:space:]]*}, the artifact says $commit"
   fi
   if git clone -q --depth 1 --branch "$branch" "$gitserver/$repo_path.git" "$tmp/clone" 2>"$tmp/clone.err"; then
-    if [ "$scenario" = scratch ]; then
+    if [ "$scratchlike" = 1 ]; then
       content=$(cat "$tmp/clone/fib.sh" 2>/dev/null || echo '<missing>')
       if [ "$content" = 'echo 0 1 1 2 3 5 8' ]; then ok "fib.sh on the branch is the project's"; else bad "fib.sh on the branch is '$content', want 'echo 0 1 1 2 3 5 8'"; fi
       if [ "$(sh "$tmp/clone/fib.sh" 2>/dev/null)" = '0 1 1 2 3 5 8' ]; then ok "fib.sh prints the first 7 Fibonacci numbers"; else bad "fib.sh does not print '0 1 1 2 3 5 8'"; fi
@@ -519,7 +597,7 @@ fi
 
 # The repository was empty: the coder gave it a first commit, of nothing, to be the base of the
 # pull request, and that is all `main` holds (the work went to the branch above, behind the gate).
-if [ "$scenario" = scratch ]; then
+if [ "$scratchlike" = 1 ]; then
   if git clone -q --branch main "$gitserver/$repo_path.git" "$tmp/main" 2>"$tmp/main.err"; then
     root_tree=$(git -C "$tmp/main" rev-parse 'HEAD^{tree}' 2>/dev/null || true)
     n_commits=$(git -C "$tmp/main" rev-list --count HEAD 2>/dev/null || echo '?')

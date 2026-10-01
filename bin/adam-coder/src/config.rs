@@ -21,6 +21,7 @@
 //! | `GITHUB_APP_INSTALLATION_ID` | the installation's ID, a positive integer | required in App mode |
 //! | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 or PKCS#8), as a file or inline (`\n` escapes accepted); exactly one; parsed at startup | one required in App mode |
 //! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them; the first is the host `owner/name` stands for | `github.com` |
+//! | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees; empty turns the tool off | empty (off) |
 //! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
 //! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
 //! | `WORKSPACE_ROOT` | mirrors and worktrees (persistent storage) | `/work` |
@@ -126,6 +127,9 @@ pub struct WorkerConfig {
     pub github: GitHubAuth,
     /// `ALLOWED_REPO_HOSTS`, lowercased.
     pub allowed_repo_hosts: Vec<String>,
+    /// `CREATE_REPO_OWNERS`, lowercased: the owners `create_repository` may create repositories for.
+    /// Empty (the default) turns the tool off.
+    pub create_repo_owners: Vec<String>,
     /// `ALLOW_LOCAL_REPOS`.
     pub allow_local_repos: bool,
     /// `GITHUB_API_URL`.
@@ -352,6 +356,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("opencode_model", &self.opencode_model)
             .field("github", &self.github)
             .field("allowed_repo_hosts", &self.allowed_repo_hosts)
+            .field("create_repo_owners", &self.create_repo_owners)
             .field("allow_local_repos", &self.allow_local_repos)
             .field("github_api_url", &self.github_api_url.as_str())
             .field("workspace_root", &self.workspace_root)
@@ -515,6 +520,19 @@ impl WorkerConfig {
                 hosts
             }
         };
+        let create_repo_owners: Vec<String> = get("CREATE_REPO_OWNERS")
+            .unwrap_or_default()
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(|o| o.trim().to_ascii_lowercase())
+            .filter(|o| !o.is_empty())
+            .collect();
+        for owner in &create_repo_owners {
+            if !is_account_name(owner) {
+                problems.push(format!(
+                    "CREATE_REPO_OWNERS entry {owner:?} is not an account name (letters, digits, `-`, `_` and `.`, a comma or space between owners)"
+                ));
+            }
+        }
         let github_api_url = match get("GITHUB_API_URL") {
             None => Url::parse(DEFAULT_GITHUB_API_URL).ok(),
             Some(raw) => match Url::parse(raw.trim()) {
@@ -543,6 +561,7 @@ impl WorkerConfig {
             opencode_model,
             github,
             allowed_repo_hosts,
+            create_repo_owners,
             allow_local_repos,
             github_api_url,
             workspace_root,
@@ -561,6 +580,17 @@ impl WorkerConfig {
             mcp,
         })
     }
+}
+
+/// Whether `owner` can be an account name on a code host: letters, digits, `-`, `_` and `.`, at
+/// most 100 characters, not starting with `.` or `-`.
+fn is_account_name(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= 100
+        && !owner.starts_with(['.', '-'])
+        && owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Repository host used when `ALLOWED_REPO_HOSTS` is unset.
@@ -744,6 +774,35 @@ mod tests {
                 err.problems
                     .iter()
                     .any(|p| p.starts_with("ALLOWED_REPO_HOSTS")),
+                "{bad:?} accepted or misreported: {:?}",
+                err.problems
+            );
+        }
+    }
+
+    #[test]
+    fn the_owners_that_may_get_a_repository_are_a_list_and_empty_means_off() {
+        let c = parse(&full()).expect("valid").worker.unwrap();
+        assert!(c.create_repo_owners.is_empty(), "off by default");
+        let mut vars = full();
+        vars.insert("CREATE_REPO_OWNERS", " Scratch, acme  Other_org.x ,,");
+        let c = parse(&vars).expect("valid").worker.unwrap();
+        assert_eq!(c.create_repo_owners, ["scratch", "acme", "other_org.x"]);
+        for bad in [
+            "a/b",
+            "https://github.com/acme",
+            "-x",
+            ".x",
+            "a@b",
+            "ac me/",
+        ] {
+            let mut vars = full();
+            vars.insert("CREATE_REPO_OWNERS", bad);
+            let err = parse(&vars).unwrap_err();
+            assert!(
+                err.problems
+                    .iter()
+                    .any(|p| p.starts_with("CREATE_REPO_OWNERS")),
                 "{bad:?} accepted or misreported: {:?}",
                 err.problems
             );

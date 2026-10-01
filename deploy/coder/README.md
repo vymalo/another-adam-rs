@@ -199,6 +199,12 @@ refused before git runs. For GitHub Enterprise add its host and set
 `https://<host>/api/v3`. `ALLOW_LOCAL_REPOS` is for development and tests and is not
 exposed by the chart.
 
+`github.createRepoOwners` (default empty; env `CREATE_REPO_OWNERS`, workers only) lists the owners the coder may
+create repositories for. Empty turns the `create_repository` tool off. With owners listed it still asks the person
+before every creation, makes the repository private and empty unless asked otherwise, and refuses an owner that is
+not in the list. A GitHub App creates for organisations only and needs the **Administration** permission on the
+organisation; a token needs the `repo` scope.
+
 ## Agent files
 
 The binary reads its prompt, card and skills from the folder `ADAM_AGENT_DIR` names, once, at startup

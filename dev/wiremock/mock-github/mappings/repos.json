@@ -1,0 +1,248 @@
+{
+  "mappings": [
+    {
+      "name": "user: an installation token is not a user",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/user",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer ghs_.+"
+          }
+        }
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "message": "Resource not accessible by integration",
+          "documentation_url": "https://docs.github.com/rest/users/users#get-the-authenticated-user"
+        }
+      },
+      "metadata": {
+        "note": "What GitHub answers GET /user with for an installation access token (a GitHub App has no user): the coder then creates repositories for organisations only."
+      }
+    },
+    {
+      "name": "user: the authenticated user",
+      "priority": 5,
+      "request": {
+        "method": "GET",
+        "urlPath": "/user"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "login": "dev-user",
+          "id": 1,
+          "type": "User"
+        }
+      }
+    },
+    {
+      "name": "account local: an organisation",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/users/local"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "login": "local",
+          "id": 2,
+          "type": "Organization"
+        }
+      }
+    },
+    {
+      "name": "account scratch: an organisation",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/users/scratch"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "login": "scratch",
+          "id": 2,
+          "type": "Organization"
+        }
+      }
+    },
+    {
+      "name": "account: any other is a user",
+      "priority": 5,
+      "request": {
+        "method": "GET",
+        "urlPathPattern": "/users/[^/]+"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "login": "{{request.pathSegments.[1]}}",
+          "id": 3,
+          "type": "User"
+        }
+      }
+    },
+    {
+      "name": "create repository: 401 (bad token)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "/(orgs/[^/]+|user)/repos",
+        "headers": {
+          "Authorization": {
+            "equalTo": "Bearer bad-token"
+          }
+        }
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "message": "Bad credentials",
+          "documentation_url": "https://docs.github.com/rest/repos/repos#create-an-organization-repository"
+        }
+      }
+    },
+    {
+      "name": "create repository: already exists (keyword in the body)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "/(orgs/[^/]+|user)/repos",
+        "bodyPatterns": [
+          {
+            "contains": "[mock:already-exists]"
+          }
+        ]
+      },
+      "response": {
+        "status": 422,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "message": "Repository creation failed.",
+          "errors": [
+            {
+              "resource": "Repository",
+              "code": "custom",
+              "field": "name",
+              "message": "name already exists on this account"
+            }
+          ],
+          "documentation_url": "https://docs.github.com/rest/repos/repos#create-an-organization-repository"
+        }
+      }
+    },
+    {
+      "name": "create repository: already exists (header)",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "/(orgs/[^/]+|user)/repos",
+        "headers": {
+          "X-Mock-Scenario": {
+            "equalTo": "already-exists"
+          }
+        }
+      },
+      "response": {
+        "status": 422,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "message": "Repository creation failed.",
+          "errors": [
+            {
+              "resource": "Repository",
+              "code": "custom",
+              "field": "name",
+              "message": "name already exists on this account"
+            }
+          ],
+          "documentation_url": "https://docs.github.com/rest/repos/repos#create-an-organization-repository"
+        }
+      }
+    },
+    {
+      "name": "create an organisation repository",
+      "priority": 10,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "/orgs/[^/]+/repos"
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "id": 1,
+          "name": "{{jsonPath request.body '$.name'}}",
+          "full_name": "{{request.pathSegments.[1]}}/{{jsonPath request.body '$.name'}}",
+          "html_url": "http://git-server:8080/{{request.pathSegments.[1]}}/{{jsonPath request.body '$.name'}}",
+          "clone_url": "http://git-server:8080/{{request.pathSegments.[1]}}/{{jsonPath request.body '$.name'}}.git",
+          "default_branch": "main"
+        }
+      },
+      "metadata": {
+        "note": "Answers the way GitHub does for an empty repository: it exists and has no ref. The clone_url is where git-server serves it (it makes an empty repository on first use for the owners of AUTO_CREATE_OWNERS: scratch)."
+      }
+    },
+    {
+      "name": "create a user repository",
+      "priority": 10,
+      "request": {
+        "method": "POST",
+        "urlPath": "/user/repos"
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "id": 1,
+          "name": "{{jsonPath request.body '$.name'}}",
+          "full_name": "dev-user/{{jsonPath request.body '$.name'}}",
+          "html_url": "http://git-server:8080/dev-user/{{jsonPath request.body '$.name'}}",
+          "clone_url": "http://git-server:8080/dev-user/{{jsonPath request.body '$.name'}}.git",
+          "default_branch": "main"
+        }
+      }
+    }
+  ]
+}

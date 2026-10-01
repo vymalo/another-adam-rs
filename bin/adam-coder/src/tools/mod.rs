@@ -5,6 +5,7 @@
 //! | `prepare_workspace { repo_url, base_branch?, branch? }` | [`prepare`] |
 //! | `start_scratch { name? }`, `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | [`scratch`] |
 //! | `request_repository { repo_url, reason }` | [`consent`] |
+//! | `create_repository { owner, name, private?, description? }` | [`create`] |
 //! | `run_command { command, cwd? }` | [`inspect`] |
 //! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `apply_patch { patch }` | [`files`] |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
@@ -80,6 +81,7 @@ const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait
 
 pub mod checks;
 pub mod consent;
+pub mod create;
 pub mod delegate;
 pub mod files;
 mod gitcli;
@@ -125,11 +127,15 @@ pub struct CoderSettings {
     /// The host `owner/name` stands for when the person writes a repository that way: the first
     /// of `ALLOWED_REPO_HOSTS` in the binary.
     pub default_repo_host: String,
+    /// The owners `create_repository` may create repositories for, lowercased: `CREATE_REPO_OWNERS`.
+    /// Empty: the tool refuses every call.
+    pub create_repo_owners: Vec<String>,
 }
 
 impl CoderSettings {
     /// Defaults: 3 cycles, 15 minutes and 16 KiB per check run, the
-    /// `adam-coder` identity, ready-for-review pull requests, `github.com` for `owner/name`.
+    /// `adam-coder` identity, ready-for-review pull requests, `github.com` for `owner/name`, and no
+    /// owner a repository may be created for.
     pub fn new(opencode: OpenCodeLaunch) -> Self {
         Self {
             max_check_cycles: 3,
@@ -139,6 +145,7 @@ impl CoderSettings {
             draft_pull_requests: false,
             opencode,
             default_repo_host: named::DEFAULT_HOST.to_owned(),
+            create_repo_owners: Vec::new(),
         }
     }
 }
@@ -382,7 +389,7 @@ pub(crate) fn resolve_slot(
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the twelve of the coding workflow,
+/// Every coder tool, in the order they are offered to the model: the thirteen of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
@@ -402,6 +409,7 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         scratch::StartScratch,
         scratch::PublishScratch,
         consent::RequestRepository,
+        create::CreateRepository,
         inspect::RunCommand,
         files::ReadFile,
         files::WriteFile,

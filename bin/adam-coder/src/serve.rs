@@ -83,6 +83,9 @@ async fn build_agent(
     if let Some(host) = worker.allowed_repo_hosts.first() {
         settings.default_repo_host.clone_from(host);
     }
+    settings
+        .create_repo_owners
+        .clone_from(&worker.create_repo_owners);
     settings.check_timeout = worker.check_timeout;
     settings.check_output_tail = worker.check_output_tail;
     settings.draft_pull_requests = worker.pr_draft;

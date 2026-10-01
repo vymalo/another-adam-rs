@@ -185,3 +185,87 @@ async fn pull_requests_and_scenarios_against_the_mock() {
         .expect("open with an installation token");
     assert_eq!(pr.head, "agent/app");
 }
+
+/// Creating a repository against the mock: the owners of the dev stack (`local`, `scratch`) are
+/// organisations and anyone else a person, `GET /user` is a person's token's and not an installation
+/// token's, an organisation repository is created empty with the clone URL git-server serves it at,
+/// and the `already-exists` keyword is a 422 the client calls invalid.
+#[tokio::test]
+async fn repositories_are_created_by_the_mock_like_github_does() {
+    use adam_workspace::{NewRepository, OwnerKind};
+    let Some(root) = std::env::var("ADAM_TEST_MOCK_GITHUB_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    else {
+        eprintln!("skipping: ADAM_TEST_MOCK_GITHUB_URL not set");
+        return;
+    };
+    let root = root.trim_end_matches('/').to_owned();
+    let github = client(&root, "dev-github-token");
+    let at = |owner: &str, name: &str| {
+        RepoRef::new(format!("http://git-server:8080/{owner}/{name}"), "main")
+    };
+
+    assert_eq!(
+        github
+            .owner_kind("scratch", &at("scratch", "x"))
+            .await
+            .unwrap(),
+        OwnerKind::Organization
+    );
+    assert_eq!(
+        github
+            .owner_kind("somebody", &at("scratch", "x"))
+            .await
+            .unwrap(),
+        OwnerKind::User
+    );
+    assert_eq!(
+        github
+            .authenticated_login(&at("scratch", "x"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("dev-user")
+    );
+    // An installation token is not a user.
+    let installation = client(&root, "ghs_mockinstallationtoken000000000000000000");
+    assert_eq!(
+        installation
+            .authenticated_login(&at("scratch", "x"))
+            .await
+            .unwrap(),
+        None
+    );
+
+    let unique = format!("probe-{}", std::process::id());
+    let created = github
+        .create_repository(NewRepository {
+            repo: at("scratch", &unique),
+            private: true,
+            description: Some("made by a test".to_owned()),
+            kind: OwnerKind::Organization,
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.full_name, format!("scratch/{unique}"));
+    assert_eq!(
+        created.clone_url,
+        format!("http://git-server:8080/scratch/{unique}.git")
+    );
+    assert_eq!(created.default_branch, "main");
+
+    let err = github
+        .create_repository(NewRepository {
+            repo: at("scratch", "taken"),
+            private: true,
+            description: Some("[mock:already-exists]".to_owned()),
+            kind: OwnerKind::Organization,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, WorkspaceError::Invalid(m) if m.contains("already exists")),
+        "{err:?}"
+    );
+}

@@ -210,4 +210,10 @@ label. `RunNotes::named_repos` now means the granted keys, and `RunNotes::consen
 refusal included, so that a repository the person turned down is not asked about again. The workspace gained
 one thing for it: `Workspaces::check_repository`, the policy alone, so that a repository that could never be
 added is not asked about. `prepare_workspace` and `publish_scratch` are unchanged except that their refusal
-now points to the tool. Not built yet: the creation of a repository, the third way a repository is granted.*
+now points to the tool. The third way a repository is granted is built too (A8, below).*
+
+*2026-10-01 (slice 7, A8): the coder creates a repository on request (decision 9, the third way a repository
+is granted; [ADR 0009](0009-github-per-installation-read-through-mcp.md), decision 9, and `bin/adam-coder/README.md`,
+"A repository of its own, on request"). `create_repository` asks the person, creates the repository empty after
+a yes, and grants it by the key of its clone URL; `RunNotes::created_repos` records it. A scratch project is then
+published to it with `publish_scratch`, as to any granted repository.*

@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::files::AgentFiles;
 use crate::redact::Redactor;
 use crate::tools::consent::{
-    REQUEST_REPOSITORY, agrees, display_name, is_answered_by_the_person, yes_label,
+    agrees, asked_by, is_answered_by_the_person, is_consent_tool, is_tools_own_result,
 };
 use crate::tools::named::{key_of_argument, named_in, without_untrusted};
 use crate::tools::notes::{Consent, PushedBranch, RunNotes};
@@ -434,7 +434,8 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
             Message::Tool { is_error, .. } => {
                 if answers.next().is_some_and(|call| {
                     is_answered_by_the_person(&call.name)
-                        && (call.name == adam_ui::ASK_USER || !*is_error)
+                        && (call.name == adam_ui::ASK_USER
+                            || (!*is_error && !is_tools_own_result(&call.name, &message.text())))
                 }) {
                     texts.push(message.text());
                 }
@@ -450,8 +451,9 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
     texts.iter().map(|text| without_untrusted(text)).collect()
 }
 
-/// What the person answered to the questions `request_repository` wrote, oldest first: one
-/// [`Consent`] per call, for the repository **named in that call's argument**.
+/// What the person answered to the questions the consent tools wrote (`request_repository`,
+/// `create_repository`), oldest first: one [`Consent`] per call, for what **that call's arguments**
+/// asked about (the repository, or `owner/name` and its visibility).
 ///
 /// The answer is the result of the call (it did not fail), paired with the call by position
 /// ([`Answers`]: ids cannot be relied on), or, while the run is parked on the call, the message
@@ -460,12 +462,12 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
 /// that is not a repository address asked nothing, so nothing was answered.
 fn consents_in(state: &Conversation, inbox: &[Inbound]) -> Vec<Consent> {
     let consent = |call: &ToolCall, answer: &str| -> Option<Consent> {
-        let url = call.arguments.get("repo_url")?.as_str()?;
+        let (subject, yes) = asked_by(&call.name, &call.arguments)?;
         Some(Consent {
             call_id: call.id.clone(),
             tool: call.name.clone(),
-            subject: key_of_argument(url)?,
-            agreed: agrees(&without_untrusted(answer), &yes_label(&display_name(url)?)),
+            subject,
+            agreed: agrees(&without_untrusted(answer), &yes),
         })
     };
     let mut found = Vec::new();
@@ -475,8 +477,9 @@ fn consents_in(state: &Conversation, inbox: &[Inbound]) -> Vec<Consent> {
             Message::Assistant { tool_calls, .. } => answers.calls(tool_calls),
             Message::Tool { is_error, .. } => {
                 if let Some(call) = answers.next()
-                    && call.name == REQUEST_REPOSITORY
+                    && is_consent_tool(&call.name)
                     && !*is_error
+                    && !is_tools_own_result(&call.name, &message.text())
                 {
                     found.extend(consent(call, &message.text()));
                 }
@@ -486,11 +489,11 @@ fn consents_in(state: &Conversation, inbox: &[Inbound]) -> Vec<Consent> {
     }
     // The run is parked on a question of the tool: the first message of the inbox is its answer.
     if let Some(PendingWait::Question(asked)) = &state.pending_wait
-        && asked.tool == REQUEST_REPOSITORY
+        && is_consent_tool(&asked.tool)
         && let Some(call) = state
             .pending_calls
             .iter()
-            .find(|call| call.id == asked.call_id && call.name == REQUEST_REPOSITORY)
+            .find(|call| call.id == asked.call_id && call.name == asked.tool)
         && let Some(answer) = inbox
             .iter()
             .find(|inbound| inbound.kind != RUN_FINISHED_KIND)
@@ -757,6 +760,8 @@ fn boundary_error(e: AgentError, redactor: &Redactor) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::consent::REQUEST_REPOSITORY;
+    use crate::tools::create::CREATE_REPOSITORY;
     use adam_error::Classify;
     use std::time::Duration;
 
@@ -1101,6 +1106,84 @@ mod tests {
         // A call whose argument is no repository asked nothing.
         assert_eq!(consents_in(&answered("acme/lib", "yes"), &[]), []);
         assert_eq!(consents_in(&answered("", "yes"), &[]), []);
+    }
+
+    /// `create_repository`'s question is about `owner/name` and how visible it will be: a yes is for
+    /// exactly that, and the label of its option is `Create owner/name`.
+    #[test]
+    fn a_yes_to_creating_is_for_that_repository_and_that_visibility() {
+        let create = |id: &str, args: Value| ToolCall {
+            id: id.into(),
+            name: CREATE_REPOSITORY.into(),
+            arguments: args,
+        };
+        let state = conversation(vec![
+            Message::user_text("task"),
+            assistant(
+                "",
+                vec![create("c1", json!({"owner": "Acme", "name": "Fib"}))],
+            ),
+            Message::tool_result("c1", "yes"),
+            assistant(
+                "",
+                vec![create(
+                    "c2",
+                    json!({"owner": "acme", "name": "pub", "private": false}),
+                )],
+            ),
+            Message::tool_result("c2", "Create acme/pub"),
+            assistant(
+                "",
+                vec![create("c3", json!({"owner": "acme", "name": "no"}))],
+            ),
+            Message::tool_result(
+                "c3",
+                "The person answered through the interface:\n- consent: no",
+            ),
+            // Nothing that could have been asked: nothing was answered.
+            assistant("", vec![create("c4", json!({"owner": "a/b", "name": "x"}))]),
+            Message::tool_result("c4", "yes"),
+        ]);
+        let consents = consents_in(&state, &[]);
+        assert_eq!(
+            agreed(&consents),
+            [
+                ("acme/fib:private", true),
+                ("acme/pub:public", true),
+                ("acme/no:private", false)
+            ]
+        );
+        assert!(consents.iter().all(|c| c.tool == CREATE_REPOSITORY));
+        // A yes to creating grants no repository by itself: the tool does, when it has created it.
+        let mut notes = RunNotes::default();
+        assert!(notes.record_consents(consents));
+        assert!(notes.named_repos.is_empty(), "{:?}", notes.named_repos);
+        assert!(notes.agreed(CREATE_REPOSITORY, "acme/fib:private"));
+        assert!(!notes.agreed(CREATE_REPOSITORY, "acme/fib:public"));
+        assert!(notes.declined(CREATE_REPOSITORY, "acme/no:private"));
+        // The tool's own results ("Created ...", "already granted") are neither an answer nor the
+        // person's words: they are not read, so they cannot flip a yes into a refusal.
+        let own = conversation(vec![
+            Message::user_text("task"),
+            assistant(
+                "",
+                vec![create("c1", json!({"owner": "acme", "name": "fib"}))],
+            ),
+            Message::tool_result("c1", "yes"),
+            assistant(
+                "",
+                vec![create("c2", json!({"owner": "acme", "name": "fib"}))],
+            ),
+            Message::tool_result(
+                "c2",
+                "Created acme/fib (private, empty).\nrepository: https://github.com/acme/fib.git",
+            ),
+        ]);
+        assert_eq!(
+            agreed(&consents_in(&own, &[])),
+            [("acme/fib:private", true)]
+        );
+        assert_eq!(said(&own), ["task", "yes"]);
     }
 
     #[test]

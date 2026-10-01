@@ -11,7 +11,8 @@ name: coder
 # that must end in a branch and one pull request (dev/coder-e2e.sh; also a task that names no
 # repository, which ends in a pull request on a repository named later; and all of them again with
 # the coder as a GitHub App installation, dev/compose.github-app.yaml; also a task that needs another
-# repository, which the coder may add only if the person says yes, and a no leaves it out; the default one also reads a
+# repository, which the coder may add only if the person says yes, and a no leaves it out; and a task
+# for which the coder creates a repository, again only after a yes (SCENARIO=create-repo); the default one also reads a
 # repository's branches through the GitHub MCP server, here its mock `mock-github-mcp`; the image build
 # itself runs the real server's tool list over stdio), and with
 # "Hi", which must get a greeting that says the agent's name, and with a changed
@@ -285,6 +286,11 @@ jobs:
           # git-server is never asked for the library and no pull request is opened.
           SCENARIO=second-repo ANSWER=yes sh dev/coder-e2e.sh
           SCENARIO=second-repo ANSWER=no sh dev/coder-e2e.sh
+          # A repository is created for the scratch project, only after the person's yes: with it
+          # mock-github sees exactly one creation (private, empty) and the pull request follows; with
+          # a no it sees none.
+          SCENARIO=create-repo ANSWER=yes sh dev/coder-e2e.sh
+          SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
           # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
           sh dev/greeting-e2e.sh
           # The general agent: "hi" answered in role by its folder, and an edited folder changes the
@@ -311,6 +317,8 @@ jobs:
           SCENARIO=scratch sh dev/coder-e2e.sh
           SCENARIO=second-repo ANSWER=yes sh dev/coder-e2e.sh
           SCENARIO=second-repo ANSWER=no sh dev/coder-e2e.sh
+          SCENARIO=create-repo ANSWER=yes sh dev/coder-e2e.sh
+          SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
       - name: Compose e2e logs
         if: failure() && steps.guard.outputs.ready == 'true'
         run: docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app logs --no-color

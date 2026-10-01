@@ -376,6 +376,9 @@ classDiagram
             <<interface>>
             open_pull_request()
             find_pull_request()
+            create_repository()
+            owner_kind()
+            authenticated_login()
         }
         class GitCredentials {
             <<interface>>
@@ -1949,6 +1952,10 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     own (it names the repository and quotes the model's reason), the grant is recorded by the agent from the
     person's answer to that call and from nothing the model says, and a refusal is remembered so that it is not
     asked again. See [`bin/adam-coder`](../bin/adam-coder/README.md#another-repository-only-with-the-persons-yes).
+  * `create_repository` makes a new, **empty** repository (private unless asked otherwise) for an owner `CREATE_REPO_OWNERS`
+    names, only after the person says yes to a question the tool writes, once per owner, name and visibility; the
+    repository it makes is granted. A GitHub App creates for organisations only. See
+    [`bin/adam-coder`](../bin/adam-coder/README.md#a-repository-of-its-own-on-request).
   * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`
     refuses to run. `commit_and_push` and `open_pull_request` refuse too.
   * `open_pull_request` refuses unless the pushed `HEAD` is the current commit

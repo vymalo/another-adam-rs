@@ -228,4 +228,24 @@ out of the pinned image). The facts of the context are verified against that tag
 a live GitHub (the server was only run against a mock of its REST API), GitHub Enterprise Server, and
 v1.13.0. Because the shipped `mcp.json` names a local process, **a coder on the embedded files needs
 `MCP_ALLOW_STDIO=true` and the binary on `PATH`**, or it stops at startup (exit 78, or 69 when the binary
-is missing); the image has both. Decision 9 is not built yet.*
+is missing); the image has both.*
+
+*2026-10-01 (slice 7, A8): decision 9 is built (`bin/adam-coder/README.md`, "A repository of its own, on
+request"). `create_repository { owner, name, private?, description? }` is off unless `CREATE_REPO_OWNERS` (the
+chart's `github.createRepoOwners`) lists the owner; it asks the person with a question it writes (the repository, its
+visibility, the description quoted) before **every** creation, records the yes for exactly `owner/name` and the
+visibility, and creates the repository **empty** (`auto_init: false`) when the model calls it again; a yes to a
+private repository does not cover a public one. The credentials are asked for the new repository's address, so the
+allowed-hosts check applies, and the `clone_url` the host answers with must pass the workspace's policy. It creates
+with `POST /orgs/{owner}/repos` for an organisation and `POST /user/repos` for the person the credentials are
+(`CodeHost::owner_kind` and `CodeHost::authenticated_login`, which is `None` for an installation token), and refuses
+any other owner, a user included when the credentials are an installation, before asking the person. Checked
+against docs.github.com on 2026-10-01 (read through a summarising fetch, not the raw pages): both endpoints answer
+`201`, `403` or `422` (a name that exists is `422`); an OAuth or classic token needs `public_repo` or `repo` for a
+public repository and `repo` for a private one; and the page "Permissions required for GitHub Apps" lists
+`POST /orgs/{org}/repos` and `POST /user/repos` under the Administration repository permission (write) for user and
+installation tokens. **Unverified:** that an installation token can really create in an organisation (the code
+assumes the Administration permission is what is missing when GitHub says `403`, and says so to the model), that
+`GET /user` answers an installation token with a `403` (the code reads a `403` that is not a rate limit as "no
+login"; a live App was not tried), and that `POST /user/repos` is unusable for an installation (the code never
+sends it: an installation has no user to create for).*
