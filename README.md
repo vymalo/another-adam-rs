@@ -11,6 +11,9 @@ run lifecycle, the error tree, the coder agent), with Mermaid diagrams.
 This repository currently contains the **durable-state layer**: the `Store`
 trait, a shared conformance suite, and two production adapters.
 
+Libraries live in `crates/`, binaries (the agents you can run) in `bin/`; the
+table below links each README, wherever it is.
+
 | Crate | What it is |
 |---|---|
 | [`adam-error`](crates/adam-error/README.md) | The error model every crate shares: `ErrorClass`, the `Classify` trait, `BoxError` and `report()`. Pure: no I/O, no async |
@@ -36,7 +39,7 @@ trait, a shared conformance suite, and two production adapters.
 | [`adam`](crates/adam/README.md) | The facade for writing an agent: `use adam::prelude::*` gives `#[tool]`, `tools!`, `Tool`, `State`, `LlmAgent`, ... (feature `macros`, on by default), `adam::include_agent!()` for the agent directory embedded by `build.rs`, `AgentDef` to bind it (feature `a2a` for the card, feature `dev` for dev reload), and re-exports the model, runtime, core, error, agent-fs and assembly crates |
 | [`adam-agent-fixture`](crates/adam-agent-fixture/README.md) | Test fixture, not published: a crate whose `build.rs` embeds an agent directory and whose tests compare the embedded manifest with the directory |
 | [`adam-a2a-runtime`](crates/adam-a2a-runtime/README.md) | `RuntimeTaskBackend`: the A2A `TaskBackend` over `adam-runtime` (task = run, ownership per caller, `input-required` from parked runs); subscriptions are rebuilt from the store, so they survive restarts. Reusable by any agent |
-| [`adam-coder`](crates/adam-coder/README.md) | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary, which runs the A2A server, the workers or both (`ROLE`); image in `docker/coder`, chart in `deploy/coder` |
+| [`adam-coder`](bin/adam-coder/README.md) | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary, which runs the A2A server, the workers or both (`ROLE`); image in `docker/coder`, chart in `deploy/coder` |
 
 ## The model
 
@@ -268,7 +271,7 @@ request gets the same answer and the script cannot drift out of step.
 | `mock-coder`, task text contains `[mock:no-opencode]` | same file | `prepare_workspace` (`nc-call-1`), `run_checks` with `echo hello > hello.txt && sh ./check.sh` (the check command makes the change, `nc-call-2`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started: deterministic where OpenCode's own behaviour is not the subject. |
 | `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |
 
-The steps mirror the reference script of `crates/adam-coder/tests/binary.rs`.
+The steps mirror the reference script of `bin/adam-coder/tests/binary.rs`.
 A request of `mock-coder` that is not on the script (an id out of order, a
 history the script does not know) is answered with **404** `off_script` on
 purpose, so a run that leaves the script fails loudly instead of wandering on
@@ -387,9 +390,9 @@ Every crate has a `README.md` next to its `Cargo.toml` (what it is for, its
 public API at a glance, features and environment variables, how it is tested),
 and `readme = "README.md"` in its manifest. Update the README in the same
 change as any change to the crate's public API, environment variables or
-tests. CI (the `lint` job) fails when a `crates/*/Cargo.toml` has no sibling
-`README.md`; it cannot check that the README is still accurate, so review
-does. The crate table above links each README.
+tests. CI (the `lint` job) fails when a `crates/*/Cargo.toml` or
+`bin/*/Cargo.toml` has no sibling `README.md`; it cannot check that the README
+is still accurate, so review does. The crate table above links each README.
 
 Docs live in [`docs/`](docs/README.md). Every process there is a Mermaid
 diagram, and CI (the `docs` job) parses each diagram and resolves each relative

@@ -39,7 +39,7 @@ jobs:
       - name: Every crate has a README
         run: |
           missing=0
-          for manifest in crates/*/Cargo.toml; do
+          for manifest in crates/*/Cargo.toml bin/*/Cargo.toml; do
             dir=$(dirname "$manifest")
             if [ ! -f "$dir/README.md" ]; then
               echo "::error file=$manifest::$dir has no README.md"

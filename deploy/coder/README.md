@@ -1,6 +1,6 @@
 # coder chart
 
-The coder agent (`crates/adam-coder`) as one StatefulSet (`topology: combined`, the
+The coder agent (`bin/adam-coder`) as one StatefulSet (`topology: combined`, the
 default) or as a front Deployment plus a worker StatefulSet (`topology: split`), with its
 own CloudNativePG database, for the `netcup-k8s` cluster.
 
@@ -67,7 +67,7 @@ With `split`:
 * The front has no volume and no model, GitHub or workspace settings. It gets `ROLE`,
   `LISTEN_ADDR`, `PUBLIC_URL`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `config.extraEnv`. The
   worker gets everything else, and neither `A2A_BEARER_TOKENS` nor `PUBLIC_URL`: the binary
-  requires them only for the roles that serve A2A (`crates/adam-coder/src/config.rs`,
+  requires them only for the roles that serve A2A (`bin/adam-coder/src/config.rs`,
   verified 2026-09-29). One `ExternalSecret` still carries all three secrets.
 * **The worker is the existing StatefulSet.** Same name, `serviceName`, selector and
   `volumeClaimTemplates`; only the pod template differs (`ROLE=worker`, fewer variables). A
@@ -108,7 +108,7 @@ A run moves between workers at every step, and the coder keeps its worktree in o
 `/work`. With more than one worker and no plan, a run that lands on a worker without its
 worktree silently forks into a second pull request. `workspace.placement` is the plan
 ([ADR 0002](../../docs/decisions/0002-workspace-placement.md)); the chart passes it to the
-binary as `WORKSPACE_PLACEMENT` (`crates/adam-coder/README.md`, "Workspace placement").
+binary as `WORKSPACE_PLACEMENT` (`bin/adam-coder/README.md`, "Workspace placement").
 
 | `workspace.placement` | `/work` | Env on the roles that run workers | Runs |
 |---|---|---|---|
@@ -144,7 +144,7 @@ chart does not render `ROLE`, and the binary runs `all`, the A2A server and the 
 pod. Set it to `control-plane` or `worker` to make that one pod run only that half (a worker
 answers `/healthz` on the same port, so the probes keep working, and serves no A2A). To run the
 two halves as separate workloads, use `topology: split` instead: it sets `ROLE` itself and
-refuses a non-empty `config.role`. See the crate README (`crates/adam-coder/README.md`,
+refuses a non-empty `config.role`. See the crate README (`bin/adam-coder/README.md`,
 "Roles") for what each role starts and needs.
 
 A control plane needs no model, GitHub or workspace configuration, so with

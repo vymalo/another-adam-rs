@@ -40,7 +40,7 @@ front:
 # (affinity, isolated) never scale the workers in: a run owned by a removed pod is stranded.
 replicaCount: 1
 
-# Environment of the binary (see crates/adam-coder/src/config.rs). Secrets are
+# Environment of the binary (see bin/adam-coder/src/config.rs). Secrets are
 # not here: they come from the ExternalSecret below.
 config:
   # What the process runs: all, control-plane or worker (ROLE). Empty leaves ROLE

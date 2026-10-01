@@ -8,7 +8,7 @@
 The glue between two ports: it implements the backend seam of
 [`adam-a2a`](../adam-a2a/README.md) using [`adam-runtime`](../adam-runtime/README.md)
 (and through it whatever `Store` the runtime holds). It is reusable by any
-agent; [`adam-coder`](../adam-coder/README.md) uses it.
+agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 
 ## API at a glance
 
@@ -186,5 +186,5 @@ the backend whose model is shown the earlier messages (memory and PostgreSQL). U
 
 [`adam-a2a`](../adam-a2a/README.md),
 [`adam-runtime`](../adam-runtime/README.md),
-[`adam-coder`](../adam-coder/README.md),
+[`adam-coder`](../../bin/adam-coder/README.md),
 [`adam-error`](../adam-error/README.md).

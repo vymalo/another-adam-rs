@@ -49,7 +49,7 @@ sequenceDiagram
 | `open_pull_request { title, body, accept_red_checks? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. Declared `#[tool(asks_user)]`, so `adam-assembly` refuses to give it to a subagent |
 
-Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../adam/README.md#tool)) in
+Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
@@ -430,7 +430,7 @@ so a bad `MODEL` is a startup error. A control plane has no model, so it takes t
 `AgentDef::card` (`agent_card(url)`), and `CoderAgent::assembly().card(url, version)` gives the same card.
 
 The Docker build context must contain `agent/`: `docker/coder/Dockerfile.dockerignore` excludes `**/*.md` and
-re-includes `crates/adam-coder/agent/**`, and `build.rs` fails the build without the file.
+re-includes `bin/adam-coder/agent/**`, and `build.rs` fails the build without the file.
 
 ### Retry safety
 
@@ -509,7 +509,7 @@ its files and whether a run stays on one worker
 
 | `WORKSPACE_PLACEMENT` | Worker root | Runs | `WORKER_ID` |
 |---|---|---|---|
-| `shared` (default) | `WORKSPACE_ROOT`, one volume mounted by every worker (RWX); guarded by the mirror lock of [`adam-workspace`](../adam-workspace/README.md) | any worker steps any run | optional |
+| `shared` (default) | `WORKSPACE_ROOT`, one volume mounted by every worker (RWX); guarded by the mirror lock of [`adam-workspace`](../../crates/adam-workspace/README.md) | any worker steps any run | optional |
 | `affinity` | `WORKSPACE_ROOT/<WORKER_ID>` | pinned to the worker that first claimed them | required |
 | `isolated` | `WORKSPACE_ROOT`, a volume of this worker only (a PVC per worker) | pinned | required |
 | `a2a-only` | | refused: every tool of the coder needs a workspace | |
@@ -544,7 +544,7 @@ run record's version compare-and-swap, and leases), so any number of each can sh
 database; the store is what is correct, and `notify` only makes it fast.
 
 **Live events and wake-up across processes.** Every process builds one
-[`PgNotify`](../adam-notify-postgres/README.md) over the store's own connection pool and runs
+[`PgNotify`](../../crates/adam-notify-postgres/README.md) over the store's own connection pool and runs
 its listener as the host component `notify` (a worker component in `all` and `worker`, which
 stops only after the `worker` component has finished, so the last step's events and signals
 are still sent; a control-plane component in `control-plane`). It logs
@@ -647,7 +647,7 @@ Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
 ## Errors
 
 The library errors it composes are classified (see
-[`adam-error`](../adam-error/README.md)); this crate adds `ConfigError`
+[`adam-error`](../../crates/adam-error/README.md)); this crate adds `ConfigError`
 (`Invalid`: the same environment never works; it lists every problem and never
 a secret). A component of the process that stops while still needed (the server
 or the workers) is an `adam_host::HostError`, which names the component and is

@@ -6,7 +6,7 @@ first of all `opencode acp`, plus a scripted fake agent for tests.
 ## Where it sits
 
 An **adapter** for an external agent protocol; nothing in the core depends on
-it. [`adam-coder`](../adam-coder/README.md) uses it to have OpenCode change
+it. [`adam-coder`](../../bin/adam-coder/README.md) uses it to have OpenCode change
 code inside a worktree prepared by
 [`adam-workspace`](../adam-workspace/README.md). The client also *serves* the
 agent's requests: file reads and writes under a policy root, and permission
@@ -85,7 +85,7 @@ environment variables itself.
 
 *Unverified:* how `opencode acp` behaves (which requests it sends, its
 configuration keys) is taken from OpenCode's sources as recorded in
-[`adam-coder`'s `src/opencode.rs`](../adam-coder/src/opencode.rs), not
+[`adam-coder`'s `src/opencode.rs`](../../bin/adam-coder/src/opencode.rs), not
 re-checked here.
 
 ## Tests
@@ -108,6 +108,6 @@ The live test is not run in CI.
 
 ## See also
 
-[`adam-coder`](../adam-coder/README.md),
+[`adam-coder`](../../bin/adam-coder/README.md),
 [`adam-workspace`](../adam-workspace/README.md),
 [`adam-error`](../adam-error/README.md).
