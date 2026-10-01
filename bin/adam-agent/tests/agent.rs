@@ -60,9 +60,10 @@ fn service_over(agents: Agents, store: &DynStore) -> Service {
         name,
         register,
         options,
+        inbound,
         ..
     } = agents;
-    Service::new(register(Runtime::builder(store.clone())), name, &options)
+    Service::new(register(Runtime::builder(store.clone())), name, &options).with_inbound(inbound)
 }
 
 fn alice() -> Caller {
@@ -225,7 +226,7 @@ async fn a_chat_folder_answers_in_role_through_a2a() {
         "the limits are the folder's"
     );
     let tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(tools, ["ask_user"]);
+    assert_eq!(tools, ["ask_user", "show", "ui_catalog"]);
     worker.stop().await;
 }
 
@@ -481,7 +482,7 @@ async fn the_servers_of_mcp_json_give_the_agent_their_tools() {
     );
     let requests = mock.requests();
     let offered: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(offered, ["ask_user", "test__echo"]);
+    assert_eq!(offered, ["ask_user", "show", "ui_catalog", "test__echo"]);
     match requests[1].messages.last().unwrap() {
         adam_model::Message::Tool {
             call_id,
@@ -621,8 +622,11 @@ async fn a_researcher_searches_a_stateless_mcp_server_and_answers_with_its_sourc
 
     let requests = mock.requests();
     let tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(tools, ["ask_user", "search__web_search"]);
-    let spec = &requests[0].tools[1];
+    assert_eq!(
+        tools,
+        ["ask_user", "show", "ui_catalog", "search__web_search"]
+    );
+    let spec = &requests[0].tools[3];
     assert!(
         spec.description.contains("Search the web"),
         "{}",
@@ -731,7 +735,7 @@ async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
     assert_eq!(requests.len(), 3);
     let offered =
         |i: usize| -> Vec<&str> { requests[i].tools.iter().map(|t| t.name.as_str()).collect() };
-    assert_eq!(offered(0), ["ask_user", "reviewer"]);
+    assert_eq!(offered(0), ["ask_user", "show", "ui_catalog", "reviewer"]);
     // The child: its own prompt, and no tool (a subagent gets none it does not list).
     assert_eq!(requests[1].system.as_deref(), Some("You review texts."));
     assert!(offered(1).is_empty(), "{:?}", offered(1));

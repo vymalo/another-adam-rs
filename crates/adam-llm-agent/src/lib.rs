@@ -141,6 +141,7 @@ mod fn_tool;
 mod history;
 #[cfg(feature = "schema")]
 mod schema;
+mod source;
 mod state;
 mod tool;
 mod toolset;
@@ -149,8 +150,8 @@ mod typed;
 pub use adam_runtime::Artifact;
 pub use agent::{BuildError, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter};
 pub use conversation::{
-    ArtifactRef, Conversation, MAX_CARRIED_BYTES, MESSAGE_KIND, OMITTED_MARKER_PREFIX,
-    PendingQuestion, PendingRemote, PendingRun, PendingWait, user_message,
+    ArtifactRef, Conversation, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MESSAGE_KIND,
+    OMITTED_MARKER_PREFIX, PendingQuestion, PendingRemote, PendingRun, PendingWait, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
@@ -158,6 +159,7 @@ pub use fn_tool::{FnToolBuilder, TypedFnToolBuilder};
 pub use history::TRUNCATION_MARKER_PREFIX;
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
+pub use source::{DynToolSource, MAX_SOURCE_TOOLS, SourceCtx, ToolSource};
 pub use state::{Extensions, State, StateKey};
 pub use tool::{DynTool, RemotePoll, Tool, ToolCtx, ToolError, ToolOutput};
 pub use toolset::ToolSet;

@@ -18,6 +18,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `.with_poll_interval(..)`, `DEFAULT_POLL_INTERVAL` | how often a subscription re-reads the durable run |
 | `.with_prompt(..)`, `.with_inbound(..)` | override how the `input-required` question is derived (`PromptFn`; the default reads `state.pending_wait.question`, and `state.pending_question.question` for runs parked by an older build) and how an A2A message becomes an `Inbound` (`InboundFn`) |
 | `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings. `artifact_of`: string data is a text part, anything else a data part; an object whose `url` is an absolute `http(s)` URL also gets a `url` part after the data part (A2A v1 `Part.url`), so a client can show a link |
+| `vymalo_inbound`, `CONTEXT_UI_REF`, `CONTEXT_UI_CATALOG`, `CONTEXT_THREAD_TOOLS`, `integral_numbers` | the inbound function of an agent that serves a screen (`.with_inbound(vymalo_inbound)`): an A2UI action reads as the person's answer, and the extensions a message carries become the run's inbound context; see *A screen as the sender* |
 | `task_id_for(agent, subject, context_id, message_id)` | the task id a new task of `agent` started by that message gets (see *Stable ids*) |
 | `MAX_REFERENCES` | how many of a message's `referenceTaskIds` are looked at (8); see *Continuing a task* |
 
@@ -102,6 +103,54 @@ An agent only continues if it overrides `init_continuing` (`LlmAgent`, `LlmStart
 `CoderAgent` and `CoderStarter` do); the default is `init`, and a wrapper must forward it. The decision, the rejected alternatives and the state diagram are in
 [ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md).
 
+## A screen as the sender
+
+`RuntimeTaskBackend::with_inbound(vymalo_inbound)` reads a message the way the orchestration layer's chat
+sends it (contracts: `docs/api/ui-catalog-v1.md` and `docs/api/thread-tools-v1.md` of
+`vymalo/another-agentic-system`; the card entries that announce them are in [`adam-a2a`](../adam-a2a/README.md)):
+
+| In the message | In the run |
+|---|---|
+| text parts | the text |
+| an A2UI action part (`application/a2ui+json`, in `mediaType` or in `metadata.mimeType`) with Choices answers (`context.answers`: `[{id, values, other?}]`) | `The person answered through the interface:` then one line per question, `- db: pg`, `- auth: other: "Keycloak"` (what the person typed is JSON-quoted); it is the result of the `ask_user` call that parked the run |
+| any other A2UI action | `The person used the interface: action "<name>" on surface "<id>" with context <JSON, cut at 4096 characters>` |
+| `metadata[ui-catalog/v1]` | `Conversation::context["vymalo.ui.ref"]` = `{catalogId, version, digest}` |
+| an inline catalog with that `catalogId` in the renderer's capabilities (`a2uiClientCapabilities` under `v0.9.1`, else `v0.9`; `a2uiRendererCapabilities` under `v1.0`) | `context["vymalo.ui.catalog"]` = `{catalogId, version, digest, catalog}`; an inline catalog of another id is ignored |
+| `metadata[thread-tools/v1]` `{url, token, expiresAt}` | `context["vymalo.threadTools"]`, copied exactly; the entry expires at `expiresAt` (`Conversation::drop_expired_context`) |
+
+A message with none of these has no `context`, so it changes nothing in the run. An A2A server holds the numbers of
+metadata as doubles (a catalog's `maxLength: 256` arrives as `256.0`, `version` as `2.0`); every whole number that goes into
+the context is written as an integer (`integral_numbers`), which is what the digest of a catalog is taken over.
+
+```mermaid
+sequenceDiagram
+    participant S as Screen (orchestrator)
+    participant B as RuntimeTaskBackend
+    participant R as Run
+    S->>B: message: text + metadata (ui-catalog/v1, thread-tools/v1)
+    B->>R: Inbound {text, context}
+    R-->>B: input-required: question + an A2UI part (the interface)
+    B-->>S: status message: [text, data(application/a2ui+json)]
+    S->>B: message on the task: an A2UI action part
+    B->>R: Inbound {text: "The person answered through the interface: ..."}
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Working: a message starts the task
+    Working --> InputRequired: a tool asks (NeedsInput), with or without an interface
+    InputRequired --> Working: a message arrives (text, or an action read as the answer)
+    Working --> Completed
+    Completed --> [*]
+```
+
+**The question's interface.** While a run waits on a question, its status message has the question as a text part and,
+when `state.pending_wait.ui` is a non-empty array of A2UI messages (`PendingQuestion::ui`), that array as a second part
+(`mediaType` and `metadata.mimeType` both `application/a2ui+json`). The status message id and the "did anything change" key
+include a digest of the interface, so a question with another interface is another status; a status without one has
+exactly the id it had before. A run **artifact** whose media type is `application/a2ui+json` (what a `show` tool emits) carries
+the same two spellings on its data part.
+
 ## Stable ids
 
 Ids are derived, never drawn at random per read, so a consumer that keys on
@@ -109,7 +158,8 @@ them sees each thing once (a SHA-256 of length-prefixed fields, laid out as a
 UUID of version 8):
 
 * **Status messages.** The `message_id` of a task's status message is a
-  function of the task id, the state and the message text. The stream event and
+  function of the task id, the state and the message text (and, for a question that has an
+  interface, a digest of it). The stream event and
   every `tasks/get` snapshot of the same status carry the same id; another
   state or text gives another id. (Progress messages, which exist only in the
   live stream, keep a fresh id.)
@@ -175,7 +225,11 @@ separate worker finished, a continuation after a restart (memory and PostgreSQL)
 the backend whose model is shown the earlier messages (memory and PostgreSQL). Unit tests in `src/backend.rs`
 (`runtime_errors_map_by_class`,
 `what_a_client_is_told_carries_no_cause_and_no_conversation_id`) and
-`src/convert.rs`.
+`src/convert.rs` (the interface part of a status, its id and key, the A2UI artifact), and the reading of a screen's
+messages in `src/vymalo.rs` (each shape of answer, quoting, the cut, the context under every capability key, a catalog
+of another id, a malformed reference, the doubles) and `tests/vymalo.rs` (a real `Runtime` and `LlmAgent`: the
+extensions reaching the run's context, a question with an interface as `input-required` with two parts, and the person's
+answer as the tool result the model reads).
 
 | Variable | Meaning |
 |---|---|

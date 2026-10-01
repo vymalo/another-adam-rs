@@ -159,7 +159,7 @@ services:
   # both binaries: only the entrypoint differs (`adam-agent` for `adam-coder`), so there is no second
   # image to build or publish. The agent is files, read at startup: edit the folder, or point
   # AGENT_FOLDER at a copy, and `docker compose --profile app up -d agent` (a restart, no rebuild). It
-  # has no tools of its own but `ask_user`, no workspace and no GitHub: its model is `mock-assistant`,
+  # has no tools of its own but the screen's (`ask_user`, `show`, `ui_catalog`), no workspace and no GitHub: its model is `mock-assistant`,
   # which greets from the two persona lines of the prompt (`Your name is <name>.` and `In one
   # sentence: <summary>.`). It shares the coder's database: runs are scoped by the agent's name.
   # A fourth agent is a folder and these lines. CI runs dev/agent-e2e.sh against it.

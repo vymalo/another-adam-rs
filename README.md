@@ -39,6 +39,7 @@ table below links each README, wherever it is.
 | [`adam`](crates/adam/README.md) | The facade for writing an agent: `use adam::prelude::*` gives `#[tool]`, `tools!`, `Tool`, `State`, `LlmAgent`, ... (feature `macros`, on by default), `adam::include_agent!()` for the agent directory embedded by `build.rs`, `AgentDef` to bind it (feature `a2a` for the card, feature `dev` for dev reload), and re-exports the model, runtime, core, error, agent-fs and assembly crates |
 | [`adam-agent-fixture`](crates/adam-agent-fixture/README.md) | Test fixture, not published: a crate whose `build.rs` embeds an agent directory and whose tests compare the embedded manifest with the directory |
 | [`adam-a2a-runtime`](crates/adam-a2a-runtime/README.md) | `RuntimeTaskBackend`: the A2A `TaskBackend` over `adam-runtime` (task = run, ownership per caller, `input-required` from parked runs); subscriptions are rebuilt from the store, so they survive restarts. Reusable by any agent |
+| [`adam-ui`](crates/adam-ui/README.md) | The screen's UI catalog as model tools: `ask_user` with `choices` (one Choices form, answers back as the result), `show` (blocks of the screen's components, validated against the catalog's JSON Schema), `ui_catalog`, and `ThreadTools`, a `ToolSource` that offers every tool of the conversation's MCP endpoint each model turn; the catalog is checked against its digest and refetched over thread tools when stale; `card_extensions()` announces it. Every adam agent can use it |
 | [`adam-service`](crates/adam-service/README.md) | The A2A service every agent binary shares: `serve(&ServiceConfig, Agents, shutdown)` connects Postgres, builds the runtime, the A2A router and the `LISTEN`/`NOTIFY` signals and runs the components of a `ROLE`; the configuration the binaries have in common (`ServiceConfig`, `ModelConfig`, `McpSettings`) and the exit codes. A binary hands it the agent's name, card and a registration closure |
 | [`adam-agent`](bin/adam-agent/README.md) | One binary that serves **any agent folder** over A2A: `ADAM_AGENT_DIR` names a folder of files (instructions, card, skills, subagents, `mcp.json` tools), read at startup; `ask_user` is its only tool of its own. No embedded agent, one agent per process, any number of services over one database. Library and the `adam-agent` binary (`ROLE`), over `adam-service`; ships inside the coder image |
 | [`adam-coder`](bin/adam-coder/README.md) | The coder agent: a coding task to a verified pull request over A2A (worktree, OpenCode over ACP, bounded check cycles, commit, push, PR). Library and the `adam-coder` binary, which runs the A2A server, the workers or both (`ROLE`); image in `docker/coder`, chart in `deploy/coder` |
@@ -299,8 +300,8 @@ the canned answers: text only, no tool call, so no pull request.
 
 The service `agent` runs `adam-agent` ([`bin/adam-agent/README.md`](bin/adam-agent/README.md)) from the
 same image: the `coder` image carries both binaries, its entrypoint stays `adam-coder`, and the service
-overrides it. The agent is a folder of files, `dev/agents/assistant/agent` (a chat persona, no tools but
-`ask_user`), read at startup from `ADAM_AGENT_DIR` (`/etc/adam/agent`); `AGENT_FOLDER=<copy>` mounts another one.
+overrides it. The agent is a folder of files, `dev/agents/assistant/agent` (a chat persona, no tools of its own
+but the screen's: `ask_user`, `show`, `ui_catalog`), read at startup from `ADAM_AGENT_DIR` (`/etc/adam/agent`); `AGENT_FOLDER=<copy>` mounts another one.
 Its model `mock-assistant` answers every request in role: the greeting is built from the two persona lines of the
 system prompt (see "Scripted models"), so the mocked answer follows the folder. There is no workspace, no
 GitHub and no worktree, and the same database holds the coder's runs and the agent's, each under its own name.
@@ -318,6 +319,29 @@ folder, the port and the token). How a folder declares MCP servers for its tools
 server) is in [`bin/adam-agent/README.md`](bin/adam-agent/README.md#mcp-servers-from-the-folder). How a *live*
 model behaves with the folder is *unverified*, as for the coder.
 
+#### Asking with choices
+
+The coder (and `adam-agent`) asks several questions at once as one form when the screen can draw it
+([`adam-ui`](crates/adam-ui/README.md), [ADR 0006](docs/decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md)):
+the card lists A2UI v0.9.1, `ui-catalog/v1` and `thread-tools/v1`, a message from the orchestration layer carries the
+screen's catalog (or its digest and a grant for the conversation's MCP endpoint), `ask_user` takes `choices`, and the
+person's answers come back as one A2UI action. The task that proves it, on the mocks: three questions as radio lists
+(a database, a login, where it runs), the answers, and the coder going on (`dev/coder-choices-e2e.sh`; no repository,
+GitHub or OpenCode is needed):
+
+```sh
+docker compose --profile app up -d --build --wait postgres mock-openai mock-github git-server coder
+sh dev/coder-choices-e2e.sh
+```
+
+The script checks the card's extensions; that a task whose text carries `[mock:choices]` and the web's catalog inline
+ends `TASK_STATE_INPUT_REQUIRED` with the question as text and an `application/a2ui+json` part (a `createSurface` under
+the screen's `catalogId` and one Choices of three questions); that an A2UI action with the answers (`db=pg`,
+`auth=keycloak`, `deploy=compose`) is read as the person's answer and the coder's next words quote it; and that a screen
+the coder cannot read (a message that only names the catalog) gets the options as text and no A2UI part. The catalog is
+a copy of the web's (`crates/adam-ui/tests/fixtures/catalog-v2.json`, with its lock); `CATALOG_FILE` and `CATALOG_LOCK`
+point at another. How a *live* model uses `choices` is *unverified*.
+
 ### Scripted models
 
 The coder's model is `mock-coder` and OpenCode's is `mock-opencode` (`MODEL` and
@@ -332,6 +356,7 @@ request gets the same answer and the script cannot drift out of step.
 | `mock-coder` | `mappings/coder-script.json` | `prepare_workspace` (`http://git-server:8080/local/sandbox.git`, `main`, id `coder-call-1`), `delegate_to_opencode` (create `hello.txt` containing `hello`, `coder-call-2`), `run_checks` (`sh ./check.sh`, `coder-call-3`), `commit_and_push` (`coder-call-4`), `open_pull_request` (`coder-call-5`), then a final text (`stop`). Not streamed. |
 | `mock-coder`, the person's first message is a greeting (`hi`, `hello` or `hey`, then anything) | same file | a text answer (`stop`): `Hi! I'm <name>. <summary>. Which repository should I work on, and what should I change?`, **built from the first two lines of the system prompt** (`messages[0]`: `Your name is <name>.` and `In one sentence: <summary>.`, the persona lines the coder's `agent/instructions.md` opens with), so editing the instructions, or mounting another folder, changes the mocked answer. The run then waits for the person (`input-required`); the answer to it (the synthetic `ask_user` call `stop0000N` is in the history) continues with `prepare_workspace` (`coder-call-1`) and the script above. A greeting needs a system message first: a request with the user message alone is not one. |
 | `mock-coder`, task text contains `[mock:no-opencode]` | same file | `prepare_workspace` (`nc-call-1`), `run_checks` with `echo hello > hello.txt && sh ./check.sh` (the check command makes the change, `nc-call-2`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started: deterministic where OpenCode's own behaviour is not the subject. |
+| `mock-coder`, task text contains `[mock:choices]` | `mappings/coder-choices.json` | `ask_user` (`choices-call-1`) with the question `Three quick questions before I start` and three `choices`: `db` (`pg`, `sqlite`), `auth` (`keycloak`, `none`), `deploy` (`k8s`, `compose`), priority 1; once its result holds `db: pg` (how the person's answers read to the model) the text `Going with Postgres, Keycloak and Compose.` (`stop`), priority 1; any other answers, `Thanks, I have your answers.`, priority 2. No workspace or repository is touched. `dev/coder-choices-e2e.sh` runs it through the stack. |
 | `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |
 | `mock-assistant` | `mappings/agent-script.json` | for the general agent (`adam-agent`), stateless: a request that holds a tool result (`role: tool`) gets a fixed text (`I looked into it with the tool you gave me. ...`), priority 1; any other request gets `Hi! I'm <name>. <summary>.`, **built from the first two lines of the system prompt** (`Your name is <name>.` and `In one sentence: <summary>.`), priority 2. Not streamed. It answers in role whatever is asked: it proves that the folder reaches the model, not what a model does with it. `dev/agent-e2e.sh` runs it through the stack. |
 

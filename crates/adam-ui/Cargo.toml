@@ -1,0 +1,36 @@
+[package]
+name = "adam-ui"
+description = "The screen's UI catalog as model tools for an adam-rs agent: ask with Choices, show components, read the catalog, call the tools of the thread; refetched over thread tools"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+a2a-lf.workspace = true
+adam-a2a.workspace = true
+adam-a2a-runtime.workspace = true
+adam-llm-agent.workspace = true
+adam-mcp.workspace = true
+adam-model.workspace = true
+adam-runtime.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+jsonschema.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+adam-core.workspace = true
+adam-model.workspace = true
+adam-mcp-testkit.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

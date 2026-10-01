@@ -96,7 +96,7 @@ impl Recipe {
     }
 
     /// Start (or dial) the server and run the handshake, within the connect timeout.
-    async fn dial(&self) -> Result<Service, Error> {
+    pub(crate) async fn dial(&self) -> Result<Service, Error> {
         match tokio::time::timeout(self.connect_timeout, self.dial_untimed()).await {
             Ok(result) => result,
             Err(_) => Err(self.connect_error(&format!(

@@ -6,7 +6,7 @@ use std::future::Future;
 
 use adam::AssemblyError;
 use adam_a2a::{AgentCardConfig, AuthConfig};
-use adam_a2a_runtime::RuntimeTaskBackend;
+use adam_a2a_runtime::{InboundFn, RuntimeTaskBackend, vymalo_inbound};
 use adam_core::DynStore;
 use adam_runtime::{Runtime, RuntimeError};
 use adam_service::Service;
@@ -17,6 +17,14 @@ use crate::agent::{AGENT_NAME, CoderAgent, CoderStarter};
 use crate::files::AgentFiles;
 
 pub use adam_service::{LiveSignals, RuntimeOptions};
+
+/// How the coder reads an A2A message: as one from the person's screen ([`vymalo_inbound`]): their
+/// answers through a form are the answer to the question, and the catalog and the grant for the
+/// conversation's tools reach the run as its context. For a message from anything else it is the
+/// default reading.
+pub(crate) fn screen_inbound() -> Option<InboundFn> {
+    Some(std::sync::Arc::new(vymalo_inbound))
+}
 
 /// The coder, composed: runtime (workers) and A2A backend over one store.
 ///
@@ -52,7 +60,9 @@ impl Coder {
         live: LiveSignals,
     ) -> Self {
         let builder = agent.register(Runtime::builder(store));
-        Self::from_service(Service::new_with(builder, AGENT_NAME, options, live))
+        Self::from_service(
+            Service::new_with(builder, AGENT_NAME, options, live).with_inbound(screen_inbound()),
+        )
     }
 
     /// Compose the control plane over `store`: the A2A backend, with the agent registered as a
@@ -71,7 +81,9 @@ impl Coder {
         live: LiveSignals,
     ) -> Self {
         let builder = Runtime::builder(store).starter(CoderStarter);
-        Self::from_service(Service::new_with(builder, AGENT_NAME, options, live))
+        Self::from_service(
+            Service::new_with(builder, AGENT_NAME, options, live).with_inbound(screen_inbound()),
+        )
     }
 
     fn from_service(service: Service) -> Self {
@@ -138,6 +150,7 @@ pub fn agent_card_from(
     files
         .def()?
         .card(public_url.clone(), env!("CARGO_PKG_VERSION"))
+        .map(adam_ui::with_card_extensions)
         .map_err(Box::new)
 }
 

@@ -36,9 +36,11 @@ use serde_json::{Value, json};
 
 mod http;
 mod logs;
+mod thread_tools;
 
 pub use http::TestHttpServer;
 pub use logs::{LogCapture, wait_until};
+pub use thread_tools::{GET_UI_CATALOG, ThreadToolsServer};
 
 /// What a server has been asked, shared by every session of it.
 #[derive(Debug, Default)]

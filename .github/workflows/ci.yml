@@ -293,6 +293,22 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"model":"mock-assistant","messages":[{"role":"system","content":"x"},{"role":"user","content":"Hi"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"search__web_search","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"1. A"}]}' \
             | jq -e '.choices[0].message.content | contains("That is all the mock assistant has to say")' > /dev/null
+          # mock-openai, model mock-coder, a task that carries [mock:choices]: the coder asks three
+          # questions at once, one `ask_user` call whose `choices` are the three questions ...
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-coder","messages":[{"role":"system","content":"x"},{"role":"user","content":"[mock:choices] set up the project"}]}' \
+            | jq -e '.choices[0].message.tool_calls[0] | .id == "choices-call-1" and .function.name == "ask_user" and ((.function.arguments | fromjson | .choices | map(.id)) == ["db","auth","deploy"])' > /dev/null
+          # ... and once the person has answered through the form (the answers are the tool result, as
+          # `- db: pg` lines), it goes on: any other answer gets the general thanks.
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-coder","messages":[{"role":"system","content":"x"},{"role":"user","content":"[mock:choices] set up the project"},{"role":"assistant","content":null,"tool_calls":[{"id":"choices-call-1","type":"function","function":{"name":"ask_user","arguments":"{}"}}]},{"role":"tool","tool_call_id":"choices-call-1","content":"The person answered through the interface:\n- db: pg\n- auth: keycloak\n- deploy: compose"}]}' \
+            | jq -e '.choices[0].finish_reason == "stop" and (.choices[0].message.content == "Going with Postgres, Keycloak and Compose.")' > /dev/null
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-coder","messages":[{"role":"system","content":"x"},{"role":"user","content":"[mock:choices] set up the project"},{"role":"assistant","content":null,"tool_calls":[{"id":"choices-call-1","type":"function","function":{"name":"ask_user","arguments":"{}"}}]},{"role":"tool","tool_call_id":"choices-call-1","content":"The person answered through the interface:\n- db: sqlite"}]}' \
+            | jq -e '.choices[0].message.content == "Thanks, I have your answers."' > /dev/null
           # mock-github: no open pull requests; creating one answers 201.
           test "$(curl -fsS 'http://127.0.0.1:8082/repos/local/sandbox/pulls?head=local:agent/x&state=open')" = '[]'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/repos/local/sandbox/pulls \

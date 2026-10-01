@@ -1,0 +1,121 @@
+//! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
+//!
+//! Three extensions, each optional (a client that does not know one ignores it), detected by the
+//! client from the card it reads, and removable without breaking plain A2A:
+//!
+//! | Extension | URI | What it is |
+//! |---|---|---|
+//! | A2UI v0.9.1 | [`A2UI_EXTENSION_V0_9_1`] | the agent can send A2UI surfaces (data parts of [`A2UI_MEDIA_TYPE`]) and receives the renderer's capabilities and actions |
+//! | `ui-catalog/v1` | [`UI_CATALOG_EXTENSION`] | the agent reads the screen's own component catalog and draws with it |
+//! | `thread-tools/v1` | [`THREAD_TOOLS_EXTENSION`] | the agent can use the per-thread tool endpoint a message announces |
+//!
+//! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md` and
+//! `docs/api/thread-tools-v1.md` of `vymalo/another-agentic-system`); what an agent does with the
+//! messages is `adam-a2a-runtime`'s `vymalo_inbound` and `adam-ui`.
+
+use serde_json::json;
+
+use crate::card::ExtensionConfig;
+
+/// The media type of a data part that carries A2UI messages, in `mediaType` (A2A 1.0) and in the
+/// part's `metadata.mimeType` (the A2UI extension's own spelling).
+pub const A2UI_MEDIA_TYPE: &str = "application/a2ui+json";
+
+/// The URI of the A2UI v0.9.1 extension.
+pub const A2UI_EXTENSION_V0_9_1: &str = "https://a2ui.org/a2a-extension/a2ui/v0.9.1";
+
+/// The id of A2UI v0.9.1's basic catalog.
+pub const A2UI_BASIC_CATALOG_V0_9_1: &str =
+    "https://a2ui.org/specification/v0_9_1/catalogs/basic/catalog.json";
+
+/// The URI of the `ui-catalog/v1` extension: the agent reads the screen's component catalog.
+pub const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1";
+
+/// The URI of the `thread-tools/v1` extension: a message carries the endpoint of the tools of its
+/// thread, and a token to call it.
+pub const THREAD_TOOLS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/thread-tools/v1";
+
+impl ExtensionConfig {
+    /// The A2UI v0.9.1 extension, as the card of an agent that takes the screen's catalog inline
+    /// declares it: `supportedCatalogIds` lists the basic catalog, and `acceptsInlineCatalogs` is
+    /// `true` (A2UI's default is `false`, so without it a renderer never sends one).
+    pub fn a2ui_v0_9_1() -> Self {
+        let mut extension = Self::new(A2UI_EXTENSION_V0_9_1);
+        extension.description =
+            Some("Draws A2UI surfaces; takes the screen's catalog inline".into());
+        extension.params.insert(
+            "supportedCatalogIds".into(),
+            json!([A2UI_BASIC_CATALOG_V0_9_1]),
+        );
+        extension
+            .params
+            .insert("acceptsInlineCatalogs".into(), json!(true));
+        extension
+    }
+
+    /// The `ui-catalog/v1` extension: the agent reads the screen's component catalog and draws
+    /// with it. Optional, no parameters.
+    pub fn ui_catalog() -> Self {
+        let mut extension = Self::new(UI_CATALOG_EXTENSION);
+        extension.description = Some("Reads the screen's UI catalog and draws with it".into());
+        extension
+    }
+
+    /// The `thread-tools/v1` extension: the agent calls the tools of the per-thread endpoint a
+    /// message announces. Optional, no parameters.
+    pub fn thread_tools() -> Self {
+        let mut extension = Self::new(THREAD_TOOLS_EXTENSION);
+        extension.description = Some("Calls the tools of the thread's endpoint".into());
+        extension
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_uris_are_the_ones_of_the_contracts() {
+        assert_eq!(
+            UI_CATALOG_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1"
+        );
+        assert_eq!(
+            THREAD_TOOLS_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/thread-tools/v1"
+        );
+        assert_eq!(
+            A2UI_EXTENSION_V0_9_1,
+            "https://a2ui.org/a2a-extension/a2ui/v0.9.1"
+        );
+        assert_eq!(A2UI_MEDIA_TYPE, "application/a2ui+json");
+    }
+
+    #[test]
+    fn the_a2ui_entry_declares_inline_catalogs_and_the_basic_one() {
+        let e = ExtensionConfig::a2ui_v0_9_1();
+        assert_eq!(e.uri, A2UI_EXTENSION_V0_9_1);
+        assert!(!e.required);
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({
+                "supportedCatalogIds": [A2UI_BASIC_CATALOG_V0_9_1],
+                "acceptsInlineCatalogs": true
+            })
+        );
+    }
+
+    #[test]
+    fn the_vymalo_entries_are_optional_and_have_no_parameters() {
+        for e in [
+            ExtensionConfig::ui_catalog(),
+            ExtensionConfig::thread_tools(),
+        ] {
+            assert!(!e.required, "{}", e.uri);
+            assert!(e.params.is_empty(), "{}", e.uri);
+            assert!(e.description.is_some(), "{}", e.uri);
+        }
+        assert_eq!(ExtensionConfig::ui_catalog().uri, UI_CATALOG_EXTENSION);
+        assert_eq!(ExtensionConfig::thread_tools().uri, THREAD_TOOLS_EXTENSION);
+    }
+}

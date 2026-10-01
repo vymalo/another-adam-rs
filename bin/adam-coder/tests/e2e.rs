@@ -490,7 +490,9 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "run_checks",
             "commit_and_push",
             "open_pull_request",
-            "ask_user"
+            "ask_user",
+            "show",
+            "ui_catalog"
         ]
     );
 }
@@ -2848,6 +2850,319 @@ async fn another_caller_cannot_see_or_resume_the_task(store: DynStore) {
     assert_eq!(seen.status.state, TaskState::InputRequired);
 }
 
+// ------------------------------------------------------- asking with choices
+
+/// The screen's catalog (the web's, version 2: Text, Column, Choices): the copy `adam-ui` pins.
+const CATALOG: &str = include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.json");
+const CATALOG_LOCK: &str =
+    include_str!("../../../crates/adam-ui/tests/fixtures/catalog-v2.lock.json");
+const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1";
+const THREAD_TOOLS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/thread-tools/v1";
+
+/// A first message from the person's screen: the text, the catalog's reference (`ui-catalog/v1`),
+/// the catalog itself in the A2UI capabilities when `inline`, and the grant for the conversation's
+/// tools when there is one.
+fn from_the_screen(text: &str, inline: bool, grant: Option<serde_json::Value>) -> Message {
+    let lock: serde_json::Value = serde_json::from_str(CATALOG_LOCK).unwrap();
+    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    let id = catalog["catalogId"].clone();
+    let mut capabilities = json!({"supportedCatalogIds": [id.clone()]});
+    if inline {
+        capabilities["inlineCatalogs"] = json!([catalog]);
+    }
+    let mut metadata = json!({
+        UI_CATALOG_EXTENSION: {
+            "catalogId": id, "version": lock["version"], "digest": lock["digest"], "inline": inline},
+        "a2uiClientCapabilities": {"v0.9.1": capabilities},
+    });
+    if let Some(grant) = grant {
+        metadata[THREAD_TOOLS_EXTENSION] = grant;
+    }
+    let mut message = user(text);
+    message.metadata = Some(
+        metadata
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    );
+    message
+}
+
+/// The person's answers through the form, as the screen sends them: one A2UI action on the task.
+fn answers_to(task: &str, surface: &str, answers: serde_json::Value) -> Message {
+    let mut part = Part::data(json!([{"version": "v0.9.1", "action": {
+        "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
+        "timestamp": "2026-10-01T10:00:00Z", "context": {"answers": answers}}}]))
+    .with_media_type("application/a2ui+json");
+    part.metadata = Some(std::collections::HashMap::from([(
+        "mimeType".to_owned(),
+        json!("application/a2ui+json"),
+    )]));
+    let mut message = Message::new(Role::User, vec![part]);
+    message.task_id = Some(task.to_owned());
+    message
+}
+
+fn three_questions() -> adam_model::ToolCall {
+    call(
+        "choices-call-1",
+        "ask_user",
+        json!({
+            "question": "Three quick questions before I start",
+            "choices": [
+                {"id": "db", "question": "Which database?",
+                 "options": [{"value": "pg", "label": "Postgres"}, {"value": "sqlite", "label": "SQLite"}]},
+                {"id": "auth", "question": "Which login?",
+                 "options": [{"value": "keycloak", "label": "Keycloak"}, {"value": "none", "label": "No login"}]},
+                {"id": "deploy", "question": "Where does it run?",
+                 "options": [{"value": "k8s", "label": "Kubernetes"}, {"value": "compose", "label": "Docker Compose"}]}
+            ]
+        }),
+    )
+}
+
+/// What the client was told while the task waits: the status message's parts.
+async fn status_parts(server: &Server, task_id: &str) -> Vec<Part> {
+    let task = server
+        .coder
+        .backend
+        .get(&Caller::new("token-0"), task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    task.status.message.map(|m| m.parts).unwrap_or_default()
+}
+
+/// Send `message` and read the stream until the task waits (or ends).
+async fn until_it_waits(server: &Server, message: Message) -> Seen {
+    let mut stream = server
+        .client
+        .send_streaming_message(&request(message))
+        .await
+        .unwrap();
+    let mut seen = Seen::default();
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await
+        .expect("the stream ends when the task waits")
+    {
+        seen.record(item.unwrap());
+    }
+    seen
+}
+
+/// The person's screen (the orchestrator) sends the catalog inline; the coder asks three questions at
+/// once as **one form**; the answers come back as one A2UI action and are what the model reads; it goes
+/// on. Over HTTP, through the official client, so the metadata travels as an A2A server gets it.
+async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![three_questions()])
+        .push_text("Going with Postgres, Keycloak and Compose.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = until_it_waits(
+        &server,
+        from_the_screen("[mock:choices] set up the project", true, None),
+    )
+    .await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    let parts = status_parts(&server, &seen.task_id).await;
+    assert_eq!(parts.len(), 2, "the question and its form: {parts:?}");
+    assert_eq!(
+        parts[0].as_text(),
+        Some("Three quick questions before I start")
+    );
+    assert_eq!(
+        parts[1].media_type.as_deref(),
+        Some("application/a2ui+json")
+    );
+    let a2a::PartContent::Data(surface) = &parts[1].content else {
+        panic!("the second part is the form: {parts:?}");
+    };
+    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    assert_eq!(
+        surface[0]["createSurface"]["catalogId"],
+        catalog["catalogId"]
+    );
+    let choices = &surface[1]["updateComponents"]["components"][0];
+    assert_eq!(choices["component"], "Choices");
+    assert_eq!(
+        choices["questions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|q| q["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["db", "auth", "deploy"]
+    );
+    // The model was offered the screen's tools beside the coder's.
+    let offered: Vec<String> = mock.requests()[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(
+        offered[offered.len() - 3..],
+        ["ask_user", "show", "ui_catalog"],
+        "{offered:?}"
+    );
+
+    // The person answers all three with one action on the same task.
+    let surface_id = surface[0]["createSurface"]["surfaceId"].as_str().unwrap();
+    let response = server
+        .client
+        .send_message(&request(answers_to(
+            &seen.task_id,
+            surface_id,
+            json!([
+                {"id": "db", "values": ["pg"]},
+                {"id": "auth", "values": ["keycloak"]},
+                {"id": "deploy", "values": ["compose"]}
+            ]),
+        )))
+        .await
+        .unwrap();
+    assert!(matches!(response, SendMessageResponse::Task(_)));
+    let run = run_id(&seen.task_id);
+    let view = wait_for(&server.coder.runtime, run, "the run waits again", |v| {
+        v.waiting && v.version > 3
+    })
+    .await;
+    worker.stop().await;
+
+    // What the model read as the result of its question, and what it said next.
+    assert_eq!(
+        mock.requests()[1].messages.last(),
+        Some(&adam_model::Message::tool_result(
+            "choices-call-1",
+            "The person answered through the interface:\n- db: pg\n- auth: keycloak\n- deploy: compose"
+        ))
+    );
+    let parts = status_parts(&server, &seen.task_id).await;
+    assert_eq!(
+        parts.first().and_then(Part::as_text),
+        Some("Going with Postgres, Keycloak and Compose.")
+    );
+    assert_eq!(parts.len(), 1, "a plain text question, no form");
+    // The catalog came inline: it is in the run's context, the grant is not (none was sent).
+    let state: Conversation = serde_json::from_value(view.state).unwrap();
+    assert!(state.context.contains_key("vymalo.ui.catalog"));
+    assert!(!state.context.contains_key("vymalo.threadTools"));
+}
+
+/// The message only says which catalog is current; the grant lets the coder read it from the
+/// conversation's tool endpoint (once), and the endpoint's tools are offered to the model.
+async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_offered(
+    store: DynStore,
+) {
+    let lock: serde_json::Value = serde_json::from_str(CATALOG_LOCK).unwrap();
+    let catalog: serde_json::Value = serde_json::from_str(CATALOG).unwrap();
+    let thread = adam_mcp_testkit::ThreadToolsServer::start(&["thread-token"]).await;
+    thread.set_catalog(Some((
+        catalog["catalogId"].as_str().unwrap(),
+        lock["version"].as_u64().unwrap(),
+        lock["digest"].as_str().unwrap(),
+        catalog.clone(),
+    )));
+    thread.add_tool(
+        "relay__search",
+        "Search the web.",
+        json!({"type": "object"}),
+        "found",
+    );
+
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![three_questions()]);
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let grant = json!({
+        "url": thread.url("thread-1"), "token": "thread-token", "expiresAt": "2999-01-01T00:00:00Z"});
+
+    let seen = until_it_waits(
+        &server,
+        from_the_screen("[mock:choices] set up the project", false, Some(grant)),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    assert_eq!(
+        status_parts(&server, &seen.task_id).await.len(),
+        2,
+        "the form was drawn: the catalog was read again"
+    );
+    assert_eq!(thread.catalog_requests(), [None], "once");
+    let offered: Vec<String> = mock.requests()[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(
+        offered[offered.len() - 2..],
+        ["get_ui_catalog", "relay__search"],
+        "the endpoint's tools come after the coder's own: {offered:?}"
+    );
+    // The token went to the endpoint and nowhere the model or the client can read it.
+    assert!(
+        thread
+            .authorizations()
+            .iter()
+            .all(|a| a == "Bearer thread-token")
+    );
+    assert!(!format!("{:?}", mock.requests()).contains("thread-token"));
+    let client_saw = format!(
+        "{:?}{:?}{:?}",
+        seen.messages,
+        seen.artifacts,
+        status_parts(&server, &seen.task_id).await
+    );
+    assert!(!client_saw.contains("thread-token"), "{client_saw}");
+}
+
+/// A screen the coder cannot read (the catalog is only referenced and there is no grant): the form
+/// cannot be drawn, so the options are in the question's text.
+async fn a_screen_the_coder_cannot_read_gets_the_options_as_text(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![three_questions()]);
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+    let seen = until_it_waits(
+        &server,
+        from_the_screen("[mock:choices] set up the project", false, None),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    let parts = status_parts(&server, &seen.task_id).await;
+    assert_eq!(parts.len(), 1, "text only: {parts:?}");
+    let text = parts[0].as_text().unwrap();
+    assert!(
+        text.contains("1. Which database?")
+            && text.contains("a) Postgres")
+            && text.contains("3. Where does it run?"),
+        "{text}"
+    );
+}
+
 // ------------------------------------------------------- one suite per store
 
 /// Every case runs once per store: in memory always, and on PostgreSQL when
@@ -2886,6 +3201,9 @@ macro_rules! coder_suite {
                 wrong_token_on_the_coder_router_is_401,
                 another_caller_cannot_see_or_resume_the_task,
                 a_second_task_continues_the_first_tasks_branch_and_pull_request,
+                three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on,
+                the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_offered,
+                a_screen_the_coder_cannot_read_gets_the_options_as_text,
                 a_continued_task_refuses_what_only_the_model_or_a_fence_mentions,
                 a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request_alone,
                 a_continued_task_finds_the_branch_in_the_history_when_the_earlier_notes_are_gone,

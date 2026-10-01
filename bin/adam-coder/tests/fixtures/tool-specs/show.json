@@ -1,0 +1,35 @@
+{
+  "name": "show",
+  "description": "Show the person something on their screen, beside your text answer: a list of blocks, each a component of the screen with its properties, drawn one under the other (at most 16). Call `ui_catalog` first to learn the components and their properties; a block that breaks a component's schema is refused with the reason, and you can correct it. Use it when a card, a list or a diagram says it better than text; the result is \"Shown to the person.\", and you still answer in text.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "blocks": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 16,
+        "description": "The blocks, top to bottom",
+        "items": {
+          "type": "object",
+          "properties": {
+            "component": {
+              "type": "string",
+              "description": "A component name from `ui_catalog`"
+            }
+          },
+          "required": [
+            "component"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "title": {
+        "type": "string",
+        "description": "A heading drawn above the blocks"
+      }
+    },
+    "required": [
+      "blocks"
+    ]
+  }
+}

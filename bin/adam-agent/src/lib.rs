@@ -8,7 +8,6 @@ mod error;
 pub mod exit;
 pub mod folder;
 mod serve;
-pub mod tools;
 
 pub use agent::{VERSION, WorkerParts, agents, assemble, card_of};
 pub use config::{Config, ConfigError, McpSettings, WorkerConfig};

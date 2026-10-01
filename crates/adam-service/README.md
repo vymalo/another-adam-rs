@@ -36,8 +36,8 @@ an agent does.
 | `parse_or`, `parse_flag`, `is_worker_id` | the helpers a binary parses its own variables with, into the same list of problems |
 | `ConfigError { problems }` | what a non-empty list becomes (`ConfigError::check(problems)`); `Classify` gives `Invalid` |
 | `RuntimeOptions`, `LiveSignals` | how the runtime is set up (worker id, claim scope, concurrency, lease, poll), and how a process learns of other processes (`LiveSignals::local()` or the Postgres `NOTIFY` ones `serve` builds) |
-| `Service { runtime, backend }` | `Service::new(builder, name, options)`, `new_with(.., live)`, `router(card, auth)`, `run_worker(shutdown)`; `router(&backend, card, auth)` for a composition that holds the parts itself |
-| `Agents::new(name, register)` | the agent a process serves: its name, `.card(card)`, `.options(options)`, and `register`, a closure that puts it on the runtime builder (`Assembly::register`, or the starter only for a control plane) |
+| `Service { runtime, backend }` | `Service::new(builder, name, options)`, `new_with(.., live)`, `with_inbound(Option<InboundFn>)` (how an A2A message becomes the agent's input), `router(card, auth)`, `run_worker(shutdown)`; `router(&backend, card, auth)` for a composition that holds the parts itself |
+| `Agents::new(name, register)` | the agent a process serves: its name, `.card(card)`, `.options(options)`, `.inbound(f)` (read A2A messages with `f`, e.g. `adam_a2a_runtime::vymalo_inbound` for an agent behind a screen; the default is `default_inbound`), and `register`, a closure that puts it on the runtime builder (`Assembly::register`, or the starter only for a control plane) |
 | `serve(&config, agents, shutdown)` | the whole process, until `shutdown` resolves; `ServeError` on failure |
 | `ServeError` | `Connect`, `Migrate`, `NoCard`, `Bind`, `LocalAddr`, `Host`. The message names the step; the cause is the `source`, so a chain printed whole says it once |
 | `claim_scope_for(placement)` | `Pinned` for a placement that pins runs, `Any` otherwise |
@@ -70,7 +70,7 @@ sequenceDiagram
   participant P as Postgres
   participant H as Host (adam-host)
   B->>B: parse the configuration, read the agent's files, assemble the agent
-  B->>S: serve(config, Agents { name, card, register, options }, shutdown)
+  B->>S: serve(config, Agents { name, card, register, options, inbound }, shutdown)
   S->>P: connect, migrate
   S->>S: PgNotify (LISTEN/NOTIFY) as LiveSignals
   S->>S: Service::new_with(register(Runtime::builder(store)), name, options, live)

@@ -1,12 +1,77 @@
 {
   "name": "ask_user",
-  "description": "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific.",
+  "description": "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific. To ask several questions with fixed answers at once, pass `choices`: the person gets one form with a list of options per question and answers them together; their answers come back as the result. Without `choices` the question is plain text.",
   "parameters": {
     "type": "object",
     "properties": {
       "question": {
         "type": "string",
         "description": "What you need to know"
+      },
+      "choices": {
+        "type": "array",
+        "maxItems": 8,
+        "description": "Questions with fixed answers, asked together as one form (at most 8). Omit for an open question.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "description": "A short id for the question (letters, digits, - _ . :), used in the answer; defaults to q1, q2, ..."
+            },
+            "question": {
+              "type": "string",
+              "description": "The question"
+            },
+            "options": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 8,
+              "description": "The answers to pick from: 2 to 8, each a label or {value, label, description}",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "value": {
+                        "type": "string",
+                        "description": "A short id for the option (letters, digits, - _ . :); made from the label when omitted"
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "description": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "label"
+                    ]
+                  }
+                ]
+              }
+            },
+            "multiple": {
+              "type": "boolean",
+              "description": "Several options may be picked"
+            },
+            "allowOther": {
+              "type": "boolean",
+              "description": "Offer an \"Other\" the person can write"
+            },
+            "required": {
+              "type": "boolean",
+              "description": "The person must answer this one (the default)"
+            }
+          },
+          "required": [
+            "question",
+            "options"
+          ]
+        }
       }
     },
     "required": [

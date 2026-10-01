@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig};
+use adam_a2a_runtime::InboundFn;
 use adam_core::{ClaimScope, DynStore, StoreError};
 use adam_host::{Host, HostError, Placement};
 use adam_notify_postgres::PgNotify;
@@ -64,6 +65,11 @@ pub struct Agents {
     pub register: Register,
     /// How the runtime is set up: worker id, claim scope, concurrency.
     pub options: RuntimeOptions,
+    /// How an A2A message becomes the agent's input. `None`: the default reading
+    /// ([`default_inbound`](adam_a2a_runtime::default_inbound)). An agent that serves a screen
+    /// sets [`vymalo_inbound`](adam_a2a_runtime::vymalo_inbound). Only the roles that serve A2A
+    /// use it.
+    pub inbound: Option<InboundFn>,
 }
 
 impl Agents {
@@ -77,6 +83,7 @@ impl Agents {
             card: None,
             register: Box::new(register),
             options: RuntimeOptions::default(),
+            inbound: None,
         }
     }
 
@@ -100,6 +107,17 @@ impl Agents {
         self.options = options;
         self
     }
+
+    /// Read A2A messages with `f` instead of the default: how a message becomes the agent's
+    /// input, for the roles that serve A2A. See [`Agents::inbound`](struct@Agents#structfield.inbound).
+    #[must_use]
+    pub fn inbound(
+        mut self,
+        f: impl Fn(&a2a::Message) -> Result<adam_runtime::Inbound, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.inbound = Some(std::sync::Arc::new(f));
+        self
+    }
 }
 
 impl std::fmt::Debug for Agents {
@@ -108,6 +126,7 @@ impl std::fmt::Debug for Agents {
             .field("name", &self.name)
             .field("card", &self.card.is_some())
             .field("options", &self.options)
+            .field("inbound", &self.inbound.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -198,6 +217,7 @@ pub async fn serve(
         card,
         register,
         options,
+        inbound,
     } = agents;
     if role.runs_control_plane() && card.is_none() {
         return Err(ServeError::NoCard);
@@ -224,7 +244,8 @@ pub async fn serve(
     };
     let workers = role.runs_workers().then_some(options.concurrency);
     let worker_id = options.worker_id.clone();
-    let service = Service::new_with(register(Runtime::builder(store)), name, &options, live);
+    let service = Service::new_with(register(Runtime::builder(store)), name, &options, live)
+        .with_inbound(inbound);
 
     // Bind before anything runs: an address that cannot be bound fails the process at once.
     let listener = TcpListener::bind(config.listen_addr)

@@ -4,13 +4,13 @@
 use adam::mcp::McpPolicy;
 use adam::{AgentDef, Assembly};
 use adam_a2a::AgentCardConfig;
-use adam_llm_agent::{LlmStarter, tools};
+use adam_llm_agent::LlmStarter;
 use adam_model::DynModel;
 use adam_service::{Agents, RuntimeOptions};
+use adam_ui::Ui;
 use url::Url;
 
 use crate::error::AgentError;
-use crate::tools::AskUser;
 
 /// The version a card advertises: this crate's.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -24,6 +24,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// [`AgentError::Card`] when the folder declares neither `description` nor `card.description`.
 pub fn card_of(def: &AgentDef, public_url: &Url) -> Result<AgentCardConfig, AgentError> {
     def.card(public_url.clone(), VERSION)
+        .map(adam_ui::with_card_extensions)
         .map_err(|e| AgentError::Card(Box::new(e)))
 }
 
@@ -62,9 +63,14 @@ pub async fn assemble(
         .connect_mcp(mcp)
         .await
         .map_err(|e| AgentError::Mcp(Box::new(e)))?;
+    // The person's screen as tools (`ask_user` with choices, `show`, `ui_catalog`) and the tools of the
+    // conversation's endpoint, offered at every model turn. The endpoint is an MCP server: the
+    // deployment's policy decides whether its URL may be plain `http`.
+    let ui = Ui::new(mcp.clone());
     let bound = def
-        .bind(tools![AskUser])
-        .map_err(|e| AgentError::Assembly(Box::new(e)))?;
+        .bind(ui.tools())
+        .map_err(|e| AgentError::Assembly(Box::new(e)))?
+        .tool_source(ui.source());
     bound
         .model(model, alias)
         .map_err(|e| AgentError::Assembly(Box::new(e)))
@@ -98,5 +104,9 @@ pub async fn agents(
             Agents::new(name, move |builder| builder.starter(starter))
         }
     };
-    Ok(agents.card_if(card))
+    // The person's screen is the sender: their answers through a form, and the catalog and the tools of
+    // the conversation, reach the run (the extensions the card lists).
+    Ok(agents
+        .card_if(card)
+        .inbound(adam_a2a_runtime::vymalo_inbound))
 }

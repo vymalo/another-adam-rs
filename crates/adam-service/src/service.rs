@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig};
-use adam_a2a_runtime::RuntimeTaskBackend;
+use adam_a2a_runtime::{InboundFn, RuntimeTaskBackend};
 use adam_core::ClaimScope;
 use adam_runtime::{
     BroadcastSink, DynEventSink, DynNotifier, Runtime, RuntimeBuilder, RuntimeError,
@@ -139,6 +139,16 @@ impl Service {
         let backend = RuntimeTaskBackend::new(runtime.clone(), broadcast, name)
             .with_poll_interval(options.poll_interval);
         Self { runtime, backend }
+    }
+
+    /// Read A2A messages with `inbound` instead of the default
+    /// ([`default_inbound`](adam_a2a_runtime::default_inbound)); `None` changes nothing.
+    #[must_use]
+    pub fn with_inbound(mut self, inbound: Option<InboundFn>) -> Self {
+        if let Some(inbound) = inbound {
+            self.backend = self.backend.with_inbound(move |message| inbound(message));
+        }
+        self
     }
 
     /// Advance runs until `shutdown` resolves; in-flight steps finish first.

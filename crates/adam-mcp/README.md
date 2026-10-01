@@ -38,9 +38,54 @@ own.
 | `Error` | closed enum, every variant names the server and none carries a value from a variable: `Var`, `StdioNotAllowed`, `SseUnsupported`, `Url`, `UrlSecret` (names the variable), `Header`, `Name`, `Spawn`, `Connect`, `ListTools`, `UnknownTool` |
 | `VarProblem`, `UrlProblem` | closed enums inside `Error::Var` and `Error::Url` |
 | `MAX_RESULT_BYTES` | 64 KiB: the most of an answer that reaches the model |
+| `Endpoint::new(url, &SecretString, &McpPolicy)`, `list_tools()`, `call_tool(name, args)`, `EndpointError`, `RemoteTool`, `RemoteResult` | one MCP endpoint a **message** announced, with a bearer token known only at run time, one connection per request: see *An endpoint a message announces* |
 
 `Connect`, `Spawn` and `ListTools` are `ErrorClass::Transient` (the server may be up later); every other variant is
 `Invalid` (the same files and policy never succeed).
+
+## An endpoint a message announces
+
+The servers of an `mcp.json` are known when the process starts, connected once and kept. The per-thread tool
+endpoint of the orchestration layer is not: a **message** carries its URL and a short-lived token, it exists for one
+conversation, and the replica that steps the next turn may not be the one that read the message. `Endpoint` is the
+client for that: it opens a connection for each request (initialize, the request, close), keeps nothing, and sends
+the token as `Authorization: Bearer` on every request of the connection. The server is expected to be stateless
+(*verified 2026-10-01* against rmcp 3.5's own server over a `NeverSessionManager`, mounted with `route_service` on a
+parametrised path, in `tests/endpoint.rs`).
+
+```mermaid
+sequenceDiagram
+    participant C as caller
+    participant E as Endpoint
+    participant S as MCP endpoint (stateless)
+    C->>E: list_tools(), or call_tool(name, args)
+    E->>S: initialize (Authorization: Bearer token)
+    S-->>E: initialized
+    E->>S: tools/list, or tools/call
+    S-->>E: the tools, or the result (isError, text, structuredContent)
+    E->>S: close
+    E-->>C: RemoteTool list, or RemoteResult, or an EndpointError with the token scrubbed
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Made: Endpoint new (URL checked under the policy)
+    Made --> Refused: plain http to another machine, credentials in the URL, a token that is no header value
+    Made --> Connecting: a request
+    Connecting --> Answered: initialized, the request answered
+    Connecting --> Unauthorized: HTTP 401 or 403
+    Connecting --> TimedOut: no answer within the connect or call timeout
+    Connecting --> Failed: the connection or the exchange failed
+    Answered --> [*]: closed
+```
+
+The URL goes through the same rules as a remote server's (https, or plain `http` only to this machine unless
+`McpPolicy::allow_insecure`; no credentials in it), and the token is registered with the redactor: **no error and no
+result text carries it**, and `Debug` shows the URL without its query. The call has no retry and no idempotency key,
+as for any MCP call; a tool that ran and failed is a `RemoteResult` with `is_error`, and a protocol error (an unknown
+tool) is `EndpointError::Rejected`. A 401 is told apart from other failures by the text the transport reports (the
+SDK gives no status code in a type); a wrong guess only changes the wording of an error. `adam-ui`'s thread-tools
+client is its user.
 
 ## What `mcp.json` means here
 
@@ -264,6 +309,12 @@ per test): none relies on another test's runtime to reap a process or to install
   restarted between two calls (four POSTs exactly, counted by the testkit: no request is sent again after a `404`,
   which `reinit_on_expired_session(true)` would do and the test then fails); a slow
   call as an error result while the session stays usable; cancellation returning at once; shutdown.
+* `tests/endpoint.rs`: against the testkit's fake thread-tools endpoint: listing and listing again after the tools
+  change (one `initialize` per request), a call with its structured content and its text, a tool that failed (`isError`)
+  and an unknown tool (`Rejected`), arguments reaching the tool, the token on every request and never shown, a token
+  the endpoint does not accept (`Unauthorized`, nothing called), an endpoint that is down, a call that times out, plain
+  `http` to another machine refused before anything is sent. Unit tests in `src/once.rs`: the URL policy, `Debug`, the
+  listed tool's defaults, the wording of a 401.
 * `tests/stdio.rs` (testkit): list and call over stdio; declared `env` expanded into the child (what the child
   reports comes back as `[REDACTED]`, which also proves it holds the value); the child does not
   inherit the environment (`CARGO`) unless asked; stdio refused without the opt-in; a missing command; a child

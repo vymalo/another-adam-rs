@@ -1,0 +1,48 @@
+[
+  {
+    "version": "v0.9.1",
+    "createSurface": {
+      "surfaceId": "ask-choices-call-1",
+      "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat"
+    }
+  },
+  {
+    "version": "v0.9.1",
+    "updateComponents": {
+      "surfaceId": "ask-choices-call-1",
+      "components": [
+        {
+          "id": "root",
+          "component": "Choices",
+          "questions": [
+            {
+              "id": "db",
+              "question": "Which database?",
+              "options": [
+                {"value": "pg", "label": "Postgres"},
+                {"value": "sqlite", "label": "SQLite"}
+              ]
+            },
+            {
+              "id": "auth",
+              "question": "Which login?",
+              "options": [
+                {"value": "keycloak", "label": "Keycloak"},
+                {"value": "none", "label": "No login"}
+              ]
+            },
+            {
+              "id": "deploy",
+              "question": "Where does it run?",
+              "options": [
+                {"value": "k8s", "label": "Kubernetes"},
+                {"value": "compose", "label": "Docker Compose"}
+              ]
+            }
+          ],
+          "action": {"event": {"name": "answer"}}
+        }
+      ]
+    }
+  }
+]

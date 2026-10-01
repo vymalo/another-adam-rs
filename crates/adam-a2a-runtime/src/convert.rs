@@ -1,8 +1,10 @@
 //! Pure mappings between the runtime's durable view of a run and A2A types.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use a2a::{Artifact, Message, Part, Role, Task, TaskState, TaskStatus};
+use adam_a2a::A2UI_MEDIA_TYPE;
 use adam_core::RunStatus;
 use adam_runtime::{Inbound, RunView};
 use serde_json::{Value, json};
@@ -116,6 +118,34 @@ fn state_name(state: &TaskState) -> &'static str {
     }
 }
 
+/// The interface that comes with the question of a run waiting for input: an array of A2UI
+/// messages at `state.pending_wait.ui` (what `adam_llm_agent::PendingQuestion::ui` stores), only
+/// while the run is `input-required` and only when it is a non-empty array.
+fn status_ui<'v>(view: &'v RunView, state: &TaskState) -> Option<&'v Value> {
+    (*state == TaskState::InputRequired)
+        .then(|| view.state.pointer("/pending_wait/ui"))
+        .flatten()
+        .filter(|ui| ui.as_array().is_some_and(|a| !a.is_empty()))
+}
+
+/// A short digest of the interface, for the status message id and the "did anything change" key:
+/// two statuses with the same question and different interfaces are different statuses.
+fn ui_digest(ui: &Value) -> String {
+    let digest = Sha256::digest(serde_json::to_vec(ui).unwrap_or_default());
+    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A data part of A2UI messages, spelled the way A2A 1.0 does (`mediaType`) and the way the A2UI
+/// extension does (`metadata.mimeType`), so that a client reads either.
+fn a2ui_part(ui: Value) -> Part {
+    let mut part = Part::data(ui).with_media_type(A2UI_MEDIA_TYPE);
+    part.metadata = Some(HashMap::from([(
+        "mimeType".to_owned(),
+        json!(A2UI_MEDIA_TYPE),
+    )]));
+    part
+}
+
 /// The message that goes with the state, if there is anything to say.
 fn status_text(view: &RunView, state: &TaskState, prompt: &PromptFn) -> Option<String> {
     match state {
@@ -136,9 +166,20 @@ pub(crate) fn status_of(view: &RunView, prompt: &PromptFn) -> TaskStatus {
     let state = task_state(view);
     // The id follows the status, not the read: every event and snapshot of the
     // same status carries the same message id.
+    let ui = status_ui(view, &state);
     let message = status_text(view, &state, prompt).map(|text| {
-        let mut message = Message::new(Role::Agent, vec![Part::text(text.clone())]);
-        message.message_id = status_message_id(&view.id.to_string(), state_name(&state), &text);
+        let mut parts = vec![Part::text(text.clone())];
+        // The interface of a question goes beside it, in a part of its own. Only a status that has
+        // one gets the digest in its id, so every other id is what it was.
+        let id_text = match ui {
+            Some(ui) => {
+                parts.push(a2ui_part(ui.clone()));
+                format!("{text}\u{0}ui:{}", ui_digest(ui))
+            }
+            None => text,
+        };
+        let mut message = Message::new(Role::Agent, parts);
+        message.message_id = status_message_id(&view.id.to_string(), state_name(&state), &id_text);
         message
     });
     TaskStatus {
@@ -148,9 +189,18 @@ pub(crate) fn status_of(view: &RunView, prompt: &PromptFn) -> TaskStatus {
     }
 }
 
-/// What distinguishes two statuses for "did anything change": the state and
-/// the message text.
-pub(crate) fn status_key(status: &TaskStatus) -> (TaskState, Option<String>) {
+/// What distinguishes two statuses for "did anything change": the state, the message text and a
+/// digest of the A2UI part the message carries, if any.
+pub(crate) type StatusKey = (TaskState, Option<String>, Option<String>);
+
+/// The [`StatusKey`] of `status`.
+pub(crate) fn status_key(status: &TaskStatus) -> StatusKey {
+    let ui = status.message.as_ref().and_then(|m| {
+        m.parts.iter().find_map(|part| match &part.content {
+            a2a::PartContent::Data(ui) if crate::vymalo::claims_a2ui(part) => Some(ui_digest(ui)),
+            _ => None,
+        })
+    });
     (
         status.state.clone(),
         status
@@ -158,6 +208,7 @@ pub(crate) fn status_key(status: &TaskStatus) -> (TaskState, Option<String>) {
             .as_ref()
             .and_then(|m| m.text())
             .map(str::to_owned),
+        ui,
     )
 }
 
@@ -192,10 +243,18 @@ pub fn artifact_of(artifact: &adam_runtime::Artifact) -> Artifact {
         Value::String(s) => Part::text(s.clone()),
         other => Part::data(other.clone()),
     };
-    let part = match &artifact.mime_type {
+    let mut part = match &artifact.mime_type {
         Some(mime) => part.with_media_type(mime.clone()),
         None => part,
     };
+    // A2UI messages are also marked the way the A2UI extension marks them, so a client that reads
+    // only `metadata.mimeType` finds them.
+    if artifact.mime_type.as_deref() == Some(A2UI_MEDIA_TYPE) {
+        part.metadata = Some(HashMap::from([(
+            "mimeType".to_owned(),
+            json!(A2UI_MEDIA_TYPE),
+        )]));
+    }
     let mut parts = vec![part];
     if let Some(url) = link_of(&artifact.data) {
         parts.push(Part::url(url));
@@ -375,6 +434,107 @@ mod tests {
         let mut other_task = v.clone();
         other_task.id = adam_core::RunId::new();
         assert_ne!(id(&v), id(&other_task));
+    }
+
+    fn ui() -> Value {
+        json!([{"version": "v0.9.1", "createSurface": {"surfaceId": "s", "catalogId": "c"}}])
+    }
+
+    fn parked_with(ui: Option<Value>) -> RunView {
+        let mut v = view(RunStatus::Parked);
+        // One run: the ids of its statuses differ only by what the statuses say.
+        v.id = adam_core::RunId(uuid::Uuid::nil());
+        let mut wait = json!({"call_id": "c1", "tool": "ask", "question": "which branch?"});
+        if let Some(ui) = ui {
+            wait["ui"] = ui;
+        }
+        v.state = json!({ "pending_wait": wait });
+        v
+    }
+
+    #[test]
+    fn a_question_with_an_interface_carries_it_in_a_part_of_its_own() {
+        let v = parked_with(Some(ui()));
+        let status = status_of(&v, &prompt());
+        let message = status.message.expect("a message");
+        assert_eq!(message.parts.len(), 2);
+        assert_eq!(message.text(), Some("which branch?"));
+        assert_eq!(message.parts[1].content, a2a::PartContent::Data(ui()));
+        assert_eq!(
+            message.parts[1].media_type.as_deref(),
+            Some(A2UI_MEDIA_TYPE)
+        );
+        assert_eq!(
+            message.parts[1]
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("mimeType")),
+            Some(&json!(A2UI_MEDIA_TYPE))
+        );
+        // The same read gives the same id (the id follows the status, not the read).
+        assert_eq!(
+            message.message_id,
+            status_of(&v, &prompt()).message.unwrap().message_id
+        );
+    }
+
+    #[test]
+    fn the_interface_makes_the_status_another_status_and_a_status_without_one_is_unchanged() {
+        let with = status_of(&parked_with(Some(ui())), &prompt());
+        let mut other = ui();
+        other[0]["createSurface"]["surfaceId"] = json!("t");
+        let other = status_of(&parked_with(Some(other)), &prompt());
+        let without = status_of(&parked_with(None), &prompt());
+        let id = |s: &TaskStatus| s.message.as_ref().unwrap().message_id.clone();
+        assert_ne!(id(&with), id(&without));
+        assert_ne!(id(&with), id(&other));
+        assert_ne!(status_key(&with), status_key(&without));
+        assert_ne!(status_key(&with), status_key(&other));
+        assert_eq!(status_key(&with), status_key(&with));
+        // Every status that has no interface is exactly what it was before interfaces existed.
+        let v = parked_with(None);
+        assert_eq!(
+            id(&without),
+            status_message_id(&v.id.to_string(), "input-required", "which branch?")
+        );
+        assert_eq!(without.message.as_ref().unwrap().parts.len(), 1);
+        assert_eq!(status_key(&without).2, None);
+    }
+
+    #[test]
+    fn only_a_non_empty_array_of_a_question_in_input_required_is_an_interface() {
+        for not_ui in [json!([]), json!({"a": 1}), json!("x"), Value::Null] {
+            let status = status_of(&parked_with(Some(not_ui.clone())), &prompt());
+            assert_eq!(status.message.unwrap().parts.len(), 1, "{not_ui}");
+        }
+        // A run that is no longer waiting says nothing of the interface it once had.
+        let mut done = parked_with(Some(ui()));
+        done.status = RunStatus::Done;
+        done.output = Some(json!({"text": "ok"}));
+        assert_eq!(status_of(&done, &prompt()).message.unwrap().parts.len(), 1);
+    }
+
+    #[test]
+    fn an_a2ui_artifact_is_marked_in_both_spellings() {
+        let artifact = artifact_of(&RunArtifact {
+            name: "ui".into(),
+            mime_type: Some(A2UI_MEDIA_TYPE.into()),
+            data: ui(),
+        });
+        let part = &artifact.parts[0];
+        assert_eq!(part.media_type.as_deref(), Some(A2UI_MEDIA_TYPE));
+        assert_eq!(
+            part.metadata.as_ref().and_then(|m| m.get("mimeType")),
+            Some(&json!(A2UI_MEDIA_TYPE))
+        );
+        assert_eq!(part.content, a2a::PartContent::Data(ui()));
+        // Any other artifact carries no part metadata.
+        let other = artifact_of(&RunArtifact {
+            name: "d".into(),
+            mime_type: Some("application/json".into()),
+            data: json!({"k": 1}),
+        });
+        assert!(other.parts[0].metadata.is_none());
     }
 
     #[test]

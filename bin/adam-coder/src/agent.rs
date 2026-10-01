@@ -20,7 +20,7 @@ use crate::redact::Redactor;
 use crate::tools::named::{key_of_argument, named_in, without_untrusted};
 use crate::tools::notes::{PushedBranch, RunNotes};
 use crate::tools::publish::{COMMIT_AND_PUSH, pushed_in};
-use crate::tools::{ToolEnv, ask, coder_tools};
+use crate::tools::{ToolEnv, coder_tools};
 
 /// The agent's name, as stored in `RunRecord::agent`. It is the `name` in `agent/instructions.md`
 /// (the two are checked against each other by a unit test).
@@ -220,6 +220,8 @@ impl CoderAgent {
         let assembly = def
             .var("max_check_cycles", env.settings.max_check_cycles)
             .bind(tools.into_iter().collect::<ToolSet>())?
+            // The tools of the conversation's endpoint, offered at every model turn.
+            .tool_source(env.ui.source())
             .state(env.clone())
             .model(model, model_alias)?;
         Ok(Self { assembly, env })
@@ -406,7 +408,7 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
             Message::Tool { .. } => {
                 if answers
                     .next()
-                    .is_some_and(|call| call.name == ask::TOOL_NAME)
+                    .is_some_and(|call| call.name == adam_ui::ASK_USER)
                 {
                     texts.push(message.text());
                 }
@@ -521,7 +523,7 @@ async fn stop_as_question(
     };
     let call = ToolCall {
         id: stop_call_id(state.turns),
-        name: ask::TOOL_NAME.to_owned(),
+        name: adam_ui::ASK_USER.to_owned(),
         arguments: json!({ "question": question }),
     };
     match state.messages.last_mut() {
@@ -540,6 +542,7 @@ async fn stop_as_question(
             call_id: call.id.clone(),
             tool: call.name.clone(),
             question,
+            ui: None,
         },
     ));
     state.pending_calls = vec![call];

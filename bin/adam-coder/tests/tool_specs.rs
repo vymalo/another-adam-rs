@@ -22,7 +22,7 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 9] = [
     "prepare_workspace",
     "run_command",
     "delegate_to_opencode",
@@ -30,6 +30,8 @@ const TOOLS: [&str; 7] = [
     "commit_and_push",
     "open_pull_request",
     "ask_user",
+    "show",
+    "ui_catalog",
 ];
 
 fn snapshot_path(name: &str) -> PathBuf {

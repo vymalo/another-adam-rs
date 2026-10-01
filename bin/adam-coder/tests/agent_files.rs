@@ -60,7 +60,7 @@ fn expected_prompt(cycles: u32) -> String {
 }
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 9] = [
     "prepare_workspace",
     "run_command",
     "delegate_to_opencode",
@@ -68,6 +68,8 @@ const TOOLS: [&str; 7] = [
     "commit_and_push",
     "open_pull_request",
     "ask_user",
+    "show",
+    "ui_catalog",
 ];
 
 async fn coder(cycles: u32) -> (Fixture, CoderAgent) {
@@ -218,10 +220,14 @@ async fn a_model_alias_the_assembly_refuses_is_an_error_not_a_panic_for_try_new(
 async fn the_assemblys_card_is_the_card_a_control_plane_serves() {
     let (_fx, agent) = coder(3).await;
     let url: url::Url = "https://agents.example.com/coder/".parse().unwrap();
-    let assembled = agent
-        .assembly()
-        .card(url.clone(), env!("CARGO_PKG_VERSION"))
-        .unwrap();
+    // The assembly knows nothing of the screen: the card of the process adds the extensions the
+    // screen's tools need.
+    let assembled = adam_ui::with_card_extensions(
+        agent
+            .assembly()
+            .card(url.clone(), env!("CARGO_PKG_VERSION"))
+            .unwrap(),
+    );
     assert_eq!(format!("{assembled:?}"), format!("{:?}", agent_card(&url)));
 }
 

@@ -17,13 +17,14 @@ use adam_runtime::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::conversation::{
     ArtifactRef, Conversation, PendingQuestion, PendingRemote, PendingRun, PendingWait,
-    parse_user_text,
+    parse_context, parse_user_text,
 };
 use crate::history::fit_history;
+use crate::source::{DynToolSource, SourceCtx, ToolSource, offered};
 use crate::state::Extensions;
 use crate::tool::{DynTool, RemotePoll, Tool, ToolCtx, ToolError, ToolOutput};
 use crate::toolset::ToolSet;
@@ -98,6 +99,7 @@ pub struct LlmAgentBuilder {
     model_alias: String,
     instructions: Option<String>,
     tools: Vec<DynTool>,
+    sources: Vec<DynToolSource>,
     limits: Limits,
     extensions: Extensions,
     wait_poll: Duration,
@@ -157,6 +159,18 @@ impl LlmAgentBuilder {
         tools
             .into_iter()
             .fold(self, |builder, tool| builder.dyn_tool(tool))
+    }
+
+    /// Add a [`ToolSource`]: tools the agent learns about while it runs, offered to the model on
+    /// every turn after the agent's own tools. Sources are asked in the order they were added.
+    pub fn tool_source(self, source: impl ToolSource) -> Self {
+        self.dyn_tool_source(Arc::new(source))
+    }
+
+    /// Add an already shared [`ToolSource`].
+    pub fn dyn_tool_source(mut self, source: DynToolSource) -> Self {
+        self.sources.push(source);
+        self
     }
 
     /// Share `value` with the tools: they read it with
@@ -274,6 +288,7 @@ impl LlmAgentBuilder {
             model_alias: self.model_alias,
             instructions: self.instructions,
             tools,
+            sources: self.sources,
             index,
             specs,
             limits: self.limits,
@@ -369,6 +384,7 @@ pub struct LlmAgent {
     model_alias: String,
     instructions: Option<String>,
     tools: Vec<DynTool>,
+    sources: Vec<DynToolSource>,
     index: HashMap<String, usize>,
     specs: Vec<ToolSpec>,
     limits: Limits,
@@ -422,6 +438,7 @@ impl LlmAgent {
             model_alias: model_alias.into(),
             instructions: None,
             tools: Vec::new(),
+            sources: Vec::new(),
             limits: Limits::default(),
             extensions: Extensions::new(),
             wait_poll: DEFAULT_WAIT_POLL,
@@ -446,7 +463,13 @@ impl LlmAgent {
         let mut texts = Vec::new();
         for inbound in inbox {
             match parse_user_text(&inbound.payload) {
-                Ok(text) => texts.push(text),
+                Ok(text) => {
+                    // What the message says about its sender is read along with what it says.
+                    if let Some(context) = parse_context(&inbound.payload) {
+                        state.merge_context(context);
+                    }
+                    texts.push(text);
+                }
                 Err(reason) => {
                     tracing::warn!(inbound = %inbound.id, kind = %inbound.kind, %reason, "ignoring unreadable inbound message");
                 }
@@ -568,8 +591,23 @@ impl LlmAgent {
             (self.limits.max_output_tokens > 0).then_some(self.limits.max_output_tokens);
 
         let model = self.model.clone();
+        let sources = self.sources.clone();
+        let source_ctx = (!sources.is_empty()).then(|| {
+            SourceCtx::new(
+                ctx.run_id(),
+                ctx.conversation_id().map(str::to_owned),
+                Arc::new(state.context.clone()),
+            )
+        });
         let recorded: Result<ModelResponse, ModelFailure> = ctx
             .step(&format!("model:{}", state.turns), move || async move {
+                // The sources are read here, inside the step, so that a replay of a turn whose model
+                // call is recorded does not read them again: only the answer is journaled, not the
+                // tools it was given.
+                if let Some(source_ctx) = &source_ctx {
+                    let more = offered(&sources, source_ctx, &request.tools).await;
+                    request.tools.extend(more);
+                }
                 model.complete(request).await.map_err(ModelFailure::from)
             })
             .await?;
@@ -652,9 +690,9 @@ impl LlmAgent {
         notices: &[(RunId, ChildStatus)],
     ) -> Result<Flow, AgentError> {
         while let Some(call) = state.pending_calls.first().cloned() {
-            let (message, artifacts) = match self.run_tool(ctx, &call).await? {
+            let (message, artifacts) = match self.run_tool(ctx, &state.context, &call).await? {
                 ToolResult::Answered { message, artifacts } => (message, artifacts),
-                ToolResult::NeedsInput(question) => {
+                ToolResult::NeedsInput { question, ui } => {
                     ctx.emit(RunEvent::Custom {
                         kind: "input_required".into(),
                         payload: json!({ "question": question, "call_id": call.id }),
@@ -664,6 +702,7 @@ impl LlmAgent {
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
                         question,
+                        ui,
                     }));
                     return Ok(Flow::Park);
                 }
@@ -717,7 +756,12 @@ impl LlmAgent {
     }
 
     #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), tool = %call.name, call_id = %call.id))]
-    async fn run_tool(&self, ctx: &mut Ctx, call: &ToolCall) -> Result<ToolResult, AgentError> {
+    async fn run_tool(
+        &self,
+        ctx: &mut Ctx,
+        context: &Map<String, Value>,
+        call: &ToolCall,
+    ) -> Result<ToolResult, AgentError> {
         let start = |status: &'static str| RunEvent::Custom {
             kind: "tool_start".into(),
             payload: json!({ "name": call.name, "call_id": call.id, "status": status }),
@@ -725,33 +769,39 @@ impl LlmAgent {
         let end = |status: &'static str| tool_end(&call.name, &call.id, status);
         ctx.emit(start("running")).await;
 
-        let Some(tool) = self.tool(&call.name).cloned() else {
-            let known: Vec<&str> = self.specs.iter().map(|s| s.name.as_str()).collect();
-            ctx.emit(end("error")).await;
-            return Ok(ToolResult::Answered {
-                message: Message::tool_error(
-                    call.id.clone(),
-                    format!(
-                        "unknown tool `{}`; available tools: {}",
-                        call.name,
-                        if known.is_empty() {
-                            "none".to_owned()
-                        } else {
-                            known.join(", ")
-                        }
-                    ),
-                ),
-                artifacts: Vec::new(),
-            });
-        };
-
-        let tool_ctx = self.tool_ctx(ctx, &call.id, &call.name);
+        let tool_ctx = self.tool_ctx(ctx, context, &call.id, &call.name);
         let args = call.arguments.clone();
-        let outcome: Result<ToolOutput, ToolError> = ctx
-            .step(&format!("tool:{}", call.id), move || async move {
-                tool.call(&tool_ctx, args).await
-            })
-            .await?;
+        let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
+            Some(tool) => {
+                ctx.step(&format!("tool:{}", call.id), move || async move {
+                    tool.call(&tool_ctx, args).await
+                })
+                .await?
+            }
+            // A name that is none of the agent's own: an agent with no source says so at once,
+            // one with sources asks them, inside the step that records the answer.
+            None if self.sources.is_empty() => {
+                ctx.emit(end("error")).await;
+                return Ok(ToolResult::Answered {
+                    message: Message::tool_error(call.id.clone(), self.unknown_tool(&call.name)),
+                    artifacts: Vec::new(),
+                });
+            }
+            None => {
+                let sources = self.sources.clone();
+                let name = call.name.clone();
+                let unknown = self.unknown_tool(&call.name);
+                ctx.step(&format!("tool:{}", call.id), move || async move {
+                    for source in &sources {
+                        if let Some(answer) = source.call(&tool_ctx, &name, args.clone()).await {
+                            return answer;
+                        }
+                    }
+                    Ok(ToolOutput::error(unknown))
+                })
+                .await?
+            }
+        };
 
         match outcome {
             Ok(output) => {
@@ -773,9 +823,9 @@ impl LlmAgent {
                     call.name
                 )))
             }
-            Err(ToolError::NeedsInput { question }) => {
+            Err(ToolError::NeedsInput { question, ui }) => {
                 ctx.emit(end("needs_input")).await;
-                Ok(ToolResult::NeedsInput(question))
+                Ok(ToolResult::NeedsInput { question, ui })
             }
             // No end event yet: `run_pending` says "waiting", or the final status when the
             // child's message is already here.
@@ -786,8 +836,15 @@ impl LlmAgent {
         }
     }
 
-    /// The context a tool sees for the call `call_id`, made from this transition's `Ctx`.
-    fn tool_ctx(&self, ctx: &Ctx, call_id: &str, tool: &str) -> ToolCtx {
+    /// The context a tool sees for the call `call_id`, made from this transition's `Ctx` and the
+    /// run's inbound `context`.
+    fn tool_ctx(
+        &self,
+        ctx: &Ctx,
+        context: &Map<String, Value>,
+        call_id: &str,
+        tool: &str,
+    ) -> ToolCtx {
         ToolCtx::new(
             ctx.conversation_id().map(str::to_owned),
             ctx.attempt(),
@@ -797,6 +854,20 @@ impl LlmAgent {
             ctx.cancel_token(),
             Arc::clone(&self.extensions),
             Some(ctx.child_starter()),
+            Arc::new(context.clone()),
+        )
+    }
+
+    /// What the model is told when it calls a tool nobody has.
+    fn unknown_tool(&self, name: &str) -> String {
+        let known: Vec<&str> = self.specs.iter().map(|s| s.name.as_str()).collect();
+        format!(
+            "unknown tool `{name}`; available tools: {}",
+            if known.is_empty() {
+                "none".to_owned()
+            } else {
+                known.join(", ")
+            }
         )
     }
 
@@ -847,7 +918,7 @@ impl LlmAgent {
             );
             return Ok(Some("error"));
         };
-        let tool_ctx = self.tool_ctx(ctx, &wait.call_id, &wait.tool);
+        let tool_ctx = self.tool_ctx(ctx, &state.context, &wait.call_id, &wait.tool);
         let task = wait.task.clone();
         let polled: Result<RemotePoll, ToolError> = ctx
             .step(&format!("poll:{}", wait.call_id), move || async move {
@@ -916,7 +987,11 @@ async fn output_message(
 /// [`LlmAgent::init`] and [`LlmStarter::init`], so they cannot drift apart.
 fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
     let text = start_text(&input)?;
-    Ok(Conversation::new(text))
+    let mut conversation = Conversation::new(text);
+    if let Some(context) = parse_context(&input.payload) {
+        conversation.merge_context(context);
+    }
+    Ok(conversation)
 }
 
 /// The user message of a new run, continuing or not: one rule for what is accepted and how a
@@ -936,7 +1011,13 @@ fn continue_conversation(
     prior_run: RunId,
 ) -> Result<Conversation, AgentError> {
     let text = start_text(input)?;
-    Ok(prior.continued(text, prior_run))
+    let mut conversation = prior.continued(text, prior_run);
+    // The context of the run before comes along; what this message says about its sender is
+    // newer, and replaces it key by key.
+    if let Some(context) = parse_context(&input.payload) {
+        conversation.merge_context(context);
+    }
+    Ok(conversation)
 }
 
 /// The start-only half of an [`LlmAgent`]: it turns the first user message
@@ -987,7 +1068,10 @@ enum ToolResult {
         message: Message,
         artifacts: Vec<ArtifactRef>,
     },
-    NeedsInput(String),
+    NeedsInput {
+        question: String,
+        ui: Option<Value>,
+    },
     AwaitRun(RunId),
     AwaitRemote {
         task: String,
@@ -1076,6 +1160,11 @@ impl Agent for LlmAgent {
                 state,
                 wake_at: None,
             });
+        }
+        // A credential in the context does not outlive its expiry in the store.
+        let expired = state.drop_expired_context(ctx.now());
+        if expired > 0 {
+            tracing::debug!(expired, "expired entries left the run's context");
         }
 
         // A wait on a child ends with the child's message or, when woken without one (the timer,

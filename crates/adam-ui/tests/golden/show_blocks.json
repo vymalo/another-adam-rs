@@ -1,0 +1,21 @@
+[
+  {
+    "version": "v0.9.1",
+    "createSurface": {
+      "surfaceId": "show-show-call-1",
+      "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat"
+    }
+  },
+  {
+    "version": "v0.9.1",
+    "updateComponents": {
+      "surfaceId": "show-show-call-1",
+      "components": [
+        {"id": "root", "component": "Column", "children": ["title", "b1", "b2"]},
+        {"id": "title", "component": "Text", "text": "Greeting", "variant": "h3"},
+        {"id": "b1", "component": "Text", "text": "Hello"},
+        {"id": "b2", "component": "Text", "text": "World", "variant": "caption"}
+      ]
+    }
+  }
+]

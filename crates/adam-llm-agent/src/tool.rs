@@ -8,7 +8,7 @@ use adam_model::ToolSpec;
 use adam_runtime::{Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, RunEvent};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::conversation::user_message;
 use crate::state::{Extensions, State, StateKey};
@@ -178,6 +178,14 @@ pub enum ToolError {
     NeedsInput {
         /// What to ask the user.
         question: String,
+        /// An interface the question comes with: an array of A2UI messages (a surface with the
+        /// choices to draw), which the A2A server sends beside the question in the
+        /// `input-required` status. `None` for a question that is only text. The agent does not
+        /// read it: it keeps it with the question ([`PendingQuestion::ui`](crate::PendingQuestion::ui))
+        /// and whoever serves the run draws it. Absent from journals written before it existed,
+        /// which decode as `None`, and not written while it is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ui: Option<Value>,
     },
     /// The answer is the result of a child run this tool started (or found: see below). The agent
     /// parks with a timer, and the child's outcome becomes this call's result, as text, or as an
@@ -216,6 +224,23 @@ pub enum ToolError {
 }
 
 impl ToolError {
+    /// A question for the user that is only text: [`ToolError::NeedsInput`] with no interface.
+    pub fn needs_input(question: impl Into<String>) -> Self {
+        Self::NeedsInput {
+            question: question.into(),
+            ui: None,
+        }
+    }
+
+    /// A question for the user that comes with an interface (`ui`, an array of A2UI messages):
+    /// [`ToolError::NeedsInput`].
+    pub fn needs_input_with_ui(question: impl Into<String>, ui: Value) -> Self {
+        Self::NeedsInput {
+            question: question.into(),
+            ui: Some(ui),
+        }
+    }
+
     /// Turn a classified error into a tool error: a retryable one
     /// ([`ErrorClass::is_retryable`]) becomes [`Transient`](Self::Transient),
     /// anything else [`Permanent`](Self::Permanent). The message is the error
@@ -274,6 +299,7 @@ pub struct ToolCtx {
     cancel: CancelToken,
     extensions: Arc<Extensions>,
     children: Option<ChildStarter>,
+    context: Arc<Map<String, Value>>,
 }
 
 impl ToolCtx {
@@ -287,6 +313,7 @@ impl ToolCtx {
         cancel: CancelToken,
         extensions: Arc<Extensions>,
         children: Option<ChildStarter>,
+        context: Arc<Map<String, Value>>,
     ) -> Self {
         Self {
             run_id: emitter.run_id(),
@@ -298,6 +325,7 @@ impl ToolCtx {
             cancel,
             extensions,
             children,
+            context,
         }
     }
 
@@ -319,7 +347,16 @@ impl ToolCtx {
             CancelToken::new(),
             Arc::default(),
             None,
+            Arc::default(),
         )
+    }
+
+    /// Give the tool under test the inbound context of a run
+    /// ([`Conversation::context`](crate::Conversation::context)), as it would read it with
+    /// [`context`](Self::context) in a real one.
+    pub fn with_context(mut self, context: Map<String, Value>) -> Self {
+        self.context = Arc::new(context);
+        self
     }
 
     /// Make `value` available to the tool under test through
@@ -393,6 +430,22 @@ impl ToolCtx {
             .await
             .map_err(|e| ToolError::from_classified(&e))?;
         Ok(child)
+    }
+
+    /// A value of the run's inbound context ([`Conversation::context`](crate::Conversation::context)):
+    /// what the caller said about itself in the messages it sent, under the key it used. The
+    /// context is the same for every call of one model turn and changes only when a message
+    /// arrives, so a tool that reads it is repeatable.
+    ///
+    /// Treat a value as input from whoever sent the message, and a secret in it (a token) as a
+    /// secret: do not put it in a result the model reads.
+    pub fn context(&self, key: &str) -> Option<&Value> {
+        self.context.get(key)
+    }
+
+    /// The whole inbound context, for a tool that wants more than one key.
+    pub fn context_map(&self) -> &Map<String, Value> {
+        &self.context
     }
 
     /// The shared value of type `T` the agent was given, if any.
@@ -498,9 +551,7 @@ mod tests {
             ),
             (
                 r#"{"NeedsInput":{"question":"which one?"}}"#,
-                ToolError::NeedsInput {
-                    question: "which one?".into(),
-                },
+                ToolError::needs_input("which one?"),
             ),
         ];
         for (json, expected) in old {

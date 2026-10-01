@@ -37,6 +37,7 @@ adam-runtime = { path = "crates/adam-runtime", version = "0.1.0" }
 adam-service = { path = "crates/adam-service", version = "0.1.0" }
 adam-store-postgres = { path = "crates/adam-store-postgres", version = "0.1.0" }
 adam-store-testkit = { path = "crates/adam-store-testkit", version = "0.1.0" }
+adam-ui = { path = "crates/adam-ui", version = "0.1.0" }
 adam-workspace = { path = "crates/adam-workspace", version = "0.1.0" }
 
 a2a-client-lf = "0.2"
@@ -51,6 +52,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
 futures = "0.3"
 httpdate = "1"
+# Catalog components are JSON Schema; no network resolution, so none of the default features.
+jsonschema = { version = "0.58", default-features = false }
 notify = "8"
 proc-macro2 = "1"
 proptest = "1"

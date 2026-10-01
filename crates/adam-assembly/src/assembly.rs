@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent};
-use adam_llm_agent::{Limits, LlmAgent, LlmAgentBuilder};
+use adam_llm_agent::{DynToolSource, Limits, LlmAgent, LlmAgentBuilder, ToolSource};
 use adam_model::DynModel;
 use adam_runtime::RuntimeBuilder;
 
@@ -27,6 +27,7 @@ pub struct BoundDef {
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
     state: Vec<ApplyState>,
+    sources: Vec<DynToolSource>,
     aliases: Option<Vec<String>>,
     wait_poll: Option<Duration>,
 }
@@ -43,6 +44,7 @@ impl std::fmt::Debug for BoundDef {
                     .collect::<Vec<_>>(),
             )
             .field("state", &self.state.len())
+            .field("sources", &self.sources.len())
             .field("aliases", &self.aliases)
             .finish_non_exhaustive()
     }
@@ -55,6 +57,7 @@ impl BoundDef {
             nodes,
             remotes,
             state: Vec::new(),
+            sources: Vec::new(),
             aliases: None,
             wait_poll: None,
         }
@@ -67,6 +70,17 @@ impl BoundDef {
     pub fn state<T: Send + Sync + 'static>(mut self, value: Arc<T>) -> Self {
         self.state
             .push(Arc::new(move |builder| builder.state(Arc::clone(&value))));
+        self
+    }
+
+    /// Give every agent a [`ToolSource`]: tools it learns about while it runs, offered to the model
+    /// at every turn after the agent's own tools ([`LlmAgentBuilder::tool_source`]). The sources are
+    /// asked in the order they were added. An agent's `tools:` does not narrow them (they are not
+    /// known when the files are read), so a deployment gives a source only the tools it wants an agent
+    /// to have.
+    #[must_use]
+    pub fn tool_source(mut self, source: impl ToolSource) -> Self {
+        self.sources.push(std::sync::Arc::new(source));
         self
     }
 
@@ -209,6 +223,9 @@ impl BoundDef {
         }
         for apply in &self.state {
             builder = apply(builder);
+        }
+        for source in &self.sources {
+            builder = builder.dyn_tool_source(Arc::clone(source));
         }
         builder.try_build().map_err(|source| Error::Build {
             origin: origin.clone(),

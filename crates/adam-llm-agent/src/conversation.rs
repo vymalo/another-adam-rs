@@ -5,7 +5,7 @@ use adam_model::{Message, ToolCall, Usage};
 use adam_runtime::Inbound;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 /// Recommended [`Inbound::kind`] of a user message. The agent does not inspect
 /// the kind: anything whose payload parses (see [`user_message`]) is a user
@@ -34,6 +34,16 @@ pub(crate) fn parse_user_text(payload: &Value) -> Result<String, String> {
     }
 }
 
+/// The most serialized JSON, in bytes, that a conversation's [`context`](Conversation::context)
+/// may hold: 256 KiB. A message whose context would take it over is read for its text and its
+/// context is dropped, with a warning.
+pub const MAX_CONTEXT_BYTES: usize = 256 * 1024;
+
+/// The context an inbound payload carries: the object under its `"context"` key, or nothing.
+pub(crate) fn parse_context(payload: &Value) -> Option<&Map<String, Value>> {
+    payload.get("context").and_then(Value::as_object)
+}
+
 /// A tool call that asked the user a question and waits for the answer.
 ///
 /// One kind of [`PendingWait`], stored in [`Conversation::pending_wait`], so it
@@ -47,6 +57,12 @@ pub struct PendingQuestion {
     pub tool: String,
     /// The question.
     pub question: String,
+    /// The interface that came with it ([`ToolError::NeedsInput::ui`](crate::ToolError::NeedsInput)):
+    /// an array of A2UI messages, which the A2A server sends beside the question in the
+    /// `input-required` status. Absent from state written before it existed, and not written
+    /// while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<Value>,
 }
 
 /// A tool call that waits for a child run to finish.
@@ -179,10 +195,37 @@ pub struct Conversation {
     /// zero.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub omitted_turns: u32,
+    /// What the caller has said about itself, key by key: the objects under `"context"` of the
+    /// inbound payloads the run has read (the start message and every later one), merged in the
+    /// order they arrived. A key a message sets replaces the one before; a key set to `null`
+    /// deletes it. Tools read it with [`ToolCtx::context`](crate::ToolCtx::context).
+    ///
+    /// The A2A server fills it from the extensions a message carries (the screen's UI catalog,
+    /// the endpoint for the thread's tools): see `adam-a2a-runtime`. It is part of the durable
+    /// state, so it survives a restart and a change of worker, and a run that continues another
+    /// starts with the context of the run before ([`Conversation::continued`]).
+    ///
+    /// It is bounded: a message whose context would take the total over [`MAX_CONTEXT_BYTES`]
+    /// has its context dropped, with a warning. An entry that is an object with an `expiresAt`
+    /// (RFC 3339) is **removed once that time has passed**, the next time the run steps
+    /// ([`drop_expired_context`](Self::drop_expired_context)): a credential does not outlive its
+    /// expiry in the store. Absent from state written before it existed, and not written while it
+    /// is empty.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub context: Map<String, Value>,
 }
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+/// Whether `value` is an object whose `expiresAt` (RFC 3339) is not after `now`.
+fn has_expired(value: &Value, now: DateTime<Utc>) -> bool {
+    value
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| at.with_timezone(&Utc) <= now)
 }
 
 /// The most serialized JSON, in bytes, of messages that a continued conversation carries from the
@@ -437,6 +480,46 @@ impl Conversation {
         }
     }
 
+    /// Merge the `update` of one inbound message into [`context`](Self::context): a key it sets
+    /// replaces the one before, a key set to `null` is deleted.
+    ///
+    /// Returns `false`, and changes nothing, when the merged context would be larger than
+    /// [`MAX_CONTEXT_BYTES`] (a warning says so: the message is still read for its text).
+    pub fn merge_context(&mut self, update: &Map<String, Value>) -> bool {
+        if update.is_empty() {
+            return true;
+        }
+        let mut merged = self.context.clone();
+        for (key, value) in update {
+            if value.is_null() {
+                merged.remove(key);
+            } else {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+        let size = serde_json::to_vec(&merged).map_or(usize::MAX, |bytes| bytes.len());
+        if size > MAX_CONTEXT_BYTES {
+            tracing::warn!(
+                limit = MAX_CONTEXT_BYTES,
+                keys = update.len(),
+                "the context of an inbound message would take the run's context over its limit: it is dropped"
+            );
+            return false;
+        }
+        self.context = merged;
+        true
+    }
+
+    /// Remove the [`context`](Self::context) entries that have expired at `now`: an object with an
+    /// `expiresAt` that is an RFC 3339 time not after `now`. An entry with no `expiresAt`, or one
+    /// that does not parse, stays. Returns how many were removed; the agent calls it at the start
+    /// of every step.
+    pub fn drop_expired_context(&mut self, now: DateTime<Utc>) -> usize {
+        let before = self.context.len();
+        self.context.retain(|_, value| !has_expired(value, now));
+        before - self.context.len()
+    }
+
     /// Whether text part `part` of message `message` is the marker that says turns were left out
     /// ([`omitted_turns`](Self::omitted_turns)): the second part of the first message, while turns
     /// have been omitted. Anything else that merely starts like the marker is not one, so a rule
@@ -495,6 +578,7 @@ impl Conversation {
             messages,
             omitted_turns,
             continued_from: Some(from),
+            context: self.context.clone(),
             ..Self::default()
         }
     }
@@ -546,6 +630,7 @@ mod tests {
                 call_id: "c1".into(),
                 tool: "ask".into(),
                 question: "which environment?".into(),
+                ui: None,
             }))
         );
         assert_eq!(c.pending_calls.len(), 1);
@@ -810,6 +895,7 @@ mod tests {
             call_id: "c1".into(),
             tool: "ask".into(),
             question: "which?".into(),
+            ui: None,
         }));
         let next = c.continued("more", run);
         assert_eq!(next.messages, [user_of(&["task", "more"])]);

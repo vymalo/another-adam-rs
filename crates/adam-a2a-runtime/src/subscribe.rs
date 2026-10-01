@@ -16,7 +16,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
-use crate::convert::{artifact_id, artifact_of, status_key, status_of, task_from_view};
+use crate::convert::{StatusKey, artifact_id, artifact_of, status_key, status_of, task_from_view};
 
 /// Consecutive failed reads of the durable run before a subscription gives up.
 const MAX_READ_FAILURES: u32 = 20;
@@ -43,7 +43,7 @@ struct Tracker {
     task_id: String,
     context_id: String,
     seen_artifacts: HashSet<String>,
-    last: (TaskState, Option<String>),
+    last: StatusKey,
 }
 
 impl Tracker {
