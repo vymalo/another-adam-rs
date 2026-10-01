@@ -3,7 +3,8 @@
 //! Given "in repo X, do Y", the agent
 //!
 //! 1. prepares a git worktree (`prepare_workspace`, `adam-workspace`),
-//! 2. has OpenCode make the change over ACP (`delegate_to_opencode`, `adam-acp`),
+//! 2. makes the change: small, well-located edits itself (`read_file`, `write_file`, `apply_patch`),
+//!    broad ones through OpenCode over ACP (`delegate_to_opencode`, `adam-acp`),
 //! 3. runs the project's own checks, at most a configured number of failing
 //!    cycles (`run_checks`; looking around uses `run_command`, which is no check),
 //! 4. commits, pushes and opens a pull request (`commit_and_push`,
@@ -20,7 +21,7 @@
 //! | Module | What |
 //! |---|---|
 //! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks or rejected credentials and no PR = failed; any other stop without a PR = a question, `input-required`) and the record of the repositories the person named; [`CoderStarter`]: its start-only half |
-//! | [`tools`] | the seven tools (`#[tool]` functions reading [`ToolEnv`] from the agent's state) and [`CoderSettings`] |
+//! | [`tools`] | the nine tools of the coder (`#[tool]` functions reading [`ToolEnv`] from the agent's state; the screen's three, `ask_user`, `show` and `ui_catalog`, are `adam-ui`'s) and [`CoderSettings`] |
 //! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`, or read at startup from the folder `ADAM_AGENT_DIR` names) |
 //! | [`files`] | [`AgentFiles`]: where those files come from, the embedded copy or a folder read once at startup, and why a folder is refused ([`AgentFilesError`]) |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |

@@ -5,7 +5,8 @@ The coder agent: a coding task in, a verified pull request out, over A2A.
 Given "in repo X, do Y" it
 
 1. prepares a git worktree of X (`adam-workspace`),
-2. has OpenCode make the change over ACP (`adam-acp`),
+2. makes the change: small, well-located edits itself (`read_file`, `write_file`, `apply_patch`), broad ones
+   through OpenCode over ACP (`adam-acp`),
 3. runs the project's own checks, at most `MAX_CHECK_CYCLES` failing cycles,
 4. commits, pushes and opens a pull request, and
 5. streams progress throughout and reports the check results, the branch and the pull request as artifacts.
@@ -30,7 +31,7 @@ sequenceDiagram
   loop until the model stops
     R->>M: next turn
     M-->>R: tool calls
-    R->>W: prepare_workspace / delegate_to_opencode / run_checks
+    R->>W: prepare_workspace / read_file, write_file, apply_patch / delegate_to_opencode / run_checks
     R-->>O: progress (status updates)
   end
   R->>G: commit_and_push, open_pull_request
@@ -43,6 +44,9 @@ sequenceDiagram
 |---|---|
 | `prepare_workspace { repo_url, base_branch?, branch? }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
 | `run_command { command, cwd? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. The same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
+| `read_file { path, start_line?, end_line? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path>` |
+| `write_file { path, content }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path>` |
+| `apply_patch { patch }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files>` |
 | `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
 | `run_checks { command, cwd? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
 | `commit_and_push { message }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
@@ -51,11 +55,11 @@ sequenceDiagram
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the nine. The tools the conversation's endpoint lists
+folder](#mcp-tools-from-the-folder)); they are not part of the twelve. The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)).
 
-Six tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the six is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Nine tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the nine is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
@@ -262,6 +266,10 @@ make them hold:
   something else or stop it. The exits are a pull request, a failure (the rules
   above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
   and CancelTask (a chat's Stop).
+* **The file tools stay in the worktree.** `read_file`, `write_file` and `apply_patch` check every path with `confine`
+  (no `..`, no absolute path, nothing inside `.git`, no write through a symlink, no read that leaves the worktree) and
+  `apply_patch` checks the paths git itself reads from the patch, so a hostile path is a refusal the model is told, never a
+  file outside the worktree (see [above](#reading-and-changing-files-itself)). `run_command` stays read-only beside them.
 * **Looking around is not checking.** `run_command` exists so that exploring a repository does not look like
   verifying it: in the owner's live thread the model explored with `run_checks` (`ls`, `cat README.md
   CLAUDE.md` with exit 1 because `CLAUDE.md` was missing, `mvn package`, `ls /usr/lib/jvm`) and every
@@ -337,6 +345,71 @@ stateDiagram-v2
 Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories named, branches the
 conversation pushed) lives in
 `<WORKSPACE_ROOT>/coder/<run>.json` next to the worktree, written atomically.
+
+### Reading and changing files itself
+
+The model used to change a worktree only by delegating to OpenCode: a process, a model and a conversation for a one-line
+fix. `read_file`, `write_file` and `apply_patch` (`src/tools/files.rs`) read and change files of the worktree in this
+process, and the instructions say when to use which: small, well-located changes yourself, broad multi-file changes
+through `delegate_to_opencode`. The model chooses every path, so the paths are the point.
+
+**The confinement rule** (`confine(slot_root, rel, Access)`, public):
+
+* an empty path, an absolute path, any `..` component and any component equal to `.git` (compared without regard to case)
+  are refused;
+* to **read**, the path is canonicalised (symlinks followed) and the result must be inside the canonical root, and not
+  inside a `.git`: a symlink that stays inside the worktree is read, one that leads out is refused;
+* to **write**, the deepest part of the path that exists is looked at one component at a time: **any symlink on the way,
+  the file itself included, is refused** (also one that stays inside: a write through a link is a write to a place the
+  model did not name), and what exists must be inside the canonical root.
+
+Every refusal is a tool **result** that names its reason, not a failed run. `apply_patch` does not trust its own reading
+of the patch: it asks `git apply --numstat -z` which paths git would touch (a rename names both ends, however the patch
+spells it), checks each with the rule for writing, refuses a mode of a symlink or a submodule (`120000`, `160000`) and a
+binary patch, then runs `git apply --check` and `git apply` (hooks and the file system monitor off, no user or system
+configuration, never `--unsafe-paths`). **A hunk that does not match changes nothing** and git's message goes to the
+model. The line counts of a hunk header are written by a model, which counts badly, so a patch git cannot read or apply as
+written gets a second reading with `--recount` (not the first: `--recount` takes the `--- ` line of the next file for a
+removed line when no `diff --git` line separates them); the policy refusals are the same under both. The three tools change files and never touch git: `commit_and_push`
+commits what the files say, a change made by these tools changes the worktree's tree like OpenCode's, so the commit
+that follows is bound to a check only after a new `run_checks` (the gate is unchanged).
+
+```mermaid
+sequenceDiagram
+  participant M as Model
+  participant T as apply_patch
+  participant G as git apply
+  participant W as Worktree
+  M->>T: patch (unified diff)
+  T->>G: --numstat -z (which paths, never trusting the patch's own spelling)
+  G-->>T: the paths
+  T->>T: confine each path for writing, refuse symlink and submodule modes
+  T->>G: --check
+  alt it applies
+    T->>G: apply
+    G->>W: the files change
+    T-->>M: the files changed
+  else a hunk does not match
+    T-->>M: nothing changed, git's message
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Read: the patch, at most 1 MiB, no NUL
+  Read --> Refused: a path leaves the worktree, touches .git or a symlink, a symlink or submodule mode, a binary part
+  Read --> Checked: git can read it and every path is confined
+  Read --> Recounted: git cannot read it or it does not apply as written
+  Recounted --> Checked: it does with --recount
+  Recounted --> Refused: it does not
+  Checked --> Applied: git apply
+  Applied --> [*]
+  Refused --> [*]: the reason, nothing changed
+```
+
+Limits: 256 KiB of a file read, 1 MiB of content or patch. The checks and the write are not one atomic step; the tools of
+a run are called one at a time and what a command leaves running is killed with it, and a write goes to a new file that is
+renamed over its target, which replaces a symlink that appeared meanwhile instead of following it.
 
 ### Looking around, and what it may not do
 
@@ -492,9 +565,10 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
 * **"What can you do?" and "list your tools"** are answered in plain words first: look around a repository the
   person names, have a change made, run its checks, push a branch and open a pull request, ask when unsure. Then what
   it cannot do, and why: it works only on a repository the person names (it cannot start without one or create one),
-  and it does not edit files itself but has OpenCode do it inside a worktree of the repository. Tool names and
-  arguments appear only if the person asks for the detail. The "what I can't do" sentence stays true until the
-  scratch workspace, file tools and repository creation of adam-rs#52 to #54 land, and then it must change with them.
+  and it makes the change inside a private worktree of the repository, itself (`read_file`, `write_file`,
+  `apply_patch`: adam-rs#53) or with OpenCode. Tool names and arguments appear only if the person asks for the
+  detail. The "what I can't do" sentence stays true until the scratch workspace and repository creation of
+  adam-rs#52 and #54 land, and then it must change with them.
 * **The two persona lines are a convention**: the body of the instructions starts with exactly
   `Your name is {{display_name}}.` and then `In one sentence: <summary>.` (the summary ends at its first period and has
   no `"` or `\`). The mocks of the model build their greeting from those two lines (`mock-coder` in
@@ -585,9 +659,9 @@ The contract of a folder:
 | `name` | must be `coder` (`AGENT_NAME`): the runs are stored under it. Another name exits 78 naming the field |
 | `vars` | must declare `max_check_cycles`: the process supplies the value (`MAX_CHECK_CYCLES`), and a folder without the var fails at assembly naming it. Declare `display_name` too if the prompt uses `{{display_name}}` (the shipped one does); the file's value is the name the agent says |
 | `description` or `card.description` | one of them: the card needs it (exit 78 for a control plane otherwise) |
-| `tools:` | optional; may narrow the coder's seven tools, and a name that is not one is refused with a suggestion. Without it the agent gets all seven |
+| `tools:` | optional; may narrow the coder's own tools, and a name that is not one is refused with a suggestion. Without it the agent gets all of them |
 | `subagents/` | assembled and **registered beside the coder** (`coder/<name>`, `CoderAgent::subagents`). A subagent runs as a child run with its own run id, so the tools that work on the worktree of the run that calls them find none in it: give it tools that need no worktree |
-| `mcp.json` | optional: the MCP servers whose tools the agent gets, named `<server>__<tool>` after its seven (see [MCP tools](#mcp-tools-from-the-folder)). Connected by the **workers** at startup |
+| `mcp.json` | optional: the MCP servers whose tools the agent gets, named `<server>__<tool>` after its own (see [MCP tools](#mcp-tools-from-the-folder)). Connected by the **workers** at startup |
 | `schedules/` | read, not run: a warning says so |
 | the rest | skills, `limits`, `model:` and the card follow the [authoring layer](../../docs/authoring.md) |
 
@@ -603,7 +677,7 @@ folder must be readable by the runtime user (uid 10001 in the image).
 #### MCP tools from the folder
 
 An `agent/mcp.json` in the folder (and one next to each subagent's file) names MCP servers; every worker
-connects them once at startup, before it serves, and gives the agent their tools beside its seven, named
+connects them once at startup, before it serves, and gives the agent their tools beside its own, named
 `<server>__<tool>` (`tools:` in the frontmatter selects among all of them: `linear__*` takes a server's tools).
 Servers are streamable HTTP (`type: http`) or local processes (`command`); `type: sse` is refused. The format and the
 rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
@@ -981,6 +1055,19 @@ database of its own, so the role needs `CREATEDB`):
   plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the
   embedded copy logged as `source=embedded`.
 * `src/tools/delegate.rs` (unit): OpenCode's tool calls as child steps (the kind and icon of each ACP kind, the state of each status, a call moved and ended by its updates, what OpenCode says scrubbed and cut, a call that never ended closed with the turn) and `tests/tools.rs`' `delegate_to_opencode_streams_updates_and_returns_the_summary` (the call is a `subagent` step labelled OpenCode, the fake agent's tool call is a child with the edit icon that ends `completed`, its reply is a `message` child and the progress lines are updates of the call's own step); `tests/agent_files.rs` and the card golden pin `steps/v1` and `text-stream/v1` on the card. The tests' models stream too (the agent calls `stream`): a model that does its work in `complete` only is not asked for it any more, so `HangingModel` of `tests/e2e.rs` and the greeting model of `tests/agent_files.rs` do it in `stream` as well.
+* `src/tools/files.rs` (unit) and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
+  `.git/x` and `.GIT/x`, a symlink to a file outside, a symlinked directory outside, a write through a symlink that
+  stays inside, a link into `.git`, a directory and a file in the wrong place; `read_file` (a range with numbers, a
+  range past the end, a cut at 256 KiB also inside a multi-byte character, a binary file, a directory),
+  `write_file` (parents, replace, the mode kept, nothing left behind, the 1 MiB limit, the progress line), and
+  `apply_patch` (two files, one a new one; a hunk that does not match changes nothing; a malformed, empty, oversized or
+  NUL patch; a patch for `.git/config`, `.GIT/hooks`, `../x`, a path through a symlink, a symlink created by the patch, a
+  rename into `.git` and a binary patch, each refused with the worktree and the repository's config untouched; wrong
+  hunk counts applied by their lines). A patch applied or a file written is seen by the next `run_checks`, and a commit
+  after a later edit is not bound to those checks. `tests/e2e.rs`'
+  `the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request` (per store): `read_file`, `apply_patch`,
+  `run_checks`, `commit_and_push` and `open_pull_request` over A2A with OpenCode unavailable, the checks artifact bound
+  to the pushed commit. The compose scenario is `SCENARIO=files sh dev/coder-e2e.sh` (the `[mock:files]` script).
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, malformed arguments,
   `prepare_workspace` refusing a repository the person did not name (the refusal names

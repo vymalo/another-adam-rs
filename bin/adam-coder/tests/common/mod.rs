@@ -391,6 +391,34 @@ impl Fixture {
         self.remote.to_string_lossy().into_owned()
     }
 
+    /// Commit `content` as `file` on `main` of the remote (through a clone of its own), as a
+    /// repository that already has something to fix.
+    pub fn commit_to_main(&self, file: &str, content: &str) {
+        let clone = self
+            .tmp
+            .path()
+            .join(format!("clone-{}", file.replace('/', "_")));
+        git(
+            self.tmp.path(),
+            &[
+                "clone",
+                "--quiet",
+                self.remote.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        if let Some(parent) = std::path::Path::new(file).parent() {
+            std::fs::create_dir_all(clone.join(parent)).unwrap();
+        }
+        std::fs::write(clone.join(file), content).unwrap();
+        git(&clone, &["add", "-A"]);
+        git(
+            &clone,
+            &["commit", "--quiet", "-m", &format!("seed {file}")],
+        );
+        git(&clone, &["push", "--quiet", "origin", "main"]);
+    }
+
     /// Branches on the remote other than `main`.
     pub fn agent_branches(&self) -> Vec<String> {
         git(

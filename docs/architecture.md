@@ -478,10 +478,10 @@ classDiagram
     PermissionPrompt <|.. StaticPrompt
 ```
 
-Each box is a crate (underscores stand for hyphens). The seven coder tools are
-`prepare_workspace`, `run_command`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
-`open_pull_request` and `ask_user` (the tool of `adam-ui`, under the coder's own words about when to ask), and
-`adam-ui` adds `show` and `ui_catalog` and a source of the tools of the conversation's endpoint. An eighth type,
+Each box is a crate (underscores stand for hyphens). The ten coder tools are
+`prepare_workspace`, `run_command`, `read_file`, `write_file`, `apply_patch`, `delegate_to_opencode`, `run_checks`,
+`commit_and_push`, `open_pull_request` and `ask_user` (the tool of `adam-ui`, under the coder's own words about when to ask), and
+`adam-ui` adds `show` and `ui_catalog` and a source of the tools of the conversation's endpoint. An eleventh type,
 `Redacting`, wraps each of them to scrub secrets (`bin/adam-coder/src/tools/mod.rs`). `CoderAgent`
 wraps the `LlmAgent` that `adam-assembly` builds from `bin/adam-coder/agent/instructions.md` (the prompt, the
 limits and the A2A card are that file) and adds its completion rule. `FnTool` is a tool made from a closure. A tool
@@ -1696,7 +1696,7 @@ Two rules keep this tree honest (details in the
 `adam-coder` turns a coding task into a pull request. A client sends
 "in repository X, do Y". The agent makes the change in a private git worktree,
 runs the project's own checks, and opens a pull request. It is an `LlmAgent`
-with seven tools and one extra rule, running on the durable runtime and served
+with ten tools and one extra rule, running on the durable runtime and served
 over A2A.
 
 ### What it does
@@ -1711,6 +1711,7 @@ sequenceDiagram
     participant A as coder agent<br/>LlmAgent + tools
     participant M as model gateway<br/>OpenAI-compatible
     participant G as Workspaces<br/>git CLI
+    participant W as worktree files<br/>read_file, write_file, apply_patch
     participant O as OpenCode<br/>opencode acp
     participant Sh as sh -lc<br/>project checks
     participant R as git remote
@@ -1718,7 +1719,7 @@ sequenceDiagram
 
     C->>A: SendStreamingMessage "in repo X (base main), do Y"
     loop each model turn
-        A->>M: stream(history + 6 tool specs)
+        A->>M: stream(history + the tool specs)
         M-->>A: text deltas, then the response: text or tool calls
     end
     Note over A,M: The turns below are the model's tool calls, in the order it picks.
@@ -1729,18 +1730,25 @@ sequenceDiagram
     G->>G: git worktree add, new branch agent/short-run-id from origin/base
     A-->>C: progress: worktree ready
 
-    A->>O: delegate_to_opencode(instructions)
-    O->>M: its own model calls, same gateway
-    O-->>A: ACP updates: text, plan, tool calls
-    A-->>C: progress lines
-    O-->>A: TurnEnded, then the files that changed
+    alt a small, well-located change
+        A->>W: read_file(path), then write_file(path, content) or apply_patch(diff)
+        Note over A,W: every path is confined to the worktree, and a patch is checked by the paths git reads from it
+        W-->>A: the text read, or the files changed
+        A-->>C: progress lines: read README.md, patched README.md
+    else a broad, multi-file change
+        A->>O: delegate_to_opencode(instructions)
+        O->>M: its own model calls, same gateway
+        O-->>A: ACP updates: text, plan, tool calls
+        A-->>C: progress lines
+        O-->>A: TurnEnded, then the files that changed
+    end
 
     loop until green, or the check cycles are used up
         A->>Sh: run_checks(command), with a time limit
         Sh-->>A: exit code and output tail
         A-->>C: artifact "checks"
         opt exit code is not 0
-            A->>O: delegate_to_opencode(fix the failure)
+            A->>W: apply_patch or write_file (or delegate_to_opencode) to fix the failure
         end
     end
 
@@ -1783,11 +1791,11 @@ stateDiagram-v2
     [*] --> NoWorkspace
     NoWorkspace --> NoWorkspace: prepare_workspace refuses a repository the person did not name, the model asks
     NoWorkspace --> WorktreeReady: prepare_workspace on a repository the person named
-    WorktreeReady --> Edited: delegate_to_opencode
+    WorktreeReady --> Edited: write_file, apply_patch or delegate_to_opencode
     Edited --> ChecksGreen: run_checks passes
     Edited --> ChecksRed: run_checks fails, one cycle used
     Edited --> Pushed: commit_and_push without a green check, unless the budget is used up
-    ChecksRed --> Edited: delegate_to_opencode to fix, cycles left
+    ChecksRed --> Edited: the file tools or delegate_to_opencode to fix, cycles left
     ChecksRed --> Exhausted: failed runs reach MAX_CHECK_CYCLES
     ChecksRed --> Pushed: commit_and_push, unless the budget is used up
     ChecksGreen --> Pushed: commit_and_push
@@ -1821,7 +1829,9 @@ pushed sha, pull request) and the worktree.
 What the diagrams cannot say (`bin/adam-coder/src/`):
 
 * **The tools** (`tools/`): `prepare_workspace`, `run_command` (looking around: no check, no cycle,
-  changes to HEAD, the branch, the working tree, refs and git configuration are undone), `delegate_to_opencode`, `run_checks` (the project's own checks only),
+  changes to HEAD, the branch, the working tree, refs and git configuration are undone), `read_file`, `write_file` and
+  `apply_patch` (small changes made in the coder's own process, confined to the worktree: see
+  [the coder README](../bin/adam-coder/README.md#reading-and-changing-files-itself)), `delegate_to_opencode`, `run_checks` (the project's own checks only),
   `commit_and_push`, `open_pull_request` and `ask_user`, then the screen's `show` and `ui_catalog` (all three
   of `adam-ui`: `Ui::tools()`).
 * **The prompt and the card** (`agent/instructions.md`, embedded by `build.rs`, or read at startup from the
@@ -1843,6 +1853,11 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     continues a pushed branch pushes to a branch of its own, and only after this
     gate does `open_pull_request` fast-forward the continued branch (never forced), so the pull
     request that is open for it never carries unverified commits.
+  * The file tools (`read_file`, `write_file`, `apply_patch`) refuse a path that is empty, absolute, goes up with `..`,
+    names `.git` (any case), leaves the worktree through a symlink (read) or goes through a symlink (write); a patch is
+    checked by the paths `git apply --numstat -z` reports and refused if it creates a symlink or a submodule; a hunk that
+    does not match changes nothing. They change files and not git: the commit that follows is bound to a check only
+    after a new `run_checks`.
   * A command the shell cannot find (exit 127, `not found`) is a missing toolchain: reported to the model,
     no check cycle used, no `checks` artifact, and the model asks the person and waits.
   * A run that stops with no pull request fails if the check-cycle budget is

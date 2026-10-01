@@ -238,8 +238,9 @@ jobs:
       # The image that just passed, in the compose stack: the coder gets a task
       # over A2A, its scripted model drives prepare -> OpenCode (also scripted)
       # -> checks -> commit and push -> pull request, and dev/coder-e2e.sh
-      # checks the artifacts, mock-github's journal and git-server. Run twice:
-      # without OpenCode (the check command makes the change) and with it.
+      # checks the artifacts, mock-github's journal and git-server. Run three times:
+      # without OpenCode (the check command makes the change), with it, and with the coder
+      # writing the file itself (SCENARIO=files).
       # The job's own Postgres service holds 5432, so the stack's Postgres
       # moves to POSTGRES_PORT.
       - name: Compose e2e
@@ -254,6 +255,8 @@ jobs:
             postgres mock-openai mock-github git-server coder agent
           NO_OPENCODE=1 sh dev/coder-e2e.sh
           sh dev/coder-e2e.sh
+          # The coder edits the files itself (read_file, write_file), and OpenCode is not started.
+          SCENARIO=files sh dev/coder-e2e.sh
           # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
           sh dev/greeting-e2e.sh
           # The general agent: "hi" answered in role by its folder, and an edited folder changes the

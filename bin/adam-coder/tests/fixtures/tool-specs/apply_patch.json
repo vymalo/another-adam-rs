@@ -1,0 +1,16 @@
+{
+  "name": "apply_patch",
+  "description": "Apply a unified diff to the worktree: one or several files, `--- a/<path>` and `+++ b/<path>` then hunks (`@@ -12,3 +12,4 @@`, with context lines), as `git diff` writes them. Every path is checked first (inside the worktree, not `.git`, not a symlink); a patch that creates a symlink is refused; and it is all or nothing: if a hunk does not match the file, nothing is changed and you are told why. Read the file first, so the context lines match it exactly. Use it for small, well-located changes; delegate broad, multi-file changes to OpenCode.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "patch": {
+        "type": "string",
+        "description": "The unified diff, at most 1 MiB, with `a/` and `b/` before the paths"
+      }
+    },
+    "required": [
+      "patch"
+    ]
+  }
+}

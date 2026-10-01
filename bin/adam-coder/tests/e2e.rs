@@ -497,6 +497,9 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
         [
             "prepare_workspace",
             "run_command",
+            "read_file",
+            "write_file",
+            "apply_patch",
             "delegate_to_opencode",
             "run_checks",
             "commit_and_push",
@@ -506,6 +509,118 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "ui_catalog"
         ]
     );
+}
+
+// ------------------------------------------------------------------ editing files itself
+
+/// The coder fixes a one-line bug itself, with `read_file` and `apply_patch` and no OpenCode:
+/// the checks see the fix, and the pull request is for exactly the code they passed on.
+async fn the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request(store: DynStore) {
+    // A fake OpenCode that would fail the run if it were started: nothing here delegates.
+    let fx = Fixture::with("never written\n", |s| {
+        s.opencode = OpenCodeLaunch::program("/nonexistent/opencode-must-not-run");
+    })
+    .await;
+    fx.commit_to_main("greet.sh", "echo \"helo world\"\n");
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "f1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call("f2", "read_file", json!({"path": "greet.sh"}))])
+    .push_tool_calls(vec![call(
+        "f3",
+        "apply_patch",
+        json!({"patch": "--- a/greet.sh\n+++ b/greet.sh\n@@ -1 +1 @@\n-echo \"helo world\"\n+echo \"hello world\"\n"}),
+    )])
+    .push_tool_calls(vec![call(
+        "f4",
+        "run_checks",
+        json!({"command": "test \"$(sh greet.sh)\" = 'hello world'"}),
+    )])
+    .push_tool_calls(vec![call(
+        "f5",
+        "commit_and_push",
+        json!({"message": "fix: spell hello"}),
+    )])
+    .push_tool_calls(vec![call(
+        "f6",
+        "open_pull_request",
+        json!({"title": "fix: spell hello", "body": "Fixes the typo.\n\n## Verification\n- `sh greet.sh`: hello world"}),
+    )])
+    .push_text("Opened the pull request.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(
+        &server,
+        &format!(
+            "In {} (base branch main) fix the spelling in greet.sh",
+            fx.remote_url()
+        ),
+    )
+    .await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        seen.labels
+    );
+    // The progress of a tool is a line of its own for a client that did not ask for steps, which is
+    // what `dev/coder-e2e.sh` (SCENARIO=files) reads.
+    for line in ["read greet.sh", "patched greet.sh"] {
+        assert!(
+            seen.messages.iter().any(|m| m == line),
+            "{line}: {:#?}",
+            seen.messages
+        );
+    }
+    assert!(
+        !seen.saw_message("starting OpenCode"),
+        "OpenCode was not needed: {:#?}",
+        seen.messages
+    );
+    // What the model read, and what the patch said.
+    let requests = mock.requests();
+    let result_of = |id: &str| -> String {
+        requests
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .find_map(|m| match m {
+                adam_model::Message::Tool {
+                    call_id, content, ..
+                } if call_id == id => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no result for {id}"))
+    };
+    assert_eq!(result_of("f2"), "echo \"helo world\"\n");
+    assert!(
+        result_of("f3").starts_with("Applied the patch to 1 file(s): greet.sh"),
+        "{}",
+        result_of("f3")
+    );
+
+    // The branch has the fix, in one commit, and the checks artifact bound to it passed on that tree.
+    let branches = fx.agent_branches();
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    assert_eq!(fx.file_on(&branches[0], "greet.sh"), "echo \"hello world\"");
+    assert_eq!(fx.commits_ahead(&branches[0]), 1);
+    let pushed = common::git(&fx.remote, &["rev-parse", &branches[0]]);
+    let checks: Vec<_> = seen
+        .artifacts
+        .iter()
+        .filter(|(n, _)| n == "checks")
+        .collect();
+    let a2a::PartContent::Data(bound) = &checks.last().unwrap().1.parts[0].content else {
+        panic!("data part expected")
+    };
+    assert_eq!(bound["passed"], true, "{bound}");
+    assert_eq!(bound["commit"], pushed.as_str(), "{bound}");
+    assert_eq!(fx.created_pulls().await.len(), 1);
 }
 
 // ------------------------------------------------------------------ input-required
@@ -3192,6 +3307,7 @@ macro_rules! coder_suite {
         mod $module {
             coder_suite!(@cases $make;
                 add_hello_txt_streams_working_progress_checks_artifact_completed,
+                the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request,
                 ask_user_parks_and_an_a2a_follow_up_resumes,
                 a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,
                 a_question_is_answered_from_a_look_around_and_costs_no_check_cycles,

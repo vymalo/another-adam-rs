@@ -4,6 +4,7 @@
 //! |---|---|
 //! | `prepare_workspace { repo_url, base_branch?, branch? }` | [`prepare`] |
 //! | `run_command { command, cwd? }` | [`inspect`] |
+//! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `apply_patch { patch }` | [`files`] |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
 //! | `run_checks { command }` | [`checks`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
@@ -65,6 +66,7 @@ const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait
 
 pub mod checks;
 pub mod delegate;
+pub mod files;
 mod gitcli;
 pub mod inspect;
 pub mod named;
@@ -217,7 +219,7 @@ impl ToolEnv {
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the six of the coding workflow,
+/// Every coder tool, in the order they are offered to the model: the nine of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
@@ -235,6 +237,9 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
     tools![
         prepare::PrepareWorkspace,
         inspect::RunCommand,
+        files::ReadFile,
+        files::WriteFile,
+        files::ApplyPatch,
         delegate::DelegateToOpenCode,
         checks::RunChecks,
         publish::CommitAndPush,

@@ -10,6 +10,7 @@ use adam_coder::ToolEnv;
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::delegate::DelegateToOpenCode;
+use adam_coder::tools::files::{ApplyPatch, ReadFile, WriteFile};
 use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::notes::PushedBranch;
@@ -2573,5 +2574,484 @@ async fn the_red_checks_note_is_not_posted_twice_for_the_same_commit() {
         1,
         "{:?}",
         rig.fx.comments().await
+    );
+}
+
+// ------------------------------------------------------------------ read_file, write_file, apply_patch
+
+/// A unified diff that changes the one line of `file` (`old` becomes `new`).
+fn one_line_patch(file: &str, old: &str, new: &str) -> String {
+    format!("--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-{old}\n+{new}\n")
+}
+
+#[tokio::test]
+async fn the_file_tools_need_a_workspace_like_the_others() {
+    let rig = Rig::new().await;
+    let cases: Vec<(&str, Result<ToolOutput, ToolError>)> = vec![
+        (
+            "read",
+            ReadFile.call(&rig.ctx, json!({"path": "README.md"})).await,
+        ),
+        (
+            "write",
+            WriteFile
+                .call(&rig.ctx, json!({"path": "a.txt", "content": "a"}))
+                .await,
+        ),
+        (
+            "patch",
+            ApplyPatch
+                .call(
+                    &rig.ctx,
+                    json!({"patch": one_line_patch("README.md", "a", "b")}),
+                )
+                .await,
+        ),
+    ];
+    for (name, out) in cases {
+        assert!(is_error(&out), "{name}: {out:?}");
+        assert!(text(out).contains("prepare_workspace"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn read_file_reads_the_worktree_and_numbers_a_range() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("lines.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+
+    let whole = ReadFile
+        .call(&rig.ctx, json!({"path": "README.md"}))
+        .await
+        .unwrap();
+    assert!(!whole.is_error, "{}", whole.content);
+    assert_eq!(whole.content, "widgets\n", "the file as it is");
+    assert!(
+        rig.progress().contains(&"read README.md".to_owned()),
+        "{:?}",
+        rig.progress()
+    );
+
+    let range = ReadFile
+        .call(
+            &rig.ctx,
+            json!({"path": "lines.txt", "start_line": 2, "end_line": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(range.content, "     2\ttwo\n     3\tthree\n");
+
+    // Binary, a directory, a missing file, an empty range: results the model can act on.
+    std::fs::write(wt.join("data.bin"), b"\x00\x01\x02 binary").unwrap();
+    for (args, needle) in [
+        (json!({"path": "data.bin"}), "binary file, 10 bytes"),
+        (json!({"path": "."}), "name a file"),
+        (json!({"path": "nope.txt"}), "does not exist"),
+        (
+            json!({"path": "lines.txt", "start_line": 9}),
+            "past the end",
+        ),
+        (json!({"path": "lines.txt", "start_line": 0}), "from 1"),
+        (json!({"path": "  "}), "path is required"),
+    ] {
+        let out = ReadFile.call(&rig.ctx, args.clone()).await;
+        assert!(is_error(&out), "{args}: {out:?}");
+        assert!(text(out).contains(needle), "{args}");
+    }
+}
+
+#[tokio::test]
+async fn read_file_cuts_a_big_file_and_says_so() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let big = "0123456789".repeat(40 * 1024); // 400 KiB
+    std::fs::write(rig.worktree().join("big.txt"), &big).unwrap();
+    let out = ReadFile
+        .call(&rig.ctx, json!({"path": "big.txt"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error);
+    assert!(
+        out.content.len() < 256 * 1024 + 300,
+        "{}",
+        out.content.len()
+    );
+    assert!(
+        out.content.contains("[cut: `big.txt` is 409600 bytes"),
+        "{}",
+        &out.content[out.content.len() - 200..]
+    );
+}
+
+/// Whatever the model passes, a path that leaves the worktree reads and writes nothing, and says
+/// why.
+#[tokio::test]
+async fn the_file_tools_never_leave_the_worktree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "s3cr3t").unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret.txt"), wt.join("leak")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), wt.join("outdir")).unwrap();
+    std::os::unix::fs::symlink("README.md", wt.join("alias")).unwrap();
+
+    let refused = [
+        ("../escape.txt", "`..`"),
+        ("sub/../../escape.txt", "`..`"),
+        ("/tmp/escape.txt", "absolute"),
+        (".git/config", ".git"),
+        (".GIT/config", ".git"),
+        ("outdir/new.txt", "symlink"),
+        ("leak", "symlink"),
+        ("alias", "symlink"),
+    ];
+    for (path, needle) in refused {
+        let out = WriteFile
+            .call(&rig.ctx, json!({"path": path, "content": "pwned"}))
+            .await;
+        assert!(is_error(&out), "write {path}: {out:?}");
+        assert!(text(out).contains(needle), "write {path}");
+    }
+    for (path, needle) in [
+        ("../secret.txt", "`..`"),
+        (".git", ".git"),
+        ("leak", "outside the worktree"),
+        ("outdir/secret.txt", "outside the worktree"),
+    ] {
+        let out = ReadFile.call(&rig.ctx, json!({"path": path})).await;
+        assert!(is_error(&out), "read {path}: {out:?}");
+        let message = text(out);
+        assert!(message.contains(needle), "read {path}: {message}");
+        assert!(!message.contains("s3cr3t"), "read {path}: {message}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+        "s3cr3t"
+    );
+    assert!(!outside.path().join("new.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets\n"
+    );
+    // A link that stays inside is read, through to its target.
+    let out = ReadFile
+        .call(&rig.ctx, json!({"path": "alias"}))
+        .await
+        .unwrap();
+    assert_eq!(out.content, "widgets\n");
+}
+
+/// A file written by the tool is a change of the worktree like any other: the checks see it, and
+/// a commit made after a later edit is not bound to them.
+#[tokio::test]
+async fn write_file_changes_what_the_checks_see_and_the_gate_binds() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+
+    let made = WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "docs/notes/hello.txt", "content": "hello\n"}),
+        )
+        .await
+        .unwrap();
+    assert!(!made.is_error, "{}", made.content);
+    assert!(
+        made.content.starts_with("Created docs/notes/hello.txt"),
+        "{}",
+        made.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("docs/notes/hello.txt")).unwrap(),
+        "hello\n"
+    );
+    assert!(
+        rig.progress()
+            .contains(&"wrote docs/notes/hello.txt".to_owned())
+    );
+
+    let checked = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "grep -qx hello docs/notes/hello.txt"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(checks_of(&checked)["passed"], true);
+    // The same path again replaces it.
+    let again = WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "docs/notes/hello.txt", "content": "hello, again\n"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        again.content.starts_with("Replaced docs/notes/hello.txt"),
+        "{}",
+        again.content
+    );
+
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "docs: add a note"}))
+        .await
+        .unwrap();
+    let (bound, _) = commit_artifacts(&out);
+    assert_eq!(
+        bound["passed"], false,
+        "edited after the checks, so not bound to them: {bound}"
+    );
+    // Checked again, the commit is bound.
+    let rechecked = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "grep -qx 'hello, again' docs/notes/hello.txt"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(checks_of(&rechecked)["passed"], true);
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "docs: add a note"}))
+        .await
+        .unwrap();
+    let (bound, _) = commit_artifacts(&out);
+    assert_eq!(bound["passed"], true, "{bound}");
+
+    let too_big = WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "big.txt", "content": "x".repeat(1024 * 1024 + 1)}),
+        )
+        .await;
+    assert!(is_error(&too_big), "{too_big:?}");
+    assert!(!wt.join("big.txt").exists());
+}
+
+#[tokio::test]
+async fn apply_patch_changes_a_file_and_the_checks_see_it() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let before = worktree_state(&rig);
+
+    let patch = format!(
+        "{}--- /dev/null\n+++ b/NOTES.md\n@@ -0,0 +1,2 @@\n+# Notes\n+second\n",
+        one_line_patch("README.md", "widgets", "widgets, patched")
+    );
+    let out = ApplyPatch
+        .call(&rig.ctx, json!({"patch": patch}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("2 file(s): README.md, NOTES.md"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets, patched\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("NOTES.md")).unwrap(),
+        "# Notes\nsecond\n"
+    );
+    assert!(
+        rig.progress()
+            .contains(&"patched README.md, NOTES.md".to_owned()),
+        "{:?}",
+        rig.progress()
+    );
+    assert_ne!(worktree_state(&rig), before, "the tree changed");
+
+    // `run_checks` sees it, and the commit is bound to those checks.
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "grep -q patched README.md"}))
+        .await
+        .unwrap();
+    assert_eq!(checks_of(&checked)["passed"], true);
+    let out = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({"message": "fix: say what the widgets are"}),
+        )
+        .await
+        .unwrap();
+    let (bound, branch) = commit_artifacts(&out);
+    assert_eq!(bound["passed"], true, "{bound}");
+    assert_eq!(bound["commit"], branch["commit"]);
+    // The patch changed the index of nothing: git sees one commit with both files.
+    let pushed = branch["commit"].as_str().unwrap();
+    assert_eq!(
+        common::git(&wt, &["show", "--stat", "--format=", pushed])
+            .lines()
+            .count(),
+        3,
+        "two files and the summary line"
+    );
+}
+
+#[tokio::test]
+async fn a_patch_whose_hunk_does_not_match_changes_nothing() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // The first file would apply; the second hunk does not match: all or nothing.
+    let patch = format!(
+        "{}{}",
+        one_line_patch("README.md", "widgets", "changed"),
+        "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-not what the file says\n+x\n"
+    );
+    let out = ApplyPatch.call(&rig.ctx, json!({"patch": patch})).await;
+    assert!(is_error(&out), "{out:?}");
+    let message = text(out);
+    assert!(
+        message.contains("does not apply") && message.contains("nothing was changed"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets\n"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_or_empty_patch_is_the_models_to_fix() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    for (patch, needle) in [
+        ("", "patch is required"),
+        ("   \n", "patch is required"),
+        ("this is not a diff at all\n", "unified diff"),
+        (
+            "--- a/README.md\n+++ b/README.md\n@@ garbage @@\n",
+            "unified diff",
+        ),
+    ] {
+        let out = ApplyPatch.call(&rig.ctx, json!({"patch": patch})).await;
+        assert!(is_error(&out), "{patch:?}: {out:?}");
+        let message = text(out);
+        assert!(message.contains(needle), "{patch:?}: {message}");
+    }
+    let huge = format!(
+        "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-widgets\n+{}\n",
+        "x".repeat(1024 * 1024)
+    );
+    let out = ApplyPatch.call(&rig.ctx, json!({"patch": huge})).await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("over the limit"));
+    let nul = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-widgets\n+x\0y\n";
+    let out = ApplyPatch.call(&rig.ctx, json!({"patch": nul})).await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("NUL"));
+}
+
+/// A patch is checked by the paths git reads from it, whatever the model wrote: nothing in `.git`,
+/// nothing above the worktree, no symlink created, none written through.
+#[tokio::test]
+async fn a_patch_cannot_reach_git_the_outside_or_a_symlink() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), wt.join("outdir")).unwrap();
+    std::os::unix::fs::symlink("README.md", wt.join("alias")).unwrap();
+    let before = worktree_state(&rig);
+    let config_before = std::fs::read_to_string(
+        common::git(&wt, &["rev-parse", "--git-common-dir"])
+            .parse::<std::path::PathBuf>()
+            .map(|p| wt.join(p).join("config"))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let new_file = |path: &str| format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+pwned\n");
+    let cases: Vec<(String, &str)> = vec![
+        (new_file(".git/config"), ".git"),
+        (new_file(".GIT/hooks/pre-commit"), ".git"),
+        (new_file("../escape.txt"), "x"),
+        (new_file("outdir/new.txt"), "symlink"),
+        (one_line_patch("alias", "widgets", "pwned"), "symlink"),
+        // A symlink created by the patch itself.
+        (
+            "diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/etc/passwd\n\\ No newline at end of file\n".to_owned(),
+            "symlink or a submodule",
+        ),
+        // A rename into `.git`.
+        (
+            "diff --git a/README.md b/.git/moved\nsimilarity index 100%\nrename from README.md\nrename to .git/moved\n".to_owned(),
+            ".git",
+        ),
+        // A binary patch.
+        (
+            "diff --git a/img.png b/img.png\nnew file mode 100644\nindex 0000000..e69de29\nGIT binary patch\nliteral 0\nHcmV?d00001\n\n".to_owned(),
+            "binary",
+        ),
+    ];
+    for (patch, needle) in cases {
+        let out = ApplyPatch.call(&rig.ctx, json!({"patch": patch})).await;
+        let shown = patch.replace('\n', "\\n");
+        assert!(is_error(&out), "{shown}: {out:?}");
+        let message = text(out);
+        if needle != "x" {
+            assert!(message.contains(needle), "{shown}: {message}");
+        }
+    }
+    assert!(!wt.join("link").exists(), "no symlink was created");
+    assert!(!wt.parent().unwrap().join("escape.txt").exists());
+    assert!(!outside.path().join("new.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets\n"
+    );
+    let config_after = std::fs::read_to_string(
+        wt.join(common::git(&wt, &["rev-parse", "--git-common-dir"]))
+            .join("config"),
+    )
+    .unwrap();
+    assert_eq!(
+        config_after, config_before,
+        "the repository's config is untouched"
+    );
+    assert_eq!(
+        worktree_state(&rig),
+        before,
+        "nothing in the worktree changed"
+    );
+}
+
+/// `run_command` is still for looking: a write it makes is undone, whatever the new tools allow.
+#[tokio::test]
+async fn run_command_stays_read_only_beside_the_file_tools() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": "echo x > made-by-command.txt"}))
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(!rig.worktree().join("made-by-command.txt").exists());
+}
+
+/// A model counts the lines of a hunk badly. A patch that only applies once git goes by the lines
+/// themselves is applied; one that is wrong in its lines is not.
+#[tokio::test]
+async fn a_hunk_header_with_wrong_counts_is_applied_by_its_lines() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let miscounted =
+        "--- a/README.md\n+++ b/README.md\n@@ -1,7 +1,9 @@\n-widgets\n+widgets, counted wrong\n";
+    let out = ApplyPatch
+        .call(&rig.ctx, json!({"patch": miscounted}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets, counted wrong\n"
     );
 }
