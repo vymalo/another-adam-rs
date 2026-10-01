@@ -405,6 +405,10 @@ jobs:
           # test binary that runs as uid 10001 is copied into the first.
           work=/tmp/adam-devcontainer
           sock=/tmp/adam-podman
+          # uid 10001 is `agent` in the coder's image; the runner has no such user, and the devcontainer
+          # CLI asks for the name of the user it runs as (`id -u -n`) before it reads a configuration.
+          getent passwd 10001 >/dev/null || sudo useradd --uid 10001 --user-group --no-create-home \
+            --home-dir "$work" --shell /bin/sh agent
           sudo install -d -o 10001 -g 10001 -m 0755 "$work" "$sock"
           {
             echo "PODMAN_SOCKET_DIR=$sock"
