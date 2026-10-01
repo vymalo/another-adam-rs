@@ -46,11 +46,17 @@ impl ManualClock {
     /// Move the clock forward by `by`.
     pub fn advance(&self, by: Duration) {
         let ms = i64::try_from(by.as_millis()).unwrap_or(i64::MAX);
-        self.offset_ms
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |o| {
-                Some(o.saturating_add(ms))
-            })
-            .ok();
+        // a compare-and-swap loop: `fetch_update` is deprecated from Rust 1.99 and its
+        // replacement, `try_update`, is newer than the MSRV
+        let mut current = self.offset_ms.load(Ordering::SeqCst);
+        while let Err(actual) = self.offset_ms.compare_exchange_weak(
+            current,
+            current.saturating_add(ms),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            current = actual;
+        }
     }
 }
 
