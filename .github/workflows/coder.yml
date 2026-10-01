@@ -10,8 +10,14 @@ name: coder
 # the compose stack (scripted models, a git remote, a mock GitHub) with a task
 # that must end in a branch and one pull request (dev/coder-e2e.sh), and with
 # "Hi", which must get a greeting that says the agent's name, and with a changed
-# agent folder mounted in place of the default one (dev/greeting-e2e.sh). On main
-# the very image that passed is the one pushed.
+# agent folder mounted in place of the default one (dev/greeting-e2e.sh). The same
+# image carries the general agent binary too (adam-agent, which serves any agent
+# folder): it is smoke-tested as a container by running the image with the
+# entrypoint `tini -- adam-agent` (docker/coder/test/agent-smoke.sh) and in the
+# compose stack as the service `agent`, where "hi" must be answered in role by the
+# folder it serves and a changed folder must change the answer after a restart
+# (dev/agent-e2e.sh). There is no second image. On main the very image that passed
+# is the one pushed.
 #
 # The bump follows the pattern of vymalo/another-agentic-system#11 (deploy-bump):
 # set the image tag in the chart's values.yaml to `sha-<first 7 of the commit>`
@@ -222,6 +228,11 @@ jobs:
       - name: Container smoke test
         if: steps.guard.outputs.ready == 'true'
         run: sh docker/coder/test/container-smoke.sh coder:smoke
+      # The same image, the other binary: no agent folder, no agent (exit 78); with the example
+      # folder mounted it serves that card, completes a task and stops on SIGTERM.
+      - name: Container smoke test of adam-agent
+        if: steps.guard.outputs.ready == 'true'
+        run: sh docker/coder/test/agent-smoke.sh coder:smoke
       # The image that just passed, in the compose stack: the coder gets a task
       # over A2A, its scripted model drives prepare -> OpenCode (also scripted)
       # -> checks -> commit and push -> pull request, and dev/coder-e2e.sh
@@ -238,11 +249,14 @@ jobs:
           docker tag coder:smoke adam-rs/coder:dev
           docker compose --profile app build git-server
           docker compose --profile app up -d --no-build --wait \
-            postgres mock-openai mock-github git-server coder
+            postgres mock-openai mock-github git-server coder agent
           NO_OPENCODE=1 sh dev/coder-e2e.sh
           sh dev/coder-e2e.sh
           # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
           sh dev/greeting-e2e.sh
+          # The general agent: "hi" answered in role by its folder, and an edited folder changes the
+          # answer after a restart (it restarts `agent` on an edited copy).
+          sh dev/agent-e2e.sh
       - name: Compose e2e logs
         if: failure() && steps.guard.outputs.ready == 'true'
         run: docker compose --profile app logs --no-color

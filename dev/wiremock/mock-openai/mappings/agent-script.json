@@ -1,0 +1,97 @@
+{
+  "mappings": [
+    {
+      "name": "assistant script: a tool result is in, say so",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-assistant"
+            }
+          },
+          {
+            "matchesJsonPath": "$.messages[?(@.role == 'tool')]"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-assistant-script-tool",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-assistant",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "I looked into it with the tool you gave me. That is all the mock assistant has to say."
+              },
+              "logprobs": null,
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "assistant script: any other request is answered in role",
+      "priority": 2,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-assistant"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-assistant-script-greeting",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-assistant",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "Hi! I'm {{regexExtract (jsonPath request.body '$.messages[0].content') 'Your name is ([A-Za-z0-9 _-]+)' 'name'}}{{name.0}}. {{regexExtract (jsonPath request.body '$.messages[0].content') 'In one sentence: ([^.]+)' 'summary'}}{{summary.0}}."
+              },
+              "logprobs": null,
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    }
+  ]
+}

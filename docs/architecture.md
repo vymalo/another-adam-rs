@@ -1912,6 +1912,8 @@ flowchart LR
         gitsrv["git-server :8083<br/>nginx + git-http-backend<br/>local/sandbox.git"]
         cdr["coder :8080<br/>profile app, built from docker/coder/Dockerfile"]
         agentdir[/"bin/adam-coder/agent<br/>mounted read-only at /etc/adam/agent"/]
+        gen["agent :8084<br/>profile app, the same image, entrypoint adam-agent"]
+        genagentdir[/"dev/agents/assistant/agent<br/>mounted read-only at /etc/adam/agent"/]
     end
 
     curl -->|"A2A, bearer dev-token"| cdr
@@ -1920,6 +1922,10 @@ flowchart LR
     cdr -->|"GITHUB_API_URL"| mogh
     cdr -->|"repository in the task"| gitsrv
     agentdir -->|"ADAM_AGENT_DIR, read at startup"| cdr
+    curl -->|"A2A, bearer dev-token"| gen
+    gen -->|"DATABASE_URL, runs scoped by agent name"| pgs
+    gen -->|"MODEL_BASE_URL, model mock-assistant"| moai
+    genagentdir -->|"ADAM_AGENT_DIR, read at startup"| gen
 
     cargo --> pgs
     cargo --> mongos
@@ -1935,6 +1941,12 @@ flowchart LR
   the same task go on to a pull request, and restarts the coder on an edited copy of the folder.
 * The coder waits until `postgres`, `mock-openai`, `mock-github` and `git-server`
   are healthy.
+* The service `agent` is [`adam-agent`](../bin/adam-agent/README.md) from the **coder's image** with the entrypoint
+  overridden (`tini -- adam-agent`; there is no second image): a chat persona in the folder
+  `dev/agents/assistant/agent` (`AGENT_FOLDER` mounts another), the model `mock-assistant` (it answers in role from the
+  two persona lines of the prompt), the same database as the coder (runs are scoped by the agent's name) and no
+  workspace or GitHub. It waits for `postgres` and `mock-openai`. `dev/agent-e2e.sh` runs "hi" through it (the task
+  completes with the folder's name and summary) and restarts it on an edited copy of the folder.
 * The mock model is canned: it answers in text, or calls the first declared tool
   with `{}`. So it cannot drive OpenCode through a real change, and a local run
   does not end in a pull request. A complete run needs a model that can call
@@ -1943,7 +1955,9 @@ flowchart LR
   test in the [`adam-coder` README](../bin/adam-coder/README.md).
 * The `compose` job in `.github/workflows/ci.yml` starts the mocks and runs the
   real clients (`OpenAiCompatible`, `GitHub`) against them, so the mappings
-  cannot rot.
+  cannot rot. The `image` job of `.github/workflows/coder.yml` builds the coder image once, smoke-tests both
+  binaries in it (`docker/coder/test/container-smoke.sh`, `agent-smoke.sh`) and runs the scenarios against the
+  stack, `dev/agent-e2e.sh` among them.
 
 ## The generic agent
 

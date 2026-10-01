@@ -282,6 +282,17 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"model":"mock-coder","messages":[{"role":"system","content":"x"},{"role":"user","content":"Hi"},{"role":"assistant","content":"Hi!","tool_calls":[{"id":"stop00001","type":"function","function":{"name":"ask_user","arguments":"{}"}}]},{"role":"tool","tool_call_id":"stop00001","content":"http://git-server:8080/local/sandbox.git, add hello.txt"}]}' \
             | jq -e '.choices[0].message.tool_calls[0] | .id == "coder-call-1" and .function.name == "prepare_workspace"' > /dev/null
+          # mock-openai, model mock-assistant (the general agent, adam-agent): any request is answered in
+          # role from the two persona lines of the system prompt, and a request that holds a tool result
+          # gets the fixed text.
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-assistant","messages":[{"role":"system","content":"Your name is Chat.\nIn one sentence: I talk things through.\n"},{"role":"user","content":"Hi"}]}' \
+            | jq -e '.choices[0].finish_reason == "stop" and (.choices[0].message.content | contains("Hi! I'"'"'m Chat. I talk things through."))' > /dev/null
+          curl -fsS http://127.0.0.1:8081/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"mock-assistant","messages":[{"role":"system","content":"x"},{"role":"user","content":"Hi"},{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"search__web_search","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"1. A"}]}' \
+            | jq -e '.choices[0].message.content | contains("That is all the mock assistant has to say")' > /dev/null
           # mock-github: no open pull requests; creating one answers 201.
           test "$(curl -fsS 'http://127.0.0.1:8082/repos/local/sandbox/pulls?head=local:agent/x&state=open')" = '[]'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/repos/local/sandbox/pulls \

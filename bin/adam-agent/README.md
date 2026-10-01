@@ -208,6 +208,36 @@ The binary is `main.rs` over a small library, so everything it does is testable 
 | `AgentError`, `exit_code(&err)` | why a step failed, and the exit code of a chain of causes |
 | `tools::ask_user` (`AskUser`) | the one built-in tool |
 
+## Image and compose
+
+`adam-agent` ships **inside the existing `coder` image** (`ghcr.io/vymalo/another-adam-rs/coder`): its
+[Dockerfile](../../docker/coder/Dockerfile) builds and installs both binaries, and the entrypoint stays
+`adam-coder`. A service that serves a folder runs the same image with the entrypoint overridden and the folder
+mounted (read-only, readable by uid 10001):
+
+```sh
+docker run --rm --entrypoint tini \
+  -v "$PWD/dev/agents/assistant/agent:/etc/adam/agent:ro" -e ADAM_AGENT_DIR=/etc/adam/agent \
+  -e DATABASE_URL=... -e MODEL_BASE_URL=... -e MODEL_API_KEY=... -e MODEL=... \
+  -e A2A_BEARER_TOKENS=... -e PUBLIC_URL=... -p 8080:8080 \
+  ghcr.io/vymalo/another-adam-rs/coder:sha-<7> -- adam-agent
+```
+
+There is no second package: a new GHCR package is private until its owner makes it public, and a lean image of its
+own (the coder's image carries the workspace toolchains, which a chat agent does not use) can come later. Stdio MCP
+servers that need `node` or `python` need an image that has them (`MCP_ALLOW_STDIO=true` allows the kind; the image
+brings the program).
+
+`compose.yaml` has the service `agent` (profile `app`): the example folder `dev/agents/assistant/agent` mounted
+at `/etc/adam/agent`, the model `mock-assistant` of the WireMock mock, the coder's database (runs are scoped by the
+agent's name), port 8084 (`AGENT_PORT`), `AGENT_FOLDER` to mount another folder. A fourth agent is a folder and the
+same dozen lines. `dev/agent-e2e.sh` runs "hi" through it and restarts it on an edited copy of the folder. See
+"A general agent from a folder" in the [root README](../../README.md#a-general-agent-from-a-folder). CI
+(`.github/workflows/coder.yml`) builds the image once and smoke-tests both binaries in it:
+`docker/coder/test/container-smoke.sh` for `adam-coder` and `docker/coder/test/agent-smoke.sh` for `adam-agent`
+(no folder: exit 78; the example folder mounted: the card, `401` without a token, a completed task against a stub
+model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
+
 ## Tests
 
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
@@ -231,5 +261,6 @@ The binary is `main.rs` over a small library, so everything it does is testable 
   the official A2A client against a model scripted by the prompt, and the same database after an edit and a
   restart saying the edited words**, a researcher answering with its source through a stateless MCP server, a control plane and a worker in two processes completing a task over one
   database, and the MCP cases of the section above as a process.
-* The mocks (`dev/wiremock/mock-openai`, model `mock-assistant`) and the compose scenario
-  (`dev/agent-e2e.sh`) are exercised by CI, see the repository README.
+* The mock model `mock-assistant` (`dev/wiremock/mock-openai/mappings/agent-script.json`) is probed by the
+  `compose` job of `ci.yml`; the container smoke test and the compose scenario (`dev/agent-e2e.sh`) run in
+  `coder.yml` (see above).
