@@ -779,6 +779,426 @@
       }
     },
     {
+      "name": "coder script (files) 0: prepare_workspace",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "[mock:files]"
+          },
+          {
+            "doesNotContain": "tool_call_id"
+          },
+          {
+            "doesNotContain": "fl-call-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-fl-call-1",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "fl-call-1",
+                    "type": "function",
+                    "function": {
+                      "name": "prepare_workspace",
+                      "arguments": "{\"repo_url\":\"http://git-server:8080/local/sandbox.git\",\"base_branch\":\"main\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (files) 1: read_file",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "fl-call-1"
+          },
+          {
+            "doesNotContain": "fl-call-2"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-fl-call-2",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "fl-call-2",
+                    "type": "function",
+                    "function": {
+                      "name": "read_file",
+                      "arguments": "{\"path\":\"README.md\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (files) 2: write_file",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "fl-call-2"
+          },
+          {
+            "doesNotContain": "fl-call-3"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-fl-call-3",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "fl-call-3",
+                    "type": "function",
+                    "function": {
+                      "name": "write_file",
+                      "arguments": "{\"path\":\"hello.txt\",\"content\":\"hello\\n\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (files) 3: run_checks",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "fl-call-3"
+          },
+          {
+            "doesNotContain": "fl-call-4"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-fl-call-4",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "fl-call-4",
+                    "type": "function",
+                    "function": {
+                      "name": "run_checks",
+                      "arguments": "{\"command\":\"sh ./check.sh\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (files) 4: commit_and_push",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "fl-call-4"
+          },
+          {
+            "doesNotContain": "fl-call-5"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-fl-call-5",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "fl-call-5",
+                    "type": "function",
+                    "function": {
+                      "name": "commit_and_push",
+                      "arguments": "{\"message\":\"feat: add hello.txt\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (files) 5: open_pull_request",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "fl-call-5"
+          },
+          {
+            "doesNotContain": "fl-call-6"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-fl-call-6",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                  {
+                    "id": "fl-call-6",
+                    "type": "function",
+                    "function": {
+                      "name": "open_pull_request",
+                      "arguments": "{\"title\":\"feat: add hello.txt\",\"body\":\"## Summary\\n\\nAdds `hello.txt` to the repository root, containing the single line `hello`, written with write_file.\\n\\n## Verification\\n\\n- `sh ./check.sh`: passed (exit code 0)\\n\"}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
+      "name": "coder script (files) 6: final answer",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-coder"
+            }
+          },
+          {
+            "contains": "fl-call-6"
+          },
+          {
+            "doesNotContain": "fl-call-7"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "id": "chatcmpl-coder-script-final",
+          "object": "chat.completion",
+          "created": 1700000000,
+          "model": "mock-coder",
+          "system_fingerprint": "fp_mock",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "Opened the pull request: hello.txt is written on a new branch and the checks passed (files)."
+              },
+              "logprobs": null,
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120
+          }
+        }
+      }
+    },
+    {
       "name": "coder script: off-script request is a 404",
       "priority": 3,
       "request": {

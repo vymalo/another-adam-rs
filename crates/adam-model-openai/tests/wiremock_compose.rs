@@ -359,6 +359,22 @@ async fn the_scripted_models_stream_what_they_complete() {
     assert_eq!(without.len(), 5, "four calls, then the answer");
     grows(&without, 6, "the coder's last answer without OpenCode");
 
+    // The same task with the file tools: it reads and writes the files itself, and OpenCode is
+    // never called (the `[mock:files]` script: `read_file`, `write_file`).
+    let files = play(
+        &client,
+        "mock-coder",
+        "x",
+        user(&format!("{task} [mock:files]")),
+    )
+    .await;
+    assert_eq!(
+        files.len(),
+        7,
+        "six calls, the last the pull request, then the answer"
+    );
+    grows(&files, 6, "the coder's last answer with the file tools");
+
     let choices = play(
         &client,
         "mock-coder",

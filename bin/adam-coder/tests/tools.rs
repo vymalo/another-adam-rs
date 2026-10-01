@@ -10,6 +10,7 @@ use adam_coder::ToolEnv;
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::delegate::DelegateToOpenCode;
+use adam_coder::tools::files::{ApplyPatch, ReadFile, WriteFile};
 use adam_coder::tools::inspect::RunCommand;
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::notes::PushedBranch;
@@ -57,10 +58,7 @@ impl Rig {
     }
 
     fn worktree(&self) -> std::path::PathBuf {
-        self.fx
-            .root
-            .join("worktrees")
-            .join(self.ctx.run_id().to_string())
+        common::slot_dir(&self.fx.root, &self.ctx.run_id().to_string())
     }
 
     fn progress(&self) -> Vec<String> {
@@ -193,7 +191,7 @@ async fn prepare_workspace_refuses_foreign_hosts_and_local_paths_in_production()
     assert!(seen.is_empty(), "the foreign host was contacted: {seen:?}");
     let root = rig.fx.tmp.path().join("production-work");
     assert!(
-        !root.join("git").exists() && !root.join("worktrees").exists(),
+        !root.join("git").exists() && !root.join("workspaces").exists(),
         "nothing was created for a refused repository"
     );
 
@@ -1291,7 +1289,8 @@ async fn opencode_cannot_write_outside_the_worktree() {
         "the write must be refused: {}",
         out.content
     );
-    let escaped = rig.fx.root.join("worktrees/escaped.txt");
+    // Beside the worktree, in the run's workspace, and above it.
+    let escaped = rig.worktree().parent().unwrap().join("escaped.txt");
     assert!(!escaped.exists(), "{}", escaped.display());
 }
 
@@ -2089,7 +2088,7 @@ async fn a_later_task_continues_the_pushed_branch_and_reports_the_same_pull_requ
         "{}",
         ready.content
     );
-    let worktree = rig.fx.root.join("worktrees").join(two.run_id().to_string());
+    let worktree = common::slot_dir(&rig.fx.root, &two.run_id().to_string());
     assert_eq!(
         std::fs::read_to_string(worktree.join("one.txt")).unwrap(),
         "one\n",
@@ -2204,7 +2203,7 @@ async fn rework_of_an_open_pull_request(
         .await
         .unwrap();
     assert!(!ready.is_error, "{}", ready.content);
-    let worktree = rig.fx.root.join("worktrees").join(two.run_id().to_string());
+    let worktree = common::slot_dir(&rig.fx.root, &two.run_id().to_string());
     (two, worktree, branch, tip)
 }
 
@@ -2453,11 +2452,7 @@ async fn a_continued_branch_keeps_the_base_of_its_pull_request() {
         "{}",
         ready.content
     );
-    let dir = rig
-        .fx
-        .root
-        .join("worktrees")
-        .join(three.run_id().to_string());
+    let dir = common::slot_dir(&rig.fx.root, &three.run_id().to_string());
     std::fs::write(dir.join("three.txt"), "three\n").unwrap();
     RunChecks
         .call(&three, json!({"command": "true"}))
@@ -2574,4 +2569,850 @@ async fn the_red_checks_note_is_not_posted_twice_for_the_same_commit() {
         "{:?}",
         rig.fx.comments().await
     );
+}
+
+// ------------------------------------------------------------------ read_file, write_file, apply_patch
+
+/// A unified diff that changes the one line of `file` (`old` becomes `new`).
+fn one_line_patch(file: &str, old: &str, new: &str) -> String {
+    format!("--- a/{file}\n+++ b/{file}\n@@ -1 +1 @@\n-{old}\n+{new}\n")
+}
+
+#[tokio::test]
+async fn the_file_tools_need_a_workspace_like_the_others() {
+    let rig = Rig::new().await;
+    let cases: Vec<(&str, Result<ToolOutput, ToolError>)> = vec![
+        (
+            "read",
+            ReadFile.call(&rig.ctx, json!({"path": "README.md"})).await,
+        ),
+        (
+            "write",
+            WriteFile
+                .call(&rig.ctx, json!({"path": "a.txt", "content": "a"}))
+                .await,
+        ),
+        (
+            "patch",
+            ApplyPatch
+                .call(
+                    &rig.ctx,
+                    json!({"patch": one_line_patch("README.md", "a", "b")}),
+                )
+                .await,
+        ),
+    ];
+    for (name, out) in cases {
+        assert!(is_error(&out), "{name}: {out:?}");
+        assert!(text(out).contains("prepare_workspace"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn read_file_reads_the_worktree_and_numbers_a_range() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(wt.join("lines.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+
+    let whole = ReadFile
+        .call(&rig.ctx, json!({"path": "README.md"}))
+        .await
+        .unwrap();
+    assert!(!whole.is_error, "{}", whole.content);
+    assert_eq!(whole.content, "widgets\n", "the file as it is");
+    assert!(
+        rig.progress()
+            .contains(&"read README.md (remote)".to_owned()),
+        "{:?}",
+        rig.progress()
+    );
+
+    let range = ReadFile
+        .call(
+            &rig.ctx,
+            json!({"path": "lines.txt", "start_line": 2, "end_line": 3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(range.content, "     2\ttwo\n     3\tthree\n");
+
+    // Binary, a directory, a missing file, an empty range: results the model can act on.
+    std::fs::write(wt.join("data.bin"), b"\x00\x01\x02 binary").unwrap();
+    for (args, needle) in [
+        (json!({"path": "data.bin"}), "binary file, 10 bytes"),
+        (json!({"path": "."}), "name a file"),
+        (json!({"path": "nope.txt"}), "does not exist"),
+        (
+            json!({"path": "lines.txt", "start_line": 9}),
+            "past the end",
+        ),
+        (json!({"path": "lines.txt", "start_line": 0}), "from 1"),
+        (json!({"path": "  "}), "path is required"),
+    ] {
+        let out = ReadFile.call(&rig.ctx, args.clone()).await;
+        assert!(is_error(&out), "{args}: {out:?}");
+        assert!(text(out).contains(needle), "{args}");
+    }
+}
+
+#[tokio::test]
+async fn read_file_cuts_a_big_file_and_says_so() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let big = "0123456789".repeat(40 * 1024); // 400 KiB
+    std::fs::write(rig.worktree().join("big.txt"), &big).unwrap();
+    let out = ReadFile
+        .call(&rig.ctx, json!({"path": "big.txt"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error);
+    assert!(
+        out.content.len() < 256 * 1024 + 300,
+        "{}",
+        out.content.len()
+    );
+    assert!(
+        out.content.contains("[cut: `big.txt` is 409600 bytes"),
+        "{}",
+        &out.content[out.content.len() - 200..]
+    );
+}
+
+/// Whatever the model passes, a path that leaves the worktree reads and writes nothing, and says
+/// why.
+#[tokio::test]
+async fn the_file_tools_never_leave_the_worktree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "s3cr3t").unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret.txt"), wt.join("leak")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), wt.join("outdir")).unwrap();
+    std::os::unix::fs::symlink("README.md", wt.join("alias")).unwrap();
+
+    let refused = [
+        ("../escape.txt", "`..`"),
+        ("sub/../../escape.txt", "`..`"),
+        ("/tmp/escape.txt", "absolute"),
+        (".git/config", ".git"),
+        (".GIT/config", ".git"),
+        ("outdir/new.txt", "symlink"),
+        ("leak", "symlink"),
+        ("alias", "symlink"),
+    ];
+    for (path, needle) in refused {
+        let out = WriteFile
+            .call(&rig.ctx, json!({"path": path, "content": "pwned"}))
+            .await;
+        assert!(is_error(&out), "write {path}: {out:?}");
+        assert!(text(out).contains(needle), "write {path}");
+    }
+    for (path, needle) in [
+        ("../secret.txt", "`..`"),
+        (".git", ".git"),
+        ("leak", "outside the worktree"),
+        ("outdir/secret.txt", "outside the worktree"),
+    ] {
+        let out = ReadFile.call(&rig.ctx, json!({"path": path})).await;
+        assert!(is_error(&out), "read {path}: {out:?}");
+        let message = text(out);
+        assert!(message.contains(needle), "read {path}: {message}");
+        assert!(!message.contains("s3cr3t"), "read {path}: {message}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+        "s3cr3t"
+    );
+    assert!(!outside.path().join("new.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets\n"
+    );
+    // A link that stays inside is read, through to its target.
+    let out = ReadFile
+        .call(&rig.ctx, json!({"path": "alias"}))
+        .await
+        .unwrap();
+    assert_eq!(out.content, "widgets\n");
+}
+
+/// A file written by the tool is a change of the worktree like any other: the checks see it, and
+/// a commit made after a later edit is not bound to them.
+#[tokio::test]
+async fn write_file_changes_what_the_checks_see_and_the_gate_binds() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+
+    let made = WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "docs/notes/hello.txt", "content": "hello\n"}),
+        )
+        .await
+        .unwrap();
+    assert!(!made.is_error, "{}", made.content);
+    assert!(
+        made.content.starts_with("Created docs/notes/hello.txt"),
+        "{}",
+        made.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("docs/notes/hello.txt")).unwrap(),
+        "hello\n"
+    );
+    assert!(
+        rig.progress()
+            .contains(&"wrote docs/notes/hello.txt (remote)".to_owned())
+    );
+
+    let checked = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "grep -qx hello docs/notes/hello.txt"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(checks_of(&checked)["passed"], true);
+    // The same path again replaces it.
+    let again = WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "docs/notes/hello.txt", "content": "hello, again\n"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        again.content.starts_with("Replaced docs/notes/hello.txt"),
+        "{}",
+        again.content
+    );
+
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "docs: add a note"}))
+        .await
+        .unwrap();
+    let (bound, _) = commit_artifacts(&out);
+    assert_eq!(
+        bound["passed"], false,
+        "edited after the checks, so not bound to them: {bound}"
+    );
+    // Checked again, the commit is bound.
+    let rechecked = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "grep -qx 'hello, again' docs/notes/hello.txt"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(checks_of(&rechecked)["passed"], true);
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "docs: add a note"}))
+        .await
+        .unwrap();
+    let (bound, _) = commit_artifacts(&out);
+    assert_eq!(bound["passed"], true, "{bound}");
+
+    let too_big = WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "big.txt", "content": "x".repeat(1024 * 1024 + 1)}),
+        )
+        .await;
+    assert!(is_error(&too_big), "{too_big:?}");
+    assert!(!wt.join("big.txt").exists());
+}
+
+#[tokio::test]
+async fn apply_patch_changes_a_file_and_the_checks_see_it() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let before = worktree_state(&rig);
+
+    let patch = format!(
+        "{}--- /dev/null\n+++ b/NOTES.md\n@@ -0,0 +1,2 @@\n+# Notes\n+second\n",
+        one_line_patch("README.md", "widgets", "widgets, patched")
+    );
+    let out = ApplyPatch
+        .call(&rig.ctx, json!({"patch": patch}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("2 file(s): README.md, NOTES.md"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets, patched\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("NOTES.md")).unwrap(),
+        "# Notes\nsecond\n"
+    );
+    assert!(
+        rig.progress()
+            .contains(&"patched README.md, NOTES.md (remote)".to_owned()),
+        "{:?}",
+        rig.progress()
+    );
+    assert_ne!(worktree_state(&rig), before, "the tree changed");
+
+    // `run_checks` sees it, and the commit is bound to those checks.
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "grep -q patched README.md"}))
+        .await
+        .unwrap();
+    assert_eq!(checks_of(&checked)["passed"], true);
+    let out = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({"message": "fix: say what the widgets are"}),
+        )
+        .await
+        .unwrap();
+    let (bound, branch) = commit_artifacts(&out);
+    assert_eq!(bound["passed"], true, "{bound}");
+    assert_eq!(bound["commit"], branch["commit"]);
+    // The patch changed the index of nothing: git sees one commit with both files.
+    let pushed = branch["commit"].as_str().unwrap();
+    assert_eq!(
+        common::git(&wt, &["show", "--stat", "--format=", pushed])
+            .lines()
+            .count(),
+        3,
+        "two files and the summary line"
+    );
+}
+
+#[tokio::test]
+async fn a_patch_whose_hunk_does_not_match_changes_nothing() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    // The first file would apply; the second hunk does not match: all or nothing.
+    let patch = format!(
+        "{}{}",
+        one_line_patch("README.md", "widgets", "changed"),
+        "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-not what the file says\n+x\n"
+    );
+    let out = ApplyPatch.call(&rig.ctx, json!({"patch": patch})).await;
+    assert!(is_error(&out), "{out:?}");
+    let message = text(out);
+    assert!(
+        message.contains("does not apply") && message.contains("nothing was changed"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets\n"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_or_empty_patch_is_the_models_to_fix() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    for (patch, needle) in [
+        ("", "patch is required"),
+        ("   \n", "patch is required"),
+        ("this is not a diff at all\n", "unified diff"),
+        (
+            "--- a/README.md\n+++ b/README.md\n@@ garbage @@\n",
+            "unified diff",
+        ),
+    ] {
+        let out = ApplyPatch.call(&rig.ctx, json!({"patch": patch})).await;
+        assert!(is_error(&out), "{patch:?}: {out:?}");
+        let message = text(out);
+        assert!(message.contains(needle), "{patch:?}: {message}");
+    }
+    let huge = format!(
+        "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-widgets\n+{}\n",
+        "x".repeat(1024 * 1024)
+    );
+    let out = ApplyPatch.call(&rig.ctx, json!({"patch": huge})).await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("over the limit"));
+    let nul = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-widgets\n+x\0y\n";
+    let out = ApplyPatch.call(&rig.ctx, json!({"patch": nul})).await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("NUL"));
+}
+
+/// A patch is checked by the paths git reads from it, whatever the model wrote: nothing in `.git`,
+/// nothing above the worktree, no symlink created, none written through.
+#[tokio::test]
+async fn a_patch_cannot_reach_git_the_outside_or_a_symlink() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), wt.join("outdir")).unwrap();
+    std::os::unix::fs::symlink("README.md", wt.join("alias")).unwrap();
+    let before = worktree_state(&rig);
+    let config_before = std::fs::read_to_string(
+        common::git(&wt, &["rev-parse", "--git-common-dir"])
+            .parse::<std::path::PathBuf>()
+            .map(|p| wt.join(p).join("config"))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let new_file = |path: &str| format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+pwned\n");
+    let cases: Vec<(String, &str)> = vec![
+        (new_file(".git/config"), ".git"),
+        (new_file(".GIT/hooks/pre-commit"), ".git"),
+        (new_file("../escape.txt"), "x"),
+        (new_file("outdir/new.txt"), "symlink"),
+        (one_line_patch("alias", "widgets", "pwned"), "symlink"),
+        // A symlink created by the patch itself.
+        (
+            "diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/etc/passwd\n\\ No newline at end of file\n".to_owned(),
+            "symlink or a submodule",
+        ),
+        // A rename into `.git`.
+        (
+            "diff --git a/README.md b/.git/moved\nsimilarity index 100%\nrename from README.md\nrename to .git/moved\n".to_owned(),
+            ".git",
+        ),
+        // A binary patch.
+        (
+            "diff --git a/img.png b/img.png\nnew file mode 100644\nindex 0000000..e69de29\nGIT binary patch\nliteral 0\nHcmV?d00001\n\n".to_owned(),
+            "binary",
+        ),
+    ];
+    for (patch, needle) in cases {
+        let out = ApplyPatch.call(&rig.ctx, json!({"patch": patch})).await;
+        let shown = patch.replace('\n', "\\n");
+        assert!(is_error(&out), "{shown}: {out:?}");
+        let message = text(out);
+        if needle != "x" {
+            assert!(message.contains(needle), "{shown}: {message}");
+        }
+    }
+    assert!(!wt.join("link").exists(), "no symlink was created");
+    assert!(!wt.parent().unwrap().join("escape.txt").exists());
+    assert!(!outside.path().join("new.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets\n"
+    );
+    let config_after = std::fs::read_to_string(
+        wt.join(common::git(&wt, &["rev-parse", "--git-common-dir"]))
+            .join("config"),
+    )
+    .unwrap();
+    assert_eq!(
+        config_after, config_before,
+        "the repository's config is untouched"
+    );
+    assert_eq!(
+        worktree_state(&rig),
+        before,
+        "nothing in the worktree changed"
+    );
+}
+
+/// `run_command` is still for looking: a write it makes is undone, whatever the new tools allow.
+#[tokio::test]
+async fn run_command_stays_read_only_beside_the_file_tools() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": "echo x > made-by-command.txt"}))
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(!rig.worktree().join("made-by-command.txt").exists());
+}
+
+/// A model counts the lines of a hunk badly. A patch that only applies once git goes by the lines
+/// themselves is applied; one that is wrong in its lines is not.
+#[tokio::test]
+async fn a_hunk_header_with_wrong_counts_is_applied_by_its_lines() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let miscounted =
+        "--- a/README.md\n+++ b/README.md\n@@ -1,7 +1,9 @@\n-widgets\n+widgets, counted wrong\n";
+    let out = ApplyPatch
+        .call(&rig.ctx, json!({"patch": miscounted}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        std::fs::read_to_string(wt.join("README.md")).unwrap(),
+        "widgets, counted wrong\n"
+    );
+}
+
+// ------------------------------------------------------------------ a workspace of two repositories
+
+/// A second repository in the run's workspace: its slot, named after it.
+async fn add_second(rig: &Rig, files: &[(&str, &str)]) -> (std::path::PathBuf, std::path::PathBuf) {
+    let remote = rig.fx.extra_remote("lib", files);
+    let url = remote.to_string_lossy().into_owned();
+    rig.say(&url).await;
+    let out = PrepareWorkspace
+        .call(&rig.ctx, json!({"repo_url": url, "base_branch": "main"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("slot: lib\n"),
+        "the result says the slot: {}",
+        out.content
+    );
+    let wt = common::slot_dir(&rig.fx.root, &rig.ctx.run_id().to_string())
+        .parent()
+        .unwrap()
+        .join("lib");
+    (remote, wt)
+}
+
+#[tokio::test]
+async fn a_second_repository_joins_the_workspace_and_repo_says_which_one() {
+    let rig = Rig::new().await;
+    let first = rig.prepare().await;
+    assert!(
+        first.content.contains("slot: remote\n"),
+        "{}",
+        first.content
+    );
+    let (remote_b, wt_b) = add_second(&rig, &[("lib.txt", "lib\n")]).await;
+    let wt_a = rig.worktree();
+    assert!(wt_a.join("README.md").is_file() && wt_b.join("lib.txt").is_file());
+    assert_ne!(wt_a, wt_b);
+
+    // Without `repo` the model must say which: the error lists the slots.
+    for out in [
+        RunCommand.call(&rig.ctx, json!({"command": "ls"})).await,
+        ReadFile.call(&rig.ctx, json!({"path": "README.md"})).await,
+        RunChecks.call(&rig.ctx, json!({"command": "true"})).await,
+        CommitAndPush.call(&rig.ctx, json!({"message": "m"})).await,
+    ] {
+        assert!(is_error(&out), "{out:?}");
+        let message = text(out);
+        assert!(
+            message.contains("2 slots")
+                && message.contains("`lib`")
+                && message.contains("`remote`"),
+            "{message}"
+        );
+    }
+    // By the slot's name, and by the address of the repository.
+    let by_name = RunCommand
+        .call(&rig.ctx, json!({"command": "cat lib.txt", "repo": "lib"}))
+        .await
+        .unwrap();
+    assert!(by_name.content.contains("lib\n"), "{}", by_name.content);
+    let by_address = ReadFile
+        .call(
+            &rig.ctx,
+            json!({"path": "lib.txt", "repo": remote_b.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_address.content, "lib\n");
+    let in_first = ReadFile
+        .call(&rig.ctx, json!({"path": "README.md", "repo": "remote"}))
+        .await
+        .unwrap();
+    assert_eq!(in_first.content, "widgets\n");
+    // A file of one slot is not in the other.
+    let wrong = ReadFile
+        .call(&rig.ctx, json!({"path": "lib.txt", "repo": "remote"}))
+        .await;
+    assert!(is_error(&wrong), "{wrong:?}");
+    // A slot that is not there: the error says which are.
+    let unknown = RunCommand
+        .call(&rig.ctx, json!({"command": "ls", "repo": "nope"}))
+        .await;
+    assert!(is_error(&unknown), "{unknown:?}");
+    assert!(text(unknown).contains("no slot of this workspace is `nope`"));
+
+    // Writes and patches go to the slot that was named.
+    WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "new.txt", "content": "n\n", "repo": "lib"}),
+        )
+        .await
+        .unwrap();
+    assert!(wt_b.join("new.txt").is_file() && !wt_a.join("new.txt").exists());
+    let patched = ApplyPatch
+        .call(
+            &rig.ctx,
+            json!({"patch": one_line_patch("README.md", "widgets", "widgets!"), "repo": "remote"}),
+        )
+        .await
+        .unwrap();
+    assert!(!patched.is_error, "{}", patched.content);
+    assert_eq!(
+        std::fs::read_to_string(wt_a.join("README.md")).unwrap(),
+        "widgets!\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt_b.join("lib.txt")).unwrap(),
+        "lib\n"
+    );
+    // The progress line names the slot.
+    assert!(
+        rig.progress().contains(&"wrote new.txt (lib)".to_owned()),
+        "{:?}",
+        rig.progress()
+    );
+    // Asking for the repository again is the same slot, and keeps what is in it.
+    let again = PrepareWorkspace
+        .call(
+            &rig.ctx,
+            json!({"repo_url": remote_b.to_string_lossy(), "base_branch": "main"}),
+        )
+        .await
+        .unwrap();
+    assert!(again.content.contains("slot: lib\n"), "{}", again.content);
+    assert!(wt_b.join("new.txt").is_file(), "work in progress survives");
+}
+
+/// `run_checks` and `commit_and_push` per slot: each pushes to its own remote, the `checks`
+/// artifact names the repository it ran in, and a check in one slot does not bind a commit in the
+/// other unless the code is the same.
+#[tokio::test]
+async fn checks_and_pushes_are_per_slot_and_the_gate_binds_by_the_tree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let (remote_b, _) = add_second(&rig, &[("README.md", "widgets\n")]).await;
+    let (url_a, url_b) = (rig.fx.remote_url(), remote_b.to_string_lossy().into_owned());
+
+    // The same new file in both: the trees are the same code.
+    for repo in ["remote", "lib"] {
+        WriteFile
+            .call(
+                &rig.ctx,
+                json!({"path": "same.txt", "content": "same\n", "repo": repo}),
+            )
+            .await
+            .unwrap();
+    }
+    let checked = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "test -f same.txt", "repo": "remote"}),
+        )
+        .await
+        .unwrap();
+    let report = checks_of(&checked);
+    assert_eq!(report["passed"], true);
+    assert_eq!(
+        report["repository"],
+        url_a.as_str(),
+        "the check names the repository it ran in"
+    );
+
+    // The commit in the *other* slot has the same tree, so the check in the first binds it.
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: same", "repo": "lib"}))
+        .await
+        .unwrap();
+    let (bound, branch) = commit_artifacts(&out);
+    assert_eq!(bound["passed"], true, "the same code was checked: {bound}");
+    assert_eq!(
+        bound["repository"],
+        url_b.as_str(),
+        "the verdict names the repository pushed to"
+    );
+    assert_eq!(branch["repository"], url_b.as_str());
+    assert_eq!(
+        bound["tree"], report["tree"],
+        "a tree id is a content address"
+    );
+    // It went to its own remote only.
+    let branches_b = common::git(
+        &remote_b,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/agent",
+        ],
+    );
+    assert_eq!(branches_b.lines().count(), 1, "{branches_b}");
+    assert!(
+        rig.fx.agent_branches().is_empty(),
+        "nothing went to the first remote yet"
+    );
+
+    // A different file in the first slot: the check that ran on the other code does not bind it.
+    WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "other.txt", "content": "other\n", "repo": "remote"}),
+        )
+        .await
+        .unwrap();
+    let out = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({"message": "feat: other", "repo": "remote"}),
+        )
+        .await
+        .unwrap();
+    let (unbound, _) = commit_artifacts(&out);
+    assert_eq!(unbound["passed"], false, "{unbound}");
+    assert_eq!(unbound["repository"], url_a.as_str());
+    assert_eq!(rig.fx.agent_branches().len(), 1);
+    assert!(
+        text_of_findings(&unbound).contains("was not checked"),
+        "{unbound}"
+    );
+    // Checked there, it binds, and the pull request of that slot is allowed.
+    RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "test -f other.txt", "repo": "remote"}),
+        )
+        .await
+        .unwrap();
+    let out = CommitAndPush
+        .call(
+            &rig.ctx,
+            json!({"message": "feat: other", "repo": "remote"}),
+        )
+        .await
+        .unwrap();
+    let (rebound, _) = commit_artifacts(&out);
+    assert_eq!(rebound["passed"], true, "{rebound}");
+    let pr = OpenPullRequest
+        .call(
+            &rig.ctx,
+            json!({"title": "feat: other", "body": "x\n\n## Verification\n- test -f other.txt", "repo": "remote"}),
+        )
+        .await
+        .unwrap();
+    assert!(!pr.is_error, "{}", pr.content);
+    assert_eq!(pr.artifacts[0].data["repository"], url_a.as_str());
+}
+
+fn text_of_findings(report: &Value) -> String {
+    report["findings"]
+        .as_array()
+        .map(|f| {
+            f.iter()
+                .map(|f| f["message"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// The gate for a pull request: green only if the most recent check on **this code**, in any slot,
+/// passed. A green and then a red on the same code is red.
+#[tokio::test]
+async fn a_pull_request_needs_the_most_recent_check_of_its_code_whichever_slot_ran_it() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    add_second(&rig, &[("README.md", "widgets\n")]).await;
+    for repo in ["remote", "lib"] {
+        WriteFile
+            .call(
+                &rig.ctx,
+                json!({"path": "same.txt", "content": "same\n", "repo": repo}),
+            )
+            .await
+            .unwrap();
+    }
+    // Green in the second slot, then the commit and the pull request in the first: the same code.
+    RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "test -f same.txt", "repo": "lib"}),
+        )
+        .await
+        .unwrap();
+    CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: same", "repo": "remote"}))
+        .await
+        .unwrap();
+    let pr = OpenPullRequest
+        .call(
+            &rig.ctx,
+            json!({"title": "feat: same", "body": "x\n\n## Verification\n- test -f same.txt", "repo": "remote"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !pr.is_error,
+        "green in the other slot, on the same tree: {}",
+        pr.content
+    );
+    // Red on the same code afterwards: the most recent check on it wins.
+    RunChecks
+        .call(&rig.ctx, json!({"command": "false", "repo": "remote"}))
+        .await
+        .unwrap();
+    let again = OpenPullRequest
+        .call(
+            &rig.ctx,
+            json!({"title": "feat: same", "body": "x\n\n## Verification\n- test -f same.txt", "repo": "remote"}),
+        )
+        .await;
+    assert!(
+        is_error(&again),
+        "red after green on the same tree: {again:?}"
+    );
+    assert!(text(again).contains("the last check run (`false`) failed"));
+}
+
+/// A run that began before workspaces had slots has one worktree in the old layout. It is a slot
+/// like any other: the tools find it, asking for its repository again returns it, and a second
+/// repository joins it.
+#[tokio::test]
+async fn a_run_that_began_in_the_old_layout_keeps_working() {
+    let rig = Rig::new().await;
+    let run = rig.ctx.run_id().to_string();
+    let repo = adam_workspace::RepoRef::new(rig.fx.remote_url(), "main");
+    let legacy = rig.fx.env.workspaces.prepare(&repo, &run).await.unwrap();
+    assert_eq!(legacy.path(), rig.fx.root.join("worktrees").join(&run));
+    std::fs::write(legacy.path().join("wip.txt"), "wip\n").unwrap();
+
+    // The tools find it without `repo`, and `prepare_workspace` of the same repository returns it.
+    let listed = RunCommand
+        .call(&rig.ctx, json!({"command": "ls"}))
+        .await
+        .unwrap();
+    assert!(listed.content.contains("wip.txt"), "{}", listed.content);
+    let again = rig.prepare().await;
+    assert!(
+        again.content.contains("slot: remote\n"),
+        "{}",
+        again.content
+    );
+    assert!(
+        again
+            .content
+            .contains(&format!("path: {}", legacy.path().display())),
+        "{}",
+        again.content
+    );
+    assert!(
+        legacy.path().join("wip.txt").is_file(),
+        "work in progress survives"
+    );
+    // A second repository joins it, in the new layout, and `repo` is needed from then on.
+    let (_, wt_b) = add_second(&rig, &[("lib.txt", "lib\n")]).await;
+    assert_eq!(
+        wt_b.parent().unwrap(),
+        rig.fx.root.join("workspaces").join(&run)
+    );
+    let out = RunCommand.call(&rig.ctx, json!({"command": "ls"})).await;
+    assert!(is_error(&out), "{out:?}");
+    let in_old = ReadFile
+        .call(&rig.ctx, json!({"path": "wip.txt", "repo": "remote"}))
+        .await
+        .unwrap();
+    assert_eq!(in_old.content, "wip\n");
 }

@@ -1,6 +1,6 @@
 //! What the coder remembers about a run besides the conversation: how many
-//! check cycles were spent, what the last check said, what was pushed and which
-//! pull request was opened.
+//! check cycles were spent, what the checks said (the last one, and a short history of them), what
+//! was pushed and which pull request was opened.
 //!
 //! The rules "at most N check cycles" and "no pull request on red checks" are
 //! enforced by the tools, so their inputs must survive a restart and be safe
@@ -40,7 +40,14 @@ pub struct CheckRecord {
     /// commit it makes when the tree is the same.
     #[serde(default)]
     pub report: Option<ChecksReport>,
+    /// The slot of the workspace the command ran in (its directory name). Absent in notes written
+    /// before a workspace had several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
 }
+
+/// Most check runs [`ChecksNotes::history`] keeps.
+pub const MAX_CHECK_HISTORY: usize = 32;
 
 /// State of the check/fix cycle.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,8 +56,14 @@ pub struct ChecksNotes {
     pub failures: u32,
     /// Call ids already counted in `failures`.
     pub counted: Vec<String>,
-    /// The most recent run.
+    /// The most recent run, in any slot.
     pub last: Option<CheckRecord>,
+    /// The last [`MAX_CHECK_HISTORY`] runs, oldest first, in every slot of the workspace: what binds
+    /// a pushed commit to the check that ran on its tree, whichever slot ran it (see
+    /// [`RunNotes::checked`]). `last` is its newest; it stays beside it for notes written before
+    /// the history existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<CheckRecord>,
 }
 
 /// The pull request the run opened.
@@ -166,13 +179,28 @@ pub struct RunNotes {
 }
 
 impl RunNotes {
-    /// Whether the last check run passed on exactly the code with tree id
-    /// `tree` (what a pull request would contain).
+    /// The check that decides for the code with tree id `tree`: **the most recent run, in any
+    /// slot, whose tree it is.** A tree id is a content address, so the same tree is the same code,
+    /// whichever slot ran the check (a scratch project that lands unchanged in an empty
+    /// repository is bound to the checks it passed in the scratch); and the most recent run wins, so
+    /// a green followed by a red on the same code reads as red. `None` means no check ran on it.
+    pub fn checked(&self, tree: &str) -> Option<&CheckRecord> {
+        let checks = &self.checks;
+        // Notes from before the history have only `last`.
+        let legacy = checks.last.iter().filter(|_| checks.history.is_empty());
+        checks
+            .history
+            .iter()
+            .rev()
+            .chain(legacy)
+            .find(|record| record.tree.as_deref() == Some(tree))
+    }
+
+    /// Whether a check run passed on exactly the code with tree id `tree` (what a pull request would
+    /// contain), the most recent one that ran on it deciding ([`checked`](Self::checked)).
     pub fn verified_tree(&self, tree: Option<&str>) -> bool {
-        match (&self.checks.last, tree) {
-            (Some(last), Some(tree)) => last.passed && last.tree.as_deref() == Some(tree),
-            _ => false,
-        }
+        tree.and_then(|tree| self.checked(tree))
+            .is_some_and(|record| record.passed)
     }
 
     /// Remember the repositories `keys` names; returns whether anything was new.
@@ -242,6 +270,13 @@ impl RunNotes {
         if !record.passed && !self.checks.counted.contains(&record.call_id) {
             self.checks.counted.push(record.call_id.clone());
             self.checks.failures += 1;
+        }
+        // A call that runs again (a replay) replaces its own record instead of crowding the history.
+        self.checks.history.retain(|r| r.call_id != record.call_id);
+        self.checks.history.push(record.clone());
+        if self.checks.history.len() > MAX_CHECK_HISTORY {
+            let extra = self.checks.history.len() - MAX_CHECK_HISTORY;
+            self.checks.history.drain(..extra);
         }
         self.checks.last = Some(record);
         self.checks.failures
@@ -337,6 +372,7 @@ mod tests {
             tail: "out".into(),
             tree: Some("t1".into()),
             report: None,
+            slot: None,
         }
     }
 
@@ -353,6 +389,83 @@ mod tests {
         assert!(!notes.last_check_failed());
         assert!(!notes.cycles_exhausted(2), "green now");
         assert_eq!(notes.checks.failures, 2, "cumulative");
+    }
+
+    fn on_tree(call: &str, tree: &str, passed: bool, slot: &str) -> CheckRecord {
+        CheckRecord {
+            tree: Some(tree.into()),
+            slot: Some(slot.into()),
+            ..record(call, passed)
+        }
+    }
+
+    #[test]
+    fn the_most_recent_check_on_a_tree_decides_whatever_slot_ran_it() {
+        let mut notes = RunNotes::default();
+        notes.record_check(on_tree("c1", "tree-a", true, "scratch"));
+        notes.record_check(on_tree("c2", "tree-b", false, "lib"));
+        // Another slot's check is the one that ran on this tree.
+        assert_eq!(notes.checked("tree-a").unwrap().call_id, "c1");
+        assert!(notes.verified_tree(Some("tree-a")));
+        assert!(!notes.verified_tree(Some("tree-b")));
+        assert!(!notes.verified_tree(Some("tree-c")), "no check ran on it");
+        assert!(!notes.verified_tree(None));
+        // A green, then a red on the same code: red.
+        notes.record_check(on_tree("c3", "tree-a", false, "lib"));
+        assert_eq!(notes.checked("tree-a").unwrap().call_id, "c3");
+        assert!(!notes.verified_tree(Some("tree-a")));
+        // And red, then green: green.
+        notes.record_check(on_tree("c4", "tree-a", true, "lib"));
+        assert!(notes.verified_tree(Some("tree-a")));
+        assert_eq!(
+            notes.checks.last.as_ref().unwrap().call_id,
+            "c4",
+            "`last` is the newest of all"
+        );
+    }
+
+    #[test]
+    fn the_history_keeps_the_last_runs_only() {
+        let mut notes = RunNotes::default();
+        for i in 0..MAX_CHECK_HISTORY + 5 {
+            notes.record_check(on_tree(&format!("c{i}"), &format!("tree-{i}"), true, "a"));
+        }
+        assert_eq!(notes.checks.history.len(), MAX_CHECK_HISTORY);
+        assert_eq!(
+            notes.checks.history[0].call_id, "c5",
+            "the oldest were dropped"
+        );
+        assert!(
+            notes.checked("tree-4").is_none(),
+            "a dropped run no longer decides"
+        );
+        assert!(notes.checked("tree-5").is_some());
+        // A replayed call replaces its own record, and counts once.
+        assert_eq!(notes.record_check(on_tree("c40", "tree-x", false, "a")), 1);
+        assert_eq!(notes.record_check(on_tree("c40", "tree-x", false, "a")), 1);
+        assert_eq!(notes.checks.history.len(), MAX_CHECK_HISTORY);
+        assert_eq!(
+            notes
+                .checks
+                .history
+                .iter()
+                .filter(|r| r.call_id == "c40")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn notes_from_before_the_history_still_decide_by_their_last_run() {
+        let notes: RunNotes = serde_json::from_value(serde_json::json!({
+            "checks": {"failures": 0, "counted": [], "last": {
+                "call_id": "c1", "command": "x", "passed": true, "exit_code": 0, "tail": "", "tree": "t9"
+            }}
+        }))
+        .unwrap();
+        assert!(notes.checks.history.is_empty());
+        assert!(notes.verified_tree(Some("t9")));
+        assert!(!notes.verified_tree(Some("t8")));
     }
 
     #[tokio::test]

@@ -206,8 +206,12 @@ The layers, from the bottom:
     chat-completions endpoint.
   * `adam-workspace` runs `git` for mirrors, worktrees, commit and push, under
     an in-process lock and a file lock on each mirror, so several processes can
-    share a root. It also owns two small ports of its own, `GitCredentials` and
-    `CodeHost` (GitHub).
+    share a root. A run's workspace (`Workspaces::run`) is a directory of
+    **slots**, each a repository's worktree or a scratch project, under its own
+    lock ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md)).
+    It also owns three small ports of its own, `GitCredentials`, `CodeHost` (GitHub)
+    and `Environment`, where a run's processes run (`Local`, this container, is
+    the one implementation so far).
   * `adam-acp` is a client for the Agent Client Protocol: it drives a coding
     agent (OpenCode) over stdio.
   * `adam-notify-postgres` implements two ports of the runtime, `EventSink`
@@ -478,10 +482,10 @@ classDiagram
     PermissionPrompt <|.. StaticPrompt
 ```
 
-Each box is a crate (underscores stand for hyphens). The seven coder tools are
-`prepare_workspace`, `run_command`, `delegate_to_opencode`, `run_checks`, `commit_and_push`,
-`open_pull_request` and `ask_user` (the tool of `adam-ui`, under the coder's own words about when to ask), and
-`adam-ui` adds `show` and `ui_catalog` and a source of the tools of the conversation's endpoint. An eighth type,
+Each box is a crate (underscores stand for hyphens). The ten coder tools are
+`prepare_workspace`, `run_command`, `read_file`, `write_file`, `apply_patch`, `delegate_to_opencode`, `run_checks`,
+`commit_and_push`, `open_pull_request` and `ask_user` (the tool of `adam-ui`, under the coder's own words about when to ask), and
+`adam-ui` adds `show` and `ui_catalog` and a source of the tools of the conversation's endpoint. An eleventh type,
 `Redacting`, wraps each of them to scrub secrets (`bin/adam-coder/src/tools/mod.rs`). `CoderAgent`
 wraps the `LlmAgent` that `adam-assembly` builds from `bin/adam-coder/agent/instructions.md` (the prompt, the
 limits and the A2A card are that file) and adds its completion rule. `FnTool` is a tool made from a closure. A tool
@@ -635,8 +639,8 @@ component named in the error (`HostError`, exit code 70).
 
 A run moves between workers at every step: a `Continue` is committed, the lease is released, and
 the next claim may go to any worker (`crates/adam-runtime/src/worker.rs`, `run_worker`). The
-coder keeps a worktree per run under a local root, so with two workers on two disks a run can land
-on a worker that has no worktree for it. Nothing fails: `prepare_workspace` clones again, the
+coder keeps a workspace per run (worktrees, below) under a local root, so with two workers on two disks a run can land
+on a worker that has no workspace for it. Nothing fails: `prepare_workspace` clones again, the
 branch `agent/<short>` is taken, a longer one is picked, the run notes are gone, and a second pull
 request is opened. The deployer therefore chooses a **placement**
 ([ADR 0002](decisions/0002-workspace-placement.md)), the closed enum `adam_host::Placement`, read
@@ -691,6 +695,84 @@ stateDiagram-v2
   `lock_mirror`). *Unverified:* `flock` on NFS and Longhorn RWX volumes.
 * **`a2a-only`** is for hosts whose agents only call remote agents, such as the
   `another-agentic-system` orchestrator; the enum is shared so both speak the same vocabulary.
+
+### What a run's workspace holds
+
+A run's files are a **workspace**, `<root>/workspaces/<run>/`: a directory of slots
+([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md)). A slot is a worktree of one
+repository on the run's own branch `agent/<run-short-id>`, or a scratch project, a local git
+repository with an empty root commit where work can start before anyone has named a repository. A run
+has at most one slot per repository, called the repository's name (`<name>-<owner>` when another
+repository of the run has it), and slots keep the order they joined the run. The workspace lives as
+long as the run and is deleted when it ends (the coder's janitor, below); the run's notes and its `agent/*` branches stay.
+`copy_into` is the only way a scratch project's files reach a repository, all or nothing, and
+`initialize_empty` gives a repository that has no branch its first commit, an empty one, the only push
+outside `agent/*`. A workspace made before slots existed (one worktree in `<root>/worktrees/<run>`) is
+read as a slot and removed with the rest. For the orchestration layer's open question 24, the MVP
+default is `shared` placement with one coder process. The API, the layout and the locks are in the
+[`adam-workspace` README](../crates/adam-workspace/README.md#a-runs-workspace-slots-scratch-projects-and-the-copy-between-them).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty: a run asks for its workspace
+    Empty --> Scratch: add_scratch
+    Empty --> RepoBacked: add_repository
+    Scratch --> RepoBacked: add_repository, copy_into
+    RepoBacked --> RepoBacked: add_repository (another repository, a new slot)
+    Scratch --> Removed: remove, nothing was published
+    RepoBacked --> Removed: remove, pushed branches remain
+    Removed --> [*]
+```
+
+### Where a run's processes run
+
+The processes that act on a run's files (the project's checks, a command to look around, OpenCode) are started
+through the `Environment` port of `adam-workspace`. A tool asks the run's session to **prepare** the command from a
+description (program or shell line, working directory, variables, the names of this process's secrets to hide) and
+spawns what comes back; the files and the paths are the same in every environment, so the file tools and all git
+work stay in the coder. `Local`, the coder's own container, is the one implementation and behaves as the tools
+always did. Another one, which runs the processes in a container made from the repository's own configuration,
+is built behind the same port and chosen when the binary is composed (swapped at build time, not by a plugin).
+
+```mermaid
+sequenceDiagram
+    participant T as tool (run_command, run_checks, delegate_to_opencode)
+    participant E as Environment
+    participant S as EnvSession
+    participant P as process
+    participant J as janitor
+    T->>E: ensure(workspace of the run, progress)
+    E-->>T: the steps of making it, shown under the tool call
+    E-->>T: the run's session (made once, then reused)
+    T->>S: prepare(program, cwd, env, hide)
+    S-->>T: the command to spawn
+    T->>P: spawn it in a process group of its own
+    opt a timeout or a cancel
+        T->>P: kill the process group
+        T->>S: kill(the command's id)
+    end
+    J->>E: release(run) before the workspace is removed
+    J->>E: held_runs, then release what a crash left
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unmade: a run starts
+    Unmade --> Made: ensure
+    Unmade --> Failed: ensure fails
+    Failed --> Unmade: the next tool call tries again
+    Made --> Made: prepare, spawn, kill
+    Made --> Unmade: the environment was lost
+    Made --> Released: the janitor releases it
+    Failed --> Released: the janitor releases it
+    Unmade --> Released: the janitor releases it
+    Released --> [*]
+```
+
+A failure to make the environment is a result for the model (no check cycle is used, nothing runs); a secret is
+never in a description, only the names to hide and, for a process that needs one, a reference
+(`EnvSession::secret_ref`). See the [`adam-workspace` README](../crates/adam-workspace/README.md#where-a-runs-processes-run-the-environment-port)
+and [the coder README](../bin/adam-coder/README.md#where-the-processes-of-a-run-run).
 
 ## The path of a task
 
@@ -1694,9 +1776,10 @@ Two rules keep this tree honest (details in the
 ## The coder agent
 
 `adam-coder` turns a coding task into a pull request. A client sends
-"in repository X, do Y". The agent makes the change in a private git worktree,
-runs the project's own checks, and opens a pull request. It is an `LlmAgent`
-with seven tools and one extra rule, running on the durable runtime and served
+"in repository X, do Y". The agent makes the change in a private git worktree
+(a slot of the run's workspace, which may hold other repositories too), runs the project's
+own checks, and opens a pull request. It is an `LlmAgent`
+with ten tools and one extra rule, running on the durable runtime and served
 over A2A.
 
 ### What it does
@@ -1711,6 +1794,7 @@ sequenceDiagram
     participant A as coder agent<br/>LlmAgent + tools
     participant M as model gateway<br/>OpenAI-compatible
     participant G as Workspaces<br/>git CLI
+    participant W as worktree files<br/>read_file, write_file, apply_patch
     participant O as OpenCode<br/>opencode acp
     participant Sh as sh -lc<br/>project checks
     participant R as git remote
@@ -1718,7 +1802,7 @@ sequenceDiagram
 
     C->>A: SendStreamingMessage "in repo X (base main), do Y"
     loop each model turn
-        A->>M: stream(history + 6 tool specs)
+        A->>M: stream(history + the tool specs)
         M-->>A: text deltas, then the response: text or tool calls
     end
     Note over A,M: The turns below are the model's tool calls, in the order it picks.
@@ -1728,19 +1812,27 @@ sequenceDiagram
     G->>R: git fetch --prune origin (token in the env of this one call)
     G->>G: git worktree add, new branch agent/short-run-id from origin/base
     A-->>C: progress: worktree ready
+    Note over A,G: a second repository the person named is a second slot of the run's workspace, and the tools then say which one with repo
 
-    A->>O: delegate_to_opencode(instructions)
-    O->>M: its own model calls, same gateway
-    O-->>A: ACP updates: text, plan, tool calls
-    A-->>C: progress lines
-    O-->>A: TurnEnded, then the files that changed
+    alt a small, well-located change
+        A->>W: read_file(path), then write_file(path, content) or apply_patch(diff)
+        Note over A,W: every path is confined to the worktree, and a patch is checked by the paths git reads from it
+        W-->>A: the text read, or the files changed
+        A-->>C: progress lines: read README.md, patched README.md
+    else a broad, multi-file change
+        A->>O: delegate_to_opencode(instructions)
+        O->>M: its own model calls, same gateway
+        O-->>A: ACP updates: text, plan, tool calls
+        A-->>C: progress lines
+        O-->>A: TurnEnded, then the files that changed
+    end
 
     loop until green, or the check cycles are used up
         A->>Sh: run_checks(command), with a time limit
         Sh-->>A: exit code and output tail
         A-->>C: artifact "checks"
         opt exit code is not 0
-            A->>O: delegate_to_opencode(fix the failure)
+            A->>W: apply_patch or write_file (or delegate_to_opencode) to fix the failure
         end
     end
 
@@ -1783,11 +1875,12 @@ stateDiagram-v2
     [*] --> NoWorkspace
     NoWorkspace --> NoWorkspace: prepare_workspace refuses a repository the person did not name, the model asks
     NoWorkspace --> WorktreeReady: prepare_workspace on a repository the person named
-    WorktreeReady --> Edited: delegate_to_opencode
+    WorktreeReady --> WorktreeReady: prepare_workspace on another repository the person named, a new slot
+    WorktreeReady --> Edited: write_file, apply_patch or delegate_to_opencode
     Edited --> ChecksGreen: run_checks passes
     Edited --> ChecksRed: run_checks fails, one cycle used
     Edited --> Pushed: commit_and_push without a green check, unless the budget is used up
-    ChecksRed --> Edited: delegate_to_opencode to fix, cycles left
+    ChecksRed --> Edited: the file tools or delegate_to_opencode to fix, cycles left
     ChecksRed --> Exhausted: failed runs reach MAX_CHECK_CYCLES
     ChecksRed --> Pushed: commit_and_push, unless the budget is used up
     ChecksGreen --> Pushed: commit_and_push
@@ -1821,7 +1914,9 @@ pushed sha, pull request) and the worktree.
 What the diagrams cannot say (`bin/adam-coder/src/`):
 
 * **The tools** (`tools/`): `prepare_workspace`, `run_command` (looking around: no check, no cycle,
-  changes to HEAD, the branch, the working tree, refs and git configuration are undone), `delegate_to_opencode`, `run_checks` (the project's own checks only),
+  changes to HEAD, the branch, the working tree, refs and git configuration are undone), `read_file`, `write_file` and
+  `apply_patch` (small changes made in the coder's own process, confined to the worktree: see
+  [the coder README](../bin/adam-coder/README.md#reading-and-changing-files-itself)), `delegate_to_opencode`, `run_checks` (the project's own checks only),
   `commit_and_push`, `open_pull_request` and `ask_user`, then the screen's `show` and `ui_catalog` (all three
   of `adam-ui`: `Ui::tools()`).
 * **The prompt and the card** (`agent/instructions.md`, embedded by `build.rs`, or read at startup from the
@@ -1843,6 +1938,18 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     continues a pushed branch pushes to a branch of its own, and only after this
     gate does `open_pull_request` fast-forward the continued branch (never forced), so the pull
     request that is open for it never carries unverified commits.
+  * **A workspace of several slots** ([the coder README](../bin/adam-coder/README.md#the-workspace-of-a-run)):
+    `prepare_workspace` on a second repository the person named adds a slot (a repository has at most one
+    slot per run); `run_command`, the file tools, `delegate_to_opencode`, `run_checks`, `commit_and_push` and
+    `open_pull_request` take an optional `repo` (the slot's directory or the repository's address), which
+    may be left out while there is one slot and is refused with the list of slots when there are several.
+    A check and a push are of one slot; the gate does not change: `open_pull_request` wants the most recent
+    check of the pushed tree, whichever slot ran it, and the run notes keep the last 32 check records for it.
+  * The file tools (`read_file`, `write_file`, `apply_patch`) refuse a path that is empty, absolute, goes up with `..`,
+    names `.git` (any case), leaves the worktree through a symlink (read) or goes through a symlink (write); a patch is
+    checked by the paths `git apply --numstat -z` reports and refused if it creates a symlink or a submodule; a hunk that
+    does not match changes nothing. They change files and not git: the commit that follows is bound to a check only
+    after a new `run_checks`.
   * A command the shell cannot find (exit 127, `not found`) is a missing toolchain: reported to the model,
     no check cycle used, no `checks` artifact, and the model asks the person and waits.
   * A run that stops with no pull request fails if the check-cycle budget is
@@ -1859,28 +1966,39 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     to `ask_user`.
 * **Safe to repeat.** A tool call that dies before its result is journaled
   runs again, so each tool is safe to repeat. `prepare_workspace` reuses the
-  run's worktree, `commit_and_push` does nothing when there is nothing new,
+  run's slot of that repository, `commit_and_push` does nothing when there is nothing new,
   `open_pull_request` returns the open pull request of the same branch, and
   failed checks are counted per call id.
 * **Where state lives.** Conversation, journal and run state are in Postgres.
-  The mirrors, worktrees and per-run notes
+  The mirrors, the workspaces of runs (`<WORKSPACE_ROOT>/workspaces/<run>/<slot>`) and per-run notes
   (`<WORKSPACE_ROOT>/coder/<run>.json`) are files under `WORKSPACE_ROOT`. Git is
   the durable artifact: a lost database loses the run ledger, not the pushed
   branches or the pull requests.
+* **The janitor.** A workspace lives as long as its run
+  ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md)). `Janitor`, a worker component of the
+  host (`Agents::worker_component`, so in the `all` and `worker` roles), sweeps at startup and every
+  `WORKSPACE_SWEEP_SECS` (300; `0` is off): the workspace of a run that is `done` or `failed` (a cancel
+  included), or that the store does not know, is removed, every slot of it, after what the run's environment
+  holds is released (and a release that fails leaves the workspace for the next sweep); the workspace of a run that is
+  `runnable` or `parked` stays, however long the person takes to answer. The notes and the `agent/*`
+  branches in the mirrors stay: they are the only copy of an unpushed commit. A store that does not answer
+  leaves the workspace alone, and a failed removal is logged and tried again at the next sweep.
 * **Secrets.**
   * The git token reaches `git` only through the environment of a single
     invocation, never in a remote URL or `.git/config`, and only for hosts on
     the allow-list (`ScopedToken` plus `Workspaces::allow_hosts`).
   * OpenCode's child process gets `MODEL_API_KEY` through its environment (its
     config says `{env:MODEL_API_KEY}`, so the key is not inlined). `GITHUB_TOKEN`,
-    `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child.
+    `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child (they are the names the
+    description of the process asks its environment to hide; a description never carries a value).
   * A `Redactor` scrubs the process's own secrets from every tool result, event
     and failure text.
 * **Limits** (`limits:` in `agent/instructions.md`): 200 model turns, 400 tool calls, 8192 output
   tokens per call, 100,000 tokens of history sent to the model. A limit that
   trips fails the run.
 * **Cancel.** When a run is cancelled while OpenCode works, the tool sends ACP
-  `session/cancel`, waits 2 seconds, then kills OpenCode and its process group.
+  `session/cancel`, waits 2 seconds, then kills OpenCode and its process group and tells the run's
+  environment which command to kill (nothing more to do in `Local`).
 * **Configuration** is environment variables only. The table is in
   `bin/adam-coder/src/config.rs` and the
   [crate README](../bin/adam-coder/README.md). Every problem is reported at
@@ -1910,7 +2028,7 @@ flowchart LR
             coder --> oc
             coder --> kids
         end
-        pvc[("PVC at /work<br/>mirrors, worktrees, notes")]
+        pvc[("PVC at /work<br/>mirrors, workspaces, notes")]
         cnpg[("CloudNativePG cluster<br/>Postgres: runs and journal")]
         secret["ExternalSecret to Secret<br/>MODEL_API_KEY, GITHUB_TOKEN (not for role control-plane), A2A_BEARER_TOKENS"]
     end
@@ -1970,8 +2088,8 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   binary changed. Verified 2026-09-29: `bin/adam-coder/src/config.rs` requires
   `A2A_BEARER_TOKENS` and `PUBLIC_URL` only for the roles that serve A2A.
 * **More than one worker needs a placement.** Runs move between workers at every step
-  (`adam-runtime`'s worker), while a worktree lives in one worker's `/work`. A second worker
-  that does not have a run's worktree would continue it on a checkout that is not there, and
+  (`adam-runtime`'s worker), while a workspace lives in one worker's `/work`. A second worker
+  that does not have a run's workspace would continue it on a checkout that is not there, and
   fork it into a second pull request. The chart therefore refuses `replicaCount > 1` for the
   roles that run workers until `workspace.placement` is set
   ([ADR 0002](decisions/0002-workspace-placement.md)), and passes it to the binary as

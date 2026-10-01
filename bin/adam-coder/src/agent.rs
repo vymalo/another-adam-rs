@@ -620,8 +620,12 @@ impl Agent for CoderAgent {
                     },
                     None if notes.pull_request.is_some() => Transition::Done { state, output },
                     None => {
-                        let prepared =
-                            matches!(self.env.workspaces.open_existing(&run).await, Ok(Some(_)));
+                        let prepared = match self.env.workspaces.run(&run) {
+                            Ok(workspace) => {
+                                matches!(workspace.slots().await, Ok(slots) if !slots.is_empty())
+                            }
+                            Err(_) => false,
+                        };
                         stop_as_question(ctx, state, output, prepared).await
                     }
                 })
@@ -1154,6 +1158,7 @@ mod tests {
                 tail: "test a ... FAILED".into(),
                 tree: None,
                 report: None,
+                slot: None,
             });
         };
 

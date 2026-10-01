@@ -14,8 +14,8 @@ A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/ \
 
 It is the second binary over [`adam-service`](../../crates/adam-service/README.md), the first being
 [`adam-coder`](../adam-coder/README.md); the process (the store, the roles, the notifications, the exit
-codes) is the same code. What is different is the agent: `adam-coder` has an embedded one and six tools of its own
-written in Rust (a worktree, OpenCode, checks, a pull request); `adam-agent` has **none of its own**, and the
+codes) is the same code. What is different is the agent: `adam-coder` has an embedded one and nine tools of its own
+written in Rust (a worktree, its files, OpenCode, checks, a pull request); `adam-agent` has **none of its own**, and the
 only tools it brings are the person's screen: `ask_user`, `show` and `ui_catalog`
 ([`adam-ui`](../../crates/adam-ui/README.md)). Everything else an agent can do comes from its folder.
 

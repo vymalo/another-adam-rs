@@ -4,6 +4,7 @@
 //! |---|---|
 //! | `prepare_workspace { repo_url, base_branch?, branch? }` | [`prepare`] |
 //! | `run_command { command, cwd? }` | [`inspect`] |
+//! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `apply_patch { patch }` | [`files`] |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
 //! | `run_checks { command }` | [`checks`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
@@ -17,7 +18,8 @@
 //! at a fresh journal position), so each tool is also safe to repeat by
 //! construction:
 //!
-//! * `prepare_workspace`: `Workspaces::prepare` (or `prepare_continuing`) reuses the run's worktree.
+//! * `prepare_workspace`: `RunWorkspace::add_repository` (or `add_repository_continuing`) returns the
+//!   slot the run already has for the repository, with whatever is in it.
 //! * `commit_and_push`: `commit_all` is a no-op without changes and the push of
 //!   a commit the remote already has is a no-op; the reported sha is `HEAD`.
 //! * `open_pull_request`: moving the continued branch to the pushed commit is a no-op the second
@@ -34,8 +36,9 @@
 //! `commit_and_push` of the conversation recorded it in the notes, which the agent carries from
 //! the run it continues, and as a fallback read from the result text, `publish::pushed_in`),
 //! after `MAX_CHECK_CYCLES` failed check runs `run_checks` refuses to run, and
-//! `open_pull_request` refuses unless the last check run passed on exactly the
-//! code the pull request contains (the tree of the pushed `HEAD`) or the model
+//! `open_pull_request` refuses unless the most recent check run of exactly the
+//! code the pull request contains (the tree of the pushed `HEAD`, whichever slot of the
+//! workspace ran it: [`notes::RunNotes::checked`]) passed, or the model
 //! passes `accept_red_checks: true` (which the prompt reserves for explicit
 //! user consent obtained with `ask_user`).
 //!
@@ -50,11 +53,14 @@ use std::time::Duration;
 
 use adam::mcp::McpPolicy;
 use adam::prelude::*;
-use adam::{DynTool, StateKey, StepStyle};
+use adam::{DynTool, StateKey, StepEvent, StepIcon, StepKind, StepState, StepStyle};
 use adam_error::{Classify, report};
 use adam_model::ToolSpec;
 use adam_ui::Ui;
-use adam_workspace::{DynCodeHost, GitIdentity, WorkspaceError, Workspaces, Worktree};
+use adam_workspace::{
+    DynCodeHost, DynEnvironment, EnvError, EnvProgress, EnvSession, EnvStep, EnvStepState,
+    GitIdentity, Local, Slot, WorkspaceError, Workspaces, Worktree,
+};
 use serde_json::Value;
 
 use crate::opencode::OpenCodeLaunch;
@@ -65,6 +71,7 @@ const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait
 
 pub mod checks;
 pub mod delegate;
+pub mod files;
 mod gitcli;
 pub mod inspect;
 pub mod named;
@@ -128,7 +135,7 @@ impl CoderSettings {
 /// What every tool shares: the workspaces, the code host, the settings and the
 /// per-run notes.
 pub struct ToolEnv {
-    /// Mirrors and worktrees.
+    /// Mirrors, and the workspace of each run: its slots (worktrees of repositories).
     pub workspaces: Workspaces,
     /// Where pull requests are opened.
     pub code_host: DynCodeHost,
@@ -144,6 +151,10 @@ pub struct ToolEnv {
     /// are shared by the tools and the source, so both come from this one value. Under the
     /// default [`McpPolicy`] until [`ToolEnv::with_mcp_policy`].
     pub ui: Ui,
+    /// Where the run's processes run: the project's checks, the commands that look around and
+    /// OpenCode. [`Local`], this container, until [`ToolEnv::with_environment`]. The file tools and
+    /// everything git does stay in this process whatever it is: they act on the shared files.
+    pub environment: DynEnvironment,
 }
 
 impl ToolEnv {
@@ -157,7 +168,17 @@ impl ToolEnv {
             notes,
             redactor: Redactor::default(),
             ui: Ui::new(McpPolicy::default()).with_ask_lead(ASK_LEAD),
+            environment: Arc::new(Local),
         }
+    }
+
+    /// Run the processes of runs in `environment` instead of this container. The janitor of the
+    /// process ([`Janitor::with_environment`](crate::Janitor::with_environment)) must be given the
+    /// same one, so that what it holds for a run is released when the run's workspace is.
+    #[must_use]
+    pub fn with_environment(mut self, environment: DynEnvironment) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Reach the conversation's tool endpoint under `policy` (the deployment's
@@ -200,24 +221,158 @@ impl ToolEnv {
         workspace_error(e)
     }
 
-    /// The worktree of the run `ctx` belongs to, or the message to give the
-    /// model when there is none yet.
-    pub(crate) async fn worktree(&self, ctx: &ToolCtx) -> Result<Worktree, Outcome> {
-        match self
+    /// The session of the run's environment, for a tool that runs a process: made on the first
+    /// need and the same after ([`Environment::ensure`](adam_workspace::Environment::ensure)).
+    ///
+    /// What the environment says while it makes one (pulling an image, building it) is shown as
+    /// steps under the tool call, `env:<run>:<step>`, scrubbed like everything else the coder
+    /// shows. A cancel of the run stops the wait. Needs no workspace: it is the run's, whether or
+    /// not a slot is there yet.
+    pub(crate) async fn session(&self, ctx: &ToolCtx) -> Result<Arc<dyn EnvSession>, ToolError> {
+        let run = ctx.run_id().to_string();
+        let workspace = self.workspaces.run(&run).map_err(|e| workspace_error(&e))?;
+        let (steps, mut reported) = tokio::sync::mpsc::unbounded_channel();
+        let progress = StepChannel(steps);
+        let ensure = self.environment.ensure(&workspace, &progress);
+        tokio::pin!(ensure);
+        let made = loop {
+            tokio::select! {
+                biased;
+                () = ctx.cancelled() => {
+                    return Err(cancelled("the environment of the run was not made"));
+                }
+                Some(step) = reported.recv() => self.show_step(ctx, &run, step).await,
+                made = &mut ensure => break made,
+            }
+        };
+        while let Ok(step) = reported.try_recv() {
+            self.show_step(ctx, &run, step).await;
+        }
+        made.map_err(|e| environment_error(&self.redactor, &e))
+    }
+
+    /// A step of making the environment, as a step of the tool call.
+    async fn show_step(&self, ctx: &ToolCtx, run: &str, step: EnvStep) {
+        let state = match step.state {
+            EnvStepState::Running => StepState::Running,
+            EnvStepState::Completed => StepState::Completed,
+            EnvStepState::Failed => StepState::Failed,
+        };
+        let label = self.redactor.scrub(&step.label).into_owned();
+        let mut event = StepEvent::new(
+            format!("env:{run}:{}", step.id),
+            StepKind::Command,
+            label,
+            state,
+        )
+        .with_icon(StepIcon::Execute);
+        if let Some(detail) = step.detail {
+            event = event.with_detail(self.redactor.scrub(&detail));
+        }
+        ctx.report_step(event).await;
+    }
+
+    /// The slot of the run's workspace that a tool acts in, or the message to give the model: it
+    /// has no workspace yet, or it did not say which of several slots (see [`resolve_slot`]).
+    ///
+    /// `repo` is what the model passed: the slot's directory (`sandbox`) or the address of the
+    /// repository the slot holds. It may be left out when the workspace has one slot.
+    pub(crate) async fn slot(&self, ctx: &ToolCtx, repo: Option<&str>) -> Result<Slot, Outcome> {
+        let run = ctx.run_id().to_string();
+        let workspace = self
             .workspaces
-            .open_existing(&ctx.run_id().to_string())
+            .run(&run)
+            .map_err(|e| Err(workspace_error(&e)))?;
+        let slots = workspace
+            .slots()
             .await
-        {
-            Ok(Some(wt)) => Ok(wt),
-            Ok(None) => Err(Ok(ToolOutput::error(
-                "there is no workspace yet: call prepare_workspace first",
-            ))),
-            Err(e) => Err(Err(workspace_error(&e))),
+            .map_err(|e| Err(workspace_error(&e)))?;
+        resolve_slot(slots, repo, &self.settings.default_repo_host)
+            .map_err(|why| Ok(ToolOutput::error(why)))
+    }
+
+    /// The worktree of the slot a tool acts in ([`slot`](Self::slot)), for the tools that need a
+    /// repository: a scratch project has none to push to.
+    pub(crate) async fn worktree(
+        &self,
+        ctx: &ToolCtx,
+        repo: Option<&str>,
+    ) -> Result<Worktree, Outcome> {
+        let slot = self.slot(ctx, repo).await?;
+        match slot.worktree() {
+            Some(worktree) => Ok(worktree.clone()),
+            None => Err(Ok(ToolOutput::error(format!(
+                "`{}` is a scratch project, not a repository: there is nothing here to check, \
+                 commit or push",
+                slot.dir()
+            )))),
         }
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the six of the coding workflow,
+/// The slot `repo` names among `slots` (see [`ToolEnv::slot`]), or what to tell the model.
+///
+/// * No slot at all: there is no workspace yet.
+/// * `repo` left out: the only slot; with several, an error that lists them (it is the model's to
+///   say which).
+/// * `repo` given: the slot with that directory, else the slot of the repository it addresses
+///   (`https://github.com/acme/lib`, `acme/lib`, a local path: compared as [`named`] keys).
+pub(crate) fn resolve_slot(
+    mut slots: Vec<Slot>,
+    repo: Option<&str>,
+    default_host: &str,
+) -> Result<Slot, String> {
+    if slots.is_empty() {
+        return Err("there is no workspace yet: call prepare_workspace first".to_owned());
+    }
+    let listed = |slots: &[Slot]| {
+        slots
+            .iter()
+            .map(|slot| match slot.worktree() {
+                Some(wt) => format!("`{}` ({})", slot.dir(), wt.repo().url),
+                None => format!("`{}` (a scratch project)", slot.dir()),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let Some(repo) = repo.and_then(non_empty) else {
+        return if slots.len() == 1 {
+            Ok(slots.remove(0))
+        } else {
+            Err(format!(
+                "this workspace has {} slots: {}. Say which one with `repo` (its name, or the \
+                 repository's address)",
+                slots.len(),
+                listed(&slots)
+            ))
+        };
+    };
+    let key_of = |slot: &Slot| {
+        slot.worktree()
+            .and_then(|wt| named::key_of_argument(&wt.repo().url))
+    };
+    let wanted = named::key_of_argument(repo)
+        .or_else(|| named::named_in(repo, default_host).into_iter().next());
+    let at = slots
+        .iter()
+        .position(|slot| slot.dir() == repo)
+        .or_else(|| {
+            let wanted = wanted.as_deref()?;
+            slots
+                .iter()
+                .position(|slot| key_of(slot).as_deref() == Some(wanted))
+        });
+    match at {
+        Some(at) => Ok(slots.remove(at)),
+        None => Err(format!(
+            "no slot of this workspace is `{repo}`; its slots are {}. Use one of them as `repo` \
+             (a repository that is not in the workspace is added with prepare_workspace)",
+            listed(&slots)
+        )),
+    }
+}
+
+/// Every coder tool, in the order they are offered to the model: the nine of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
@@ -235,6 +390,9 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
     tools![
         prepare::PrepareWorkspace,
         inspect::RunCommand,
+        files::ReadFile,
+        files::WriteFile,
+        files::ApplyPatch,
         delegate::DelegateToOpenCode,
         checks::RunChecks,
         publish::CommitAndPush,
@@ -323,6 +481,45 @@ pub(crate) fn workspace_error(e: &WorkspaceError) -> ToolError {
         ToolError::Transient(text)
     } else {
         ToolError::Permanent(text)
+    }
+}
+
+/// An environment failure as a tool error: worth retrying (it is not available now, too slow, lost),
+/// or a report to the model (the repository's configuration is wrong, the build failed). The end of
+/// a failed build's output is in the report.
+pub(crate) fn environment_error(redactor: &Redactor, e: &EnvError) -> ToolError {
+    // Journaled and shown to the model: a boundary, so the chain is flattened here, once.
+    let mut text = format!("the work environment: {}", report(e));
+    if let EnvError::Build { log_tail, .. } = e
+        && !log_tail.trim().is_empty()
+    {
+        text.push('\n');
+        text.push_str(log_tail.trim_end());
+    }
+    let text = redactor.scrub(&text).into_owned();
+    if e.is_retryable() {
+        ToolError::Transient(text)
+    } else {
+        ToolError::Permanent(text)
+    }
+}
+
+/// A command that did not run, as a tool error.
+pub(crate) fn run_error(redactor: &Redactor, e: &shell::RunError) -> ToolError {
+    match e {
+        shell::RunError::Prepare(e) => environment_error(redactor, e),
+        shell::RunError::Spawn(e) => ToolError::Transient(format!("cannot start the shell: {e}")),
+    }
+}
+
+/// Where [`Environment::ensure`](adam_workspace::Environment::ensure) reports its steps: a channel
+/// the tool drains while it waits.
+struct StepChannel(tokio::sync::mpsc::UnboundedSender<EnvStep>);
+
+impl EnvProgress for StepChannel {
+    fn step(&self, step: EnvStep) {
+        // The tool stopped waiting (the run was cancelled): nobody needs the step.
+        let _ = self.0.send(step);
     }
 }
 

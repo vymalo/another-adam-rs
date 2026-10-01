@@ -1,18 +1,21 @@
 //! Running a shell command for `run_checks` and `run_command`: cwd confined to the worktree, a
-//! timeout that kills the whole process group, and an output cap that keeps the tail. The shell
-//! is a login shell (`bash -lc`, or `sh -lc` where there is no bash), and a command the shell
-//! cannot find is recognised ([`missing_tool`]) so that it is reported as a missing toolchain
-//! and not as a failing check.
+//! timeout that kills the whole process group, and an output cap that keeps the tail. The command is
+//! prepared by the run's environment ([`EnvSession`]: the coder's own container unless a deployment
+//! says otherwise), and the shell is a login shell (`bash -lc`, or `sh -lc` where there is no bash).
+//! A command the shell cannot find is recognised ([`missing_tool`]) so that it is reported as a
+//! missing toolchain and not as a failing check.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use adam_workspace::{EnvError, EnvSession, ExecSpec};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+
+pub use adam_workspace::login_shell;
 
 /// Secrets of this process that a project's checks must not see. A check runs
 /// repository code (build scripts, tests), which is untrusted.
@@ -128,28 +131,6 @@ async fn pump(mut reader: impl AsyncRead + Unpin, tail: Arc<Mutex<Tail>>) {
                 .push(&chunk[..n]),
         }
     }
-}
-
-/// The shell commands run in: `bash` when the image has one, else `sh`.
-///
-/// Models write bash (`${PIPESTATUS[0]}`, `[[ ]]`, arrays, `<(...)`), and where `sh` is dash
-/// they fail with "Bad substitution" for reasons that have nothing to do with the project. Both
-/// are run as login shells (`-l`), which is what keeps the toolchain's `PATH` from
-/// `/etc/profile.d`, since Debian's `/etc/profile` resets it. Found once, on `PATH`.
-pub fn login_shell() -> &'static str {
-    static SHELL: OnceLock<&'static str> = OnceLock::new();
-    SHELL.get_or_init(|| if on_path("bash") { "bash" } else { "sh" })
-}
-
-/// Whether an executable file called `name` is in a directory of `PATH`.
-fn on_path(name: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            std::fs::metadata(dir.join(name))
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
-    })
 }
 
 /// A command the shell could not find, as a run's output says it: the workspace lacks a tool.
@@ -287,52 +268,52 @@ pub fn project_dependency_hint(dirs: &[&Path], name: &str) -> Option<String> {
     None
 }
 
-/// Run `<login shell> -lc <command>` in `dir` (see [`login_shell`]; agent tool `PATH`s are set
-/// up in `/etc/profile.d`).
+/// The spec of a command of the project's (a check, a look around): the shell command `command`
+/// in `dir`, without the secrets of this process (`GITHUB_TOKEN`, `DATABASE_URL`, `A2A_BEARER_TOKENS`
+/// and `MODEL_API_KEY`: a check runs repository code, which is untrusted).
+pub fn shell_spec(dir: &Path, command: &str) -> ExecSpec {
+    ExecSpec::shell(command, dir).hide(HIDDEN_FROM_CHECKS.iter().copied())
+}
+
+/// Why a command did not run.
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    /// The environment would not prepare it.
+    #[error("the environment would not prepare the command")]
+    Prepare(#[source] EnvError),
+    /// The process could not be started.
+    #[error("cannot start the process")]
+    Spawn(#[source] io::Error),
+}
+
+/// Run `spec` in the environment of `session` (a login shell for a [`Program::Shell`](adam_workspace::Program),
+/// see [`login_shell`]; agent tool `PATH`s are set up in `/etc/profile.d`).
 ///
-/// Stdin is closed. After `timeout` the whole process group is killed. The
+/// The session prepares the command, and it is spawned here, in a process group of its own, with
+/// stdin closed and `kill_on_drop`. After `timeout` the whole process group is killed **and**
+/// [`EnvSession::kill`] is told, which is for what runs where this process cannot reach. The
 /// returned tail holds at most `tail_cap` bytes.
 ///
 /// # Errors
 ///
-/// Only when the shell cannot be started.
-#[tracing::instrument(skip(command), fields(dir = %dir.display()))]
-pub async fn run_shell(
-    dir: &Path,
-    command: &str,
+/// [`RunError::Prepare`] when the environment refuses the spec, [`RunError::Spawn`] when the process
+/// cannot be started.
+#[tracing::instrument(skip(session, spec), fields(dir = %spec.cwd.display()))]
+pub async fn run_in(
+    session: &dyn EnvSession,
+    spec: ExecSpec,
     timeout: Duration,
     tail_cap: usize,
-) -> io::Result<ShellOutcome> {
-    run_shell_with(dir, command, timeout, tail_cap, &[]).await
-}
-
-/// [`run_shell`] with extra environment, applied *before* the secrets are
-/// hidden (so the hiding is testable without touching this process's
-/// environment).
-async fn run_shell_with(
-    dir: &Path,
-    command: &str,
-    timeout: Duration,
-    tail_cap: usize,
-    extra_env: &[(&str, &str)],
-) -> io::Result<ShellOutcome> {
-    let mut cmd = Command::new(login_shell());
-    cmd.arg("-lc")
-        .arg(command)
-        .current_dir(dir)
-        .stdin(Stdio::null())
+) -> Result<ShellOutcome, RunError> {
+    let prepared = session.prepare(&spec).map_err(RunError::Prepare)?;
+    let mut cmd = prepared.command();
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    for name in HIDDEN_FROM_CHECKS {
-        cmd.env_remove(name);
-    }
-    let mut child = cmd.spawn()?;
+    let mut child = cmd.spawn().map_err(RunError::Spawn)?;
     let pid = child.id();
 
     let tail = Arc::new(Mutex::new(Tail {
@@ -349,10 +330,11 @@ async fn run_shell_with(
     }
 
     let (exit_code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(status) => (status?.code(), false),
+        Ok(status) => (status.map_err(RunError::Spawn)?.code(), false),
         Err(_) => {
             kill_group(pid).await;
             let _ = child.kill().await;
+            session.kill(&prepared.exec).await;
             (None, true)
         }
     };
@@ -402,9 +384,59 @@ async fn kill_group(pid: Option<u32>) {
 
 #[cfg(test)]
 mod tests {
+    use adam_workspace::{
+        EnvDescription, EnvKind, ExecId, LocalSession, PreparedCommand, SecretRef,
+    };
+    use async_trait::async_trait;
+
     use super::*;
 
     const LONG: Duration = Duration::from_secs(30);
+
+    /// A command of the project's in `dir`, in this container.
+    async fn run_shell(
+        dir: &Path,
+        command: &str,
+        timeout: Duration,
+        tail_cap: usize,
+    ) -> Result<ShellOutcome, RunError> {
+        run_in(&LocalSession, shell_spec(dir, command), timeout, tail_cap).await
+    }
+
+    /// An environment that is this container and keeps a record of what it was asked.
+    #[derive(Default)]
+    struct Recording {
+        prepared: Mutex<Vec<ExecId>>,
+        killed: Mutex<Vec<ExecId>>,
+        refuse: bool,
+    }
+
+    #[async_trait]
+    impl EnvSession for Recording {
+        fn describe(&self) -> EnvDescription {
+            EnvDescription {
+                kind: EnvKind::Local,
+                summary: "a recording environment".to_owned(),
+            }
+        }
+
+        fn prepare(&self, spec: &ExecSpec) -> Result<PreparedCommand, EnvError> {
+            if self.refuse {
+                return Err(EnvError::Refused("not here".to_owned()));
+            }
+            let prepared = LocalSession.prepare(spec)?;
+            self.prepared.lock().unwrap().push(prepared.exec.clone());
+            Ok(prepared)
+        }
+
+        async fn kill(&self, exec: &ExecId) {
+            self.killed.lock().unwrap().push(exec.clone());
+        }
+
+        fn secret_ref(&self, _name: &str) -> Option<SecretRef> {
+            None
+        }
+    }
 
     #[tokio::test]
     async fn captures_exit_code_and_both_streams() {
@@ -481,21 +513,18 @@ mod tests {
     #[tokio::test]
     async fn secrets_of_this_process_are_not_visible_to_checks() {
         let dir = tempfile::tempdir().unwrap();
-        let out = run_shell_with(
+        // The spec sets the names itself, so the hiding is testable without touching this
+        // process's environment: what a spec hides is hidden even when the spec sets it.
+        let spec = shell_spec(
             dir.path(),
             "env | grep -c -E '^(GITHUB_TOKEN|DATABASE_URL|A2A_BEARER_TOKENS|MODEL_API_KEY)=' || true; echo kept=$KEPT",
-            LONG,
-            1024,
-            &[
-                ("GITHUB_TOKEN", "a"),
-                ("DATABASE_URL", "b"),
-                ("A2A_BEARER_TOKENS", "c"),
-                ("MODEL_API_KEY", "d"),
-                ("KEPT", "yes"),
-            ],
         )
-        .await
-        .unwrap();
+        .env("GITHUB_TOKEN", "a")
+        .env("DATABASE_URL", "b")
+        .env("A2A_BEARER_TOKENS", "c")
+        .env("MODEL_API_KEY", "d")
+        .env("KEPT", "yes");
+        let out = run_in(&LocalSession, spec, LONG, 1024).await.unwrap();
         // (a login shell may print profile noise before the count)
         assert!(out.tail.lines().any(|l| l.trim() == "0"), "{:?}", out.tail);
         assert!(
@@ -503,6 +532,74 @@ mod tests {
             "other variables still pass: {:?}",
             out.tail
         );
+    }
+
+    #[tokio::test]
+    async fn the_command_that_runs_is_the_one_the_session_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Recording::default();
+        let out = run_in(&session, shell_spec(dir.path(), "echo hi"), LONG, 1024)
+            .await
+            .unwrap();
+        assert!(out.passed() && out.tail.contains("hi"), "{out:?}");
+        assert_eq!(session.prepared.lock().unwrap().len(), 1);
+        assert!(
+            session.killed.lock().unwrap().is_empty(),
+            "a command that ends on its own is not killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timeout_kills_the_group_here_and_tells_the_session_which_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Recording::default();
+        let out = run_in(
+            &session,
+            shell_spec(dir.path(), "sleep 60"),
+            Duration::from_secs(1),
+            1024,
+        )
+        .await
+        .unwrap();
+        assert!(out.timed_out, "{out:?}");
+        let prepared = session.prepared.lock().unwrap().clone();
+        let killed = session.killed.lock().unwrap().clone();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(
+            killed, prepared,
+            "the session is told which command timed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spec_the_environment_refuses_is_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let session = Recording {
+            refuse: true,
+            ..Recording::default()
+        };
+        let err = run_in(
+            &session,
+            shell_spec(dir.path(), &format!("touch {}", marker.display())),
+            LONG,
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::Prepare(EnvError::Refused(_))),
+            "{err:?}"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn a_program_that_cannot_start_is_a_spawn_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = ExecSpec::argv(["/nonexistent/program"], dir.path());
+        let err = run_in(&LocalSession, spec, LONG, 1024).await.unwrap_err();
+        assert!(matches!(err, RunError::Spawn(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -528,13 +625,6 @@ mod tests {
             "{:?}",
             out.tail
         );
-    }
-
-    #[test]
-    fn the_shell_is_bash_where_there_is_one_and_sh_otherwise() {
-        assert_eq!(login_shell() == "bash", on_path("bash"));
-        assert!(on_path("sh"));
-        assert!(!on_path("no-such-program-anywhere"));
     }
 
     fn failed(code: i32, tail: &str) -> ShellOutcome {

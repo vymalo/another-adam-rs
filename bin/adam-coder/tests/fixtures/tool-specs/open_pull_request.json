@@ -1,6 +1,6 @@
 {
   "name": "open_pull_request",
-  "description": "Open the pull request for the pushed branch. Requires that everything is pushed with commit_and_push and that the last check run passed on exactly this code (re-run the checks after your last change). The body must have a summary and a verification section listing the commands you ran and their results. If you continue a branch that already has an open pull request, this updates it with your commits (after the same check) instead of opening another.",
+  "description": "Open the pull request for the pushed branch. Requires that everything is pushed with commit_and_push and that the last check run passed on exactly this code (re-run the checks after your last change). The body must have a summary and a verification section listing the commands you ran and their results. If you continue a branch that already has an open pull request, this updates it with your commits (after the same check) instead of opening another. With several repositories in the workspace, say which one with `repo`.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -15,6 +15,10 @@
       "accept_red_checks": {
         "type": "boolean",
         "description": "Set true ONLY when the user explicitly said, in this conversation, that a pull request with failing (or no) checks is acceptable. Never set it on your own judgement."
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to open the pull request for: its name, or the repository's address. Leave out when the workspace has one."
       }
     },
     "required": [

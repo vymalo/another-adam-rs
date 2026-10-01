@@ -272,6 +272,7 @@ async fn missing_and_bad_variables_are_reported_together_and_exit_78() {
     env.push(("ALLOW_LOCAL_REPOS".into(), "sure".into()));
     env.push(("GITHUB_API_URL".into(), "ftp://api.example".into()));
     env.push(("WORKERS".into(), "0".into()));
+    env.push(("WORKSPACE_SWEEP_SECS".into(), "often".into()));
     let mut p = Proc::spawn(&env);
     let status = p.exit_within(Duration::from_secs(30)).await;
     assert_eq!(status.code(), Some(78), "{}", p.logs());
@@ -281,6 +282,7 @@ async fn missing_and_bad_variables_are_reported_together_and_exit_78() {
         "ALLOW_LOCAL_REPOS",
         "GITHUB_API_URL",
         "WORKERS",
+        "WORKSPACE_SWEEP_SECS",
     ] {
         assert!(err.contains(name), "{name} missing from:\n{err}");
     }
@@ -962,6 +964,12 @@ fn turns(asked: &Mutex<Vec<usize>>) -> usize {
     asked.lock().unwrap().iter().max().map_or(0, |t| t + 1)
 }
 
+/// The slot of `https://github.com/octo/widgets` (the repository these tests name; the private git
+/// config sends it to the local remote) in the workspace of `run`: `<root>/workspaces/<run>/widgets`.
+fn widgets_slot(root: &Path, run: &str) -> PathBuf {
+    root.join("workspaces").join(run).join("widgets")
+}
+
 /// A bare `remote.git` seeded with `main`, and a private `$HOME` whose git config points
 /// `https://github.com/octo/widgets.git` at it (so the production repository policy applies while
 /// the bytes stay local). Returns `(remote, home)`.
@@ -1184,7 +1192,7 @@ async fn sigterm_mid_run_commits_the_in_flight_step() {
         github.received_requests().await.unwrap().is_empty(),
         "nothing reached GitHub yet"
     );
-    let worktree = workspace.join("worktrees").join(run.to_string());
+    let worktree = widgets_slot(&workspace, &run.to_string());
     assert_eq!(
         std::fs::read_to_string(worktree.join("hello.txt")).unwrap(),
         "hello\n"
@@ -1469,9 +1477,7 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
     assert_eq!(done.status, RunStatus::Done, "{done:?}");
     assert_eq!(turns(&asked), 6, "{:?}", asked.lock().unwrap());
     assert!(
-        worker_workspace
-            .join("worktrees")
-            .join(run.to_string())
+        widgets_slot(&worker_workspace, &run.to_string())
             .join("hello.txt")
             .is_file(),
         "the worker's workspace holds the worktree"
@@ -1521,6 +1527,184 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
     assert!(
         !all_logs.contains(A2A_TOKEN),
         "the bearer token is never logged"
+    );
+    db.finish().await;
+}
+
+// ------------------------------------------------------------------- the janitor
+
+/// A run of the coder in the store with `status`, and a workspace of one slot for it (and for
+/// `ids` the store does not know) under `workspace`.
+async fn run_with_workspace(
+    store: &adam_core::DynStore,
+    workspaces: &adam_workspace::Workspaces,
+    remote: &Path,
+    status: Option<RunStatus>,
+) -> RunId {
+    let id = RunId::new();
+    if let Some(status) = status {
+        store
+            .create_run(adam_core::NewRun {
+                id,
+                agent: "coder".to_owned(),
+                conversation_id: None,
+                parent_id: None,
+                status,
+                state: json!({}),
+                wake_at: None,
+            })
+            .await
+            .unwrap();
+    }
+    let repo = adam_workspace::RepoRef::new(remote.to_str().unwrap(), "main");
+    workspaces
+        .run(&id.to_string())
+        .unwrap()
+        .add_repository(&repo)
+        .await
+        .unwrap();
+    id
+}
+
+/// The coder sweeps the workspaces of runs that are over, on its own, while it serves: a run that
+/// is done or failed, and one the store does not know, lose their workspace; a parked run keeps it,
+/// whatever it holds; a directory that is not a run is left alone; the notes stay.
+#[tokio::test]
+async fn the_janitor_removes_the_workspace_of_a_finished_run_and_keeps_an_open_one() {
+    use adam_coder::tools::{NotesStore, RunNotes};
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, _home) = seed_remote(tmp.path());
+    let workspace = tmp.path().join("work");
+    let workspaces = adam_workspace::Workspaces::new(
+        workspace.clone(),
+        Arc::new(adam_workspace::StaticToken::new("t")),
+    );
+    let store = db.store();
+    let done = run_with_workspace(&store, &workspaces, &remote, Some(RunStatus::Done)).await;
+    let failed = run_with_workspace(&store, &workspaces, &remote, Some(RunStatus::Failed)).await;
+    let parked = run_with_workspace(&store, &workspaces, &remote, Some(RunStatus::Parked)).await;
+    let unknown = run_with_workspace(&store, &workspaces, &remote, None).await;
+    let notes = NotesStore::new(&workspace);
+    notes
+        .save(&done.to_string(), &RunNotes::default())
+        .await
+        .unwrap();
+    std::fs::create_dir_all(workspace.join("workspaces/not-a-run")).unwrap();
+    let dir = |run: RunId| workspace.join("workspaces").join(run.to_string());
+    assert!(dir(done).is_dir() && dir(parked).is_dir());
+
+    let mut env = valid_env(&db.url(), &workspace);
+    env.push(("WORKSPACE_SWEEP_SECS".into(), "1".into()));
+    let mut p = Proc::spawn(&env);
+    p.ready().await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while [done, failed, unknown].iter().any(|run| dir(*run).exists()) {
+        assert!(
+            Instant::now() < deadline,
+            "the janitor never swept\n{}",
+            p.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(dir(parked).is_dir(), "a parked run keeps its workspace");
+    assert!(
+        workspace.join("workspaces/not-a-run").is_dir(),
+        "what is not a run is not the janitor's"
+    );
+    assert!(
+        workspace
+            .join("coder")
+            .join(format!("{done}.json"))
+            .is_file(),
+        "the notes stay"
+    );
+    assert!(
+        workspace.join("git").is_dir(),
+        "the mirrors stay: the run's branches are in them"
+    );
+    assert!(
+        p.stdout()
+            .contains("removed the workspace of a finished run"),
+        "{}",
+        p.logs()
+    );
+    // And it goes on: a run that finishes later loses its workspace at the next sweep.
+    let record = store.load_run(parked).await.unwrap().unwrap();
+    store
+        .commit_run(
+            parked,
+            record.version,
+            adam_core::RunUpdate::new(RunStatus::Done, record.state),
+        )
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while dir(parked).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the run finished and its workspace stayed\n{}",
+            p.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    p.sigterm().await;
+    let status = p.exit_within(Duration::from_secs(15)).await;
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the janitor stops with the workers\n{}",
+        p.logs()
+    );
+    db.finish().await;
+}
+
+/// `WORKSPACE_SWEEP_SECS=0` turns the janitor off: it says so and removes nothing.
+#[tokio::test]
+async fn a_sweep_of_zero_seconds_turns_the_janitor_off() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, _home) = seed_remote(tmp.path());
+    let workspace = tmp.path().join("work");
+    let workspaces = adam_workspace::Workspaces::new(
+        workspace.clone(),
+        Arc::new(adam_workspace::StaticToken::new("t")),
+    );
+    let store = db.store();
+    let done = run_with_workspace(&store, &workspaces, &remote, Some(RunStatus::Done)).await;
+
+    let mut env = valid_env(&db.url(), &workspace);
+    env.push(("WORKSPACE_SWEEP_SECS".into(), "0".into()));
+    let mut p = Proc::spawn(&env);
+    p.ready().await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !p
+        .stdout()
+        .contains("the sweep of finished workspaces is off")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "it never said it is off\n{}",
+            p.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        workspace.join("workspaces").join(done.to_string()).is_dir(),
+        "nothing was swept"
+    );
+    p.sigterm().await;
+    assert_eq!(
+        p.exit_within(Duration::from_secs(15)).await.code(),
+        Some(0),
+        "{}",
+        p.logs()
     );
     db.finish().await;
 }

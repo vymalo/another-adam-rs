@@ -1,0 +1,25 @@
+{
+  "name": "write_file",
+  "description": "Create a file, or replace one, with exactly `content`. Parent directories are created. The path is relative to the root of the worktree; nothing inside `.git` and nothing through a symlink can be written. For a change to part of a file use apply_patch (or read it first with read_file and write it whole); for a broad, multi-file change use delegate_to_opencode.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Path of the file, relative to the root of the worktree"
+      },
+      "content": {
+        "type": "string",
+        "description": "The whole new content of the file (at most 1 MiB)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to write in: its name, or the repository's address. Leave out when the workspace has one."
+      }
+    },
+    "required": [
+      "path",
+      "content"
+    ]
+  }
+}

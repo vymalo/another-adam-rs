@@ -3,7 +3,8 @@
 //! Given "in repo X, do Y", the agent
 //!
 //! 1. prepares a git worktree (`prepare_workspace`, `adam-workspace`),
-//! 2. has OpenCode make the change over ACP (`delegate_to_opencode`, `adam-acp`),
+//! 2. makes the change: small, well-located edits itself (`read_file`, `write_file`, `apply_patch`),
+//!    broad ones through OpenCode over ACP (`delegate_to_opencode`, `adam-acp`),
 //! 3. runs the project's own checks, at most a configured number of failing
 //!    cycles (`run_checks`; looking around uses `run_command`, which is no check),
 //! 4. commits, pushes and opens a pull request (`commit_and_push`,
@@ -20,11 +21,12 @@
 //! | Module | What |
 //! |---|---|
 //! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks or rejected credentials and no PR = failed; any other stop without a PR = a question, `input-required`) and the record of the repositories the person named; [`CoderStarter`]: its start-only half |
-//! | [`tools`] | the seven tools (`#[tool]` functions reading [`ToolEnv`] from the agent's state) and [`CoderSettings`] |
+//! | [`tools`] | the nine tools of the coder (`#[tool]` functions reading [`ToolEnv`] from the agent's state; the screen's three, `ask_user`, `show` and `ui_catalog`, are `adam-ui`'s) and [`CoderSettings`] |
 //! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`, or read at startup from the folder `ADAM_AGENT_DIR` names) |
 //! | [`files`] | [`AgentFiles`]: where those files come from, the embedded copy or a folder read once at startup, and why a folder is refused ([`AgentFilesError`]) |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
+//! | [`janitor`] | [`Janitor`]: the sweep that removes the workspaces of finished runs, a worker component of the process |
 //! | [`app`] | [`Coder`]: runtime + A2A backend + router (an [`adam_service::Service`] for the coder's agent); [`Coder::control_plane`] for a process that only starts runs; [`LiveSignals`]: events and wake-up signals, in-process or across processes (from `adam-service`) |
 //! | [`config`] | the binary's environment variables (the ones every agent binary shares are `adam-service`'s) |
 //! | [`serve()`] | the whole process: the agent files, the model, GitHub, the workspaces and the MCP servers, then `adam_service::serve` for the store and the A2A server and workers its `ROLE` runs (through `adam_host::Host`), until a shutdown future resolves |
@@ -83,6 +85,7 @@ pub mod app;
 pub mod config;
 pub mod exit;
 pub mod files;
+pub mod janitor;
 pub mod opencode;
 pub mod redact;
 mod repos;
@@ -94,6 +97,7 @@ pub use app::{Coder, LiveSignals, RuntimeOptions, agent_card, agent_card_from};
 pub use config::{Config, ConfigError, McpSettings, WorkerConfig};
 pub use exit::exit_code;
 pub use files::{AgentFiles, AgentFilesError};
+pub use janitor::Janitor;
 pub use redact::Redactor;
 pub use repos::workspaces_for;
 pub use serve::serve;

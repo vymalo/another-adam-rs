@@ -47,9 +47,11 @@
 //! through `adam-workspace`, never by the child.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use adam_acp::AcpCommand;
+use adam_workspace::{EnvError, ExecSpec, PreparedCommand};
 use serde_json::{Value, json};
 
 /// Provider id under which the gateway is registered in OpenCode.
@@ -136,22 +138,55 @@ impl OpenCodeLaunch {
         self
     }
 
-    /// The command to run in `cwd`.
-    pub(crate) fn command(&self, cwd: &Path) -> AcpCommand {
-        let mut cmd = AcpCommand::new(self.program.clone(), cwd);
-        cmd.args.clone_from(&self.args);
-        for name in HIDDEN_FROM_CHILD {
-            cmd = cmd.env(*name, "");
-        }
-        for (k, v) in &self.env {
-            cmd = cmd.env(k, v);
-        }
-        cmd
+    /// What to run in `cwd`, for the run's environment to prepare
+    /// ([`EnvSession::prepare`](adam_workspace::EnvSession::prepare)): the program and its arguments,
+    /// the configuration, and the secrets of this process that OpenCode has no use for to hide.
+    /// `MODEL_API_KEY` is not among them: OpenCode reads it by reference (`{env:MODEL_API_KEY}`).
+    pub(crate) fn exec_spec(&self, cwd: &Path) -> ExecSpec {
+        let mut argv = vec![self.program.clone().into_os_string()];
+        argv.extend(self.args.iter().map(OsString::from));
+        let mut spec = ExecSpec::argv(argv, cwd).hide(HIDDEN_FROM_CHILD.iter().copied());
+        spec.env.clone_from(&self.env);
+        spec
     }
+}
+
+/// `prepared` as the ACP client starts it: the program, the arguments, the directory and the
+/// environment added on top of this process's, with the names to remove blanked (the client
+/// cannot remove a variable, and an empty one is as good as none for a secret).
+///
+/// # Errors
+///
+/// [`EnvError::Refused`] for what the client cannot do yet: start the process with an empty
+/// environment, or take an argument or a value that is not UTF-8.
+pub(crate) fn acp_command(prepared: &PreparedCommand) -> Result<AcpCommand, EnvError> {
+    if prepared.env_clear {
+        return Err(EnvError::Refused(
+            "the ACP client cannot start a process with an empty environment".to_owned(),
+        ));
+    }
+    let text = |value: &OsString| {
+        value.to_str().map(str::to_owned).ok_or_else(|| {
+            EnvError::Refused("the ACP client takes only UTF-8 arguments and values".to_owned())
+        })
+    };
+    let mut cmd = AcpCommand::new(prepared.program.clone(), prepared.cwd.clone());
+    for arg in &prepared.args {
+        cmd = cmd.arg(text(arg)?);
+    }
+    for (name, value) in &prepared.env {
+        cmd = cmd.env(text(name)?, text(value)?);
+    }
+    for name in &prepared.env_remove {
+        cmd = cmd.env(name, "");
+    }
+    Ok(cmd)
 }
 
 #[cfg(test)]
 mod tests {
+    use adam_workspace::{EnvSession, LocalSession, Program};
+
     use super::*;
 
     #[test]
@@ -166,10 +201,18 @@ mod tests {
         assert_eq!(p["models"]["coder-large"]["name"], "coder-large");
     }
 
+    /// What the ACP client is given for `launch` in `cwd` in this container.
+    fn local_command(launch: &OpenCodeLaunch, cwd: &str) -> AcpCommand {
+        let prepared = LocalSession
+            .prepare(&launch.exec_spec(Path::new(cwd)))
+            .unwrap();
+        acp_command(&prepared).unwrap()
+    }
+
     #[test]
     fn launch_sets_config_and_blanks_unneeded_secrets() {
         let launch = OpenCodeLaunch::opencode("https://gw.example/v1", "m");
-        let cmd = launch.command(Path::new("/work/worktrees/r"));
+        let cmd = local_command(&launch, "/work/worktrees/r");
         assert_eq!(cmd.program, PathBuf::from("opencode"));
         assert_eq!(cmd.args, ["acp"]);
         assert_eq!(cmd.cwd, PathBuf::from("/work/worktrees/r"));
@@ -181,6 +224,10 @@ mod tests {
         );
         assert_eq!(cmd.env.get("GITHUB_TOKEN").map(String::as_str), Some(""));
         assert_eq!(cmd.env.get("DATABASE_URL").map(String::as_str), Some(""));
+        assert_eq!(
+            cmd.env.get("A2A_BEARER_TOKENS").map(String::as_str),
+            Some("")
+        );
         assert!(
             cmd.env
                 .get(CONFIG_ENV)
@@ -190,6 +237,43 @@ mod tests {
             !cmd.env.contains_key("MODEL_API_KEY"),
             "the key is inherited, never copied"
         );
+    }
+
+    #[test]
+    fn the_spec_names_what_to_hide_and_never_carries_the_key() {
+        let launch = OpenCodeLaunch::opencode("https://gw.example/v1", "m");
+        let spec = launch.exec_spec(Path::new("/w"));
+        assert_eq!(
+            spec.program,
+            Program::Argv(vec!["opencode".into(), "acp".into()])
+        );
+        assert_eq!(
+            spec.hide,
+            ["GITHUB_TOKEN", "DATABASE_URL", "A2A_BEARER_TOKENS"]
+        );
+        assert!(!spec.hide.iter().any(|name| name == "MODEL_API_KEY"));
+        assert!(!spec.env.contains_key("MODEL_API_KEY"));
+        assert!(
+            !spec.env.values().any(|v| v.contains("MODEL_API_KEY=")),
+            "only the reference {{env:MODEL_API_KEY}} is in the configuration"
+        );
+    }
+
+    #[test]
+    fn a_hidden_name_stays_blank_even_when_the_launch_sets_it() {
+        let launch = OpenCodeLaunch::program("agent").env("GITHUB_TOKEN", "from the launch");
+        let cmd = local_command(&launch, "/w");
+        assert_eq!(cmd.env.get("GITHUB_TOKEN").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn the_client_cannot_start_a_process_with_an_empty_environment_yet() {
+        let mut prepared = LocalSession
+            .prepare(&OpenCodeLaunch::program("agent").exec_spec(Path::new("/w")))
+            .unwrap();
+        prepared.env_clear = true;
+        let err = acp_command(&prepared).unwrap_err();
+        assert!(matches!(err, EnvError::Refused(_)), "{err}");
     }
 
     #[test]

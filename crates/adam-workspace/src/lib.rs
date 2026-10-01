@@ -58,11 +58,13 @@
 
 mod code_host;
 mod credentials;
+mod environment;
 mod error;
 mod git;
 #[cfg(feature = "github")]
 mod github;
 mod repo;
+mod run_workspace;
 mod workspace;
 mod worktree;
 
@@ -70,9 +72,15 @@ mod worktree;
 pub use code_host::MemoryCodeHost;
 pub use code_host::{CodeHost, DynCodeHost, NewPullRequest, PullRequest};
 pub use credentials::{DynGitCredentials, GitCredentials, ScopedToken, StaticToken};
+pub use environment::{
+    DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress, EnvSession, EnvStep,
+    EnvStepState, Environment, ExecId, ExecSpec, Local, LocalSession, NoProgress, PreparedCommand,
+    Program, SecretRef, login_shell,
+};
 pub use error::{WorkspaceError, WorkspaceResult};
 #[cfg(feature = "github")]
 pub use github::GitHub;
 pub use repo::{RepoLocation, RepoRef};
+pub use run_workspace::{Collision, CopyReport, RunWorkspace, Scratch, Slot, SlotKind, copy_into};
 pub use workspace::Workspaces;
 pub use worktree::{ChangedFile, FileStatus, GitIdentity, MirrorLock, Worktree};

@@ -1,4 +1,4 @@
-//! A run's worktree: inspect, commit, push.
+//! A run's worktree (one repository of its workspace): inspect, commit, push.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::git::GitCmd;
 use crate::repo::RepoRef;
-use crate::workspace::{Inner, REMOTE_TRACKING_PREFIX};
+use crate::workspace::{Inner, Meta, REMOTE_TRACKING_PREFIX};
 
 /// A run's isolated working tree on its own branch.
 ///
@@ -19,6 +19,8 @@ use crate::workspace::{Inner, REMOTE_TRACKING_PREFIX};
 pub struct Worktree {
     ws: Arc<Inner>,
     run: String,
+    /// The slot's directory name in the run's workspace.
+    dir: String,
     repo: RepoRef,
     path: PathBuf,
     /// The name the work ends up under: the run's own branch, or the pushed branch this worktree
@@ -33,6 +35,7 @@ impl fmt::Debug for Worktree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Worktree")
             .field("run", &self.run)
+            .field("dir", &self.dir)
             .field("path", &self.path)
             .field("branch", &self.branch)
             .finish_non_exhaustive()
@@ -57,7 +60,7 @@ impl GitIdentity {
         }
     }
 
-    fn validate(&self) -> WorkspaceResult<()> {
+    pub(crate) fn validate(&self) -> WorkspaceResult<()> {
         let bad = |s: &str| s.trim().is_empty() || s.contains(['\n', '\r', '<', '>', '\0']);
         if bad(&self.name) || bad(&self.email) {
             return Err(WorkspaceError::Invalid(
@@ -101,29 +104,41 @@ pub struct ChangedFile {
 }
 
 impl Worktree {
+    /// The worktree that `meta` describes, in the slot `dir`, at `path`.
     pub(crate) fn new(
         ws: Arc<Inner>,
-        run: String,
-        repo: RepoRef,
+        meta: &Meta,
+        dir: String,
         path: PathBuf,
-        branch: String,
-        continued: Option<String>,
         mirror: PathBuf,
     ) -> Self {
         Self {
             ws,
-            run,
-            repo,
+            run: meta.run.clone(),
+            dir,
+            repo: RepoRef::new(&meta.url, &meta.base_branch),
             path,
-            branch: continued.unwrap_or_else(|| branch.clone()),
-            local: branch,
+            branch: meta
+                .remote_branch
+                .clone()
+                .unwrap_or_else(|| meta.branch.clone()),
+            local: meta.branch.clone(),
             mirror,
         }
     }
 
-    /// The worktree directory: `<root>/worktrees/<run>`.
+    /// The worktree directory: `<root>/workspaces/<run>/<dir>` for a slot of a
+    /// [`RunWorkspace`](crate::RunWorkspace), `<root>/worktrees/<run>` for one made by
+    /// [`Workspaces::prepare`](crate::Workspaces::prepare).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The name of the worktree's slot in the run's workspace: the repository's name, lowercased
+    /// (see [`RunWorkspace::slots`](crate::RunWorkspace::slots)); the same for a worktree made by
+    /// [`Workspaces::prepare`](crate::Workspaces::prepare), which is a slot of the legacy layout.
+    pub fn dir(&self) -> &str {
+        &self.dir
     }
 
     /// The branch this worktree's work ends up on, which is what a pull request is opened from:
@@ -271,36 +286,7 @@ impl Worktree {
         message: &str,
         author: &GitIdentity,
     ) -> WorkspaceResult<Option<String>> {
-        author.validate()?;
-        if message.trim().is_empty() {
-            return Err(WorkspaceError::Invalid(
-                "commit message is empty".to_owned(),
-            ));
-        }
-        self.git().args(["add", "-A"]).run().await?;
-        let staged = self
-            .git()
-            .args(["diff", "--cached", "--quiet"])
-            .run_status()
-            .await?;
-        match staged.code {
-            Some(0) => return Ok(None),
-            Some(1) => {}
-            _ => {
-                return Err(WorkspaceError::Corrupt(
-                    "cannot tell whether anything is staged".to_owned(),
-                ));
-            }
-        }
-        self.git()
-            .config("user.name", &author.name)
-            .config("user.email", &author.email)
-            .args(["commit", "--quiet", "-m"])
-            .arg(message)
-            .run()
-            .await?;
-        let sha = self.git().args(["rev-parse", "HEAD"]).run().await?;
-        Ok(Some(sha.stdout_text()))
+        commit_all_in(|| self.git(), message, author).await
     }
 
     /// Push the run's own branch ([`local_branch`](Self::local_branch), `agent/<run-short-id>`) to
@@ -450,6 +436,45 @@ impl Worktree {
             _guard: self.ws.lock_mirror(&self.mirror).await?,
         })
     }
+}
+
+/// Stage everything (`git add -A`) and commit as `author`, in the repository `git` runs in: the
+/// sha, or `None` when there was nothing to commit. What [`Worktree::commit_all`] and
+/// [`Scratch::commit_all`](crate::Scratch::commit_all) do.
+pub(crate) async fn commit_all_in(
+    git: impl Fn() -> GitCmd,
+    message: &str,
+    author: &GitIdentity,
+) -> WorkspaceResult<Option<String>> {
+    author.validate()?;
+    if message.trim().is_empty() {
+        return Err(WorkspaceError::Invalid(
+            "commit message is empty".to_owned(),
+        ));
+    }
+    git().args(["add", "-A"]).run().await?;
+    let staged = git()
+        .args(["diff", "--cached", "--quiet"])
+        .run_status()
+        .await?;
+    match staged.code {
+        Some(0) => return Ok(None),
+        Some(1) => {}
+        _ => {
+            return Err(WorkspaceError::Corrupt(
+                "cannot tell whether anything is staged".to_owned(),
+            ));
+        }
+    }
+    git()
+        .config("user.name", &author.name)
+        .config("user.email", &author.email)
+        .args(["commit", "--quiet", "-m"])
+        .arg(message)
+        .run()
+        .await?;
+    let sha = git().args(["rev-parse", "HEAD"]).run().await?;
+    Ok(Some(sha.stdout_text()))
 }
 
 /// The lock of a mirror, held by [`Worktree::lock_mirror`] until it is dropped.

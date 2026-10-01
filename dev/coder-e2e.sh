@@ -4,6 +4,7 @@
 #
 #   dev/coder-e2e.sh                  # OpenCode (model mock-opencode) makes the change
 #   NO_OPENCODE=1 dev/coder-e2e.sh    # the check command makes it; OpenCode is not started
+#   SCENARIO=files dev/coder-e2e.sh   # the coder reads and writes the files itself; no OpenCode
 #
 # Start the stack first (the coder's models are the scripts in
 # dev/wiremock/mock-openai/mappings/coder-script.json and opencode-script.json):
@@ -23,7 +24,9 @@
 #     branch artifact's commit, with a 40-hex tree;
 #   * mock-github saw exactly one POST /repos/local/sandbox/pulls, head = the
 #     branch, base = main;
-#   * git-server has the branch, and hello.txt on it is `hello`.
+#   * git-server has the branch, and hello.txt on it is `hello`;
+#   * SCENARIO=files also: the stream says `read README.md (sandbox)` and `wrote hello.txt (sandbox)`
+#     (the coder's file tools ran, in the slot of the repository) and never `starting OpenCode`.
 # It prints one "ok" or "FAIL" line per check and exits 1 if any failed.
 #
 # Environment (defaults match compose.yaml on one machine):
@@ -33,6 +36,8 @@
 #   GIT_SERVER_URL   http://127.0.0.1:${GIT_SERVER_PORT:-8083}   (from the host)
 #   TIMEOUT          300     seconds to wait for the task to end
 #   NO_OPENCODE      unset   1 = the [mock:no-opencode] script (no OpenCode)
+#   SCENARIO         default `default` (the script above) or `files` (the [mock:files] script:
+#                    read_file, write_file; every check above holds, and so do the two lines)
 #
 # Needs curl, jq and git. Verified by CI only in the compose run of
 # .github/workflows/coder.yml; the mock scripts were also run against the real
@@ -62,8 +67,21 @@ trap 'rm -rf "$tmp"' EXIT
 stream=$tmp/stream.sse
 : > "$stream"
 
+scenario=${SCENARIO:-default}
+case "$scenario" in
+  default | files) ;;
+  *) echo "SCENARIO must be default or files, not '$scenario'" >&2; exit 2 ;;
+esac
+if [ "$scenario" != default ] && [ "${NO_OPENCODE:-}" = 1 ]; then
+  echo "NO_OPENCODE=1 and SCENARIO=$scenario are two different scripts: set one" >&2
+  exit 2
+fi
+
 text="In $repo_url (base branch main), add hello.txt containing hello."
-if [ "${NO_OPENCODE:-}" = 1 ]; then
+if [ "$scenario" = files ]; then
+  text="$text [mock:files]"
+  echo "variant: the coder edits the files itself ([mock:files])"
+elif [ "${NO_OPENCODE:-}" = 1 ]; then
   text="$text [mock:no-opencode]"
   echo "variant: no OpenCode ([mock:no-opencode])"
 else
@@ -76,7 +94,7 @@ if [ "$code" = 200 ]; then ok "mock-github journal reset"; else bad "mock-github
 
 # The message id names the task (same agent, no context: same id, same task), so
 # it must differ between runs, including two variants started in one second.
-message_id="e2e-${NO_OPENCODE:-0}-$(date +%s)-$$"
+message_id="e2e-$scenario-${NO_OPENCODE:-0}-$(date +%s)-$$"
 rpc=$(jq -n --arg id "$message_id" --arg text "$text" '{
   jsonrpc: "2.0", id: "1", method: "SendStreamingMessage",
   params: {message: {messageId: $id, role: "ROLE_USER", parts: [{text: $text}]}}}')
@@ -142,6 +160,17 @@ if [ -n "$stream_id" ] && [ "$stream_id" = "$said_id" ]; then ok "the status tha
 order=$(jq '([to_entries[] | select(.value.result.artifactUpdate.artifact.name == "reply") | .key] | max)
   < ([to_entries[] | select(.value.result.statusUpdate.status.state == "TASK_STATE_COMPLETED") | .key] | max)' "$all")
 if [ "$order" = true ]; then ok "the chunks came before the end of the task"; else bad "a chunk came after the status that ends the task"; fi
+
+# --- the file tools (SCENARIO=files) -------------------------------------------------
+# A client that did not activate `steps/v1` reads a tool's progress as lines of text.
+if [ "$scenario" = files ]; then
+  lines=$tmp/lines.txt
+  jq -r '.. | .text? // empty' "$events" > "$lines" 2>/dev/null || : > "$lines"
+  slot=${repo_path##*/}
+  if grep -qx "read README.md ($slot)" "$lines"; then ok "the coder read README.md itself"; else bad "no 'read README.md ($slot)' line in the stream"; fi
+  if grep -qx "wrote hello.txt ($slot)" "$lines"; then ok "the coder wrote hello.txt itself"; else bad "no 'wrote hello.txt ($slot)' line in the stream"; fi
+  if grep -q 'starting OpenCode' "$lines"; then bad "OpenCode was started, and this script does not delegate"; else ok "OpenCode was not started"; fi
+fi
 
 # --- artifacts ---------------------------------------------------------------------
 artifact() { # artifact <name> <jq path under .parts[0].data> -> value ("" if absent)

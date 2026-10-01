@@ -121,6 +121,8 @@ spec:
               value: "3"
             - name: CHECK_TIMEOUT_SECS
               value: "900"
+            - name: WORKSPACE_SWEEP_SECS
+              value: "300"
             - name: ALLOWED_REPO_HOSTS
               value: "github.com"
             - name: GITHUB_API_URL

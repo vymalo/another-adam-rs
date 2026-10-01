@@ -6,14 +6,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::{CoderSettings, Redactor, ToolEnv};
 use adam_model::ToolCall;
 use adam_workspace::{
-    CodeHost, DynCodeHost, GitHub, NewPullRequest, PullRequest, RepoRef, ScopedToken,
-    WorkspaceError, Workspaces,
+    CodeHost, DynCodeHost, DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress,
+    EnvSession, EnvStep, Environment, ExecId, ExecSpec, GitHub, LocalSession, NewPullRequest,
+    PreparedCommand, PullRequest, RepoRef, RunWorkspace, ScopedToken, SecretRef, WorkspaceError,
+    Workspaces,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -37,6 +40,16 @@ pub const DB_PASSWORD: &str = "pg-pa55w0rd-very-secret";
 
 /// Every secret value above.
 pub const SECRETS: [&str; 4] = [GITHUB_TOKEN, MODEL_KEY, A2A_TOKEN, DB_PASSWORD];
+
+/// The directory of the slot of the fixture's repository (`remote.git`) in a run's workspace: the
+/// repository's name.
+pub const SLOT: &str = "remote";
+
+/// The worktree of the repository `remote.git` in the workspace of `run`, under `root`:
+/// `<root>/workspaces/<run>/remote`.
+pub fn slot_dir(root: &Path, run: &str) -> PathBuf {
+    root.join("workspaces").join(run).join(SLOT)
+}
 
 /// URL of pull request `number` of the mock repository.
 pub fn pull_url(number: u64) -> String {
@@ -369,6 +382,15 @@ impl Fixture {
         }
     }
 
+    /// The same fixture with the processes of runs going through `environment`.
+    #[must_use]
+    pub fn using(mut self, environment: DynEnvironment) -> Self {
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .environment = environment;
+        self
+    }
+
     /// The same tools as `env` but with the production repository policy:
     /// only `github.com`, no local paths (`ALLOW_LOCAL_REPOS` unset), in a
     /// workspace root of its own.
@@ -389,6 +411,59 @@ impl Fixture {
 
     pub fn remote_url(&self) -> String {
         self.remote.to_string_lossy().into_owned()
+    }
+
+    /// Commit `content` as `file` on `main` of the remote (through a clone of its own), as a
+    /// repository that already has something to fix.
+    pub fn commit_to_main(&self, file: &str, content: &str) {
+        let clone = self
+            .tmp
+            .path()
+            .join(format!("clone-{}", file.replace('/', "_")));
+        git(
+            self.tmp.path(),
+            &[
+                "clone",
+                "--quiet",
+                self.remote.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        if let Some(parent) = std::path::Path::new(file).parent() {
+            std::fs::create_dir_all(clone.join(parent)).unwrap();
+        }
+        std::fs::write(clone.join(file), content).unwrap();
+        git(&clone, &["add", "-A"]);
+        git(
+            &clone,
+            &["commit", "--quiet", "-m", &format!("seed {file}")],
+        );
+        git(&clone, &["push", "--quiet", "origin", "main"]);
+    }
+
+    /// Another bare remote, `<tmp>/other/<name>.git`, on `main` with `files`: the second repository
+    /// of a workspace. Returns its path.
+    pub fn extra_remote(&self, name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let remote = self.tmp.path().join("other").join(format!("{name}.git"));
+        let seed = self.tmp.path().join(format!("seed-{name}"));
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&seed).unwrap();
+        git(
+            &remote,
+            &["init", "--bare", "--quiet", "--initial-branch=main"],
+        );
+        git(&seed, &["init", "--quiet", "--initial-branch=main"]);
+        for (file, content) in files {
+            std::fs::write(seed.join(file), content).unwrap();
+        }
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "--quiet", "-m", "seed"]);
+        git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&seed, &["push", "--quiet", "origin", "main"]);
+        remote
     }
 
     /// Branches on the remote other than `main`.
@@ -767,4 +842,141 @@ pub fn json_of(response: &str) -> Value {
     let start = response.find('{').expect("a JSON body");
     let end = response.rfind('}').expect("a JSON body");
     serde_json::from_str(&response[start..=end]).expect("the body is JSON")
+}
+
+/// An [`Environment`] for tests: commands still run in this container, but through a session that
+/// records every spec it was asked to prepare and every process it was told to kill, and puts
+/// `FAKE_ENV=<name>` in the environment of each (so a command can say where it ran). It also
+/// records what it was asked to ensure and release, and can be made to fail or to say what it
+/// holds.
+pub struct FakeEnvironment {
+    /// The workspace root, to say whether a run's workspace was there when it was released.
+    root: Option<PathBuf>,
+    pub session: Arc<FakeSession>,
+    /// The runs `ensure` was called for.
+    pub ensured: Mutex<Vec<String>>,
+    /// The runs `release` was called for, and whether their workspace still existed then.
+    pub released: Mutex<Vec<(String, bool)>>,
+    /// What `held_runs` says.
+    pub held: Mutex<Vec<String>>,
+    /// The steps `ensure` reports before it returns.
+    pub steps: Mutex<Vec<EnvStep>>,
+    /// `ensure` fails with this, once set.
+    pub ensure_fails: Mutex<Option<fn() -> EnvError>>,
+    /// `release` fails while this is set.
+    pub release_fails: AtomicBool,
+    /// `ensure` never returns while this is set (an environment that takes forever to build).
+    pub hang: AtomicBool,
+}
+
+/// The session of a [`FakeEnvironment`].
+#[derive(Default)]
+pub struct FakeSession {
+    /// The specs it was asked to prepare, in order.
+    pub specs: Mutex<Vec<ExecSpec>>,
+    /// What it prepared.
+    pub prepared: Mutex<Vec<ExecId>>,
+    /// What it was told to kill.
+    pub killed: Mutex<Vec<ExecId>>,
+    /// Variables added to every prepared command.
+    pub extra_env: Mutex<BTreeMap<String, String>>,
+}
+
+impl FakeEnvironment {
+    /// A fake with nothing held, no steps, and nothing failing. `root` is the workspace root of the
+    /// fixture, for [`released`](Self::released).
+    pub fn new(root: Option<&Path>) -> Arc<Self> {
+        let session = Arc::new(FakeSession::default());
+        session
+            .extra_env
+            .lock()
+            .unwrap()
+            .insert("FAKE_ENV".to_owned(), "fake".to_owned());
+        Arc::new(Self {
+            root: root.map(Path::to_path_buf),
+            session,
+            ensured: Mutex::new(Vec::new()),
+            released: Mutex::new(Vec::new()),
+            held: Mutex::new(Vec::new()),
+            steps: Mutex::new(Vec::new()),
+            ensure_fails: Mutex::new(None),
+            release_fails: AtomicBool::new(false),
+            hang: AtomicBool::new(false),
+        })
+    }
+}
+
+#[async_trait]
+impl Environment for FakeEnvironment {
+    async fn ensure(
+        &self,
+        workspace: &RunWorkspace,
+        progress: &dyn EnvProgress,
+    ) -> Result<Arc<dyn EnvSession>, EnvError> {
+        self.ensured
+            .lock()
+            .unwrap()
+            .push(workspace.run().to_owned());
+        for step in self.steps.lock().unwrap().iter() {
+            progress.step(step.clone());
+        }
+        if self.hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        if let Some(fail) = *self.ensure_fails.lock().unwrap() {
+            return Err(fail());
+        }
+        Ok(self.session.clone())
+    }
+
+    async fn release(&self, run: &str) -> Result<(), EnvError> {
+        let present = self
+            .root
+            .as_ref()
+            .is_some_and(|root| root.join("workspaces").join(run).exists());
+        self.released
+            .lock()
+            .unwrap()
+            .push((run.to_owned(), present));
+        if self.release_fails.load(Ordering::SeqCst) {
+            return Err(EnvError::Unavailable("the runtime is down".to_owned()));
+        }
+        self.held.lock().unwrap().retain(|held| held != run);
+        Ok(())
+    }
+
+    async fn held_runs(&self) -> Result<Vec<String>, EnvError> {
+        Ok(self.held.lock().unwrap().clone())
+    }
+}
+
+#[async_trait]
+impl EnvSession for FakeSession {
+    fn describe(&self) -> EnvDescription {
+        EnvDescription {
+            kind: EnvKind::DevContainer {
+                source: None,
+                image: "fake".to_owned(),
+            },
+            summary: "a fake environment".to_owned(),
+        }
+    }
+
+    fn prepare(&self, spec: &ExecSpec) -> Result<PreparedCommand, EnvError> {
+        let mut prepared = LocalSession.prepare(spec)?;
+        for (name, value) in self.extra_env.lock().unwrap().iter() {
+            prepared.env.insert(name.into(), value.into());
+        }
+        self.specs.lock().unwrap().push(spec.clone());
+        self.prepared.lock().unwrap().push(prepared.exec.clone());
+        Ok(prepared)
+    }
+
+    async fn kill(&self, exec: &ExecId) {
+        self.killed.lock().unwrap().push(exec.clone());
+    }
+
+    fn secret_ref(&self, name: &str) -> Option<SecretRef> {
+        (name == "model-key").then(|| SecretRef::File(PathBuf::from("/run/secrets/model-key")))
+    }
 }

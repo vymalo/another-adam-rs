@@ -1,15 +1,17 @@
 # adam-workspace
 
 Per-run git worktrees, push and pull requests for coding agents. git is the
-durable artifact: a run's result is a pushed branch and a pull request.
+durable artifact: a run's result is a pushed branch and a pull request. A run's workspace holds
+several repositories and scratch projects ([below](#a-runs-workspace-slots-scratch-projects-and-the-copy-between-them)).
 
 ## Where it sits
 
 The **workspace and code-host layer** of the coder agent, used by
 [`adam-coder`](../../bin/adam-coder/README.md) (and by anything that wants isolated
-worktrees). It defines two ports, `GitCredentials` and `CodeHost`, and ships
+worktrees). It defines three ports, `GitCredentials`, `CodeHost` and `Environment` (where a run's
+processes run, [below](#where-a-runs-processes-run-the-environment-port)), and ships
 their implementations in the same crate (`StaticToken`, `ScopedToken`,
-`GitHub`; `MemoryCodeHost` for tests). Nothing implementation-specific appears
+`GitHub`; `MemoryCodeHost` for tests; `Local`). Nothing implementation-specific appears
 in a trait signature. It shells out to the `git` CLI so mirrors, worktrees and
 authentication behave like the real tool.
 
@@ -17,9 +19,17 @@ authentication behave like the real tool.
 
 | Item | What |
 |---|---|
-| `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `default_branch(url)`, `open_existing(run)`, `remove(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
+| `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, **`run(run)`** (a run's workspace, below), **`runs()`** (the runs that have one on disk), **`remote_is_empty(url)`**, **`initialize_empty(&RepoRef, &GitIdentity)`**, **`wait_reachable(url, Duration)`**, `default_branch(url)`, `remove(run)` (everything of the run's workspace, the legacy worktree included), and the single-repository helpers `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `open_existing(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
+| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, `remove()`; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)` and `files()` |
+| `copy_into(&Scratch, &Worktree, path, overwrite)`, `CopyReport`, `Collision` | the files of a scratch project into a worktree, all or nothing: `copied`, `unchanged`, `collisions` |
+| `Environment` (trait), `DynEnvironment`, `Local` | where a run's processes run: `ensure(&RunWorkspace, &dyn EnvProgress)` gives the run's `EnvSession` (made on first need, then the same), `release(run)` (idempotent), `held_runs()`. `Local` is the caller's own container and holds nothing |
+| `EnvSession` (trait), `LocalSession` | `describe()`, `prepare(&ExecSpec)` (the command to spawn), `kill(&ExecId)`, `secret_ref(name)` |
+| `ExecSpec`, `Program`, `PreparedCommand`, `ExecId`, `SecretRef` | what to run (`ExecSpec::shell(command, cwd)` or `::argv(..)`, `.env(..)`, `.hide(names)`), the command an environment made of it (`PreparedCommand::command()` is a `tokio::process::Command` with its program, arguments, directory and environment), and how a process reads a secret (`SecretRef::Env` or `File`) |
+| `EnvProgress` (trait), `EnvStep`, `EnvStepState`, `NoProgress`, `EnvKind`, `EnvDescription` | the steps of a slow `ensure`, and what an environment says it is |
+| `EnvError` | `Unavailable`, `Config { file, reason }`, `Refused`, `Build { reason, log_tail }`, `Timeout { phase, secs }`, `Lost`, `Io`; `#[non_exhaustive]`, see *Errors* |
+| `login_shell()` | `bash` where the image has one, else `sh` (the shell of a `Program::Shell`) |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
-| `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` (the run's own branch), `publish` (moves the continued branch) |
+| `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `dir` (the slot's name), `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` (the run's own branch), `publish` (moves the continued branch) |
 | `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files |
 | `GitCredentials` (trait), `DynGitCredentials` | `token_for(&RepoRef) -> SecretString` |
 | `StaticToken`, `ScopedToken` | one token for any host, or bound to named hosts (`from_env(..)` for both) |
@@ -88,6 +98,140 @@ each of those commands, the crate removes from the mirror's configuration every 
 invocation: never in a remote URL, `.git/config`, logs or error messages.
 URLs with embedded credentials and ssh/scp forms are refused.
 
+## A run's workspace: slots, scratch projects, and the copy between them
+
+A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](../../docs/decisions/0008-a-workspace-holds-several-repositories.md)).
+
+```text
+<root>/git/<host>/<owner>/<name>.git    mirrors, shared by every run (unchanged)
+<root>/workspaces/<run>/<dir>/          a slot: a worktree on agent/<run-short-id>, or a scratch project
+<root>/workspaces/<run>.lock            the run's lock, beside its directory
+<root>/meta/<run>/<dir>.json            the slot's metadata, version 2: dir, seq, kind ("repo" | "scratch"),
+                                        and for a repository url, base_branch, branch, remote_branch (no secrets)
+<root>/worktrees/<run>                  legacy (one worktree per run): read as a slot, removed by remove(),
+<root>/meta/<run>.json                  made only by prepare / prepare_continuing
+```
+
+* **A repository slot** is a `Worktree` of one repository; `add_repository` is `prepare` for a slot. Its directory is the
+  repository's name, lowercased (`<name>-<owner>` when another repository of the run has that name, a number if even that is
+  taken). A run has **at most one slot per repository**: asking again returns it, whatever the base branch or the spelling
+  of the address (`.git`, `file://`), and a slot whose directory was lost is made again on its own branch, keeping its
+  commits. `add_repository_continuing` is `prepare_continuing`.
+* **A scratch slot** is a git repository on `main` with an empty root commit (so `HEAD` exists), made by
+  `add_scratch(dir, identity)` (`^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`; again it returns the same project; a
+  crash between `git init` and the first commit is finished by the next call). `Scratch::commit_all` commits locally;
+  `Scratch::files` lists tracked files and untracked ones that `.gitignore` does not exclude.
+* **Order.** Every slot records `seq`, the place it joined the run, from 1; the legacy worktree is 0.
+  `slots()` lists the legacy worktree first and then by directory; `slots_in_join_order()` by `seq`, whose first
+  element is "the first repository". A slot whose directory is gone is not listed.
+* **`copy_into(scratch, worktree, path, overwrite)`** copies the project's files under the directory `path` of the worktree
+  (`.` for its root; no `..`, absolute path or `.git`), each written next to its place and renamed over it, with the
+  executable bit. A symbolic link is copied only when its target is relative and stays inside the project. **All or
+  nothing:** a file already there with other content (a collision unless `overwrite`), a directory or a symbolic link in the
+  way or behind a link of the repository, and a link that leaves the project (a collision whatever `overwrite` says) stop
+  the whole copy, and the report lists every collision with its reason. Nothing is written inside `.git`.
+* **`remote_is_empty(url)`, `initialize_empty(repo, identity)`.** An empty remote (`git ls-remote` prints nothing) is given
+  a commit of the empty tree (`Initial commit`) pushed as `repo.base_branch`, never forced: the only push outside `agent/*`,
+  so a worktree has a base to start from. A remote with any ref is a `Conflict` and nothing is pushed, also when somebody
+  pushed in between. `wait_reachable(url, within)` waits for a repository that was just created to answer `ls-remote`
+  (backoff from 250 ms to 2 s; not found, a network failure and a rate limit are tried again, anything else fails at once).
+* **`remove()`** deletes every slot (a worktree with its uncommitted changes, a scratch project), the legacy worktree, the
+  metadata and the directory, idempotently, under the run's lock and each mirror's; the `agent/*` branches stay. A workspace
+  with unreadable metadata is removed anyway. **`Workspaces::runs()`** lists the runs that have anything on disk, in either
+  layout, a partly removed one too, so a sweep of finished runs can finish the job.
+
+```mermaid
+sequenceDiagram
+  participant C as caller
+  participant R as RunWorkspace
+  participant W as Workspaces
+  participant G as git remote
+  C->>R: add_scratch("fib", identity)
+  R-->>C: a slot with an empty root commit
+  C->>C: files are written, Scratch::commit_all
+  C->>W: remote_is_empty(url)
+  W->>G: ls-remote
+  G-->>W: no refs
+  C->>W: initialize_empty(repo, identity)
+  W->>G: push the empty-tree commit as the base branch (never forced)
+  C->>R: add_repository(repo)
+  R->>W: worktree on agent/run-short-id from origin/base
+  R-->>C: the repository's slot
+  C->>W: copy_into(scratch, worktree, path, overwrite)
+  W-->>C: copied, unchanged and collisions (all or nothing)
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Empty: a run asks for its workspace
+  Empty --> Scratch: add_scratch
+  Empty --> RepoBacked: add_repository
+  Scratch --> RepoBacked: add_repository, copy_into
+  RepoBacked --> RepoBacked: add_repository (another repository, a new slot)
+  Scratch --> Removed: remove, nothing was published
+  RepoBacked --> Removed: remove, pushed branches remain
+  Removed --> [*]
+```
+
+## Where a run's processes run: the environment port
+
+A run's files are a workspace, and the processes that act on them (the project's checks, a command to look
+around, a coding agent) run somewhere. Until now that was always the caller's own container. `Environment` is the
+seam that lets it be somewhere else without the callers changing; `Local` is the one implementation here and
+behaves as the callers always did. A caller describes what to run (`ExecSpec`), asks the run's `EnvSession` to
+`prepare` it, and spawns what comes back (`PreparedCommand`) in its own process group. **Paths are the same in
+every environment** (`cwd` is absolute and inside a slot of the run), which keeps working directories, file
+requests and the git snapshots valid without any mapping. What stays in the caller whatever the environment is:
+all git work, and the file tools (they act on the shared files).
+
+```mermaid
+sequenceDiagram
+  participant C as caller (the coder's tools)
+  participant E as Environment
+  participant S as EnvSession
+  participant J as janitor
+  C->>E: ensure(workspace, progress)
+  E-->>C: steps while it is made (pull, build, start)
+  E-->>C: the run's session, the same one on the next call
+  C->>S: prepare(ExecSpec: program, cwd, env, hide)
+  S-->>C: PreparedCommand (program, args, cwd, env, env_clear, env_remove, exec id)
+  C->>C: spawn it in a process group of its own
+  alt the command times out, or the run is cancelled
+    C->>C: kill the process group
+    C->>S: kill(exec id)
+  end
+  J->>E: release(run), before the workspace is removed
+  J->>E: held_runs(), release what a crash left
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Unmade: a run starts
+  Unmade --> Made: ensure (single-flight per run)
+  Unmade --> Failed: ensure fails (Unavailable, Config, Build, Timeout)
+  Failed --> Unmade: the next call tries again, or the caller says otherwise
+  Made --> Made: prepare, spawn, kill
+  Made --> Lost: the environment vanished (Lost)
+  Lost --> Unmade: ensure makes it again
+  Made --> Released: release(run)
+  Failed --> Released: release(run)
+  Released --> [*]
+```
+
+* `ExecSpec.env` is **never a secret**. A secret is given by reference: `EnvSession::secret_ref("model-key")` says how a
+  process in that environment reads it (`Local`: the variable `MODEL_API_KEY` that the process inherits), so no secret is
+  ever in an argument list.
+* `ExecSpec.hide` names variables of the caller's own environment that the process must not see (the caller's secrets).
+  `Local` passes them as `env_remove` and keeps the rest of the environment (`env_clear` false); an environment that starts
+  a process with nothing of the caller's has nothing to hide and sets `env_clear`. A name in both `env` and `hide` is hidden.
+* `kill` is for what lives where the caller cannot reach; the caller has already killed the process it spawned, so `Local`'s
+  is a no-op. `release` is idempotent, and the janitor calls it before it removes the workspace; `held_runs` lets an orphan
+  sweep find what a crash left (`Local` holds nothing).
+* `ensure` may be slow (an image to build): it reports `EnvStep`s through `EnvProgress`, which the caller shows. It is
+  single-flight per run, and a caller may drop its future.
+* An implementation that runs processes in a container is a crate of its own (ADR 0009 of the orchestration layer: swapped
+  at build time); this crate holds the port and `Local` only.
+
 ## Sharing a root between processes
 
 Several worker processes may use one root (the `shared` placement of
@@ -113,6 +257,12 @@ two processes still must not prepare the *same run* at once (a run has one lease
 A root that belongs to one worker (the `affinity` and `isolated` placements) pays for one
 uncontended `flock` per operation and gains nothing.
 
+A run's workspace has a lock of its own, `<root>/workspaces/<run>.lock`, taken the same way (an in-process lock, then an
+exclusive `flock` on the file beside the directory), by the operations that change its set of slots: `add_repository`,
+`add_scratch` (which choose a directory and a `seq` that no other slot of the run has) and `remove` (which deletes the lock
+file with the workspace). **The run's lock is taken before a mirror's, never the other way round, and never while holding
+another run's**, so the locks cannot wait on each other in a circle.
+
 ## Errors
 
 `WorkspaceError` implements `adam_error::Classify` (see
@@ -125,9 +275,13 @@ uncontended `flock` per operation and gains nothing.
 | `Invalid` | `Invalid` |
 | `Transient { message, source }` | `Transient` |
 | `RateLimited { retry_after }` | `RateLimited` |
-| `Conflict` (the run id is bound to another repository) | `Rejected` |
+| `Conflict` (the run id is bound to another repository; a slot name is taken; the remote is not empty) | `Rejected` |
 | `Corrupt` | `Corrupt` |
 | `Git`, `Http`, `Io` | `Internal` |
+
+`EnvError` implements `Classify` too: `Unavailable`, `Lost` and `Timeout` are `Transient` (worth another try), `Config`,
+`Refused` and `Build` are `Invalid` (the repository's configuration or the request is at fault), `Io` is `Internal`. No
+variant carries a secret; `Build` carries the end of the build's output, which the caller scrubs.
 
 Only `Transient` and `RateLimited` are retryable. The `GitHub` code host
 answers HTTP 429, and a 403 that GitHub marks as a rate limit, with
@@ -164,6 +318,27 @@ Offline. The `git` CLI must be on `PATH`.
   lock it fails with "could not lock" in 5 of 5 runs) and
   `a_mirror_locked_by_another_process_makes_prepare_wait` (a lock held on the lock file blocks
   `prepare` until it is released).
+* `tests/workspace.rs` also covers the workspace of slots, against local bare repositories: two repositories in one run
+  (their directories, their `seq`, the order they joined, each a worktree like any other), asking for one repository twice
+  (also spelled as `file://` with another base: the same slot, uncommitted work kept), three repositories called `lib` (told
+  apart by their owner, found again by their own repository), a slot that continues a pushed branch, a slot whose directory was
+  lost (made again on its branch, with its commit), a refused repository (nothing created, no lock file, bad run ids);
+  scratch (a repository on `main` with one root commit by the given identity, no sample hooks, `files` without ignored or
+  deleted files, `commit_all` once and then nothing, idempotent, bad names, a name that is a repository's, a lost root
+  commit made again); `remote_is_empty` and `initialize_empty` (the empty tree, `Initial commit`, a `Conflict` the second
+  time and for a remote with refs, also under another base, nothing forced, a worktree of it from the new base);
+  `wait_reachable` (found at once, `NotFound` after the time, found when the repository appears meanwhile, a refused URL at
+  once); `copy_into` (files, the executable bit, a link kept, ignored files left, no temporary file, again all unchanged;
+  all or nothing with a collision, `overwrite` replaces files only, a directory or a link in the way, a link outside the
+  project, destinations that leave the repository, a nested repository); a legacy worktree read as a slot, joined by a new
+  repository (mixed layouts) and removed with it; `remove` (files and metadata and lock gone, the unpushed commit still in
+  the mirror, repeatable, unreadable metadata); `runs`; and
+  `two_workspaces_on_one_root_add_slots_without_clashing` (two handles, six repositories, one run from both: six slots, six
+  distinct places in the order, no git lock error).
+* `src/environment.rs`: `Local` (a shell command as a login shell that keeps the caller's environment and removes what
+  was hidden, a program and its arguments as they are, an empty `argv` refused, an id of its own for each command,
+  `describe`, `secret_ref`, nothing held, `release` twice), `PreparedCommand::command` (what is hidden stays hidden even
+  when the spec sets it; `env_clear` starts from nothing), the error classes, and `login_shell`.
 * `tests/github.rs`: the `GitHub` code host against a `wiremock` server,
   including the match on head and base and the comment on a pull request, error classes, `Retry-After` and transport source chains.
 * Unit tests in `src/error.rs` (`class_table` and the source-chain checks) and

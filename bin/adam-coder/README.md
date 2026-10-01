@@ -4,8 +4,9 @@ The coder agent: a coding task in, a verified pull request out, over A2A.
 
 Given "in repo X, do Y" it
 
-1. prepares a git worktree of X (`adam-workspace`),
-2. has OpenCode make the change over ACP (`adam-acp`),
+1. prepares a git worktree of X in the run's workspace (`adam-workspace`; a workspace holds several repositories),
+2. makes the change: small, well-located edits itself (`read_file`, `write_file`, `apply_patch`), broad ones
+   through OpenCode over ACP (`adam-acp`),
 3. runs the project's own checks, at most `MAX_CHECK_CYCLES` failing cycles,
 4. commits, pushes and opens a pull request, and
 5. streams progress throughout and reports the check results, the branch and the pull request as artifacts.
@@ -30,7 +31,7 @@ sequenceDiagram
   loop until the model stops
     R->>M: next turn
     M-->>R: tool calls
-    R->>W: prepare_workspace / delegate_to_opencode / run_checks
+    R->>W: prepare_workspace / read_file, write_file, apply_patch / delegate_to_opencode / run_checks
     R-->>O: progress (status updates)
   end
   R->>G: commit_and_push, open_pull_request
@@ -41,21 +42,24 @@ sequenceDiagram
 
 | Tool | Does |
 |---|---|
-| `prepare_workspace { repo_url, base_branch?, branch? }` | `Workspaces::prepare` with the run id as the run key, so a restart reuses the worktree. **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
-| `run_command { command, cwd? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. The same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
-| `delegate_to_opencode { instructions }` | spawns the ACP agent in the worktree (`ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
-| `run_checks { command, cwd? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group, output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
-| `commit_and_push { message }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
-| `open_pull_request { title, body, accept_red_checks? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
+| `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
+| `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
+| `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
+| `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
+| `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
+| `delegate_to_opencode { instructions, repo? }` | spawns the ACP agent in the worktree of the slot, as the run's environment prepared the command ([below](#where-the-processes-of-a-run-run); `ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
+| `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
+| `commit_and_push { message, repo? }` | `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
+| `open_pull_request { title, body, accept_red_checks?, repo? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question, choices? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions of 2 to 8 options, as one form) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the nine. The tools the conversation's endpoint lists
+folder](#mcp-tools-from-the-folder)); they are not part of the twelve. The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)).
 
-Six tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the six is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Nine tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the nine is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
@@ -163,6 +167,7 @@ subscriber sees it once.
 |---|---|---|
 | `passed` | bool | the command exited 0 in time **and** `commit` was determined |
 | `commit` | string | the 40-hex SHA of a commit: for `run_checks`, the `HEAD` of the run's worktree when the command ran (`""` only when it could not be read); for `commit_and_push`, the pushed commit |
+| `repository` | string, optional | the URL of the repository of the slot the command ran in; for the verdict `commit_and_push` binds to a pushed commit, the repository it was pushed to. Absent from a report of an older coder |
 | `tree` | string, optional | the 40-hex git tree id of the code that was checked: the worktree as `commit_and_push` would commit it (`git add -A`: tracked changes and untracked files, minus what `.gitignore` excludes), computed in a temporary index. Absent when it could not be computed |
 | `summary` | string, optional | one line: `` `cmd` passed ``, or `` `cmd` failed: exit code 2 `` / `timed out after 900s` / `killed by a signal`. Says so when the worktree had uncommitted changes on top of `commit`, or that the tree was checked before it was committed |
 | `findings` | `[{check, message}]`, optional | one entry per failing check: `check` is the command, `message` is how it ended, then the tail of its output |
@@ -195,7 +200,7 @@ subscriber sees it once.
   is cut, and the finished artifact is scrubbed again on its way out, like every tool result.
 * **Replay-safe.** Both artifacts are part of their tool's journaled result and hold nothing that varies between
   executions (no timestamps, no ids of their own), so a replayed step re-emits identical artifacts. The last
-  report and its tree are kept in the run's notes (the file next to the worktree that also holds the cycle count),
+  report and its tree, and the 32 before it, are kept in the run's notes (the file next to the workspace that also holds the cycle count),
   written before the tool's result is journaled; the bound report is a pure function of the notes, the pushed SHA
   and its tree. A `commit_and_push` that ran twice (a crash before its result was journaled) commits nothing the
   second time, sees the same `HEAD` and tree, and emits the same `checks` once.
@@ -216,8 +221,8 @@ make them hold:
   `open_pull_request` refuse too. The run then ends `failed` with the findings
   (the output of the last failing check) and no pull request.
 * **No PR on red checks.** `open_pull_request` opens a pull request only if the
-  last check run passed **on exactly the code the pull request contains** (the
-  tree of the pushed `HEAD`, compared with the tree the check ran on), and the
+  most recent check run **on exactly the code the pull request contains** (the
+  tree of the pushed `HEAD`, compared with the tree the check ran on, in whichever slot it ran) passed, and the
   branch is pushed. The single override is `accept_red_checks: true`, which the
   prompt reserves for explicit user consent obtained with `ask_user`; a pull
   request opened that way says so in its body, and one that was already open says
@@ -262,6 +267,10 @@ make them hold:
   something else or stop it. The exits are a pull request, a failure (the rules
   above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
   and CancelTask (a chat's Stop).
+* **The file tools stay in the worktree.** `read_file`, `write_file` and `apply_patch` check every path with `confine`
+  (no `..`, no absolute path, nothing inside `.git`, no write through a symlink, no read that leaves the worktree) and
+  `apply_patch` checks the paths git itself reads from the patch, so a hostile path is a refusal the model is told, never a
+  file outside the worktree (see [above](#reading-and-changing-files-itself)). `run_command` stays read-only beside them.
 * **Looking around is not checking.** `run_command` exists so that exploring a repository does not look like
   verifying it: in the owner's live thread the model explored with `run_checks` (`ls`, `cat README.md
   CLAUDE.md` with exit 1 because `CLAUDE.md` was missing, `mvn package`, `ls /usr/lib/jvm`) and every
@@ -337,6 +346,198 @@ stateDiagram-v2
 Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories named, branches the
 conversation pushed) lives in
 `<WORKSPACE_ROOT>/coder/<run>.json` next to the worktree, written atomically.
+
+### Reading and changing files itself
+
+The model used to change a worktree only by delegating to OpenCode: a process, a model and a conversation for a one-line
+fix. `read_file`, `write_file` and `apply_patch` (`src/tools/files.rs`) read and change files of the worktree in this
+process, and the instructions say when to use which: small, well-located changes yourself, broad multi-file changes
+through `delegate_to_opencode`. The model chooses every path, so the paths are the point.
+
+**The confinement rule** (`confine(slot_root, rel, Access)`, public):
+
+* an empty path, an absolute path, any `..` component and any component equal to `.git` (compared without regard to case)
+  are refused;
+* to **read**, the path is canonicalised (symlinks followed) and the result must be inside the canonical root, and not
+  inside a `.git`: a symlink that stays inside the worktree is read, one that leads out is refused;
+* to **write**, the deepest part of the path that exists is looked at one component at a time: **any symlink on the way,
+  the file itself included, is refused** (also one that stays inside: a write through a link is a write to a place the
+  model did not name), and what exists must be inside the canonical root.
+
+Every refusal is a tool **result** that names its reason, not a failed run. `apply_patch` does not trust its own reading
+of the patch: it asks `git apply --numstat -z` which paths git would touch (a rename names both ends, however the patch
+spells it), checks each with the rule for writing, refuses a mode of a symlink or a submodule (`120000`, `160000`) and a
+binary patch, then runs `git apply --check` and `git apply` (hooks and the file system monitor off, no user or system
+configuration, never `--unsafe-paths`). **A hunk that does not match changes nothing** and git's message goes to the
+model. The line counts of a hunk header are written by a model, which counts badly, so a patch git cannot read or apply as
+written gets a second reading with `--recount` (not the first: `--recount` takes the `--- ` line of the next file for a
+removed line when no `diff --git` line separates them); the policy refusals are the same under both. The three tools change files and never touch git: `commit_and_push`
+commits what the files say, a change made by these tools changes the worktree's tree like OpenCode's, so the commit
+that follows is bound to a check only after a new `run_checks` (the gate is unchanged).
+
+```mermaid
+sequenceDiagram
+  participant M as Model
+  participant T as apply_patch
+  participant G as git apply
+  participant W as Worktree
+  M->>T: patch (unified diff)
+  T->>G: --numstat -z (which paths, never trusting the patch's own spelling)
+  G-->>T: the paths
+  T->>T: confine each path for writing, refuse symlink and submodule modes
+  T->>G: --check
+  alt it applies
+    T->>G: apply
+    G->>W: the files change
+    T-->>M: the files changed
+  else a hunk does not match
+    T-->>M: nothing changed, git's message
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Read: the patch, at most 1 MiB, no NUL
+  Read --> Refused: a path leaves the worktree, touches .git or a symlink, a symlink or submodule mode, a binary part
+  Read --> Checked: git can read it and every path is confined
+  Read --> Recounted: git cannot read it or it does not apply as written
+  Recounted --> Checked: it does with --recount
+  Recounted --> Refused: it does not
+  Checked --> Applied: git apply
+  Applied --> [*]
+  Refused --> [*]: the reason, nothing changed
+```
+
+Limits: 256 KiB of a file read, 1 MiB of content or patch. The checks and the write are not one atomic step; the tools of
+a run are called one at a time and what a command leaves running is killed with it, and a write goes to a new file that is
+renamed over its target, which replaces a symlink that appeared meanwhile instead of following it.
+
+### The workspace of a run
+
+A run's files are a **workspace**: a directory of slots, `<WORKSPACE_ROOT>/workspaces/<run>/<dir>/`
+([ADR 0008](../../docs/decisions/0008-a-workspace-holds-several-repositories.md), built in
+[`adam-workspace`](../../crates/adam-workspace/README.md#a-runs-workspace-slots-scratch-projects-and-the-copy-between-them)).
+Each repository the person names is a **slot**, a worktree on the run's own branch, called after the repository
+(`sandbox`; `<name>-<owner>` if two repositories of the run share a name). `prepare_workspace` adds one (a repository
+that is already there returns its slot), and every tool that works in a repository takes `repo`: the slot's name or
+the repository's address (`https://github.com/acme/lib`, `acme/lib`, a path). **With one slot `repo` may be left out;
+with several, leaving it out is an error result that lists the slots** (and a `repo` that matches none lists them too).
+A run that began before slots existed has its one worktree in the old layout (`<root>/worktrees/<run>`): it is read as a
+slot, and may be joined by others.
+
+* **The gate binds by tree, across slots.** `run_checks` records its result with the slot it ran in, in the notes'
+  history of the last 32 runs (`RunNotes::checks.history`; `last` stays beside it). For a commit with tree *T*, in any
+  slot, the deciding check is **the most recent run, from any slot, whose tree is *T*** (`RunNotes::checked`): a tree id
+  is a content address, so the same tree is the same code, and the most recent check of that code wins (a green then a red
+  on it reads as red). No such run means "unchecked". `commit_and_push` binds that run's report to the pushed commit
+  (`commit` the pushed SHA, `repository` the slot's repository) and `open_pull_request` refuses unless that check passed.
+  Pushing to two repositories in one job leaves the orchestration layer's gate judging only the last `branch`
+  (its open question 40). The cycle budget stays per run.
+* **The janitor** (`src/janitor.rs`, a worker component of the process: roles `all` and `worker`) sweeps once at startup
+  and then every `WORKSPACE_SWEEP_SECS` (300; `0` turns it off): for each run that has a workspace on this worker's volume
+  (`Workspaces::runs`), a run the store reports `done` or `failed` (a cancel is `failed`), or does not know, has what its
+  environment holds released (`Environment::release`; nothing for `Local`; a release that fails leaves the workspace for
+  the next sweep) and **then** loses its
+  workspace (`RunWorkspace::remove`: every slot, the legacy worktree, the metadata); the sweep then asks the environment what
+  it still holds (`held_runs`) and releases what belongs to runs that are over or unknown even though they have no workspace
+  here (`Sweep::orphans`); a **`runnable` or `parked` run is
+  never swept**, so a run waiting a week for an answer keeps its files; a directory that is not a run id is left alone.
+  The run's notes (`<root>/coder/<run>.json`) and its `agent/*` branches in the mirrors stay: the branch is the work.
+  Errors are logged and never stop the process.
+
+```mermaid
+sequenceDiagram
+  participant M as Model
+  participant T as Tools
+  participant W as RunWorkspace
+  participant N as Run notes
+  participant J as Janitor
+  participant S as Store
+  M->>T: prepare_workspace(lib), prepare_workspace(app)
+  T->>W: add_repository, add_repository
+  T-->>M: slot: lib, slot: app
+  M->>T: write_file(repo: lib) and run_checks(repo: lib)
+  T->>W: the slot's worktree
+  T->>N: the check, with its slot and its tree
+  M->>T: commit_and_push(repo: app)
+  T->>N: the most recent check on the pushed tree, any slot
+  N-->>T: bound to the commit, or unchecked
+  T-->>M: checks and branch artifacts, with the repository
+  loop every WORKSPACE_SWEEP_SECS
+    J->>S: load_run for each run with a workspace
+    S-->>J: open, finished or unknown
+    J->>W: remove, for a finished or unknown run
+  end
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> NoWorkspace: the run starts
+  NoWorkspace --> OneSlot: prepare_workspace on a repository the person named
+  OneSlot --> SeveralSlots: prepare_workspace on another repository the person named
+  SeveralSlots --> SeveralSlots: the tools take repo
+  OneSlot --> Swept: the run is done or failed, the janitor sweeps
+  SeveralSlots --> Swept: the run is done or failed, the janitor sweeps
+  NoWorkspace --> Swept: the store does not know the run
+  Swept --> [*]: the notes and the branches stay
+```
+
+### Where the processes of a run run
+
+`run_command`, `run_checks` and `delegate_to_opencode` do not spawn a process themselves: each asks the run's
+**environment** ([`adam_workspace::Environment`](../../crates/adam-workspace/README.md#where-a-runs-processes-run-the-environment-port),
+`ToolEnv::environment`) for the run's session, has the session prepare the command from an `ExecSpec`, and spawns what
+comes back in a process group of its own. The default is `Local`, this container, and it behaves exactly as the tools always
+did (a login shell, the same `cwd`, the same hidden secrets); a deployment composing the coder with another `Environment`
+(`ToolEnv::with_environment`, and the same value for `Janitor::with_environment`) runs the processes of a run somewhere
+else without the tools changing. There is no setting for it yet: `serve` builds `Local`.
+
+```mermaid
+sequenceDiagram
+  participant T as run_command, run_checks, delegate_to_opencode
+  participant E as Environment
+  participant S as EnvSession
+  participant P as the process
+  T->>E: ensure(workspace of the run, progress)
+  E-->>T: its steps are shown as steps of the tool call (env:run:step)
+  E-->>T: the run's session
+  T->>S: prepare(ExecSpec: the program or shell command, cwd, env, hide)
+  S-->>T: PreparedCommand
+  T->>P: spawn, in a process group of its own
+  alt a timeout or a cancel
+    T->>P: kill the process group
+    T->>S: kill(exec id)
+  end
+  Note over T,E: the janitor releases the run's environment before it removes the workspace
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> NoSession: the tool is called
+  NoSession --> Session: ensure
+  NoSession --> Failed: ensure fails
+  Failed --> [*]: the model gets the reason, no check cycle is used, nothing is recorded for the gate
+  Session --> Running: prepare, spawn
+  Running --> Finished: the process ends
+  Running --> Killed: timeout or cancel, the group and the session's kill
+  Finished --> [*]
+  Killed --> [*]
+```
+
+* **Paths are the same everywhere.** The `cwd` of a spec is the slot's own path, so the file tools, `resolve_cwd`, OpenCode's
+  `fs_root` and the git snapshots of `run_command` need no mapping. The file tools and all git work stay in this process.
+* **No secret in a spec.** `ExecSpec.env` carries the OpenCode configuration (which names the key as `{env:MODEL_API_KEY}`) and
+  never a value of a secret; what the process must not see of this process's own environment is `ExecSpec.hide`:
+  `GITHUB_TOKEN`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY` for the project's commands, the first three for
+  OpenCode (which reads the model key from its environment). A name in `hide` stays hidden even when a spec sets it.
+* **A failure to make the environment is a result for the model**, worded `the work environment: <reason>` (the end of a
+  failed build's output follows, scrubbed): permanent for a configuration or a build that is wrong, transient for a runtime
+  that is down or too slow. Nothing ran, no check cycle was used, no `checks` artifact was emitted. A cancel of the run ends
+  the wait for `ensure`.
+* **A timeout or a cancel** kills the process group here and then calls `EnvSession::kill` with the id of the command, for what
+  lives where this process cannot reach. For OpenCode the same call follows the stop (`session/cancel`, then the kill).
+* **The ACP client cannot yet start a process with an empty environment**: a session whose `PreparedCommand` has `env_clear`
+  is refused for OpenCode with `the ACP client cannot start a process with an empty environment`. `Local` never asks for it.
 
 ### Looking around, and what it may not do
 
@@ -474,7 +675,7 @@ stateDiagram-v2
   Refused --> [*]: check budget spent, the run fails: the pull request was not updated
 ```
 
-The old run's worktree is not removed by this (nothing removes finished runs' worktrees yet); the branch
+The old run's workspace is not removed by this task: the janitor removes it when that run is over ([below](#the-workspace-of-a-run)); the branch
 that was pushed is what carries the work, so the new worktree does not depend on it.
 
 ### Who it is
@@ -492,9 +693,10 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
 * **"What can you do?" and "list your tools"** are answered in plain words first: look around a repository the
   person names, have a change made, run its checks, push a branch and open a pull request, ask when unsure. Then what
   it cannot do, and why: it works only on a repository the person names (it cannot start without one or create one),
-  and it does not edit files itself but has OpenCode do it inside a worktree of the repository. Tool names and
-  arguments appear only if the person asks for the detail. The "what I can't do" sentence stays true until the
-  scratch workspace, file tools and repository creation of adam-rs#52 to #54 land, and then it must change with them.
+  and it makes the change inside a private worktree of the repository, itself (`read_file`, `write_file`,
+  `apply_patch`: adam-rs#53) or with OpenCode. Tool names and arguments appear only if the person asks for the
+  detail. The "what I can't do" sentence stays true until the scratch workspace and repository creation of
+  adam-rs#52 and #54 land, and then it must change with them.
 * **The two persona lines are a convention**: the body of the instructions starts with exactly
   `Your name is {{display_name}}.` and then `In one sentence: <summary>.` (the summary ends at its first period and has
   no `"` or `\`). The mocks of the model build their greeting from those two lines (`mock-coder` in
@@ -585,9 +787,9 @@ The contract of a folder:
 | `name` | must be `coder` (`AGENT_NAME`): the runs are stored under it. Another name exits 78 naming the field |
 | `vars` | must declare `max_check_cycles`: the process supplies the value (`MAX_CHECK_CYCLES`), and a folder without the var fails at assembly naming it. Declare `display_name` too if the prompt uses `{{display_name}}` (the shipped one does); the file's value is the name the agent says |
 | `description` or `card.description` | one of them: the card needs it (exit 78 for a control plane otherwise) |
-| `tools:` | optional; may narrow the coder's seven tools, and a name that is not one is refused with a suggestion. Without it the agent gets all seven |
+| `tools:` | optional; may narrow the coder's own tools, and a name that is not one is refused with a suggestion. Without it the agent gets all of them |
 | `subagents/` | assembled and **registered beside the coder** (`coder/<name>`, `CoderAgent::subagents`). A subagent runs as a child run with its own run id, so the tools that work on the worktree of the run that calls them find none in it: give it tools that need no worktree |
-| `mcp.json` | optional: the MCP servers whose tools the agent gets, named `<server>__<tool>` after its seven (see [MCP tools](#mcp-tools-from-the-folder)). Connected by the **workers** at startup |
+| `mcp.json` | optional: the MCP servers whose tools the agent gets, named `<server>__<tool>` after its own (see [MCP tools](#mcp-tools-from-the-folder)). Connected by the **workers** at startup |
 | `schedules/` | read, not run: a warning says so |
 | the rest | skills, `limits`, `model:` and the card follow the [authoring layer](../../docs/authoring.md) |
 
@@ -603,7 +805,7 @@ folder must be readable by the runtime user (uid 10001 in the image).
 #### MCP tools from the folder
 
 An `agent/mcp.json` in the folder (and one next to each subagent's file) names MCP servers; every worker
-connects them once at startup, before it serves, and gives the agent their tools beside its seven, named
+connects them once at startup, before it serves, and gives the agent their tools beside its own, named
 `<server>__<tool>` (`tools:` in the frontmatter selects among all of them: `linear__*` takes a server's tools).
 Servers are streamable HTTP (`type: http`) or local processes (`command`); `type: sse` is refused. The format and the
 rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
@@ -684,7 +886,8 @@ way; every problem is reported at once at startup):
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
-| `WORKSPACE_ROOT` | mirrors, worktrees, run notes | `/work` |
+| `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
+| `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs ([below](#the-workspace-of-a-run)); `0` turns it off | `300` |
 | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` (`a2a-only` is refused; see [Workspace placement](#workspace-placement)) | `shared` |
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
@@ -981,6 +1184,35 @@ database of its own, so the role needs `CREATEDB`):
   plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the
   embedded copy logged as `source=embedded`.
 * `src/tools/delegate.rs` (unit): OpenCode's tool calls as child steps (the kind and icon of each ACP kind, the state of each status, a call moved and ended by its updates, what OpenCode says scrubbed and cut, a call that never ended closed with the turn) and `tests/tools.rs`' `delegate_to_opencode_streams_updates_and_returns_the_summary` (the call is a `subagent` step labelled OpenCode, the fake agent's tool call is a child with the edit icon that ends `completed`, its reply is a `message` child and the progress lines are updates of the call's own step); `tests/agent_files.rs` and the card golden pin `steps/v1` and `text-stream/v1` on the card. The tests' models stream too (the agent calls `stream`): a model that does its work in `complete` only is not asked for it any more, so `HangingModel` of `tests/e2e.rs` and the greeting model of `tests/agent_files.rs` do it in `stream` as well.
+* `src/tools/files.rs` (unit) and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
+  `.git/x` and `.GIT/x`, a symlink to a file outside, a symlinked directory outside, a write through a symlink that
+  stays inside, a link into `.git`, a directory and a file in the wrong place; `read_file` (a range with numbers, a
+  range past the end, a cut at 256 KiB also inside a multi-byte character, a binary file, a directory),
+  `write_file` (parents, replace, the mode kept, nothing left behind, the 1 MiB limit, the progress line), and
+  `apply_patch` (two files, one a new one; a hunk that does not match changes nothing; a malformed, empty, oversized or
+  NUL patch; a patch for `.git/config`, `.GIT/hooks`, `../x`, a path through a symlink, a symlink created by the patch, a
+  rename into `.git` and a binary patch, each refused with the worktree and the repository's config untouched; wrong
+  hunk counts applied by their lines). A patch applied or a file written is seen by the next `run_checks`, and a commit
+  after a later edit is not bound to those checks. `tests/e2e.rs`'
+  `the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request` (per store): `read_file`, `apply_patch`,
+  `run_checks`, `commit_and_push` and `open_pull_request` over A2A with OpenCode unavailable, the checks artifact bound
+  to the pushed commit. The compose scenario is `SCENARIO=files sh dev/coder-e2e.sh` (the `[mock:files]` script).
+* The workspace of several slots: `tests/tools.rs` (`a_second_repository_joins_the_workspace_and_repo_says_which_one`: a
+  second repository is added next to the first, a missing `repo` with two slots is an error that lists them, a slot is chosen by
+  name and by the repository's address, a file of one slot is not in the other, writes and patches go where `repo` says,
+  progress lines name the slot, asking for a repository again keeps its slot and its work;
+  `checks_and_pushes_are_per_slot_and_the_gate_binds_by_the_tree`: each push goes to its own remote, the `checks` artifact
+  names its repository, the same tree checked in one slot binds a commit in the other and a different tree does not;
+  `a_pull_request_needs_the_most_recent_check_of_its_code_whichever_slot_ran_it`: green in the other slot opens it, a red
+  afterwards on the same code refuses it; `a_run_that_began_in_the_old_layout_keeps_working`), the unit tests of
+  `src/tools/notes.rs` (the most recent check on a tree decides whatever slot ran it, the history keeps 32 and a replayed call
+  replaces its own record, notes from before the history decide by `last`);
+  `tests/janitor.rs` (what a sweep removes and keeps: done, failed and unknown runs, the legacy worktree; open runs, a
+  directory that is not a run, the notes, the mirror and the run's branch; a cancelled sweep; the component sweeping at start and
+  again and stopping when told to; a janitor that is off waiting for the stop); `tests/binary.rs`
+  (`the_janitor_removes_the_workspace_of_a_finished_run_and_keeps_an_open_one`, with Postgres: the process sweeps on its
+  own, a run that finishes later loses its workspace, SIGTERM stops it with exit 0; `a_sweep_of_zero_seconds_turns_the_janitor_off`;
+  a bad `WORKSPACE_SWEEP_SECS` exits 78 with the other problems) and `src/config.rs`.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, malformed arguments,
   `prepare_workspace` refusing a repository the person did not name (the refusal names
@@ -1028,6 +1260,16 @@ database of its own, so the role needs `CREATEDB`):
   cycle) and in `src/tools/shell.rs` (`missing_tool` for dash and bash lines, `login_shell`).
   The tests use a name no image has for the missing tool (`nosuchbuild`): a CI image that carries `mvn` would
   otherwise run it.
+* `tests/environment.rs`: the three tools that run a process go through a fake `Environment`
+  (`FakeEnvironment` in `tests/common/mod.rs`): the command that runs is the one its session prepared (a variable the session
+  adds is seen by a check and by the fake OpenCode), the spec has the slot's path and hides the right names and carries no
+  secret, a check that times out and an OpenCode that is cancelled each tell the session which command to kill, what `ensure`
+  says shows as steps of the tool call with the secret scrubbed from a detail, an environment that cannot be made (a build
+  that failed with its log, a runtime that is down) is a permanent or a transient result for the model that runs nothing, uses
+  no check cycle and records nothing, and is made again at the next call, and a cancel stops the wait for `ensure`.
+* `tests/janitor.rs` also covers the environment: it is released before the workspace is removed (and never for an open run),
+  a release that fails keeps the workspace for the next sweep, and what an environment holds for runs that are over or unknown
+  is released without a workspace (`orphans`), once, leaving an open run's and a name that is no run.
 * `tests/tool_specs.rs`: each tool's `ToolSpec` equals `tests/fixtures/tool-specs/<tool>.json`, the JSON of
   the hand-written tools, so a change to what the model is told is a reviewed diff. The one expected difference
   is normalised: an optional argument is `"type": ["string", "null"]` in a derived schema. Regenerate with
@@ -1042,8 +1284,10 @@ database of its own, so the role needs `CREATEDB`):
   variables each role requires, and that `Config::worker` is `Some` exactly for the roles that
   run workers; and placement: the default, each variant, `WORKER_ID` required by the pinning
   ones and validated as a safe name, `a2a-only` and unknown values refused, a control plane
-  ignoring both), the folder each placement gives the workspaces (`src/repos.rs`), prompt, OpenCode config, shell execution (timeout
-  kills the process group, output tail, cwd confinement, hidden secrets), run
+  ignoring both), the folder each placement gives the workspaces (`src/repos.rs`), prompt, OpenCode config (the spec for an environment to prepare, and the ACP command made of what it
+  prepared), shell execution (timeout
+  kills the process group and tells the session, output tail, cwd confinement, hidden secrets, a spec the environment
+  refuses, a program that cannot start), run
   notes, the exit code of each root cause (`src/exit.rs`), and the scrubbing
   and bounding of failure text (`src/agent.rs`, `src/redact.rs`).
 

@@ -25,6 +25,7 @@
 //! | `WORKER_ID` | stable identity of this worker: the lease identity and, with `affinity` or `isolated`, the run owner; letters, digits, `.`, `_`, `-` | random per process; required for `affinity` and `isolated` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
+//! | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs; `0` turns it off | `300` |
 //! | `CHECK_TIMEOUT_SECS` | time limit of one `run_checks` command | `900` |
 //! | `CHECK_OUTPUT_TAIL_BYTES` | output tail `run_checks` returns | `16384` |
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
@@ -134,6 +135,9 @@ pub struct WorkerConfig {
     pub workers: usize,
     /// `MAX_CHECK_CYCLES`.
     pub max_check_cycles: u32,
+    /// `WORKSPACE_SWEEP_SECS`: how often the janitor sweeps the workspaces of finished runs;
+    /// `None` (the variable is `0`) turns it off.
+    pub workspace_sweep: Option<Duration>,
     /// `CHECK_TIMEOUT_SECS`.
     pub check_timeout: Duration,
     /// `CHECK_OUTPUT_TAIL_BYTES`.
@@ -163,6 +167,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("worker_id", &self.worker_id)
             .field("workers", &self.workers)
             .field("max_check_cycles", &self.max_check_cycles)
+            .field("workspace_sweep", &self.workspace_sweep)
             .field("check_timeout", &self.check_timeout)
             .field("check_output_tail", &self.check_output_tail)
             .field("pr_draft", &self.pr_draft)
@@ -294,6 +299,9 @@ impl WorkerConfig {
         if max_check_cycles == 0 {
             problems.push("MAX_CHECK_CYCLES must be at least 1".into());
         }
+        // The janitor of the workspaces of finished runs: every five minutes, `0` is off.
+        let workspace_sweep =
+            Some(parse_or(get, "WORKSPACE_SWEEP_SECS", 300u64, problems)).filter(|secs| *secs > 0);
         let check_timeout =
             Duration::from_secs(parse_or(get, "CHECK_TIMEOUT_SECS", 900u64, problems).max(1));
         let check_output_tail =
@@ -356,6 +364,7 @@ impl WorkerConfig {
             worker_id: settings.worker_id.clone(),
             workers: settings.workers,
             max_check_cycles,
+            workspace_sweep: workspace_sweep.map(Duration::from_secs),
             check_timeout,
             check_output_tail,
             git_author_name: get("GIT_AUTHOR_NAME").unwrap_or_else(|| "adam-coder".to_owned()),
@@ -435,6 +444,37 @@ mod tests {
         assert!(!c.allow_local_repos, "local repositories are opt-in");
         assert_eq!(c.github_api_url.as_str(), "https://api.github.com/");
         assert!(!c.pr_draft);
+        assert_eq!(
+            c.workspace_sweep,
+            Some(Duration::from_secs(300)),
+            "the janitor sweeps every five minutes"
+        );
+    }
+
+    #[test]
+    fn the_sweep_of_finished_workspaces_is_every_n_seconds_and_zero_is_off() {
+        let sweep = |value: &'static str| {
+            let mut vars = full();
+            vars.insert("WORKSPACE_SWEEP_SECS", value);
+            parse(&vars).map(|c| c.worker.unwrap().workspace_sweep)
+        };
+        assert_eq!(sweep("60").unwrap(), Some(Duration::from_secs(60)));
+        assert_eq!(sweep("0").unwrap(), None, "zero turns the janitor off");
+        for bad in ["often", "-1", "1.5"] {
+            let err = sweep(bad).unwrap_err();
+            assert!(
+                err.problems
+                    .iter()
+                    .any(|p| p.starts_with("WORKSPACE_SWEEP_SECS")),
+                "{bad}: {:?}",
+                err.problems
+            );
+        }
+        // A control plane runs no workers, so it has no use for it and does not read it.
+        let mut vars = full();
+        vars.insert("ROLE", "control-plane");
+        vars.insert("WORKSPACE_SWEEP_SECS", "often");
+        assert!(parse(&vars).is_ok());
     }
 
     #[test]

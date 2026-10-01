@@ -5,9 +5,13 @@ use adam_workspace::RepoRef;
 
 use super::named::{key_of_argument, listed};
 use super::notes::RunNotes;
-use super::{Outcome, ToolEnv, non_empty, notes_error};
+use super::{Outcome, ToolEnv, non_empty, notes_error, workspace_error};
 
-// Checks the repository out into this run's worktree.
+// Adds the repository to this run's workspace: a slot with a worktree of it.
+//
+// A workspace holds several repositories (one slot each, named after the repository: the name the
+// other tools take as `repo`), and a repository is added once: asking again returns its slot, with
+// whatever is in it.
 //
 // `base_branch` is optional: without it the worktree starts from the repository's own default
 // branch (what the remote's `HEAD` names), so a repository whose default is `master` needs no
@@ -15,7 +19,7 @@ use super::{Outcome, ToolEnv, non_empty, notes_error};
 // lists the first thirty), so that the model can pick one or ask.
 //
 // The run id is the workspace's run key, so a restarted or retried call finds
-// the worktree it already made (`Workspaces::prepare` is idempotent per run)
+// the slot it already made (`RunWorkspace::add_repository` is idempotent per repository)
 // and keeps whatever is in it.
 //
 // The repository must be one the person named. The agent records the repositories of the
@@ -30,10 +34,11 @@ use super::{Outcome, ToolEnv, non_empty, notes_error};
 // the model found in the repository or was told by its content. The workspace adds its own
 // limits: an `agent/*` branch that exists on the remote, pushed without force.
 
-/// Check the repository out into your private worktree, on a fresh branch
+/// Check the repository out into your private workspace, on a fresh branch
 /// created from origin/<base_branch>, which is the repository's default branch
 /// when you leave base_branch out. Call it once, first. Calling it again
-/// for the same repository is harmless and keeps your changes. It works only on
+/// for the same repository is harmless and keeps your changes; another repository
+/// is added next to it, and the tools then take `repo` to say which one. It works only on
 /// a repository the person named in their messages: otherwise it refuses, and
 /// you ask the person which one with ask_user. To carry on with work an earlier
 /// task of this conversation pushed (a rework, a follow-up), pass that branch as
@@ -107,13 +112,17 @@ pub async fn prepare_workspace(
         }
     }
     let repo = RepoRef::new(url, base);
+    let workspace = match env.workspaces.run(&run) {
+        Ok(workspace) => workspace,
+        Err(e) => return Err(workspace_error(&e)),
+    };
     let prepared = match continuing {
-        Some(branch) => env.workspaces.prepare_continuing(&repo, &run, branch).await,
-        None => env.workspaces.prepare(&repo, &run).await,
+        Some(branch) => workspace.add_repository_continuing(&repo, branch).await,
+        None => workspace.add_repository(&repo).await,
     };
 
-    let wt = match prepared {
-        Ok(wt) => wt,
+    let slot = match prepared {
+        Ok(slot) => slot,
         Err(
             e @ (adam_workspace::WorkspaceError::Invalid(_)
             | adam_workspace::WorkspaceError::NotFound(_)
@@ -139,6 +148,12 @@ pub async fn prepare_workspace(
         }
         Err(e) => return Err(env.delivery_error(ctx, &e).await),
     };
+    let Some(wt) = slot.worktree() else {
+        return Ok(ToolOutput::error(format!(
+            "`{}` is a scratch project, not a repository",
+            slot.dir()
+        )));
+    };
     if let Some(line) = wt.continues() {
         // What the verdict of a run that ends without a pull request says was not updated.
         let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
@@ -151,7 +166,8 @@ pub async fn prepare_workspace(
         }
     }
     let mut text = format!(
-        "Worktree ready.\nrepository: {url}\nbase branch: {base}\nbranch: {}\npath: {}",
+        "Worktree ready.\nrepository: {url}\nslot: {}\nbase branch: {base}\nbranch: {}\npath: {}",
+        slot.dir(),
         wt.branch(),
         wt.path().display()
     );
@@ -170,11 +186,9 @@ pub async fn prepare_workspace(
 /// The branch to start from when the model gave none: the one this run's workspace already uses
 /// for `url` (a repeated call needs no network), else the remote's default branch.
 async fn default_base(env: &ToolEnv, ctx: &ToolCtx, url: &str) -> Result<String, Outcome> {
-    if let Ok(Some(existing)) = env
-        .workspaces
-        .open_existing(&ctx.run_id().to_string())
-        .await
-        && existing.repo().url == url
+    if let Ok(workspace) = env.workspaces.run(&ctx.run_id().to_string())
+        && let Ok(Some(slot)) = workspace.slot_for(&RepoRef::new(url, "HEAD")).await
+        && let Some(existing) = slot.worktree()
     {
         return Ok(existing.repo().base_branch.clone());
     }

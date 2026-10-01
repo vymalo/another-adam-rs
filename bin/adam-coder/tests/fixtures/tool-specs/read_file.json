@@ -1,0 +1,32 @@
+{
+  "name": "read_file",
+  "description": "Read a text file of your worktree. Give `path` relative to the root of the worktree. Without a range you get the whole file (cut at 256 KiB, and the cut is marked); with `start_line` and `end_line` you get just those lines, each behind its number. A binary file is not shown. Use it to read before you change something, and run_command (`ls`, `grep -rn`) to find where to look.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Path of the file, relative to the root of the worktree (no `..`, nothing inside `.git`)"
+      },
+      "start_line": {
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "description": "First line to show, counting from 1. Leave out to read from the top."
+      },
+      "end_line": {
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "description": "Last line to show. Leave out to read to the end of the file (or of what fits)."
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to read in: its name, or the repository's address. Leave out when the workspace has one."
+      }
+    },
+    "required": [
+      "path"
+    ]
+  }
+}

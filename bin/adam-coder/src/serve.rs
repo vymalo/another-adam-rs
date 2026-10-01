@@ -33,6 +33,7 @@ use adam_workspace::{DynCodeHost, GitHub, GitIdentity};
 use anyhow::Context as _;
 
 use crate::agent::CoderStarter;
+use crate::janitor::Janitor;
 use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 use crate::repos::workspaces_for;
@@ -50,7 +51,7 @@ async fn build_agent(
     worker: &WorkerConfig,
     redactor: Redactor,
     files: &AgentFiles,
-) -> anyhow::Result<CoderAgent> {
+) -> anyhow::Result<(CoderAgent, Janitor)> {
     let model: DynModel = worker.model.client().context("building the model client")?;
 
     let root = worker.placed_root();
@@ -110,9 +111,13 @@ async fn build_agent(
     // either is a startup error, not a panic. The error is unboxed so its class (exit 78 for a
     // mistake in the files) reaches `exit_code`.
     let tools = coder_tools(&env);
-    CoderAgent::try_from_def(def, model, worker.model.alias.clone(), env, tools)
+    // The workspaces of finished runs are swept from this worker's volume.
+    let janitor = Janitor::new(env.workspaces.clone(), worker.workspace_sweep)
+        .with_environment(env.environment.clone());
+    let agent = CoderAgent::try_from_def(def, model, worker.model.alias.clone(), env, tools)
         .map_err(|e| *e)
-        .context("assembling the coder agent")
+        .context("assembling the coder agent")?;
+    Ok((agent, janitor))
 }
 
 /// The runtime options of a worker: its id, how many runs at once, and whose runs it claims (its own
@@ -155,9 +160,12 @@ pub async fn serve(
     // agent's name and `init` only (`CoderStarter`), so it takes no model or GitHub configuration.
     let agents = match &config.worker {
         Some(worker) => {
-            let agent = build_agent(worker, Redactor::from_config(&config), &files).await?;
+            let (agent, janitor) =
+                build_agent(worker, Redactor::from_config(&config), &files).await?;
             Agents::new(AGENT_NAME, move |builder| agent.register(builder))
                 .options(options_of(worker))
+                // Beside the runtime's worker: the sweep of the workspaces of finished runs.
+                .worker_component("janitor", move |store, stop| janitor.run(store, stop))
         }
         None => Agents::new(AGENT_NAME, |builder| builder.starter(CoderStarter)),
     }
