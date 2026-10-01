@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::ids::status_message_id;
+use crate::text_stream;
 
 /// Prefix `Runtime::cancel` puts on the error of a cancelled run.
 pub(crate) const CANCEL_PREFIX: &str = "cancelled: ";
@@ -168,6 +169,7 @@ pub(crate) fn status_of(view: &RunView, prompt: &PromptFn) -> TaskStatus {
     // same status carries the same message id.
     let ui = status_ui(view, &state);
     let message = status_text(view, &state, prompt).map(|text| {
+        let streamed = text_stream::streamed_status(view, &state, &text);
         let mut parts = vec![Part::text(text.clone())];
         // The interface of a question goes beside it, in a part of its own. Only a status that has
         // one gets the digest in its id, so every other id is what it was.
@@ -180,6 +182,11 @@ pub(crate) fn status_of(view: &RunView, prompt: &PromptFn) -> TaskStatus {
         };
         let mut message = Message::new(Role::Agent, parts);
         message.message_id = status_message_id(&view.id.to_string(), state_name(&state), &id_text);
+        // An answer that was streamed says so: its text is the whole of the chunks that a client
+        // which activated `text-stream/v1` has read, and the stream's id is the message's.
+        if let Some(stream) = streamed {
+            text_stream::mark_status(&mut message, stream);
+        }
         message
     });
     TaskStatus {

@@ -63,6 +63,14 @@ pub struct PendingQuestion {
     /// while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<Value>,
+    /// The stream the question's words were sent as ([`RunEvent::TextDelta`](adam_runtime::RunEvent)),
+    /// when the question **is** the words the model wrote (an agent that turns a model's reply into a
+    /// question to the person, as the coder does with a reply that delivers nothing), so that the A2A
+    /// server states them under that stream's id and a client that read the pieces knows this text
+    /// for what they were. Absent from state written before it existed, and not written while it is
+    /// `None`; a tool's own question (`ask_user`) has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
 }
 
 /// A tool call that waits for a child run to finish.
@@ -631,6 +639,7 @@ mod tests {
                 tool: "ask".into(),
                 question: "which environment?".into(),
                 ui: None,
+                stream: None,
             }))
         );
         assert_eq!(c.pending_calls.len(), 1);
@@ -896,6 +905,7 @@ mod tests {
             tool: "ask".into(),
             question: "which?".into(),
             ui: None,
+            stream: None,
         }));
         let next = c.continued("more", run);
         assert_eq!(next.messages, [user_of(&["task", "more"])]);

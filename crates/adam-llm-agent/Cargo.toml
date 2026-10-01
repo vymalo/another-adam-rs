@@ -22,17 +22,18 @@ adam-model.workspace = true
 adam-runtime.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+futures.workspace = true
 schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 schemars = { workspace = true, features = ["derive"] }
 proptest.workspace = true
-futures.workspace = true
-tokio.workspace = true
 adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.1.0" }
 adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
 adam-store-testkit.workspace = true

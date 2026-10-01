@@ -175,6 +175,36 @@ contract asks for at most one update per step per second; a client without steps
 events: a subscription that attaches after they were emitted, or in another process without an event sink,
 does not see them (the durable record of the task is unchanged).
 
+## Streamed text
+
+The model's answer reaches an A2A client **as it is written** ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md),
+`text-stream/v1`, the contract of `docs/api/text-stream-v1.md` of `vymalo/another-agentic-system`). Each `RunEvent::TextDelta` a
+subscription sees (live, like every event; `adam-llm-agent` sends them while a model turn streams) is, **for a client whose
+request activated `text-stream/v1`** (`Caller::extensions` has `TEXT_STREAM_EXTENSION` of `adam-a2a`), a **chunk**: a
+`TaskArtifactUpdateEvent` whose artifact is the stream (`artifactId` = the stream id, `name` `reply`, one text part, the
+piece), with where it begins in UTF-8 bytes in its metadata, and nothing for any other client:
+
+```json
+{"artifact": {"artifactId": "run-m2-a1b2c3d4", "name": "reply", "parts": [{"text": "onacci "}],
+              "extensions": ["https://agents.vymalo.com/a2a/extensions/text-stream/v1"],
+              "metadata": {"https://agents.vymalo.com/a2a/extensions/text-stream/v1": {"offset": 3}}},
+ "append": true, "lastChunk": false}
+```
+
+`append` is false for the first chunk and true after; the last has `lastChunk: true` (and its text may be empty), and
+`"abandoned": true` in the metadata when the model failed in the middle (no whole text follows, and the task ends as a
+failed model call always did). The whole text is **stated once**, in the metadata of a status message under the same URI,
+`{"streamId": "<the stream>"}`: on a `working` status for the words that came before a tool call (from the `agent_text`
+event that names a stream; best effort, like every event; only for an activated client; the message id is the stream's),
+and on the status that ends the turn when its text is the streamed words (durable, so a poll and a stream agree, and
+**for every client**: it is data under a namespaced key): `completed` for a run whose output names its stream
+(`output.stream`), and `input-required` for a question that is the model's own reply (`pending_wait.stream`, set by an agent
+that turns a reply into a question, as the coder does: `PendingQuestion::stream` of `adam-llm-agent`) while the status
+says that question. Chunks are transient: they are never in a task's
+`artifacts`, a resubscribe does not replay them, and a blocking `message/send` is unchanged. A client that did not activate
+the extension reads the whole reply with the turn, as it always did. On the wire the SDK writes a number of metadata as a
+float (`"offset": 3.0`): the contract reads a whole number either way.
+
 ## Stable ids
 
 Ids are derived, never drawn at random per read, so a consumer that keys on
@@ -253,7 +283,7 @@ the backend whose model is shown the earlier messages (memory and PostgreSQL). U
 messages in `src/vymalo.rs` (each shape of answer, quoting, the cut, the context under every capability key, a catalog
 of another id, a malformed reference, the doubles) and `tests/vymalo.rs` (a real `Runtime` and `LlmAgent`: the
 extensions reaching the run's context, a question with an interface as `input-required` with two parts, and the person's
-answer as the tool result the model reads), and `tests/steps.rs` (a real `Runtime` and an agent that reports a tool call, a command under it that waits and fails, and the end: an activated client reads each step as a report in the metadata beside its line, with the same state held back within a second and a change of state not, one that did not reads every step as a line and nothing else, and another extension activates nothing) with the unit tests of `src/steps.rs` (the metadata, the message, the line of each state) and of the throttle in `src/subscribe.rs` (once a second a state, every change, the end, a retry starting afresh, the bound on what is remembered).
+answer as the tool result the model reads), and `tests/text_stream.rs` (a real `Runtime` and an `LlmAgent` with a model that writes slowly: an activated client reads chunks that begin where the one before ended and add up to the answer, all before the status that ends the turn, and that status carries the stream's id; the words before a tool call are a `working` status with the stream's id as the message id and the answer is another stream; a question that is the streamed reply is stated under its stream; a model that fails in the middle ends the stream abandoned and fails the task as it does without streaming; a client that did not activate reads no chunk and the same reply; a blocking send's task has no chunk; and over HTTP through the SDK the header activates it, the response names it, and `offset` is a whole number on the wire), `src/text_stream.rs` (the chunk, the marker and the stream id as pure functions), and `tests/steps.rs` (a real `Runtime` and an agent that reports a tool call, a command under it that waits and fails, and the end: an activated client reads each step as a report in the metadata beside its line, with the same state held back within a second and a change of state not, one that did not reads every step as a line and nothing else, and another extension activates nothing) with the unit tests of `src/steps.rs` (the metadata, the message, the line of each state) and of the throttle in `src/subscribe.rs` (once a second a state, every change, the end, a retry starting afresh, the bound on what is remembered).
 
 | Variable | Meaning |
 |---|---|

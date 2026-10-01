@@ -18,7 +18,7 @@ instructions + a model + a toolset. It is served over A2A by
 
 | Item | What |
 |---|---|
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "OpenCode", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) |
@@ -150,7 +150,7 @@ sequenceDiagram
     participant T as LlmAgent (step tool:ID)
     L->>S: specs(ctx with the run's context)
     S-->>L: the tools to offer on this turn
-    L->>M: complete(history, own tools + offered, own first)
+    L->>M: stream(history, own tools + offered, own first)  (complete when stream_text is off)
     M-->>L: a call to a tool that is none of the agent's own
     T->>S: call(ctx, name, args), inside the journaled step
     S-->>T: Some(result), or None: the next source is asked
@@ -208,6 +208,29 @@ returns is closed by whoever shows the tree. These replace the `Custom` events `
 the `Progress` of `emit_progress` that earlier versions emitted (a breaking change of the events, ADR 0007):
 `tool_end`'s `ok` is `completed`, `error` and `transient_error` are `failed`, `needs_input` and `waiting` are `waiting`.
 `adam-a2a-runtime` serves steps to a client that activated `steps/v1` and as lines of text to one that did not.
+
+## Streamed text
+
+A model turn is **streamed** by default ([`LlmAgentBuilder::stream_text`](src/agent.rs), [ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md)):
+the journaled step `model:<turn>` calls `ModelClient::stream` instead of `complete`, and while the model writes it sends what
+it has written as `RunEvent::TextDelta` events (see [`adam-runtime`](../adam-runtime/README.md#streamed-text)); the turn's
+outcome is the assembled response, so the history, the tools and the run's outcome are what they were. `stream_text(false)`
+asks for `complete` as before (for a model client that cannot stream, or a provider that refuses `stream: true`).
+
+* **Pieces.** What the client of the model yields is cut into pieces: one goes out when 200 bytes have gathered or 100 ms
+  have passed since the last one, whichever comes first (the first at once, a timer for the last words of a quiet model),
+  never more than `MAX_TEXT_DELTA_BYTES`. A stream opens on the first word that is not blank and ends with a piece marked
+  `last` (empty when everything had gone). The offsets are UTF-8 bytes of the whole text.
+* **The stream's id** is `<run id>-m<turn>-<8 hex digits>`, made inside the step and **recorded with the answer** (the journal
+  entry is `{message, finish, usage, stream}`; a journal written before this, a bare response, reads as one with no stream),
+  so a replay calls no model and sends no piece but names the same stream. A retried turn is another stream.
+* **A failure is the call's failure**: an error before the first byte or in the middle of the answer is the same
+  `ModelFailure` as a failed `complete` (same retry, same message), and an open stream first ends with `abandoned: true`.
+* **What says the words whole**: for a turn that goes on to call tools, the `agent_text` event carries `stream`; the answer that
+  ends the run names its stream in the run's **output** (`{"text": .., "artifacts": .., "stream": ..}`). A turn that did
+  not stream has neither. An agent that turns the answer into a question to the person (the coder does, for a reply that
+  delivers nothing) puts the stream in `PendingQuestion::stream`, so the `input-required` status that carries the question
+  says which stream its text was.
 
 ## Child runs
 
@@ -321,6 +344,15 @@ acknowledgement of a write (`FaultyStore`), the replays: a model step that was r
 reads the sources again, a source's tool that was recorded is not called again, and a source's tool that waits on a
 remote task ends as an error result.
 
+`tests/streaming.rs` is the suite of *Streamed text* (real `Runtime`, `MemoryStore`, a scripted stream): the pieces add up to the answer and
+each begins where the one before ended in UTF-8 bytes, a long answer is cut into pieces of a bounded size, the words before a
+tool call are a stream of their own and the answer another (named by the run's output), a turn with no words opens no
+stream, `stream_text(false)` calls `complete` and says nothing of streams, a model that fails in the middle fails the run
+exactly as a failed `complete` does and ends its stream abandoned, a transient failure is retried as another stream, and a
+replayed journal (the new record, and a bare response from before streaming) calls no model, sends no piece and says the
+same words. `src/text_stream.rs` tests the coalescing (pure, with the time passed in) and the timer (a model that goes
+quiet: what waits is sent when the interval is over); a stream takes about a second there, because it does not fake the clock.
+
 `tests/remote_tasks.rs` is the remote-task suite (`MemoryStore`, and PostgreSQL when `ADAM_TEST_POSTGRES_URL` is
 set): polling on the moved clock until `Ready` with one start, a new process that polls on without starting,
 a failed result, permanent and transient poll errors, the timeout, a tool that cannot be polled, and a user
@@ -344,7 +376,7 @@ crash, `NeedsInput` parking, cancellation, history truncation, and **steps**: a 
 of the truncation are in `src/history.rs`; the journal record of a model
 failure is tested in `src/agent.rs`
 (`a_journaled_failure_keeps_the_class_the_hint_and_the_whole_chain`,
-`old_journal_records_decode`). `tests/typed_tools.rs` covers the typed helpers end to end (state reaching a tool in a real run,
+`old_journal_records_decode`, and `a_recorded_model_call_reads_a_journal_from_before_streaming` for the record of a model call). `tests/typed_tools.rs` covers the typed helpers end to end (state reaching a tool in a real run,
 `try_build`, `ToolSet` middleware, `FnTool`, and with `schema` a typed `FnTool`). Unit tests in
 `src/typed.rs` include a property test that arbitrary JSON into `parse_args` never panics and fails only
 as a `ToolOutput::error`; `src/schema.rs` tests the generated schema (run them with

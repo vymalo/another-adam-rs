@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 use adam_core::{RunId, RunStatus};
 
 use crate::step::StepEvent;
+use crate::text::is_false;
 
 /// A named piece of output produced while a run works (a file, a report, a
 /// structured result). A2A maps these to task artifacts.
@@ -49,6 +50,33 @@ pub enum RunEvent {
     /// call, a sub-agent's work, a command it ran): see [`StepEvent`]. The A2A server serves it as
     /// `steps/v1` to a client that asked for it, and as a line of text to one that did not.
     Step(StepEvent),
+    /// A piece of the text the model is writing, sent as it arrives: the words of one model turn, in
+    /// pieces, so a client can show them growing. The pieces of one `stream` follow each other
+    /// (`offset` is where each begins) and the last one says so. The A2A server serves them as
+    /// `text-stream/v1` to a client that asked for it and as nothing to one that did not: the whole
+    /// text always arrives in the end, with the turn. See [`MAX_TEXT_DELTA_BYTES`](crate::MAX_TEXT_DELTA_BYTES).
+    ///
+    /// Live, like every event, and meant to be lost: a stream whose pieces were not all heard is
+    /// completed by the whole text, which is durable.
+    TextDelta {
+        /// Which text this is a piece of: one per model turn that wrote words, unique within the run
+        /// and at most [`MAX_STREAM_ID_BYTES`](crate::MAX_STREAM_ID_BYTES) bytes. It is also the id
+        /// of the message the whole text becomes.
+        stream: String,
+        /// Where `text` begins in the whole text of the stream, in UTF-8 bytes: 0 for the first
+        /// piece, then the sum of the lengths of the pieces before it.
+        offset: u64,
+        /// The piece. At most [`MAX_TEXT_DELTA_BYTES`](crate::MAX_TEXT_DELTA_BYTES) bytes, whole
+        /// characters; empty only on the last piece.
+        text: String,
+        /// The last piece of the stream: nothing follows it.
+        #[serde(default, skip_serializing_if = "is_false")]
+        last: bool,
+        /// With `last`: the model failed before it finished, so the text so far is all there is and
+        /// no whole text follows.
+        #[serde(default, skip_serializing_if = "is_false")]
+        abandoned: bool,
+    },
     /// Application-defined event.
     Custom {
         /// Event kind.
@@ -270,6 +298,20 @@ mod tests {
                     .with_icon(StepIcon::Execute)
                     .with_detail("1 failed"),
             ),
+            RunEvent::TextDelta {
+                stream: "run-m0-a1b2c3d4".into(),
+                offset: 3,
+                text: "onacci ".into(),
+                last: false,
+                abandoned: false,
+            },
+            RunEvent::TextDelta {
+                stream: "run-m0-a1b2c3d4".into(),
+                offset: 10,
+                text: String::new(),
+                last: true,
+                abandoned: true,
+            },
         ];
         for e in events {
             let json = serde_json::to_value(&e).expect("serialize");
@@ -289,6 +331,32 @@ mod tests {
             serde_json::to_value(&event).expect("serialize"),
             serde_json::json!({"type": "step", "id": "tool:c1", "kind": "tool",
                                "label": "run_checks", "state": "running"})
+        );
+    }
+
+    #[test]
+    fn a_text_delta_is_tagged_text_delta_and_says_only_what_is_true() {
+        let piece = |last, abandoned| RunEvent::TextDelta {
+            stream: "s1".into(),
+            offset: 3,
+            text: "onacci ".into(),
+            last,
+            abandoned,
+        };
+        assert_eq!(
+            serde_json::to_value(piece(false, false)).expect("serialize"),
+            serde_json::json!({"type": "text_delta", "stream": "s1", "offset": 3, "text": "onacci "})
+        );
+        assert_eq!(
+            serde_json::to_value(piece(true, true)).expect("serialize"),
+            serde_json::json!({"type": "text_delta", "stream": "s1", "offset": 3, "text": "onacci ",
+                               "last": true, "abandoned": true})
+        );
+        // What a sender that left out the flags meant.
+        let bare = serde_json::json!({"type": "text_delta", "stream": "s1", "offset": 3, "text": "onacci "});
+        assert_eq!(
+            serde_json::from_value::<RunEvent>(bare).expect("parse"),
+            piece(false, false)
         );
     }
 

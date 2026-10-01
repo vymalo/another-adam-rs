@@ -28,7 +28,7 @@ over A2A).
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
 | `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`) |
-| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status`, `Progress`, `Step`, `Custom`, `Artifact` |
+| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status`, `Progress`, `Step`, `TextDelta`, `Custom`, `Artifact` |
 | `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `MAX_STEP_ID_BYTES`, `MAX_STEP_LABEL_CHARS`, `MAX_STEP_DETAIL_CHARS` | `RunEvent::Step`: a step of the run's work (a tool call, a sub-agent's work, a command) started, moved or ended, and which step it runs under; see *Steps* |
 | `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
 | `RetryPolicy`, `MAX_RETRY_AFTER` | exponential backoff for transient errors |
@@ -168,6 +168,19 @@ contract's bounds: an id of at most 128 bytes (control characters become `_`), a
 characters, a detail of at most 1000 (`…` marks a cut). Kinds, states and icons are closed enums
 (`#[non_exhaustive]`); `as_str()` is the word on the wire and `parse(..)` reads it. A step is best effort and not
 durable, like every event; `adam-llm-agent` reports every tool call as one.
+
+## Streamed text
+
+`RunEvent::TextDelta { stream, offset, text, last, abandoned }` is a piece of the text the model is writing, sent as it
+arrives, so a client can show the words growing ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md);
+the contract is the orchestration layer's `text-stream/v1`, `docs/api/text-stream-v1.md` of
+`vymalo/another-agentic-system`, which `adam-a2a-runtime` serves to a client that asked for it). The pieces of one
+`stream` (an id of at most `MAX_STREAM_ID_BYTES` = 128 bytes, unique within the run) follow each other: `offset` is where
+a piece begins in the whole text, **in UTF-8 bytes**; the last piece says `last` (its text may be empty), and
+`abandoned` with it says the model failed, so the text so far is all there is. A piece holds whole characters and at most
+`MAX_TEXT_DELTA_BYTES` = 1024 bytes (`floor_boundary` cuts text there), so that the event fits a `NOTIFY` payload between
+processes. Live and meant to be lost, like every event: the whole text is what the run records and says
+(`AGENT_TEXT_KIND`, the `agent_text` event of `adam-llm-agent`, names the stream of words that came before a tool call).
 
 ## Several processes
 

@@ -600,11 +600,23 @@ impl ModelClient for PersonaModel {
         Ok(ModelResponse::text(answer))
     }
 
+    /// The coder streams its model calls: the greeting is written in two pieces and then whole.
     async fn stream(
         &self,
-        _req: ModelRequest,
+        req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
-        Err(ModelError::invalid_request("the coder does not stream"))
+        let response = self.complete(req).await?;
+        let text = response.message.text();
+        let middle = text
+            .char_indices()
+            .nth(text.chars().count() / 2)
+            .map_or(text.len(), |(at, _)| at);
+        let (head, tail) = (text[..middle].to_owned(), text[middle..].to_owned());
+        Ok(futures::StreamExt::boxed(futures::stream::iter([
+            Ok(ModelDelta::Text(head)),
+            Ok(ModelDelta::Text(tail)),
+            Ok(ModelDelta::Finished(response)),
+        ])))
     }
 }
 
@@ -635,8 +647,15 @@ async fn a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says() {
             assert!(view.artifacts.is_empty(), "no tool ran: {view:#?}");
             let answers = model.answers();
             assert_eq!(answers.len(), 1, "one turn, no tool calls: {answers:?}");
-            // The greeting is the question the run waits on.
+            // The greeting is the question the run waits on, and the question says which stream the
+            // words were (the model streams its calls), so that a client that read the pieces knows
+            // this text for what they were.
             assert!(view.state.to_string().contains(&answers[0]), "{view:#?}");
+            assert_eq!(view.state["pending_wait"]["question"], answers[0]);
+            let stream = view.state["pending_wait"]["stream"]
+                .as_str()
+                .expect("the question names the stream of its words");
+            assert!(stream.starts_with(&format!("{run}-m0-")), "{stream}");
             answers[0].clone()
         }
     };

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse, TaskState, TaskStatus};
 use common::pg::TestDb;
 use common::{
-    SearchServer, assistant, chat, edit_instructions, greeting_for, researcher, text_reply,
-    tool_reply,
+    SearchServer, assistant, chat, chat_response, edit_instructions, greeting_for, researcher,
+    text_reply, tool_reply,
 };
 use futures::StreamExt;
 use serde_json::Value;
@@ -480,7 +480,8 @@ impl Respond for Persona {
         self.seen.lock().unwrap().push(body.clone());
         let system = body["messages"][0]["content"].as_str().unwrap_or_default();
         match greeting_for(system) {
-            Some(greeting) => ResponseTemplate::new(200).set_body_json(text_reply(&greeting)),
+            // The agent streams its model calls: a request that asks for a stream gets one.
+            Some(greeting) => chat_response(request, &text_reply(&greeting)),
             None => ResponseTemplate::new(500).set_body_string("no persona lines"),
         }
     }
@@ -775,7 +776,7 @@ impl Respond for Researcher {
                 )
             }
         };
-        ResponseTemplate::new(200).set_body_json(reply)
+        chat_response(request, &reply)
     }
 }
 

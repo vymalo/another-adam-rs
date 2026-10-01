@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse, TaskState};
 use adam_core::{RunId, RunStatus};
 use common::pg::TestDb;
-use common::{edit_instructions, folder, text_reply, tool_reply};
+use common::{chat_response, edit_instructions, folder, text_reply, tool_reply};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -950,7 +950,8 @@ impl Respond for Script {
             .map_or(0, |m| m.iter().filter(|m| m["role"] == "tool").count());
         self.asked.lock().unwrap().push(turn);
         match self.replies.get(turn) {
-            Some(reply) => ResponseTemplate::new(200).set_body_json(reply),
+            // The coder streams its model calls: a request that asks for a stream gets one.
+            Some(reply) => chat_response(request, reply),
             None => ResponseTemplate::new(500).set_body_string("script exhausted"),
         }
     }

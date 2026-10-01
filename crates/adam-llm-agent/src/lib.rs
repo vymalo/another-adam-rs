@@ -143,6 +143,7 @@ mod history;
 mod schema;
 mod source;
 mod state;
+mod text_stream;
 mod tool;
 mod toolset;
 mod typed;
