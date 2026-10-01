@@ -89,6 +89,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod activation;
 mod auth;
 mod backend;
 mod card;

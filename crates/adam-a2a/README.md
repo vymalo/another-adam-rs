@@ -19,7 +19,8 @@ resubscribe only works inside one process.
 | Item | What |
 |---|---|
 | `TaskBackend` (trait), `DynTaskBackend` | `submit(caller, message, task_id, context_id)`, `get`, `cancel`, `subscribe(caller, task_id) -> stream of TaskEvent` |
-| `TaskEvent`, `BackendError`, `Caller` | events, errors (`#[non_exhaustive]`, see *Errors*), and the authenticated subject requests carry |
+| `TaskEvent`, `BackendError`, `Caller` | events, errors (`#[non_exhaustive]`, see *Errors*), and the caller a request carries: the authenticated `subject` and the `extensions` the request activated (`Caller::new(subject)`, `with_extensions(..)`, `has_extension(uri)`; see *Extensions a request activates*) |
+| `AgentCardConfig::extension_uris()` | the URIs the card declares: what a request may activate |
 | `A2aServer::router(card, backend, auth)` | the `axum::Router`; `router_with_options(.., ServerOptions)` |
 | `ServerOptions` | `with_keepalive_interval(..)` (the SDK sends an SSE comment every `SDK_KEEPALIVE_INTERVAL`, 15 s) |
 | `AuthConfig` | `BearerTokens(Vec<SecretString>)` (constant-time comparison) or `AllowAnonymous` (logs a warning) |
@@ -57,6 +58,17 @@ Protocol notes (details in the crate docs, `src/lib.rs`):
   `-32700` when it is not JSON, `-32600` when it is JSON but not a request, is
   not declared as `application/json`, or is over the SDK's size limit. The
   layer sits inside authentication, so an anonymous caller still gets 401.
+* **Extensions a request activates.** A client names the extensions it wants in the `A2A-Extensions` request header (a
+  comma-separated list) and, in a message it sends, in `message.extensions`. The handler gives the backend the ones
+  the **card declares**, each once, in the order they were named (the header first), in `Caller::extensions`; a URI
+  the card does not declare (or names with another version, a trailing slash or another case) is not activated, so a
+  client cannot switch on what the agent never advertised. Every method does this for its own request: a poll, a
+  cancel and a resubscribe carry their own header. The response lists what was activated in its `A2A-Extensions`
+  header, and has none when nothing was (*verified* 2026-10-01,
+  <https://a2a-protocol.org/latest/topics/extensions/>: "the response SHOULD include the `A2A-Extensions` header,
+  listing all extensions that were successfully activated for that request"; the page does not mention
+  `Message.extensions`, which the orchestration layer sends as well, so both count). Ownership never looks at
+  `extensions`: a task belongs to a `subject`.
 * Payload numbers come back as floats (ProtoJSON): send exact integers and
   money as strings.
 

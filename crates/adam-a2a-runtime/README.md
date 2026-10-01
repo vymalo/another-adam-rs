@@ -87,7 +87,7 @@ is skipped with a `warn`. No reference, no continuation: the backend never guess
 context". `task_id_for` does not depend on the references, so a repeated request is idempotent, continuing or
 not.
 
-* **"Caller" is the authenticated subject** (`Caller::subject`). With token authentication that is
+* **"Caller" is the authenticated subject** (`Caller::subject`; `Caller::extensions`, the extensions the request activated, is for what the agent *reports*, never for who owns a task). With token authentication that is
   `token-<index>` of the token in the configured list, so **reordering or replacing tokens hands the history of
   an index to whoever holds it next**: keep the list append-only, or drop the contexts, when a holder changes.
   The **anonymous** caller (`Caller::ANONYMOUS`, authentication off) is every client at once, so a message from

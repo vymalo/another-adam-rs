@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::StreamExt;
 
+use crate::activation::{self, HEADER};
 use crate::auth::{self, AuthConfig, Authenticator};
 use crate::backend::DynTaskBackend;
 use crate::card::{AgentCardConfig, build_card};
@@ -94,7 +95,9 @@ impl A2aServer {
         let authenticator = Arc::new(Authenticator::new(auth));
         let agent_card = build_card(&card, authenticator.requires_bearer());
 
-        let mut rpc = jsonrpc_router(BackendHandler::new(backend))
+        let declared: Arc<[String]> = card.extension_uris().into();
+        let mut rpc = jsonrpc_router(BackendHandler::new(backend, card.extension_uris()))
+            .layer(middleware::from_fn_with_state(declared, echo_extensions))
             .layer(middleware::from_fn(json_rpc_rejections));
         if let Some(interval) = options.keepalive_interval {
             rpc = rpc.layer(middleware::from_fn_with_state(interval, keepalive));
@@ -113,6 +116,73 @@ impl A2aServer {
                 auth::authenticate,
             ))
     }
+}
+
+/// Say which extensions a request activated, as the A2A specification asks: the response carries
+/// an `A2A-Extensions` header that lists them (*verified* 2026-10-01,
+/// <https://a2a-protocol.org/latest/topics/extensions/>). The extensions are the ones the request
+/// named, in its header or, for a send, in `message.extensions`, that the card declares
+/// ([`activation::activated`], the rule the handler fills
+/// [`Caller::extensions`](crate::Caller::extensions) with). No header when there are none.
+///
+/// Inside [`json_rpc_rejections`], so the body it reads is already bounded.
+async fn echo_extensions(
+    State(declared): State<Arc<[String]>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if declared.is_empty() {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let header: Vec<String> = parts
+        .headers
+        .get_all(HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await else {
+        return rejection(INVALID_REQUEST, "invalid request: the body is too large");
+    };
+    let message = message_extensions(&bytes);
+    let activated = activation::activated(
+        &declared,
+        header.iter().map(String::as_str),
+        message.iter().map(String::as_str),
+    );
+    let mut response = next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await;
+    if !activated.is_empty()
+        && let Ok(value) = activated.join(", ").parse()
+    {
+        response.headers_mut().insert(HEADER, value);
+    }
+    response
+}
+
+/// `params.message.extensions` of a `SendMessage` or `SendStreamingMessage` body; nothing for any
+/// other body (a method that carries no message, or something that is not a JSON-RPC request).
+fn message_extensions(body: &[u8]) -> Vec<String> {
+    use a2a::jsonrpc::methods::{SEND_MESSAGE, SEND_STREAMING_MESSAGE};
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    if !matches!(
+        request["method"].as_str(),
+        Some(SEND_MESSAGE | SEND_STREAMING_MESSAGE)
+    ) {
+        return Vec::new();
+    }
+    request["params"]["message"]["extensions"]
+        .as_array()
+        .map(|uris| {
+            uris.iter()
+                .filter_map(|u| u.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Turn the SDK extractor's plain-text rejections into JSON-RPC error objects.

@@ -67,6 +67,12 @@ impl AgentCardConfig {
         self.extensions.push(extension);
         self
     }
+
+    /// The URIs of the extensions the card declares: the ones a request may activate (see
+    /// [`Caller::extensions`](crate::Caller::extensions)).
+    pub fn extension_uris(&self) -> Vec<String> {
+        self.extensions.iter().map(|e| e.uri.clone()).collect()
+    }
 }
 
 /// One advertised skill.
