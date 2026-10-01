@@ -50,7 +50,7 @@ macro_rules! store_conformance {
             concurrent_commits_single_winner, journal_roundtrip_and_order,
             journal_first_writer_wins, journal_concurrent_writers_agree,
             journal_detects_nondeterminism, journal_requires_run,
-            claim_respects_due_rules, claim_filters_agents_and_limit,
+            claim_respects_due_rules, claim_filters_agents_and_limit, claim_skips_busy_runs,
             claim_is_exclusive_under_concurrency, lease_expiry_allows_takeover,
             renew_and_release_lease,
             pinned_claim_never_gives_a_run_to_another_worker,
@@ -534,7 +534,15 @@ pub mod cases {
         let now = now() + chrono::Duration::seconds(1);
         let ttl = Duration::from_secs(60);
         let leases = store
-            .claim_due(std::slice::from_ref(&a), "w", ClaimScope::Any, now, ttl, 3)
+            .claim_due(
+                std::slice::from_ref(&a),
+                "w",
+                ClaimScope::Any,
+                &[],
+                now,
+                ttl,
+                3,
+            )
             .await
             .unwrap();
         assert_eq!(leases.len(), 3, "limit is honoured");
@@ -547,24 +555,93 @@ pub mod cases {
         assert_eq!(first_three, a_ids[..3].to_vec(), "earliest sched_at first");
 
         let rest = store
-            .claim_due(&[a.clone(), b.clone()], "w", ClaimScope::Any, now, ttl, 100)
+            .claim_due(
+                &[a.clone(), b.clone()],
+                "w",
+                ClaimScope::Any,
+                &[],
+                now,
+                ttl,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(rest.len(), 2 + 5);
         assert!(
             store
-                .claim_due(&[], "w", ClaimScope::Any, now, ttl, 100)
+                .claim_due(&[], "w", ClaimScope::Any, &[], now, ttl, 100)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
             store
-                .claim_due(std::slice::from_ref(&a), "w", ClaimScope::Any, now, ttl, 0)
+                .claim_due(
+                    std::slice::from_ref(&a),
+                    "w",
+                    ClaimScope::Any,
+                    &[],
+                    now,
+                    ttl,
+                    0
+                )
                 .await
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The runs a caller names as busy are never claimed, with a live lease, an expired one or
+    /// none, and they take no slot of `limit`. A worker that still steps a run whose lease ran
+    /// out must not be leased the run again: the snapshot of the claim would be older than what
+    /// its own step is about to commit. A busy run is left as it is, for any other worker whose
+    /// claim finds it expired.
+    pub async fn claim_skips_busy_runs(store: DynStore) {
+        for scope in [ClaimScope::Any, ClaimScope::Pinned] {
+            let agent = agent();
+            let mut runs = Vec::new();
+            for i in 0..3 {
+                runs.push(
+                    store
+                        .create_run(NewRun::new(&agent, json!(i)))
+                        .await
+                        .unwrap()
+                        .id,
+                );
+            }
+            let [first, second, third] = [runs[0], runs[1], runs[2]];
+            let t = now() + chrono::Duration::seconds(1);
+            let ttl = Duration::from_secs(30);
+
+            let got = claim_ids_busy(&store, scope, &agent, &[first], t, ttl, 2).await;
+            assert_eq!(
+                got.into_iter().collect::<HashSet<_>>(),
+                HashSet::from([second, third]),
+                "{scope:?}: the busy run takes no slot of the limit"
+            );
+            assert_eq!(
+                claim_ids_busy(&store, scope, &agent, &[], t, ttl, 10).await,
+                vec![first],
+                "{scope:?}: the busy run was not leased by the call that skipped it"
+            );
+
+            // All three leases have run out. Two runs are busy, so only the third is leased.
+            let later = t + chrono::Duration::seconds(31);
+            assert_eq!(
+                claim_ids_busy(&store, scope, &agent, &[first, second], later, ttl, 10).await,
+                vec![third],
+                "{scope:?}: a busy run is skipped although its lease expired"
+            );
+            let left: HashSet<_> = claim_ids_busy(&store, scope, &agent, &[], later, ttl, 10)
+                .await
+                .into_iter()
+                .collect();
+            assert_eq!(
+                left,
+                HashSet::from([first, second]),
+                "{scope:?}: and left expired, not leased to the caller behind its back"
+            );
+        }
     }
 
     pub async fn claim_is_exclusive_under_concurrency(store: DynStore) {
@@ -588,6 +665,7 @@ pub mod cases {
                             std::slice::from_ref(&agent),
                             &format!("w{w}"),
                             ClaimScope::Any,
+                            &[],
                             now,
                             Duration::from_secs(60),
                             4,
@@ -1113,7 +1191,26 @@ pub mod cases {
         limit: usize,
     ) -> Vec<RunId> {
         store
-            .claim_due(&[agent.to_owned()], worker, scope, now, ttl, limit)
+            .claim_due(&[agent.to_owned()], worker, scope, &[], now, ttl, limit)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.run.id)
+            .collect()
+    }
+
+    /// A claim by worker `w` that offers all runs but `busy`.
+    async fn claim_ids_busy(
+        store: &DynStore,
+        scope: ClaimScope,
+        agent: &str,
+        busy: &[RunId],
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> Vec<RunId> {
+        store
+            .claim_due(&[agent.to_owned()], "w", scope, busy, now, ttl, limit)
             .await
             .unwrap()
             .into_iter()

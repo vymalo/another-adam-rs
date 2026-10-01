@@ -16,7 +16,7 @@ database driver.
 
 | Item | What |
 |---|---|
-| `Store` (trait) | `migrate`, `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope`), `renew_lease`, `release_lease`, `purge_finished` |
+| `Store` (trait) | `migrate`, `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `purge_finished` |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
 | `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
@@ -61,6 +61,19 @@ about `Placement`; the host maps `Placement::pins_runs()` to `ClaimScope::Pinned
 ([`adam-host`](../adam-host/README.md)). The signature change is breaking for anyone who
 implements `Store`; the conformance cases in
 [`adam-store-testkit`](../adam-store-testkit/README.md) prove an implementation.
+
+## Runs the caller is stepping
+
+`Store::claim_due(.., busy, ..)` never returns a run listed in `busy`, whatever its lease says, and
+such a run takes no slot of `limit`. The runtime passes the runs it is stepping. A step can outlive
+its lease (a renewal that failed, a clock that jumped), and a claim of that run by the worker that
+still holds it would lease it a second time: the claim returns a snapshot that the running step is
+about to make stale, so a second step could start on it, and the release at the end of the first
+step (it matches the worker, not the claim) would clear the new lease. Another worker is not
+affected: it claims the run once the lease has expired, as before. The conformance case
+`claim_skips_busy_runs` in [`adam-store-testkit`](../adam-store-testkit/README.md) proves an
+implementation, for both scopes. The signature change is breaking for anyone who implements
+`Store`.
 
 ## Errors
 

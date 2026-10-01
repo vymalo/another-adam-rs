@@ -1776,6 +1776,7 @@ mod cases {
                 std::slice::from_ref(&name),
                 "someone-else",
                 adam_core::ClaimScope::Any,
+                &[],
                 adam_core::store::now(),
                 Duration::from_secs(30),
                 10,
@@ -2866,6 +2867,69 @@ mod cases {
         assert_eq!(after.output, Some(json!("fast")), "the late commit lost");
         assert_eq!(after.version, committed_version);
         assert_eq!(count(&invocations), 2);
+    }
+
+    /// A worker does not claim a run it is still stepping, even when the lease on it has lapsed.
+    /// The claim would lease the run a second time to the worker that holds it: its snapshot is
+    /// older than what the running step commits next (so a step could start on it, and run
+    /// twice for one wake-up), and the release at the end of the first step would clear the new
+    /// lease. Another worker may still take the run over once the lease has expired (see
+    /// `renew_failure_lets_another_worker_take_over`).
+    ///
+    /// The step waits at a gate while the clock moves past its lease and whole claim passes
+    /// follow; the store has handed the run out once, at the start, and the step ran once.
+    pub async fn a_step_that_outlives_its_lease_is_not_claimed_again_by_its_worker(
+        store: DynStore,
+    ) {
+        let (faults, store) = faulty(store);
+        let name = uniq("lapsed");
+        let (started, gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let steps = Arc::new(AtomicUsize::new(0));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (started, gate, steps) = (started.clone(), gate.clone(), steps.clone());
+                move |_ctx, state| {
+                    let (started, gate, steps) = (started.clone(), gate.clone(), steps.clone());
+                    async move {
+                        steps.fetch_add(1, SeqCst);
+                        started.notify_one();
+                        notified(&gate, "the clock to move past the lease").await;
+                        Ok(Transition::Done {
+                            state,
+                            output: json!("once"),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let probe = probe_agent();
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .agent(probe.clone())
+            .lease_renewal(false)
+            .clock(clock.clone())
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        notified(&started, "the step").await;
+        assert_eq!(faults.claimed(run), 1);
+
+        clock.advance(Duration::from_secs(11)); // the 10 s lease lapses under the step
+        // A worker has claimed a run that started after the clock moved, so a whole claim pass
+        // has seen the lapsed lease; twice, so that a claim that returned the run and then
+        // handed it back would have come round again.
+        claim_pass(&rt, &probe).await;
+        claim_pass(&rt, &probe).await;
+        assert_eq!(faults.claimed(run), 1, "the store handed the run out again");
+
+        gate.notify_one();
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(done.output, Some(json!("once")));
+        assert_eq!(count(&steps), 1, "the step ran once");
+        assert_eq!(faults.claimed(run), 1);
     }
 
     /// A lease that cannot be released simply expires; the run still goes on.
@@ -4409,6 +4473,7 @@ macro_rules! runtime_suite {
                 commit_ack_lost_is_survived,
                 journal_write_failure_reruns_the_step_after_the_lease_expires,
                 renew_failure_lets_another_worker_take_over,
+                a_step_that_outlives_its_lease_is_not_claimed_again_by_its_worker,
                 release_failure_is_harmless,
                 api_calls_surface_store_outage_as_retryable_errors,
                 cancel_signals_the_step_that_is_running,

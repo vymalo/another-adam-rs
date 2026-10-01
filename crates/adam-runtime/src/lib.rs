@@ -67,6 +67,10 @@
 //! * The version CAS is what guarantees correctness; leases only avoid
 //!   wasted work. A worker whose lease expired mid-step can not overwrite
 //!   newer state: its commit is rejected and it drops its result.
+//! * A worker never claims a run it is stepping, even once the lease on it
+//!   has lapsed, and it releases a run's lease before it counts the run as
+//!   free again, so it never starts a second step on a snapshot that its own
+//!   first step is about to make stale.
 //! * A recorded step outcome is never re-executed, but a side effect is
 //!   at-least-once: a crash between the effect and its journal write, or a
 //!   transient retry, runs it again. Keep effects idempotent (see

@@ -221,6 +221,16 @@ see [ADR 0002](../../docs/decisions/0002-workspace-placement.md)).
   `Placement::pins_runs()` to `ClaimScope::Pinned`. `adam-coder` does it from `WORKSPACE_PLACEMENT`.
 * `start`, `deliver`, `cancel` and `view` are unaffected: they never claim.
 
+## Runs the worker is stepping
+
+The worker lists the runs it is stepping in every `claim_due` (`busy`, see
+[`adam-core`](../adam-core/README.md#runs-the-caller-is-stepping)), so the store never gives it a run
+it already holds, even when the lease on that run has lapsed under a slow step. It releases a run's
+lease at the end of a step before it counts the run as free: a release matches the worker and not
+the claim, and one that landed after a newer claim would clear that claim's lease. Another worker
+may take a run over once its lease expired; the version CAS rejects whichever commit comes second,
+as before.
+
 ## Errors
 
 `AgentError` and `RuntimeError` implement `adam_error::Classify`; the worker
@@ -271,7 +281,9 @@ even when its prior is wrong or gone), the pair
 `pinned_workers_step_a_run_only_on_its_owner` (three workers, each first seeded alone with one
 unfinished run so all three own something, then twelve six-step runs stepped together: each run
 steps on one worker only) and its control
-`any_workers_let_a_run_move_between_workers` (a run seeded by one worker is finished by another), and the two
+`any_workers_let_a_run_move_between_workers` (a run seeded by one worker is finished by another),
+`a_step_that_outlives_its_lease_is_not_claimed_again_by_its_worker` (a lease lapses under a gated step and
+whole claim passes follow: `FaultyStore::claimed` says the store handed the run out once, and the step ran once), and the two
 `notifier_*` cases: two runtimes over one store and one `LocalNotifier`, a 30 s poll, a 5 s deadline, and the child-run cases: `a_finished_child_wakes_its_parent_once`, `a_lost_notice_is_recovered_by_the_timer`, `a_parent_that_loses_its_lease_does_not_start_or_resume_twice` and the rest, which use gates, a `ManualClock` and `FaultyStore::fail_run` and never sleep for a fixed time) run against `MemoryStore` always,
 against PostgreSQL and against MongoDB when their variables are set. Unit
 tests sit in `src/cancel.rs`, `erased.rs` (an override reaches an agent and a starter, the default is `init`, a prior state that does not decode falls back to `init`), `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs`, `events.rs`, `step.rs` (the words of the kinds, states and icons are the contract's, a step is made within its bounds on a character boundary, the serde shape leaves out what a step does not say), `notify.rs` and `retry.rs`, and the

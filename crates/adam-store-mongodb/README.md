@@ -62,6 +62,11 @@ re-evaluates per document under its write lock, and `$set`s `owner` in that same
 two workers cannot both take an unowned run, and the owner is written atomically with the lease.
 `release_lease` leaves `owner` alone.
 
+The runs the caller says it is stepping (`busy`, see
+[`adam-core`](../adam-core/README.md#runs-the-caller-is-stepping)) are left out of the candidate
+filter with `_id: { $nin: busy }`; the `updateMany` then selects by the ids of the candidates, so it
+cannot take one either.
+
 ## Errors
 
 Failures are `adam_core::StoreError` (see [`adam-core`](../adam-core/README.md#errors)

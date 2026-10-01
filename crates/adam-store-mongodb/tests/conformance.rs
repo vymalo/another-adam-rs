@@ -72,13 +72,13 @@ async fn a_document_without_an_owner_field_is_unowned() {
     let ttl = Duration::from_secs(30);
     let at = t + chrono::Duration::seconds(1);
     let first = store
-        .claim_due(&agents, "w1", ClaimScope::Pinned, at, ttl, 10)
+        .claim_due(&agents, "w1", ClaimScope::Pinned, &[], at, ttl, 10)
         .await
         .unwrap();
     assert_eq!(first.len(), 1, "a missing owner field counts as no owner");
     store.release_lease(id, "w1").await.unwrap();
     let other = store
-        .claim_due(&agents, "w2", ClaimScope::Pinned, at, ttl, 10)
+        .claim_due(&agents, "w2", ClaimScope::Pinned, &[], at, ttl, 10)
         .await
         .unwrap();
     assert!(other.is_empty(), "w1 owns the run now");
