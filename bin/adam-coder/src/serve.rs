@@ -7,6 +7,11 @@
 //! [`adam_host::Host`], which starts only the ones the role runs and stops them
 //! in a fixed order.
 //!
+//! Before anything connects, `serve` reads the agent files ([`AgentFiles`]: the folder
+//! `ADAM_AGENT_DIR` names, else the embedded copy) for every role, logs what it runs (`agent files`:
+//! source, path, digest, agent, warning count; then each warning) and refuses a folder with errors.
+//! The control plane serves the card of those files, and the workers assemble the agent from them.
+//!
 //! | Role | Components | Also |
 //! |---|---|---|
 //! | `all` (default) | `a2a-server` (control plane), `worker`, `notify` | |
@@ -44,7 +49,8 @@ use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 use crate::repos::workspaces_for;
 use crate::{
-    Coder, CoderAgent, CoderSettings, Config, LiveSignals, RuntimeOptions, ToolEnv, WorkerConfig,
+    AgentFiles, Coder, CoderAgent, CoderSettings, Config, LiveSignals, RuntimeOptions, ToolEnv,
+    WorkerConfig, agent_card_from, coder_tools,
 };
 
 /// How long open connections (SSE streams never end on their own) get to
@@ -52,10 +58,15 @@ use crate::{
 const SERVER_DRAIN: Duration = Duration::from_secs(10);
 
 /// The complete coder agent for a role that runs workers: the model client, the GitHub client and
-/// the workspaces. The clients are only constructed here; nothing calls the model or GitHub until
-/// a worker steps a run. `redactor` is built from the whole configuration, so it also knows the
-/// database password and the A2A tokens, which a step's error text must not carry either.
-async fn build_agent(worker: &WorkerConfig, redactor: Redactor) -> anyhow::Result<CoderAgent> {
+/// the workspaces, assembled from `files`. The clients are only constructed here; nothing calls the
+/// model or GitHub until a worker steps a run. `redactor` is built from the whole configuration, so
+/// it also knows the database password and the A2A tokens, which a step's error text must not carry
+/// either.
+async fn build_agent(
+    worker: &WorkerConfig,
+    redactor: Redactor,
+    files: &AgentFiles,
+) -> anyhow::Result<CoderAgent> {
     let model: DynModel = Arc::new(
         OpenAiCompatible::new(OpenAiConfig::new(
             worker.model_base_url.clone(),
@@ -90,8 +101,13 @@ async fn build_agent(worker: &WorkerConfig, redactor: Redactor) -> anyhow::Resul
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 
     let env = Arc::new(ToolEnv::new(workspaces, code_host, settings).with_redactor(redactor));
-    // The alias comes from the environment, so a bad one is a startup error, not a panic.
-    CoderAgent::try_new(model, worker.model.clone(), env).context("assembling the coder agent")
+    // The alias comes from the environment, and the files may come from a folder, so a bad one of
+    // either is a startup error, not a panic. The error is unboxed so its class (exit 78 for a
+    // mistake in the files) reaches `exit_code`.
+    let tools = coder_tools(&env);
+    CoderAgent::try_from_files(files, model, worker.model.clone(), env, tools)
+        .map_err(|e| *e)
+        .context("assembling the coder agent")
 }
 
 /// Drive the notifier until `stop`, and log once `LISTEN` is active.
@@ -139,6 +155,10 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
     let role = config.role;
+    // The agent files first, for every role and before anything connects: a folder with a mistake
+    // in it stops the process (exit 78) with every diagnostic, whether or not the database is up.
+    let files = AgentFiles::load(config.agent_dir.as_deref()).context("reading the agent files")?;
+    files.log();
     let (store, pool): (DynStore, _) = {
         let store = PgStore::connect(config.database_url.expose_secret())
             .await
@@ -167,7 +187,7 @@ pub async fn serve(
         Some(worker) => (
             Coder::new_with(
                 store,
-                build_agent(worker, Redactor::from_config(&config)).await?,
+                build_agent(worker, Redactor::from_config(&config), &files).await?,
                 &RuntimeOptions {
                     worker_id: worker.worker_id.clone(),
                     claim_scope: claim_scope_for(worker.placement),
@@ -209,8 +229,12 @@ pub async fn serve(
             .public_url
             .as_ref()
             .context("PUBLIC_URL is unset for a role that serves A2A")?;
-        let app = coder.router(
-            public_url,
+        // The card of the files this process runs, like the workers' agent.
+        let card = agent_card_from(&files, public_url)
+            .map_err(|e| *e)
+            .context("building the agent card")?;
+        let app = coder.router_with_card(
+            card,
             AuthConfig::BearerTokens(config.a2a_bearer_tokens.clone()),
         );
         host.control_plane("a2a-server", |stop| async move {

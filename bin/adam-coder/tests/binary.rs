@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse, TaskState};
 use adam_core::{RunId, RunStatus};
 use common::pg::TestDb;
-use common::{text_reply, tool_reply};
+use common::{edit_instructions, folder, text_reply, tool_reply};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -449,7 +449,7 @@ async fn serves_card_and_healthz_then_stops_cleanly_on_sigterm() {
     let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
     assert_eq!(status, 200, "{card}");
     assert!(card.contains(PUBLIC_URL), "{card}");
-    assert!(card.contains("adam-coder"), "{card}");
+    assert_eq!(common::json_of(&card)["name"], "Coder", "{card}");
     let (status, _) = common::raw(addr, "POST", "/", None).await;
     assert_eq!(status, 401, "an unauthenticated call is refused");
     assert!(
@@ -535,6 +535,200 @@ async fn an_affinity_worker_works_in_a_folder_named_after_its_id() {
     p.sigterm().await;
     let status = p.exit_within(Duration::from_secs(15)).await;
     assert_eq!(status.code(), Some(0), "{}", p.logs());
+    db.finish().await;
+}
+
+// ------------------------------------------------------------------- agent folders
+
+/// `ADAM_AGENT_DIR` names a folder that must exist: a missing one is a configuration error (exit
+/// 78) that names the variable, and nothing is started (no database is needed to see it).
+#[tokio::test]
+async fn a_missing_agent_folder_is_a_configuration_error_naming_the_variable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut env = valid_env("postgres://u:p@127.0.0.1:1/x", tmp.path());
+    env.push(("ADAM_AGENT_DIR".into(), "/nonexistent/agent".into()));
+    let mut p = Proc::spawn(&env);
+    let status = p.exit_within(Duration::from_secs(30)).await;
+    assert_eq!(status.code(), Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(err.contains("ADAM_AGENT_DIR"), "{err}");
+    assert!(err.contains("/nonexistent/agent"), "{err}");
+    assert!(!err.contains("connecting to Postgres"), "{err}");
+}
+
+/// A folder with mistakes in its files stops every role before anything connects, with exit 78
+/// and every finding as `path:line: error: ...` in the one failure line, so one round trip fixes
+/// them all.
+#[tokio::test]
+async fn a_folder_with_errors_exits_78_with_every_diagnostic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = folder();
+    // Two subagents whose frontmatter is not YAML: both are found in one load.
+    std::fs::create_dir_all(agent.path().join("agent/subagents")).unwrap();
+    for name in ["broken", "worse"] {
+        std::fs::write(
+            agent.path().join(format!("agent/subagents/{name}.md")),
+            "---\n: : [\n---\nSub.\n",
+        )
+        .unwrap();
+    }
+    for role in ["all", "control-plane", "worker"] {
+        let mut env = role_env(role, "postgres://u:p@127.0.0.1:1/x", tmp.path());
+        env.push((
+            "ADAM_AGENT_DIR".into(),
+            agent.path().to_string_lossy().into_owned(),
+        ));
+        let mut p = Proc::spawn(&env);
+        let status = p.exit_within(Duration::from_secs(30)).await;
+        assert_eq!(status.code(), Some(78), "{role}: {}", p.logs());
+        let fields = failure(&p);
+        assert_eq!(fields["code"], 78);
+        let err = fields["error"].as_str().unwrap().to_owned();
+        assert!(err.contains("reading the agent files"), "{role}: {err}");
+        for file in ["broken", "worse"] {
+            let at = format!("agent/subagents/{file}.md:");
+            assert!(err.contains(&at), "{role}: {at} missing from {err}");
+        }
+        assert!(err.contains(": error: "), "{role}: {err}");
+        assert!(
+            !err.contains("connecting to Postgres"),
+            "files are read before anything connects: {err}"
+        );
+    }
+}
+
+/// A folder of another agent is refused naming `name`: the runs of the coder are stored under it.
+#[tokio::test]
+async fn a_folder_for_another_agent_exits_78_naming_the_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = folder();
+    edit_instructions(&agent, |text| {
+        text.replacen("name: coder", "name: other", 1)
+    });
+    let mut env = valid_env("postgres://u:p@127.0.0.1:1/x", tmp.path());
+    env.push((
+        "ADAM_AGENT_DIR".into(),
+        agent.path().to_string_lossy().into_owned(),
+    ));
+    let mut p = Proc::spawn(&env);
+    let status = p.exit_within(Duration::from_secs(30)).await;
+    assert_eq!(status.code(), Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(
+        err.contains("name: coder") && err.contains("`other`"),
+        "{err}"
+    );
+}
+
+/// The control plane serves the card of the folder (no model variables needed), and logs which
+/// files it runs: the source, the path, the digest and the agent, then a warning for what the
+/// loader found that does not stop it.
+#[tokio::test]
+async fn a_control_plane_serves_the_card_of_its_agent_folder() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = folder();
+    edit_instructions(&agent, |text| {
+        text.replacen("  name: Coder", "  name: Cody", 1).replacen(
+            "limits:",
+            "favourite_colour: green\nlimits:",
+            1,
+        )
+    });
+    let mut env = role_env("control-plane", &db.url(), tmp.path());
+    env.push((
+        "ADAM_AGENT_DIR".into(),
+        agent.path().to_string_lossy().into_owned(),
+    ));
+    let mut p = Proc::spawn(&env);
+    let addr = p.ready().await;
+
+    let (status, card) = common::raw(addr, "GET", "/.well-known/agent-card.json", None).await;
+    assert_eq!(status, 200, "{card}");
+    assert_eq!(common::json_of(&card)["name"], "Cody", "{card}");
+    assert!(card.contains(PUBLIC_URL), "{card}");
+
+    let line = p
+        .stdout()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["fields"]["message"] == "agent files")
+        .unwrap_or_else(|| panic!("no `agent files` line:\n{}", p.logs()));
+    let fields = &line["fields"];
+    assert_eq!(fields["source"], "folder", "{line}");
+    assert_eq!(fields["agent"], "coder", "{line}");
+    assert_eq!(fields["warnings"], 1, "{line}");
+    assert!(
+        fields["path"]
+            .as_str()
+            .unwrap()
+            .contains(agent.path().to_str().unwrap()),
+        "{line}"
+    );
+    assert!(
+        fields["digest"].as_str().unwrap().starts_with("sha256:"),
+        "{line}"
+    );
+    let out = p.stdout();
+    assert!(
+        out.contains("instructions.md") && out.contains("favourite_colour"),
+        "the warning is logged as path and message:\n{out}"
+    );
+
+    p.sigterm().await;
+    let status = p.exit_within(Duration::from_secs(15)).await;
+    assert_eq!(status.code(), Some(0), "{}", p.logs());
+    db.finish().await;
+}
+
+/// Without `ADAM_AGENT_DIR` the embedded copy is used, and says so.
+#[tokio::test]
+async fn without_an_agent_folder_the_embedded_copy_is_served_and_logged() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut p = Proc::spawn(&role_env("control-plane", &db.url(), tmp.path()));
+    p.ready().await;
+    let line = p
+        .stdout()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["fields"]["message"] == "agent files")
+        .unwrap_or_else(|| panic!("no `agent files` line:\n{}", p.logs()));
+    assert_eq!(line["fields"]["source"], "embedded", "{line}");
+    assert_eq!(line["fields"]["warnings"], 0, "{line}");
+    p.sigterm().await;
+    p.exit_within(Duration::from_secs(15)).await;
+    db.finish().await;
+}
+
+/// A worker whose folder disagrees with the code (here: no `max_check_cycles` var, which the
+/// process supplies) fails at startup, naming the var, with exit 78: not in the middle of a run.
+#[tokio::test]
+async fn a_worker_whose_folder_cannot_be_assembled_exits_78_naming_the_problem() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let agent = folder();
+    edit_instructions(&agent, |text| {
+        text.replacen("  max_check_cycles: 3\n", "", 1)
+            .replace("{{max_check_cycles}}", "three")
+    });
+    let mut env = role_env("worker", &db.url(), tmp.path());
+    env.push((
+        "ADAM_AGENT_DIR".into(),
+        agent.path().to_string_lossy().into_owned(),
+    ));
+    let mut p = Proc::spawn(&env);
+    let status = p.exit_within(Duration::from_secs(30)).await;
+    assert_eq!(status.code(), Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(err.contains("assembling the coder agent"), "{err}");
+    assert!(err.contains("max_check_cycles"), "{err}");
     db.finish().await;
 }
 

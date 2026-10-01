@@ -167,6 +167,15 @@ refused before git runs. For GitHub Enterprise add its host and set
 `https://<host>/api/v3`. `ALLOW_LOCAL_REPOS` is for development and tests and is not
 exposed by the chart.
 
+## Agent files
+
+The binary reads its prompt, card and skills from the folder `ADAM_AGENT_DIR` names, once, at startup
+(`bin/adam-coder/README.md`, "Where the prompt and the card live"); unset, it runs the copy embedded in the
+image, which is what this chart deploys. **The chart does not expose it yet**: it has no volume for a
+folder (a ConfigMap mounted at a path), and `config.extraEnv.ADAM_AGENT_DIR` alone would name a path the
+pod does not have, which stops the pod with exit code 78. Mounting a folder is a chart change of its own
+(a new value, a volume in both workloads, a render check), not part of the change that added the variable.
+
 ## Known risks
 
 * **No database backups.** Losing the CNPG volume loses the run ledger (what

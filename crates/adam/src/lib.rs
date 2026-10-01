@@ -4,11 +4,12 @@
 pub use adam_agent_fs as agent_fs;
 pub use adam_assembly as assembly;
 pub use adam_assembly::{
-    AgentDef, AgentInfo, AliasProblem, Assembly, BoundDef, Error as AssemblyError, IntoManifest,
-    Origin, RemoteInfo, TemplateProblem,
+    AGENT_DIR_ENV, AgentDef, AgentFolder, AgentInfo, AliasProblem, Assembly, BoundDef,
+    Error as AssemblyError, IntoManifest, Origin, RemoteInfo, TemplateProblem, agent_dir,
+    agent_dir_from_env,
 };
-// Dev reload, only with the feature `dev`: the agent directory read at run time and swapped when a
-// file changes. See `adam_assembly::LiveAssembly`.
+// Dev reload, only with the feature `dev`: the agent directory watched and swapped when a file
+// changes. See `adam_assembly::LiveAssembly`.
 #[cfg(feature = "dev")]
 pub use adam_assembly::{LiveAssembly, LiveBuilder, ReloadError, Reloaded};
 pub use adam_core as core;
@@ -54,7 +55,8 @@ pub mod prelude {
     };
 }
 
-/// Without the feature `dev` nothing here can read the agent directory at run time.
+/// Without the feature `dev` nothing here can watch the agent directory and reload it. (Reading a
+/// folder once, at startup, needs no feature: [`AgentFolder`].)
 ///
 /// ```compile_fail,E0432
 /// use adam::LiveAssembly;

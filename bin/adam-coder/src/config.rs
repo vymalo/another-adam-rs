@@ -25,6 +25,7 @@
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 //! | `PR_DRAFT` | open pull requests as drafts (`true`/`false`) | `false` |
 //! | `OPENCODE_COMMAND` | program that speaks ACP on stdio (arguments follow, whitespace-separated) | `opencode acp` |
+//! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
 //!
 //! # Roles
 //!
@@ -55,6 +56,10 @@
 //! A pinning placement without `WORKER_ID` is refused, because a random id would strand every
 //! run at the next restart. A pinned run whose worker never returns is stranded (nothing adopts it).
 //!
+//! `ADAM_AGENT_DIR` is read by every role: the control plane serves the card from the folder, the workers
+//! run its prompt. Its contents are checked when `serve` loads them (`name: coder`, valid files), before
+//! anything connects; here only that the path is a directory.
+//!
 //! What a role does not use is not validated: a chart may set a variable for every role, and a
 //! malformed `GITHUB_API_URL` does not stop a control plane. `LISTEN_ADDR` is read by every role.
 //!
@@ -66,6 +71,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use adam::AGENT_DIR_ENV;
 use adam_error::{Classify, ErrorClass};
 use adam_host::{Placement, Role};
 use secrecy::SecretString;
@@ -102,6 +108,9 @@ pub struct Config {
     pub public_url: Option<Url>,
     /// `LISTEN_ADDR`: the A2A server, or the `/healthz` listener of a worker.
     pub listen_addr: SocketAddr,
+    /// `ADAM_AGENT_DIR`: the folder the agent's files are read from, an existing directory.
+    /// `None`: the copy embedded in the binary. Every role reads it.
+    pub agent_dir: Option<PathBuf>,
     /// What stepping a run needs: the model, GitHub, the workspaces and the checks. `Some` exactly
     /// when [`Role::runs_workers`]; a control plane holds none of it.
     pub worker: Option<WorkerConfig>,
@@ -115,6 +124,7 @@ impl std::fmt::Debug for Config {
             .field("a2a_bearer_tokens", &self.a2a_bearer_tokens.len())
             .field("public_url", &self.public_url.as_ref().map(Url::as_str))
             .field("listen_addr", &self.listen_addr)
+            .field("agent_dir", &self.agent_dir)
             .field("worker", &self.worker)
             .finish_non_exhaustive()
     }
@@ -269,6 +279,23 @@ impl Config {
             &mut problems,
         );
 
+        let agent_dir = match get(AGENT_DIR_ENV) {
+            None => None,
+            Some(raw) => {
+                let path = PathBuf::from(raw);
+                if path.is_dir() {
+                    Some(path)
+                } else {
+                    problems.push(format!(
+                        "{AGENT_DIR_ENV} {:?} is not a directory (name the folder that holds \
+                         `agent/`, or `agent/` itself; unset it to use the copy embedded in the binary)",
+                        path.display().to_string()
+                    ));
+                    None
+                }
+            }
+        };
+
         // The workers' variables: a control plane neither needs nor validates them.
         let worker = if role.runs_workers() {
             WorkerConfig::parse(&lookup, &get, &mut problems)
@@ -285,6 +312,7 @@ impl Config {
             a2a_bearer_tokens,
             public_url,
             listen_addr,
+            agent_dir,
             worker,
         })
     }
@@ -981,5 +1009,73 @@ mod tests {
         let shown = format!("{:?}", worker(&with_placement("affinity", Some("coder-3"))));
         assert!(shown.contains("Affinity"), "{shown}");
         assert!(shown.contains("coder-3"), "{shown}");
+    }
+
+    /// `full()` plus `ADAM_AGENT_DIR=<dir>`, for `role`.
+    fn with_agent_dir(role: &str, dir: &str) -> Result<Config, ConfigError> {
+        let mut vars: HashMap<String, String> = full()
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        vars.insert("ROLE".into(), role.to_owned());
+        vars.insert("ADAM_AGENT_DIR".into(), dir.to_owned());
+        Config::from_lookup(|k| vars.get(k).cloned())
+    }
+
+    #[test]
+    fn without_an_agent_dir_the_embedded_copy_is_used() {
+        assert_eq!(parse(&full()).unwrap().agent_dir, None);
+        // Blank counts as unset.
+        assert_eq!(with_agent_dir("all", "  ").unwrap().agent_dir, None);
+    }
+
+    #[test]
+    fn every_role_reads_the_agent_dir_and_it_must_be_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        for role in Role::VALUES {
+            let c = with_agent_dir(role.as_str(), path).expect("an existing directory");
+            assert_eq!(c.agent_dir.as_deref(), Some(dir.path()), "{role}");
+        }
+        let missing = dir.path().join("nowhere");
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        for role in Role::VALUES {
+            for bad in [&missing, &file] {
+                let err = with_agent_dir(role.as_str(), bad.to_str().unwrap()).unwrap_err();
+                let problem = err
+                    .problems
+                    .iter()
+                    .find(|p| p.starts_with("ADAM_AGENT_DIR"))
+                    .unwrap_or_else(|| panic!("{role}: {:?}", err.problems));
+                assert!(problem.contains("is not a directory"), "{problem}");
+                assert!(problem.contains(bad.to_str().unwrap()), "{problem}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_agent_dir_problem_comes_with_the_others() {
+        let mut vars = full();
+        vars.remove("DATABASE_URL");
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nowhere").display().to_string();
+        let err = Config::from_lookup(|k| match k {
+            "ADAM_AGENT_DIR" => Some(missing.clone()),
+            other => vars.get(other).map(|v| (*v).to_owned()),
+        })
+        .unwrap_err();
+        assert!(err.problems.iter().any(|p| p.starts_with("DATABASE_URL")));
+        assert!(err.problems.iter().any(|p| p.starts_with("ADAM_AGENT_DIR")));
+    }
+
+    #[test]
+    fn the_agent_dir_shows_in_debug_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let shown = format!(
+            "{:?}",
+            with_agent_dir("control-plane", dir.path().to_str().unwrap()).unwrap()
+        );
+        assert!(shown.contains("agent_dir"), "{shown}");
     }
 }

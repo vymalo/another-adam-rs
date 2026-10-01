@@ -389,13 +389,42 @@ stateDiagram-v2
 The old run's worktree is not removed by this (nothing removes finished runs' worktrees yet); the branch
 that was pushed is what carries the work, so the new worktree does not depend on it.
 
+### Who it is
+
+The coder has a name and talks like a colleague, not like its tool schemas (adam-rs#55).
+
+* **Its name** is `Coder`: `vars.display_name` in `agent/instructions.md`, said by the first line of the prompt,
+  `Your name is {{display_name}}.`, and the `card.name` the A2A card advertises. "What is your name?" is answered
+  with it, never with "I don't have a name". A deployment that mounts its own folder
+  ([`ADAM_AGENT_DIR`](#a-folder-at-run-time-adam_agent_dir)) changes the name by changing the var (and `card.name`).
+* **A greeting gets a greeting**: "hi" is answered with a short greeting that says the name and what the agent does
+  in one sentence (the second persona line, `In one sentence: <summary>.`) and asks one question, which repository
+  and what to change. It is not a task with something missing, so no tool is called and nothing is asked for "the
+  task". The run waits for the answer (A2A `input-required`, as for any plain-text stop that delivers nothing).
+* **"What can you do?" and "list your tools"** are answered in plain words first: look around a repository the
+  person names, have a change made, run its checks, push a branch and open a pull request, ask when unsure. Then what
+  it cannot do, and why: it works only on a repository the person names (it cannot start without one or create one),
+  and it does not edit files itself but has OpenCode do it inside a worktree of the repository. Tool names and
+  arguments appear only if the person asks for the detail. The "what I can't do" sentence stays true until the
+  scratch workspace, file tools and repository creation of adam-rs#52 to #54 land, and then it must change with them.
+* **The two persona lines are a convention**: the body of the instructions starts with exactly
+  `Your name is {{display_name}}.` and then `In one sentence: <summary>.` (the summary ends at its first period and has
+  no `"` or `\`). The mocks of the model build their greeting from those two lines (`mock-coder` in
+  `dev/wiremock/mock-openai`), so editing them changes the mocked answer, and a folder for another agent that follows
+  the convention gets a greeting from the same mock.
+
+Which words a live model chooses is *unverified*. What is tested: the model is sent the persona lines, the rules
+above and the rest of the prompt (the instruction snapshot, `tests/fixtures/agent/prompt.txt`), a scripted model that
+greets from the persona lines gets the run to wait without any tool, editing the folder changes the greeting
+(`tests/agent_files.rs`), and the whole chain runs through the compose stack (`dev/greeting-e2e.sh`).
+
 ### Where the prompt and the card live
 
 One file, [`agent/instructions.md`](agent/instructions.md), holds what describes the agent, in the format of
 [`docs/authoring.md`](../../docs/authoring.md): the frontmatter has `name` (`coder`, which must equal
 `AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 8192 output tokens, 100000 tokens of history),
-`vars.max_check_cycles` (the default, 3) and `card:` (the A2A card: name `adam-coder`, the `coding-task` skill
-with its tags and example); the body is the system prompt.
+`vars.max_check_cycles` (the default, 3), `vars.display_name` (`Coder`: the name the agent says) and `card:` (the A2A
+card: name `Coder`, the `coding-task` skill with its tags and example); the body is the system prompt.
 
 ```mermaid
 sequenceDiagram
@@ -414,10 +443,10 @@ sequenceDiagram
 To change what the model is told or what the card advertises, edit that file and run the tests: the
 build fails with the file and line if the frontmatter is wrong, and binding fails at startup (not in the
 middle of a run) for a `{{placeholder}}` the frontmatter does not declare, a var it declares and the body never
-uses, or a `tools:` name the coder does not register. Then review `tests/fixtures/agent/prompt.txt` and
-`card.json`: they were the prompt and the card as they were when they were Rust, and a difference from them is a
-change of behaviour to decide on, not a refactor; `prompt.txt` follows the body of `instructions.md` whenever the
-prompt is changed on purpose (see [Tests](#tests)). The limit in the prompt follows
+uses, or a `tools:` name the coder does not register. Then update `tests/fixtures/agent/prompt.txt` (the
+**instruction snapshot**: the body of `instructions.md`, placeholders as written) and `card.json` in the same commit:
+a change of what the model is told is a reviewed diff of those files, a change of behaviour to decide on and not
+a refactor (see [Tests](#tests)). The limit in the prompt follows
 `MAX_CHECK_CYCLES`: the process passes `CoderSettings::max_check_cycles` as the var, so the file's default only
 applies to a caller that does not.
 
@@ -431,6 +460,56 @@ so a bad `MODEL` is a startup error. A control plane has no model, so it takes t
 
 The Docker build context must contain `agent/`: `docker/coder/Dockerfile.dockerignore` excludes `**/*.md` and
 re-includes `bin/adam-coder/agent/**`, and `build.rs` fails the build without the file.
+
+#### A folder at run time (`ADAM_AGENT_DIR`)
+
+The same files can be read when the process starts instead of when it was built
+([ADR 0004](../../docs/decisions/0004-agent-folders-at-run-time.md)). Set `ADAM_AGENT_DIR` to the directory that holds
+`agent/` (or to `agent/` itself) and **every role** reads it once, at startup: the control plane serves the card
+of the folder, the workers assemble the agent from its prompt, limits, vars, skills and subagents. Unset or blank,
+the copy `build.rs` embedded is used, as before. There is no watcher: an edit applies at the next start
+(`docker compose --profile app up -d coder`, a rollout), so a restart is a deploy, and a change to which tools exist
+(`tools:`, a subagent) can fail the replay of a run that is mid-turn, like any deploy of new code.
+
+```mermaid
+sequenceDiagram
+  participant S as serve
+  participant F as AgentFiles
+  participant A as AgentFolder (adam-assembly)
+  participant C as CoderAgent
+  S->>F: AgentFiles::load(ADAM_AGENT_DIR)
+  alt unset or blank
+    F-->>S: Embedded
+  else a folder
+    F->>A: AgentFolder::load(path)
+    A-->>F: def, warnings, digest (or the diagnostics)
+    F->>F: name must be `coder`
+    F-->>S: Folder
+  end
+  S->>S: log `agent files` (source, path, digest, agent, warnings) and each warning
+  S->>C: CoderAgent::try_from_files(files, ...) (workers), agent_card_from(files, url) (control plane)
+```
+
+The contract of a folder:
+
+| The folder | Rule |
+|---|---|
+| `name` | must be `coder` (`AGENT_NAME`): the runs are stored under it. Another name exits 78 naming the field |
+| `vars` | must declare `max_check_cycles`: the process supplies the value (`MAX_CHECK_CYCLES`), and a folder without the var fails at assembly naming it. Declare `display_name` too if the prompt uses `{{display_name}}` (the shipped one does); the file's value is the name the agent says |
+| `description` or `card.description` | one of them: the card needs it (exit 78 for a control plane otherwise) |
+| `tools:` | optional; may narrow the coder's seven tools, and a name that is not one is refused with a suggestion. Without it the agent gets all seven |
+| `subagents/` | assembled and **registered beside the coder** (`coder/<name>`, `CoderAgent::subagents`). A subagent runs as a child run with its own run id, so the tools that work on the worktree of the run that calls them find none in it: give it tools that need no worktree |
+| `schedules/` | read, not run: a warning says so |
+| the rest | skills, `limits`, `model:` and the card follow the [authoring layer](../../docs/authoring.md) |
+
+What a folder cannot change is what the tools do (the policy, the checks, the redaction): it changes what the agent
+says and offers. Any mistake in the files (not found, a YAML error, an unknown tool, another agent's name, several
+agents under `agents/`) stops the process before it connects, exit code 78, with every finding as
+`path:line: error: ...` in the one `adam-coder failed` line. A warning does not stop it and is logged as
+`path:line: warning: ...`. The `agent files` line says what runs: `source` (`folder` or `embedded`), `path` (the directory that holds `agent/`:
+`/etc/adam` for `ADAM_AGENT_DIR=/etc/adam/agent`), `digest`
+(`sha256:...`; the shipped `agent/` read from disk has the digest of the embedded copy), `agent` and `warnings`. The
+folder must be readable by the runtime user (uid 10001 in the image).
 
 ### Retry safety
 
@@ -487,8 +566,9 @@ reported at once at startup):
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
+| `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills and subagents, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
 
-Everything from `MODEL_BASE_URL` down is read by the roles that run workers (`all`, `worker`)
+Everything from `MODEL_BASE_URL` down, except `ADAM_AGENT_DIR` (every role reads that one), is read by the roles that run workers (`all`, `worker`)
 only, and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.
 A control plane neither needs nor validates any of it (see [Roles](#roles)).
 
@@ -728,15 +808,34 @@ database of its own, so the role needs `CREATEDB`):
   `completed`, and a `working` update carrying the text of the worker's `Progress` event
   (`preparing a worktree of ...`), which exists only as a live event and so proves events
   crossed the two processes over `NOTIFY`. Both processes log `listening for notifications`.
-* `tests/agent_files.rs`: the prompt, limits and card in `agent/instructions.md` against the Rust they replaced.
-  `the_prompt_carries_the_rules_the_code_relies_on` runs on the assembled prompt; the prompt equals
-  `tests/fixtures/agent/prompt.txt` (the old constant, captured before it was deleted) for several limits, but for its
-  final newline, which the loader drops from every body; the limits, the tool order and the model alias are the
-  old ones; a run through a runtime on a `MockModel` sends the old system prompt, tools and `max_output_tokens` and
+* `tests/agent_files.rs`: the prompt, limits and card in `agent/instructions.md`, against the Rust they replaced and
+  against the instruction snapshot. `the_prompt_carries_the_rules_the_code_relies_on` runs on the assembled prompt;
+  `the_prompt_gives_the_agent_a_name_and_asks_for_plain_words` pins what #55 added (the persona lines first, the
+  greeting rule, the plain-words answer, what it cannot do, no tool list); the prompt equals
+  `tests/fixtures/agent/prompt.txt` (the **instruction snapshot**: it began as the old Rust constant, and #55 is its
+  first deliberate change) for several limits, with `{{display_name}}` as `Coder`, but for its final newline, which the
+  loader drops from every body; the limits, the tool order and the model alias are the old ones; a run through a runtime on a `MockModel` sends the old system prompt, tools and `max_output_tokens` and
   journals the old step names (`model:0`, `tool:<call id>`, so a run journaled before replays); the assembly's
   card equals `agent_card`. A model alias the assembly refuses (empty, whitespace) is an error from `try_new`.
   The card is also pinned by a unit test in `src/app.rs` against `tests/fixtures/agent/card.json`, the card as the
   Rust literal built it.
+  The second half runs the coder on **a copy of the shipped `agent/` in a temp dir** (`ADAM_AGENT_DIR`'s folder,
+  `AgentFiles::load`): it assembles to the embedded agent (same digest, same `AgentInfo`, same card); **editing
+  `instructions.md` changes the system prompt the model is sent** (and the limit is still the process's); the card
+  comes from the folder; a folder named `other` is refused naming `name: coder`; a folder without
+  `max_check_cycles` and one with a tool the coder does not have fail at assembly naming them; `tools:` narrows
+  the tools; and a `subagents/reviewer.md` is registered as `coder/reviewer`, called by the model, run as a child
+  run and its text comes back to the coder; **`a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says`** runs
+  "hi" through a runtime on a model scripted by the prompt itself (it greets from the two persona lines): the run waits
+  with the greeting as its question, no tool ran, and a folder with another `display_name` and summary changes the
+  answer; `the_display_name_var_is_the_name_in_the_prompt` renames the prompt. The unit tests of `src/files.rs` (a missing folder, every diagnostic
+  of a broken one in the message once, another name, warnings), `src/config.rs` (`ADAM_AGENT_DIR` read by every role,
+  must be a directory, reported with the other problems) and `src/exit.rs` (78 for the files and their assembly)
+  cover the rest. In `tests/binary.rs`: a missing folder (exit 78, names the variable), a folder with two broken
+  subagents (exit 78 for every role, before anything connects, both findings as `path:line` in the one failure line),
+  another agent's name, a worker whose folder cannot be assembled (exit 78, names the var; Postgres), a control
+  plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the
+  embedded copy logged as `source=embedded`.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, malformed arguments,
   `prepare_workspace` refusing a repository the person did not name (the refusal names
@@ -844,7 +943,10 @@ curl -N http://127.0.0.1:8080/ \
 Expected: a stream of status updates whose messages include `opencode: ...`
 lines and `running checks: ...`, then artifacts `checks` (twice: of `HEAD`, then bound to the pushed commit), `branch` and `pull_request`,
 then `TASK_STATE_COMPLETED`. Send only "Hi" instead and the task ends `TASK_STATE_INPUT_REQUIRED` with
-the model's question. Verify:
+the model's question, which should be a greeting that says the agent's name (`Coder`) and what it does in one
+sentence and asks which repository and what to change ([Who it is](#who-it-is)); "What is your name?" and "List me all
+your tools" (each a new task, or an answer to the open one) should be answered in plain words, with no tool signatures.
+That is what the instructions ask for; that a live model follows them is *unverified* until this has been run. Verify:
 
 * the pull request URL from the artifact opens on GitHub, from a branch
   `agent/<run id prefix>` with one commit, and its body has a summary and a

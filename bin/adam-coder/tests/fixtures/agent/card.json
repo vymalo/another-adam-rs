@@ -1,5 +1,5 @@
 {
-  "name": "adam-coder",
+  "name": "Coder",
   "description": "Coder agent: turns a coding task into a verified pull request.",
   "url": "https://agents.example.com/coder/",
   "version": "0.1.0",

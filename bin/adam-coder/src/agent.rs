@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use adam::{AgentDef, Assembly, AssemblyError};
+use adam::{Assembly, AssemblyError};
 use adam_core::RunId;
 use adam_error::report;
 use adam_llm_agent::{Conversation, DynTool, LlmStarter, ToolSet};
@@ -14,6 +14,7 @@ use adam_runtime::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use crate::files::AgentFiles;
 use crate::redact::Redactor;
 use crate::tools::named::{key_of_argument, named_in, without_untrusted};
 use crate::tools::notes::{PushedBranch, RunNotes};
@@ -156,7 +157,8 @@ impl CoderAgent {
     ///
     /// The steps are the ones any agent written as files takes: the embedded definition, the value
     /// of the `max_check_cycles` var (the prompt tells the model the limit the tools enforce), the
-    /// tools, the state they read and the model.
+    /// tools, the state they read and the model. It is
+    /// [`try_from_files`](Self::try_from_files) over the embedded copy.
     ///
     /// # Errors
     ///
@@ -168,12 +170,47 @@ impl CoderAgent {
         env: Arc<ToolEnv>,
         tools: impl IntoIterator<Item = DynTool>,
     ) -> Result<Self, Box<AssemblyError>> {
-        let assembly = AgentDef::from_manifest(AGENT)?
+        Self::try_from_files(&AgentFiles::Embedded, model, model_alias, env, tools)
+    }
+
+    /// The coder assembled from `files`: the embedded copy, or the folder the process read at
+    /// startup ([`AgentFiles::load`]). The steps are those of
+    /// [`try_with_tools`](Self::try_with_tools), over that definition.
+    ///
+    /// A folder is held to what the code supplies and registers: the `max_check_cycles` var
+    /// (`vars` must declare it, or the bind fails naming it), the coder's tools (`tools:` may
+    /// narrow them, and a name that is not one is refused with a suggestion), and the state they read.
+    /// Every subagent the folder has is assembled too ([`subagents`](Self::subagents)).
+    ///
+    /// # Errors
+    ///
+    /// [`AssemblyError`] (boxed: it is large) when the files and the code disagree, as the assembly
+    /// reports it (an unknown tool, an unused or unset var, a prompt placeholder `vars` does not
+    /// declare), or the `model_alias` is empty or has whitespace in it.
+    pub fn try_from_files(
+        files: &AgentFiles,
+        model: DynModel,
+        model_alias: impl Into<String>,
+        env: Arc<ToolEnv>,
+        tools: impl IntoIterator<Item = DynTool>,
+    ) -> Result<Self, Box<AssemblyError>> {
+        let assembly = files
+            .def()?
             .var("max_check_cycles", env.settings.max_check_cycles)
             .bind(tools.into_iter().collect::<ToolSet>())?
             .state(env.clone())
             .model(model, model_alias)?;
         Ok(Self { assembly, env })
+    }
+
+    /// The subagents of the folder the agent was assembled from, registered as `coder/<name>`
+    /// (none for the embedded copy, which has none). A process that steps runs registers them
+    /// beside the agent ([`Coder::new_with`](crate::Coder::new_with) does): a subagent tool starts
+    /// its child as a run of its own, found by that name. A subagent is a run with its own id, so
+    /// the tools of the coder that work on a run's worktree find none there: give a subagent
+    /// tools that need no worktree.
+    pub fn subagents(&self) -> &[adam_llm_agent::LlmAgent] {
+        self.assembly.agents().get(1..).unwrap_or_default()
     }
 
     /// What the agent was assembled from: the prompt the model sees, the limits, the tools it is

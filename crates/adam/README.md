@@ -17,12 +17,14 @@ adam = "0.1"
 | `macros` | yes | `#[tool]` (`adam::tool`, and in the prelude) |
 | `a2a` | no | `Assembly::card`: the root agent's `card:` as an `adam_a2a::AgentCardConfig` (turns on `adam-assembly/a2a`) |
 | `mcp` | no | `mcp.json` tools: `adam::mcp` (the MCP client: `McpPolicy`, `Env`, `McpServers`) and `AgentDef::connect_mcp`, which connects each agent's MCP servers at startup and gives it their tools as `<server>__<tool>` (turns on `adam-assembly/mcp`; see [MCP tools](../adam-assembly/README.md#mcp-tools-feature-mcp)). Off by default: a build cannot start a process or reach a server because an `mcp.json` said so unless it opts in |
-| `dev` | no | dev reload: `adam::LiveAssembly` reads the agent directory at run time and swaps the agents when a file changes (turns on `adam-assembly/dev`, which brings `notify`). Off by default, so a release build cannot read prompts from disk unless it opts in |
+| `dev` | no | dev reload: `adam::LiveAssembly` watches the agent directory and swaps the agents when a file changes (turns on `adam-assembly/dev`, which brings `notify`). Off by default, so a release build cannot watch and reload prompts unless it opts in. Reading a folder once, at startup, needs no feature: `adam::AgentFolder` |
 
 The authoring layer around it (agent directories, skills, subagents) is designed in
 [`docs/authoring.md`](../../docs/authoring.md). What exists: `#[tool]`, the agent directory
 embedded at build time (`adam::include_agent!()`, below), and `AgentDef`, which binds it to
-`LlmAgent`s ([`adam-assembly`](../adam-assembly/README.md), also `adam::assembly`), and, with the feature
+`LlmAgent`s ([`adam-assembly`](../adam-assembly/README.md), also `adam::assembly`), `adam::AgentFolder`, which
+reads one agent's folder when the process starts (`ADAM_AGENT_DIR`, no feature; see
+[run-time folders](../adam-assembly/README.md#run-time-folders-no-feature)), and, with the feature
 `dev`, `adam::LiveAssembly`, which reloads the directory while the process runs (the rules for runs in flight
 are in the [dev reload](../adam-assembly/README.md#dev-reload-feature-dev) section).
 

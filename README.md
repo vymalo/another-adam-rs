@@ -144,7 +144,7 @@ docker compose down -v             # stop and forget all state (volumes included
 | `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder` and `mock-opencode` are scripted (see "Scripted models") |
 | `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) |
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git`; no authentication |
-| `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token` |
+| `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token`; its agent files are the folder `bin/adam-coder/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`, see "Changing what the coder says") |
 
 Host ports can be moved with `POSTGRES_PORT`, `MONGODB_PORT`, `MOCK_OPENAI_PORT`,
 `MOCK_GITHUB_PORT`, `GIT_SERVER_PORT` and `CODER_PORT` (for example in a `.env`
@@ -163,6 +163,8 @@ export DATABASE_URL=$ADAM_TEST_POSTGRES_URL
 export MODEL_BASE_URL=http://127.0.0.1:8081/v1 MODEL_API_KEY=mock-api-key MODEL=mock-model
 export GITHUB_API_URL=http://127.0.0.1:8082 GITHUB_TOKEN=dev-github-token
 export A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/
+# optional: ADAM_AGENT_DIR=bin/adam-coder/agent reads the prompt and the card from that folder at startup
+# instead of the copy embedded in the binary (see the crate README, "Where the prompt and the card live").
 # optional: ROLE=control-plane or ROLE=worker instead of the default `all`. Run one of each
 # over the same DATABASE_URL (different LISTEN_ADDR) to split the halves; a control plane ignores
 # the model, GitHub and workspace variables. See the crate README.
@@ -252,6 +254,40 @@ artifacts are there, that `mock-github` saw exactly one
 `CODER_URL`, `CODER_TOKEN`, `MOCK_GITHUB_URL` and `GIT_SERVER_URL` override the
 defaults (see the script's header).
 
+#### Saying hello, and the coder's name
+
+The coder introduces itself (adam-rs#55): it says its name (`Coder`, the `display_name` var of its
+instructions and the name on its card), answers "hi" with a short greeting that says what it does in one
+sentence and asks which repository and what to change, and answers "what can you do?" in plain words, with the
+tool names only when asked for detail. On the mocks the greeting is built from the persona lines of the prompt
+(see "Scripted models"); `dev/greeting-e2e.sh` checks the whole chain through the stack (a greeting that ends
+`TASK_STATE_INPUT_REQUIRED`, the same task going on to a pull request, and a restart on an edited folder):
+
+```sh
+docker compose --profile app up -d --build --wait postgres mock-openai mock-github git-server coder
+sh dev/greeting-e2e.sh                   # NO_RESTART=1 skips the step that restarts the coder on an edited copy
+```
+
+How a *live* model behaves with these instructions is *unverified*: the mocks prove what the model is sent, not
+what it says.
+
+#### Changing what the coder says
+
+The coder reads its agent files (the prompt, the card, the skills) at startup from
+`ADAM_AGENT_DIR`; `compose.yaml` mounts `bin/adam-coder/agent` there, read-only.
+Edit `bin/adam-coder/agent/instructions.md` (or copy the folder, edit the copy and set
+`CODER_AGENT_DIR=<copy>`) and restart the service, with no rebuild:
+
+```sh
+docker compose --profile app up -d coder        # the container is recreated and reads the folder again
+```
+
+The startup log has one `agent files` line (`source=folder`, the path, the digest, the agent,
+the number of warnings); a folder with a mistake stops the container with exit code 78 and every
+finding as `path:line: error: ...`. The folder must be readable by uid 10001 (`chmod -R a+rX`).
+Remove the variable and the mount and the copy embedded in the image is used. The tests that prove
+this are in [`bin/adam-coder/README.md`](bin/adam-coder/README.md#tests).
+
 To run a prebuilt image instead of building one, set `CODER_IMAGE` (default
 `adam-rs/coder:dev`) and pass `--no-build`. `CODER_MODEL=mock-model` brings back
 the canned answers: text only, no tool call, so no pull request.
@@ -268,10 +304,13 @@ request gets the same answer and the script cannot drift out of step.
 | Model | Mapping | Script |
 |---|---|---|
 | `mock-coder` | `mappings/coder-script.json` | `prepare_workspace` (`http://git-server:8080/local/sandbox.git`, `main`, id `coder-call-1`), `delegate_to_opencode` (create `hello.txt` containing `hello`, `coder-call-2`), `run_checks` (`sh ./check.sh`, `coder-call-3`), `commit_and_push` (`coder-call-4`), `open_pull_request` (`coder-call-5`), then a final text (`stop`). Not streamed. |
+| `mock-coder`, the person's first message is a greeting (`hi`, `hello` or `hey`, then anything) | same file | a text answer (`stop`): `Hi! I'm <name>. <summary>. Which repository should I work on, and what should I change?`, **built from the first two lines of the system prompt** (`messages[0]`: `Your name is <name>.` and `In one sentence: <summary>.`, the persona lines the coder's `agent/instructions.md` opens with), so editing the instructions, or mounting another folder, changes the mocked answer. The run then waits for the person (`input-required`); the answer to it (the synthetic `ask_user` call `stop0000N` is in the history) continues with `prepare_workspace` (`coder-call-1`) and the script above. A greeting needs a system message first: a request with the user message alone is not one. |
 | `mock-coder`, task text contains `[mock:no-opencode]` | same file | `prepare_workspace` (`nc-call-1`), `run_checks` with `echo hello > hello.txt && sh ./check.sh` (the check command makes the change, `nc-call-2`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started: deterministic where OpenCode's own behaviour is not the subject. |
 | `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |
 
-The steps mirror the reference script of `bin/adam-coder/tests/binary.rs`.
+The steps mirror the reference script of `bin/adam-coder/tests/binary.rs`. The greeting mapping has priority 1 and
+the first step of the script (`prepare_workspace` on a first request) priority 2, so a greeting is never taken for a
+task; the 404 is priority 3. `dev/greeting-e2e.sh` runs the greeting through the stack (see below).
 A request of `mock-coder` that is not on the script (an id out of order, a
 history the script does not know) is answered with **404** `off_script` on
 purpose, so a run that leaves the script fails loudly instead of wandering on

@@ -1,14 +1,20 @@
 //! The coder's prompt, limits and A2A card live in `agent/instructions.md` (slice S6b of the
 //! authoring layer), not in Rust. These tests pin what the files must keep producing:
 //!
-//! * `fixtures/agent/prompt.txt` is the system prompt as it was when it was a Rust constant
-//!   (`instructions.rs`), with its one placeholder spelled `{{max_check_cycles}}`; it follows
-//!   `agent/instructions.md` whenever the prompt is changed on purpose (the body of that file,
-//!   after the front matter, is this file);
+//! * `fixtures/agent/prompt.txt` is the **instruction snapshot**: the body of
+//!   `agent/instructions.md` (everything after the front matter) with its placeholders spelled
+//!   `{{max_check_cycles}}` and `{{display_name}}`. Changing the instructions on purpose means
+//!   changing this file in the same commit, so the change of what the model is told is a reviewed
+//!   diff (`the_prompt_equals_the_snapshot`). It began as the prompt of the Rust constant the
+//!   file replaced, and #55 (the coder's name and plain words) is the first deliberate change;
 //! * the limits, the tool order, the step names and what the model is sent are the ones the
 //!   hand-written agent had, so a run journaled by the previous version replays;
-//! * the card is the one `agent_card()` used to build (`fixtures/agent/card.json`, pinned by a
-//!   unit test in `app.rs`; here the assembled agent is compared with it).
+//! * the card is `fixtures/agent/card.json` (pinned by a unit test in `app.rs`; here the
+//!   assembled agent is compared with it).
+//!
+//! The same files can be read from a folder at startup (`ADAM_AGENT_DIR`, `AgentFiles::load`):
+//! the last half of this file runs the coder on a copy of `agent/` in a temp dir, edited the way a
+//! deployment would edit a mounted folder.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -16,27 +22,39 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use adam_coder::{AGENT_NAME, CoderAgent, agent_card};
-use adam_core::{DynStore, MemoryStore, RunStatus};
+use adam_coder::{
+    AGENT_NAME, AgentFiles, AgentFilesError, Coder, CoderAgent, RuntimeOptions, agent_card,
+    agent_card_from, coder_tools,
+};
+use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
+use adam_error::{Classify, ErrorClass};
 use adam_llm_agent::{Limits, user_message};
-use adam_model::{DynModel, MockModel, ToolCall};
+use adam_model::{
+    DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
+    ToolCall,
+};
 use adam_runtime::Runtime;
-use common::Fixture;
+use async_trait::async_trait;
+use common::{Fixture, edit_instructions, folder};
+use futures::stream::BoxStream;
 use serde_json::json;
 
-/// The prompt as it was before the move, with `{{max_check_cycles}}` where the limit goes.
-const GOLDEN_PROMPT: &str = include_str!("fixtures/agent/prompt.txt");
+/// The instruction snapshot: the body of `agent/instructions.md`, with `{{max_check_cycles}}`
+/// where the limit goes and `{{display_name}}` where the name goes.
+const SNAPSHOT: &str = include_str!("fixtures/agent/prompt.txt");
 
-/// What the model is sent for `cycles`: the old prompt with the limit put in. The one difference
-/// from the old constant is the file's final newline, which the loader drops from every body
-/// (`adam-agent-fs` trims trailing whitespace), so it is dropped here too.
+/// What the model is sent for `cycles` and the shipped name: the snapshot with both put in. The
+/// snapshot's final newline is dropped, as the loader drops it from every body
+/// (`adam-agent-fs` trims trailing whitespace).
 fn expected_prompt(cycles: u32) -> String {
-    let old = GOLDEN_PROMPT.replace("{{max_check_cycles}}", &cycles.to_string());
+    let rendered = SNAPSHOT
+        .replace("{{max_check_cycles}}", &cycles.to_string())
+        .replace("{{display_name}}", "Coder");
     assert!(
-        old.ends_with(".\n"),
-        "the old prompt ended with one newline"
+        rendered.ends_with(".\n"),
+        "the snapshot ends with one newline"
     );
-    old.trim_end().to_owned()
+    rendered.trim_end().to_owned()
 }
 
 /// The tools in the order the model is offered them.
@@ -93,6 +111,32 @@ async fn the_prompt_carries_the_rules_the_code_relies_on() {
     }
 }
 
+/// #55: what the instructions tell the model about who it is. The needles are single lines of the
+/// prompt (it is wrapped by hand), and the test that follows pins the whole text.
+#[tokio::test]
+async fn the_prompt_gives_the_agent_a_name_and_asks_for_plain_words() {
+    let (_fx, agent) = coder(3).await;
+    let text = prompt_of(&agent);
+    for needle in [
+        // The two persona lines the mocks read, first.
+        "Your name is Coder.\nIn one sentence: I take a repository you name,",
+        "and never say",
+        "A greeting gets a greeting.",
+        "\"list your tools\".**",
+        "cannot do, and why:",
+        "you cannot create one",
+        "Do not\n  list the tools.",
+        // A greeting is answered, not treated as a missing task.
+        "so do not call a tool for it",
+    ] {
+        assert!(text.contains(needle), "prompt lost: {needle}\n{text}");
+    }
+    assert!(text.starts_with("Your name is Coder."), "{text}");
+    assert!(!text.contains("{{"), "unreplaced placeholder");
+    // The old instruction that made a greeting a task with something missing is gone.
+    assert!(!text.contains("A greeting or a\n   vague request is not a task"));
+}
+
 #[tokio::test]
 async fn the_limit_is_templated_in_from_the_settings() {
     let (_fx, agent) = coder(7).await;
@@ -101,15 +145,19 @@ async fn the_limit_is_templated_in_from_the_settings() {
     assert!(!text.contains("{{"), "unreplaced placeholder");
 }
 
-/// The old prompt, whatever the limit, byte for byte but for its final newline (see
-/// [`expected_prompt`]): the file did not change the wording, and the var replaced what
-/// `str::replace` on `{{MAX_CHECK_CYCLES}}` did.
+/// The instruction snapshot, whatever the limit, byte for byte but for its final newline (see
+/// [`expected_prompt`]). A change to `agent/instructions.md` that is not in the snapshot fails
+/// here, and the diff of the snapshot is what a reviewer reads.
 #[tokio::test]
-async fn the_prompt_equals_the_one_that_was_a_rust_constant() {
+async fn the_prompt_equals_the_snapshot() {
     assert_eq!(
-        GOLDEN_PROMPT.matches("{{max_check_cycles}}").count(),
+        SNAPSHOT.matches("{{max_check_cycles}}").count(),
         1,
-        "one placeholder"
+        "one limit placeholder"
+    );
+    assert!(
+        SNAPSHOT.starts_with("Your name is {{display_name}}.\nIn one sentence: "),
+        "the body opens with the two persona lines the mocks read"
     );
     for cycles in [1, 3, 7, 25] {
         let (_fx, agent) = coder(cycles).await;
@@ -240,4 +288,392 @@ async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
     let steps: Vec<&str> = journal.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(steps, ["model:0", "tool:call-1", "model:1"]);
     assert!(journal.iter().all(|e| e.ok));
+}
+
+// ------------------------------------------------------------------ run-time folders
+
+fn files_of(folder: &tempfile::TempDir) -> AgentFiles {
+    AgentFiles::load(Some(folder.path())).expect("the folder loads")
+}
+
+fn coder_from(files: &AgentFiles, fx: &Fixture, mock: &Arc<MockModel>) -> CoderAgent {
+    let model: DynModel = mock.clone();
+    let tools = coder_tools(&fx.env);
+    CoderAgent::try_from_files(files, model, "test-model", fx.env.clone(), tools)
+        .expect("the files assemble")
+}
+
+/// Start a run on `coder` with `text` and wait until it waits for the person (the model stopped
+/// with nothing to deliver, so the run asks).
+async fn run_to_a_question(coder: &Coder, text: &str) -> RunId {
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let worker = {
+        let runtime = coder.runtime.clone();
+        tokio::spawn(async move {
+            runtime
+                .run_worker(async {
+                    let _ = rx.await;
+                })
+                .await
+        })
+    };
+    let run = coder
+        .runtime
+        .start(AGENT_NAME, user_message(text), None)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let view = coder.runtime.view(run).await.unwrap().expect("run exists");
+        match view.status {
+            RunStatus::Parked if view.waiting => break,
+            RunStatus::Done | RunStatus::Failed => panic!("the run ended: {view:#?}"),
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "timed out: {view:#?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = stop.send(());
+    worker.await.unwrap().unwrap();
+    run
+}
+
+fn options() -> RuntimeOptions {
+    RuntimeOptions {
+        poll_interval: Duration::from_millis(20),
+        ..RuntimeOptions::default()
+    }
+}
+
+/// A folder that is a copy of the shipped one is the embedded agent: the same digest, the same
+/// assembly (prompt, tools, limits) and the same card.
+#[tokio::test]
+async fn a_copy_of_the_shipped_folder_is_the_embedded_agent() {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    let tmp = folder();
+    let files = files_of(&tmp);
+    assert_eq!(files.describe().source, "folder");
+    assert_eq!(files.describe().agent, AGENT_NAME);
+    assert_eq!(
+        files.describe().digest,
+        AgentFiles::load(None).unwrap().describe().digest
+    );
+    assert!(files.warnings().is_empty(), "{:?}", files.warnings());
+
+    let from_folder = coder_from(&files, &fx, &mock);
+    let embedded = coder_from(&AgentFiles::Embedded, &fx, &mock);
+    assert_eq!(from_folder.assembly().info(), embedded.assembly().info());
+    assert!(from_folder.subagents().is_empty());
+
+    let url: url::Url = "https://agents.example.com/coder/".parse().unwrap();
+    assert_eq!(
+        format!("{:?}", agent_card_from(&files, &url).unwrap()),
+        format!("{:?}", agent_card(&url))
+    );
+}
+
+/// The point of the feature: edit `instructions.md` in the folder and the model is sent the
+/// edited prompt, with no rebuild. The limit is still the process's (`max_check_cycles`).
+#[tokio::test]
+async fn editing_the_folder_changes_what_the_model_is_sent() {
+    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 5).await;
+    let tmp = folder();
+    edit_instructions(&tmp, |text| format!("{text}\nAlways answer in French.\n"));
+    let files = files_of(&tmp);
+
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("Bonjour.");
+    let agent = coder_from(&files, &fx, &mock);
+    let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
+    run_to_a_question(&coder, "hi").await;
+
+    let system = mock.requests()[0].system.clone().unwrap();
+    assert!(system.ends_with("\n\nAlways answer in French."), "{system}");
+    assert!(system.contains("at most 5 times"), "{system}");
+    assert_eq!(
+        system,
+        format!("{}\n\nAlways answer in French.", expected_prompt(5)),
+        "the shipped prompt, and the edit"
+    );
+    // The embedded copy is what it was: the folder changed this process only.
+    assert_eq!(
+        coder_from(&AgentFiles::Embedded, &fx, &mock)
+            .assembly()
+            .info()[0]
+            .prompt,
+        expected_prompt(5)
+    );
+}
+
+/// The card comes from the folder too, so a control plane that has no model serves it.
+#[tokio::test]
+async fn the_card_comes_from_the_folder() {
+    let tmp = folder();
+    edit_instructions(&tmp, |text| {
+        text.replacen("  name: Coder", "  name: Cody", 1)
+    });
+    let url: url::Url = "https://agents.example.com/coder/".parse().unwrap();
+    let card = agent_card_from(&files_of(&tmp), &url).unwrap();
+    assert_eq!(card.name, "Cody");
+    assert_eq!(card.url, url);
+    assert_ne!(card.name, agent_card(&url).name);
+}
+
+/// A folder is the coder's: another name would strand the runs stored under `coder`.
+#[tokio::test]
+async fn a_folder_for_another_agent_is_refused_naming_the_field() {
+    let tmp = folder();
+    edit_instructions(&tmp, |text| text.replacen("name: coder", "name: other", 1));
+    let error = AgentFiles::load(Some(tmp.path())).unwrap_err();
+    assert!(matches!(error, AgentFilesError::Name { .. }), "{error}");
+    let text = error.to_string();
+    assert!(
+        text.contains("name: coder") && text.contains("`other`"),
+        "{text}"
+    );
+    assert_eq!(error.class(), ErrorClass::Invalid);
+}
+
+/// The process supplies `max_check_cycles`, so a folder must declare it; one that does not fails
+/// at startup, naming the var, and so does a tool the coder does not have.
+#[tokio::test]
+async fn a_folder_that_disagrees_with_the_code_fails_at_assembly() {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    let model = || -> DynModel { mock.clone() };
+
+    let tmp = folder();
+    edit_instructions(&tmp, |text| {
+        text.replacen("  max_check_cycles: 3\n", "", 1)
+            .replace("{{max_check_cycles}}", "three")
+    });
+    let files = files_of(&tmp);
+    let error = CoderAgent::try_from_files(
+        &files,
+        model(),
+        "test-model",
+        fx.env.clone(),
+        coder_tools(&fx.env),
+    )
+    .err()
+    .expect("a folder without the var is refused");
+    assert!(error.to_string().contains("max_check_cycles"), "{error}");
+    assert_eq!(error.class(), ErrorClass::Invalid);
+
+    let tmp = folder();
+    edit_instructions(&tmp, |text| {
+        text.replacen("limits:", "tools: [run_comand]\nlimits:", 1)
+    });
+    let error = CoderAgent::try_from_files(
+        &files_of(&tmp),
+        model(),
+        "test-model",
+        fx.env.clone(),
+        coder_tools(&fx.env),
+    )
+    .err()
+    .expect("a tool the coder does not have is refused");
+    let text = error.to_string();
+    assert!(
+        text.contains("run_comand") && text.contains("did you mean `run_command`"),
+        "{text}"
+    );
+}
+
+/// `tools:` in the folder narrows the coder's tools.
+#[tokio::test]
+async fn a_folder_may_narrow_the_tools() {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    let tmp = folder();
+    edit_instructions(&tmp, |text| {
+        text.replacen("limits:", "tools: [run_command, ask_user]\nlimits:", 1)
+    });
+    let agent = coder_from(&files_of(&tmp), &fx, &mock);
+    assert_eq!(
+        agent.assembly().info()[0].tools,
+        ["run_command", "ask_user"]
+    );
+}
+
+/// The subagents of a folder are registered beside the coder: the model calls the subagent's tool,
+/// a child run answers, and the coder goes on with the child's text.
+#[tokio::test]
+async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
+    let fx = Fixture::new("hello\n").await;
+    let tmp = folder();
+    std::fs::create_dir_all(tmp.path().join("agent/subagents")).unwrap();
+    std::fs::write(
+        tmp.path().join("agent/subagents/reviewer.md"),
+        "---\ndescription: Reviews a diff.\ntools: [run_command]\n---\nYou review diffs.\n",
+    )
+    .unwrap();
+    let files = files_of(&tmp);
+
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "c1".into(),
+        name: "reviewer".into(),
+        arguments: json!({"message": "review the diff"}),
+    }])
+    .push_text("LGTM, nothing to fix.")
+    .push_text("The reviewer is happy.");
+    let agent = coder_from(&files, &fx, &mock);
+    let info = agent.assembly().info();
+    assert_eq!(
+        info.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+        ["coder", "coder/reviewer"]
+    );
+    assert_eq!(agent.subagents().len(), 1);
+    assert_eq!(info[0].tools.last().map(String::as_str), Some("reviewer"));
+
+    let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
+    run_to_a_question(&coder, "have it reviewed").await;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 3);
+    let offered =
+        |r: &ModelRequest| -> Vec<String> { r.tools.iter().map(|t| t.name.clone()).collect() };
+    assert!(offered(&requests[0]).contains(&"reviewer".to_owned()));
+    // The child: its own prompt and the one tool it picked from the coder's.
+    assert_eq!(requests[1].system.as_deref(), Some("You review diffs."));
+    assert_eq!(offered(&requests[1]), ["run_command"]);
+    // The coder goes on with what the child said.
+    match requests[2].messages.last().unwrap() {
+        Message::Tool {
+            call_id, content, ..
+        } => {
+            assert_eq!(call_id, "c1");
+            assert_eq!(content, "LGTM, nothing to fix.");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A model that answers the way the `mock-coder` greeting mapping of `dev/wiremock/mock-openai`
+/// does: it reads the two persona lines at the top of its system prompt (`Your name is X.`, `In one
+/// sentence: Y.`) and greets back with them. It is a scripted model whose script is the prompt, so
+/// what a test edits in the folder is what the answer says.
+struct PersonaModel {
+    answers: std::sync::Mutex<Vec<String>>,
+}
+
+impl PersonaModel {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            answers: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn answers(&self) -> Vec<String> {
+        self.answers.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ModelClient for PersonaModel {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        let system = req.system.unwrap_or_default();
+        let line = |prefix: &str| {
+            system
+                .lines()
+                .find_map(|l| l.strip_prefix(prefix))
+                .map(|rest| rest.trim_end_matches('.').to_owned())
+                .ok_or_else(|| ModelError::invalid_request(format!("no `{prefix}` line")))
+        };
+        let answer = format!(
+            "Hi! I'm {}. {}. Which repository should I work on, and what should I change?",
+            line("Your name is ")?,
+            line("In one sentence: ")?
+        );
+        self.answers.lock().unwrap().push(answer.clone());
+        Ok(ModelResponse::text(answer))
+    }
+
+    async fn stream(
+        &self,
+        _req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        Err(ModelError::invalid_request("the coder does not stream"))
+    }
+}
+
+/// "hi" gets a greeting that carries the name and the one-sentence summary, not a request for a
+/// task and not a tool call, and the run waits for the answer; editing the persona lines in the
+/// mounted folder changes what is said, with no rebuild. (The model here is scripted by the
+/// prompt; what a live model does with it is unverified.)
+#[tokio::test]
+async fn a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says() {
+    let fx = Fixture::new("hello\n").await;
+
+    let greet = |files: AgentFiles| {
+        let fx = &fx;
+        async move {
+            let model = PersonaModel::new();
+            let dynamic: DynModel = model.clone();
+            let agent = CoderAgent::try_from_files(
+                &files,
+                dynamic,
+                "test-model",
+                fx.env.clone(),
+                coder_tools(&fx.env),
+            )
+            .unwrap();
+            let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
+            let run = run_to_a_question(&coder, "hi").await;
+            let view = coder.runtime.view(run).await.unwrap().unwrap();
+            assert!(view.artifacts.is_empty(), "no tool ran: {view:#?}");
+            let answers = model.answers();
+            assert_eq!(answers.len(), 1, "one turn, no tool calls: {answers:?}");
+            // The greeting is the question the run waits on.
+            assert!(view.state.to_string().contains(&answers[0]), "{view:#?}");
+            answers[0].clone()
+        }
+    };
+
+    let shipped = greet(AgentFiles::Embedded).await;
+    assert!(
+        shipped.starts_with("Hi! I'm Coder. I take a repository you name"),
+        "{shipped}"
+    );
+    assert!(shipped.ends_with("Which repository should I work on, and what should I change?"));
+
+    let tmp = folder();
+    edit_instructions(&tmp, |text| {
+        text.replacen("display_name: Coder", "display_name: Cody", 1)
+            .replacen(
+                "In one sentence: I take a repository you name, make the change you ask for, run the project's own checks and open a pull request.",
+                "In one sentence: I only fix typos.",
+                1,
+            )
+    });
+    let edited = greet(files_of(&tmp)).await;
+    assert_eq!(
+        edited,
+        "Hi! I'm Cody. I only fix typos. Which repository should I work on, and what should I change?"
+    );
+    assert!(
+        fx.agent_branches().is_empty(),
+        "nothing was prepared or pushed"
+    );
+}
+
+/// `display_name` is the one var of the persona: a folder that renames it renames the prompt.
+#[tokio::test]
+async fn the_display_name_var_is_the_name_in_the_prompt() {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    let tmp = folder();
+    edit_instructions(&tmp, |text| {
+        text.replacen("display_name: Coder", "display_name: Cody", 1)
+    });
+    let agent = coder_from(&files_of(&tmp), &fx, &mock);
+    let prompt = &agent.assembly().info()[0].prompt;
+    assert!(
+        prompt.starts_with("Your name is Cody.\nIn one sentence: "),
+        "{prompt}"
+    );
+    assert!(prompt.contains("You are Cody."), "{prompt}");
+    assert!(!prompt.contains("Coder"), "{prompt}");
 }

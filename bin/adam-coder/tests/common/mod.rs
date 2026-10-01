@@ -678,3 +678,41 @@ pub async fn a2a_client(
         .await
         .expect("an A2A client")
 }
+
+/// A copy of the shipped `agent/` under `<tmp>/agent`: what a deployment mounts as `ADAM_AGENT_DIR`,
+/// which a test then edits the way a deployment edits it.
+pub fn folder() -> TempDir {
+    fn copy(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    copy(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("agent"),
+        &tmp.path().join("agent"),
+    );
+    tmp
+}
+
+/// `agent/instructions.md` of a folder made by [`folder`], rewritten by `edit`.
+pub fn edit_instructions(folder: &TempDir, edit: impl FnOnce(String) -> String) {
+    let path = folder.path().join("agent/instructions.md");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, edit(text)).unwrap();
+}
+
+/// The JSON of a raw HTTP response (see [`raw`]): from the first `{` to the last `}`, which skips
+/// the status line and the headers and any chunked-encoding framing.
+pub fn json_of(response: &str) -> Value {
+    let start = response.find('{').expect("a JSON body");
+    let end = response.rfind('}').expect("a JSON body");
+    serde_json::from_str(&response[start..=end]).expect("the body is JSON")
+}

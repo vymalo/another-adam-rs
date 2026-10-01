@@ -8,7 +8,7 @@
 //! | Code | Name | Root cause |
 //! |---|---|---|
 //! | 0 | | clean shutdown after a signal (not an error) |
-//! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, or any error whose class is `Invalid` |
+//! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, [`AgentFilesError`] (a folder that cannot be read or is not the coder's), an assembly error (the files and the code disagree), or any error whose class is `Invalid` |
 //! | 69 | `EX_UNAVAILABLE` | a dependency is unreachable: a `Transient`, `RateLimited` or `Conflict` error, such as Postgres |
 //! | 71 | `EX_OSERR` | an [`std::io::Error`]: a listener that cannot bind, a directory that cannot be created |
 //! | 70 | `EX_SOFTWARE` | [`HostError`] (a component of the process stopped, panicked or ended while still needed), a panicked task, or a `Corrupt` or `Internal` error |
@@ -19,6 +19,7 @@
 
 use std::error::Error;
 
+use adam::AssemblyError;
 use adam_core::StoreError;
 use adam_error::{Classify, ErrorClass};
 use adam_host::HostError;
@@ -26,7 +27,7 @@ use adam_model_openai::OpenAiConfigError;
 use adam_runtime::RuntimeError;
 use adam_workspace::WorkspaceError;
 
-use crate::ConfigError;
+use crate::{AgentFilesError, ConfigError};
 
 /// `EX_CONFIG`: the configuration is wrong; restarting will not help.
 pub const EX_CONFIG: u8 = 78;
@@ -80,6 +81,14 @@ fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
     if let Some(e) = cause.downcast_ref::<WorkspaceError>() {
         return Some(e.class());
     }
+    // The agent files and the code disagreeing is a mistake in the deployment's files, which a
+    // restart does not fix: `Invalid`, except what the assembly itself classifies otherwise.
+    if let Some(e) = cause.downcast_ref::<AgentFilesError>() {
+        return Some(e.class());
+    }
+    if let Some(e) = cause.downcast_ref::<AssemblyError>() {
+        return Some(e.class());
+    }
     if let Some(e) = cause.downcast_ref::<RuntimeError>() {
         return Some(e.class());
     }
@@ -123,6 +132,38 @@ mod tests {
             source: Box::new(std::io::Error::other("bad url")),
         };
         assert_eq!(coded(e), 78);
+    }
+
+    /// A mistake in the agent files, or the files and the code disagreeing, is the deployment's:
+    /// 78, so a supervisor does not restart it. An assembly error keeps its own class otherwise.
+    #[test]
+    fn the_agent_files_and_their_assembly_are_78() {
+        let folder = crate::AgentFilesError::Name {
+            root: "/etc/adam".into(),
+            file: "agent/instructions.md".into(),
+            found: "other".into(),
+            expected: "coder",
+        };
+        let chained = Err::<(), _>(folder)
+            .context("reading the agent files")
+            .unwrap_err();
+        assert_eq!(exit_code(&chained), 78);
+
+        let unset = AssemblyError::DuplicateTool { tool: "t".into() };
+        let chained = Err::<(), _>(unset)
+            .context("assembling the coder agent")
+            .unwrap_err();
+        assert_eq!(exit_code(&chained), 78);
+
+        let down = AssemblyError::Mcp {
+            origin: adam::Origin {
+                agent: "coder".into(),
+                file: "agent/mcp.json".into(),
+            },
+            class: ErrorClass::Transient,
+            source: "connection refused".into(),
+        };
+        assert_eq!(coded(down), 69);
     }
 
     #[test]

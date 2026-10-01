@@ -12,9 +12,9 @@ rust-version.workspace = true
 default = []
 # `Assembly::card`: the root agent's `card:` frontmatter as an `adam_a2a::AgentCardConfig`.
 a2a = ["dep:adam-a2a"]
-# Dev reload: read the agent directory at run time and swap the agents when a file changes
-# (`LiveAssembly`, `AgentDef::from_dir`). Off by default, so a release build cannot read prompts
-# from disk unless it opts in. The only feature that brings `notify`.
+# Dev reload: watch the agent directory and swap the agents when a file changes (`LiveAssembly`).
+# Off by default, so a release build cannot watch and reload prompts unless it opts in (reading a
+# folder once, at startup, needs no feature: `AgentFolder`). The only feature that brings `notify`.
 dev = ["dep:notify", "dep:adam-core"]
 # `mcp.json` tools (`AgentDef::connect_mcp`): connect to the MCP servers an agent's files name and
 # give the agent their tools. Off by default: it brings the MCP client and can start processes.

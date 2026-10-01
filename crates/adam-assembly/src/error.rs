@@ -543,6 +543,20 @@ pub enum Error {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// A folder that was to hold one agent holds none, or several
+    /// ([`AgentFolder::load`](crate::AgentFolder::load)): a process serves one agent.
+    #[error(
+        "{} holds {}: a process serves exactly one agent, so point it at a folder with a single \
+         `agent/` (or an `agents/` with one agent in it)",
+        portable(.root),
+        found_agents(.found)
+    )]
+    NotOneAgent {
+        /// The folder that was read.
+        root: PathBuf,
+        /// The root agents it holds, by name; empty when it holds none.
+        found: Vec<String>,
+    },
     /// The A2A card needs a description and the agent has none.
     #[error(
         "{origin}: the A2A card needs a description: set `description` (or `card.description`) in the frontmatter"
@@ -612,6 +626,14 @@ fn not_connected_how() -> &'static str {
 /// `; did you mean `x`?`, or nothing.
 pub(crate) fn hint(suggestion: Option<&str>) -> String {
     suggestion.map_or_else(String::new, |s| format!("; did you mean `{s}`?"))
+}
+
+/// What a folder holds, for [`Error::NotOneAgent`].
+fn found_agents(found: &[String]) -> String {
+    match found {
+        [] => "no agent".to_owned(),
+        _ => format!("{} agents ({})", found.len(), list(found)),
+    }
 }
 
 /// The names in backticks, or `none`.
@@ -961,5 +983,28 @@ mod tests {
             source: std::io::Error::from(std::io::ErrorKind::NotFound),
         });
         assert_eq!(missing.class(), ErrorClass::NotFound);
+    }
+
+    #[test]
+    fn a_folder_that_does_not_hold_one_agent_says_what_it_holds() {
+        let many = Error::NotOneAgent {
+            root: PathBuf::from("/etc/adam"),
+            found: vec!["coder".into(), "reviewer".into()],
+        };
+        assert_eq!(
+            many.to_string(),
+            "/etc/adam holds 2 agents (`coder`, `reviewer`): a process serves exactly one agent, \
+             so point it at a folder with a single `agent/` (or an `agents/` with one agent in it)"
+        );
+        let none = Error::NotOneAgent {
+            root: PathBuf::from("/etc/adam"),
+            found: vec![],
+        };
+        assert!(
+            none.to_string().starts_with("/etc/adam holds no agent:"),
+            "{none}"
+        );
+        assert_eq!(many.class(), ErrorClass::Invalid);
+        assert_eq!(none.class(), ErrorClass::Invalid);
     }
 }

@@ -21,7 +21,8 @@
 //! |---|---|
 //! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks or rejected credentials and no PR = failed; any other stop without a PR = a question, `input-required`) and the record of the repositories the person named; [`CoderStarter`]: its start-only half |
 //! | [`tools`] | the seven tools (`#[tool]` functions reading [`ToolEnv`] from the agent's state) and [`CoderSettings`] |
-//! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`) |
+//! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`, or read at startup from the folder `ADAM_AGENT_DIR` names) |
+//! | [`files`] | [`AgentFiles`]: where those files come from, the embedded copy or a folder read once at startup, and why a folder is refused ([`AgentFilesError`]) |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
 //! | [`app`] | [`Coder`]: runtime + A2A backend + router; [`Coder::control_plane`] for a process that only starts runs; [`LiveSignals`]: events and wake-up signals, in-process or across processes |
@@ -81,6 +82,7 @@ pub mod agent;
 pub mod app;
 pub mod config;
 pub mod exit;
+pub mod files;
 pub mod opencode;
 pub mod redact;
 mod repos;
@@ -88,9 +90,10 @@ mod serve;
 pub mod tools;
 
 pub use agent::{AGENT_NAME, CoderAgent, CoderStarter};
-pub use app::{Coder, LiveSignals, RuntimeOptions, agent_card};
+pub use app::{Coder, LiveSignals, RuntimeOptions, agent_card, agent_card_from};
 pub use config::{Config, ConfigError, WorkerConfig};
 pub use exit::exit_code;
+pub use files::{AgentFiles, AgentFilesError};
 pub use redact::Redactor;
 pub use repos::workspaces_for;
 pub use serve::serve;

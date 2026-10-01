@@ -98,6 +98,13 @@ services:
   # commits, pushes and opens a pull request, so a task ends in one. CI runs
   # exactly that with dev/coder-e2e.sh, on an image it has already built:
   # CODER_IMAGE names it (`--no-build` then uses it as it is).
+  #
+  # The agent's files (prompt, card, skills) are read at startup from the folder
+  # mounted at /etc/adam/agent (ADAM_AGENT_DIR), so a change to them needs a
+  # restart, not a build: edit bin/adam-coder/agent/instructions.md, or point
+  # CODER_AGENT_DIR at a copy, and `docker compose --profile app up -d coder`.
+  # Unset ADAM_AGENT_DIR (remove the two lines) and the copy embedded in the
+  # image is used. The folder must be readable by uid 10001 (chmod -R a+rX).
   coder:
     profiles: ["app"]
     image: ${CODER_IMAGE:-adam-rs/coder:dev}
@@ -133,9 +140,12 @@ services:
       # both are development-only settings, never set them in production.
       ALLOWED_REPO_HOSTS: git-server
       ALLOW_LOCAL_REPOS: "true"
+      # The mounted folder below: what the agent says and offers, read at startup.
+      ADAM_AGENT_DIR: /etc/adam/agent
     ports: ["127.0.0.1:${CODER_PORT:-8080}:8080"]
     volumes:
       - coder-work:/work
+      - ${CODER_AGENT_DIR:-./bin/adam-coder/agent}:/etc/adam/agent:ro
     healthcheck:
       # Plain TCP connect: the image is not guaranteed to ship curl.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]

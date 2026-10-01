@@ -109,11 +109,18 @@
 //! [`AgentDef::env`]) and fails closed; the URL must be https unless it is local
 //! ([`AgentDef::allow_insecure_remotes`]); the token is never logged or journaled. See the README.
 //!
+//! # Run-time folders
+//!
+//! [`AgentFolder::load`] reads the one agent of a folder when the process starts (no feature):
+//! the instructions, card, skills and `mcp.json` of a deployment, without a build. It returns the
+//! definition, the warnings and the digest of what was read; [`agent_dir_from_env`] reads where
+//! the folder is from `ADAM_AGENT_DIR`. The folder is read once.
+//!
 //! # Dev reload
 //!
-//! With the feature `dev` (off by default, so a release build cannot read prompts from disk unless
-//! it opts in), `LiveAssembly` reads the agent directory at run time and swaps the agents when a
-//! file changes: a running run picks up new instructions at its next step, an invalid edit keeps
+//! With the feature `dev` (off by default, so a release build cannot watch and reload prompts
+//! unless it opts in), `LiveAssembly` reads the agent directory at run time and swaps the agents
+//! when a file changes: a running run picks up new instructions at its next step, an invalid edit keeps
 //! the last good version and logs the diagnostics. A change to an agent's tool set applies to runs
 //! that start later, so that durable replay never sees a tool appear or vanish. The rules are in
 //! the docs of `LiveAssembly` and in the README.
@@ -138,6 +145,7 @@ mod def;
 #[cfg(feature = "dev")]
 mod dev;
 mod error;
+mod folder;
 mod mcp;
 mod remote;
 mod skills;
@@ -149,12 +157,13 @@ pub use assembly::{AgentInfo, Assembly, BoundDef, RemoteInfo};
 pub use def::{AgentDef, IntoManifest};
 #[cfg(feature = "dev")]
 pub use dev::{
-    AGENT_DIR_ENV, DEFAULT_DEBOUNCE, LiveAssembly, LiveBuilder, ReloadError, Reloaded, ToolChange,
-    Watch, WatchError, agent_dir,
+    DEFAULT_DEBOUNCE, LiveAssembly, LiveBuilder, ReloadError, Reloaded, ToolChange, Watch,
+    WatchError,
 };
 pub use error::{
     AliasProblem, Error, Origin, RemoteAuthProblem, RemoteUrlProblem, SkillField, ToolClash,
 };
+pub use folder::{AGENT_DIR_ENV, AgentFolder, agent_dir, agent_dir_from_env};
 pub use skills::{LOAD_SKILL, READ_SKILL_FILE, SkillError, SkillFiles};
 pub use subagent::SubagentTool;
 pub use template::TemplateProblem;
@@ -164,13 +173,10 @@ pub use template::TemplateProblem;
 pub use url::Url;
 
 /// Without the feature `dev` the reload API does not exist: a release build cannot ask for it.
+/// (Reading a folder once, when the process starts, needs no feature: [`AgentFolder`].)
 ///
 /// ```compile_fail,E0432
 /// use adam_assembly::LiveAssembly;
-/// ```
-///
-/// ```compile_fail,E0599
-/// let _ = adam_assembly::AgentDef::from_dir("agent");
 /// ```
 #[cfg(not(feature = "dev"))]
 mod dev_is_off {}

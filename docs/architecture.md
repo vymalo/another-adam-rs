@@ -206,7 +206,9 @@ The layers, from the bottom:
     is the code generator a `build.rs` calls to embed the directory in the
     binary as a `'static` manifest. See [`docs/authoring.md`](authoring.md).
   * `adam-assembly` binds a manifest to `LlmAgent`s: `AgentDef::from_manifest`
-    takes the embedded manifest or one read from a directory (one code path),
+    takes the embedded manifest or one read from a directory (one code path;
+    `AgentFolder::load` reads one agent's folder at startup, `ADAM_AGENT_DIR`, see
+    [ADR 0004](decisions/0004-agent-folders-at-run-time.md)),
     `bind` checks `tools:` against a `ToolSet` (unknown names come back with a
     "did you mean") and renders the `{{var}}` placeholders of the prompt,
     `model` gives every agent its gateway alias and builds the root and one
@@ -1647,10 +1649,16 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
 * **The tools** (`tools/`): `prepare_workspace`, `run_command` (looking around: no check, no cycle,
   changes to HEAD, the branch, the working tree, refs and git configuration are undone), `delegate_to_opencode`, `run_checks` (the project's own checks only),
   `commit_and_push`, `open_pull_request` and `ask_user`.
-* **The prompt and the card** (`agent/instructions.md`, embedded by `build.rs`): the system prompt with its
-  `{{max_check_cycles}}`, the loop's limits and the A2A card are a file, not Rust; `CoderAgent::new` puts
-  the file, the tools, the `ToolEnv` state and the model together with `AgentDef`, and keeps only the
-  completion policy in Rust.
+* **The prompt and the card** (`agent/instructions.md`, embedded by `build.rs`, or read at startup from the
+  folder `ADAM_AGENT_DIR` names): the agent says its name (`vars.display_name`, `Coder`; the card says it too),
+  answers a greeting with a greeting and "what can you do?" in plain words (adam-rs#55); the system prompt with its `{{max_check_cycles}}`, the loop's limits and the
+  A2A card are a file, not Rust; `CoderAgent::new` puts the file, the tools, the `ToolEnv` state and the
+  model together with `AgentDef`, and keeps only the completion policy in Rust. `serve` reads the files
+  first, for every role (`AgentFiles::load`: the folder, else the embedded copy), logs the `agent files`
+  line and refuses a folder with mistakes (exit 78); the control plane serves the folder's card
+  (`agent_card_from`), the workers assemble from it (`CoderAgent::try_from_files`), and a folder's
+  subagents are registered beside the coder. A restart applies an edit; there is no hot reload
+  ([ADR 0004](decisions/0004-agent-folders-at-run-time.md)).
 * **Rules in code.**
   * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`
     refuses to run. `commit_and_push` and `open_pull_request` refuse too.
@@ -1856,6 +1864,7 @@ flowchart LR
         mogh["mock-github :8082<br/>WireMock, pull requests"]
         gitsrv["git-server :8083<br/>nginx + git-http-backend<br/>local/sandbox.git"]
         cdr["coder :8080<br/>profile app, built from docker/coder/Dockerfile"]
+        agentdir[/"bin/adam-coder/agent<br/>mounted read-only at /etc/adam/agent"/]
     end
 
     curl -->|"A2A, bearer dev-token"| cdr
@@ -1863,6 +1872,7 @@ flowchart LR
     cdr -->|"MODEL_BASE_URL"| moai
     cdr -->|"GITHUB_API_URL"| mogh
     cdr -->|"repository in the task"| gitsrv
+    agentdir -->|"ADAM_AGENT_DIR, read at startup"| cdr
 
     cargo --> pgs
     cargo --> mongos
@@ -1871,6 +1881,11 @@ flowchart LR
 ```
 
 * `mongodb` is used by the store tests only. The coder does not use it.
+* The coder reads its prompt and card from `bin/adam-coder/agent`, mounted at `/etc/adam/agent`
+  (`ADAM_AGENT_DIR`; `CODER_AGENT_DIR` points the mount at a copy). An edit applies with
+  `docker compose --profile app up -d coder`, no rebuild. `dev/greeting-e2e.sh` runs "hi" through the stack (the
+  scripted `mock-coder` greets from the two persona lines of the prompt: its name and a one-sentence summary), lets
+  the same task go on to a pull request, and restarts the coder on an edited copy of the folder.
 * The coder waits until `postgres`, `mock-openai`, `mock-github` and `git-server`
   are healthy.
 * The mock model is canned: it answers in text, or calls the first declared tool
