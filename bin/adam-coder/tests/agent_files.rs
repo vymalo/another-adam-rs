@@ -705,13 +705,13 @@ fn write_mcp_json(folder: &tempfile::TempDir, url: &str) {
 async fn connected_def(
     files: &AgentFiles,
     policy: &McpPolicy,
-) -> Result<adam::AgentDef, adam::AssemblyError> {
+) -> Result<adam::AgentDef, Box<adam::AssemblyError>> {
     files
-        .def()
-        .map_err(|e| *e)?
+        .def()?
         .env(MCP_TOKEN_VAR, MCP_TOKEN)
         .connect_mcp(policy)
         .await
+        .map_err(Box::new)
 }
 
 /// A folder with an `mcp.json` gives the coder the tools of its servers, named `<server>__<tool>`
