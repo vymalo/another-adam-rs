@@ -134,6 +134,13 @@ impl Worktree {
         &self.path
     }
 
+    /// The shared bare mirror this worktree is linked to: `<root>/git/<host>/<owner>/<repo>.git`.
+    /// The worktree's `.git` file points into it, so a process that is to run `git` in the
+    /// worktree (an environment other than the caller's own) must be able to read it.
+    pub fn mirror(&self) -> &Path {
+        &self.mirror
+    }
+
     /// The name of the worktree's slot in the run's workspace: the repository's name, lowercased
     /// (see [`RunWorkspace::slots`](crate::RunWorkspace::slots)); the same for a worktree made by
     /// [`Workspaces::prepare`](crate::Workspaces::prepare), which is a slot of the legacy layout.

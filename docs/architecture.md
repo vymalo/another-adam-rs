@@ -1,6 +1,6 @@
 # Architecture
 
-adam-rs is a Rust workspace of 21 crates for **durable AI agents**. An agent is
+adam-rs is a Rust workspace of 22 crates for **durable AI agents**. An agent is
 a state machine. The runtime saves its state after every step, so a worker that
 dies loses nothing: another worker resumes from the last saved step. Every piece
 of infrastructure (database, model, code host, A2A backend) sits behind a trait,
@@ -64,6 +64,7 @@ flowchart TB
         openai["adam-model-openai"]
         pgn["adam-notify-postgres"]
         ws["adam-workspace"]
+        devc["adam-devcontainer"]
         acp["adam-acp"]
     end
     subgraph contracts["Contracts and ports"]
@@ -89,6 +90,7 @@ flowchart TB
     coder --> rt
     coder --> service
     coder --> ws
+    devc --> ws
     coder --> host
     coder --> ui
     agent --> ui
@@ -175,8 +177,9 @@ flowchart TB
     asm --> err
     host --> err
     pgn --> err
+    devc --> err
 
-    linkStyle 70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88 stroke:#999,stroke-width:1px
+    linkStyle 71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -211,7 +214,10 @@ The layers, from the bottom:
     lock ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md)).
     It also owns three small ports of its own, `GitCredentials`, `CodeHost` (GitHub)
     and `Environment`, where a run's processes run (`Local`, this container, is
-    the one implementation so far).
+    the implementation it holds).
+  * `adam-devcontainer` is the other `Environment`: it runs a run's processes in the
+    devcontainer of the run's first repository, on a rootless Podman service, through
+    the official devcontainer CLI ([ADR 0010](decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)).
   * `adam-acp` is a client for the Agent Client Protocol: it drives a coding
     agent (OpenCode) over stdio.
   * `adam-notify-postgres` implements two ports of the runtime, `EventSink`
@@ -512,6 +518,7 @@ The boundaries, by what they swap:
 | `ModelClient` | `adam-model` | `OpenAiCompatible` | `MockModel` |
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` | `InMemoryBackend` (feature `test-util`) |
 | `CodeHost` | `adam-workspace` | `GitHub` (feature `github`, on by default) | `MemoryCodeHost` (feature `test-util`) |
+| `Environment` | `adam-workspace` | `Local` (the caller's own container), `DevContainer` (`adam-devcontainer`: the first repository's devcontainer, on a rootless Podman service) | the stub Podman and stub CLI of `adam-devcontainer`'s tests |
 | `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `GitHubApp` (installation access tokens minted from a GitHub App's key, feature `github`; wrapped in `HostScoped`, which limits any credentials to named hosts), `StaticToken` (one token, any host) | none needed |
 | `Agent` | `adam-runtime` | `LlmAgent`, `CoderAgent` | test agents |
 | `AgentStarter` | `adam-runtime` | `LlmStarter`, `CoderStarter` | test starters |
@@ -738,9 +745,14 @@ The processes that act on a run's files (the project's checks, a command to look
 through the `Environment` port of `adam-workspace`. A tool asks the run's session to **prepare** the command from a
 description (program or shell line, working directory, variables, the names of this process's secrets to hide) and
 spawns what comes back; the files and the paths are the same in every environment, so the file tools and all git
-work stay in the coder. `Local`, the coder's own container, is the one implementation and behaves as the tools
-always did. Another one, which runs the processes in a container made from the repository's own configuration,
-is built behind the same port and chosen when the binary is composed (swapped at build time, not by a plugin).
+work stay in the coder. `Local`, the coder's own container, behaves as the tools always did. The other,
+`DevContainer` of [`adam-devcontainer`](../crates/adam-devcontainer/README.md), runs the processes in a container made from
+the repository's own `devcontainer.json` (the first slot of the run decides, a default image when it has none), on a rootless
+Podman service and never the host's Docker socket; the file is untrusted and checked three times, nothing of the coder's
+environment enters the container, and every step of making it is shown
+([ADR 0010](decisions/0010-a-run-works-in-its-repositorys-devcontainer.md), which has the sequence and the lifecycle of that
+environment). It is chosen when the binary is composed (swapped at build time, not by a plugin); the coder composes it in the
+next change of the series.
 
 ```mermaid
 sequenceDiagram
@@ -2311,6 +2323,7 @@ What the diagrams cannot say:
 | `adam-store-mongodb` | implementation | [crates/adam-store-mongodb](../crates/adam-store-mongodb/README.md) |
 | `adam-model-openai` | implementation | [crates/adam-model-openai](../crates/adam-model-openai/README.md) |
 | `adam-workspace` | implementation | [crates/adam-workspace](../crates/adam-workspace/README.md) |
+| `adam-devcontainer` | implementation | [crates/adam-devcontainer](../crates/adam-devcontainer/README.md) |
 | `adam-acp` | implementation | [crates/adam-acp](../crates/adam-acp/README.md) |
 | `adam-notify-postgres` | implementation | [crates/adam-notify-postgres](../crates/adam-notify-postgres/README.md) |
 | `adam-runtime` | runtime | [crates/adam-runtime](../crates/adam-runtime/README.md) |

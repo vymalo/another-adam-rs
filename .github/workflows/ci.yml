@@ -254,6 +254,7 @@ jobs:
         run: |
           docker compose config -q
           docker compose --profile app config -q
+          docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app config -q
       - name: Start postgres and the mocks
         run: docker compose up -d --build --wait postgres mock-openai mock-github mock-github-mcp git-server
       - name: Smoke-test each service
@@ -364,3 +365,73 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose down -v
+
+  # The devcontainer environment (crates/adam-devcontainer, ADR 0010) against a real rootless Podman
+  # service and the real devcontainer CLI: dev/podman/README.md says what the service is given and why,
+  # and what in this job was not verified before it ran here for the first time (the sysctl, podman-remote
+  # from the distribution against a Podman 5.8.7 server, Compose resolving the relative seccomp path).
+  # The test (crates/adam-devcontainer/tests/podman.rs) is gated; ADAM_TEST_REQUIRE_DEVCONTAINER makes
+  # it fail instead of skipping, so a typo in the variables cannot turn the job green.
+  devcontainer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      DEVCONTAINERS_CLI_VERSION: "0.89.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # Ubuntu 24.04 stops unprivileged user namespaces under AppArmor, which a rootless Podman needs.
+      - name: Let unprivileged user namespaces through AppArmor
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: The devcontainer CLI and Podman's remote client
+        run: |
+          set -eu
+          npm install -g --no-fund --no-audit "@devcontainers/cli@${DEVCONTAINERS_CLI_VERSION}"
+          devcontainer --version
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends podman-remote
+          podman-remote --version
+      - name: A rootless Podman service beside a directory it shares with the test
+        run: |
+          set -eu
+          work="$RUNNER_TEMP/adam-devcontainer"
+          sock="$RUNNER_TEMP/adam-podman"
+          sudo install -d -o 10001 -g 10001 -m 0755 "$work" "$sock"
+          {
+            echo "PODMAN_SOCKET_DIR=$sock"
+            echo "PODMAN_WORK=$work"
+            echo "PODMAN_WORK_TARGET=$work"
+          } >> "$GITHUB_ENV"
+          PODMAN_SOCKET_DIR="$sock" PODMAN_WORK="$work" PODMAN_WORK_TARGET="$work" \
+            docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app up -d --build --wait podman
+      - name: The devbox fixture in its devcontainer
+        run: |
+          set -eu
+          bin=$(cargo test --locked -p adam-devcontainer --test podman --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.name == "podman") | .executable' | tail -n 1)
+          test -x "$bin"
+          # The service runs as uid 10001, so does the test: what a container makes in the shared
+          # directory is then the test's own outside. It runs from that directory (the runner's home
+          # may not be open to another user), and with this job's PATH (sudo's own has no node, which
+          # the devcontainer CLI is a script of).
+          sudo install -o 10001 -g 10001 -m 0755 "$bin" "$PODMAN_WORK/podman-test"
+          sudo -E setpriv --reuid 10001 --regid 10001 --clear-groups env \
+            PATH="$PATH" \
+            ADAM_TEST_DEVCONTAINER=1 ADAM_TEST_REQUIRE_DEVCONTAINER=1 \
+            CONTAINER_HOST="unix://$PODMAN_SOCKET_DIR/podman.sock" \
+            ADAM_TEST_DEVCONTAINER_ROOT="$PODMAN_WORK" \
+            ADAM_TEST_DEVCONTAINER_DNS_NAME=podman \
+            HOME="$PODMAN_WORK" "$PODMAN_WORK/podman-test" --nocapture
+      - name: Logs
+        if: failure()
+        run: docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app logs --no-color podman
+      - name: Tear down
+        if: always()
+        run: docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app down -v

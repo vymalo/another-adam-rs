@@ -333,6 +333,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-devcontainer"
+version = "0.1.0"
+dependencies = [
+ "adam-error",
+ "adam-workspace",
+ "async-trait",
+ "jsonc-parser",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "adam-error"
 version = "0.1.0"
 dependencies = [
@@ -2685,6 +2702,15 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonc-parser"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ecded084f9b9a718d39668a42657c32253663d1f6afb3fbb9134f0305f73f48"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

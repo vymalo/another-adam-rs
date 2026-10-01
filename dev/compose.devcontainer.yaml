@@ -1,0 +1,82 @@
+# The coder's devcontainers, on a rootless Podman service (adam-devcontainer, ADR 0010).
+#
+#   docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app up -d --build --wait
+#
+# This file adds a `podman` service and points the coder at it. Without it the coder runs with
+# DEVCONTAINER_RUNTIME=off, in its own container, as it always did. dev/podman/README.md says what the
+# service is given and why (no `privileged`, no `cap_add`, no `devices`; three `security_opt`).
+#
+# The service must see the coder's workspace volume at the SAME path (a bind source is resolved by
+# the service), so one service serves one workspace volume. The three variables below let a test put
+# a host directory where the volumes are: PODMAN_SOCKET_DIR, PODMAN_WORK and PODMAN_WORK_TARGET.
+#
+# The coder image does not carry the devcontainer CLI and Podman's client yet (the next change of this
+# series builds them in): until it does, the coder starts, probes, finds no way to run a devcontainer,
+# and goes on in its own environment with a step that says so. Nothing breaks.
+
+services:
+  podman:
+    profiles: ["app"]
+    build:
+      context: ./dev/podman
+    image: adam-rs/podman:dev
+    restart: unless-stopped
+    user: "10001:10001"
+    command: ["podman", "system", "service", "--time=0", "unix:///run/podman/podman.sock"]
+    environment:
+      # The service runs on a cgroup v1 host in some CI images; the warning is noise.
+      PODMAN_IGNORE_CGROUPSV1_WARNING: "1"
+    security_opt:
+      # containers/container-libs's profile, pinned: unshare, clone(CLONE_NEWUSER), mount.
+      - seccomp=${PODMAN_SECCOMP:-./dev/podman/seccomp.json}
+      # Nested containers mount a fresh /proc; Docker's masked paths forbid it.
+      - systempaths=unconfined
+      # `docker-default` has `deny mount,`; this does nothing where AppArmor is off.
+      - apparmor=unconfined
+    # NO privileged, NO cap_add, NO devices: native overlay on the volume (no /dev/fuse) and the
+    # service's network namespace shared by the containers (no /dev/net/tun).
+    cpus: 2
+    mem_limit: 6g
+    # Bounds every devcontainer together: their own cgroups are off.
+    pids_limit: 4096
+    volumes:
+      # The only way in: a socket of mode 0600, owned by uid 10001.
+      - ${PODMAN_SOCKET_DIR:-podman-socket}:/run/podman
+      - podman-storage:/home/agent/.local/share/containers
+      # The coder's workspace volume, at the same path as in the coder.
+      - ${PODMAN_WORK:-coder-work}:${PODMAN_WORK_TARGET:-/work}
+    # What a devcontainer can reach: the model (mock-openai, for OpenCode) and the internet (pulls). Not
+    # postgres, and not the orchestrator.
+    networks: [devcontainers]
+    healthcheck:
+      test: ["CMD", "podman", "--remote", "--url", "unix:///run/podman/podman.sock", "info"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 5s
+
+  coder:
+    depends_on:
+      # The service makes the socket volume, owned by uid 10001.
+      podman:
+        condition: service_healthy
+    environment:
+      DEVCONTAINER_RUNTIME: podman
+      CONTAINER_HOST: unix:///run/podman/podman.sock
+      # The small base image of the devcontainers.dev project, pinned by tag and digest (367 MiB). A
+      # deployment uses the `workspace` image of another-agentic-images instead.
+      DEVCONTAINER_DEFAULT_IMAGE: ${DEVCONTAINER_DEFAULT_IMAGE:-mcr.microsoft.com/devcontainers/base:2.2.1-trixie@sha256:1f851004adcd3dff3776b4a1da86727cf52280b0fdc9d5b0568c9c7d74274286}
+      WORKSPACE_SWEEP_SECS: "10"
+    volumes:
+      - ${PODMAN_SOCKET_DIR:-podman-socket}:/run/podman
+
+  # OpenCode, inside a devcontainer, reaches its model here.
+  mock-openai:
+    networks: [default, devcontainers]
+
+networks:
+  devcontainers: {}
+
+volumes:
+  podman-socket:
+  podman-storage:

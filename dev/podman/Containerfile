@@ -1,0 +1,28 @@
+# A rootless Podman service for the coder's devcontainers (adam-devcontainer, ADR 0010).
+#
+# The image is Podman's own, pinned by tag and digest (the digest was read from quay.io's API on
+# 2026-10-01: manifest list of v5.8.7-immutable). It adds one thing: the user the service runs as,
+# uid 10001, which is also the coder's uid, so that the files a devcontainer makes in the shared
+# workspace volume are the coder's. Nothing here needs `privileged`, a capability or a device;
+# see README.md for the three options the *service* container is started with, and why.
+FROM quay.io/podman/stable:v5.8.7-immutable@sha256:f345d8d4fddea244d3a1ced27bcec82d14cc9e32cb5ead7f5882b0baf59dc8b0
+
+USER root
+# agent:100000:65536 is the range of uids and gids that nested containers get (`newuidmap`, which
+# the image carries, needs the SETUID and SETGID capabilities Docker gives every container by
+# default). The user has no `containers.conf` of its own on purpose: the one of the upstream
+# `podman` user binds the service's /proc into every nested container, which would show a
+# devcontainer the processes of every other run. The system-wide /etc/containers/containers.conf of
+# the image (host namespaces for the nested containers, cgroups disabled) is what applies.
+RUN useradd --uid 10001 --user-group --create-home --home-dir /home/agent --shell /bin/sh agent \
+ && printf 'agent:100000:65536\n' > /etc/subuid \
+ && printf 'agent:100000:65536\n' > /etc/subgid \
+ && mkdir -p /home/agent/.local/share/containers /run/podman /work \
+ && chown -R 10001:10001 /home/agent /run/podman /work
+
+# Images and layers: native overlay on this volume (there is no /dev/fuse to give), kept across runs.
+VOLUME /home/agent/.local/share/containers
+
+USER 10001:10001
+ENV HOME=/home/agent
+CMD ["podman", "system", "service", "--time=0", "unix:///run/podman/podman.sock"]

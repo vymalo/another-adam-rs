@@ -23,6 +23,7 @@ adam-acp = { path = "crates/adam-acp", version = "0.1.0" }
 adam-assembly = { path = "crates/adam-assembly", version = "0.1.0" }
 adam-agent-fs = { path = "crates/adam-agent-fs", version = "0.1.0" }
 adam-core = { path = "crates/adam-core", version = "0.1.0" }
+adam-devcontainer = { path = "crates/adam-devcontainer", version = "0.1.0" }
 adam-error = { path = "crates/adam-error", version = "0.1.0" }
 adam-host = { path = "crates/adam-host", version = "0.1.0" }
 adam-llm-agent = { path = "crates/adam-llm-agent", version = "0.1.0" }
@@ -55,6 +56,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
 futures = "0.3"
 httpdate = "1"
+# Reads a repository's devcontainer.json (JSON with comments and trailing commas), as serde_json values
+# (adam-devcontainer).
+jsonc-parser = { version = "0.34", features = ["serde"] }
 # Catalog components are JSON Schema; no network resolution, so none of the default features.
 jsonschema = { version = "0.58", default-features = false }
 notify = "8"
