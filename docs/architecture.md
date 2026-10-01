@@ -53,6 +53,7 @@ flowchart TB
     subgraph runtime["Runtime"]
         a2art["adam-a2a-runtime"]
         rt["adam-runtime"]
+        service["adam-service"]
     end
     subgraph impls["Implementations"]
         pg["adam-store-postgres"]
@@ -82,12 +83,18 @@ flowchart TB
     coder --> core
     coder --> llm
     coder --> model
-    coder --> openai
     coder --> rt
-    coder --> pg
+    coder --> service
     coder --> ws
     coder --> host
-    coder --> pgn
+    service --> a2a
+    service --> a2art
+    service --> core
+    service --> host
+    service --> openai
+    service --> pg
+    service --> pgn
+    service --> rt
     a2art --> a2a
     a2art --> core
     a2art --> rt
@@ -129,12 +136,15 @@ flowchart TB
     pgn -.-> nk
     pgn -.-> pg
     asm -.-> fixture
+    coder -.-> openai
+    coder -.-> pg
 
     a2a --> err
     adam --> err
     a2art --> err
     acp --> err
     coder --> err
+    service --> err
     core --> err
     llm --> err
     openai --> err
@@ -148,7 +158,7 @@ flowchart TB
     host --> err
     pgn --> err
 
-    linkStyle 53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69 stroke:#999,stroke-width:1px
+    linkStyle 61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78 stroke:#999,stroke-width:1px
 ```
 
 The layers, from the bottom:
@@ -190,11 +200,17 @@ The layers, from the bottom:
   * `adam-runtime` owns the run state machine, the journal, the workers and the
     retry policy. It depends on `adam-core` and `adam-error` only.
   * `adam-a2a-runtime` implements the `adam-a2a` seam over the runtime.
+  * [`adam-service`](../crates/adam-service/README.md) is the composition every agent binary
+    shares: `serve` connects the Postgres store, builds the runtime, the A2A router and the
+    cross-process notifications, and runs the components a role asks for under an
+    `adam_host::Host`. It also holds the configuration the binaries have in common
+    (`ServiceConfig`, `ModelConfig`, `McpSettings`) and the exit codes. It does not know what an
+    agent does: a binary hands it the agent's name, its card and a closure that registers it.
 * **Agents.**
   * `adam-llm-agent` is a reusable model-and-tools loop written as an
     `adam_runtime::Agent`.
   * `adam-coder` is the coder agent and the only binary. It is a composition
-    root: it wires the pieces below it.
+    root: it wires the pieces below it, and `adam-service` runs the process.
 * **Authoring.**
   * `adam-macros` is the `#[tool]` attribute macro: a proc-macro crate whose
     expansion is a pure function over token streams. It depends on `syn`,
@@ -483,11 +499,14 @@ Rules the code follows, from the crate docs:
 ### How a binary composes them
 
 `adam-coder` is the composition root. Its `serve` function
-(`bin/adam-coder/src/serve.rs`) is the whole process, and `main` is
+(`bin/adam-coder/src/serve.rs`) reads the agent files, builds the coder's agent (the model client,
+GitHub, the workspaces, the MCP servers of the folder) and hands it to
+[`adam-service`](../crates/adam-service/README.md)'s `serve`, which is the rest of the process; `main` is
 `serve(Config::from_env(), sigterm)`. To use MongoDB, another model client or
-another code host, write another root that builds the same pieces.
+another code host, write another root that builds the same pieces. A second binary,
+over another agent, is the same two steps with another agent.
 
-`serve` does not supervise anything by hand. It builds the pieces, registers what
+`adam_service::serve` does not supervise anything by hand. It builds the pieces, registers what
 the process runs as components of an `adam_host::Host`, and calls `run`. The
 `ROLE` variable, parsed with `adam_host::Role`, decides which components run.
 
@@ -497,19 +516,25 @@ flowchart LR
 
     subgraph serve["adam-coder: serve()"]
         direction LR
-        pg["PgStore::connect + migrate()<br/>as DynStore"]
         subgraph wcfg["roles that run workers (all, worker): Config::worker is Some, build_agent()"]
             direction LR
-            mdl["OpenAiCompatible::new<br/>as DynModel"]
+            mdl["ModelConfig::client<br/>OpenAiCompatible as DynModel"]
             creds["ScopedToken<br/>as DynGitCredentials"]
             wsp["Workspaces::new<br/>allow_hosts, allow_local"]
             gh["GitHub::new(creds)<br/>as DynCodeHost"]
             tenv["ToolEnv<br/>workspaces + code host + settings + Redactor"]
-            agent["CoderAgent::new<br/>model + ToolEnv"]
+            mcp["AgentDef::connect_mcp<br/>the folder's mcp.json, McpSettings policy"]
+            agent["CoderAgent::try_from_def<br/>model + ToolEnv + MCP tools"]
         end
         starter["CoderStarter<br/>name + init only<br/>(role control-plane: no model, no GitHub)"]
+        agents["Agents { name, card, register, options }"]
+    end
+
+    subgraph svc["adam-service: serve(ServiceConfig, Agents, shutdown)"]
+        direction LR
+        pg["PgStore::connect + migrate()<br/>as DynStore"]
         pgn["PgNotify::new(store pool, BroadcastSink)<br/>LiveSignals: PgEventSink + PgNotifier"]
-        coder["Coder<br/>Coder::new_with(store, agent, live) or<br/>Coder::control_plane_with(store, live)"]
+        service["Service::new_with(register(Runtime::builder(store)), name, options, live)"]
         rtm["Runtime<br/>PgEventSink as EventSink, PgNotifier as Notifier"]
         bk["RuntimeTaskBackend"]
         router["A2aServer::router<br/>card + backend + AuthConfig"]
@@ -518,35 +543,38 @@ flowchart LR
         ntf["component notify<br/>PgNotify::run<br/>(worker component in all and worker,<br/>control-plane component in control-plane)"]
         hlt["worker component health<br/>A2aServer::health_router<br/>(role worker only)"]
         host["Host::new(role)<br/>.run(shutdown)"]
-
-        creds --> wsp
-        creds --> gh
-        wsp --> tenv
-        gh --> tenv
-        tenv --> agent
-        mdl --> agent
-        agent -- "all, worker" --> coder
-        starter -- "control-plane" --> coder
-        pg --> coder
-        pg -- "pool" --> pgn
-        pgn --> coder
-        pgn --> ntf
-        coder --> rtm
-        coder --> bk
-        bk --> router
-        router --> cp
-        rtm --> wrk
-        cp --> host
-        wrk --> host
-        ntf --> host
-        hlt --> host
     end
+
+    serve --> svc
+    creds --> wsp
+    creds --> gh
+    wsp --> tenv
+    gh --> tenv
+    tenv --> agent
+    mdl --> agent
+    mcp --> agent
+    agent -- "all, worker" --> agents
+    starter -- "control-plane" --> agents
+    agents --> service
+    pg --> service
+    pg -- "pool" --> pgn
+    pgn --> service
+    pgn --> ntf
+    service --> rtm
+    service --> bk
+    bk --> router
+    router --> cp
+    rtm --> wrk
+    cp --> host
+    wrk --> host
+    ntf --> host
+    hlt --> host
 ```
 
 | `ROLE` | Components that run | Needs |
 |---|---|---|
 | `all` (default) | `a2a-server`, `worker` and `notify`: one process, as before | every variable |
-| `control-plane` | `a2a-server` and `notify`, over `Coder::control_plane_with`: a `Runtime` with the agent's `CoderStarter` only, which starts, delivers, cancels and views runs; `run_worker` is never called | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variables, and no workspace root is created |
+| `control-plane` | `a2a-server` and `notify`, over a `Service` whose `Runtime` has the agent's `CoderStarter` only (`Coder::control_plane_with`), which starts, delivers, cancels and views runs; `run_worker` is never called | `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`; no model, GitHub or workspace variables, and no workspace root is created |
 | `worker` | `worker` (`run_worker`), `notify` and `health` (`GET /healthz` on `LISTEN_ADDR`, no A2A) | everything except `A2A_BEARER_TOKENS` and `PUBLIC_URL` |
 
 Only the roles that run workers hold the model, GitHub and workspace settings. Starting a run
@@ -554,7 +582,7 @@ needs the agent's name and its `init` and nothing else, so the control plane reg
 `CoderStarter` (an `adam_runtime::AgentStarter`, `RuntimeBuilder::starter`) instead of the
 `CoderAgent`, and `Config::worker` is `None` for it: no model client, GitHub client or
 workspaces are built, and none of their variables is read
-(`bin/adam-coder/src/serve.rs`, `config.rs`). The runtime claims only registered agents, so
+(`bin/adam-coder/src/serve.rs`, `config.rs`; the components, `crates/adam-service/src/serve.rs`). The runtime claims only registered agents, so
 a control plane never steps a run even if `run_worker` were called. `CoderAgent::init`
 delegates to `CoderStarter`, so both start a run with the same state. The two roles meet in the Postgres store: the run record with its version
 compare-and-swap, and leases, which is what makes them correct. They also meet in `NOTIFY`
@@ -592,7 +620,7 @@ by `adam-coder` from `WORKSPACE_PLACEMENT`:
 | `a2a-only` | none | `Any` | refused by `adam-coder` (its tools need a workspace) |
 
 `serve` maps `Placement::pins_runs()` to `RuntimeOptions::claim_scope`
-(`bin/adam-coder/src/serve.rs`), and `RuntimeBuilder::claim_scope` to the claim. The store keeps
+(`bin/adam-coder/src/serve.rs`, `adam_service::claim_scope_for`), and `RuntimeBuilder::claim_scope` to the claim. The store keeps
 the **owner** of a run beside its lease (`runs.owner` in Postgres, `owner` in MongoDB), set by the
 first pinned claim and never cleared by a release or a commit:
 
@@ -928,7 +956,7 @@ sequenceDiagram
     participant WN as Worker PgNotify
     participant W as Worker<br/>run_worker + Agent.step
 
-    Note over F,W: adam-coder serve wires one PgNotify per process,<br/>the component notify, in every role
+    Note over F,W: adam-service serve wires one PgNotify per process,<br/>the component notify, in every role
     C->>F: SendStreamingMessage
     F->>DB: create_run (Runnable)
     F-)FN: publish Signal Runnable (queued, never waits)
@@ -973,7 +1001,7 @@ What the diagram cannot say:
   transaction-mode pooler in front of it.
 * **Not built here:** MongoDB has no equivalent (no change streams on a standalone
   `mongod`), so it keeps polling; `adam-coder` is Postgres only and uses the crate in
-  every role (`bin/adam-coder/src/serve.rs`, and its `binary.rs` test of a control plane
+  every role (`crates/adam-service/src/serve.rs`, and the coder's `binary.rs` test of a control plane
   and a worker in two processes, which sees the worker's progress in the front's stream).
 
 The listener's lifecycle (`crates/adam-notify-postgres/src/lib.rs`, `listen_loop`
@@ -1499,7 +1527,9 @@ Where each decision is made:
   `BackendError::NotCancelable`, which the backend raises when `CancelTask`
   targets a task that is finished and not already canceled.
 * **The exit code** is chosen by `adam_coder::exit_code`
-  (`bin/adam-coder/src/exit.rs`). It walks the `anyhow` chain from the
+  (`bin/adam-coder/src/exit.rs`), which is `adam_service::exit_code_with`
+  (`crates/adam-service/src/exit.rs`) plus the coder's own errors (a workspace, the agent
+  files). It walks the `anyhow` chain from the
   outside in and takes the first match. A `ConfigError` is 78. A typed error
   (`StoreError`, `OpenAiConfigError`, `WorkspaceError`, `RuntimeError`,
   `StoppedUnexpectedly`) is decided by its class, as in the diagram. A panicked

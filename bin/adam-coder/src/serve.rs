@@ -1,61 +1,45 @@
-//! The coder as one process: [`serve`] composes the Postgres store from a [`Config`] and, for the
-//! roles that run workers, the model, GitHub and the workspaces, and runs the halves its
-//! [`adam_host::Role`] asks for until told to stop.
+//! The coder as one process: [`serve`] reads the agent files, assembles the agent (for the roles
+//! that run workers: the model, GitHub and the workspaces) and hands it to [`adam_service::serve`],
+//! which connects Postgres and runs the halves its [`adam_host::Role`] asks for until told to stop.
 //!
-//! The binary is `serve(Config::from_env()?, sigterm)` and nothing else; tests
-//! drive it with their own shutdown future. The halves are components of an
-//! [`adam_host::Host`], which starts only the ones the role runs and stops them
-//! in a fixed order.
+//! The binary is `serve(Config::from_env()?, sigterm)` and nothing else; tests drive it with their
+//! own shutdown future. Everything that is not the coder's (the store, the notifications, the
+//! components of a role, the drain) is [`adam_service`]; see its README for the process.
 //!
 //! Before anything connects, `serve` reads the agent files ([`AgentFiles`]: the folder
 //! `ADAM_AGENT_DIR` names, else the embedded copy) for every role, logs what it runs (`agent files`:
 //! source, path, digest, agent, warning count; then each warning) and refuses a folder with errors.
-//! The control plane serves the card of those files, and the workers assemble the agent from them.
+//! The control plane serves the card of those files, and the workers assemble the agent from them,
+//! connecting the MCP servers of the folder's `mcp.json` first.
 //!
 //! | Role | Components | Also |
 //! |---|---|---|
 //! | `all` (default) | `a2a-server` (control plane), `worker`, `notify` | |
 //! | `control-plane` | `a2a-server`, `notify` | [`Coder::control_plane_with`]: a runtime with the agent's starter only, no model or GitHub configuration |
-//! | `worker` | `worker`, `health`, `notify` | `/healthz` on [`Config::listen_addr`], no A2A |
+//! | `worker` | `worker`, `health`, `notify` | `/healthz` on [`ServiceConfig::listen_addr`](adam_service::ServiceConfig::listen_addr), no A2A |
 //!
-//! `notify` is the [`adam_notify_postgres::PgNotify`] listener and publisher: live events and
+//! `notify` is the `adam_notify_postgres::PgNotify` listener and publisher: live events and
 //! wake-up/cancel signals cross processes over Postgres `LISTEN`/`NOTIFY`, so a worker takes a
 //! run another process started at once instead of at its next poll, and a control plane streams
 //! the progress of a run a worker steps as it happens. It is a latency optimisation: polling
-//! stays on and correctness never depends on a notification (see `adam-notify-postgres`). With a
-//! worker it stops only after the worker has finished, then sends what is still queued for up to
-//! `adam_notify_postgres::DRAIN_ON_STOP`, so the last step's events and signals normally still
-//! reach other processes (best effort, like any notification).
+//! stays on and correctness never depends on a notification (see `adam-notify-postgres`).
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
-use adam_a2a::{A2aServer, AuthConfig};
-use adam_core::{ClaimScope, DynStore};
-use adam_host::{Host, Placement};
 use adam_model::DynModel;
-use adam_model_openai::{OpenAiCompatible, OpenAiConfig};
-use adam_notify_postgres::PgNotify;
-use adam_runtime::BroadcastSink;
-use adam_store_postgres::PgStore;
+use adam_service::{Agents, RuntimeOptions, claim_scope_for};
 use adam_workspace::{DynCodeHost, GitHub, GitIdentity};
 use anyhow::Context as _;
-use secrecy::ExposeSecret as _;
-use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
 
+use crate::agent::CoderStarter;
 use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 use crate::repos::workspaces_for;
 use crate::{
-    AgentFiles, Coder, CoderAgent, CoderSettings, Config, LiveSignals, RuntimeOptions, ToolEnv,
-    WorkerConfig, agent_card_from, coder_tools,
+    AGENT_NAME, AgentFiles, CoderAgent, CoderSettings, Config, ToolEnv, WorkerConfig,
+    agent_card_from, coder_tools,
 };
-
-/// How long open connections (SSE streams never end on their own) get to
-/// finish after the shutdown signal before the server is dropped.
-const SERVER_DRAIN: Duration = Duration::from_secs(10);
 
 /// The complete coder agent for a role that runs workers: the model client, the GitHub client and
 /// the workspaces, assembled from `files`. The clients are only constructed here; nothing calls the
@@ -67,18 +51,18 @@ async fn build_agent(
     redactor: Redactor,
     files: &AgentFiles,
 ) -> anyhow::Result<CoderAgent> {
-    let model: DynModel = Arc::new(
-        OpenAiCompatible::new(OpenAiConfig::new(
-            worker.model_base_url.clone(),
-            worker.model_api_key.clone(),
-        ))
-        .context("building the model client")?,
-    );
+    let model: DynModel = worker.model.client().context("building the model client")?;
 
     let root = worker.placed_root();
     tokio::fs::create_dir_all(&root)
         .await
         .with_context(|| format!("creating {}", root.display()))?;
+    tracing::info!(
+        placement = worker.placement.as_str(),
+        worker_id = worker.worker_id.as_deref(),
+        root = %root.display(),
+        "workspace placement"
+    );
     let (workspaces, creds) = workspaces_for(worker);
     let code_host: DynCodeHost = Arc::new(
         GitHub::new(creds)
@@ -88,7 +72,7 @@ async fn build_agent(
 
     let mut settings = CoderSettings::new(OpenCodeLaunch::from_command(
         &worker.opencode_command,
-        &worker.model_base_url,
+        &worker.model.base_url,
         &worker.opencode_model,
     ));
     settings.max_check_cycles = worker.max_check_cycles;
@@ -120,40 +104,26 @@ async fn build_agent(
     // either is a startup error, not a panic. The error is unboxed so its class (exit 78 for a
     // mistake in the files) reaches `exit_code`.
     let tools = coder_tools(&env);
-    CoderAgent::try_from_def(def, model, worker.model.clone(), env, tools)
+    CoderAgent::try_from_def(def, model, worker.model.alias.clone(), env, tools)
         .map_err(|e| *e)
         .context("assembling the coder agent")
 }
 
-/// Drive the notifier until `stop`, and log once `LISTEN` is active.
-async fn run_notify(
-    notify: PgNotify,
-    stop: impl Future<Output = ()> + Send,
-) -> Result<(), adam_error::BoxError> {
-    let listening = async {
-        notify.wait_listening().await;
-        tracing::info!("listening for notifications");
-        std::future::pending::<Result<(), adam_notify_postgres::NotifyError>>().await
-    };
-    tokio::select! {
-        result = notify.run(stop) => result.map_err(Into::into),
-        result = listening => result.map_err(Into::into),
-    }
-}
-
-/// Pinned runs for the placements that keep a run's files on one worker, any run otherwise.
-fn claim_scope_for(placement: Placement) -> ClaimScope {
-    if placement.pins_runs() {
-        ClaimScope::Pinned
-    } else {
-        ClaimScope::Any
+/// The runtime options of a worker: its id, how many runs at once, and whose runs it claims (its own
+/// only, for a placement that keeps a run's files on one worker).
+fn options_of(worker: &WorkerConfig) -> RuntimeOptions {
+    RuntimeOptions {
+        worker_id: worker.worker_id.clone(),
+        claim_scope: claim_scope_for(worker.placement),
+        concurrency: worker.workers,
+        ..RuntimeOptions::default()
     }
 }
 
 /// Run the coder until `shutdown` resolves (SIGTERM in the binary).
 ///
-/// Which components run depends on [`Config::role`]; see the module docs. On
-/// shutdown the server stops taking connections (open ones get ten seconds
+/// Which components run depends on [`ServiceConfig::role`](adam_service::ServiceConfig::role); see the
+/// module docs. On shutdown the server stops taking connections (open ones get ten seconds
 /// to finish), and the workers finish and commit the steps they are in
 /// before this returns; a step cut short by a hard kill is picked up by
 /// another replica when its lease expires. If a component stops on its own the
@@ -161,135 +131,40 @@ fn claim_scope_for(placement: Placement) -> ClaimScope {
 ///
 /// # Errors
 ///
-/// Connecting to or migrating Postgres, building the clients, binding
-/// [`Config::listen_addr`], or a component stopping unexpectedly (an
-/// [`adam_host::HostError`], exit code 70). Each error says which step failed
-/// and never contains a credential.
+/// Reading the agent files, building the clients, connecting the MCP servers, connecting to or
+/// migrating Postgres, binding the listen address, or a component stopping unexpectedly (an
+/// [`adam_host::HostError`], exit code 70). Each error says which step failed and never contains a
+/// credential.
 pub async fn serve(
     config: Config,
     shutdown: impl Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
-    let role = config.role;
     // The agent files first, for every role and before anything connects: a folder with a mistake
     // in it stops the process (exit 78) with every diagnostic, whether or not the database is up.
     let files = AgentFiles::load(config.agent_dir.as_deref()).context("reading the agent files")?;
     files.log();
-    let (store, pool): (DynStore, _) = {
-        let store = PgStore::connect(config.database_url.expose_secret())
-            .await
-            .context("connecting to Postgres")?;
-        adam_core::Store::migrate(&store)
-            .await
-            .context("migrating the schema")?;
-        let pool = store.pool().clone();
-        (Arc::new(store), pool)
-    };
 
-    // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own pool. The
-    // listener (`notify.run`) is a host component below; the runtime only holds the two halves.
-    let broadcast = BroadcastSink::default();
-    let notify = PgNotify::new(pool, broadcast.clone());
-    let live = LiveSignals {
-        broadcast,
-        sink: Arc::new(notify.event_sink()),
-        notifier: Some(Arc::new(notify.notifier())),
+    // Only a role that runs workers builds the agent: model, GitHub client, workspaces, MCP
+    // servers. A control plane starts, delivers to, cancels and views runs, which needs the
+    // agent's name and `init` only (`CoderStarter`), so it takes no model or GitHub configuration.
+    let agents = match &config.worker {
+        Some(worker) => {
+            let agent = build_agent(worker, Redactor::from_config(&config), &files).await?;
+            Agents::new(AGENT_NAME, move |builder| agent.register(builder))
+                .options(options_of(worker))
+        }
+        None => Agents::new(AGENT_NAME, |builder| builder.starter(CoderStarter)),
     };
-
-    // Only a role that runs workers builds the agent: model, GitHub client, workspaces. A control
-    // plane starts, delivers to, cancels and views runs, which needs the agent's name and `init`
-    // only (`CoderStarter`), so it takes no model or GitHub configuration.
-    let (coder, workers) = match &config.worker {
-        Some(worker) => (
-            Coder::new_with(
-                store,
-                build_agent(worker, Redactor::from_config(&config), &files).await?,
-                &RuntimeOptions {
-                    worker_id: worker.worker_id.clone(),
-                    claim_scope: claim_scope_for(worker.placement),
-                    concurrency: worker.workers,
-                    ..RuntimeOptions::default()
-                },
-                live,
-            ),
-            Some(worker.workers),
+    // The card of the files this process runs, like the workers' agent.
+    let card = match &config.service.public_url {
+        Some(public_url) => Some(
+            agent_card_from(&files, public_url)
+                .map_err(|e| *e)
+                .context("building the agent card")?,
         ),
-        None => (
-            Coder::control_plane_with(store, &RuntimeOptions::default(), live),
-            None,
-        ),
+        None => None,
     };
 
-    // Bind before anything runs: an address that cannot be bound fails the process at once.
-    let listener = TcpListener::bind(config.listen_addr)
-        .await
-        .with_context(|| format!("binding {}", config.listen_addr))?;
-    // The bound address, not the configured one: `LISTEN_ADDR=…:0` picks a
-    // free port, and this line is how a supervisor (or a test) learns it.
-    let addr = listener.local_addr().context("reading the bound address")?;
-    tracing::info!(
-        %addr,
-        %role,
-        workers,
-        placement = config.worker.as_ref().map(|w| w.placement.as_str()),
-        worker_id = config.worker.as_ref().and_then(|w| w.worker_id.as_deref()),
-        "listening"
-    );
-
-    let host = Host::new(role)
-        .control_plane_drain(Some(SERVER_DRAIN))
-        // Workers are never cut short here; the orchestrator's grace period bounds the wait.
-        .worker_grace(None);
-    let host = if role.runs_control_plane() {
-        let public_url = config
-            .public_url
-            .as_ref()
-            .context("PUBLIC_URL is unset for a role that serves A2A")?;
-        // The card of the files this process runs, like the workers' agent.
-        let card = agent_card_from(&files, public_url)
-            .map_err(|e| *e)
-            .context("building the agent card")?;
-        let app = coder.router_with_card(
-            card,
-            AuthConfig::BearerTokens(config.a2a_bearer_tokens.clone()),
-        );
-        host.control_plane("a2a-server", |stop| async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(stop.cancelled_owned())
-                .await
-                .map_err(Into::into)
-        })
-    } else {
-        // No A2A here, but probes still need an answer: the same `/healthz` the A2A router serves.
-        host.worker("health", |stop| async move {
-            axum::serve(listener, A2aServer::health_router())
-                .with_graceful_shutdown(stop.cancelled_owned())
-                .await
-                .map_err(Into::into)
-        })
-    };
-    // With workers, `notify` is a worker component that stops when the `worker` component is done
-    // (or gone): the host cancels the components of a tier together, and a step finishing after
-    // the cancel still emits events and signals that should be sent. Without workers it stops with
-    // the control plane.
-    let notify_stop = CancellationToken::new();
-    let host = if role.runs_workers() {
-        let runtime = coder.runtime.clone();
-        let done = notify_stop.clone().drop_guard();
-        host.worker("worker", |stop| async move {
-            let _done = done;
-            runtime
-                .run_worker(stop.cancelled_owned())
-                .await
-                .map_err(Into::into)
-        })
-        .worker("notify", |_| {
-            run_notify(notify, notify_stop.cancelled_owned())
-        })
-    } else {
-        host.control_plane("notify", |stop| run_notify(notify, stop.cancelled_owned()))
-    };
-
-    host.run(shutdown).await?;
-    tracing::info!("stopped");
+    adam_service::serve(&config.service, agents.card_if(card), shutdown).await?;
     Ok(())
 }

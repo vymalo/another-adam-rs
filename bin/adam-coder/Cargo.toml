@@ -26,10 +26,8 @@ adam-error.workspace = true
 adam-host.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
-adam-model-openai.workspace = true
-adam-notify-postgres.workspace = true
 adam-runtime.workspace = true
-adam-store-postgres.workspace = true
+adam-service = { workspace = true, features = ["mcp"] }
 adam-workspace.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
@@ -41,7 +39,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "signal"] }
-tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
@@ -53,6 +50,8 @@ adam-agent-fs = { workspace = true, features = ["build"] }
 a2a-client-lf.workspace = true
 a2a-lf.workspace = true
 adam-mcp-testkit.workspace = true
+adam-model-openai.workspace = true
+adam-store-postgres.workspace = true
 adam-workspace = { workspace = true, features = ["test-util"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile.workspace = true

@@ -257,8 +257,8 @@ dependencies = [
  "adam-mcp-testkit",
  "adam-model",
  "adam-model-openai",
- "adam-notify-postgres",
  "adam-runtime",
+ "adam-service",
  "adam-store-postgres",
  "adam-workspace",
  "anyhow",
@@ -273,7 +273,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -470,6 +469,33 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "adam-service"
+version = "0.1.0"
+dependencies = [
+ "a2a-lf",
+ "adam-a2a",
+ "adam-a2a-runtime",
+ "adam-core",
+ "adam-error",
+ "adam-host",
+ "adam-mcp",
+ "adam-model",
+ "adam-model-openai",
+ "adam-notify-postgres",
+ "adam-runtime",
+ "adam-store-postgres",
+ "async-trait",
+ "axum",
+ "secrecy",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
 ]
 
 [[package]]

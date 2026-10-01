@@ -79,16 +79,17 @@ impl Redactor {
     pub fn from_config(config: &Config) -> Self {
         let mut secrets: Vec<String> = Vec::new();
         if let Some(worker) = &config.worker {
-            secrets.push(worker.model_api_key.expose_secret().to_owned());
+            secrets.push(worker.model.api_key.expose_secret().to_owned());
             secrets.push(worker.github_token.expose_secret().to_owned());
         }
         secrets.extend(
             config
+                .service
                 .a2a_bearer_tokens
                 .iter()
                 .map(|t| t.expose_secret().to_owned()),
         );
-        if let Ok(url) = url::Url::parse(config.database_url.expose_secret())
+        if let Ok(url) = url::Url::parse(config.service.database_url.expose_secret())
             && let Some(password) = url.password()
         {
             secrets.push(password.to_owned());

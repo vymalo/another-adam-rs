@@ -580,8 +580,10 @@ crash after it was posted and before the call was journaled posts it again when 
 
 ## Configuration
 
-Environment variables (`src/config.rs` is the reference; every problem is
-reported at once at startup):
+Environment variables (`src/config.rs` is the reference for the coder's own, and
+[`adam-service`](../../crates/adam-service/README.md#environment) for `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`,
+`PUBLIC_URL`, `LISTEN_ADDR`, `WORKERS`, `WORKER_ID`, `MODEL_*` and `MCP_ALLOW_*`, which every agent binary reads the same
+way; every problem is reported at once at startup):
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -638,8 +640,8 @@ its files and whether a run stays on one worker
 | `a2a-only` | | refused: every tool of the coder needs a workspace | |
 
 * A pinning placement (`affinity`, `isolated`) makes `serve` build the runtime with
-  `ClaimScope::Pinned` and `worker_id = WORKER_ID` (`RuntimeOptions::claim_scope`,
-  `RuntimeOptions::worker_id`). The id must survive restarts (a StatefulSet pod name): a run stays
+  `ClaimScope::Pinned` (`adam_service::claim_scope_for`) and `worker_id = WORKER_ID` (`RuntimeOptions::claim_scope`,
+  `RuntimeOptions::worker_id`); a worker logs its `placement`, `worker_id` and `root` (`workspace placement`). The id must survive restarts (a StatefulSet pod name): a run stays
   with the worker of that name. Without `WORKER_ID` the process exits 78, naming the variable.
 * `a2a-only` exits 78 for `all` and `worker`: a host whose agents only call remote agents (the
   orchestrator) can use the placement, the coder cannot. A `control-plane` reads neither variable.
@@ -654,7 +656,10 @@ its files and whether a run stays on one worker
 `ROLE` is parsed with `adam_host::Role` (`all`, `control-plane`, `worker`; case-insensitive;
 unset or blank means `all`). Anything else is a configuration error (exit 78) that names
 `ROLE` and the accepted values. The process registers its parts as components of an
-`adam_host::Host`, which starts only those the role runs.
+`adam_host::Host`, which starts only those the role runs. The components, the store, the
+notifications and the drain are [`adam-service`](../../crates/adam-service/README.md#the-process)'s
+`serve`, shared with every agent binary; `adam-coder` reads its files, builds its agent and hands it over
+(`src/serve.rs`).
 
 | Role | Starts | Listener | Workspace root |
 |---|---|---|---|
@@ -680,7 +685,7 @@ are still sent; a control-plane component in `control-plane`). It logs
 * The control plane's A2A stream carries the `Progress`, `Custom` and `Artifact` events of a
   run a worker steps as they happen, not only the states and artifacts it finds by polling.
 
-It is Postgres only (MongoDB has no equivalent here, and `adam-coder` is Postgres only), needs
+It is Postgres only (MongoDB has no equivalent here, and `adam-service` is Postgres only), needs
 no variable, and changes nothing about correctness: `NOTIFY` is at most once and not durable,
 polling stays on at 250 ms, and a run completes with the listener gone, only later. The
 listener holds one connection of the store's pool, and needs a direct or session-mode
@@ -709,7 +714,7 @@ What a role does not read it does not validate either: a worker ignores `A2A_BEA
 agent's name and its `init`, which `CoderStarter` provides (`CoderAgent::init` delegates to it, so
 the two cannot disagree). `serve` builds the model client, the GitHub client, the workspaces and
 the `CoderAgent` (`build_agent`, which also creates the workspace root) only when
-`Config::worker` is `Some`; otherwise it composes `Coder::control_plane`. A control plane
+`Config::worker` is `Some`; otherwise it registers the starter only (`Coder::control_plane`). A control plane
 never steps a run, so a `run_worker` on it would claim nothing (`adam-runtime` claims only
 registered agents, not starters). The library keeps `Coder::new(store, CoderAgent, ..)` for
 processes that step runs. See [ADR 0001](../../docs/decisions/0001-library-first-host-roles.md),
@@ -779,7 +784,9 @@ or the workers) is an `adam_host::HostError`, which names the component and is
 A failure ends the process with one structured log line, `adam-coder failed`
 (JSON on stdout, fields `error`, the whole scrubbed cause chain, and `code`),
 and nothing on stderr. The exit code (`src/exit.rs`, `exit_code`) comes from
-walking the `anyhow` chain from the outside in and taking the first match:
+walking the `anyhow` chain from the outside in and taking the first match (the walk is
+`adam_service::exit_code_with`, which knows the errors of the service; `src/exit.rs` adds the coder's own, a
+workspace, the agent files and their assembly):
 
 | Exit code | Meaning | Root cause |
 |---|---|---|
@@ -791,7 +798,8 @@ walking the `anyhow` chain from the outside in and taking the first match:
 | 1 | anything else | for example `NotFound`, `Rejected`, `Unauthenticated` (a bad `GITHUB_TOKEN`) or an untyped error |
 
 The typed errors it looks for are `StoreError`, `OpenAiConfigError`,
-`WorkspaceError`, `RuntimeError` and `HostError`. Because the walk goes
+`WorkspaceError`, `RuntimeError`, `HostError`, `AgentFilesError` and the assembly's (including an MCP server
+that is down: 69). Because the walk goes
 outside in, an unreachable Postgres is 69 although an `io::Error` is at the
 bottom of its chain. The values are BSD `sysexits.h`'s, *unverified* (from
 memory).
@@ -874,7 +882,8 @@ database of its own, so the role needs `CREATEDB`):
   answer; `the_display_name_var_is_the_name_in_the_prompt` renames the prompt. The unit tests of `src/files.rs` (a missing folder, every diagnostic
   of a broken one in the message once, another name, warnings), `src/config.rs` (`ADAM_AGENT_DIR` read by every role,
   must be a directory, reported with the other problems) and `src/exit.rs` (78 for the files and their assembly)
-  cover the rest. In `tests/binary.rs`: a missing folder (exit 78, names the variable), a folder with two broken
+  cover the rest (the exit-code walk, the shared configuration, the roles' components and the Postgres-backed `serve`
+  are tested in [`adam-service`](../../crates/adam-service/README.md#tests); here only what the coder adds). In `tests/binary.rs`: a missing folder (exit 78, names the variable), a folder with two broken
   subagents (exit 78 for every role, before anything connects, both findings as `path:line` in the one failure line),
   another agent's name, a worker whose folder cannot be assembled (exit 78, names the var; Postgres), a control
   plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the

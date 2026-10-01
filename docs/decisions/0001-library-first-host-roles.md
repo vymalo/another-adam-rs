@@ -4,6 +4,11 @@ Status: **Accepted** (2026-09-29). The owner answered the open questions the sam
 questions stayed open: cross-process events (*resolved 2026-09-29, see below*), and the exact
 workspace placement enum (*resolved 2026-09-29: decided in [ADR 0002](0002-workspace-placement.md)*).
 
+*Status note 2026-10-01: built. The composition that ran the two halves by hand in `adam-coder`'s
+`serve.rs` is now [`adam-service`](../../crates/adam-service/README.md), shared by every agent
+binary: `serve` registers the components of a role on an `adam_host::Host` exactly as described
+here, over the store and the notifications, and a binary only hands it the agent it serves.*
+
 ## Context
 
 adam-rs started as a framework with one binary, `adam-coder`. Its `serve.rs` runs two halves

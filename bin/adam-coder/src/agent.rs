@@ -9,7 +9,8 @@ use adam_error::report;
 use adam_llm_agent::{Conversation, DynTool, LlmStarter, ToolSet};
 use adam_model::{DynModel, Message, ToolCall};
 use adam_runtime::{
-    Agent, AgentError, AgentStarter, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent, Transition,
+    Agent, AgentError, AgentStarter, Ctx, Inbound, RUN_FINISHED_KIND, RunEvent, RuntimeBuilder,
+    Transition,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -232,6 +233,17 @@ impl CoderAgent {
     /// tools that need no worktree.
     pub fn subagents(&self) -> &[adam_llm_agent::LlmAgent] {
         self.assembly.agents().get(1..).unwrap_or_default()
+    }
+
+    /// Register the agent on a runtime builder: the coder, and the subagents of its folder beside it
+    /// ([`subagents`](Self::subagents)). What [`Coder::new_with`](crate::Coder::new_with) and the
+    /// binary's `serve` put on the runtime of a process that steps runs.
+    pub fn register(self, builder: RuntimeBuilder) -> RuntimeBuilder {
+        let builder = self
+            .subagents()
+            .iter()
+            .fold(builder, |builder, sub| builder.agent(sub.clone()));
+        builder.agent(self)
     }
 
     /// What the agent was assembled from: the prompt the model sees, the limits, the tools it is

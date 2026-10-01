@@ -25,9 +25,9 @@
 //! | [`files`] | [`AgentFiles`]: where those files come from, the embedded copy or a folder read once at startup, and why a folder is refused ([`AgentFilesError`]) |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
-//! | [`app`] | [`Coder`]: runtime + A2A backend + router; [`Coder::control_plane`] for a process that only starts runs; [`LiveSignals`]: events and wake-up signals, in-process or across processes |
-//! | [`config`] | the binary's environment variables |
-//! | [`serve()`] | the whole process: store, model, GitHub, and the A2A server and workers its `ROLE` runs (through `adam_host::Host`), until a shutdown future resolves |
+//! | [`app`] | [`Coder`]: runtime + A2A backend + router (an [`adam_service::Service`] for the coder's agent); [`Coder::control_plane`] for a process that only starts runs; [`LiveSignals`]: events and wake-up signals, in-process or across processes (from `adam-service`) |
+//! | [`config`] | the binary's environment variables (the ones every agent binary shares are `adam-service`'s) |
+//! | [`serve()`] | the whole process: the agent files, the model, GitHub, the workspaces and the MCP servers, then `adam_service::serve` for the store and the A2A server and workers its `ROLE` runs (through `adam_host::Host`), until a shutdown future resolves |
 //!
 //! # Composition
 //!

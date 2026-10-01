@@ -34,6 +34,7 @@ adam-model-openai = { path = "crates/adam-model-openai", version = "0.1.0" }
 adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.1.0" }
 adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.1.0" }
 adam-runtime = { path = "crates/adam-runtime", version = "0.1.0" }
+adam-service = { path = "crates/adam-service", version = "0.1.0" }
 adam-store-postgres = { path = "crates/adam-store-postgres", version = "0.1.0" }
 adam-store-testkit = { path = "crates/adam-store-testkit", version = "0.1.0" }
 adam-workspace = { path = "crates/adam-workspace", version = "0.1.0" }
