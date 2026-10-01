@@ -112,7 +112,8 @@ async fn build_agent(
     // mistake in the files) reaches `exit_code`.
     let tools = coder_tools(&env);
     // The workspaces of finished runs are swept from this worker's volume.
-    let janitor = Janitor::new(env.workspaces.clone(), worker.workspace_sweep);
+    let janitor = Janitor::new(env.workspaces.clone(), worker.workspace_sweep)
+        .with_environment(env.environment.clone());
     let agent = CoderAgent::try_from_def(def, model, worker.model.alias.clone(), env, tools)
         .map_err(|e| *e)
         .context("assembling the coder agent")?;

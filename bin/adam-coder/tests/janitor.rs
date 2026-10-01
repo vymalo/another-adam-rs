@@ -5,13 +5,14 @@
 
 mod common;
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use adam_coder::Janitor;
 use adam_coder::tools::RunNotes;
 use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus, RunUpdate};
 use adam_workspace::RepoRef;
-use common::Fixture;
+use common::{FakeEnvironment, Fixture};
 use serde_json::json;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -238,5 +239,124 @@ async fn a_janitor_that_is_off_waits_for_the_stop_and_removes_nothing() {
             .unwrap()
             .unwrap()
             .is_ok()
+    );
+}
+
+/// A fixture whose janitor holds `fake` as its environment.
+fn janitor_with(fx: &Fixture, fake: &Arc<FakeEnvironment>) -> Janitor {
+    Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)))
+        .with_environment(fake.clone())
+}
+
+/// The environment of a run that is over is released **before** its workspace is removed, and an
+/// open run's is not touched.
+#[tokio::test]
+async fn the_environment_of_a_finished_run_is_released_before_its_workspace_is_removed() {
+    let fx = Fixture::new("hello\n").await;
+    let fake = FakeEnvironment::new(Some(&fx.root));
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let done = run_in(&store, RunStatus::Done).await.to_string();
+    let unknown = RunId::new().to_string();
+    let parked = run_in(&store, RunStatus::Parked).await.to_string();
+    for run in [&done, &unknown, &parked] {
+        workspace_of(&fx, run).await;
+    }
+
+    let report = janitor_with(&fx, &fake)
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert!(report.failed.is_empty(), "{report:?}");
+    let mut released = fake.released.lock().unwrap().clone();
+    released.sort();
+    let mut want = vec![(done.clone(), true), (unknown.clone(), true)];
+    want.sort();
+    assert_eq!(
+        released, want,
+        "released while the workspace was still there, and never for the open run"
+    );
+    assert!(!workspace_dir(&fx, &done).exists());
+    assert!(!workspace_dir(&fx, &unknown).exists());
+    assert!(workspace_dir(&fx, &parked).is_dir());
+}
+
+/// A workspace that an environment could not let go of stays, and goes at the next sweep.
+#[tokio::test]
+async fn a_release_that_fails_keeps_the_workspace_for_the_next_sweep() {
+    let fx = Fixture::new("hello\n").await;
+    let fake = FakeEnvironment::new(Some(&fx.root));
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let done = run_in(&store, RunStatus::Done).await.to_string();
+    workspace_of(&fx, &done).await;
+    let janitor = janitor_with(&fx, &fake);
+
+    fake.release_fails.store(true, Ordering::SeqCst);
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert_eq!(report.failed, std::slice::from_ref(&done), "{report:?}");
+    assert!(report.removed.is_empty(), "{report:?}");
+    assert!(
+        workspace_dir(&fx, &done).join("remote/README.md").is_file(),
+        "the files an environment may still hold stay"
+    );
+
+    fake.release_fails.store(false, Ordering::SeqCst);
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert_eq!(report.removed, std::slice::from_ref(&done), "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert!(!workspace_dir(&fx, &done).exists());
+}
+
+/// What an environment still holds for a run that is over is released even when the run has no
+/// workspace here (a crash left it), and what it holds for an open run, or for something that is not
+/// a run, is not.
+#[tokio::test]
+async fn what_an_environment_holds_for_runs_that_are_over_is_released_without_a_workspace() {
+    let fx = Fixture::new("hello\n").await;
+    let fake = FakeEnvironment::new(Some(&fx.root));
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let finished = run_in(&store, RunStatus::Failed).await.to_string();
+    let unknown = RunId::new().to_string();
+    let open = run_in(&store, RunStatus::Runnable).await.to_string();
+    // This one has a workspace as well: it is released once, by the loop over workspaces.
+    let with_files = run_in(&store, RunStatus::Done).await.to_string();
+    workspace_of(&fx, &with_files).await;
+    *fake.held.lock().unwrap() = vec![
+        finished.clone(),
+        unknown.clone(),
+        open.clone(),
+        with_files.clone(),
+        "not-a-run".to_owned(),
+    ];
+
+    let report = janitor_with(&fx, &fake)
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    let mut orphans = report.orphans.clone();
+    orphans.sort();
+    let mut want = vec![finished.clone(), unknown.clone()];
+    want.sort();
+    assert_eq!(orphans, want, "{report:?}");
+    assert_eq!(
+        report.removed,
+        std::slice::from_ref(&with_files),
+        "{report:?}"
+    );
+    assert!(report.failed.is_empty(), "{report:?}");
+    let released = fake.released.lock().unwrap().clone();
+    assert_eq!(
+        released
+            .iter()
+            .filter(|(run, _)| *run == with_files)
+            .count(),
+        1,
+        "released once: {released:?}"
+    );
+    assert_eq!(
+        *fake.held.lock().unwrap(),
+        [open, "not-a-run".to_owned()],
+        "what is left held is the open run's and what is not a run's"
     );
 }

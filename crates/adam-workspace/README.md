@@ -8,9 +8,10 @@ several repositories and scratch projects ([below](#a-runs-workspace-slots-scrat
 
 The **workspace and code-host layer** of the coder agent, used by
 [`adam-coder`](../../bin/adam-coder/README.md) (and by anything that wants isolated
-worktrees). It defines two ports, `GitCredentials` and `CodeHost`, and ships
+worktrees). It defines three ports, `GitCredentials`, `CodeHost` and `Environment` (where a run's
+processes run, [below](#where-a-runs-processes-run-the-environment-port)), and ships
 their implementations in the same crate (`StaticToken`, `ScopedToken`,
-`GitHub`; `MemoryCodeHost` for tests). Nothing implementation-specific appears
+`GitHub`; `MemoryCodeHost` for tests; `Local`). Nothing implementation-specific appears
 in a trait signature. It shells out to the `git` CLI so mirrors, worktrees and
 authentication behave like the real tool.
 
@@ -21,6 +22,12 @@ authentication behave like the real tool.
 | `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, **`run(run)`** (a run's workspace, below), **`runs()`** (the runs that have one on disk), **`remote_is_empty(url)`**, **`initialize_empty(&RepoRef, &GitIdentity)`**, **`wait_reachable(url, Duration)`**, `default_branch(url)`, `remove(run)` (everything of the run's workspace, the legacy worktree included), and the single-repository helpers `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `open_existing(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
 | `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, `remove()`; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)` and `files()` |
 | `copy_into(&Scratch, &Worktree, path, overwrite)`, `CopyReport`, `Collision` | the files of a scratch project into a worktree, all or nothing: `copied`, `unchanged`, `collisions` |
+| `Environment` (trait), `DynEnvironment`, `Local` | where a run's processes run: `ensure(&RunWorkspace, &dyn EnvProgress)` gives the run's `EnvSession` (made on first need, then the same), `release(run)` (idempotent), `held_runs()`. `Local` is the caller's own container and holds nothing |
+| `EnvSession` (trait), `LocalSession` | `describe()`, `prepare(&ExecSpec)` (the command to spawn), `kill(&ExecId)`, `secret_ref(name)` |
+| `ExecSpec`, `Program`, `PreparedCommand`, `ExecId`, `SecretRef` | what to run (`ExecSpec::shell(command, cwd)` or `::argv(..)`, `.env(..)`, `.hide(names)`), the command an environment made of it (`PreparedCommand::command()` is a `tokio::process::Command` with its program, arguments, directory and environment), and how a process reads a secret (`SecretRef::Env` or `File`) |
+| `EnvProgress` (trait), `EnvStep`, `EnvStepState`, `NoProgress`, `EnvKind`, `EnvDescription` | the steps of a slow `ensure`, and what an environment says it is |
+| `EnvError` | `Unavailable`, `Config { file, reason }`, `Refused`, `Build { reason, log_tail }`, `Timeout { phase, secs }`, `Lost`, `Io`; `#[non_exhaustive]`, see *Errors* |
+| `login_shell()` | `bash` where the image has one, else `sh` (the shell of a `Program::Shell`) |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
 | `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `dir` (the slot's name), `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` (the run's own branch), `publish` (moves the continued branch) |
 | `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files |
@@ -166,6 +173,65 @@ stateDiagram-v2
   Removed --> [*]
 ```
 
+## Where a run's processes run: the environment port
+
+A run's files are a workspace, and the processes that act on them (the project's checks, a command to look
+around, a coding agent) run somewhere. Until now that was always the caller's own container. `Environment` is the
+seam that lets it be somewhere else without the callers changing; `Local` is the one implementation here and
+behaves as the callers always did. A caller describes what to run (`ExecSpec`), asks the run's `EnvSession` to
+`prepare` it, and spawns what comes back (`PreparedCommand`) in its own process group. **Paths are the same in
+every environment** (`cwd` is absolute and inside a slot of the run), which keeps working directories, file
+requests and the git snapshots valid without any mapping. What stays in the caller whatever the environment is:
+all git work, and the file tools (they act on the shared files).
+
+```mermaid
+sequenceDiagram
+  participant C as caller (the coder's tools)
+  participant E as Environment
+  participant S as EnvSession
+  participant J as janitor
+  C->>E: ensure(workspace, progress)
+  E-->>C: steps while it is made (pull, build, start)
+  E-->>C: the run's session, the same one on the next call
+  C->>S: prepare(ExecSpec: program, cwd, env, hide)
+  S-->>C: PreparedCommand (program, args, cwd, env, env_clear, env_remove, exec id)
+  C->>C: spawn it in a process group of its own
+  alt the command times out, or the run is cancelled
+    C->>C: kill the process group
+    C->>S: kill(exec id)
+  end
+  J->>E: release(run), before the workspace is removed
+  J->>E: held_runs(), release what a crash left
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Unmade: a run starts
+  Unmade --> Made: ensure (single-flight per run)
+  Unmade --> Failed: ensure fails (Unavailable, Config, Build, Timeout)
+  Failed --> Unmade: the next call tries again, or the caller says otherwise
+  Made --> Made: prepare, spawn, kill
+  Made --> Lost: the environment vanished (Lost)
+  Lost --> Unmade: ensure makes it again
+  Made --> Released: release(run)
+  Failed --> Released: release(run)
+  Released --> [*]
+```
+
+* `ExecSpec.env` is **never a secret**. A secret is given by reference: `EnvSession::secret_ref("model-key")` says how a
+  process in that environment reads it (`Local`: the variable `MODEL_API_KEY` that the process inherits), so no secret is
+  ever in an argument list.
+* `ExecSpec.hide` names variables of the caller's own environment that the process must not see (the caller's secrets).
+  `Local` passes them as `env_remove` and keeps the rest of the environment (`env_clear` false); an environment that starts
+  a process with nothing of the caller's has nothing to hide and sets `env_clear`. A name in both `env` and `hide` is hidden.
+* `kill` is for what lives where the caller cannot reach; the caller has already killed the process it spawned, so `Local`'s
+  is a no-op. `release` is idempotent, and the janitor calls it before it removes the workspace; `held_runs` lets an orphan
+  sweep find what a crash left (`Local` holds nothing).
+* `ensure` may be slow (an image to build): it reports `EnvStep`s through `EnvProgress`, which the caller shows. It is
+  single-flight per run, and a caller may drop its future.
+* An implementation that runs processes in a container is a crate of its own (ADR 0009 of the orchestration layer: swapped
+  at build time); this crate holds the port and `Local` only.
+
 ## Sharing a root between processes
 
 Several worker processes may use one root (the `shared` placement of
@@ -212,6 +278,10 @@ another run's**, so the locks cannot wait on each other in a circle.
 | `Conflict` (the run id is bound to another repository; a slot name is taken; the remote is not empty) | `Rejected` |
 | `Corrupt` | `Corrupt` |
 | `Git`, `Http`, `Io` | `Internal` |
+
+`EnvError` implements `Classify` too: `Unavailable`, `Lost` and `Timeout` are `Transient` (worth another try), `Config`,
+`Refused` and `Build` are `Invalid` (the repository's configuration or the request is at fault), `Io` is `Internal`. No
+variant carries a secret; `Build` carries the end of the build's output, which the caller scrubs.
 
 Only `Transient` and `RateLimited` are retryable. The `GitHub` code host
 answers HTTP 429, and a 403 that GitHub marks as a rate limit, with
@@ -265,6 +335,10 @@ Offline. The `git` CLI must be on `PATH`.
   the mirror, repeatable, unreadable metadata); `runs`; and
   `two_workspaces_on_one_root_add_slots_without_clashing` (two handles, six repositories, one run from both: six slots, six
   distinct places in the order, no git lock error).
+* `src/environment.rs`: `Local` (a shell command as a login shell that keeps the caller's environment and removes what
+  was hidden, a program and its arguments as they are, an empty `argv` refused, an id of its own for each command,
+  `describe`, `secret_ref`, nothing held, `release` twice), `PreparedCommand::command` (what is hidden stays hidden even
+  when the spec sets it; `env_clear` starts from nothing), the error classes, and `login_shell`.
 * `tests/github.rs`: the `GitHub` code host against a `wiremock` server,
   including the match on head and base and the comment on a pull request, error classes, `Retry-After` and transport source chains.
 * Unit tests in `src/error.rs` (`class_table` and the source-chain checks) and

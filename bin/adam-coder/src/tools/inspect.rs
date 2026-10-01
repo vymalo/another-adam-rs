@@ -25,8 +25,8 @@ use super::gitcli::{
     RepoState, git_stdout, head_ref, head_sha, repo_state, restore_repo_state, restore_worktree,
     status_text, working_tree_id,
 };
-use super::shell::{ShellOutcome, missing_tool, resolve_cwd, run_shell};
-use super::{Outcome, ToolEnv, non_empty};
+use super::shell::{ShellOutcome, missing_tool, resolve_cwd, run_in, shell_spec};
+use super::{Outcome, ToolEnv, non_empty, run_error};
 
 /// Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`,
 /// `ls`, `cat README.md`, `grep -rn name src`. You get the exit code and the tail of the output.
@@ -56,6 +56,9 @@ pub async fn run_command(
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
 
+    // Where it runs; made before the worktree is looked at, since it may take a while.
+    let environment = env.session(ctx).await?;
+
     // What the worktree is before the command: nothing it does may change it.
     let Some(before) = Snapshot::take(wt.path()).await else {
         return Ok(ToolOutput::error(
@@ -67,14 +70,14 @@ pub async fn run_command(
     let redactor = &env.redactor;
     let shown = redactor.scrub(command).into_owned();
     ctx.emit_progress(format!("running: {shown}")).await;
-    let mut outcome = run_shell(
-        &dir,
-        command,
+    let mut outcome = run_in(
+        &*environment,
+        shell_spec(&dir, command),
         env.settings.check_timeout,
         env.settings.check_output_tail,
     )
     .await
-    .map_err(|e| ToolError::Transient(format!("cannot start the shell: {e}")))?;
+    .map_err(|e| run_error(redactor, &e))?;
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
 
     // Did it change anything it should not have?

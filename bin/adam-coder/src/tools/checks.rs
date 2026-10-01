@@ -29,9 +29,10 @@ use crate::redact::Redactor;
 
 use super::notes::CheckRecord;
 use super::shell::{
-    MissingTool, ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, run_shell,
+    MissingTool, ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, run_in,
+    shell_spec,
 };
-use super::{Outcome, ToolEnv, non_empty, notes_error};
+use super::{Outcome, ToolEnv, non_empty, notes_error, run_error};
 
 /// The name of the artifact `run_checks` emits.
 pub const CHECKS_ARTIFACT: &str = "checks";
@@ -501,14 +502,15 @@ pub async fn run_checks(
     let redactor = &env.redactor;
     let shown = redactor.scrub(command).into_owned();
     ctx.emit_progress(format!("running checks: {shown}")).await;
-    let mut outcome = run_shell(
-        &dir,
-        command,
+    let environment = env.session(ctx).await?;
+    let mut outcome = run_in(
+        &*environment,
+        shell_spec(&dir, command),
         env.settings.check_timeout,
         env.settings.check_output_tail,
     )
     .await
-    .map_err(|e| ToolError::Transient(format!("cannot start the shell: {e}")))?;
+    .map_err(|e| run_error(redactor, &e))?;
 
     outcome.tail = redactor.scrub_string(std::mem::take(&mut outcome.tail));
 

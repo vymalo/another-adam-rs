@@ -209,8 +209,9 @@ The layers, from the bottom:
     share a root. A run's workspace (`Workspaces::run`) is a directory of
     **slots**, each a repository's worktree or a scratch project, under its own
     lock ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md)).
-    It also owns two small ports of its own, `GitCredentials` and
-    `CodeHost` (GitHub).
+    It also owns three small ports of its own, `GitCredentials`, `CodeHost` (GitHub)
+    and `Environment`, where a run's processes run (`Local`, this container, is
+    the one implementation so far).
   * `adam-acp` is a client for the Agent Client Protocol: it drives a coding
     agent (OpenCode) over stdio.
   * `adam-notify-postgres` implements two ports of the runtime, `EventSink`
@@ -722,6 +723,56 @@ stateDiagram-v2
     RepoBacked --> Removed: remove, pushed branches remain
     Removed --> [*]
 ```
+
+### Where a run's processes run
+
+The processes that act on a run's files (the project's checks, a command to look around, OpenCode) are started
+through the `Environment` port of `adam-workspace`. A tool asks the run's session to **prepare** the command from a
+description (program or shell line, working directory, variables, the names of this process's secrets to hide) and
+spawns what comes back; the files and the paths are the same in every environment, so the file tools and all git
+work stay in the coder. `Local`, the coder's own container, is the one implementation and behaves as the tools
+always did. Another one, which runs the processes in a container made from the repository's own configuration,
+is built behind the same port and chosen when the binary is composed (swapped at build time, not by a plugin).
+
+```mermaid
+sequenceDiagram
+    participant T as tool (run_command, run_checks, delegate_to_opencode)
+    participant E as Environment
+    participant S as EnvSession
+    participant P as process
+    participant J as janitor
+    T->>E: ensure(workspace of the run, progress)
+    E-->>T: the steps of making it, shown under the tool call
+    E-->>T: the run's session (made once, then reused)
+    T->>S: prepare(program, cwd, env, hide)
+    S-->>T: the command to spawn
+    T->>P: spawn it in a process group of its own
+    opt a timeout or a cancel
+        T->>P: kill the process group
+        T->>S: kill(the command's id)
+    end
+    J->>E: release(run) before the workspace is removed
+    J->>E: held_runs, then release what a crash left
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unmade: a run starts
+    Unmade --> Made: ensure
+    Unmade --> Failed: ensure fails
+    Failed --> Unmade: the next tool call tries again
+    Made --> Made: prepare, spawn, kill
+    Made --> Unmade: the environment was lost
+    Made --> Released: the janitor releases it
+    Failed --> Released: the janitor releases it
+    Unmade --> Released: the janitor releases it
+    Released --> [*]
+```
+
+A failure to make the environment is a result for the model (no check cycle is used, nothing runs); a secret is
+never in a description, only the names to hide and, for a process that needs one, a reference
+(`EnvSession::secret_ref`). See the [`adam-workspace` README](../crates/adam-workspace/README.md#where-a-runs-processes-run-the-environment-port)
+and [the coder README](../bin/adam-coder/README.md#where-the-processes-of-a-run-run).
 
 ## The path of a task
 
@@ -1927,7 +1978,8 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
   ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md)). `Janitor`, a worker component of the
   host (`Agents::worker_component`, so in the `all` and `worker` roles), sweeps at startup and every
   `WORKSPACE_SWEEP_SECS` (300; `0` is off): the workspace of a run that is `done` or `failed` (a cancel
-  included), or that the store does not know, is removed, every slot of it; the workspace of a run that is
+  included), or that the store does not know, is removed, every slot of it, after what the run's environment
+  holds is released (and a release that fails leaves the workspace for the next sweep); the workspace of a run that is
   `runnable` or `parked` stays, however long the person takes to answer. The notes and the `agent/*`
   branches in the mirrors stay: they are the only copy of an unpushed commit. A store that does not answer
   leaves the workspace alone, and a failed removal is logged and tried again at the next sweep.
@@ -1937,14 +1989,16 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     the allow-list (`ScopedToken` plus `Workspaces::allow_hosts`).
   * OpenCode's child process gets `MODEL_API_KEY` through its environment (its
     config says `{env:MODEL_API_KEY}`, so the key is not inlined). `GITHUB_TOKEN`,
-    `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child.
+    `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child (they are the names the
+    description of the process asks its environment to hide; a description never carries a value).
   * A `Redactor` scrubs the process's own secrets from every tool result, event
     and failure text.
 * **Limits** (`limits:` in `agent/instructions.md`): 200 model turns, 400 tool calls, 8192 output
   tokens per call, 100,000 tokens of history sent to the model. A limit that
   trips fails the run.
 * **Cancel.** When a run is cancelled while OpenCode works, the tool sends ACP
-  `session/cancel`, waits 2 seconds, then kills OpenCode and its process group.
+  `session/cancel`, waits 2 seconds, then kills OpenCode and its process group and tells the run's
+  environment which command to kill (nothing more to do in `Local`).
 * **Configuration** is environment variables only. The table is in
   `bin/adam-coder/src/config.rs` and the
   [crate README](../bin/adam-coder/README.md). Every problem is reported at

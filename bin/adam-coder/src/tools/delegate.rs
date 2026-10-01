@@ -10,9 +10,10 @@ use adam_error::{Classify, report};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
+use crate::opencode::acp_command;
 use crate::redact::Redactor;
 
-use super::{Outcome, ToolEnv, cancelled, non_empty};
+use super::{Outcome, ToolEnv, cancelled, environment_error, non_empty};
 
 /// Most of the agent's reply kept for the summary.
 const SUMMARY_CAP: usize = 8 * 1024;
@@ -129,12 +130,21 @@ pub async fn delegate_to_opencode(
     let dir = wt.path().to_path_buf();
 
     ctx.emit_progress("starting OpenCode").await;
-    let command = env.settings.opencode.command(&dir);
+    // OpenCode runs where the run's processes run, and the command is the one that environment
+    // prepared (the files it works on are the same ones, at the same paths).
+    let environment = env.session(ctx).await?;
+    let prepared = environment
+        .prepare(&env.settings.opencode.exec_spec(&dir))
+        .map_err(|e| environment_error(&env.redactor, &e))?;
+    let command = acp_command(&prepared).map_err(|e| environment_error(&env.redactor, &e))?;
     // A cancel before the process is up needs no cleanup here: the spawn
-    // future kills what it started when it is dropped.
+    // future kills what it started when it is dropped (and the environment is told).
     let client = tokio::select! {
         biased;
-        () = ctx.cancelled() => return Err(cancelled("OpenCode was stopped")),
+        () = ctx.cancelled() => {
+            environment.kill(&prepared.exec).await;
+            return Err(cancelled("OpenCode was stopped"));
+        }
         client = AcpClient::spawn(command, ClientPolicy::new(&dir)) => client,
     }
     .map_err(|e| acp_error(&e))?;
@@ -142,6 +152,7 @@ pub async fn delegate_to_opencode(
         biased;
         () = ctx.cancelled() => {
             stop(client, None, None).await;
+            environment.kill(&prepared.exec).await;
             return Err(cancelled("OpenCode was stopped"));
         }
         session = client.new_session(&dir, Vec::new()) => session,
@@ -158,6 +169,7 @@ pub async fn delegate_to_opencode(
             biased;
             () = ctx.cancelled() => {
                 stop(client, Some(&session), Some(turn)).await;
+                environment.kill(&prepared.exec).await;
                 children.close(ctx, StepState::Canceled).await;
                 return Err(cancelled("OpenCode was stopped"));
             }
@@ -168,6 +180,9 @@ pub async fn delegate_to_opencode(
             Ok(update) => update,
             Err(e) => {
                 children.close(ctx, StepState::Failed).await;
+                // The client is dropped on return, which kills what it started here; what lives
+                // in the environment is for the session.
+                environment.kill(&prepared.exec).await;
                 return Err(acp_error(&e));
             }
         };
