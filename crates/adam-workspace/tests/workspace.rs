@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use adam_error::Classify;
 use adam_workspace::{
-    FileStatus, GitCredentials, GitIdentity, RepoRef, ScopedToken, StaticToken, WorkspaceError,
-    Workspaces,
+    FileStatus, GitCredentials, GitIdentity, RepoRef, ScopedToken, SlotKind, StaticToken,
+    WorkspaceError, Workspaces, copy_into,
 };
 use base64::Engine as _;
 use tempfile::TempDir;
@@ -1532,4 +1532,1021 @@ async fn an_empty_remote_has_no_default_branch() {
         .await
         .unwrap_err();
     assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+}
+
+// ------------------------------------------------------------------ a workspace of several slots
+
+/// A bare remote `<tmp>/<owner>/<name>.git` on `main` with `files`, and the repository of it.
+fn remote_with(tmp: &Path, owner: &str, name: &str, files: &[(&str, &str)]) -> (PathBuf, RepoRef) {
+    let remote = tmp.join(owner).join(format!("{name}.git"));
+    let seed = tmp.join(format!("seed-{owner}-{name}"));
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::create_dir_all(&seed).unwrap();
+    git(
+        &remote,
+        &["init", "--bare", "--quiet", "--initial-branch=main"],
+    );
+    git(&seed, &["init", "--quiet", "--initial-branch=main"]);
+    for (file, content) in files {
+        let path = seed.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    if files.is_empty() {
+        git(&seed, &["commit", "--quiet", "--allow-empty", "-m", "seed"]);
+    } else {
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "--quiet", "-m", "seed"]);
+    }
+    git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    let repo = RepoRef::new(remote.to_str().unwrap(), "main");
+    (remote, repo)
+}
+
+/// A bare remote with no refs at all, and the repository of it.
+fn empty_remote(tmp: &Path, owner: &str, name: &str) -> (PathBuf, RepoRef) {
+    let remote = tmp.join(owner).join(format!("{name}.git"));
+    std::fs::create_dir_all(&remote).unwrap();
+    git(
+        &remote,
+        &["init", "--bare", "--quiet", "--initial-branch=main"],
+    );
+    let repo = RepoRef::new(remote.to_str().unwrap(), "main");
+    (remote, repo)
+}
+
+fn workspaces(tmp: &Path) -> Workspaces {
+    Workspaces::new(tmp.join("root"), Arc::new(StaticToken::new(TOKEN)))
+}
+
+const RUN: &str = "slots-run-0001";
+
+#[tokio::test]
+async fn a_run_holds_two_repositories_each_in_a_slot_of_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, api) = remote_with(tmp.path(), "acme", "API", &[("api.txt", "api\n")]);
+    let (_, web) = remote_with(tmp.path(), "acme", "web", &[("web.txt", "web\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    assert_eq!(run.path(), tmp.path().join("root/workspaces").join(RUN));
+    assert!(run.slots().await.unwrap().is_empty(), "nothing yet");
+
+    // Added in this order: web first.
+    let web_slot = run.add_repository(&web).await.unwrap();
+    let api_slot = run.add_repository(&api).await.unwrap();
+    assert_eq!((web_slot.dir(), web_slot.seq()), ("web", 1));
+    assert_eq!(
+        (api_slot.dir(), api_slot.seq()),
+        ("api", 2),
+        "the name, lowercased"
+    );
+    assert_eq!(web_slot.path(), run.path().join("web"));
+    let (web_wt, api_wt) = (web_slot.worktree().unwrap(), api_slot.worktree().unwrap());
+    assert_eq!(web_wt.dir(), "web");
+    assert_eq!(
+        std::fs::read_to_string(web_wt.path().join("web.txt")).unwrap(),
+        "web\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(api_wt.path().join("api.txt")).unwrap(),
+        "api\n"
+    );
+    assert!(
+        !web_wt.path().join("api.txt").exists(),
+        "each slot has its repository's files"
+    );
+    assert_eq!(
+        git(web_wt.path(), &["symbolic-ref", "--short", "HEAD"]),
+        web_wt.branch()
+    );
+    assert_eq!(
+        web_wt.branch(),
+        "agent/slots-ru",
+        "the run's own branch, in each repository"
+    );
+    assert_eq!(api_wt.branch(), web_wt.branch());
+
+    // Listed by directory, and in the order they joined.
+    let by_dir: Vec<_> = run
+        .slots()
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.dir().to_owned())
+        .collect();
+    assert_eq!(by_dir, ["api", "web"]);
+    let by_join: Vec<_> = run
+        .slots_in_join_order()
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.dir().to_owned())
+        .collect();
+    assert_eq!(by_join, ["web", "api"]);
+    assert_eq!(
+        run.slot("web").await.unwrap().unwrap().path(),
+        web_slot.path()
+    );
+    assert!(run.slot("nope").await.unwrap().is_none());
+    assert_eq!(run.slot_for(&api).await.unwrap().unwrap().dir(), "api");
+
+    // Each is a worktree like any other: commit and push in one leaves the other alone.
+    std::fs::write(web_wt.path().join("new.txt"), "new\n").unwrap();
+    web_wt.commit_all("work", &me()).await.unwrap().unwrap();
+    web_wt.push().await.unwrap();
+    assert!(api_wt.status().await.unwrap().is_empty());
+    let meta =
+        std::fs::read_to_string(tmp.path().join("root/meta").join(RUN).join("web.json")).unwrap();
+    assert!(
+        meta.contains("\"version\": 2") && meta.contains("\"seq\": 1"),
+        "{meta}"
+    );
+    assert!(
+        meta.contains("\"kind\": \"repo\"") && meta.contains("\"dir\": \"web\""),
+        "{meta}"
+    );
+    assert!(!meta.contains(TOKEN), "no credentials in the metadata");
+}
+
+#[tokio::test]
+async fn adding_a_repository_twice_returns_its_one_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let first = run.add_repository(&repo).await.unwrap();
+    std::fs::write(first.path().join("wip.txt"), "uncommitted\n").unwrap();
+
+    // The same repository, written another way and with another base: the same slot.
+    let as_url = RepoRef::new(format!("file://{}", remote.display()), "develop");
+    let again = run.add_repository(&as_url).await.unwrap();
+    assert_eq!(again.path(), first.path());
+    assert_eq!(again.seq(), first.seq());
+    assert_eq!(
+        again.worktree().unwrap().repo().base_branch,
+        "main",
+        "the slot keeps the base it was made with"
+    );
+    assert_eq!(run.slots().await.unwrap().len(), 1);
+    assert!(
+        first.path().join("wip.txt").is_file(),
+        "work in progress survives"
+    );
+    assert_eq!(run.slot_for(&as_url).await.unwrap().unwrap().dir(), "lib");
+}
+
+#[tokio::test]
+async fn two_repositories_with_one_name_are_told_apart_by_their_owner() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, mine) = remote_with(tmp.path(), "a", "lib", &[("mine.txt", "a\n")]);
+    let (_, theirs) = remote_with(tmp.path(), "b", "Lib", &[("theirs.txt", "b\n")]);
+    let (_, third) = remote_with(tmp.path(), "c", "lib", &[("third.txt", "c\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let one = run.add_repository(&mine).await.unwrap();
+    let two = run.add_repository(&theirs).await.unwrap();
+    let three = run.add_repository(&third).await.unwrap();
+    assert_eq!(one.dir(), "lib");
+    assert!(
+        two.dir().starts_with("lib-") && two.dir() != "lib",
+        "{}",
+        two.dir()
+    );
+    assert!(
+        three.dir().starts_with("lib-") && three.dir() != two.dir(),
+        "{}",
+        three.dir()
+    );
+    assert!(two.path().join("theirs.txt").is_file());
+    assert!(three.path().join("third.txt").is_file());
+    // Each is found again by its own repository.
+    assert_eq!(
+        run.slot_for(&theirs).await.unwrap().unwrap().dir(),
+        two.dir()
+    );
+    assert_eq!(
+        run.slot_for(&third).await.unwrap().unwrap().dir(),
+        three.dir()
+    );
+}
+
+#[tokio::test]
+async fn a_slot_can_continue_a_pushed_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let ws = workspaces(tmp.path());
+    let first = ws
+        .run("run-first-0001")
+        .unwrap()
+        .add_repository(&repo)
+        .await
+        .unwrap();
+    let first = first.worktree().unwrap();
+    std::fs::write(first.path().join("first.txt"), "one\n").unwrap();
+    first.commit_all("first", &me()).await.unwrap().unwrap();
+    first.push().await.unwrap();
+
+    let second = ws.run("run-second-002").unwrap();
+    let slot = second
+        .add_repository_continuing(&repo, first.branch())
+        .await
+        .unwrap();
+    let wt = slot.worktree().unwrap();
+    assert_eq!(wt.continues(), Some(first.branch()));
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("first.txt")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(
+        git(wt.path(), &["rev-parse", "HEAD"]),
+        git(
+            &remote,
+            &["rev-parse", &format!("refs/heads/{}", first.branch())]
+        )
+    );
+    // Again: the same slot; another branch for the repository the run has: a conflict.
+    let again = second
+        .add_repository_continuing(&repo, first.branch())
+        .await
+        .unwrap();
+    assert_eq!(again.path(), slot.path());
+    let err = second.add_repository(&repo).await;
+    assert!(
+        err.is_ok(),
+        "a plain request finds the slot of a continued branch: {err:?}"
+    );
+    let err = second
+        .add_repository_continuing(&repo, "agent/other")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            WorkspaceError::Conflict(_) | WorkspaceError::Invalid(_)
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_slot_whose_directory_was_lost_is_made_again_on_its_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_repository(&repo).await.unwrap();
+    let wt = slot.worktree().unwrap();
+    std::fs::write(wt.path().join("kept.txt"), "k\n").unwrap();
+    let sha = wt.commit_all("kept", &me()).await.unwrap().unwrap();
+    std::fs::remove_dir_all(slot.path()).unwrap();
+    assert!(
+        run.slots().await.unwrap().is_empty(),
+        "a slot without its directory is not listed"
+    );
+
+    let again = run.add_repository(&repo).await.unwrap();
+    assert_eq!(again.dir(), slot.dir());
+    assert_eq!(again.seq(), slot.seq());
+    assert_eq!(
+        git(again.path(), &["rev-parse", "HEAD"]),
+        sha,
+        "the branch kept its commit"
+    );
+    assert!(again.path().join("kept.txt").is_file());
+}
+
+#[tokio::test]
+async fn a_refused_repository_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let ws = workspaces(tmp.path()).allow_local(false);
+    let run = ws.run(RUN).unwrap();
+    let err = run.add_repository(&repo).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert!(
+        !tmp.path().join("root").exists(),
+        "no directory, lock or mirror for a refused repository"
+    );
+    assert!(matches!(
+        ws.run("a/b").unwrap_err(),
+        WorkspaceError::Invalid(_)
+    ));
+    assert!(matches!(
+        ws.run(".hidden").unwrap_err(),
+        WorkspaceError::Invalid(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_scratch_project_is_a_local_repository_with_a_root_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_scratch("fib", &me()).await.unwrap();
+    assert_eq!((slot.dir(), slot.seq()), ("fib", 1));
+    assert!(matches!(slot.kind(), SlotKind::Scratch(_)));
+    assert!(slot.worktree().is_none());
+    let scratch = slot.scratch().unwrap();
+    assert_eq!(scratch.path(), run.path().join("fib"));
+    assert!(
+        scratch.path().join(".git").is_dir(),
+        "a repository of its own"
+    );
+    assert_eq!(
+        git(scratch.path(), &["symbolic-ref", "--short", "HEAD"]),
+        "main"
+    );
+    assert_eq!(
+        git(scratch.path(), &["rev-list", "--count", "HEAD"]),
+        "1",
+        "the root commit"
+    );
+    assert_eq!(
+        git(scratch.path(), &["log", "-1", "--format=%an|%ae"]),
+        "Adam Agent|adam@example.com"
+    );
+    assert!(scratch.files().await.unwrap().is_empty());
+    assert!(
+        !scratch.path().join(".git/hooks/pre-commit.sample").exists(),
+        "no sample hooks from a template"
+    );
+
+    // Files: tracked and untracked ones that are not ignored, relative, sorted.
+    std::fs::create_dir_all(scratch.path().join("src")).unwrap();
+    std::fs::write(scratch.path().join("src/fib.sh"), "echo 0 1 1\n").unwrap();
+    std::fs::write(scratch.path().join(".gitignore"), "*.log\ntarget/\n").unwrap();
+    std::fs::write(scratch.path().join("run.log"), "noise\n").unwrap();
+    std::fs::create_dir_all(scratch.path().join("target")).unwrap();
+    std::fs::write(scratch.path().join("target/out"), "x\n").unwrap();
+    std::fs::write(scratch.path().join("README.md"), "# fib\n").unwrap();
+    let names = |files: Vec<PathBuf>| -> Vec<String> {
+        files
+            .into_iter()
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect()
+    };
+    assert_eq!(
+        names(scratch.files().await.unwrap()),
+        [".gitignore", "README.md", "src/fib.sh"]
+    );
+    let sha = scratch
+        .commit_all("feat: fib", &me())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(git(scratch.path(), &["rev-parse", "HEAD"]), sha);
+    assert_eq!(git(scratch.path(), &["rev-list", "--count", "HEAD"]), "2");
+    assert!(
+        scratch.commit_all("again", &me()).await.unwrap().is_none(),
+        "nothing to commit"
+    );
+    // A tracked file that was deleted is gone from the list.
+    std::fs::remove_file(scratch.path().join("README.md")).unwrap();
+    assert_eq!(
+        names(scratch.files().await.unwrap()),
+        [".gitignore", "src/fib.sh"]
+    );
+    assert!(
+        scratch.commit_all("", &me()).await.is_err(),
+        "a message is required"
+    );
+
+    // Idempotent; another name is another slot; a repository's name is taken.
+    let again = run.add_scratch("fib", &me()).await.unwrap();
+    assert_eq!(again.path(), slot.path());
+    assert_eq!(again.seq(), 1);
+    assert_eq!(
+        git(scratch.path(), &["rev-list", "--count", "HEAD"]),
+        "2",
+        "not started over"
+    );
+    assert_eq!(run.add_scratch("other", &me()).await.unwrap().seq(), 2);
+    for bad in ["", "Fib", "a/b", ".x", "repo.git", "a b"] {
+        let err = run.add_scratch(bad, &me()).await.unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::Invalid(_)),
+            "{bad:?}: {err:?}"
+        );
+    }
+    let (_, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    run.add_repository(&repo).await.unwrap();
+    let err = run.add_scratch("lib", &me()).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Conflict(_)), "{err:?}");
+    // A repository whose name a scratch project has gets the owner in its directory.
+    let (_, other) = remote_with(tmp.path(), "zed", "fib", &[("x.txt", "x\n")]);
+    assert!(
+        run.add_repository(&other)
+            .await
+            .unwrap()
+            .dir()
+            .starts_with("fib-")
+    );
+}
+
+#[tokio::test]
+async fn a_scratch_project_that_lost_its_root_commit_gets_one_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_scratch("fib", &me()).await.unwrap();
+    // A crash between `git init` and the first commit: an unborn branch.
+    std::fs::remove_dir_all(slot.path().join(".git")).unwrap();
+    git(slot.path(), &["init", "--quiet", "--initial-branch=main"]);
+    let again = run.add_scratch("fib", &me()).await.unwrap();
+    assert_eq!(git(again.path(), &["rev-list", "--count", "HEAD"]), "1");
+}
+
+#[tokio::test]
+async fn an_empty_remote_is_given_its_first_commit_and_only_then() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, repo) = empty_remote(tmp.path(), "scratch", "fib");
+    let ws = workspaces(tmp.path());
+    assert!(ws.remote_is_empty(&repo.url).await.unwrap());
+
+    let sha = ws.initialize_empty(&repo, &me()).await.unwrap();
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), sha);
+    assert_eq!(
+        git(&remote, &["rev-parse", "main^{tree}"]),
+        "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        "the empty tree"
+    );
+    assert_eq!(
+        git(&remote, &["log", "-1", "--format=%s|%an|%ae", "main"]),
+        "Initial commit|Adam Agent|adam@example.com"
+    );
+    assert_eq!(git(&remote, &["rev-list", "--count", "main"]), "1");
+    assert!(!ws.remote_is_empty(&repo.url).await.unwrap());
+
+    // Not empty any more: a conflict, and nothing moved.
+    let err = ws.initialize_empty(&repo, &me()).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Conflict(_)), "{err:?}");
+    assert_eq!(git(&remote, &["rev-parse", "refs/heads/main"]), sha);
+
+    // A worktree starts from the new base, and is empty.
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_repository(&repo).await.unwrap();
+    assert_eq!(git(slot.path(), &["rev-parse", "HEAD"]), sha);
+    assert!(slot.worktree().unwrap().status().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_remote_with_refs_is_never_given_a_first_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let ws = workspaces(tmp.path());
+    assert!(!ws.remote_is_empty(&repo.url).await.unwrap());
+    let before = git(&remote, &["rev-parse", "refs/heads/main"]);
+    let err = ws.initialize_empty(&repo, &me()).await.unwrap_err();
+    assert!(matches!(err, WorkspaceError::Conflict(_)), "{err:?}");
+    // Not even under another branch name.
+    let err = ws
+        .initialize_empty(&RepoRef::new(&repo.url, "develop"), &me())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::Conflict(_)), "{err:?}");
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/main"]),
+        before,
+        "nothing was forced"
+    );
+    assert_eq!(remote_refs_of(&remote), ["refs/heads/main"]);
+
+    // A bad branch name or identity is refused before anything runs.
+    let (_, empty) = empty_remote(tmp.path(), "scratch", "e");
+    assert!(matches!(
+        ws.initialize_empty(&RepoRef::new(&empty.url, "bad..branch"), &me())
+            .await
+            .unwrap_err(),
+        WorkspaceError::Invalid(_)
+    ));
+    assert!(matches!(
+        ws.initialize_empty(&empty, &GitIdentity::new("", "x@y"))
+            .await
+            .unwrap_err(),
+        WorkspaceError::Invalid(_)
+    ));
+    assert!(ws.remote_is_empty(&empty.url).await.unwrap());
+}
+
+fn remote_refs_of(remote: &Path) -> Vec<String> {
+    git(remote, &["for-each-ref", "--format=%(refname)"])
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn wait_reachable_waits_for_a_repository_that_appears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let (_, there) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    ws.wait_reachable(&there.url, std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // One that does not exist is NotFound once the time is up.
+    let missing = tmp.path().join("later").join("late.git");
+    let started = std::time::Instant::now();
+    let err = ws
+        .wait_reachable(
+            missing.to_str().unwrap(),
+            std::time::Duration::from_millis(600),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::NotFound(_)), "{err:?}");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(500),
+        "it waited"
+    );
+
+    // One that is created meanwhile is found.
+    let url = missing.to_str().unwrap().to_owned();
+    let make = tokio::spawn({
+        let tmp = tmp.path().to_path_buf();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            empty_remote(&tmp, "later", "late");
+        }
+    });
+    ws.wait_reachable(&url, std::time::Duration::from_secs(15))
+        .await
+        .unwrap();
+    make.await.unwrap();
+    // A url the policy refuses fails at once, with no waiting.
+    let strict = workspaces(tmp.path()).allow_local(false);
+    let started = std::time::Instant::now();
+    let err = strict
+        .wait_reachable(&url, std::time::Duration::from_secs(10))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+/// The scratch project that is published: its files into a worktree of an (empty) repository.
+async fn scratch_and_worktree(tmp: &Path) -> (adam_workspace::Scratch, adam_workspace::Worktree) {
+    let (_, repo) = empty_remote(tmp, "scratch", "fib");
+    let ws = workspaces(tmp);
+    ws.initialize_empty(&repo, &me()).await.unwrap();
+    let run = ws.run(RUN).unwrap();
+    let scratch = run
+        .add_scratch("fib", &me())
+        .await
+        .unwrap()
+        .scratch()
+        .unwrap()
+        .clone();
+    let wt = run
+        .add_repository(&repo)
+        .await
+        .unwrap()
+        .worktree()
+        .unwrap()
+        .clone();
+    (scratch, wt)
+}
+
+fn put(root: &Path, file: &str, content: &str) {
+    let path = root.join(file);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+fn paths(files: &[PathBuf]) -> Vec<String> {
+    files
+        .iter()
+        .map(|f| f.to_string_lossy().into_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn copy_into_puts_the_projects_files_in_the_repository() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (scratch, wt) = scratch_and_worktree(tmp.path()).await;
+    put(scratch.path(), "fib.sh", "echo 0 1 1 2 3 5 8\n");
+    put(scratch.path(), "docs/notes.md", "notes\n");
+    put(scratch.path(), ".gitignore", "*.log\n");
+    put(scratch.path(), "run.log", "ignored\n");
+    std::fs::set_permissions(
+        scratch.path().join("fib.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("notes.md", scratch.path().join("docs/latest")).unwrap();
+
+    let report = copy_into(&scratch, &wt, ".", false).await.unwrap();
+    assert!(report.collisions.is_empty(), "{report:?}");
+    assert_eq!(
+        paths(&report.copied),
+        [".gitignore", "docs/latest", "docs/notes.md", "fib.sh"]
+    );
+    assert!(report.unchanged.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("docs/notes.md")).unwrap(),
+        "notes\n"
+    );
+    assert_eq!(
+        std::fs::metadata(wt.path().join("fib.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "the executable bit stays"
+    );
+    assert_eq!(
+        std::fs::read_link(wt.path().join("docs/latest")).unwrap(),
+        PathBuf::from("notes.md"),
+        "a symbolic link that stays inside is kept as a link"
+    );
+    assert!(
+        !wt.path().join("run.log").exists(),
+        "ignored files stay behind"
+    );
+    assert!(
+        wt.path().join(".git").is_file(),
+        "the repository's own .git is untouched"
+    );
+    assert!(
+        !std::fs::read_dir(wt.path()).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("adam-copy")),
+        "no temporary file is left"
+    );
+    // The worktree sees them as changes, and they commit.
+    assert!(wt.commit_all("feat: fib", &me()).await.unwrap().is_some());
+
+    // The same again: all unchanged, nothing copied.
+    let again = copy_into(&scratch, &wt, "", false).await.unwrap();
+    assert!(
+        again.copied.is_empty() && again.collisions.is_empty(),
+        "{again:?}"
+    );
+    assert_eq!(again.unchanged.len(), 4);
+}
+
+#[tokio::test]
+async fn copy_into_is_all_or_nothing_and_overwrite_replaces_files_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scratch, wt) = scratch_and_worktree(tmp.path()).await;
+    put(scratch.path(), "a.txt", "from scratch\n");
+    put(scratch.path(), "b.txt", "same\n");
+    put(scratch.path(), "new.txt", "new\n");
+    put(wt.path(), "a.txt", "in the repository\n");
+    put(wt.path(), "b.txt", "same\n");
+
+    let report = copy_into(&scratch, &wt, ".", false).await.unwrap();
+    assert!(
+        report.copied.is_empty(),
+        "a collision stops the whole copy: {report:?}"
+    );
+    assert_eq!(paths(&report.unchanged), ["b.txt"]);
+    assert_eq!(report.collisions.len(), 1);
+    assert_eq!(report.collisions[0].path, PathBuf::from("a.txt"));
+    assert!(
+        report.collisions[0].reason.contains("other content"),
+        "{:?}",
+        report.collisions
+    );
+    assert!(!wt.path().join("new.txt").exists(), "nothing was copied");
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("a.txt")).unwrap(),
+        "in the repository\n"
+    );
+
+    let report = copy_into(&scratch, &wt, ".", true).await.unwrap();
+    assert!(report.collisions.is_empty(), "{report:?}");
+    assert_eq!(paths(&report.copied), ["a.txt", "new.txt"]);
+    assert_eq!(paths(&report.unchanged), ["b.txt"]);
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("a.txt")).unwrap(),
+        "from scratch\n"
+    );
+
+    // What overwrite never does: put a file where the repository has a directory or a link, or
+    // write through a link.
+    put(scratch.path(), "docs", "a file\n");
+    std::fs::create_dir_all(wt.path().join("docs")).unwrap();
+    put(wt.path(), "docs/x", "x\n");
+    let report = copy_into(&scratch, &wt, ".", true).await.unwrap();
+    assert_eq!(report.collisions.len(), 1, "{report:?}");
+    assert!(
+        report.collisions[0].reason.contains("directory"),
+        "{:?}",
+        report.collisions
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("docs/x")).unwrap(),
+        "x\n"
+    );
+    std::fs::remove_file(scratch.path().join("docs")).unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), wt.path().join("linked")).unwrap();
+    put(scratch.path(), "linked/inside.txt", "x\n");
+    let report = copy_into(&scratch, &wt, ".", true).await.unwrap();
+    assert_eq!(report.collisions.len(), 1, "{report:?}");
+    assert!(
+        report.collisions[0].reason.contains("symbolic link"),
+        "{:?}",
+        report.collisions
+    );
+    assert!(!outside.path().join("inside.txt").exists());
+}
+
+#[tokio::test]
+async fn copy_into_refuses_a_link_that_leaves_the_project_and_a_destination_that_leaves_the_repository()
+ {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scratch, wt) = scratch_and_worktree(tmp.path()).await;
+    put(scratch.path(), "ok.txt", "ok\n");
+    std::os::unix::fs::symlink("../../etc/passwd", scratch.path().join("up")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", scratch.path().join("abs")).unwrap();
+    let report = copy_into(&scratch, &wt, ".", false).await.unwrap();
+    assert!(report.copied.is_empty(), "all or nothing: {report:?}");
+    let refused: Vec<_> = report
+        .collisions
+        .iter()
+        .map(|c| c.path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(refused, ["abs", "up"]);
+    assert!(
+        report
+            .collisions
+            .iter()
+            .all(|c| c.reason.contains("outside the project")),
+        "{:?}",
+        report.collisions
+    );
+    assert!(!wt.path().join("ok.txt").exists());
+
+    std::fs::remove_file(scratch.path().join("up")).unwrap();
+    std::fs::remove_file(scratch.path().join("abs")).unwrap();
+    for bad in ["..", "../x", "/tmp", ".git", "a/.GIT/b"] {
+        let err = copy_into(&scratch, &wt, bad, false).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Invalid(_)), "{bad}: {err:?}");
+    }
+    assert!(!wt.path().join("ok.txt").exists());
+    // Into a directory of the repository.
+    let report = copy_into(&scratch, &wt, "apps/fib", false).await.unwrap();
+    assert!(report.collisions.is_empty(), "{report:?}");
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("apps/fib/ok.txt")).unwrap(),
+        "ok\n"
+    );
+}
+
+#[tokio::test]
+async fn a_scratch_project_never_copies_a_dot_git_it_does_not_have() {
+    // A nested repository is a directory in the listing, and a directory is not copied.
+    let tmp = tempfile::tempdir().unwrap();
+    let (scratch, wt) = scratch_and_worktree(tmp.path()).await;
+    put(scratch.path(), "ok.txt", "ok\n");
+    let nested = scratch.path().join("vendor/dep");
+    std::fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "--quiet", "--initial-branch=main"]);
+    put(&nested, "x.txt", "x\n");
+    let report = copy_into(&scratch, &wt, ".", false).await.unwrap();
+    assert!(report.collisions.is_empty(), "{report:?}");
+    assert!(!wt.path().join("vendor/dep/.git").exists());
+}
+
+#[tokio::test]
+async fn a_legacy_worktree_is_a_slot_that_a_new_repository_joins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, old) = remote_with(tmp.path(), "acme", "old", &[("old.txt", "old\n")]);
+    let (_, new) = remote_with(tmp.path(), "acme", "new", &[("new.txt", "new\n")]);
+    let ws = workspaces(tmp.path());
+    let legacy = ws.prepare(&old, RUN).await.unwrap();
+    assert_eq!(legacy.dir(), "old");
+    assert_eq!(legacy.path(), tmp.path().join("root/worktrees").join(RUN));
+    std::fs::write(legacy.path().join("wip.txt"), "wip\n").unwrap();
+
+    let run = ws.run(RUN).unwrap();
+    let slots = run.slots().await.unwrap();
+    assert_eq!(slots.len(), 1);
+    assert_eq!((slots[0].dir(), slots[0].seq()), ("old", 0));
+    assert_eq!(slots[0].path(), legacy.path());
+
+    // The same repository again: the legacy slot, not a second one.
+    let again = run.add_repository(&old).await.unwrap();
+    assert_eq!(again.path(), legacy.path());
+    assert_eq!(run.slots().await.unwrap().len(), 1);
+    // Another: a slot of the new layout, after it.
+    let joined = run.add_repository(&new).await.unwrap();
+    assert_eq!((joined.dir(), joined.seq()), ("new", 1));
+    assert_eq!(joined.path(), run.path().join("new"));
+    let order: Vec<_> = run
+        .slots_in_join_order()
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.dir().to_owned())
+        .collect();
+    assert_eq!(order, ["old", "new"]);
+    assert_eq!(run.slot_for(&old).await.unwrap().unwrap().seq(), 0);
+    // The legacy helper still finds the legacy worktree.
+    assert_eq!(
+        ws.open_existing(RUN).await.unwrap().unwrap().path(),
+        legacy.path()
+    );
+    // A repository named like the legacy one gets the owner in its directory.
+    let (_, same_name) = remote_with(tmp.path(), "zed", "old", &[("z.txt", "z\n")]);
+    assert!(
+        run.add_repository(&same_name)
+            .await
+            .unwrap()
+            .dir()
+            .starts_with("old-")
+    );
+
+    // Everything goes together, the legacy worktree and its metadata included.
+    run.remove().await.unwrap();
+    assert!(run.slots().await.unwrap().is_empty());
+    assert!(!legacy.path().exists());
+    assert!(
+        !tmp.path()
+            .join("root/meta")
+            .join(format!("{RUN}.json"))
+            .exists()
+    );
+    assert!(ws.open_existing(RUN).await.unwrap().is_none());
+    assert!(ws.runs().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn removing_a_workspace_deletes_its_files_keeps_its_branches_and_can_be_repeated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (remote, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_repository(&repo).await.unwrap();
+    let wt = slot.worktree().unwrap().clone();
+    std::fs::write(wt.path().join("unpushed.txt"), "u\n").unwrap();
+    let sha = wt.commit_all("unpushed", &me()).await.unwrap().unwrap();
+    let scratch = run.add_scratch("fib", &me()).await.unwrap();
+    std::fs::write(scratch.path().join("f.txt"), "f\n").unwrap();
+
+    run.remove().await.unwrap();
+    assert!(!run.path().exists(), "the directory of the workspace");
+    assert!(
+        !tmp.path().join("root/meta").join(RUN).exists(),
+        "its metadata"
+    );
+    assert!(
+        !tmp.path()
+            .join("root/workspaces")
+            .join(format!("{RUN}.lock"))
+            .exists(),
+        "its lock"
+    );
+    assert!(run.slots().await.unwrap().is_empty());
+    // The commit that was never pushed is still in the mirror, on the run's branch.
+    let mirror = tmp
+        .path()
+        .join("root")
+        .join(repo.locate().unwrap().mirror_relative());
+    assert_eq!(
+        git(&mirror, &["rev-parse", "refs/heads/agent/slots-ru"]),
+        sha
+    );
+    assert!(!git(&mirror, &["worktree", "list", "--porcelain"]).contains("workspaces"));
+    assert_eq!(remote_refs_of(&remote), ["refs/heads/main"]);
+
+    run.remove().await.unwrap();
+    ws.remove(RUN).await.unwrap();
+    // Added again, the branch is attached to a new worktree with its commit.
+    let back = run.add_repository(&repo).await.unwrap();
+    assert_eq!(git(back.path(), &["rev-parse", "HEAD"]), sha);
+}
+
+#[tokio::test]
+async fn a_workspace_with_unreadable_metadata_is_still_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_repository(&repo).await.unwrap();
+    std::fs::write(
+        tmp.path().join("root/meta").join(RUN).join("lib.json"),
+        "not json",
+    )
+    .unwrap();
+    assert!(matches!(
+        run.slots().await.unwrap_err(),
+        WorkspaceError::Corrupt(_)
+    ));
+    run.remove().await.unwrap();
+    assert!(!slot.path().exists());
+    assert!(!tmp.path().join("root/meta").join(RUN).exists());
+}
+
+#[tokio::test]
+async fn runs_lists_every_run_that_has_a_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, repo) = remote_with(tmp.path(), "acme", "lib", &[("lib.txt", "lib\n")]);
+    let ws = workspaces(tmp.path());
+    assert!(ws.runs().await.unwrap().is_empty(), "nothing on disk yet");
+    ws.prepare(&repo, "run-legacy-001").await.unwrap();
+    ws.run("run-slots-0002")
+        .unwrap()
+        .add_repository(&repo)
+        .await
+        .unwrap();
+    ws.run("run-scratch-03")
+        .unwrap()
+        .add_scratch("fib", &me())
+        .await
+        .unwrap();
+    // A run whose workspace is partly gone: only its metadata is left.
+    let half = tmp.path().join("root/meta/run-half-00004");
+    std::fs::create_dir_all(&half).unwrap();
+    // Files that are not runs: a lock, a temporary file, something with a bad name.
+    std::fs::write(tmp.path().join("root/meta/stray.txt"), "x").unwrap();
+    std::fs::create_dir_all(tmp.path().join("root/workspaces/.hidden")).unwrap();
+    assert_eq!(
+        ws.runs().await.unwrap(),
+        [
+            "run-half-00004",
+            "run-legacy-001",
+            "run-scratch-03",
+            "run-slots-0002"
+        ]
+    );
+    ws.remove("run-half-00004").await.unwrap();
+    ws.remove("run-slots-0002").await.unwrap();
+    assert_eq!(
+        ws.runs().await.unwrap(),
+        ["run-legacy-001", "run-scratch-03"]
+    );
+}
+
+/// Two `Workspaces` on one root stand for two worker processes on a shared volume. Slots join one
+/// run from both while other runs take the same repositories: every slot gets its own directory and
+/// its own place in the order, and no git lock trips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_workspaces_on_one_root_add_slots_without_clashing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let other = Workspaces::new(tmp.path().join("root"), Arc::new(StaticToken::new(TOKEN)));
+    let repos: Vec<RepoRef> = (0..6)
+        .map(|i| remote_with(tmp.path(), "acme", &format!("repo{i}"), &[("f.txt", "f\n")]).1)
+        .collect();
+    let mut tasks = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
+        for (n, handle) in [&ws, &other].into_iter().enumerate() {
+            let (handle, repo) = (handle.clone(), repo.clone());
+            tasks.push(tokio::spawn(async move {
+                // The same run from both handles, and another run of its own beside it.
+                let shared = handle.run("shared-run-0001")?.add_repository(&repo).await?;
+                let own = handle
+                    .run(&format!("own-run-{i}-{n}"))?
+                    .add_repository(&repo)
+                    .await?;
+                Ok::<_, WorkspaceError>((shared.dir().to_owned(), shared.seq(), own.seq()))
+            }));
+        }
+    }
+    let mut dirs = Vec::new();
+    let mut seqs = Vec::new();
+    for task in tasks {
+        let (dir, seq, own) = task
+            .await
+            .unwrap()
+            .expect("no clash, no \"could not lock\"");
+        assert_eq!(own, 1);
+        dirs.push(dir);
+        seqs.push(seq);
+    }
+    dirs.sort();
+    dirs.dedup();
+    assert_eq!(
+        dirs.len(),
+        6,
+        "one slot per repository, however often it was asked for: {dirs:?}"
+    );
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(
+        seqs,
+        [1, 2, 3, 4, 5, 6],
+        "every slot has its own place in the order"
+    );
+    let slots = ws.run("shared-run-0001").unwrap().slots().await.unwrap();
+    assert_eq!(slots.len(), 6);
+    for repo in &repos {
+        let mirror = tmp
+            .path()
+            .join("root")
+            .join(repo.locate().unwrap().mirror_relative());
+        git(&mirror, &["fsck", "--strict", "--no-dangling"]);
+    }
 }

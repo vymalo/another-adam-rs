@@ -206,7 +206,10 @@ The layers, from the bottom:
     chat-completions endpoint.
   * `adam-workspace` runs `git` for mirrors, worktrees, commit and push, under
     an in-process lock and a file lock on each mirror, so several processes can
-    share a root. It also owns two small ports of its own, `GitCredentials` and
+    share a root. A run's workspace (`Workspaces::run`) is a directory of
+    **slots**, each a repository's worktree or a scratch project, under its own
+    lock ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md)).
+    It also owns two small ports of its own, `GitCredentials` and
     `CodeHost` (GitHub).
   * `adam-acp` is a client for the Agent Client Protocol: it drives a coding
     agent (OpenCode) over stdio.
@@ -691,6 +694,34 @@ stateDiagram-v2
   `lock_mirror`). *Unverified:* `flock` on NFS and Longhorn RWX volumes.
 * **`a2a-only`** is for hosts whose agents only call remote agents, such as the
   `another-agentic-system` orchestrator; the enum is shared so both speak the same vocabulary.
+
+### What a run's workspace holds
+
+A run's files are a **workspace**, `<root>/workspaces/<run>/`: a directory of slots
+([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md)). A slot is a worktree of one
+repository on the run's own branch `agent/<run-short-id>`, or a scratch project, a local git
+repository with an empty root commit where work can start before anyone has named a repository. A run
+has at most one slot per repository, called the repository's name (`<name>-<owner>` when another
+repository of the run has it), and slots keep the order they joined the run. The workspace lives as
+long as the run and is deleted when it ends; the run's notes and its `agent/*` branches stay.
+`copy_into` is the only way a scratch project's files reach a repository, all or nothing, and
+`initialize_empty` gives a repository that has no branch its first commit, an empty one, the only push
+outside `agent/*`. A workspace made before slots existed (one worktree in `<root>/worktrees/<run>`) is
+read as a slot and removed with the rest. For the orchestration layer's open question 24, the MVP
+default is `shared` placement with one coder process. The API, the layout and the locks are in the
+[`adam-workspace` README](../crates/adam-workspace/README.md#a-runs-workspace-slots-scratch-projects-and-the-copy-between-them).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Empty: a run asks for its workspace
+    Empty --> Scratch: add_scratch
+    Empty --> RepoBacked: add_repository
+    Scratch --> RepoBacked: add_repository, copy_into
+    RepoBacked --> RepoBacked: add_repository (another repository, a new slot)
+    Scratch --> Removed: remove, nothing was published
+    RepoBacked --> Removed: remove, pushed branches remain
+    Removed --> [*]
+```
 
 ## The path of a task
 

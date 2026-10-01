@@ -63,6 +63,7 @@ mod git;
 #[cfg(feature = "github")]
 mod github;
 mod repo;
+mod run_workspace;
 mod workspace;
 mod worktree;
 
@@ -74,5 +75,6 @@ pub use error::{WorkspaceError, WorkspaceResult};
 #[cfg(feature = "github")]
 pub use github::GitHub;
 pub use repo::{RepoLocation, RepoRef};
+pub use run_workspace::{Collision, CopyReport, RunWorkspace, Scratch, Slot, SlotKind, copy_into};
 pub use workspace::Workspaces;
 pub use worktree::{ChangedFile, FileStatus, GitIdentity, MirrorLock, Worktree};
