@@ -35,9 +35,14 @@ mod backend;
 mod convert;
 mod ids;
 mod subscribe;
+mod vymalo;
 
 pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
 pub use convert::{
     InboundFn, PromptFn, artifact_id, artifact_of, default_inbound, default_prompt, task_state,
 };
 pub use ids::task_id_for;
+pub use vymalo::{
+    CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF, MAX_ACTION_CONTEXT_CHARS,
+    integral_numbers, vymalo_inbound,
+};

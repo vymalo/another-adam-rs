@@ -24,6 +24,7 @@ resubscribe only works inside one process.
 | `ServerOptions` | `with_keepalive_interval(..)` (the SDK sends an SSE comment every `SDK_KEEPALIVE_INTERVAL`, 15 s) |
 | `AuthConfig` | `BearerTokens(Vec<SecretString>)` (constant-time comparison) or `AllowAnonymous` (logs a warning) |
 | `AgentCardConfig`, `SkillConfig`, `ExtensionConfig` | the public agent card |
+| `ExtensionConfig::a2ui_v0_9_1()`, `ui_catalog()`, `thread_tools()` | the card entries of an agent that draws on a screen: A2UI v0.9.1 (with `supportedCatalogIds` and `acceptsInlineCatalogs: true`), `ui-catalog/v1` and `thread-tools/v1` (both optional, no parameters); `A2UI_EXTENSION_V0_9_1`, `A2UI_BASIC_CATALOG_V0_9_1`, `A2UI_MEDIA_TYPE`, `UI_CATALOG_EXTENSION`, `THREAD_TOOLS_EXTENSION` are the URIs and the media type. The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`, `docs/api/thread-tools-v1.md` in `vymalo/another-agentic-system`); what an agent does with the messages is [`adam-a2a-runtime`](../adam-a2a-runtime/README.md) (`vymalo_inbound`) and `adam-ui` |
 | `InMemoryBackend`, `InMemoryConfig` | reference backend, **only with feature `test-util`** |
 
 ```rust
@@ -103,7 +104,7 @@ resubscribe, `input-required` follow-ups, error mapping, malformed bodies
 `an_oversized_body_is_an_invalid_request`), authentication on every route,
 keepalive frames, caller isolation). Unit tests in `src/backend.rs`
 (`class_table`, `the_source_is_kept_and_not_repeated_in_the_message`,
-`a2a_errors_do_not_leak_the_cause`). The crate's own
+`a2a_errors_do_not_leak_the_cause`, and the three extension entries of `src/extensions.rs`). The crate's own
 dev-dependency turns on `test-util`. Offline, no environment variables.
 
 ## See also

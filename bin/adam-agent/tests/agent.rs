@@ -60,9 +60,10 @@ fn service_over(agents: Agents, store: &DynStore) -> Service {
         name,
         register,
         options,
+        inbound,
         ..
     } = agents;
-    Service::new(register(Runtime::builder(store.clone())), name, &options)
+    Service::new(register(Runtime::builder(store.clone())), name, &options).with_inbound(inbound)
 }
 
 fn alice() -> Caller {
