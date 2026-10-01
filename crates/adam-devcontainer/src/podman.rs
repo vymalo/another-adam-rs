@@ -51,6 +51,10 @@ impl Podman {
 
     /// Run `podman <args>` and return its standard output.
     async fn call(&self, args: &[&str], timeout: Duration) -> Result<String, PodmanError> {
+        self.env
+            .ensure_home()
+            .await
+            .map_err(|e| PodmanError(format!("cannot make {}: {e}", self.env.home().display())))?;
         let cmd = self.env.command(&self.program, args);
         match run(cmd, timeout, |_| {}).await {
             Ok(done) if done.success() => Ok(done.stdout),

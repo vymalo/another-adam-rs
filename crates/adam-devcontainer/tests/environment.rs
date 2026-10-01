@@ -56,6 +56,23 @@ fn error_of(result: Result<Arc<dyn EnvSession>, EnvError>) -> EnvError {
     }
 }
 
+// --------------------------------------------------------------------------------------- probing
+
+#[tokio::test]
+async fn a_probe_on_a_fresh_root_makes_the_home_podman_resolves_first() {
+    // Podman's client `lstat`s its HOME before it talks to the service: on a root where no
+    // environment was built yet, the probe failed with "cannot resolve .../.cli-home" (CI, run
+    // 36939350461) and every run fell back to the coder's own environment.
+    let rig = Rig::new();
+    let home = rig.root.join("environments").join(".cli-home");
+    assert!(!home.exists(), "nothing is made before the first call");
+
+    rig.env.probe().await.unwrap();
+
+    assert!(home.is_dir(), "the probe made {}", home.display());
+    assert_eq!(rig.podman("info").len(), 1, "and asked the service once");
+}
+
 // -------------------------------------------------------------------------------------- building
 
 #[tokio::test]

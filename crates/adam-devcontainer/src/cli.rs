@@ -68,6 +68,12 @@ impl CleanEnv {
         &self.home
     }
 
+    /// Make `HOME` if it is not there. Podman's client resolves its `HOME` before it does anything
+    /// (`lstat`), so a probe on a fresh root would fail without it.
+    pub(crate) async fn ensure_home(&self) -> std::io::Result<()> {
+        tokio::fs::create_dir_all(&self.home).await
+    }
+
     /// The variables, as a process gets them and as `PreparedCommand::env` says them.
     pub(crate) fn vars(&self) -> Vec<(&'static str, OsString)> {
         vec![

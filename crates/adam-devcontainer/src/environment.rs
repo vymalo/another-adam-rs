@@ -864,6 +864,7 @@ impl DevContainer {
         log: &mut LogTail,
     ) -> Result<Finished, EnvError> {
         let s = &self.inner.settings;
+        self.inner.env.ensure_home().await?;
         let cmd = self.inner.env.command(&s.cli, args);
         match run(cmd, timeout, on_line).await {
             Ok(done) => {
