@@ -10,7 +10,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse, TaskState};
+use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse, TaskState, TaskStatus};
 use common::pg::TestDb;
 use common::{
     SearchServer, assistant, chat, edit_instructions, greeting_for, researcher, text_reply,
@@ -497,8 +497,23 @@ async fn mount_persona_model() -> (MockServer, Arc<Mutex<Vec<Value>>>) {
     (model, seen)
 }
 
+/// What a streamed response says about the task, if anything: the state and the words of the status of
+/// the snapshot the stream starts with, or of a status update.
+fn status_of(event: &StreamResponse) -> Option<&TaskStatus> {
+    match event {
+        StreamResponse::Task(task) => Some(&task.status),
+        StreamResponse::StatusUpdate(update) => Some(&update.status),
+        _ => None,
+    }
+}
+
 /// Send `text` to the agent at `addr` over A2A (the official client, streaming) and return the final
 /// state of the task and the words of its last status.
+///
+/// The stream starts with a snapshot of the task, and that snapshot is the whole stream when the run
+/// is already over by the time the subscription takes it (a worker in the same process answers a
+/// scripted model in milliseconds, so on a loaded machine it can win the race): the state is read
+/// from the snapshot as well as from the updates that follow it.
 async fn talk(addr: SocketAddr, text: &str) -> (TaskState, String) {
     let client = common::a2a_client(addr, A2A_TOKEN).await;
     let mut stream = client
@@ -512,17 +527,20 @@ async fn talk(addr: SocketAddr, text: &str) -> (TaskState, String) {
         .unwrap();
     let mut state = None;
     let mut words = String::new();
+    let mut seen = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !state.as_ref().is_some_and(TaskState::is_terminal) {
         match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(Ok(StreamResponse::StatusUpdate(u)))) => {
-                if let Some(text) = u.status.message.as_ref().and_then(|m| m.text()) {
-                    words = text.to_owned();
+            Ok(Some(Ok(event))) => {
+                if let Some(status) = status_of(&event) {
+                    if let Some(text) = status.message.as_ref().and_then(|m| m.text()) {
+                        words = text.to_owned();
+                    }
+                    state = Some(status.state.clone());
                 }
-                state = Some(u.status.state);
+                seen.push(event);
             }
-            Ok(Some(Ok(_))) => {}
-            other => panic!("the stream ended before the task did: {other:?}"),
+            other => panic!("the stream ended before the task did: {other:?}\nseen: {seen:#?}"),
         }
     }
     (state.unwrap(), words)
@@ -648,13 +666,14 @@ async fn a_control_plane_and_a_worker_process_complete_a_task_over_one_database(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !last.as_ref().is_some_and(TaskState::is_terminal) {
         match tokio::time::timeout_at(deadline, stream.next()).await {
-            Ok(Some(Ok(StreamResponse::StatusUpdate(u)))) => {
-                if let Some(text) = u.status.message.as_ref().and_then(|m| m.text()) {
-                    words = text.to_owned();
+            Ok(Some(Ok(event))) => {
+                if let Some(status) = status_of(&event) {
+                    if let Some(text) = status.message.as_ref().and_then(|m| m.text()) {
+                        words = text.to_owned();
+                    }
+                    last = Some(status.state.clone());
                 }
-                last = Some(u.status.state);
             }
-            Ok(Some(Ok(_))) => {}
             other => panic!(
                 "the stream ended before the task did: {other:?}\n{}\n{}",
                 front.logs(),

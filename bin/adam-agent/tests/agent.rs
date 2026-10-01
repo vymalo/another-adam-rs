@@ -11,7 +11,7 @@ use std::time::Duration;
 use a2a::{Message, Part, Role, Task, TaskState};
 use adam::AgentDef;
 use adam::mcp::McpPolicy;
-use adam_a2a::{Caller, TaskBackend as _};
+use adam_a2a::{Caller, TaskBackend as _, TaskEvent};
 use adam_agent::agents as build;
 use adam_agent::{AgentError, VERSION, WorkerParts, card_of, exit_code, folder};
 use adam_core::{DynStore, MemoryStore};
@@ -226,6 +226,45 @@ async fn a_chat_folder_answers_in_role_through_a2a() {
     );
     let tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(tools, ["ask_user"]);
+    worker.stop().await;
+}
+
+/// A subscription taken after the run finished starts with the snapshot of the task, already final,
+/// and ends with it: that is what a streaming client sees when the worker wins the race against the
+/// subscription (a worker in the same process answers a scripted model in milliseconds, and on a loaded
+/// machine it can finish first). A client must read the state of the snapshot, not only of the updates
+/// after it, which is what the helper of `tests/binary.rs` does.
+#[tokio::test]
+async fn a_task_that_finished_before_it_was_subscribed_to_is_one_final_snapshot() {
+    use futures::StreamExt as _;
+    let store = store();
+    let model = PersonaModel::new();
+    let dynamic: DynModel = model.clone();
+    let agents = build(def_of(&chat()), None, Some(worker_parts(dynamic)))
+        .await
+        .unwrap();
+    let service = service_over(agents, &store);
+    let worker = Worker::start(&service);
+    let done = ask(&service, "hi").await;
+
+    let mut events = service.backend.subscribe(&alice(), &done.id);
+    let first = events
+        .next()
+        .await
+        .expect("an event")
+        .expect("not an error");
+    let TaskEvent::Snapshot(task) = first else {
+        panic!("the stream starts with the snapshot: {first:?}");
+    };
+    assert_eq!(task.status.state, TaskState::Completed);
+    assert_eq!(
+        said(&task),
+        Some("Hi! I'm Chat. I talk things through with you.")
+    );
+    assert!(
+        events.next().await.is_none(),
+        "a final snapshot is the whole stream"
+    );
     worker.stop().await;
 }
 
