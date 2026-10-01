@@ -162,6 +162,10 @@ pub struct ToolEnv {
     /// OpenCode. [`Local`], this container, until [`ToolEnv::with_environment`]. The file tools and
     /// everything git does stay in this process whatever it is: they act on the shared files.
     pub environment: DynEnvironment,
+    /// What a run that ends on rejected GitHub credentials says to check: the variables of the kind
+    /// of credentials the process has (a token, or a GitHub App). `GITHUB_TOKEN` until
+    /// [`ToolEnv::with_credentials_hint`].
+    pub credentials_hint: &'static str,
 }
 
 impl ToolEnv {
@@ -176,7 +180,16 @@ impl ToolEnv {
             redactor: Redactor::default(),
             ui: Ui::new(McpPolicy::default()).with_ask_lead(ASK_LEAD),
             environment: Arc::new(Local),
+            credentials_hint: "GITHUB_TOKEN is valid and may push and open pull requests for the repository",
         }
+    }
+
+    /// Say `hint` when the GitHub credentials are rejected, as the end of "check that ...": see
+    /// [`GitHubAuth::check_hint`](crate::GitHubAuth::check_hint).
+    #[must_use]
+    pub fn with_credentials_hint(mut self, hint: &'static str) -> Self {
+        self.credentials_hint = hint;
+        self
     }
 
     /// Run the processes of runs in `environment` instead of this container. The janitor of the
@@ -215,8 +228,8 @@ impl ToolEnv {
             let recorded = async {
                 let mut notes = self.notes.load(&run).await?;
                 notes.blocker = Some(format!(
-                    "the credentials were rejected ({e}); check that GITHUB_TOKEN is valid and \
-                     may push and open pull requests for the repository"
+                    "the credentials were rejected ({e}); check that {}",
+                    self.credentials_hint
                 ));
                 self.notes.save(&run, &notes).await
             }

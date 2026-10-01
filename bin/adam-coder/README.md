@@ -252,7 +252,8 @@ make them hold:
   checks, the check-cycle budget used up and no pull request fails instead of
   completing, whatever the model says. So does a run that ends without a pull
   request because GitHub or git rejected the credentials (the model cannot fix a
-  bad token): the error names `GITHUB_TOKEN`. Anything else is a **question,
+  bad token, or an App that is not installed there): the error names `GITHUB_TOKEN`, or the `GITHUB_APP_*`
+  variables in App mode. Anything else is a **question,
   not a completion** (red checks with cycles left included: fixing or asking is
   the model's call): the model
   that answers "Hi! I need a repository and a task" in plain text asked
@@ -603,8 +604,9 @@ stateDiagram-v2
   `fs_root` and the git snapshots of `run_command` need no mapping. The file tools and all git work stay in this process.
 * **No secret in a spec.** `ExecSpec.env` carries the OpenCode configuration (which names the key as `{env:MODEL_API_KEY}`) and
   never a value of a secret; what the process must not see of this process's own environment is `ExecSpec.hide`:
-  `GITHUB_TOKEN`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY` for the project's commands, the first three for
-  OpenCode (which reads the model key from its environment). A name in `hide` stays hidden even when a spec sets it.
+  `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY` for the project's commands,
+  the first four for OpenCode (which reads the model key from its environment). The App's key as a *file*
+  (`GITHUB_APP_PRIVATE_KEY_PATH`) is a path, not a secret, and the file is readable by the user the checks run as. A name in `hide` stays hidden even when a spec sets it.
 * **A failure to make the environment is a result for the model**, worded `the work environment: <reason>` (the end of a
   failed build's output follows, scrubbed): permanent for a configuration or a build that is wrong, transient for a runtime
   that is down or too slow. Nothing ran, no check cycle was used, no `checks` artifact was emitted. A cancel of the run ends
@@ -957,7 +959,9 @@ way; every problem is reported at once at startup):
 | `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required by `all` and `worker` (key may be empty) |
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
-| `GITHUB_TOKEN` | push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | required by `all` and `worker` |
+| `GITHUB_TOKEN` | push and pull request token (a personal access token); only ever sent to the `ALLOWED_REPO_HOSTS`. Must be unset or empty in App mode | one of this or the App's variables, for `all` and `worker` |
+| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` | GitHub App mode: the App's application ID or client ID (the JWT's `iss`), and the installation's ID (a positive integer). See [GitHub credentials](#github-credentials-a-token-or-an-app-installation) | both required in App mode, unset in token mode |
+| `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 as GitHub gives it, or PKCS#8): a file, or inline (`\n` escapes accepted). Exactly one. Parsed at startup | one required in App mode |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
@@ -985,7 +989,7 @@ OpenCode's configuration is generated at startup into
 `MODEL_BASE_URL`, model `OPENCODE_MODEL`, key by reference `{env:MODEL_API_KEY}`,
 never inlined) together with `OPENCODE_DISABLE_AUTOUPDATE=1`; see
 `src/opencode.rs` for what was verified against the OpenCode sources. The
-OpenCode child does not see `GITHUB_TOKEN`, `DATABASE_URL` or
+OpenCode child does not see `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` or
 `A2A_BEARER_TOKENS`, and the checks do not see those or `MODEL_API_KEY`.
 
 ### Workspace placement
@@ -1066,7 +1070,7 @@ By default any worker may lease any run at any step. Several workers therefore n
 |---|---|---|---|
 | `DATABASE_URL` | yes | yes | yes |
 | `A2A_BEARER_TOKENS`, `PUBLIC_URL` | yes | yes | not read |
-| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `GITHUB_TOKEN` | yes | not read | yes |
+| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, and `GITHUB_TOKEN` or the `GITHUB_APP_*` variables | yes | not read | yes |
 | the rest of the table above (`OPENCODE_*`, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `WORKSPACE_PLACEMENT`, `WORKER_ID`, `WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
 
 A missing required value is a configuration error (exit 78) listed with every other problem.
@@ -1090,7 +1094,8 @@ own stops the others and ends the process with a `HostError`, exit 70.
 ### Which repositories, and where the token goes
 
 The repository URL comes from the model, which took it from the user, so it
-is treated as hostile input. `GITHUB_TOKEN` is bound to `ALLOWED_REPO_HOSTS`
+is treated as hostile input. The GitHub credential (the token, or the App's installation
+token) is bound to `ALLOWED_REPO_HOSTS`
 twice over, and a third layer decides whether the repository may be used at all:
 
 0. **Only a repository the person named.** `prepare_workspace` refuses, before
@@ -1103,21 +1108,88 @@ twice over, and a third layer decides whether the repository may be used at all:
    anything that is not `https://<host>/<owner>/<repo>` are refused by the
    parser, and git is handed the URL rebuilt from the parsed parts, never the
    raw string.
-2. The credentials are a `ScopedToken` for the same hosts, which refuses
+2. The credentials are a `ScopedToken` for the same hosts (a `HostScoped<GitHubApp>` in App mode, which
+   checks the host *before* it signs anything or calls GitHub), which refuses
    every other host even if a caller forgot the check.
 
 Local paths, `file://` and plain `http://` are refused unless
 `ALLOW_LOCAL_REPOS=true`, which exists for development and tests; local
 remotes never receive the token.
 
+### GitHub credentials: a token or an App installation
+
+A worker authenticates to GitHub one of two ways, **exactly one**
+([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md)):
+
+| | token | GitHub App installation |
+|---|---|---|
+| Variables | `GITHUB_TOKEN` | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and one of `GITHUB_APP_PRIVATE_KEY_PATH` (a file) or `GITHUB_APP_PRIVATE_KEY` (the PEM; `\n` escapes accepted) |
+| `GITHUB_TOKEN` | required | must be unset or empty |
+| Whose | a person's, until it is revoked | the App's, scoped to what the App was granted on the installation; its tokens last an hour |
+| Credentials | `ScopedToken` for `ALLOWED_REPO_HOSTS` | `HostScoped<GitHubApp>` for the same hosts |
+
+Both set, an App set that is partial (`GITHUB_APP_ID` without the installation or the key, a key with both its
+file and its variable), an installation ID that is not a positive integer, a key file that cannot be read, and a
+key that is not an unencrypted RSA key in PEM form (PKCS#1, as GitHub lets the owner download it, or PKCS#8) are
+configuration errors: exit 78, every problem listed, the name of the variable and never a value. The key is
+**parsed at startup**, so a deployment learns of a bad one when it rolls out, not at the first push. A rotated
+key needs a restart. `GITHUB_APP_ID` is the App's application ID or its client ID (the JWT's `iss`).
+
+```mermaid
+sequenceDiagram
+  participant S as a step (clone, push, pull request)
+  participant C as credentials (HostScoped, then GitHubApp)
+  participant G as GITHUB_API_URL
+  participant R as the redactor
+  S->>C: token_for(repository)
+  C->>C: the host is in ALLOWED_REPO_HOSTS? (else refused, nothing is signed)
+  alt a cached token has more than 5 minutes left
+    C-->>S: the cached token
+  else none, or about to expire (one caller at a time)
+    C->>G: POST /app/installations/{id}/access_tokens (Bearer: a JWT, RS256, iat now-60s, exp now+540s)
+    G-->>C: 201 {token, expires_at}
+    C->>R: add(token)
+    C-->>S: the new token
+  end
+  S->>G: git: x-access-token:token, REST: Bearer token
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Empty: startup, the key is parsed
+  Empty --> Fresh: minted
+  Fresh --> Expiring: 5 minutes or less left
+  Expiring --> Fresh: minted
+  Empty --> Empty: a mint failed, nothing cached
+  Expiring --> Expiring: a mint failed, the next call tries again
+```
+
+A token the App minted is a secret from the moment it exists: the redactor is shared, and the credentials add
+each token they hand out (at most 16 are remembered, oldest forgotten first), so a tool result, an error or a
+log line that quotes one is scrubbed (the App's PEM and its Base64 body are registered at startup). The key is
+hidden from OpenCode and from the project's commands as `GITHUB_TOKEN` is; a key file is a path, and sits
+wherever the deployment mounted it (the chart: `/var/run/secrets/github-app/private-key.pem`, read-only, mode
+0440, group `fsGroup`).
+
+A refused mint is told to the person as it is for a bad token: `401`, `403` and `404` from GitHub are an
+authentication error that names `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and the key, and a run that ends at
+one fails naming them (and that the App must be installed on the repository, with write access to its contents
+and pull requests). A rate limit is a rate limit (with the wait GitHub asked for), and a `5xx` or a transport
+failure is transient. The token endpoint is `{GITHUB_API_URL}/app/installations/{id}/access_tokens`, so GitHub
+Enterprise Server and a mock need no other variable. The deployment's own example is
+`dev/compose.github-app.yaml` (an init service makes a throwaway key; the mock gives an installation token that
+lasts four minutes, so the coder renews it all the time) and `deploy/coder` (`github.auth: app`).
+
 ### Secrets in output
 
 Text from things this process does not control (OpenCode's stderr tail in an
 "ACP agent exited" error, a check's output, a provider's error body) reaches
 clients as run errors, events and tool results. A `Redactor` built from the
-configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN` (both only where the role holds them), every
+configuration replaces the *values* of `MODEL_API_KEY`, `GITHUB_TOKEN` or the App's private key (the PEM and its
+Base64 body), each only where the role holds them, every
 `A2A_BEARER_TOKENS` entry and the `DATABASE_URL` password (and their Base64
-forms) with `[redacted]` in tool results and errors, in OpenCode's and the
+forms), and every installation token an App mints, from the moment it is minted (the redactor is shared, and
+the credentials add each token they hand out, up to 16 at a time), with `[redacted]` in tool results and errors, in OpenCode's and the
 checks' progress lines, in the `checks` artifact's findings and summary, in the agent's final
 failure message, and in the process's own `adam-coder failed` log line.
 A failed step's error crosses one boundary (`boundary_error` in
@@ -1158,7 +1230,7 @@ workspace, the agent files and their assembly):
 | 69 (`EX_UNAVAILABLE`) | a dependency is unreachable; restart later | a `Transient`, `RateLimited` or `Conflict` one of those, such as Postgres at boot |
 | 71 (`EX_OSERR`) | the OS refused something | an `io::Error` with no typed error above it: a listener that cannot bind |
 | 70 (`EX_SOFTWARE`) | internal | `HostError` (a component stopped, panicked or ended before shutdown, whatever its own cause), a panicked task, or a `Corrupt` or `Internal` typed error (including `OpenAiConfigError::Client`) |
-| 1 | anything else | for example `NotFound`, `Rejected`, `Unauthenticated` (a bad `GITHUB_TOKEN`) or an untyped error |
+| 1 | anything else | for example `NotFound`, `Rejected`, `Unauthenticated` (a bad `GITHUB_TOKEN`, or a refused App) or an untyped error |
 
 The typed errors it looks for are `StoreError`, `OpenAiConfigError`,
 `WorkspaceError`, `RuntimeError`, `HostError`, `AgentFilesError` and the assembly's (including an MCP server
@@ -1198,7 +1270,9 @@ database of its own, so the role needs `CREATEDB`):
   commit (the one bound to the pushed commit is emitted once), the same worktree; OpenCode crashing on every attempt
   (run fails after the retry budget, with the child's stderr) and once
   (retried, completes); two concurrent tasks on one repository (two branches,
-  two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`).
+  two pull requests); a GitHub 401 (run fails and names `GITHUB_TOKEN`, or the `GITHUB_APP_*` variables when the coder is an App
+  installation); an App installation token that is minted, used for every call to the repositories' API and never
+  echoed (a tool result that quotes it is scrubbed).
   Asking with choices, over A2A with the screen's real catalog (a copy of the web's, in
   `adam-ui`'s fixtures): three questions as one form (`input-required` with the question as text and one
   `application/a2ui+json` part, a Choices of db, auth and deploy under the screen's `catalogId`), the person's
@@ -1288,6 +1362,19 @@ database of its own, so the role needs `CREATEDB`):
   (`the_janitor_removes_the_workspace_of_a_finished_run_and_keeps_an_open_one`, with Postgres: the process sweeps on its
   own, a run that finishes later loses its workspace, SIGTERM stops it with exit 0; `a_sweep_of_zero_seconds_turns_the_janitor_off`;
   a bad `WORKSPACE_SWEEP_SECS` exits 78 with the other problems) and `src/config.rs`.
+* GitHub credentials: the unit tests of `src/config.rs` (a token is one way; an App is the other, with the key from a
+  file or from the variable, in PKCS#1 or PKCS#8, `\n` escapes accepted; both, a partial App set, an installation ID that is
+  not a positive integer and a key given twice are every problem at once and never a value; a key that cannot be used is
+  refused at startup naming the variable and not the key; a control plane reads none of it, bad values included), of
+  `src/redact.rs` (a secret added later is scrubbed by every clone, only the latest 16 are kept, a token is registered as it is
+  handed out, an App's key is redacted as its PEM and as its body) and of `src/repos.rs` (an App mints at the API root, for the
+  allowed hosts only); in `tests/binary.rs`, `a_github_app_configuration_is_checked_at_startup_and_exits_78_with_every_problem`
+  and `a_github_app_installation_gets_its_token_minted_and_opens_the_pull_request` (with Postgres: the real binary against a
+  mock that hands a token for a JWT, every call to the repositories' API carries it, and no secret is in the output); in
+  `tests/tools.rs`, `a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_return`; in `tests/e2e.rs`
+  (per store), `a_refused_github_app_fails_the_run_naming_its_own_variables`. The compose scenarios run twice, the second time
+  as an App (`GITHUB_AUTH=app`, `-f dev/compose.github-app.yaml`: an init service makes a throwaway key), and assert that the
+  mock saw the trade and that every call to `/repos/...` carried the installation token and never the JWT.
 * Scratch projects: `tests/tools.rs` (`a_scratch_project_is_built_checked_and_committed_locally`: the file tools, `run_checks`
   (an artifact with no `repository`), `run_command` (a stray file and a sneaky commit are undone, as in a worktree) and OpenCode
   work in it, `commit_and_push` is a local commit with no artifact and no remote branch, `open_pull_request` is refused and

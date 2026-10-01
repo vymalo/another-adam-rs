@@ -141,6 +141,7 @@ async fn a_command_and_a_check_run_as_the_environment_prepared_them() {
         // A command of the project's is repository code: it must not see this process's secrets.
         for name in [
             "GITHUB_TOKEN",
+            "GITHUB_APP_PRIVATE_KEY",
             "DATABASE_URL",
             "A2A_BEARER_TOKENS",
             "MODEL_API_KEY",
@@ -192,10 +193,16 @@ async fn opencode_is_started_from_the_command_the_environment_prepared() {
         spec.cwd,
         rig.worktree().canonicalize().unwrap_or(rig.worktree())
     );
-    // OpenCode reads the model key by reference; the three secrets it has no use for are hidden.
+    // OpenCode reads the model key by reference; the secrets it has no use for are hidden (the token,
+    // the GitHub App's key, the database, the A2A tokens).
     assert_eq!(
         spec.hide,
-        ["GITHUB_TOKEN", "DATABASE_URL", "A2A_BEARER_TOKENS"]
+        [
+            "GITHUB_TOKEN",
+            "GITHUB_APP_PRIVATE_KEY",
+            "DATABASE_URL",
+            "A2A_BEARER_TOKENS"
+        ]
     );
     assert_eq!(
         spec.env.get("FAKE_ACP_SCENARIO").map(String::as_str),

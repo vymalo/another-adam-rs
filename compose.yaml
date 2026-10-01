@@ -136,8 +136,10 @@ services:
       MODEL: ${CODER_MODEL:-mock-coder}
       OPENCODE_MODEL: ${CODER_OPENCODE_MODEL:-mock-opencode}
       GITHUB_API_URL: http://mock-github:8080
-      # Dummy. Set MOCK_GITHUB_TOKEN=bad-token to make mock-github answer 401.
-      GITHUB_TOKEN: ${MOCK_GITHUB_TOKEN:-dev-github-token}
+      # Dummy. Set MOCK_GITHUB_TOKEN=bad-token to make mock-github answer 401. An installation is
+      # a token OR a GitHub App, never both: dev/compose.github-app.yaml turns this one off (empty)
+      # and gives the coder an App (GITHUB_APP_*) that mock-github trades JWTs for tokens.
+      GITHUB_TOKEN: ${MOCK_GITHUB_TOKEN-dev-github-token}
       # Dummy bearer token for the A2A endpoint; never reuse it anywhere real.
       A2A_BEARER_TOKENS: dev-token
       PUBLIC_URL: http://127.0.0.1:${CODER_PORT:-8080}/

@@ -149,7 +149,7 @@ docker compose down -v             # stop and forget all state (volumes included
 | `postgres` | `127.0.0.1:5432` | PostgreSQL 16, database `adam_test`, user and password `postgres` |
 | `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone |
 | `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder`, `mock-opencode`, `mock-assistant` and `mock-researcher` are scripted (see "Scripted models") |
-| `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) |
+| `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) and the GitHub App token trade (`POST /app/installations/{id}/access_tokens`: a JWT for an installation token that lasts four minutes) |
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git` and creating an empty repository on first use for the owners of `AUTO_CREATE_OWNERS` (`scratch` in the compose file); no authentication |
 | `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token`; its agent files are the folder `bin/adam-coder/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`, see "Changing what the coder says") |
 | `agent` (profile `app`) | `http://127.0.0.1:8084/` | the general agent: `adam-agent` from the **coder's image** (`entrypoint: ["tini", "--", "adam-agent"]`, so there is no second image), bearer token `dev-token`, serving the folder `dev/agents/assistant/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`); model `mock-assistant`; shares the coder's database (runs are scoped by the agent's name). See "A general agent from a folder" |
@@ -283,6 +283,29 @@ on first use, and checks everything above for that repository (the pull request,
 plus that `main` is the one empty commit the coder gave it, that `fib.sh` is on the branch, and that the
 **tree** the checks ran on in the scratch project is the tree of the pushed commit: what was checked is what
 was pushed. `<id>` is new on every run, so a rerun on one stack never meets the last one's repository.
+
+#### The coder as a GitHub App installation
+
+An installation is a token or a GitHub App, never both
+([ADR 0009](docs/decisions/0009-github-per-installation-read-through-mcp.md)). The compose file runs the
+token. The override `dev/compose.github-app.yaml` runs the same coder as an App: an init service makes a
+throwaway RSA key into a volume (`openssl genrsa`; no key is committed), `GITHUB_TOKEN` is turned off, and the
+coder gets `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_PATH`. It signs a JWT,
+trades it at `mock-github` for an installation token and gives that to `git` and to the REST calls.
+
+```sh
+docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app up -d --build --wait \
+  postgres mock-openai mock-github git-server coder
+GITHUB_AUTH=app sh dev/coder-e2e.sh                  # likewise NO_OPENCODE=1, SCENARIO=files, SCENARIO=scratch
+```
+
+With `GITHUB_AUTH=app` the script asserts, besides everything above, that `mock-github` saw at least one
+`POST /app/installations/67890/access_tokens` and that **every** call to `/repos/...` (the pull request's
+included) carried `Bearer ghs_mockinstallationtoken...` and never the JWT. With the default `token` it asserts
+that every such call carried the dummy token. WireMock cannot check an RS256 signature, so the mock accepts any
+bearer that looks like a JWT; the signature, `iss` and lifetime are checked by
+`cargo test -p adam-workspace --test github_app` against a key made for the test. CI runs the four scenarios a
+second time this way (`.github/workflows/coder.yml`, step "Compose e2e").
 
 #### Saying hello, and the coder's name
 

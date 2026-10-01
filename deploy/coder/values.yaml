@@ -49,9 +49,10 @@ config:
   # that one pod runs; leave it empty with topology=split, which sets ROLE for
   # the front (control-plane) and the worker (worker) itself.
   # `control-plane` renders none of the model, GitHub and workspace settings
-  # below (modelBaseUrl through gitAuthorEmail) and none of the two secrets
-  # they need (properties.modelApiKey, properties.githubToken): it only starts,
-  # delivers to, cancels and views runs. `all` and `worker` need all of them.
+  # below (modelBaseUrl through gitAuthorEmail), none of the two secrets
+  # they need (properties.modelApiKey, properties.githubToken) and no GitHub App
+  # settings or key volume (github.app): it only starts, delivers to, cancels
+  # and views runs. `all` and `worker` need all of them.
   role: ""
   # OpenAI-compatible gateway, with its /v1 prefix. Roles that run workers only.
   modelBaseUrl: "https://gateway.example.invalid/v1"
@@ -84,6 +85,30 @@ config:
   gitAuthorEmail: "adam-coder@users.noreply.github.com"
   # Extra environment variables, as a name -> value map.
   extraEnv: {}
+
+# How the coder authenticates to GitHub (ADR 0009). Roles that run workers only: a control
+# plane renders none of it.
+github:
+  # token  (default) one token, GITHUB_TOKEN, from externalSecrets.properties.githubToken. It is
+  #        valid for as long as it is: a classic or fine-grained personal access token, or a
+  #        token someone refreshes.
+  # app    a GitHub App installation: the coder signs a short-lived JWT with the App's private
+  #        key and trades it for an installation access token (valid for 1 hour, renewed
+  #        before it runs out), per installation and scoped to what the App was granted.
+  #        GITHUB_TOKEN is then neither rendered nor required, and the ExternalSecret has no
+  #        githubToken entry. The key is read at startup: a rotated key needs a restart.
+  auth: token
+  app:
+    # The App's application ID (a number) or its client ID (`Iv1.…`): the JWT's `iss`.
+    id: ""
+    # The installation's ID, a positive integer (the last part of the URL of the installation's
+    # settings page).
+    installationId: ""
+    # Name of a Secret in this namespace that you (or another ExternalSecret) manage, with one
+    # key, `private-key.pem`: the App's private key as GitHub gives it (PKCS#1) or PKCS#8. The
+    # chart mounts it read-only at /var/run/secrets/github-app and sets
+    # GITHUB_APP_PRIVATE_KEY_PATH to the file. The chart never carries the key itself.
+    privateKeySecret: ""
 
 service:
   port: 8080
@@ -157,7 +182,8 @@ externalSecrets:
   properties:
     # modelApiKey and githubToken are read by the roles that run workers (all,
     # worker); with config.role=control-plane they are neither rendered nor
-    # required, and may be set to null.
+    # required, and may be set to null. githubToken is also neither rendered nor
+    # required with github.auth=app.
     modelApiKey: adam_coder_model_api_key
     githubToken: adam_coder_github_token
     # Comma-separated bearer tokens the A2A server accepts.

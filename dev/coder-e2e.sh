@@ -6,6 +6,7 @@
 #   NO_OPENCODE=1 dev/coder-e2e.sh    # the check command makes it; OpenCode is not started
 #   SCENARIO=files dev/coder-e2e.sh   # the coder reads and writes the files itself; no OpenCode
 #   SCENARIO=scratch dev/coder-e2e.sh # no repository is named: a scratch project, then published
+#   GITHUB_AUTH=app dev/coder-e2e.sh  # the stack runs the coder as a GitHub App (see below)
 #
 # Start the stack first (the coder's models are the scripts in
 # dev/wiremock/mock-openai/mappings/coder-script.json and opencode-script.json):
@@ -38,6 +39,14 @@
 #     repository), `fib.sh` is on the branch, and the last `checks` artifact is bound to the pushed
 #     commit with the tree the checks ran on in the scratch project (the code that was checked is
 #     the code that was pushed).
+#   * the coder's GitHub credentials, as the stack was started with them (GITHUB_AUTH):
+#       token (default): every call the coder made to mock-github's `/repos/...` carried
+#         `Authorization: Bearer dev-github-token` (MOCK_GITHUB_TOKEN, the compose file's dummy);
+#       app: the stack was started with `-f dev/compose.github-app.yaml`, the coder holds a GitHub
+#         App's key and no token: mock-github's journal holds at least one
+#         `POST /app/installations/67890/access_tokens` (the trade of a signed JWT for a token), and
+#         every call to `/repos/...`, the pull request's included, carried the installation token it
+#         gave, `Bearer ghs_mockinstallationtoken...`, and never the JWT (`Bearer eyJ...`).
 # It prints one "ok" or "FAIL" line per check and exits 1 if any failed.
 #
 # Environment (defaults match compose.yaml on one machine):
@@ -51,6 +60,8 @@
 #                    read_file, write_file; every check above holds, and so do the two lines) or
 #                    `scratch` (the [mock:scratch] script, above)
 #   REPO_BASE_URL    http://git-server:8080   where the coder (inside the compose network) finds git-server
+#   GITHUB_AUTH      token   how the stack was started: `token` or `app` (see the assertions above)
+#   MOCK_GITHUB_TOKEN dev-github-token   the token of `token` mode (compose.yaml's `${MOCK_GITHUB_TOKEN-dev-github-token}`)
 #
 # Needs curl, jq and git. Verified by CI only in the compose run of
 # .github/workflows/coder.yml; the mock scripts were also run against the real
@@ -80,6 +91,11 @@ bad() { echo "FAIL $1"; fail=1; }
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+github_auth=${GITHUB_AUTH:-token}
+case "$github_auth" in
+  token | app) ;;
+  *) echo "GITHUB_AUTH must be token or app, not '$github_auth'" >&2; exit 2 ;;
+esac
 scenario=${SCENARIO:-default}
 case "$scenario" in
   default | files | scratch) ;;
@@ -282,6 +298,31 @@ base_ref=$(jq -r '.requests[0].body | fromjson | .base // empty' "$found" 2>/dev
 head_branch=${head_ref##*:}
 if [ -n "$branch" ] && [ "$head_branch" = "$branch" ]; then ok "the pull request head is $head_branch"; else bad "the pull request head is '$head_ref', want '$branch'"; fi
 if [ "$base_ref" = main ]; then ok "the pull request base is main"; else bad "the pull request base is '$base_ref', want main"; fi
+
+# --- the coder's GitHub credentials -----------------------------------------------------
+# Every call the coder made to the repositories' API in this run (the journal was reset at the
+# start): which `Authorization` it carried.
+repo_calls=$tmp/repo-calls.json
+curl -s --max-time 30 -X POST "$github/__admin/requests/find" \
+  -H 'Content-Type: application/json' \
+  -d '{"urlPathPattern":"/repos/.*"}' > "$repo_calls" || true
+n_calls=$(jq -r '.requests | length' "$repo_calls" 2>/dev/null || echo 0)
+auths=$(jq -r '.requests[] | .headers | with_entries(.key |= ascii_downcase) | .authorization // "none"' "$repo_calls" 2>/dev/null | sort | uniq -c | sed 's/^ *//' | tr '\n' ';')
+case "$github_auth" in
+  token)
+    want="Bearer ${MOCK_GITHUB_TOKEN-dev-github-token}"
+    wrong=$(jq -r --arg want "$want" '[.requests[] | .headers | with_entries(.key |= ascii_downcase) | select(.authorization != $want)] | length' "$repo_calls" 2>/dev/null || echo '?')
+    if [ "$n_calls" -ge 1 ] && [ "$wrong" = 0 ]; then ok "all $n_calls call(s) to the repositories' API carried the token"; else bad "token mode: $wrong of $n_calls call(s) to /repos/... did not carry '$want' ($auths)"; fi
+    ;;
+  app)
+    mints=$(curl -s --max-time 30 -X POST "$github/__admin/requests/find" \
+      -H 'Content-Type: application/json' \
+      -d '{"method":"POST","urlPath":"/app/installations/67890/access_tokens"}' | jq -r '.requests | length' 2>/dev/null || echo '?')
+    if [ "$mints" != '?' ] && [ "$mints" -ge 1 ]; then ok "the coder traded a JWT for an installation token ($mints POST /app/installations/67890/access_tokens)"; else bad "mock-github saw $mints POST /app/installations/67890/access_tokens, want at least 1 (is the stack started with -f dev/compose.github-app.yaml?)"; fi
+    wrong=$(jq -r '[.requests[] | .headers | with_entries(.key |= ascii_downcase) | select((.authorization // "") | startswith("Bearer ghs_mockinstallationtoken") | not)] | length' "$repo_calls" 2>/dev/null || echo '?')
+    if [ "$n_calls" -ge 1 ] && [ "$wrong" = 0 ]; then ok "all $n_calls call(s) to the repositories' API carried the installation token"; else bad "app mode: $wrong of $n_calls call(s) to /repos/... did not carry 'Bearer ghs_mockinstallationtoken...' ($auths)"; fi
+    ;;
+esac
 
 # --- git-server ---------------------------------------------------------------------
 if [ -n "$branch" ]; then

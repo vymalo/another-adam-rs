@@ -16,6 +16,20 @@ from service.yaml, which every render contains, so they always run.
 {{- if not (has $placement (list "" "shared" "affinity" "isolated")) -}}
 {{- fail (printf "workspace.placement must be one of shared, affinity or isolated (or empty for the single-worker default), got %q" $placement) -}}
 {{- end -}}
+{{- if not (has (toString .Values.github.auth) (list "token" "app")) -}}
+{{- fail (printf "github.auth must be token or app, got %q" (toString .Values.github.auth)) -}}
+{{- end -}}
+{{- if include "coder.githubApp" . -}}
+{{- if not (include "coder.githubAppId" .) -}}
+{{- fail "github.auth=app needs github.app.id (the App's application ID or client ID)" -}}
+{{- end -}}
+{{- if le (int64 (include "coder.githubAppInstallationId" .)) 0 -}}
+{{- fail "github.auth=app needs github.app.installationId, a positive integer" -}}
+{{- end -}}
+{{- if not .Values.github.app.privateKeySecret -}}
+{{- fail "github.auth=app needs github.app.privateKeySecret: the name of a Secret with the App's private key under the key private-key.pem" -}}
+{{- end -}}
+{{- end -}}
 {{- if and (gt (int .Values.replicaCount) 1) (include "coder.runsWorkers" .) (not $placement) -}}
 {{- fail "replicaCount > 1 needs workspace.placement (shared, affinity or isolated): runs move between workers at every step, and without a placement a run that lands on a worker without its worktree forks into a second pull request (see deploy/coder/README.md, Workspace placement)" -}}
 {{- end -}}

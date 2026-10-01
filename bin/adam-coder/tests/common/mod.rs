@@ -391,6 +391,16 @@ impl Fixture {
         self
     }
 
+    /// The same fixture whose tools tell a run that GitHub rejected its credentials to check `hint`
+    /// (what a process with a GitHub App says instead of `GITHUB_TOKEN`).
+    #[must_use]
+    pub fn with_credentials_hint(mut self, hint: &'static str) -> Self {
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .credentials_hint = hint;
+        self
+    }
+
     /// The same tools as `env` but with the production repository policy:
     /// only `github.com`, no local paths (`ALLOW_LOCAL_REPOS` unset), in a
     /// workspace root of its own.

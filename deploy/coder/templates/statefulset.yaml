@@ -1,4 +1,5 @@
 {{- $split := eq .Values.topology "split" -}}
+{{- $githubApp := include "coder.githubApp" . -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -90,6 +91,15 @@ spec:
               value: {{ join "," .Values.config.allowedRepoHosts | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.config.githubApiUrl | quote }}
+            {{- if $githubApp }}
+            {{- /* github.auth=app: no GITHUB_TOKEN; the key is a file from the Secret mounted below. */}}
+            - name: GITHUB_APP_ID
+              value: {{ include "coder.githubAppId" . | quote }}
+            - name: GITHUB_APP_INSTALLATION_ID
+              value: {{ include "coder.githubAppInstallationId" . | quote }}
+            - name: GITHUB_APP_PRIVATE_KEY_PATH
+              value: /var/run/secrets/github-app/private-key.pem
+            {{- end }}
             - name: PR_DRAFT
               value: {{ .Values.config.prDraft | quote }}
             - name: GIT_AUTHOR_NAME
@@ -116,11 +126,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "coder.secretName" . }}
                   key: MODEL_API_KEY
+            {{- if not $githubApp }}
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ include "coder.secretName" . }}
                   key: GITHUB_TOKEN
+            {{- end }}
             {{- end }}
             {{- if not $split }}
             - name: A2A_BEARER_TOKENS
@@ -154,11 +166,28 @@ spec:
           volumeMounts:
             - name: work
               mountPath: /work
-      {{- if include "coder.sharedWork" . }}
+            {{- if $githubApp }}
+            - name: github-app
+              mountPath: /var/run/secrets/github-app
+              readOnly: true
+            {{- end }}
+      {{- if or (include "coder.sharedWork" .) $githubApp }}
       volumes:
+        {{- if include "coder.sharedWork" . }}
         - name: work
           persistentVolumeClaim:
             claimName: {{ include "coder.workClaim" . }}
+        {{- end }}
+        {{- if $githubApp }}
+        - name: github-app
+          secret:
+            secretName: {{ .Values.github.app.privateKeySecret }}
+            # Group-readable by the runtime user (fsGroup); the key is for the coder alone.
+            defaultMode: 0440
+            items:
+              - key: private-key.pem
+                path: private-key.pem
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

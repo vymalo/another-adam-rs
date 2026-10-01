@@ -4147,3 +4147,77 @@ async fn the_history_of_the_project_is_not_carried_into_the_repository() {
         "the project keeps its own"
     );
 }
+
+/// Credentials that mint a token the redactor has never heard of, as a GitHub App's do.
+struct Minting;
+
+#[async_trait::async_trait]
+impl adam_workspace::GitCredentials for Minting {
+    async fn token_for(
+        &self,
+        _repo: &adam_workspace::RepoRef,
+    ) -> Result<secrecy::SecretString, adam_workspace::WorkspaceError> {
+        Ok(secrecy::SecretString::from("ghs_runtimeMinted0123456789"))
+    }
+}
+
+/// An installation token only exists once it is minted, so it cannot be registered at startup: the
+/// credentials register it as they hand it out, and the tools' results, which share the redactor,
+/// scrub it from then on.
+#[tokio::test]
+async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_return() {
+    use adam_coder::{RedactingCredentials, Redactor, coder_tools};
+    use adam_workspace::{DynGitCredentials, RepoRef, Workspaces};
+
+    let fx = Fixture::new("hello\n").await;
+    let redactor = Redactor::default();
+    let creds: DynGitCredentials = Arc::new(RedactingCredentials::new(
+        Arc::new(Minting),
+        redactor.clone(),
+    ));
+    let env = Arc::new(
+        ToolEnv::new(
+            Workspaces::new(fx.tmp.path().join("minting-work"), creds.clone()),
+            fx.env.code_host.clone(),
+            fx.env.settings.clone(),
+        )
+        .with_redactor(redactor),
+    );
+    let sink = CollectingSink::new();
+    let ctx = ToolCtx::detached("tool", "call-1", Arc::new(sink)).with_state(env.clone());
+    let tools: Vec<_> = coder_tools(&env).into_iter().collect();
+    let tool = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t.spec().name == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))
+            .clone()
+    };
+    tool("start_scratch")
+        .call(&ctx, json!({"name": "notes"}))
+        .await
+        .unwrap();
+    tool("write_file")
+        .call(
+            &ctx,
+            json!({"path": "t.txt", "content": "push with ghs_runtimeMinted0123456789 please\n"}),
+        )
+        .await
+        .unwrap();
+    let read = || async { text(tool("read_file").call(&ctx, json!({"path": "t.txt"})).await) };
+    assert_eq!(
+        read().await,
+        "push with ghs_runtimeMinted0123456789 please\n",
+        "not known yet: nothing to scrub"
+    );
+
+    let token = creds
+        .token_for(&RepoRef::new("https://github.com/o/r", "main"))
+        .await
+        .unwrap();
+    assert_eq!(
+        secrecy::ExposeSecret::expose_secret(&token),
+        "ghs_runtimeMinted0123456789"
+    );
+    assert_eq!(read().await, "push with [redacted] please\n");
+}

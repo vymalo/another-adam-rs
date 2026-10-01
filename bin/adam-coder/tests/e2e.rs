@@ -2903,6 +2903,44 @@ async fn a_github_401_fails_the_run_with_a_clear_message(store: DynStore) {
     assert!(fx.created_pulls().await.is_empty());
 }
 
+/// The same, for a process that is a GitHub App: GitHub (or the mint) refuses it, and what the run
+/// ends with names the App's variables, not `GITHUB_TOKEN`.
+async fn a_refused_github_app_fails_the_run_naming_its_own_variables(store: DynStore) {
+    let fx = Fixture::new("hello\n").await.with_credentials_hint(
+        "the GitHub App's credentials (GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and the private \
+         key) are valid and that the App is installed on the repository with write access to its \
+         contents and pull requests",
+    );
+    common::github_fails_with(&fx.github, 401, "Bad credentials").await;
+    let mock = Arc::new(MockModel::new());
+    happy_script(&mock, &fx.remote_url());
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, &format!("add hello.txt in {}", fx.remote_url())).await;
+    worker.stop().await;
+
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Failed),
+        "{:#?}",
+        seen.messages
+    );
+    let error = seen
+        .messages
+        .iter()
+        .find(|m| m.contains("Bad credentials"))
+        .unwrap_or_else(|| panic!("the GitHub message is reported: {:#?}", seen.messages));
+    assert!(
+        error.contains("GITHUB_APP_ID") && error.contains("GITHUB_APP_INSTALLATION_ID"),
+        "{error}"
+    );
+    assert!(
+        !error.contains("GITHUB_TOKEN"),
+        "not the other way's variable: {error}"
+    );
+}
+
 // ------------------------------------------------------------- the A2A front
 
 /// The coder's own router (not just `adam-a2a`'s) refuses a missing or wrong
@@ -3491,6 +3529,7 @@ macro_rules! coder_suite {
                 cancel_during_opencode_turn_cancels_without_push_or_pr,
                 two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs,
                 a_github_401_fails_the_run_with_a_clear_message,
+                a_refused_github_app_fails_the_run_naming_its_own_variables,
                 secrets_in_opencode_stderr_never_reach_the_client,
                 secrets_in_check_output_never_reach_the_client,
                 wrong_token_on_the_coder_router_is_401,

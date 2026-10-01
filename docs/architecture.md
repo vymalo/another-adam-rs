@@ -385,11 +385,15 @@ classDiagram
         class MemoryCodeHost
         class StaticToken
         class ScopedToken
+        class HostScoped
+        class GitHubApp
     }
     CodeHost <|.. GitHub
     CodeHost <|.. MemoryCodeHost
     GitCredentials <|.. StaticToken
     GitCredentials <|.. ScopedToken
+    GitCredentials <|.. HostScoped
+    GitCredentials <|.. GitHubApp
 
     namespace adam_runtime {
         class Agent {
@@ -505,7 +509,7 @@ The boundaries, by what they swap:
 | `ModelClient` | `adam-model` | `OpenAiCompatible` | `MockModel` |
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` | `InMemoryBackend` (feature `test-util`) |
 | `CodeHost` | `adam-workspace` | `GitHub` (feature `github`, on by default) | `MemoryCodeHost` (feature `test-util`) |
-| `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `StaticToken` (one token, any host) | none needed |
+| `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `GitHubApp` (installation access tokens minted from a GitHub App's key, feature `github`; wrapped in `HostScoped`, which limits any credentials to named hosts), `StaticToken` (one token, any host) | none needed |
 | `Agent` | `adam-runtime` | `LlmAgent`, `CoderAgent` | test agents |
 | `AgentStarter` | `adam-runtime` | `LlmStarter`, `CoderStarter` | test starters |
 | `Tool` | `adam-llm-agent` | the coder tools, `FnTool` | test tools |
@@ -553,7 +557,7 @@ flowchart LR
         subgraph wcfg["roles that run workers (all, worker): Config::worker is Some, build_agent()"]
             direction LR
             mdl["ModelConfig::client<br/>OpenAiCompatible as DynModel"]
-            creds["ScopedToken<br/>as DynGitCredentials"]
+            creds["ScopedToken, or HostScoped over GitHubApp<br/>inside RedactingCredentials<br/>as DynGitCredentials"]
             wsp["Workspaces::new<br/>allow_hosts, allow_local"]
             gh["GitHub::new(creds)<br/>as DynCodeHost"]
             tenv["ToolEnv<br/>workspaces + code host + settings + Redactor"]
@@ -2002,10 +2006,19 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
 * **Secrets.**
   * The git token reaches `git` only through the environment of a single
     invocation, never in a remote URL or `.git/config`, and only for hosts on
-    the allow-list (`ScopedToken` plus `Workspaces::allow_hosts`).
+    the allow-list (`ScopedToken`, or `HostScoped` over `GitHubApp`, plus `Workspaces::allow_hosts`).
+  * **A token or a GitHub App installation, never both**
+    ([ADR 0009](decisions/0009-github-per-installation-read-through-mcp.md)): `GITHUB_TOKEN`, or
+    `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and a private key (a file, or the PEM in a variable). The
+    key is parsed at startup. `GitHubApp` signs a short JWT with it and trades it, at
+    `{GITHUB_API_URL}/app/installations/{id}/access_tokens`, for an installation token, kept until five minutes
+    before it expires and minted again by one caller at a time. `RedactingCredentials` hands every token it
+    gets to the shared `Redactor`, so a minted token is a secret from the moment it exists. The sequence and the
+    states of the cached token are in the ADR and in the
+    [`adam-workspace` README](../crates/adam-workspace/README.md#github-app-credentials).
   * OpenCode's child process gets `MODEL_API_KEY` through its environment (its
     config says `{env:MODEL_API_KEY}`, so the key is not inlined). `GITHUB_TOKEN`,
-    `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child (they are the names the
+    `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child (they are the names the
     description of the process asks its environment to hide; a description never carries a value).
   * A `Redactor` scrubs the process's own secrets from every tool result, event
     and failure text.
@@ -2046,7 +2059,7 @@ flowchart LR
         end
         pvc[("PVC at /work<br/>mirrors, workspaces, notes")]
         cnpg[("CloudNativePG cluster<br/>Postgres: runs and journal")]
-        secret["ExternalSecret to Secret<br/>MODEL_API_KEY, GITHUB_TOKEN (not for role control-plane), A2A_BEARER_TOKENS"]
+        secret["ExternalSecret to Secret<br/>MODEL_API_KEY, GITHUB_TOKEN (not for role control-plane, nor with github.auth=app), A2A_BEARER_TOKENS"]
     end
 
     orch -->|"A2A JSON-RPC + bearer token"| svc
@@ -2127,6 +2140,10 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   creates. With `config.role=control-plane` the chart renders neither
   `MODEL_API_KEY` nor `GITHUB_TOKEN` (nor the model, GitHub and workspace
   settings): the control plane holds none of them. `all` and `worker` need both.
+  With `github.auth: app` the roles that run workers get no `GITHUB_TOKEN` either: they get
+  `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_PATH`, and the App's private key
+  is a Secret you manage (`github.app.privateKeySecret`, key `private-key.pem`) mounted read-only at
+  `/var/run/secrets/github-app`. The chart carries no key, and a control plane has no GitHub setting or key volume.
 * **Known risks** (stated in the chart README): no database backups, a pinned run whose
   worker never returns is stranded, and `flock` on NFS or Longhorn RWX is unverified.
 
@@ -2171,7 +2188,7 @@ flowchart LR
         pgs[("postgres :5432<br/>database adam_test")]
         mongos[("mongodb :27017<br/>standalone")]
         moai["mock-openai :8081<br/>WireMock, chat completions"]
-        mogh["mock-github :8082<br/>WireMock, pull requests"]
+        mogh["mock-github :8082<br/>WireMock, pull requests, GitHub App token trade"]
         gitsrv["git-server :8083<br/>nginx + git-http-backend<br/>local/sandbox.git"]
         cdr["coder :8080<br/>profile app, built from docker/coder/Dockerfile"]
         agentdir[/"bin/adam-coder/agent<br/>mounted read-only at /etc/adam/agent"/]
@@ -2208,6 +2225,12 @@ flowchart LR
   `[mock:choices]`); on a screen it cannot read the options are text ([ADR 0006](decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md)).
 * The coder waits until `postgres`, `mock-openai`, `mock-github` and `git-server`
   are healthy.
+* The coder is a token (`GITHUB_TOKEN`, a dummy) unless `-f dev/compose.github-app.yaml` is added: that override
+  turns the token off, makes a throwaway RSA key into a volume with an init service (no key is committed) and gives
+  the coder `GITHUB_APP_*`, so it trades a JWT at `mock-github` for an installation token that lasts four minutes
+  (inside the coder's refresh margin, so the refresh runs all the time). `dev/coder-e2e.sh` with `GITHUB_AUTH=app`
+  asserts that the trade happened and that every call to the repositories' API carried the installation token and
+  never the JWT; CI runs the four scenarios of that script in both modes.
 * The service `agent` is [`adam-agent`](../bin/adam-agent/README.md) from the **coder's image** with the entrypoint
   overridden (`tini -- adam-agent`; there is no second image): a chat persona in the folder
   `dev/agents/assistant/agent` (`AGENT_FOLDER` mounts another), the model `mock-assistant` (it answers in role from the

@@ -1,0 +1,47 @@
+{
+  "mappings": [
+    {
+      "name": "GitHub App: an installation access token for a JWT",
+      "priority": 1,
+      "metadata": {
+        "note": "GitHub's tokens last an hour. This one lasts four minutes, inside the five the coder refreshes before expiry, so the coder trades a JWT for a token at every use: each run of dev/coder-e2e.sh (which empties the journal first) sees its own trade, and the refresh path is exercised all the time. The coder's tests keep the real cycle (cargo test -p adam-workspace --test github_app)."
+      },
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "/app/installations/[0-9]+/access_tokens",
+        "headers": {
+          "Authorization": {"matches": "Bearer eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"}
+        }
+      },
+      "response": {
+        "status": 201,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "token": "ghs_mockinstallationtoken000000000000000000",
+          "expires_at": "{{now offset='4 minutes'}}",
+          "permissions": {"contents": "write", "pull_requests": "write", "metadata": "read"},
+          "repository_selection": "all"
+        }
+      }
+    },
+    {
+      "name": "GitHub App: anything but a JWT is refused",
+      "priority": 2,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "/app/installations/[0-9]+/access_tokens"
+      },
+      "response": {
+        "status": 401,
+        "headers": {"Content-Type": "application/json; charset=utf-8"},
+        "jsonBody": {
+          "message": "A JSON web token could not be decoded",
+          "documentation_url": "https://docs.github.com/rest"
+        }
+      }
+    }
+  ]
+}

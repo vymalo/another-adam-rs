@@ -1708,3 +1708,308 @@ async fn a_sweep_of_zero_seconds_turns_the_janitor_off() {
     );
     db.finish().await;
 }
+
+// ------------------------------------------------------ GitHub credentials, per installation
+
+/// `valid_env` for a GitHub App installation instead of a token: `GITHUB_TOKEN` is gone, and the key
+/// is a file under `dir` (what a deployment mounts).
+fn app_env(
+    database_url: &str,
+    workspace: &Path,
+    key: &adam_workspace::testing::TestAppKey,
+    dir: &Path,
+) -> Vec<(String, String)> {
+    let file = dir.join("github-app.pem");
+    std::fs::write(&file, &key.pkcs1_pem).unwrap();
+    let mut env = valid_env(database_url, workspace);
+    env.retain(|(k, _)| k != "GITHUB_TOKEN");
+    env.extend([
+        ("GITHUB_APP_ID".to_owned(), "12345".to_owned()),
+        ("GITHUB_APP_INSTALLATION_ID".to_owned(), "67890".to_owned()),
+        (
+            "GITHUB_APP_PRIVATE_KEY_PATH".to_owned(),
+            file.to_string_lossy().into_owned(),
+        ),
+    ]);
+    env
+}
+
+/// A token or a GitHub App, never both and never a part of an App: every problem at once (exit 78,
+/// before anything connects), each naming its variable, none carrying a token or a key; and a
+/// complete App configuration is accepted (the process gets as far as Postgres).
+#[tokio::test]
+async fn a_github_app_configuration_is_checked_at_startup_and_exits_78_with_every_problem() {
+    let key = adam_workspace::testing::TestAppKey::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let unreachable = "postgres://u:p@127.0.0.1:1/x";
+    let failed = |env: Vec<(String, String)>| {
+        let mut p = Proc::spawn(&env);
+        async move {
+            let status = p.exit_within(Duration::from_secs(45)).await;
+            (status.code(), p)
+        }
+    };
+
+    // A complete App is accepted: the key was read and parsed, and the process goes on to Postgres.
+    let (code, p) = failed(app_env(unreachable, tmp.path(), &key, tmp.path())).await;
+    assert_eq!(code, Some(69), "{}", p.logs());
+    let chain = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(chain.starts_with("connecting to Postgres: "), "{chain}");
+
+    // A token and an App: refused, naming the variables and not their values.
+    let mut env = app_env(unreachable, tmp.path(), &key, tmp.path());
+    env.push(("GITHUB_TOKEN".to_owned(), GITHUB_TOKEN.to_owned()));
+    let (code, p) = failed(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(
+        err.contains("GITHUB_TOKEN and the GITHUB_APP_* variables are both set"),
+        "{err}"
+    );
+    assert!(
+        !err.contains(GITHUB_TOKEN) && !err.contains("BEGIN"),
+        "{err}"
+    );
+
+    // Neither: both ways are named.
+    let mut env = valid_env(unreachable, tmp.path());
+    env.retain(|(k, _)| k != "GITHUB_TOKEN");
+    let (code, p) = failed(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(
+        err.contains("GITHUB_TOKEN is required") && err.contains("GITHUB_APP_ID"),
+        "{err}"
+    );
+
+    // A part of an App, a key that is not RSA, a bad installation: all in one report.
+    let ec = tmp.path().join("ec.pem");
+    std::fs::write(
+        &ec,
+        "-----BEGIN EC PRIVATE KEY-----\nTOPSECRETBODYOFANECKEY\n-----END EC PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let mut env = valid_env(unreachable, tmp.path());
+    env.retain(|(k, _)| k != "GITHUB_TOKEN");
+    env.extend([
+        ("GITHUB_APP_ID".to_owned(), "12345".to_owned()),
+        ("GITHUB_APP_INSTALLATION_ID".to_owned(), "none".to_owned()),
+        (
+            "GITHUB_APP_PRIVATE_KEY_PATH".to_owned(),
+            ec.to_string_lossy().into_owned(),
+        ),
+        ("GITHUB_API_URL".to_owned(), "ftp://api.example".to_owned()),
+    ]);
+    let (code, p) = failed(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    for name in [
+        "GITHUB_APP_INSTALLATION_ID must be a positive integer",
+        "GITHUB_APP_PRIVATE_KEY_PATH: the GitHub App's private key is not usable",
+        "GITHUB_API_URL",
+    ] {
+        assert!(err.contains(name), "{name} missing from:\n{err}");
+    }
+    assert!(
+        !p.logs().contains("TOPSECRET") && !p.logs().contains("connecting to Postgres"),
+        "the key is not logged, and nothing connected:\n{}",
+        p.logs()
+    );
+
+    // A key file that is not there.
+    let mut env = app_env(unreachable, tmp.path(), &key, tmp.path());
+    for (k, v) in &mut env {
+        if k == "GITHUB_APP_PRIVATE_KEY_PATH" {
+            *v = tmp
+                .path()
+                .join("missing.pem")
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    let (code, p) = failed(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(
+        err.contains("GITHUB_APP_PRIVATE_KEY_PATH") && err.contains("cannot be read"),
+        "{err}"
+    );
+}
+
+/// What GitHub does with the trade of a JWT for an installation token: checks the signature against
+/// the App's public key, and gives the same token (good for years, so that the whole run uses one).
+struct MintToken {
+    key: Arc<adam_workspace::testing::TestAppKey>,
+    minted: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Respond for MintToken {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let jwt = request
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or_default();
+        match self.key.verify_jwt(jwt) {
+            Ok(claims) if claims["iss"] == 12345 => {
+                self.minted
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(201).set_body_json(json!({
+                    "token": APP_TOKEN,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                }))
+            }
+            _ => ResponseTemplate::new(401).set_body_json(json!({"message": "Bad credentials"})),
+        }
+    }
+}
+
+/// The installation token the mock GitHub gives.
+const APP_TOKEN: &str = "ghs_binaryAppInstallationToken0123456789";
+
+/// The whole binary as a GitHub App installation: the key is read at startup, the coder trades a
+/// JWT signed with it for an installation token the first time it needs one, **that token (and not
+/// the JWT) is what the pull request calls carry**, one token serves the whole run, and neither the
+/// token, the JWT nor the key is in a log line or on the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_github_app_installation_gets_its_token_minted_and_opens_the_pull_request() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let key = Arc::new(adam_workspace::testing::TestAppKey::generate());
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let (remote, home) = seed_remote(dir);
+    let model = MockServer::start().await;
+    let asked = mount_happy_model(&model).await;
+    let github = common::mock_github().await;
+    let minted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/app/installations/67890/access_tokens"))
+        .respond_with(MintToken {
+            key: key.clone(),
+            minted: minted.clone(),
+        })
+        .mount(&github)
+        .await;
+
+    let mut env = app_env(&db.url(), &dir.join("work"), &key, dir);
+    env.extend([
+        ("MODEL_BASE_URL".to_owned(), model.uri()),
+        ("GITHUB_API_URL".to_owned(), github.uri()),
+        ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+        (
+            "GIT_CONFIG_GLOBAL".to_owned(),
+            home.join(".gitconfig").to_string_lossy().into_owned(),
+        ),
+        (
+            "OPENCODE_COMMAND".to_owned(),
+            common::fake_agent().to_string_lossy().into_owned(),
+        ),
+        ("FAKE_ACP_SCENARIO".to_owned(), "write-file".to_owned()),
+        ("FAKE_ACP_WRITE_PATH".to_owned(), "hello.txt".to_owned()),
+        ("FAKE_ACP_WRITE_CONTENT".to_owned(), "hello\n".to_owned()),
+    ]);
+    let mut coder = Proc::spawn(&env);
+    let addr = coder.ready().await;
+    let client = common::a2a_client(addr, A2A_TOKEN).await;
+    let mut stream = client
+        .send_streaming_message(&SendMessageRequest {
+            message: Message::new(
+                Role::User,
+                vec![Part::text(
+                    "In https://github.com/octo/widgets (base main) add hello.txt containing hello",
+                )],
+            ),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    let mut seen = String::new();
+    let mut last = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !last.as_ref().is_some_and(TaskState::is_terminal) {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(item))) => {
+                seen.push_str(&format!("{item:?}\n"));
+                match item {
+                    StreamResponse::StatusUpdate(u) => last = Some(u.status.state),
+                    StreamResponse::Task(t) => last = Some(t.status.state),
+                    _ => {}
+                }
+            }
+            other => panic!("the task did not finish: {other:?}\n{}", coder.logs()),
+        }
+    }
+    assert_eq!(last, Some(TaskState::Completed), "{seen}\n{}", coder.logs());
+    drop(stream);
+
+    assert_eq!(turns(&asked), 6, "{:?}", asked.lock().unwrap());
+    let branches = common::git(
+        &remote,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/agent",
+        ],
+    );
+    assert_eq!(branches.lines().count(), 1, "{branches}");
+
+    // One trade, and the token it made is what GitHub's REST API was given, every time.
+    assert_eq!(
+        minted.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one installation token for the whole run"
+    );
+    let calls: Vec<_> = github
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().starts_with("/repos/"))
+        .collect();
+    assert!(
+        calls.len() >= 2,
+        "the probe and the pull request: {calls:?}"
+    );
+    for call in &calls {
+        assert_eq!(
+            call.headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("Bearer {APP_TOKEN}").as_str()),
+            "{} {}",
+            call.method,
+            call.url
+        );
+    }
+    assert_eq!(
+        calls.iter().filter(|r| r.method.as_str() == "POST").count(),
+        1,
+        "one pull request"
+    );
+
+    coder.sigterm().await;
+    let status = coder.exit_within(Duration::from_secs(30)).await;
+    assert_eq!(status.code(), Some(0), "{}", coder.logs());
+    // Nothing secret anywhere the process shows: not the installation token, not the key, in the
+    // logs or on the stream.
+    let body: String = key
+        .pkcs1_pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    let visible = format!("{}{seen}", coder.logs());
+    for secret in [
+        APP_TOKEN,
+        body.as_str(),
+        &body[..60],
+        "BEGIN RSA PRIVATE KEY",
+    ] {
+        assert!(!visible.contains(secret), "{secret}");
+    }
+    db.finish().await;
+}

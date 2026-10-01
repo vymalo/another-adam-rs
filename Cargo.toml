@@ -46,6 +46,9 @@ a2a-server-lf = "0.4"
 agent-client-protocol = "2.2"
 anyhow = "1"
 async-trait = "0.1"
+# Signs the JWT of a GitHub App (adam-workspace): already in the tree under rustls, with the features
+# rustls asks for; the defaults would add `untrusted` 0.7 for ring's I/O types, which nothing here uses.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "alloc"] }
 axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
@@ -61,6 +64,8 @@ quote = "1"
 # Client only, and only the transports adam-mcp uses; the crate picks its own features.
 rmcp = { version = "3.5", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream", "json", "query"] }
+# Reads the PEM of a GitHub App's private key (adam-workspace): already in the tree under rustls.
+rustls-pki-types = "1"
 schemars = { version = "1.2", default-features = false, features = ["std"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
