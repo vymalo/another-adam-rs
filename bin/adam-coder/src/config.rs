@@ -94,7 +94,7 @@ pub struct Config {
     /// `None`: the copy embedded in the binary. Every role reads it.
     pub agent_dir: Option<PathBuf>,
     /// What stepping a run needs: the model, GitHub, the workspaces and the checks. `Some` exactly
-    /// when [`Role::runs_workers`](adam_host::Role::runs_workers)(adam_host::Role::runs_workers); a control plane holds none of it.
+    /// when [`Role::runs_workers`](adam_host::Role::runs_workers); a control plane holds none of it.
     pub worker: Option<WorkerConfig>,
 }
 
