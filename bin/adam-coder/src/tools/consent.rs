@@ -17,10 +17,14 @@
 //! model wrote itself (`ask_user`) grants nothing, however it is worded, and neither does anything
 //! a tool printed.
 //!
-//! What counts as yes (`agrees`): the person picked the option `yes` of the form, or wrote
-//! exactly `yes`, `y` or the label of the option ("Yes, add acme/lib"), whatever the case.
-//! Anything else (`yes please`, `no`, `no, use acme/other`) is not agreement; a free-text answer
-//! still names whatever repository it names, as every answer of the person does.
+//! What an answer says (`answer_of`): the person picked the option `yes` of the form, or wrote
+//! exactly `yes`, `y` or the label of the option ("Yes, add acme/lib"), whatever the case, and that
+//! is a **yes**; the option `no`, or exactly `no`, `n` or the label of the no option, is a **no**.
+//! Anything else (`yes please`, `wait`, `?`, `no, use acme/other`) is **neither**: nothing is
+//! recorded, so a repository is not refused for good by a message that did not refuse it, and the
+//! question can be asked again. The model still gets the person's words as the call's result, so it
+//! can answer them. A free-text answer still names whatever repository it names, as every answer of
+//! the person does.
 
 use adam::prelude::*;
 use adam_ui::ASK_USER;
@@ -48,7 +52,7 @@ const FORM_ANSWER: &str = "The person answered through the interface:";
 /// Whether the result of a call to `tool` is what the person said: `ask_user` (the model's own
 /// question) and the tools whose question the tool wrote. These results are the person's words,
 /// read for the repositories they name ([`CoderAgent`](crate::CoderAgent)). Of them only the
-/// consent tools' answers can **grant**, and only for their own subject ([`agrees`]).
+/// consent tools' answers can **grant**, and only for their own subject ([`answer_of`]).
 pub(crate) fn is_answered_by_the_person(tool: &str) -> bool {
     tool == ASK_USER || is_consent_tool(tool)
 }
@@ -58,15 +62,29 @@ pub(crate) fn is_consent_tool(tool: &str) -> bool {
     tool == REQUEST_REPOSITORY || tool == CREATE_REPOSITORY
 }
 
-/// What a call of a consent tool asked the person, from its arguments: the **subject** the answer
-/// is recorded for (the repository's key for `request_repository`, `owner/name:private|public` for
-/// `create_repository`) and the label of the question's "yes" option. `None` when the arguments
+/// What a consent tool asked the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Asked {
+    /// What the answer is recorded for: the repository's key for `request_repository`,
+    /// `owner/name:private|public` for `create_repository`.
+    pub subject: String,
+    /// The label of the question's "yes" option.
+    pub yes: String,
+    /// The label of its "no" option.
+    pub no: String,
+}
+
+/// What a call of a consent tool asked the person, from its arguments. `None` when the arguments
 /// are not something that could have been asked (nothing was asked, so nothing was answered).
-pub(crate) fn asked_by(tool: &str, arguments: &Value) -> Option<(String, String)> {
+pub(crate) fn asked_by(tool: &str, arguments: &Value) -> Option<Asked> {
     match tool {
         REQUEST_REPOSITORY => {
             let url = arguments.get("repo_url")?.as_str()?;
-            Some((key_of_argument(url)?, yes_label(&display_name(url)?)))
+            Some(Asked {
+                subject: key_of_argument(url)?,
+                yes: yes_label(&display_name(url)?),
+                no: NO_LABEL.to_owned(),
+            })
         }
         CREATE_REPOSITORY => consent_of(arguments),
         _ => None,
@@ -98,26 +116,54 @@ pub(crate) fn display_name(url: &str) -> Option<String> {
     })
 }
 
+/// The label of the option that says no to adding a repository.
+pub(crate) const NO_LABEL: &str = "No";
+
 /// The label of the option that says yes to adding `display`.
 pub(crate) fn yes_label(display: &str) -> String {
     format!("Yes, add {display}")
 }
 
-/// Whether `answer` (what the person said, without the blocks marked `untrusted`) says yes to the
-/// question whose "yes" option is labelled `yes_label`.
+/// What an answer says to a question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// Yes: it is recorded, and grants.
+    Yes,
+    /// No: it is recorded, and the question is not asked again.
+    No,
+    /// Anything else (`wait`, `?`, `yes please`): nothing is recorded.
+    Neither,
+}
+
+/// What `answer` (what the person said, without the blocks marked `untrusted`) says to the question
+/// whose options are labelled `yes_label` and `no_label`.
 ///
-/// Either the form's answer picked `yes` for the question [`QUESTION_ID`] and nothing else for it
-/// (a line `- consent: yes` of the text the answer comes back as), or the person wrote, in words,
-/// exactly `yes`, `y` or `yes_label`, trimmed and without regard to case. Nothing is agreement that
-/// is only close to it: `yes please` and `yes, but not the tests` are not.
-pub(crate) fn agrees(answer: &str, yes_label: &str) -> bool {
+/// Either the form's answer picked `yes` (or `no`) for the question [`QUESTION_ID`] and nothing
+/// else for it (a line `- consent: yes` of the text the answer comes back as), or the person
+/// wrote, in words, exactly `yes`, `y` or `yes_label` (`no`, `n` or `no_label`), trimmed and without
+/// regard to case. Nothing is an answer that is only close to one: `yes please`, `yes, but not the
+/// tests` and `no, use acme/other` say neither, and so does a form that picked nothing.
+pub(crate) fn answer_of(answer: &str, yes_label: &str, no_label: &str) -> Answer {
     let answer = answer.trim();
     if let Some(form) = answer.strip_prefix(FORM_ANSWER) {
-        let wanted = format!("- {QUESTION_ID}: yes");
-        return form.lines().any(|line| line.trim() == wanted);
+        let line_is = |value: &str| {
+            let wanted = format!("- {QUESTION_ID}: {value}");
+            form.lines().any(|line| line.trim() == wanted)
+        };
+        return match (line_is("yes"), line_is("no")) {
+            (true, false) => Answer::Yes,
+            (false, true) => Answer::No,
+            _ => Answer::Neither,
+        };
     }
     let said = answer.to_lowercase();
-    said == "yes" || said == "y" || said == yes_label.trim().to_lowercase()
+    if said == "yes" || said == "y" || said == yes_label.trim().to_lowercase() {
+        Answer::Yes
+    } else if said == "no" || said == "n" || said == no_label.trim().to_lowercase() {
+        Answer::No
+    } else {
+        Answer::Neither
+    }
 }
 
 /// `reason` as one line the person reads inside quotes: whitespace collapsed, quotes made single,
@@ -232,7 +278,7 @@ pub async fn request_repository(
             &text,
             &format!("Add {display} to this workspace?"),
             &yes_label(&display),
-            "No",
+            NO_LABEL,
         ),
     )
     .await
@@ -242,9 +288,12 @@ pub async fn request_repository(
 mod tests {
     use super::*;
 
+    fn said(answer: &str) -> Answer {
+        answer_of(answer, &yes_label("acme/lib"), NO_LABEL)
+    }
+
     #[test]
-    fn yes_in_the_words_the_plan_allows_is_agreement() {
-        let label = yes_label("acme/lib");
+    fn yes_in_the_words_the_plan_allows_is_a_yes() {
         for yes in [
             "yes",
             "Yes",
@@ -254,12 +303,31 @@ mod tests {
             "Yes, add acme/lib",
             "yes, ADD acme/lib",
         ] {
-            assert!(agrees(yes, &label), "{yes:?}");
+            assert_eq!(said(yes), Answer::Yes, "{yes:?}");
         }
-        for not_yes in [
+    }
+
+    #[test]
+    fn only_an_explicit_no_is_a_no() {
+        for no in ["no", "No", " NO\n", "n", "N"] {
+            assert_eq!(said(no), Answer::No, "{no:?}");
+        }
+        // The label of the other question's no option is a no to that question.
+        assert_eq!(
+            answer_of("Don't create it", "Create acme/fib", "Don't create it"),
+            Answer::No
+        );
+    }
+
+    #[test]
+    fn anything_else_says_neither_so_that_nothing_is_recorded() {
+        for neither in [
             "",
-            "no",
-            "No",
+            "wait",
+            "Wait",
+            "?",
+            "hold on",
+            "what is it for?",
             "yes please",
             "yes, but not the tests",
             "yes.",
@@ -267,31 +335,35 @@ mod tests {
             "ok",
             "sure",
             "no, use acme/other",
+            "no thanks",
+            "nope",
             "Yes, add acme/other",
             "yess",
         ] {
-            assert!(!agrees(not_yes, &label), "{not_yes:?}");
+            assert_eq!(said(neither), Answer::Neither, "{neither:?}");
         }
     }
 
     #[test]
-    fn the_form_agrees_only_when_it_picked_yes_for_the_consent_question() {
-        let label = yes_label("acme/lib");
+    fn the_form_answers_only_when_it_picked_yes_or_no_for_the_consent_question() {
         let form = |line: &str| format!("The person answered through the interface:\n{line}");
-        assert!(agrees(&form("- consent: yes"), &label));
-        assert!(agrees(&format!("{}\n", form("- consent: yes")), &label));
-        for not_yes in [
-            form("- consent: no"),
+        assert_eq!(said(&form("- consent: yes")), Answer::Yes);
+        assert_eq!(said(&format!("{}\n", form("- consent: yes"))), Answer::Yes);
+        assert_eq!(said(&form("- consent: no")), Answer::No);
+        for neither in [
             form("- consent: yes, no"),
             form("- consent: yes, other: \"x\""),
             form("- consent: (nothing chosen)"),
             form("- other: yes"),
+            form("- other: no"),
             form("- consent: \"yes please\""),
+            form("- consent: yes\n- consent: no"),
             // The header must be there: a line that merely looks like one is text.
             "- consent: yes".to_owned(),
+            "- consent: no".to_owned(),
             "I said:\n- consent: yes".to_owned(),
         ] {
-            assert!(!agrees(&not_yes, &label), "{not_yes:?}");
+            assert_eq!(said(&neither), Answer::Neither, "{neither:?}");
         }
     }
 

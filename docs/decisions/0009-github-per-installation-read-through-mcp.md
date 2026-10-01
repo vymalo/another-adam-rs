@@ -249,3 +249,13 @@ assumes the Administration permission is what is missing when GitHub says `403`,
 `GET /user` answers an installation token with a `403` (the code reads a `403` that is not a rate limit as "no
 login"; a live App was not tried), and that `POST /user/repos` is unusable for an installation (the code never
 sends it: an installation has no user to create for).*
+
+*2026-10-01 (review of slice 7, A8): `create_repository` is safe to repeat. It writes an intent
+(`owner/name`, visibility; `RunNotes::creating`) into the run's notes before it asks the host. If the process
+dies between the host's answer and the note of it, the replay meets "already exists" **with** that intent in the
+notes: it looks the repository up (`CodeHost::find_repository`, `GET /repos/{owner}/{name}`; a host that cannot
+say answers `None`), applies the same address policy as to a new repository, grants it and records it, instead of
+refusing it as a name the run did not create. A name that exists without an intent is still left alone, and the
+intent is removed when the creation is recorded or the host definitely refused it (it stays after a failure that
+may have happened after the host made the repository, a timeout). The consent rule is the one of ADR 0008: only
+an explicit yes or no is recorded, so a "wait" no longer ends the question for the task.*

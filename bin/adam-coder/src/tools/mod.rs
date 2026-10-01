@@ -35,6 +35,13 @@
 //!   branch an earlier task opened it for, or the call is repeated), and
 //!   `CodeHost::open_pull_request` returns it instead of a second one in any case.
 //! * `run_checks`: failures are counted per call id ([`notes`]).
+//! * `request_repository { repo_url, reason }`: it only asks. A repeat after the person's yes finds the
+//!   repository granted and says so; after a no it says so; with no answer yet it asks again.
+//! * `create_repository { owner, name, private?, description? }`: a repository made is recorded under
+//!   its `owner/name` and a repeat returns the record. The call writes its intent to the run's notes
+//!   before it asks the host, so a repeat after a crash between the host's answer and the record
+//!   finds the name taken *and* the intent there: it looks the repository up, applies the same
+//!   address policy and records it. Without the intent a taken name is left alone ([`create`]).
 //!
 //! # The rules, in code
 //!

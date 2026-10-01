@@ -63,6 +63,20 @@ pub trait CodeHost: Send + Sync + 'static {
         ))
     }
 
+    /// The repository `repo` names, if the host has it: what a caller that is not sure its own
+    /// [`create_repository`](Self::create_repository) took effect (the process died between the
+    /// host's answer and the caller's note of it) asks, instead of creating again. `Ok(None)` when
+    /// there is no such repository, and for a host that cannot say.
+    ///
+    /// The default is `Ok(None)`.
+    async fn find_repository(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<Option<CreatedRepository>, WorkspaceError> {
+        let _ = repo;
+        Ok(None)
+    }
+
     /// Whether `owner` is a person or an organisation on the host that `host_repo` is on (the
     /// credentials and the host check are those of `host_repo`; only its host matters).
     ///
@@ -355,6 +369,26 @@ mod memory {
             Ok(out)
         }
 
+        async fn find_repository(
+            &self,
+            repo: &RepoRef,
+        ) -> Result<Option<CreatedRepository>, WorkspaceError> {
+            let loc = repo.locate()?;
+            let created = self
+                .created
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok(created.iter().any(|c| c.repo.url == repo.url).then(|| {
+                let full_name = format!("{}/{}", loc.owner, loc.name);
+                CreatedRepository {
+                    clone_url: format!("memory://{full_name}.git"),
+                    html_url: format!("memory://{full_name}"),
+                    default_branch: "main".to_owned(),
+                    full_name,
+                }
+            }))
+        }
+
         async fn owner_kind(
             &self,
             owner: &str,
@@ -486,6 +520,15 @@ mod memory {
                 host.create_repository(request).await,
                 Err(WorkspaceError::Invalid(m)) if m.contains("already exists")
             ));
+            // What a caller that is unsure its creation took effect asks.
+            let found = host.find_repository(&at).await.unwrap().unwrap();
+            assert_eq!(found, created);
+            assert_eq!(
+                host.find_repository(&RepoRef::new("https://github.com/acme/other", "main"))
+                    .await
+                    .unwrap(),
+                None
+            );
             assert_eq!(
                 host.owner_kind("acme", &at).await.unwrap(),
                 OwnerKind::Organization

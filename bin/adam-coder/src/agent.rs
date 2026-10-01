@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::files::AgentFiles;
 use crate::redact::Redactor;
 use crate::tools::consent::{
-    agrees, asked_by, is_answered_by_the_person, is_consent_tool, is_tools_own_result,
+    Answer, answer_of, asked_by, is_answered_by_the_person, is_consent_tool, is_tools_own_result,
 };
 use crate::tools::named::{key_of_argument, named_in, without_untrusted};
 use crate::tools::notes::{Consent, PushedBranch, RunNotes};
@@ -280,7 +280,7 @@ impl CoderAgent {
     /// the inbox, which the step takes next. What the model or a tool said is never read for a
     /// repository: one found in a README is not one the person asked for.
     ///
-    /// An agreement is the person's yes ([`agrees`]) to a `request_repository` question, the
+    /// An agreement is the person's yes ([`answer_of`]) to a `request_repository` question, the
     /// result of that call (paired with it by position, as [`person_texts`] pairs answers) or, while
     /// the run is parked on it, the message waiting in the inbox. It grants the repository named in
     /// **that call's** argument, which is the one the question the tool wrote names, and never
@@ -457,17 +457,25 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
 ///
 /// The answer is the result of the call (it did not fail), paired with the call by position
 /// ([`Answers`]: ids cannot be relied on), or, while the run is parked on the call, the message
-/// waiting in `inbox`. It is read without the blocks marked `untrusted`, and agrees when
-/// [`agrees`] says so, which is also when the form's option is picked. A call with an argument
-/// that is not a repository address asked nothing, so nothing was answered.
+/// waiting in `inbox`. It is read without the blocks marked `untrusted`, and [`answer_of`] says
+/// what it is: a yes (which includes the form's yes), a no (an explicit one: `no`, `n`, the no
+/// option's label, the form's no) or neither. **Only a yes or a no is a consent**: any other text
+/// (`wait`, `?`, a question back) records nothing, so the question can be asked again, while the
+/// model still gets the person's words as the call's result. A call with an argument that is not a
+/// repository address asked nothing, so nothing was answered.
 fn consents_in(state: &Conversation, inbox: &[Inbound]) -> Vec<Consent> {
     let consent = |call: &ToolCall, answer: &str| -> Option<Consent> {
-        let (subject, yes) = asked_by(&call.name, &call.arguments)?;
+        let asked = asked_by(&call.name, &call.arguments)?;
+        let agreed = match answer_of(&without_untrusted(answer), &asked.yes, &asked.no) {
+            Answer::Yes => true,
+            Answer::No => false,
+            Answer::Neither => return None,
+        };
         Some(Consent {
             call_id: call.id.clone(),
             tool: call.name.clone(),
-            subject,
-            agreed: agrees(&without_untrusted(answer), &yes),
+            subject: asked.subject,
+            agreed,
         })
     };
     let mut found = Vec::new();
@@ -1009,6 +1017,28 @@ mod tests {
         ])
     }
 
+    /// A run parked on the question a `request_repository` call of `url` wrote.
+    fn parked_on(url: &str) -> Conversation {
+        let mut state = conversation(vec![
+            Message::user_text("task"),
+            assistant("", vec![request("c1", url)]),
+        ]);
+        state.pending_calls = vec![request("c1", url)];
+        state.pending_wait = Some(PendingWait::Question(adam_llm_agent::PendingQuestion {
+            call_id: "c1".into(),
+            tool: REQUEST_REPOSITORY.into(),
+            question: "May I?".into(),
+            ui: None,
+            stream: None,
+        }));
+        state
+    }
+
+    /// The person's message waiting in the inbox.
+    fn inbox(text: &str) -> [Inbound; 1] {
+        [Inbound::new("message", json!({ "text": text }))]
+    }
+
     fn agreed(consents: &[Consent]) -> Vec<(&str, bool)> {
         consents
             .iter()
@@ -1030,17 +1060,64 @@ mod tests {
             assert_eq!(consents[0].call_id, "c1");
             assert_eq!(consents[0].tool, REQUEST_REPOSITORY);
         }
-        for not_yes in [
+        for no in [
             "no",
             "No",
-            "yes please",
+            "n",
             "The person answered through the interface:\n- consent: no",
+        ] {
+            let consents = consents_in(&answered(LIB, no), &[]);
+            assert_eq!(agreed(&consents), [(LIB_KEY, false)], "{no:?}");
+        }
+    }
+
+    /// Only an explicit yes or no is a consent. "wait" or "?" must not close the question for good.
+    #[test]
+    fn an_answer_that_is_neither_a_yes_nor_a_no_records_nothing() {
+        for neither in [
+            "wait",
+            "?",
+            "what is it for?",
+            "yes please",
             "no, use acme/other",
             "",
+            "The person answered through the interface:\n- consent: (nothing chosen)",
         ] {
-            let consents = consents_in(&answered(LIB, not_yes), &[]);
-            assert_eq!(agreed(&consents), [(LIB_KEY, false)], "{not_yes:?}");
+            assert_eq!(consents_in(&answered(LIB, neither), &[]), [], "{neither:?}");
         }
+        // A "no" later in the conversation is still a no, and a "wait" before it changed nothing.
+        let state = conversation(vec![
+            Message::user_text("In acme/app, add the shared greeting."),
+            assistant("", vec![request("c1", LIB)]),
+            Message::tool_result("c1", "wait"),
+            assistant("", vec![request("c2", LIB)]),
+            Message::tool_result("c2", "no"),
+        ]);
+        let consents = consents_in(&state, &[]);
+        assert_eq!(agreed(&consents), [(LIB_KEY, false)]);
+        assert_eq!(consents[0].call_id, "c2");
+    }
+
+    /// While parked, the first inbound message is the answer; "wait" must not refuse the repository
+    /// for the task, and the question can be asked again.
+    #[test]
+    fn a_wait_while_parked_records_nothing_and_the_question_can_be_asked_again() {
+        let state = parked_on(LIB);
+        for neither in ["wait", "?"] {
+            assert_eq!(consents_in(&state, &inbox(neither)), [], "{neither:?}");
+        }
+        let mut notes = RunNotes::default();
+        assert!(!notes.record_consents(consents_in(&state, &inbox("wait"))));
+        assert!(
+            !notes.declined(REQUEST_REPOSITORY, LIB_KEY),
+            "nothing was declined: the tool asks again"
+        );
+        assert!(!notes.agreed(REQUEST_REPOSITORY, LIB_KEY));
+        assert_eq!(
+            agreed(&consents_in(&state, &inbox("no"))),
+            [(LIB_KEY, false)],
+            "an explicit no is recorded"
+        );
     }
 
     /// The model cannot grant: an `ask_user` the model wrote, whatever it says and however the
@@ -1088,8 +1165,14 @@ mod tests {
     #[test]
     fn the_answer_grants_the_repository_the_call_named_not_the_one_the_answer_mentions() {
         let state = answered(LIB, "yes, add acme/other");
-        let consents = consents_in(&state, &[]);
-        assert_eq!(agreed(&consents), [(LIB_KEY, false)]);
+        assert_eq!(
+            consents_in(&state, &[]),
+            [],
+            "yes, but to another label: neither"
+        );
+        // The yes of the tool's own label is a yes for the repository of the call.
+        let state = answered(LIB, "yes");
+        assert_eq!(agreed(&consents_in(&state, &[])), [(LIB_KEY, true)]);
         // A free-text "no, use acme/other" still names acme/other, like every word of the person.
         let state = answered(LIB, "no, use acme/other");
         assert_eq!(
@@ -1221,19 +1304,7 @@ mod tests {
     /// While the run is parked on the question, the answer is in the inbox, not yet in the history.
     #[test]
     fn an_answer_in_the_inbox_while_parked_is_recorded() {
-        let mut state = conversation(vec![
-            Message::user_text("task"),
-            assistant("", vec![request("c1", LIB)]),
-        ]);
-        state.pending_calls = vec![request("c1", LIB)];
-        state.pending_wait = Some(PendingWait::Question(adam_llm_agent::PendingQuestion {
-            call_id: "c1".into(),
-            tool: REQUEST_REPOSITORY.into(),
-            question: "May I?".into(),
-            ui: None,
-            stream: None,
-        }));
-        let inbox = |text: &str| [Inbound::new("message", json!({ "text": text }))];
+        let mut state = parked_on(LIB);
         assert_eq!(
             agreed(&consents_in(&state, &inbox("yes"))),
             [(LIB_KEY, true)]
@@ -1242,10 +1313,7 @@ mod tests {
             agreed(&consents_in(&state, &inbox("No"))),
             [(LIB_KEY, false)]
         );
-        assert_eq!(
-            agreed(&consents_in(&state, &inbox("yes please"))),
-            [(LIB_KEY, false)]
-        );
+        assert_eq!(consents_in(&state, &inbox("yes please")), []);
         // Nothing waiting, or only a finished-child notice: no answer yet.
         assert_eq!(consents_in(&state, &[]), []);
         let finished = [Inbound::new(RUN_FINISHED_KIND, json!({"text": "yes"}))];

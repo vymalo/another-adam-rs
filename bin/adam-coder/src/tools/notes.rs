@@ -136,8 +136,9 @@ pub struct PushedBranch {
 /// the answer to `request_repository` ("may this repository join the workspace?").
 ///
 /// Recorded by the agent before each step from the conversation, never from what the model says,
-/// and kept whether or not the person agreed: a refusal is remembered so that the tool does not ask
-/// again.
+/// and kept whether the person said yes or an explicit no: a no is remembered so that the tool does
+/// not ask again. An answer that is neither (`wait`, `?`) is not recorded, and the question can be
+/// asked again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Consent {
     /// The tool call that asked. A provider may send the same id again in a later turn, so a
@@ -147,7 +148,8 @@ pub struct Consent {
     pub tool: String,
     /// What the person was asked about: the repository's [`named`](super::named) key.
     pub subject: String,
-    /// Whether the answer was a yes (`consent::agrees`).
+    /// Whether the answer was a yes (`consent::answer_of`); an explicit no is recorded too, and any
+    /// other answer is not recorded at all.
     pub agreed: bool,
 }
 
@@ -164,6 +166,20 @@ pub struct CreatedRepo {
     /// The browser URL.
     pub html_url: String,
     /// Whether it was created private.
+    pub private: bool,
+}
+
+/// A repository creation that was begun and whose outcome this run has not noted: written by
+/// `create_repository` **before** it asks the host, and removed when the creation is noted or the
+/// host definitely refused it. One that is still here when `create_repository` is called again is
+/// what a process that died between the host's answer and the note leaves: a name that "already
+/// exists" is then the run's own repository (`create_repository` looks it up and adopts it) and not
+/// somebody else's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreationIntent {
+    /// `owner/name`, lowercase, as the call spelled it (the key of [`CreatedRepo::full_name`]).
+    pub full_name: String,
+    /// The visibility the person agreed to.
     pub private: bool,
 }
 
@@ -199,6 +215,9 @@ pub struct RunNotes {
     /// also grants the repository's key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub created_repos: Vec<CreatedRepo>,
+    /// The repository creations begun and not settled (see [`CreationIntent`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub creating: Vec<CreationIntent>,
     /// The branches that this run and the earlier tasks of the conversation pushed work for, which
     /// `prepare_workspace` may continue with its `branch`. `commit_and_push` writes its own; the
     /// agent adds, before each step, the ones in the notes of the run this one continues (and,
@@ -281,6 +300,33 @@ impl RunNotes {
             }
         }
         added
+    }
+
+    /// Whether a creation of exactly this repository and visibility was begun and not settled.
+    pub fn is_creating(&self, full_name: &str, private: bool) -> bool {
+        self.creating
+            .iter()
+            .any(|c| c.full_name == full_name && c.private == private)
+    }
+
+    /// Note that a creation is about to be asked of the host; returns whether it was new.
+    pub fn begin_creating(&mut self, full_name: &str, private: bool) -> bool {
+        if self.is_creating(full_name, private) {
+            return false;
+        }
+        self.creating.push(CreationIntent {
+            full_name: full_name.to_owned(),
+            private,
+        });
+        true
+    }
+
+    /// Forget the creations of `full_name` (whatever the visibility): the host refused it, or it is
+    /// noted in [`created_repos`](Self::created_repos). Returns whether anything was removed.
+    pub fn settle_creating(&mut self, full_name: &str) -> bool {
+        let before = self.creating.len();
+        self.creating.retain(|c| c.full_name != full_name);
+        self.creating.len() != before
     }
 
     /// Whether the person agreed to `subject` when `tool` asked: the latest answer decides.

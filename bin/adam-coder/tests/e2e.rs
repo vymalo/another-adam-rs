@@ -3659,9 +3659,9 @@ async fn another_repository_joins_the_workspace_when_the_person_says_yes_on_the_
     assert!(notes.consents[0].agreed && notes.consents[0].tool == "request_repository");
 }
 
-/// Anything that is not a yes adds nothing: "yes please" is not agreement, the repository stays
-/// refused (the refusal sends the model back to the tool), asking again for a repository the
-/// person turned down is refused too, and nothing of it is ever fetched.
+/// Anything that is not a yes adds nothing: the repository stays refused (the refusal sends the
+/// model back to the tool), and after an explicit no, asking again for the repository the person
+/// turned down is refused too, and nothing of it is ever fetched.
 async fn an_answer_that_is_not_a_yes_adds_nothing_and_is_not_asked_again(store: DynStore) {
     let fx = Fixture::new("hello\n").await;
     let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
@@ -3708,7 +3708,7 @@ async fn an_answer_that_is_not_a_yes_adds_nothing_and_is_not_asked_again(store: 
         "{text}"
     );
 
-    let mut follow = user("yes please");
+    let mut follow = user("no");
     follow.task_id = Some(seen.task_id.clone());
     server.client.send_message(&request(follow)).await.unwrap();
     wait_for(&server.coder.runtime, run, "the run waits again", |v| {
@@ -3736,6 +3736,78 @@ async fn an_answer_that_is_not_a_yes_adds_nothing_and_is_not_asked_again(store: 
         notes.consents.iter().all(|c| !c.agreed),
         "{:?}",
         notes.consents
+    );
+}
+
+/// A message that is neither a yes nor a no ("wait") is no answer: nothing is recorded, the
+/// repository stays refused for now, and the tool asks the same question again instead of
+/// answering that the person declined.
+async fn a_wait_is_no_answer_and_the_question_is_asked_again(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
+    let library_url = library.to_string_lossy().into_owned();
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "r1",
+        "request_repository",
+        json!({"repo_url": library_url, "reason": "the greeting"}),
+    )])
+    .push_tool_calls(vec![call(
+        "r2",
+        "prepare_workspace",
+        json!({"repo_url": library_url}),
+    )])
+    .push_tool_calls(vec![call(
+        "r3",
+        "request_repository",
+        json!({"repo_url": library_url, "reason": "the greeting, again"}),
+    )]);
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = until_it_waits(
+        &server,
+        user(&format!(
+            "In {}, put our shared greeting into hello.txt.",
+            fx.remote_url()
+        )),
+    )
+    .await;
+    assert_eq!(seen.last_state, Some(TaskState::InputRequired));
+    let run = run_id(&seen.task_id);
+    let parked = wait_for(&server.coder.runtime, run, "the run waits", |v| v.waiting).await;
+
+    let mut follow = user("wait");
+    follow.task_id = Some(seen.task_id.clone());
+    server.client.send_message(&request(follow)).await.unwrap();
+    wait_for(&server.coder.runtime, run, "the run waits again", |v| {
+        v.waiting && v.version > parked.version && mock.requests().len() == 3
+    })
+    .await;
+    worker.stop().await;
+
+    // "wait" reached the model as the call's result, and granted nothing.
+    assert_eq!(result_of(&mock, "r1").0, "wait");
+    let (refused, is_error) = result_of(&mock, "r2");
+    assert!(
+        is_error && refused.contains("not a repository the person named"),
+        "{refused}"
+    );
+    // The second request was asked, not answered with "declined": the run waits on its question.
+    let parts = status_parts(&server, &seen.task_id).await;
+    let text = parts[0].as_text().unwrap();
+    assert!(
+        text.contains("May I add the repository library")
+            && text.contains("the greeting, again")
+            && !text.contains("declined"),
+        "{text}"
+    );
+    let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
+    assert!(notes.consents.is_empty(), "{:?}", notes.consents);
+    assert_eq!(
+        mirrors(&fx.root),
+        Vec::<String>::new(),
+        "nothing was fetched"
     );
 }
 
@@ -3957,7 +4029,7 @@ async fn a_no_to_creating_a_repository_creates_nothing(store: DynStore) {
     assert_eq!(seen.last_state, Some(TaskState::InputRequired));
     let run = run_id(&seen.task_id);
     let parked = wait_for(&server.coder.runtime, run, "the run waits", |v| v.waiting).await;
-    let mut no = user("No.");
+    let mut no = user("No");
     no.task_id = Some(seen.task_id.clone());
     server.client.send_message(&request(no)).await.unwrap();
     wait_for(&server.coder.runtime, run, "the run waits again", |v| {
@@ -4022,6 +4094,7 @@ macro_rules! coder_suite {
                 a_screen_the_coder_cannot_read_gets_the_options_as_text,
                 another_repository_joins_the_workspace_when_the_person_says_yes_on_the_form,
                 an_answer_that_is_not_a_yes_adds_nothing_and_is_not_asked_again,
+                a_wait_is_no_answer_and_the_question_is_asked_again,
                 a_yes_to_a_question_the_model_wrote_grants_nothing,
                 a_repository_is_created_after_the_person_says_yes_and_the_project_goes_into_it,
                 a_no_to_creating_a_repository_creates_nothing,

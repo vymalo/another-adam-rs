@@ -4448,6 +4448,93 @@ async fn a_name_that_exists_and_was_not_made_by_this_run_is_left_alone() {
     );
 }
 
+/// A process that dies after the host made the repository and before the run noted it is run again:
+/// the host says the name exists, and the intent written before the host was asked says whose it is.
+#[tokio::test]
+async fn a_creation_that_died_before_its_note_is_adopted_when_it_is_repeated() {
+    let (rig, host) = creating(None).await;
+    let run = rig.ctx.run_id().to_string();
+    answer(&rig, "acme/fib:private", true).await;
+    let args = json!({"owner": "acme", "name": "fib"});
+    let first = create(&rig, args.clone()).await.unwrap();
+    assert!(!first.is_error, "{}", first.content);
+    // The crash: the host has the repository, the notes have only the intent.
+    let mut notes = rig.fx.env.notes.load(&run).await.unwrap();
+    assert!(
+        notes.creating.is_empty(),
+        "a creation that was noted leaves no intent"
+    );
+    notes.created_repos.clear();
+    notes.named_repos.clear();
+    assert!(notes.begin_creating("acme/fib", true));
+    rig.fx.env.notes.save(&run, &notes).await.unwrap();
+
+    let again = create(&rig, args.clone()).await.unwrap();
+    assert!(!again.is_error, "{}", again.content);
+    assert_eq!(
+        again.content, first.content,
+        "the same answer as the first time"
+    );
+    assert_eq!(host.created().len(), 1, "it was not created a second time");
+    let notes = rig.fx.env.notes.load(&run).await.unwrap();
+    assert_eq!(notes.created_repos.len(), 1);
+    assert_eq!(
+        notes.named_repos,
+        [notes.created_repos[0].key.clone()],
+        "granted by the key of its clone URL, as when it is created"
+    );
+    assert!(notes.creating.is_empty(), "the intent is settled");
+}
+
+/// The intent is written before the host is asked, so a host whose answer is lost (it made the
+/// repository, the call failed) is recovered by the retry.
+#[tokio::test]
+async fn the_intent_is_written_before_the_host_is_asked_so_a_lost_answer_is_recovered() {
+    let (rig, host) = creating(None).await;
+    let run = rig.ctx.run_id().to_string();
+    answer(&rig, "acme/fib:private", true).await;
+    host.answer_is_lost(1);
+    let args = json!({"owner": "acme", "name": "fib"});
+    let lost = create(&rig, args.clone()).await;
+    assert!(matches!(lost, Err(ToolError::Transient(_))), "{lost:?}");
+    let notes = rig.fx.env.notes.load(&run).await.unwrap();
+    assert!(
+        notes.is_creating("acme/fib", true),
+        "the intent is kept: the host may have made it"
+    );
+    assert!(notes.created_repos.is_empty());
+
+    let retried = create(&rig, args).await.unwrap();
+    assert!(!retried.is_error, "{}", retried.content);
+    assert!(
+        retried
+            .content
+            .starts_with("Created acme/fib (private, empty")
+    );
+    assert_eq!(host.created().len(), 1, "the retry did not create it again");
+    let notes = rig.fx.env.notes.load(&run).await.unwrap();
+    assert_eq!(notes.created_repos.len(), 1);
+    assert!(notes.creating.is_empty());
+}
+
+/// Without an intent a taken name is somebody else's, and a refusal leaves no intent behind to turn
+/// the next call into an adoption.
+#[tokio::test]
+async fn a_refused_creation_leaves_no_intent_and_a_taken_name_is_never_adopted() {
+    let (rig, host) = creating(None).await;
+    let run = rig.ctx.run_id().to_string();
+    host.take("acme", "fib");
+    answer(&rig, "acme/fib:private", true).await;
+    for _ in 0..2 {
+        let out = create(&rig, json!({"owner": "acme", "name": "fib"})).await;
+        assert!(is_error(&out), "{out:?}");
+        assert!(text(out).contains("did not create it"));
+        let notes = rig.fx.env.notes.load(&run).await.unwrap();
+        assert!(notes.creating.is_empty(), "{:?}", notes.creating);
+        assert!(notes.created_repos.is_empty() && notes.named_repos.is_empty());
+    }
+}
+
 /// A user's repository is made for the person the credentials are, and for nobody else; an
 /// installation has no such person, so it makes organisations' only.
 #[tokio::test]

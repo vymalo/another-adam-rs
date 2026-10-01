@@ -47,7 +47,7 @@ sequenceDiagram
 | `start_scratch { name? }` | `RunWorkspace::add_scratch` for the run (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. The result says the project is **temporary** (it exists only while the task is open, nothing is kept unless it is published) and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
 | `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **that is granted** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
 | `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
-| `request_repository { repo_url, reason }` | **asks the person** whether another repository may join the workspace: the run parks (`input-required`) on a question **the tool writes**, which names the repository and quotes the model's `reason` (one line, at most 300 characters: `May I add the repository acme/lib (https://github.com/acme/lib) to this workspace? The agent says why: "..."`) and offers `Yes, add acme/lib` and `No`, as a form (one `Choices` question, id `consent`) on a screen that can draw it and as text on one that cannot (the same machinery as `ask_user`'s `choices`, [below](#asking-with-choices)). Only a yes adds the repository (it is then **granted**: the model calls `prepare_workspace` with it); the model never grants, see [the rules](#another-repository-only-with-the-persons-yes). A repository already granted is a result that says so (nobody is asked); one the person turned down is an error result that says not to ask again; one the workspace's policy would refuse (its host is not in `ALLOWED_REPO_HOSTS`, or it is a local path) is an error result **before** anyone is asked. `asks_user()` is `true`, so a subagent cannot have it |
+| `request_repository { repo_url, reason }` | **asks the person** whether another repository may join the workspace: the run parks (`input-required`) on a question **the tool writes**, which names the repository and quotes the model's `reason` (one line, at most 300 characters: `May I add the repository acme/lib (https://github.com/acme/lib) to this workspace? The agent says why: "..."`) and offers `Yes, add acme/lib` and `No`, as a form (one `Choices` question, id `consent`) on a screen that can draw it and as text on one that cannot (the same machinery as `ask_user`'s `choices`, [below](#asking-with-choices)). Only a yes adds the repository (it is then **granted**: the model calls `prepare_workspace` with it); the model never grants, see [the rules](#another-repository-only-with-the-persons-yes). A repository already granted is a result that says so (nobody is asked); one the person turned down (an explicit `no`) is an error result that says not to ask again; a message that is neither a yes nor a no (`wait`, `?`) records nothing, and the tool asks again; one the workspace's policy would refuse (its host is not in `ALLOWED_REPO_HOSTS`, or it is a local path) is an error result **before** anyone is asked. `asks_user()` is `true`, so a subagent cannot have it |
 | `create_repository { owner, name, private?, description? }` | creates a new, **empty** repository (no commit: `publish_scratch` gives it its first), and only **after the person agrees, every time**. Off unless `CREATE_REPO_OWNERS` lists the owner (any other owner, and every owner when the variable is empty, is an error result that says so); private unless `private: false`; `name` is `^[A-Za-z0-9._-]{1,100}$`, not `.`/`..`, not ending `.git`; `description` is at most 350 characters. The first call parks the run on a question **the tool writes** (`May I create the repository acme/fib on github.com? It will be private and empty.`, with the description quoted, and the options `Create acme/fib` and `Don't create it`); the answer comes back as that call's result, and **the model calls the tool again** with the same arguments: with a recorded yes for exactly `owner/name` **and that visibility** it creates the repository (a yes to the private one does not cover a public one), waits up to 10 s for it to be reachable over git, and grants it (the key of its clone URL) and records it (`RunNotes::created_repos`); a repeat after that is the same result and creates nothing; after a no it is an error result that says not to ask again. See [below](#a-repository-of-its-own-on-request). `asks_user()` is `true` |
 | `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
@@ -595,7 +595,8 @@ stateDiagram-v2
   [*] --> Granted: the person named it
   NotGranted --> Asked: request_repository
   Asked --> Granted: the person says yes
-  Asked --> Refused: any other answer
+  Asked --> Refused: an explicit no
+  Asked --> Asked: any other answer (nothing is recorded, the question can be asked again)
   Granted --> [*]: prepare_workspace and publish_scratch accept it
   Refused --> [*]: request_repository says no more asking, prepare_workspace refuses
 ```
@@ -612,15 +613,19 @@ stateDiagram-v2
   `ask_user`, however it is worded, grants nothing; neither does anything a tool printed, and an error
   result of `request_repository` is the tool's own words and counts for nothing, not even as the person naming a
   repository (it may quote an address the model chose).
-* **What is a yes.** The form's option `yes` (the answer comes back as `- consent: yes`), or, in words, exactly
-  `yes`, `y` or `Yes, add acme/lib`, whatever the case. Anything else is not agreement: `yes please`, `no`, `no, use
-  acme/other` (which does name `acme/other`, as every word of the person does).
+* **What is a yes, what is a no.** The form's option `yes` (the answer comes back as `- consent: yes`), or, in words,
+  exactly `yes`, `y` or `Yes, add acme/lib`, whatever the case, is a **yes**. The form's option `no` (`- consent: no`), or
+  exactly `no`, `n` or the no option's label, is a **no**. Anything else is **neither** and records nothing: `wait`, `?`,
+  `yes please`, `no, use acme/other` (which does name `acme/other`, as every word of the person does). The model still
+  gets the person's words as the call's result, so it can answer them, and the tool asks again; only an explicit no
+  closes the question for the task.
 * **Replays are the same.** Before every step the agent reads the answers from the history again and records them
   (`RunNotes::consents`, `Consent { call_id, tool, subject, agreed }`; the same call, tool and subject is not
-  recorded twice, and a refusal is kept): a restarted worker, or another one, reaches the same grants, and a task
+  recorded twice, and an explicit no is kept): a restarted worker, or another one, reaches the same grants, and a task
   that continues this one reads them from the carried history.
-* **Asked once.** A repository the person turned down is not asked about again in the run: `request_repository`
-  answers that they declined.
+* **Asked until answered.** A repository the person explicitly turned down (`no`) is not asked about again in the
+  run: `request_repository` answers that they declined. A message that is neither a yes nor a no does not turn it
+  down: the question is asked again.
 
 ### A repository of its own, on request
 
@@ -653,6 +658,7 @@ stateDiagram-v2
   [*] --> Refused: the feature is off, the owner or the name is not allowed, the host cannot create for the owner
   [*] --> Asked: no consent for owner/name:visibility yet
   Asked --> Declined: the person says no (asking again is refused)
+  Asked --> Asked: any other answer (nothing is recorded)
   Asked --> Consented: the person says yes
   Consented --> Created: create_repository again (empty, granted, recorded)
   Created --> Created: a repeated call is the same result
@@ -679,9 +685,15 @@ stateDiagram-v2
   so the allowed-hosts check and the scoped token apply as for any repository, before anything is sent. The `clone_url`
   the host answers with must pass the workspace's policy too (a host that sends it somewhere else leaves the repository
   made, ungranted, and tells the person to look at it).
-* **Replays.** The call is journaled like any tool. A worker that dies **after** the host created the repository and
-  **before** the notes say so finds the name taken when the call runs again, and refuses it as a name this run did not
-  make: the model picks another or asks. The window is two writes wide and the cost is a repository nobody uses.
+* **Replays.** The call is journaled like any tool, and it writes its **intent** (`owner/name`, visibility:
+  `RunNotes::creating`) into the run's notes *before* it asks the host. A worker that dies **after** the host created
+  the repository and **before** the notes say so runs the call again and finds the name taken **and** its own intent
+  there: it looks the repository up (`CodeHost::find_repository`, `GET /repos/{owner}/{name}`), applies the same
+  address policy as to a new one, grants it and records it, and the model gets the same answer as the first time. A
+  name that is taken **without** an intent is somebody else's and is left alone ("this run did not create it"). The
+  intent is removed when the creation is recorded and when the host definitely refused it (a name that exists, a
+  validation error, the credentials); a failure that may have happened after the host made it (a timeout) keeps it, so
+  that the retry adopts. The intent is not a consent: the person's yes is still read from the conversation.
 
 ### Where the processes of a run run
 
@@ -1523,17 +1535,18 @@ database of its own, so the role needs `CREATEDB`):
   through the stack.
 * **Another repository, only with the person's yes** ([above](#another-repository-only-with-the-persons-yes)).
   `src/agent.rs` (unit): a yes is a consent for the repository of *that call's* argument whatever the answer says
-  (the forms `yes`, `y`, the option's label and the form's `- consent: yes`; `yes please`, `no`, `yes, add
-  acme/other` and the form's `no` are not); an `ask_user` the model wrote, a tool's result, an error result of the
+  (the forms `yes`, `y`, the option's label and the form's `- consent: yes`); an explicit no (`no`, `n`, the form's
+  `no`) is a recorded refusal, and anything else (`wait`, `?`, `yes please`, `yes, add acme/other`, a form that picked
+  nothing) records nothing, also while the run is parked on the question (so it can be asked again); an `ask_user` the model wrote, a tool's result, an error result of the
   tool and a call whose argument is no repository grant nothing and name nothing; the pairing holds when a provider
   sends `call_0` again; an answer in the inbox while the run is parked on the question is recorded (and a finished-child
-  notice, or a run parked on another tool, records none); recording the same consents again changes nothing, a
-  refusal is kept and the same id for another repository is another consent. `src/tools/consent.rs` (unit): what a yes
+  notice, or a run parked on another tool, records none); recording the same consents again changes nothing, an
+  explicit no is kept and the same id for another repository is another consent. `src/tools/consent.rs` (unit): what a yes
   is, the reason cut at 300 characters and made one line, the question's two options. `tests/e2e.rs` (per store):
   the second repository is not fetched while the question waits, the question names it, quotes the reason and
   carries a form with a yes and a no, a yes picked on the form lets `prepare_workspace` add it and the notes say
-  so; `yes please` adds nothing, the refusal points back to the tool, asking again is refused and nothing was ever
-  fetched; a yes to a question the model wrote with `ask_user` grants nothing. `tests/tool_specs.rs` pins the
+  so; a `no` adds nothing, the refusal points back to the tool, asking again is refused and nothing was ever
+  fetched; a `wait` adds nothing and records nothing, and the tool asks the same question again; a yes to a question the model wrote with `ask_user` grants nothing. `tests/tool_specs.rs` pins the
   tool's spec and that it is one of the two tools that ask the person. `dev/coder-e2e.sh` (`SCENARIO=second-repo`,
   with `ANSWER=yes` and `ANSWER=no`) runs the chain through the stack.
 * **GitHub over MCP** ([above](#github-over-mcp-read-only)). `tests/agent_files.rs`: the shipped `mcp.json` is the

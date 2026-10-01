@@ -243,6 +243,32 @@ impl CodeHost for GitHub {
         })
     }
 
+    #[tracing::instrument(skip(self, repo), fields(repo = %repo.url))]
+    async fn find_repository(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<Option<CreatedRepository>, WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        let (owner, name) = slug(repo)?;
+        let resp = self
+            .request(Method::GET, &format!("/repos/{owner}/{name}"), &token)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        let found = match check(resp, &token).await {
+            Ok(resp) => resp,
+            Err(WorkspaceError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let found: ApiRepository = found.json().await.map_err(|e| decode_error(e, &token))?;
+        Ok(Some(CreatedRepository {
+            full_name: found.full_name,
+            clone_url: found.clone_url,
+            html_url: found.html_url,
+            default_branch: found.default_branch.unwrap_or_else(|| "main".to_owned()),
+        }))
+    }
+
     #[tracing::instrument(skip(self, host_repo), fields(owner))]
     async fn owner_kind(
         &self,

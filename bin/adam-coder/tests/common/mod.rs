@@ -320,6 +320,9 @@ pub struct CreatingHost {
     created: Mutex<Vec<NewRepository>>,
     taken: Mutex<Vec<String>>,
     clone_url: Mutex<Option<String>>,
+    /// Creations to answer with a transient error, after which the repository **was made** (the
+    /// answer was lost on its way): what a timeout looks like.
+    answer_lost: Mutex<u32>,
     owner_kinds_asked: Mutex<Vec<String>>,
 }
 
@@ -332,6 +335,12 @@ impl CreatingHost {
     /// Say that `owner/name` exists already, on the host, from before the run.
     pub fn take(&self, owner: &str, name: &str) {
         self.taken.lock().unwrap().push(format!("{owner}/{name}"));
+    }
+
+    /// The next `times` creations make the repository and then fail with a transient error, as a
+    /// host does whose answer never arrives.
+    pub fn answer_is_lost(&self, times: u32) {
+        *self.answer_lost.lock().unwrap() = times;
     }
 
     /// Answer creations with `url` as the clone URL (no repository is made there).
@@ -409,12 +418,46 @@ impl CodeHost for CreatingHost {
         };
         self.taken.lock().unwrap().push(full_name.clone());
         self.created.lock().unwrap().push(new);
+        {
+            let mut lost = self.answer_lost.lock().unwrap();
+            if *lost > 0 {
+                *lost -= 1;
+                return Err(WorkspaceError::Transient {
+                    message: "the host did not answer".to_owned(),
+                    source: None,
+                });
+            }
+        }
         Ok(CreatedRepository {
             html_url: format!("https://example.invalid/{full_name}"),
             full_name,
             clone_url,
             default_branch: "main".to_owned(),
         })
+    }
+
+    async fn find_repository(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<Option<CreatedRepository>, WorkspaceError> {
+        let loc = repo.locate()?;
+        let full_name = format!("{}/{}", loc.owner, loc.name);
+        if !self.taken.lock().unwrap().contains(&full_name) {
+            return Ok(None);
+        }
+        let clone_url = match self.clone_url.lock().unwrap().clone() {
+            Some(url) => url,
+            None => self
+                .path_of(&loc.owner, &loc.name)
+                .to_string_lossy()
+                .into_owned(),
+        };
+        Ok(Some(CreatedRepository {
+            html_url: format!("https://example.invalid/{full_name}"),
+            full_name,
+            clone_url,
+            default_branch: "main".to_owned(),
+        }))
     }
 
     async fn owner_kind(
@@ -542,6 +585,7 @@ impl Fixture {
             created: Mutex::default(),
             taken: Mutex::default(),
             clone_url: Mutex::default(),
+            answer_lost: Mutex::default(),
             owner_kinds_asked: Mutex::default(),
         });
         env.code_host = host.clone();

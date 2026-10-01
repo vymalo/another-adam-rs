@@ -8,6 +8,13 @@
 //! a yes to a private repository does not cover a public one. The model calls the tool again after
 //! the yes, and the second call creates it.
 //!
+//! **Safe to repeat.** The call writes its intent (`owner/name`, visibility) into the run's notes
+//! before it asks the host. A call that dies between the host's answer and the note of it is run
+//! again, and finds the host saying the name exists: with the intent there, that name is this run's
+//! own, so the repository is looked up ([`CodeHost::find_repository`](adam_workspace::CodeHost)),
+//! checked against the workspace's policy like any new one, granted and recorded. Without the
+//! intent, a name that exists is somebody else's and is left alone.
+//!
 //! The credentials are those of the installation. A person's token creates for the person it is, and
 //! for the organisations it can; an installation token creates for organisations only (it has no
 //! user: `GET /user` is refused, and `POST /user/repos` has no one to create for).
@@ -18,7 +25,7 @@ use adam::prelude::*;
 use adam_workspace::{NewRepository, OwnerKind, RepoRef, WorkspaceError};
 use serde_json::Value;
 
-use super::consent::{ask, quoted_reason, yes_no};
+use super::consent::{Asked, ask, quoted_reason, yes_no};
 use super::named::key_of_argument;
 use super::notes::{CreatedRepo, RunNotes};
 use super::{Outcome, ToolEnv, non_empty, notes_error, workspace_error};
@@ -61,9 +68,9 @@ pub(crate) fn subject(owner: &str, name: &str, private: bool) -> String {
     )
 }
 
-/// The subject and the label of the "yes" option of a `create_repository` call, from its
+/// What a `create_repository` call asks (the subject and the labels of the two options), from its
 /// arguments; `None` when they are not an owner and a name that could be created.
-pub(crate) fn consent_of(arguments: &Value) -> Option<(String, String)> {
+pub(crate) fn consent_of(arguments: &Value) -> Option<Asked> {
     let owner = arguments.get("owner")?.as_str()?.trim();
     let name = arguments.get("name")?.as_str()?.trim();
     if !valid_owner(owner) || !valid_name(name) {
@@ -73,8 +80,15 @@ pub(crate) fn consent_of(arguments: &Value) -> Option<(String, String)> {
         .get("private")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    Some((subject(owner, name, private), yes_label(owner, name)))
+    Some(Asked {
+        subject: subject(owner, name, private),
+        yes: yes_label(owner, name),
+        no: NO_CREATE_LABEL.to_owned(),
+    })
 }
+
+/// The label of the option that says no to creating a repository.
+const NO_CREATE_LABEL: &str = "Don't create it";
 
 /// The label of the option that says yes to creating `owner/name`.
 fn yes_label(owner: &str, name: &str) -> String {
@@ -227,13 +241,22 @@ pub async fn create_repository(
                 &text,
                 &format!("Create {owner}/{name} on {host}?"),
                 &yes_label(owner, name),
-                "Don't create it",
+                NO_CREATE_LABEL,
             ),
         )
         .await;
     }
 
     ctx.emit_progress(format!("creating {owner}/{name}")).await;
+    // The intent is written **before** the host is asked. If this process dies after the host made
+    // the repository and before the note of it, the call that replays finds the intent, and a name
+    // that "already exists" is then this run's own (looked up and adopted below), not somebody
+    // else's. An intent that is already there is such a replay's; one this call writes is not.
+    let replay = notes.is_creating(&full_name, private);
+    if !replay {
+        note_intent(&env, &run, &full_name, private).await?;
+    }
+    let exists = at.clone();
     let created = match env
         .code_host
         .create_repository(NewRepository {
@@ -246,23 +269,42 @@ pub async fn create_repository(
     {
         Ok(created) => created,
         Err(WorkspaceError::Invalid(why)) if why.contains("already exists") => {
-            return Ok(ToolOutput::error(format!(
-                "A repository {owner}/{name} already exists, and this run did not create it, so \
-                 it is not touched. Pick another name and ask again, or ask the person."
-            )));
+            let own = if replay {
+                match env.code_host.find_repository(&exists).await {
+                    Ok(found) => found,
+                    // Not known: the intent stays, and the call can be made again.
+                    Err(e) => return Err(workspace_error(&e)),
+                }
+            } else {
+                None
+            };
+            match own {
+                Some(found) => found,
+                None => {
+                    settle(&env, &run, &full_name).await?;
+                    return Ok(ToolOutput::error(format!(
+                        "A repository {owner}/{name} already exists, and this run did not create \
+                         it, so it is not touched. Pick another name and ask again, or ask the \
+                         person."
+                    )));
+                }
+            }
         }
         Err(WorkspaceError::Invalid(why)) => {
+            settle(&env, &run, &full_name).await?;
             return Ok(ToolOutput::error(format!(
                 "{owner}/{name} cannot be created: {why}"
             )));
         }
         Err(WorkspaceError::Auth(why)) => {
+            settle(&env, &run, &full_name).await?;
             return Ok(ToolOutput::error(format!(
                 "The credentials were refused for creating {owner}/{name}: {why}. A token needs \
                  the `repo` scope; a GitHub App needs the Administration permission for the \
                  organisation. Tell the person."
             )));
         }
+        // Anything else may have happened after the host made it: the intent stays.
         Err(e) => return Err(workspace_error(&e)),
     };
 
@@ -299,6 +341,35 @@ pub async fn create_repository(
             record.full_name, record.clone_url
         ))),
     }
+}
+
+/// Write the intent to create `full_name` into the run's notes (see the module documentation).
+async fn note_intent(
+    env: &ToolEnv,
+    run: &str,
+    full_name: &str,
+    private: bool,
+) -> Result<(), ToolError> {
+    let mut notes: RunNotes = env.notes.load(run).await.map_err(|e| notes_error(&e))?;
+    if notes.begin_creating(full_name, private) {
+        env.notes
+            .save(run, &notes)
+            .await
+            .map_err(|e| notes_error(&e))?;
+    }
+    Ok(())
+}
+
+/// The host definitely did not make `full_name` for this run: forget the intent.
+async fn settle(env: &ToolEnv, run: &str, full_name: &str) -> Result<(), ToolError> {
+    let mut notes: RunNotes = env.notes.load(run).await.map_err(|e| notes_error(&e))?;
+    if notes.settle_creating(full_name) {
+        env.notes
+            .save(run, &notes)
+            .await
+            .map_err(|e| notes_error(&e))?;
+    }
+    Ok(())
 }
 
 /// Whether `owner` is an organisation, or the person the credentials are: the kind of API to create
@@ -348,6 +419,7 @@ async fn remember(env: &ToolEnv, run: &str, record: &CreatedRepo) -> Result<(), 
         notes.created_repos.push(record.clone());
     }
     notes.name_repos([record.key.clone()]);
+    notes.settle_creating(&record.full_name);
     env.notes
         .save(run, &notes)
         .await
@@ -389,10 +461,15 @@ mod tests {
         // The same call, as the model writes it: private is the default.
         assert_eq!(
             consent_of(&json!({"owner": "scratch", "name": "fib"})),
-            Some(("scratch/fib:private".into(), "Create scratch/fib".into()))
+            Some(Asked {
+                subject: "scratch/fib:private".into(),
+                yes: "Create scratch/fib".into(),
+                no: "Don't create it".into(),
+            })
         );
         assert_eq!(
-            consent_of(&json!({"owner": "scratch", "name": "fib", "private": false})).map(|c| c.0),
+            consent_of(&json!({"owner": "scratch", "name": "fib", "private": false}))
+                .map(|c| c.subject),
             Some("scratch/fib:public".into())
         );
         for bad in [

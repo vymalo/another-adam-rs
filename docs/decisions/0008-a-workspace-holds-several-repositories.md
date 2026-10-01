@@ -217,3 +217,11 @@ is granted; [ADR 0009](0009-github-per-installation-read-through-mcp.md), decisi
 "A repository of its own, on request"). `create_repository` asks the person, creates the repository empty after
 a yes, and grants it by the key of its clone URL; `RunNotes::created_repos` records it. A scratch project is then
 published to it with `publish_scratch`, as to any granted repository.*
+
+*2026-10-01 (review of slice 7, A7 and A8): the rule for what counts as an answer is narrower than it was.
+A yes (the form's option, or exactly `yes`, `y` or the option's label) grants and is recorded; an **explicit no**
+(the form's option, or exactly `no`, `n` or the no option's label) is recorded as a refusal and is final for the
+task; **any other message** (`wait`, `?`, a question back, `yes please`) records nothing, so that it neither grants
+nor refuses, and the question can be asked again. The model still gets the person's words as the call's result.
+Before, any text that was not a yes was recorded as a refusal, which made a "wait" a permanent "do not ask again".
+`create_repository` follows the same rule, and is now safe to repeat (ADR 0009).*

@@ -1950,8 +1950,8 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     one the person agreed to add when `request_repository` asked
     ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md), decision 9). The question is the tool's
     own (it names the repository and quotes the model's reason), the grant is recorded by the agent from the
-    person's answer to that call and from nothing the model says, and a refusal is remembered so that it is not
-    asked again. See [`bin/adam-coder`](../bin/adam-coder/README.md#another-repository-only-with-the-persons-yes).
+    person's answer to that call and from nothing the model says, and an explicit no is remembered so that it is not
+    asked again (any other message, `wait` or `?`, records nothing and the question can be asked again). See [`bin/adam-coder`](../bin/adam-coder/README.md#another-repository-only-with-the-persons-yes).
   * `create_repository` makes a new, **empty** repository (private unless asked otherwise) for an owner `CREATE_REPO_OWNERS`
     names, only after the person says yes to a question the tool writes, once per owner, name and visibility; the
     repository it makes is granted. A GitHub App creates for organisations only. See

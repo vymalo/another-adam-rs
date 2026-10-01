@@ -256,7 +256,7 @@ jobs:
       # over A2A, its scripted model drives prepare -> OpenCode (also scripted)
       # -> checks -> commit and push -> pull request, and dev/coder-e2e.sh
       # checks the artifacts, mock-github's journal and git-server. Run four times (and the second repository
-# twice, with the person's yes and no):
+      # twice, with the person's yes and no):
       # without OpenCode (the check command makes the change), with it, with the coder
       # writing the file itself (SCENARIO=files), and with no repository named at all
       # (SCENARIO=scratch: a project is built in a scratch slot, the coder asks where to put

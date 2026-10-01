@@ -618,6 +618,37 @@ mod create {
     }
 
     #[tokio::test]
+    async fn a_repository_that_exists_is_found_and_one_that_does_not_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/fib"))
+            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(api_repo("acme", "fib")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/none"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "Not Found"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let host = client(&server);
+        let found = host.find_repository(&at("acme", "fib")).await.unwrap();
+        assert_eq!(
+            found.map(|f| (f.full_name, f.clone_url)),
+            Some((
+                "acme/fib".to_owned(),
+                "https://github.com/acme/fib.git".to_owned()
+            ))
+        );
+        assert_eq!(
+            host.find_repository(&at("acme", "none")).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn an_existing_name_is_invalid_and_a_refused_token_is_auth() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
