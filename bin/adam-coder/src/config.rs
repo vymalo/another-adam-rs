@@ -25,6 +25,9 @@
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 //! | `PR_DRAFT` | open pull requests as drafts (`true`/`false`) | `false` |
 //! | `OPENCODE_COMMAND` | program that speaks ACP on stdio (arguments follow, whitespace-separated) | `opencode acp` |
+//! | `MCP_ALLOW_STDIO` | let an agent folder's `mcp.json` start local processes (`command` servers) | `false` |
+//! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
+//! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
 //!
 //! # Roles
@@ -38,7 +41,7 @@
 //!   or GitHub configuration.
 //! * **The workers** (`all`, `worker`) need everything a step uses, the `MODEL_*`, `MODEL`
 //!   and `GITHUB_TOKEN` variables, and read the rest of the table above (the workspace, the
-//!   checks, the commit identity, OpenCode). They arrive in [`Config::worker`] as a
+//!   checks, the commit identity, OpenCode, what MCP servers a folder may start or reach). They arrive in [`Config::worker`] as a
 //!   [`WorkerConfig`], which is `Some` exactly when [`Role::runs_workers`].
 //!
 //! # Workspace placement
@@ -72,6 +75,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use adam::AGENT_DIR_ENV;
+use adam::mcp::McpPolicy;
 use adam_error::{Classify, ErrorClass};
 use adam_host::{Placement, Role};
 use secrecy::SecretString;
@@ -172,6 +176,35 @@ pub struct WorkerConfig {
     pub pr_draft: bool,
     /// `OPENCODE_COMMAND`, split into program and arguments.
     pub opencode_command: Vec<String>,
+    /// `MCP_ALLOW_*`: what the MCP servers of the agent folder's `mcp.json` may be.
+    pub mcp: McpSettings,
+}
+
+/// What the deployment lets an agent folder's `mcp.json` do (`MCP_ALLOW_STDIO`,
+/// `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS`). The files say which servers an agent uses; these
+/// say which kinds may be used. Every flag is off by default, as in [`McpPolicy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpSettings {
+    /// `MCP_ALLOW_STDIO`: a server may be a local process (`command` in `mcp.json`). The file
+    /// would decide what this process runs, with this process's rights.
+    pub allow_stdio: bool,
+    /// `MCP_ALLOW_INSECURE`: a server may be at a plain `http` URL that is not this machine.
+    /// Development only: the requests and their headers cross the network in the clear.
+    pub allow_insecure: bool,
+    /// `MCP_ALLOW_URL_VARS`: a server's `url` may contain `${VAR}`. Off by default because the
+    /// MCP client library logs the URL it dials; a credential belongs in `headers`, which are
+    /// never logged, and `${VAR}` in a header works without this flag.
+    pub allow_url_vars: bool,
+}
+
+impl McpSettings {
+    /// The policy `AgentDef::connect_mcp` is given.
+    pub fn policy(&self) -> McpPolicy {
+        McpPolicy::default()
+            .allow_stdio(self.allow_stdio)
+            .allow_insecure(self.allow_insecure)
+            .allow_url_secrets(self.allow_url_vars)
+    }
 }
 
 impl std::fmt::Debug for WorkerConfig {
@@ -192,6 +225,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("check_output_tail", &self.check_output_tail)
             .field("pr_draft", &self.pr_draft)
             .field("opencode_command", &self.opencode_command)
+            .field("mcp", &self.mcp)
             .finish_non_exhaustive()
     }
 }
@@ -415,6 +449,11 @@ impl WorkerConfig {
         };
         let pr_draft = flag("PR_DRAFT");
         let allow_local_repos = flag("ALLOW_LOCAL_REPOS");
+        let mcp = McpSettings {
+            allow_stdio: flag("MCP_ALLOW_STDIO"),
+            allow_insecure: flag("MCP_ALLOW_INSECURE"),
+            allow_url_vars: flag("MCP_ALLOW_URL_VARS"),
+        };
         let allowed_repo_hosts = match get("ALLOWED_REPO_HOSTS") {
             None => vec![DEFAULT_REPO_HOST.to_owned()],
             Some(raw) => {
@@ -479,6 +518,7 @@ impl WorkerConfig {
                 .unwrap_or_else(|| "adam-coder@users.noreply.github.com".to_owned()),
             pr_draft,
             opencode_command,
+            mcp,
         })
     }
 }
@@ -687,6 +727,74 @@ mod tests {
         let mut vars = full();
         vars.insert("GITHUB_API_URL", "not a url");
         assert!(parse(&vars).is_err());
+    }
+
+    #[test]
+    fn the_mcp_flags_are_off_by_default_and_each_one_is_read() {
+        let w = worker(&full());
+        assert_eq!(w.mcp, McpSettings::default());
+        let policy = w.mcp.policy();
+        assert!(!policy.stdio_allowed());
+        assert!(!policy.insecure_allowed());
+        assert!(!policy.url_secrets_allowed());
+
+        let mut vars = full();
+        vars.insert("MCP_ALLOW_STDIO", "true");
+        vars.insert("MCP_ALLOW_INSECURE", "1");
+        vars.insert("MCP_ALLOW_URL_VARS", "TRUE");
+        let w = worker(&vars);
+        assert_eq!(
+            w.mcp,
+            McpSettings {
+                allow_stdio: true,
+                allow_insecure: true,
+                allow_url_vars: true
+            }
+        );
+        let policy = w.mcp.policy();
+        assert!(
+            policy.stdio_allowed() && policy.insecure_allowed() && policy.url_secrets_allowed()
+        );
+
+        // One at a time: each variable maps to its own flag.
+        for (name, expected) in [
+            ("MCP_ALLOW_STDIO", (true, false, false)),
+            ("MCP_ALLOW_INSECURE", (false, true, false)),
+            ("MCP_ALLOW_URL_VARS", (false, false, true)),
+        ] {
+            let mut vars = full();
+            vars.insert(name, "true");
+            let m = worker(&vars).mcp;
+            assert_eq!(
+                (m.allow_stdio, m.allow_insecure, m.allow_url_vars),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_mcp_flag_names_the_variable() {
+        let mut vars = full();
+        vars.insert("MCP_ALLOW_STDIO", "sometimes");
+        vars.insert("MCP_ALLOW_INSECURE", "yes");
+        vars.insert("MCP_ALLOW_URL_VARS", "2");
+        let err = parse(&vars).unwrap_err();
+        for name in [
+            "MCP_ALLOW_STDIO",
+            "MCP_ALLOW_INSECURE",
+            "MCP_ALLOW_URL_VARS",
+        ] {
+            assert!(
+                err.problems
+                    .iter()
+                    .any(|p| p.starts_with(name) && p.contains("true or false")),
+                "{name} missing from {:?}",
+                err.problems
+            );
+        }
+        // A control plane connects no MCP servers, so it does not validate them.
+        vars.insert("ROLE", "control-plane");
+        assert!(parse(&vars).is_ok());
     }
 
     fn with_role(role: &'static str) -> HashMap<&'static str, &'static str> {

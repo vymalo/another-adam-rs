@@ -17,7 +17,7 @@ name = "adam-coder"
 path = "src/main.rs"
 
 [dependencies]
-adam = { workspace = true, features = ["a2a"] }
+adam = { workspace = true, features = ["a2a", "mcp"] }
 adam-a2a.workspace = true
 adam-a2a-runtime.workspace = true
 adam-acp.workspace = true
@@ -52,6 +52,7 @@ adam-agent-fs = { workspace = true, features = ["build"] }
 [dev-dependencies]
 a2a-client-lf.workspace = true
 a2a-lf.workspace = true
+adam-mcp-testkit.workspace = true
 adam-workspace = { workspace = true, features = ["test-util"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile.workspace = true

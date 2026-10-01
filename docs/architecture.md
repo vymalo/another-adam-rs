@@ -1656,8 +1656,9 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
   model together with `AgentDef`, and keeps only the completion policy in Rust. `serve` reads the files
   first, for every role (`AgentFiles::load`: the folder, else the embedded copy), logs the `agent files`
   line and refuses a folder with mistakes (exit 78); the control plane serves the folder's card
-  (`agent_card_from`), the workers assemble from it (`CoderAgent::try_from_files`), and a folder's
-  subagents are registered beside the coder. A restart applies an edit; there is no hot reload
+  (`agent_card_from`), the workers assemble from it (`CoderAgent::try_from_files`; they connect the
+  servers of the folder's `mcp.json` first, `AgentDef::connect_mcp` under the `MCP_ALLOW_*` policy, and
+  assemble with `CoderAgent::try_from_def`), and a folder's subagents are registered beside the coder. A restart applies an edit; there is no hot reload
   ([ADR 0004](decisions/0004-agent-folders-at-run-time.md)).
 * **Rules in code.**
   * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`

@@ -732,6 +732,151 @@ async fn a_worker_whose_folder_cannot_be_assembled_exits_78_naming_the_problem()
     db.finish().await;
 }
 
+/// `mcp.json` in the folder: a worker connects the servers it names at startup (with the token
+/// from the environment in the header), serves, and stops on SIGTERM with exit code 0. A control
+/// plane steps no run, so it connects none of them (the server it names is down and it starts).
+#[tokio::test]
+async fn a_worker_connects_the_mcp_servers_of_its_folder_and_a_control_plane_does_not() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let server = adam_mcp_testkit::TestHttpServer::start(Some("mcp-secret-token")).await;
+    let agent = folder();
+    write_mcp_json(&agent, &server.url());
+
+    let mut env = role_env("worker", &db.url(), tmp.path());
+    env.push((
+        "ADAM_AGENT_DIR".into(),
+        agent.path().to_string_lossy().into_owned(),
+    ));
+    env.push(("TEST_MCP_TOKEN".into(), "mcp-secret-token".into()));
+    let mut p = Proc::spawn(&env);
+    p.ready().await;
+    assert!(
+        server.initializations() >= 1,
+        "the worker connected the server before it served:\n{}",
+        p.logs()
+    );
+    assert!(
+        server
+            .authorizations()
+            .iter()
+            .all(|a| a == "Bearer mcp-secret-token"),
+        "{:?}",
+        server.authorizations()
+    );
+    assert!(
+        !p.logs().contains("mcp-secret-token"),
+        "the token is not logged:\n{}",
+        p.logs()
+    );
+    p.sigterm().await;
+    let status = p.exit_within(Duration::from_secs(15)).await;
+    assert_eq!(status.code(), Some(0), "{}", p.logs());
+
+    // The same folder, the server down, a control plane: it needs no tools, so it starts.
+    let down = folder();
+    write_mcp_json(&down, "http://127.0.0.1:1/mcp");
+    let mut env = role_env("control-plane", &db.url(), tmp.path());
+    env.push((
+        "ADAM_AGENT_DIR".into(),
+        down.path().to_string_lossy().into_owned(),
+    ));
+    let mut p = Proc::spawn(&env);
+    p.ready().await;
+    p.sigterm().await;
+    let status = p.exit_within(Duration::from_secs(15)).await;
+    assert_eq!(status.code(), Some(0), "{}", p.logs());
+    db.finish().await;
+}
+
+/// What a worker cannot connect stops it at startup, with the exit code of the cause: a server
+/// that is down is 69 (a supervisor retries), a local process the deployment does not allow, a
+/// variable nobody set and a `${VAR}` in a URL are 78 (the files and the deployment disagree). The
+/// failure line names the file and which variables decide, and never the value of a variable.
+#[tokio::test]
+async fn an_mcp_server_that_cannot_be_connected_stops_the_worker_with_the_code_of_the_cause() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let cases: [(&str, &str, u8, &str); 4] = [
+        (
+            r#"{"mcpServers": {"down": {"type": "http", "url": "http://127.0.0.1:1/mcp"}}}"#,
+            "",
+            69,
+            "down",
+        ),
+        (
+            r#"{"mcpServers": {"local": {"command": "adam-mcp-test-server"}}}"#,
+            "",
+            78,
+            "MCP_ALLOW_STDIO",
+        ),
+        (
+            r#"{"mcpServers": {"x": {"type": "http", "url": "http://127.0.0.1:1/mcp",
+                "headers": {"Authorization": "Bearer ${TEST_MCP_TOKEN_NOBODY_SET}"}}}}"#,
+            "",
+            78,
+            "TEST_MCP_TOKEN_NOBODY_SET",
+        ),
+        (
+            r#"{"mcpServers": {"x": {"type": "http", "url": "${TEST_MCP_URL}"}}}"#,
+            "http://127.0.0.1:1/mcp",
+            78,
+            "TEST_MCP_URL",
+        ),
+    ];
+    for (mcp_json, url, code, wants) in cases {
+        let agent = folder();
+        std::fs::write(agent.path().join("agent/mcp.json"), mcp_json).unwrap();
+        let mut env = role_env("worker", &db.url(), tmp.path());
+        env.push((
+            "ADAM_AGENT_DIR".into(),
+            agent.path().to_string_lossy().into_owned(),
+        ));
+        if !url.is_empty() {
+            env.push(("TEST_MCP_URL".into(), url.into()));
+        }
+        let mut p = Proc::spawn(&env);
+        let status = p.exit_within(Duration::from_secs(60)).await;
+        assert_eq!(
+            status.code(),
+            Some(i32::from(code)),
+            "{wants}: {}",
+            p.logs()
+        );
+        let err = failure(&p)["error"].as_str().unwrap().to_owned();
+        assert!(err.contains("connecting the MCP servers"), "{err}");
+        assert!(err.contains(wants), "{wants} missing from:\n{err}");
+        assert!(
+            err.contains("mcp.json"),
+            "the failure names the file:\n{err}"
+        );
+        assert!(
+            url.is_empty() || !err.contains(url),
+            "the value of a variable is not in the failure:\n{err}"
+        );
+    }
+    db.finish().await;
+}
+
+/// `MCP_ALLOW_STDIO=true` is read by the worker roles (not validated by a control plane), and a
+/// bad value is a configuration error naming the variable.
+#[tokio::test]
+async fn a_bad_mcp_flag_is_a_configuration_error_naming_the_variable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut env = valid_env("postgres://u:p@127.0.0.1:1/x", tmp.path());
+    env.push(("MCP_ALLOW_STDIO".into(), "maybe".into()));
+    let mut p = Proc::spawn(&env);
+    let status = p.exit_within(Duration::from_secs(30)).await;
+    assert_eq!(status.code(), Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(err.contains("MCP_ALLOW_STDIO"), "{err}");
+    assert!(!err.contains("connecting to Postgres"), "{err}");
+}
+
 /// A control plane serves A2A (card, `/healthz`, 401 without a token) with no model, GitHub or
 /// workspace configuration, and never touches the workspace root, even when one is set: it is not
 /// created, because no run is stepped here.
@@ -770,6 +915,20 @@ async fn a_control_plane_serves_a2a_and_does_not_create_the_workspace_root() {
     assert_eq!(status.code(), Some(0), "{}", p.logs());
     assert!(!workspace.exists(), "still not created after the stop");
     db.finish().await;
+}
+
+/// `agent/mcp.json` of `agent`: one server `test` at `url`, which takes its token from
+/// `${TEST_MCP_TOKEN}`.
+fn write_mcp_json(agent: &tempfile::TempDir, url: &str) {
+    std::fs::write(
+        agent.path().join("agent/mcp.json"),
+        format!(
+            r#"{{"mcpServers": {{"test": {{"type": "http", "url": "{url}",
+                "headers": {{"Authorization": "Bearer ${{TEST_MCP_TOKEN}}"}},
+                "tools": ["echo"]}}}}}}"#
+        ),
+    )
+    .unwrap();
 }
 
 /// Answers `POST /chat/completions` by *turn*: the reply is the one after as

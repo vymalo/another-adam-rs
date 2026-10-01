@@ -886,6 +886,12 @@ stateDiagram-v2
   `McpPolicy::allow_url_secrets(true)`, and then the `rmcp` log target must be filtered. A secret in a stdio `args`
   is visible to every process of the machine (`/proc/*/cmdline`, `ps`): use `env`. Tool descriptions and answers are text the server
   controls and go into the model's context: the allow-list is the mitigation.
+* **In the binaries.** `adam-coder` reads the folder at startup
+  ([ADR 0004](decisions/0004-agent-folders-at-run-time.md)) and calls `connect_mcp` in every role that runs workers,
+  with the policy of three variables: `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE` and `MCP_ALLOW_URL_VARS` (each
+  `McpPolicy` opt-in above, all off by default). `${VAR}` in `headers`, `args` and `env` reads the process
+  environment. A server that is down is exit code 69, anything the files or the policy get wrong is 78; see
+  [the coder's README](../bin/adam-coder/README.md#mcp-tools-from-the-folder).
 * **Reload.** Connections are made once, at startup, and outlive dev reloads (`LiveBuilder::connect_mcp`, features
   `dev` and `mcp`; a reload is synchronous and may run on the watcher's thread, so it never connects). An edit of
   an `mcp.json` is refused with a message saying to restart: tools are discovered once, and a run in flight may

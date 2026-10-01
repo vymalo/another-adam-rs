@@ -254,6 +254,7 @@ dependencies = [
  "adam-error",
  "adam-host",
  "adam-llm-agent",
+ "adam-mcp-testkit",
  "adam-model",
  "adam-model-openai",
  "adam-notify-postgres",

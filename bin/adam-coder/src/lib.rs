@@ -91,7 +91,7 @@ pub mod tools;
 
 pub use agent::{AGENT_NAME, CoderAgent, CoderStarter};
 pub use app::{Coder, LiveSignals, RuntimeOptions, agent_card, agent_card_from};
-pub use config::{Config, ConfigError, WorkerConfig};
+pub use config::{Config, ConfigError, McpSettings, WorkerConfig};
 pub use exit::exit_code;
 pub use files::{AgentFiles, AgentFilesError};
 pub use redact::Redactor;

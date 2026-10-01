@@ -49,6 +49,9 @@ sequenceDiagram
 | `open_pull_request { title, body, accept_red_checks? }` | after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. Declared `#[tool(asks_user)]`, so `adam-assembly` refuses to give it to a subagent |
 
+A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
+folder](#mcp-tools-from-the-folder)); they are not part of the seven.
+
 Each tool is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
@@ -499,6 +502,7 @@ The contract of a folder:
 | `description` or `card.description` | one of them: the card needs it (exit 78 for a control plane otherwise) |
 | `tools:` | optional; may narrow the coder's seven tools, and a name that is not one is refused with a suggestion. Without it the agent gets all seven |
 | `subagents/` | assembled and **registered beside the coder** (`coder/<name>`, `CoderAgent::subagents`). A subagent runs as a child run with its own run id, so the tools that work on the worktree of the run that calls them find none in it: give it tools that need no worktree |
+| `mcp.json` | optional: the MCP servers whose tools the agent gets, named `<server>__<tool>` after its seven (see [MCP tools](#mcp-tools-from-the-folder)). Connected by the **workers** at startup |
 | `schedules/` | read, not run: a warning says so |
 | the rest | skills, `limits`, `model:` and the card follow the [authoring layer](../../docs/authoring.md) |
 
@@ -510,6 +514,42 @@ agents under `agents/`) stops the process before it connects, exit code 78, with
 `/etc/adam` for `ADAM_AGENT_DIR=/etc/adam/agent`), `digest`
 (`sha256:...`; the shipped `agent/` read from disk has the digest of the embedded copy), `agent` and `warnings`. The
 folder must be readable by the runtime user (uid 10001 in the image).
+
+#### MCP tools from the folder
+
+An `agent/mcp.json` in the folder (and one next to each subagent's file) names MCP servers; every worker
+connects them once at startup, before it serves, and gives the agent their tools beside its seven, named
+`<server>__<tool>` (`tools:` in the frontmatter selects among all of them: `linear__*` takes a server's tools).
+Servers are streamable HTTP (`type: http`) or local processes (`command`); `type: sse` is refused. The format and the
+rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
+[MCP tools at run time](../../docs/authoring.md#mcp-tools-at-run-time-built-feature-mcp).
+
+```json
+{
+  "mcpServers": {
+    "search": {
+      "type": "http",
+      "url": "https://search.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${SEARCH_TOKEN}" },
+      "tools": ["web_search"]
+    }
+  }
+}
+```
+
+* **`${VAR}` and `${VAR:-default}`** in `headers`, `args` and `env` read the process environment (`SEARCH_TOKEN`
+  above): put credentials there. A variable that is unset (and has no default) stops the process with exit 78
+  naming the variable, never its value.
+* **`${VAR}` in a `url`** is refused (exit 78 naming the variable) unless the deployment sets
+  `MCP_ALLOW_URL_VARS=true`: the MCP client library logs the URL it dials, so a secret there would reach the logs.
+  A URL that is not a secret (`"url": "${SEARCH_URL}"`, so that one folder serves a stack and a cluster) is what the
+  flag is for.
+* **Which kinds are allowed** is the deployment's: a local process needs `MCP_ALLOW_STDIO=true`, plain `http` to
+  another machine needs `MCP_ALLOW_INSECURE=true` (development only); `https` and loopback need nothing.
+* **A server that is down** at startup stops the process with exit 69, so a supervisor restarts it until the server
+  is up; a mistake in the files or the policy is 78. A tool call that fails is an error result the model reads.
+* A folder without an `mcp.json` connects nothing (the embedded copy has none). A **control plane** serves the card
+  and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
 
 ### Retry safety
 
@@ -566,10 +606,13 @@ reported at once at startup):
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
-| `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills and subagents, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
+| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server | `false` |
+| `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
+| `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
+| `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills, subagents and `mcp.json`, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
 
 Everything from `MODEL_BASE_URL` down, except `ADAM_AGENT_DIR` (every role reads that one), is read by the roles that run workers (`all`, `worker`)
-only, and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.
+only (the `MCP_ALLOW_*` flags too: a control plane connects no MCP server), and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.
 A control plane neither needs nor validates any of it (see [Roles](#roles)).
 
 OpenCode's configuration is generated at startup into

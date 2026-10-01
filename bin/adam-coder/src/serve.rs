@@ -101,11 +101,26 @@ async fn build_agent(
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 
     let env = Arc::new(ToolEnv::new(workspaces, code_host, settings).with_redactor(redactor));
+    // The MCP servers the folder's `mcp.json` names are connected now, at startup, before the
+    // agent is bound: a server that is down, a local process the policy does not allow, a
+    // `${VAR}` that is unset are startup errors with their own exit code (69 or 78), never
+    // something found in the middle of a run. Without an `mcp.json` (the embedded copy has none)
+    // this connects to nothing.
+    let def = files
+        .def()
+        .map_err(|e| *e)
+        .context("reading the agent definition")?
+        .connect_mcp(&worker.mcp.policy())
+        .await
+        .context(
+            "connecting the MCP servers of the agent files (MCP_ALLOW_STDIO, MCP_ALLOW_INSECURE and \
+             MCP_ALLOW_URL_VARS decide which kinds they may be)",
+        )?;
     // The alias comes from the environment, and the files may come from a folder, so a bad one of
     // either is a startup error, not a panic. The error is unboxed so its class (exit 78 for a
     // mistake in the files) reaches `exit_code`.
     let tools = coder_tools(&env);
-    CoderAgent::try_from_files(files, model, worker.model.clone(), env, tools)
+    CoderAgent::try_from_def(def, model, worker.model.clone(), env, tools)
         .map_err(|e| *e)
         .context("assembling the coder agent")
 }
