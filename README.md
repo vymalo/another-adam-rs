@@ -144,7 +144,7 @@ docker compose down -v             # stop and forget all state (volumes included
 | `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder` and `mock-opencode` are scripted (see "Scripted models") |
 | `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) |
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git`; no authentication |
-| `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token` |
+| `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token`; its agent files are the folder `bin/adam-coder/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`, see "Changing what the coder says") |
 
 Host ports can be moved with `POSTGRES_PORT`, `MONGODB_PORT`, `MOCK_OPENAI_PORT`,
 `MOCK_GITHUB_PORT`, `GIT_SERVER_PORT` and `CODER_PORT` (for example in a `.env`
@@ -163,6 +163,8 @@ export DATABASE_URL=$ADAM_TEST_POSTGRES_URL
 export MODEL_BASE_URL=http://127.0.0.1:8081/v1 MODEL_API_KEY=mock-api-key MODEL=mock-model
 export GITHUB_API_URL=http://127.0.0.1:8082 GITHUB_TOKEN=dev-github-token
 export A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/
+# optional: ADAM_AGENT_DIR=bin/adam-coder/agent reads the prompt and the card from that folder at startup
+# instead of the copy embedded in the binary (see the crate README, "Where the prompt and the card live").
 # optional: ROLE=control-plane or ROLE=worker instead of the default `all`. Run one of each
 # over the same DATABASE_URL (different LISTEN_ADDR) to split the halves; a control plane ignores
 # the model, GitHub and workspace variables. See the crate README.
@@ -251,6 +253,23 @@ artifacts are there, that `mock-github` saw exactly one
 `git-server` has the branch with `hello.txt` containing `hello`. `TIMEOUT`,
 `CODER_URL`, `CODER_TOKEN`, `MOCK_GITHUB_URL` and `GIT_SERVER_URL` override the
 defaults (see the script's header).
+
+#### Changing what the coder says
+
+The coder reads its agent files (the prompt, the card, the skills) at startup from
+`ADAM_AGENT_DIR`; `compose.yaml` mounts `bin/adam-coder/agent` there, read-only.
+Edit `bin/adam-coder/agent/instructions.md` (or copy the folder, edit the copy and set
+`CODER_AGENT_DIR=<copy>`) and restart the service, with no rebuild:
+
+```sh
+docker compose --profile app up -d coder        # the container is recreated and reads the folder again
+```
+
+The startup log has one `agent files` line (`source=folder`, the path, the digest, the agent,
+the number of warnings); a folder with a mistake stops the container with exit code 78 and every
+finding as `path:line: error: ...`. The folder must be readable by uid 10001 (`chmod -R a+rX`).
+Remove the variable and the mount and the copy embedded in the image is used. The tests that prove
+this are in [`bin/adam-coder/README.md`](bin/adam-coder/README.md#tests).
 
 To run a prebuilt image instead of building one, set `CODER_IMAGE` (default
 `adam-rs/coder:dev`) and pass `--no-build`. `CODER_MODEL=mock-model` brings back

@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam::AgentDef;
+use adam::AssemblyError;
 use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig};
 use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::{ClaimScope, DynStore};
@@ -14,7 +14,8 @@ use adam_runtime::{
 use axum::Router;
 use url::Url;
 
-use crate::agent::{AGENT, AGENT_NAME, CoderAgent, CoderStarter};
+use crate::agent::{AGENT_NAME, CoderAgent, CoderStarter};
+use crate::files::AgentFiles;
 
 /// How the runtime that advances runs is set up.
 #[derive(Debug, Clone)]
@@ -110,13 +111,22 @@ impl Coder {
 
     /// [`Coder::new`] with `live` in place of the in-process signals: events and wake-up signals
     /// that cross processes.
+    ///
+    /// The subagents of the agent's folder ([`CoderAgent::subagents`]) are registered beside it,
+    /// so that a subagent tool finds the agent it starts a child run of.
     pub fn new_with(
         store: DynStore,
         agent: CoderAgent,
         options: &RuntimeOptions,
         live: LiveSignals,
     ) -> Self {
-        Self::compose(Runtime::builder(store).agent(agent), options, live)
+        let builder = agent
+            .subagents()
+            .iter()
+            .fold(Runtime::builder(store), |builder, sub| {
+                builder.agent(sub.clone())
+            });
+        Self::compose(builder.agent(agent), options, live)
     }
 
     /// Compose the control plane over `store`: the A2A backend, with the agent registered as a
@@ -174,9 +184,17 @@ impl Coder {
         self.runtime.run_worker(shutdown).await
     }
 
-    /// The A2A router (agent card, JSON-RPC, `/healthz`) with `auth`.
+    /// The A2A router (agent card, JSON-RPC, `/healthz`) with `auth`, serving the card of the
+    /// embedded agent ([`agent_card`]). A process that runs on a folder serves
+    /// [`router_with_card`](Self::router_with_card) with the card of that folder.
     pub fn router(&self, public_url: &Url, auth: AuthConfig) -> Router {
-        A2aServer::router(agent_card(public_url), Arc::new(self.backend.clone()), auth)
+        self.router_with_card(agent_card(public_url), auth)
+    }
+
+    /// [`router`](Self::router) with the card the caller made, usually
+    /// [`agent_card_from`] over the files the process runs.
+    pub fn router_with_card(&self, card: AgentCardConfig, auth: AuthConfig) -> Router {
+        A2aServer::router(card, Arc::new(self.backend.clone()), auth)
     }
 }
 
@@ -185,7 +203,8 @@ impl Coder {
 ///
 /// The card is declared in `agent/instructions.md` (the `card:` frontmatter) and read from the
 /// embedded agent, so a control plane, which has no model, tools or credentials, serves the same
-/// card as `Assembly::card` gives for the assembled agent.
+/// card as `Assembly::card` gives for the assembled agent. A process that runs on a folder
+/// uses [`agent_card_from`].
 ///
 /// # Panics
 ///
@@ -193,13 +212,26 @@ impl Coder {
 /// this crate and `adam-agent-fs`, which the build would already have refused.
 #[allow(clippy::expect_used)] // see `# Panics`
 pub fn agent_card(public_url: &Url) -> AgentCardConfig {
-    AgentDef::from_manifest(AGENT)
-        .map_err(Box::new)
-        .and_then(|def| {
-            def.card(public_url.clone(), env!("CARGO_PKG_VERSION"))
-                .map_err(Box::new)
-        })
+    agent_card_from(&AgentFiles::Embedded, public_url)
         .expect("the coder's embedded agent declares a card")
+}
+
+/// The card the agent `files` declare, with `public_url` where clients POST JSON-RPC: the same
+/// card [`Assembly::card`](adam::Assembly::card) gives for the agent assembled from them, with no
+/// model, tools or credentials.
+///
+/// # Errors
+///
+/// [`AssemblyError::MissingCardDescription`] when a folder declares neither `description` nor
+/// `card.description`; the embedded files cannot fail.
+pub fn agent_card_from(
+    files: &AgentFiles,
+    public_url: &Url,
+) -> Result<AgentCardConfig, Box<AssemblyError>> {
+    files
+        .def()?
+        .card(public_url.clone(), env!("CARGO_PKG_VERSION"))
+        .map_err(Box::new)
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 Status: **design; slices S1 (the typed tool helpers in `adam-llm-agent`), S2 (`#[tool]` and the `adam`
 facade), S3 (`adam-coder` tools through `#[tool]`), S4 (`adam-agent-fs`, the parser and validator of
 agent directories), S5 (the `build.rs` codegen and `adam::include_agent!()`), S6 (`adam-assembly`,
-which binds a manifest to `LlmAgent`s), S6b (the coder's prompt and card from `agent/`), S7 (skills at run time), S8 (durable child runs in the runtime), S9 (subagents as tools), S9b (remote A2A subagents), S10 (dev reload) and S11 (`mcp.json` tools) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
+which binds a manifest to `LlmAgent`s), S6b (the coder's prompt and card from `agent/`), S7 (skills at run time), S8 (durable child runs in the runtime), S9 (subagents as tools), S9b (remote A2A subagents), S10 (dev reload), S11 (`mcp.json` tools) and S12 (run-time folders: `ADAM_AGENT_DIR`) are built**, the rest is planned (see [Delivery order](#delivery-order)). Accepted by
 the owner on 2026-09-29 (decisions D1 to D6 below).
 The roadmap items it serves are 3 (`#[tool]`) and 4 (`agent/` discovery) in the
 [root README](../README.md#roadmap).
@@ -25,8 +25,9 @@ Facts about third parties are marked *verified* (with the date and the source) o
    format:** Markdown with YAML frontmatter (`name`, `description`, `tools`, `model`, ...), body = system
    prompt. A file copied from `.claude/agents/x.md` or `.github/agents/x.agent.md` parses unchanged.
 4. **Skills are the [Agent Skills](https://agentskills.io/specification) format, unchanged.**
-5. **`build.rs` compiles the directory into a static manifest;** a `dev` feature reads the same
-   directory at run time. One parser and one validator serve both.
+5. **`build.rs` compiles the directory into a static manifest;** the same directory can be read at run
+   time instead (`ADAM_AGENT_DIR`, once, at startup, with no feature) and a `dev` feature watches it and
+   reloads. One parser and one validator serve all three.
 6. **Skills and subagents add no durability mechanism.** They run inside the existing journaled
    `tool:CALL_ID` step; a subagent is a durable child run.
 
@@ -909,7 +910,8 @@ Slice S10. The comparison of the three ways to get an agent into a process, for 
 | Cost at startup | none | none | parse |
 
 With the `dev` feature of `adam-assembly` (re-exported by `adam` as `dev`; **off by default**, so a release
-binary cannot read prompts from disk unless it opts in, and turning it on logs a warning), a
+binary cannot watch and reload prompts unless it opts in, and turning it on logs a warning; reading a folder
+once, at startup, is [S12](#run-time-folders-built-adam_agent_dir) and needs no feature), a
 `LiveAssembly` does what `from_source`, `bind` and `model` do at startup and keeps the recipe (the directory, the
 `ToolSet`, the model, and the closures that give `AgentDef` and `BoundDef` their values: `var`, `env`,
 `remote_timeout`, `state`, `wait_poll`), so it can do it again. `ADAM_AGENT_DIR` replaces the directory the code
@@ -1063,6 +1065,17 @@ type already sets the pattern).
 * An `evals/` directory; an OpenAPI connection; subagent continuation (`task_id`) and a built-in
   root-copy `agent` tool; exporting a Rust tool as an MCP server; following SEP-2633 to ratification.
 
+## Run-time folders (built: `ADAM_AGENT_DIR`)
+
+Slice S12, [ADR 0004](decisions/0004-agent-folders-at-run-time.md). A deployment can change what an agent
+says and offers (instructions, card, skills, subagents, `mcp.json`) without a build: the binary reads a
+folder when it starts. `AgentFolder::load(path)` in `adam-assembly` is the whole mechanism (one agent, lenient:
+warnings returned, errors refused, plus the digest of what was read), `agent_dir_from_env()` reads
+`ADAM_AGENT_DIR`, and a binary that embeds a copy falls back to it when the variable is unset
+(`adam-coder`: `AgentFiles`). The folder is read once: no watcher, no `notify`, so a release image stays as it
+was, and the next start applies an edit (a restart is a deploy: see the ADR for what that means for runs in
+flight). The dev reload above is still the tool for editing while the process runs.
+
 ## Dogfood: `adam-coder` (S3 and S6b)
 
 `adam-coder` is written with the layer it documents, in two steps, neither of which changed what the
@@ -1101,6 +1114,13 @@ journal's step names (`model:0`, `tool:<call id>`) are the old ones, so a run jo
 version replays. The optional next step, moving "discover the repository's real checks" into a skill, changes
 what the model does and needs a comparison with a live model; it is not a slice.
 
+**S12, the same files from a folder.** With `ADAM_AGENT_DIR` set, `adam-coder` reads the folder instead of
+the embedded copy (`AgentFiles::load`, then `CoderAgent::try_from_files`; the control plane serves the card
+of the folder with `agent_card_from`). The folder must be the coder's (`name: coder`, the runs are stored under
+it), declare `max_check_cycles` (the process supplies it) and may narrow `tools:`; its subagents are
+registered beside the coder. The tests copy the shipped `agent/` to a temp dir, edit it and show the model
+being sent the edit (`tests/agent_files.rs`), and run the binary on folders with mistakes (`tests/binary.rs`).
+
 ## Delivery order
 
 | Slice | What | State |
@@ -1119,3 +1139,4 @@ what the model does and needs a comparison with a live model; it is not a slice.
 | S9b | remote (A2A) subagents: `AwaitRemote`, `PendingWait::Remote`, `Tool::poll_remote`, `auth: bearer:VAR`, the journaled send and the poll on the timer | built |
 | S10 | dev reload: feature `dev`, `LiveAssembly`, `reload`, `watch`, the swap at step boundaries, the replay rule | built |
 | S11 | `mcp.json` tools: `adam-mcp`, `adam-mcp-testkit`, feature `mcp` of `adam-assembly` and `adam`, `AgentDef::connect_mcp` and `mcp_tools`, `LiveBuilder::connect_mcp` | built |
+| S12 | run-time folders: `AgentFolder`, `agent_dir_from_env`, `Error::NotOneAgent` in `adam-assembly`; `ADAM_AGENT_DIR` and the embedded fallback in `adam-coder` (see [Run-time folders](#run-time-folders-built-adam_agent_dir)) | built |

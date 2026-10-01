@@ -66,7 +66,8 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
 | `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `connect_mcp(&McpPolicy)` (feature `mcp`), `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
 | `Reloaded`, `ToolChange`, `ReloadError`, `WatchError` (feature `dev`) | what a reload did (`generation`, `changed`, `tool_changes`, `retired`), why it changed nothing (`Load(Error)` with `diagnostics()`, `NeedsRestart { added }`), why a watcher did not start |
-| `agent_dir`, `AGENT_DIR_ENV`, `AgentDef::from_dir` (feature `dev`) | the `ADAM_AGENT_DIR` override, and one `AgentDef` per agent of a directory |
+| `AgentFolder` | one agent read from a folder when the process starts (no feature): `AgentFolder::load(path)` gives `root`, `def` (an `AgentDef`), `warnings` and `digest`; the folder holds exactly one agent, else `Error::NotOneAgent` |
+| `agent_dir_from_env`, `agent_dir`, `AGENT_DIR_ENV`, `AgentDef::from_dir` | where the folder is: `ADAM_AGENT_DIR` when set and not blank (`agent_dir_from_env` is `None` otherwise, `agent_dir(default)` falls back to `default`), and one `AgentDef` per agent of a directory. No feature |
 | `Error`, `Origin` | the closed error enum, and the agent and file every file-related variant carries |
 | `AliasProblem`, `TemplateProblem`, `SkillField`, `ToolClash`, `RemoteAuthProblem`, `RemoteUrlProblem` | closed enums inside `Error::ModelAlias`, `Error::Template`, `Error::UnknownSkill`, `Error::SubagentToolClash` (which may name a parent's MCP tool: `ToolClash::McpTool`), `Error::RemoteAuth` and `Error::RemoteUrl` |
 
@@ -243,10 +244,73 @@ Known limit: a loaded skill is a tool result, and the loop may truncate an old o
 `limits.max_history_tokens`. `preload_skills` is the way around it until the loop learns to protect skill
 content.
 
+## Run-time folders (no feature)
+
+An agent does not have to be embedded. `AgentFolder::load(path)` reads one agent's folder when the process
+starts, with the same loader `build.rs` uses (lenient: a warning is returned, an error is an `Err`), so a
+deployment can change the instructions, the card, the skills or the `mcp.json` of an agent by changing
+a mounted folder, without a build. It is read once, and a change on disk is picked up by the next start.
+
+```rust
+use adam::{AgentFolder, agent_dir_from_env};
+
+// ADAM_AGENT_DIR=/etc/adam/agent; unset or blank: the copy embedded at build time.
+let def = match agent_dir_from_env() {
+    Some(path) => {
+        let folder = AgentFolder::load(path)?;             // exit 78 on `Err`: the files are wrong
+        for warning in &folder.warnings { tracing::warn!("{warning}"); }
+        tracing::info!(root = %folder.root.display(), digest = %folder.digest, "agent files");
+        folder.def
+    }
+    None => AgentDef::from_manifest(AGENT)?,
+};
+let assembly = def.var("max_check_cycles", 3).bind(tools)?.model(model, "alias")?;
+```
+
+```mermaid
+sequenceDiagram
+  participant P as process (main)
+  participant F as AgentFolder::load
+  participant D as Dir (adam-agent-fs)
+  P->>P: agent_dir_from_env()
+  alt ADAM_AGENT_DIR is set
+    P->>F: load(path)
+    F->>D: Dir::new(project_root(path)).load()
+    D-->>F: Report: package and diagnostics
+    F->>F: into_package(Lenient): an error is Error::Manifest
+    F->>F: exactly one agent, else Error::NotOneAgent
+    F->>D: digest(manifest), resources_from(dir)
+    F-->>P: AgentFolder { root, def, warnings, digest }
+  else unset or blank
+    P->>P: AgentDef::from_manifest(AGENT)
+  end
+  P->>P: def.var(..).bind(tools).model(..): what the files and the code disagree on fails here
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Unset
+  Unset --> Embedded: ADAM_AGENT_DIR unset or blank
+  Unset --> Reading: ADAM_AGENT_DIR names a path
+  Reading --> Folder: one agent, no error
+  Reading --> Refused: not found, an error in the files, or not exactly one agent
+  Embedded --> [*]: the process binds and serves it
+  Folder --> [*]: the process binds and serves it
+  Refused --> [*]: the process does not start
+```
+
+A path may name the directory that holds `agent/` (or `agents/`), or that directory itself. `agents/` is
+accepted when it holds exactly one agent: a process serves one. `digest` is the digest of the manifest and
+the bytes of the files its skills bundle, so the same files read from a folder and embedded by `build.rs`
+have the same digest (a test compares them on the fixture); a startup log line with it says which files a
+process runs. `AgentDef::from_dir(path)` is the one-shot `from_source(&Dir::new(root), Strictness::Lenient)`
+for a path that may hold several agents, with `ADAM_AGENT_DIR` replacing the path.
+
 ## Dev reload (feature `dev`)
 
-Off by default, so **a release build cannot read prompts from disk unless its author turned the feature on**
-(the `adam` facade re-exports it as `dev`); turning it on brings `notify` and logs a warning at startup.
+Off by default, so **a release build cannot watch and reload prompts unless its author turned the feature on**
+(the `adam` facade re-exports it as `dev`; reading a folder once, at startup, needs no feature: see above);
+turning it on brings `notify` and logs a warning at startup.
 `LiveAssembly` does what `from_source`, `bind` and `model` do at startup, keeps the recipe, and does it again
 when a file changes. Tool code is Rust and still needs a rebuild (`cargo watch`); `mcp.json` tools are connected
 once, at startup, and outlive reloads (see the paragraph on `mcp.json` below).
@@ -263,9 +327,8 @@ let runtime = live.register(Runtime::builder(store)).build(); // stable names, c
 let _watch = live.watch()?;                        // notify; dropping it stops the watching
 ```
 
-`ADAM_AGENT_DIR` replaces the directory the code names (with the feature on); it may name the directory that
-holds `agent/` (or `agents/`), or that directory itself. `AgentDef::from_dir(path)` is the one-shot
-`from_source(&Dir::new(root), Strictness::Lenient)` with the same rule. A store that survives the process
+`ADAM_AGENT_DIR` replaces the directory the code names; it may name the directory that
+holds `agent/` (or `agents/`), or that directory itself (the same rule as for a run-time folder). A store that survives the process
 (the Compose Postgres) lets a restart resume runs; the in-memory store cannot.
 
 ```mermaid
@@ -361,7 +424,7 @@ MSRV 1.77; the API used is `recommended_watcher`, `Watcher::watch`, `RecursiveMo
 
 `Error` is a closed enum; every variant about the files carries an `Origin { agent, file }`, printed as
 ``agent `coder/reviewer` (agent/subagents/reviewer.md)``. All are `ErrorClass::Invalid` (the same input
-never succeeds) except `Manifest`, which keeps its source's class, and `Mcp`, which keeps the class of the MCP
+never succeeds) except `Manifest`, which keeps its source's class (a folder that is not there is `NotFound`), and `Mcp`, which keeps the class of the MCP
 client's error in its `class` field (a server that is down is transient). `Mcp` is a variant of every build, with
 or without the feature `mcp`, and its `source` is an opaque `Box<dyn Error + Send + Sync>` (with the feature, an
 `adam_mcp::Error`: `source.downcast_ref::<adam_mcp::Error>()`), so that the feature adds nothing to the enum. `bind` and `model` return the first
@@ -570,6 +633,13 @@ place each:
 ## Tests
 
 `cargo test -p adam-assembly --all-features` (and without, for the compile-fail doctests of a build without `dev` or `mcp`):
+
+* `tests/folder.rs` (no feature): `AgentFolder::load` on the fixture (its digest equals the embedded copy's, its
+  manifest equals the embedded manifest), a root or the `agent/` directory, binding and rendering a loaded
+  folder, an edit changing the digest and the prompt, the bytes of a skill's bundled file counting in the digest,
+  warnings returned, an error in the files refused with every diagnostic (`Error::Manifest`, class `Invalid`), a
+  folder that is not there (class `NotFound`), several agents refused and named (`Error::NotOneAgent`), one
+  agent under `agents/`, and `AgentDef::from_dir`.
 
 * `tests/bind.rs`: unknown tool (the message asserted, the suggestion, the subagent's origin), patterns,
   default tool access, duplicate tools; unknown, unused and unset vars, values for undeclared vars and

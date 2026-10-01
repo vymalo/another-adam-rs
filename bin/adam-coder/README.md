@@ -432,6 +432,56 @@ so a bad `MODEL` is a startup error. A control plane has no model, so it takes t
 The Docker build context must contain `agent/`: `docker/coder/Dockerfile.dockerignore` excludes `**/*.md` and
 re-includes `bin/adam-coder/agent/**`, and `build.rs` fails the build without the file.
 
+#### A folder at run time (`ADAM_AGENT_DIR`)
+
+The same files can be read when the process starts instead of when it was built
+([ADR 0004](../../docs/decisions/0004-agent-folders-at-run-time.md)). Set `ADAM_AGENT_DIR` to the directory that holds
+`agent/` (or to `agent/` itself) and **every role** reads it once, at startup: the control plane serves the card
+of the folder, the workers assemble the agent from its prompt, limits, vars, skills and subagents. Unset or blank,
+the copy `build.rs` embedded is used, as before. There is no watcher: an edit applies at the next start
+(`docker compose --profile app up -d coder`, a rollout), so a restart is a deploy, and a change to which tools exist
+(`tools:`, a subagent) can fail the replay of a run that is mid-turn, like any deploy of new code.
+
+```mermaid
+sequenceDiagram
+  participant S as serve
+  participant F as AgentFiles
+  participant A as AgentFolder (adam-assembly)
+  participant C as CoderAgent
+  S->>F: AgentFiles::load(ADAM_AGENT_DIR)
+  alt unset or blank
+    F-->>S: Embedded
+  else a folder
+    F->>A: AgentFolder::load(path)
+    A-->>F: def, warnings, digest (or the diagnostics)
+    F->>F: name must be `coder`
+    F-->>S: Folder
+  end
+  S->>S: log `agent files` (source, path, digest, agent, warnings) and each warning
+  S->>C: CoderAgent::try_from_files(files, ...) (workers), agent_card_from(files, url) (control plane)
+```
+
+The contract of a folder:
+
+| The folder | Rule |
+|---|---|
+| `name` | must be `coder` (`AGENT_NAME`): the runs are stored under it. Another name exits 78 naming the field |
+| `vars` | must declare `max_check_cycles`: the process supplies the value (`MAX_CHECK_CYCLES`), and a folder without the var fails at assembly naming it. Declare `display_name` too if the prompt uses `{{display_name}}` (the shipped one does); the file's value is the name the agent says |
+| `description` or `card.description` | one of them: the card needs it (exit 78 for a control plane otherwise) |
+| `tools:` | optional; may narrow the coder's seven tools, and a name that is not one is refused with a suggestion. Without it the agent gets all seven |
+| `subagents/` | assembled and **registered beside the coder** (`coder/<name>`, `CoderAgent::subagents`). A subagent runs as a child run with its own run id, so the tools that work on the worktree of the run that calls them find none in it: give it tools that need no worktree |
+| `schedules/` | read, not run: a warning says so |
+| the rest | skills, `limits`, `model:` and the card follow the [authoring layer](../../docs/authoring.md) |
+
+What a folder cannot change is what the tools do (the policy, the checks, the redaction): it changes what the agent
+says and offers. Any mistake in the files (not found, a YAML error, an unknown tool, another agent's name, several
+agents under `agents/`) stops the process before it connects, exit code 78, with every finding as
+`path:line: error: ...` in the one `adam-coder failed` line. A warning does not stop it and is logged as
+`path:line: warning: ...`. The `agent files` line says what runs: `source` (`folder` or `embedded`), `path` (the directory that holds `agent/`:
+`/etc/adam` for `ADAM_AGENT_DIR=/etc/adam/agent`), `digest`
+(`sha256:...`; the shipped `agent/` read from disk has the digest of the embedded copy), `agent` and `warnings`. The
+folder must be readable by the runtime user (uid 10001 in the image).
+
 ### Retry safety
 
 Each tool's side effect runs inside `LlmAgent`'s journaled `tool:<call id>`
@@ -487,8 +537,9 @@ reported at once at startup):
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
+| `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills and subagents, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
 
-Everything from `MODEL_BASE_URL` down is read by the roles that run workers (`all`, `worker`)
+Everything from `MODEL_BASE_URL` down, except `ADAM_AGENT_DIR` (every role reads that one), is read by the roles that run workers (`all`, `worker`)
 only, and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.
 A control plane neither needs nor validates any of it (see [Roles](#roles)).
 
@@ -737,6 +788,20 @@ database of its own, so the role needs `CREATEDB`):
   card equals `agent_card`. A model alias the assembly refuses (empty, whitespace) is an error from `try_new`.
   The card is also pinned by a unit test in `src/app.rs` against `tests/fixtures/agent/card.json`, the card as the
   Rust literal built it.
+  The second half runs the coder on **a copy of the shipped `agent/` in a temp dir** (`ADAM_AGENT_DIR`'s folder,
+  `AgentFiles::load`): it assembles to the embedded agent (same digest, same `AgentInfo`, same card); **editing
+  `instructions.md` changes the system prompt the model is sent** (and the limit is still the process's); the card
+  comes from the folder; a folder named `other` is refused naming `name: coder`; a folder without
+  `max_check_cycles` and one with a tool the coder does not have fail at assembly naming them; `tools:` narrows
+  the tools; and a `subagents/reviewer.md` is registered as `coder/reviewer`, called by the model, run as a child
+  run and its text comes back to the coder. The unit tests of `src/files.rs` (a missing folder, every diagnostic
+  of a broken one in the message once, another name, warnings), `src/config.rs` (`ADAM_AGENT_DIR` read by every role,
+  must be a directory, reported with the other problems) and `src/exit.rs` (78 for the files and their assembly)
+  cover the rest. In `tests/binary.rs`: a missing folder (exit 78, names the variable), a folder with two broken
+  subagents (exit 78 for every role, before anything connects, both findings as `path:line` in the one failure line),
+  another agent's name, a worker whose folder cannot be assembled (exit 78, names the var; Postgres), a control
+  plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the
+  embedded copy logged as `source=embedded`.
 * `tests/tools.rs`: each tool against real worktrees, including the hostile
   `repo_url` shapes against the production repository policy, malformed arguments,
   `prepare_workspace` refusing a repository the person did not name (the refusal names

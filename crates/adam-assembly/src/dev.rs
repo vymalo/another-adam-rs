@@ -11,7 +11,6 @@
 //! has the diagrams.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -29,65 +28,13 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use crate::assembly::{AgentInfo, BoundDef};
 use crate::def::AgentDef;
 use crate::error::Error;
+use crate::folder::{agent_dir, project_root};
 #[cfg(feature = "mcp")]
 use crate::mcp::McpBinding;
-
-/// The environment variable that replaces the directory a caller names, when the feature `dev` is
-/// on: `ADAM_AGENT_DIR=./my-agent cargo run`.
-pub const AGENT_DIR_ENV: &str = "ADAM_AGENT_DIR";
 
 /// How long the files must be quiet before a watched change is loaded (an editor writes a file in
 /// several steps).
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(150);
-
-/// The directory to read: [`AGENT_DIR_ENV`] when it is set and not empty, else `default`.
-pub fn agent_dir(default: impl Into<PathBuf>) -> PathBuf {
-    resolve_dir(default.into(), std::env::var_os(AGENT_DIR_ENV))
-}
-
-fn resolve_dir(default: PathBuf, env: Option<OsString>) -> PathBuf {
-    match env {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => default,
-    }
-}
-
-/// The root a [`Dir`] reads (the directory that holds `agent/` or `agents/`) for a path that is
-/// either that root or the `agent/` (`agents/`) directory itself.
-fn project_root(path: PathBuf) -> PathBuf {
-    if path.join("agent").is_dir() || path.join("agents").is_dir() {
-        return path;
-    }
-    let named = path
-        .file_name()
-        .is_some_and(|name| name == "agent" || name == "agents");
-    match path.parent() {
-        Some(parent) if named && path.is_dir() => {
-            if parent.as_os_str().is_empty() {
-                PathBuf::from(".")
-            } else {
-                parent.to_path_buf()
-            }
-        }
-        _ => path,
-    }
-}
-
-impl AgentDef {
-    /// One definition per agent found in a directory: [`from_source`](Self::from_source) over a
-    /// [`Dir`], with [`Strictness::Lenient`]. Only with the feature `dev`.
-    ///
-    /// `path` is the directory that holds `agent/` (or `agents/`), or that directory itself. The
-    /// environment variable [`AGENT_DIR_ENV`] replaces it when set.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Manifest`] when the directory cannot be read or has errors.
-    pub fn from_dir(path: impl Into<PathBuf>) -> Result<Vec<Self>, Error> {
-        let root = project_root(agent_dir(path));
-        Self::from_source(&Dir::new(root), Strictness::Lenient)
-    }
-}
 
 type DefHook = Arc<dyn Fn(AgentDef) -> AgentDef + Send + Sync>;
 type BoundHook = Arc<dyn Fn(BoundDef) -> BoundDef + Send + Sync>;
@@ -618,8 +565,9 @@ impl LiveBuilder {
 ///
 /// # Not for production
 ///
-/// The feature is off by default, so a release build cannot read prompts from disk unless its
-/// author turned it on; turning it on logs a warning at startup. Tool code is Rust and changes
+/// The feature is off by default, so a release build cannot watch and reload prompts unless its
+/// author turned it on; turning it on logs a warning at startup. (Reading a folder once, when the
+/// process starts, needs no feature: [`AgentFolder`](crate::AgentFolder).) Tool code is Rust and changes
 /// with a rebuild. `mcp.json` tools are connected once, at startup
 /// (`LiveBuilder::connect_mcp`, feature `mcp`), and the connections outlive reloads: an edit of
 /// `mcp.json` is refused with a message that says to restart, because a tool discovered at startup
@@ -668,7 +616,7 @@ impl LiveAssembly {
     /// Start describing a live assembly of the agents in `dir` (the directory that holds `agent/`
     /// or `agents/`, or that directory itself), talking to `model` under the gateway alias
     /// `alias` when an agent names none: the arguments of [`BoundDef::model`]. The environment
-    /// variable [`AGENT_DIR_ENV`] replaces `dir` when it is set.
+    /// variable [`AGENT_DIR_ENV`](crate::AGENT_DIR_ENV) replaces `dir` when it is set.
     pub fn builder(
         dir: impl Into<PathBuf>,
         model: DynModel,
@@ -1030,36 +978,6 @@ mod tests {
 
     fn same(a: &Arc<LlmAgent>, b: &Arc<LlmAgent>) -> bool {
         Arc::ptr_eq(a, b)
-    }
-
-    #[test]
-    fn an_environment_value_replaces_the_default_unless_it_is_empty() {
-        let default = PathBuf::from("agent");
-        assert_eq!(resolve_dir(default.clone(), None), default);
-        assert_eq!(resolve_dir(default.clone(), Some(OsString::new())), default);
-        assert_eq!(
-            resolve_dir(default, Some(OsString::from("/srv/other"))),
-            PathBuf::from("/srv/other")
-        );
-    }
-
-    #[test]
-    fn a_path_may_name_the_root_or_the_agent_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("project");
-        std::fs::create_dir_all(root.join("agent")).unwrap();
-        assert_eq!(project_root(root.clone()), root);
-        assert_eq!(project_root(root.join("agent")), root);
-        // `agents/` too, and a directory that is neither stays as it is.
-        let many = tmp.path().join("many");
-        std::fs::create_dir_all(many.join("agents/a")).unwrap();
-        assert_eq!(project_root(many.join("agents")), many);
-        let plain = tmp.path().join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-        assert_eq!(project_root(plain.clone()), plain);
-        // A path that does not exist is left for the load to report.
-        let missing = tmp.path().join("missing").join("agent");
-        assert_eq!(project_root(missing.clone()), missing);
     }
 
     #[test]

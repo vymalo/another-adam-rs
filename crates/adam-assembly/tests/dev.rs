@@ -20,7 +20,7 @@ use adam_a2a::{
     A2aServer, AgentCardConfig, AuthConfig, BackendError, Caller, InMemoryBackend, TaskBackend,
     TaskEvent,
 };
-use adam_assembly::{AgentDef, Error, LiveAssembly, LiveBuilder, ReloadError, ToolChange};
+use adam_assembly::{Error, LiveAssembly, LiveBuilder, ReloadError, ToolChange};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
 use adam_llm_agent::{
     FnTool, StateKey, Tool, ToolCtx, ToolError, ToolOutput, ToolSet, user_message,
@@ -666,24 +666,6 @@ async fn vars_and_state_from_code_are_applied_on_every_load() {
     edit(dir.path(), FILE, &file("Speak in a {{tone}} way."));
     live.reload().unwrap();
     assert_eq!(live.info()[0].prompt, "Speak in a casual way.");
-}
-
-#[test]
-fn from_dir_reads_the_agents_of_a_directory() {
-    let dir = tempfile::tempdir().unwrap();
-    edit(dir.path(), FILE, &agent_file("helper", "", "Hi."));
-    edit(
-        dir.path(),
-        "agent/subagents/sub.md",
-        "---\ndescription: The sub.\n---\nSub.\n",
-    );
-    for path in [dir.path().to_path_buf(), dir.path().join("agent")] {
-        let defs = AgentDef::from_dir(path).unwrap();
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].name(), "helper");
-    }
-    let error = AgentDef::from_dir(dir.path().join("nowhere")).unwrap_err();
-    assert!(matches!(error, Error::Manifest(_)), "{error}");
 }
 
 // --- remote subagents -----------------------------------------------------------------------
