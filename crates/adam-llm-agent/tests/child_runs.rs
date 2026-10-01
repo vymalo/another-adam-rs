@@ -197,9 +197,7 @@ impl Tool for AskTool {
         spec("ask")
     }
     async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
-        Err(ToolError::NeedsInput {
-            question: "which environment?".into(),
-        })
+        Err(ToolError::needs_input("which environment?"))
     }
 }
 
@@ -1115,6 +1113,7 @@ mod cases {
                 call_id: "c1".into(),
                 tool: "ask".into(),
                 question: "which environment?".into(),
+                ui: None,
             }))
         );
 
@@ -1201,6 +1200,7 @@ mod cases {
                 call_id: "c1".into(),
                 tool: "ask".into(),
                 question: "which one?".into(),
+                ui: None,
             }))
         );
     }

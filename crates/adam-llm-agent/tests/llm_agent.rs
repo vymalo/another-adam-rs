@@ -988,9 +988,7 @@ async fn a_detached_tool_ctx_is_never_cancelled_unless_given_a_token() {
 
 fn asking_tool() -> impl Tool {
     fn_tool("ask", |_, _| {
-        Err(ToolError::NeedsInput {
-            question: "which environment?".into(),
-        })
+        Err(ToolError::needs_input("which environment?"))
     })
 }
 
@@ -1021,6 +1019,7 @@ async fn needs_input_parks_and_the_answer_becomes_the_tool_result() {
             call_id: "c1".into(),
             tool: "ask".into(),
             question: "which environment?".into(),
+            ui: None,
         }))
     );
     assert_eq!(

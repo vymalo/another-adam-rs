@@ -540,6 +540,7 @@ async fn stop_as_question(
             call_id: call.id.clone(),
             tool: call.name.clone(),
             question,
+            ui: None,
         },
     ));
     state.pending_calls = vec![call];

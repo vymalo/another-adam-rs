@@ -270,15 +270,8 @@ mod tests {
         );
         let ok: Result<String, ToolError> = Ok("y".into());
         assert_eq!(ok.into_tool_result(), Ok(ToolOutput::text("y")));
-        let needs: Result<&'static str, ToolError> = Err(ToolError::NeedsInput {
-            question: "q".into(),
-        });
-        assert_eq!(
-            needs.into_tool_result(),
-            Err(ToolError::NeedsInput {
-                question: "q".into()
-            })
-        );
+        let needs: Result<&'static str, ToolError> = Err(ToolError::needs_input("q"));
+        assert_eq!(needs.into_tool_result(), Err(ToolError::needs_input("q")));
         // Any error with `Into<ToolError>` works.
         struct MyErr;
         impl From<MyErr> for ToolError {

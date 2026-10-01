@@ -341,19 +341,10 @@ async fn a_fn_tool_error_is_a_tool_error() {
         "ask",
         "Ask.",
         json!({"type": "object"}),
-        |_ctx, _args| async {
-            Err::<String, _>(ToolError::NeedsInput {
-                question: "which one?".into(),
-            })
-        },
+        |_ctx, _args| async { Err::<String, _>(ToolError::needs_input("which one?")) },
     );
     let err = ask.call(&ctx, json!({})).await.unwrap_err();
-    assert_eq!(
-        err,
-        ToolError::NeedsInput {
-            question: "which one?".into()
-        }
-    );
+    assert_eq!(err, ToolError::needs_input("which one?"));
 }
 
 #[cfg(feature = "schema")]

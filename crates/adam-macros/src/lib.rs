@@ -14,7 +14,7 @@
 //!     /// What you need to know
 //!     question: String,
 //! ) -> Result<ToolOutput, ToolError> {
-//!     Err(ToolError::NeedsInput { question })
+//!     Err(ToolError::needs_input(question))
 //! }
 //!
 //! let tools = tools![AskUser];

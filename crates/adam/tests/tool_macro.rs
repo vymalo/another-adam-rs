@@ -48,9 +48,7 @@ async fn ask_user(
 ) -> Result<ToolOutput, ToolError> {
     match question.trim() {
         "" => Ok(ToolOutput::error("question is required")),
-        q => Err(ToolError::NeedsInput {
-            question: q.to_owned(),
-        }),
+        q => Err(ToolError::needs_input(q.to_owned())),
     }
 }
 
@@ -303,12 +301,7 @@ async fn context_arguments_ctx_and_needs_input() {
         .call(&detached("ask_user"), json!({"question": " why? "}))
         .await
         .unwrap_err();
-    assert_eq!(
-        err,
-        ToolError::NeedsInput {
-            question: "why?".into()
-        }
-    );
+    assert_eq!(err, ToolError::needs_input("why?"));
     let out = AskUser
         .call(&detached("ask_user"), json!({"question": "  "}))
         .await

@@ -268,9 +268,15 @@ impl Tool for Redacting {
             }
             Err(ToolError::Transient(m)) => Err(ToolError::Transient(r.scrub_string(m))),
             Err(ToolError::Permanent(m)) => Err(ToolError::Permanent(r.scrub_string(m))),
-            Err(ToolError::NeedsInput { question }) => Err(ToolError::NeedsInput {
-                question: r.scrub_string(question),
-            }),
+            Err(ToolError::NeedsInput { question, mut ui }) => {
+                if let Some(ui) = &mut ui {
+                    r.scrub_value(ui);
+                }
+                Err(ToolError::NeedsInput {
+                    question: r.scrub_string(question),
+                    ui,
+                })
+            }
             // `ToolError` is non_exhaustive: a variant added later must not slip past the
             // redactor, so it is reported to the model as a scrubbed permanent error.
             Err(other) => Err(ToolError::Permanent(r.scrub_string(report(&other)))),

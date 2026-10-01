@@ -23,8 +23,8 @@ instructions + a model + a toolset. It is served over A2A by
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) |
 | `ToolOutput` | `text`, `error`, `with_artifact` |
-| `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `emit_progress`, `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, and for tests `detached(..).with_state(..)` |
-| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question }` (parks the run; A2A reports `input-required`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer); `#[non_exhaustive]`, see *Errors* |
+| `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `emit_progress`, `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), and for tests `detached(..).with_state(..).with_context(..)` |
+| `ToolError` | `Transient`, `Permanent`, `NeedsInput { question, ui }` (parks the run; A2A reports `input-required`; `ui` is an interface that comes with the question; build one with `ToolError::needs_input(q)` or `needs_input_with_ui(q, ui)`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer); `#[non_exhaustive]`, see *Errors* |
 | `LlmAgentBuilder::state`, `try_build`, `tools` | `state(Arc<T>)` shares a value with the tools (one per type); `try_build() -> Result<LlmAgent, BuildError>` fails on a tool whose `required_state` was not given (`BuildError::MissingState`) or on two tools with one name (`BuildError::DuplicateTool`); `tools(ToolSet)` registers a group. `build()` is unchanged (last duplicate wins, no state check) |
 | `State<T>`, `StateKey`, `Extensions` | a cheap `Arc` handle that derefs to `T`; the key of a state type; the typed map behind them |
 | `ToolSet`, `tools!` | an ordered group of tools: `tools![Clock, Search::new()]`, `.extend(..)`, `.wrap(\|tool\| ..)` for middleware, `names()`, `get(..)` |
@@ -33,7 +33,9 @@ instructions + a model + a toolset. It is served over A2A by
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
 | `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
 | `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
-| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed) |
+| `ToolSource`, `DynToolSource`, `SourceCtx`, `LlmAgentBuilder::tool_source`, `MAX_SOURCE_TOOLS` | tools the agent learns about while it runs: a source lists its tools at every model turn (`specs(&SourceCtx)`) and answers the calls to them (`call(&ToolCtx, name, args) -> Option<..>`), see *Context and tool sources* |
+| `Conversation::context`, `merge_context`, `drop_expired_context`, `MAX_CONTEXT_BYTES` | what the messages of the run say about their sender, merged key by key (`null` deletes), bounded, with expiring entries; see *Context and tool sources* |
+| `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed) |
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
@@ -112,6 +114,65 @@ dropping turns is the last resort. The cap is about what is stored and carried. 
 `Conversation` with a struct literal (two new public fields) and for `AgentStarter` implementors (`State` now
 needs `DeserializeOwned`), see the ADR's *Consequences*. The decision is
 [ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md).
+
+## Context and tool sources
+
+Two ways for a run to learn something its code did not know when it was built, both fed by the **inbound
+messages**.
+
+**The context.** A message may carry `{"text": "...", "context": {...}}`: the object under `context` is merged,
+key by key, into `Conversation::context` when the run reads the message (the start message, every message
+delivered later, and the answer to a question). A key a message sets replaces the one before, a key set to `null`
+deletes it, a message without `context` changes nothing. Tools read it with `ToolCtx::context(key)`. What it holds
+is the sender's own account of itself, so a tool treats it as input; an A2A server fills it from the extensions a
+message carries (`adam-a2a-runtime`'s `vymalo_inbound`). The context is part of the durable state, so a restart or a
+change of worker keeps it, and a run that continues another starts with the one before
+(`Conversation::continued`; the new message's keys then win). Two bounds: the whole context is at most
+`MAX_CONTEXT_BYTES` (256 KiB of JSON; a message that would take it over has its context dropped, with a warning,
+and is still read for its text), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
+that time has passed**, at the start of the next step (`drop_expired_context`): a credential the sender put there
+does not stay in the store after it stops working. (A run parked for hours still holds it until it next steps.)
+
+**The question's interface.** `ToolError::NeedsInput { question, ui }` may carry an interface, an array of A2UI
+messages; it is kept with the question in `PendingQuestion::ui` (`/pending_wait/ui` in the stored state), where an
+A2A server reads it to send it beside the question in the `input-required` status. The agent does not look inside
+it.
+
+**Tool sources.** A `Tool` has one fixed spec; a `ToolSource` lists its tools anew for every model call and answers
+the calls to them:
+
+```mermaid
+sequenceDiagram
+    participant L as LlmAgent (step model:N)
+    participant S as ToolSource
+    participant M as Model
+    participant T as LlmAgent (step tool:ID)
+    L->>S: specs(ctx with the run's context)
+    S-->>L: the tools to offer on this turn
+    L->>M: complete(history, own tools + offered, own first)
+    M-->>L: a call to a tool that is none of the agent's own
+    T->>S: call(ctx, name, args), inside the journaled step
+    S-->>T: Some(result), or None: the next source is asked
+    Note over T: nobody owns the name: an error result for the model
+```
+
+The sources are read inside the step of the model call, so a replay of a turn whose answer is recorded reads
+nothing and the journal has no new entries: only the answer is recorded, not the tools it was given. A listed tool
+whose name an own tool or an earlier source has is left out, with a warning (the agent's own tools win), at most
+`MAX_SOURCE_TOOLS` (64) are offered, and an agent with no source behaves exactly as before. A source's tool may ask
+the person and wait for a child run, but not wait on a remote task (`AwaitRemote` is answered with an error result:
+the agent polls the tool that started the task, and a source's tool is not known then).
+
+```mermaid
+stateDiagram-v2
+    [*] --> Absent: no entry in the context
+    Absent --> Present: a message sets the key
+    Present --> Present: a later message sets it again (replaced) or leaves it
+    Present --> Absent: a message sets it to null
+    Present --> Expired: its expiresAt passes
+    Expired --> Absent: the next step removes it
+    Absent --> [*]
+```
 
 ## Child runs
 
@@ -215,6 +276,15 @@ No environment variables.
 The old `Conversation` JSON with `pending_question` is a literal in `src/conversation.rs`
 (`a_state_stored_as_pending_question_still_loads`) and the old `ToolError` shapes are literals in `src/tool.rs`
 (`journals_written_before_await_run_still_decode`).
+
+`tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
+the context of the start message reaching a tool, replace/delete/keep across messages, a continued run carrying the
+context (and the new message winning), the expiry, the size bound, state stored before the context existed, a question
+that keeps its interface and the frozen shapes of old journals, a source read at every turn (a tool offered since the
+last turn is there), an own tool winning a clash, the limit of offered tools, an unknown name, a source's tool that asks the person, and, with a store that loses the
+acknowledgement of a write (`FaultyStore`), the replays: a model step that was recorded neither calls the model nor
+reads the sources again, a source's tool that was recorded is not called again, and a source's tool that waits on a
+remote task ends as an error result.
 
 `tests/remote_tasks.rs` is the remote-task suite (`MemoryStore`, and PostgreSQL when `ADAM_TEST_POSTGRES_URL` is
 set): polling on the moved clock until `Ready` with one start, a new process that polls on without starting,

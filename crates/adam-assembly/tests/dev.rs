@@ -74,11 +74,7 @@ fn asking(name: &str) -> FnTool {
         name,
         "Ask the user.",
         json!({"type": "object", "properties": {}}),
-        |_ctx, _args| async move {
-            Err::<ToolOutput, _>(ToolError::NeedsInput {
-                question: "which one?".into(),
-            })
-        },
+        |_ctx, _args| async move { Err::<ToolOutput, _>(ToolError::needs_input("which one?")) },
     )
 }
 

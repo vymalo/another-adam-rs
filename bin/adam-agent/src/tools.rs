@@ -24,9 +24,7 @@ pub async fn ask_user(
     question: String,
 ) -> Outcome {
     match Some(question.trim()).filter(|q| !q.is_empty()) {
-        Some(question) => Err(ToolError::NeedsInput {
-            question: question.to_owned(),
-        }),
+        Some(question) => Err(ToolError::needs_input(question)),
         None => Ok(ToolOutput::error("question is required")),
     }
 }
@@ -78,12 +76,7 @@ mod tests {
         let out = AskUser
             .call(&ctx(), json!({"question": " Which city? "}))
             .await;
-        assert_eq!(
-            out,
-            Err(ToolError::NeedsInput {
-                question: "Which city?".into()
-            })
-        );
+        assert_eq!(out, Err(ToolError::needs_input("Which city?")));
         for args in [json!({"question": "  "}), json!({}), Value::Null] {
             let out = AskUser.call(&ctx(), args.clone()).await;
             assert!(matches!(&out, Ok(o) if o.is_error), "{args}: {out:?}");

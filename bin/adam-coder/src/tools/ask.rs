@@ -23,9 +23,7 @@ pub async fn ask_user(
     question: String,
 ) -> Outcome {
     match non_empty(&question) {
-        Some(question) => Err(ToolError::NeedsInput {
-            question: question.to_owned(),
-        }),
+        Some(question) => Err(ToolError::needs_input(question)),
         None => Ok(ToolOutput::error("question is required")),
     }
 }

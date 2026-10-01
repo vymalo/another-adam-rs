@@ -1265,12 +1265,7 @@ async fn ask_user_needs_input_with_the_question() {
     let out = AskUser
         .call(&rig.ctx, json!({"question": " Which repo? "}))
         .await;
-    assert_eq!(
-        out,
-        Err(ToolError::NeedsInput {
-            question: "Which repo?".into()
-        })
-    );
+    assert_eq!(out, Err(ToolError::needs_input("Which repo?")));
     assert!(is_error(&AskUser.call(&rig.ctx, Value::Null).await));
 }
 
