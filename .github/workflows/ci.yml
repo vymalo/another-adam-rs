@@ -434,10 +434,18 @@ jobs:
             CONTAINER_HOST="unix://$PODMAN_SOCKET_DIR/podman.sock" \
             ADAM_TEST_DEVCONTAINER_ROOT="$PODMAN_WORK" \
             ADAM_TEST_DEVCONTAINER_DNS_NAME=podman \
+            ADAM_TEST_DEVCONTAINER_UP_SECS=600 \
             HOME="$PODMAN_WORK" "$PODMAN_WORK/podman-test" --nocapture
       - name: Logs
         if: failure()
-        run: docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app logs --no-color podman
+        run: |
+          docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app logs --no-color podman
+          # What the service holds and what was still running when the test gave up.
+          podman-remote --url "unix://$PODMAN_SOCKET_DIR/podman.sock" ps -a || true
+          podman-remote --url "unix://$PODMAN_SOCKET_DIR/podman.sock" images || true
+          docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app exec -T podman ps -ef || true
+          pgrep -a -f 'devcontainer|podman|node' || true
+          sudo find "$PODMAN_WORK" -name build.log -exec sh -c 'echo "== $1"; cat "$1"' _ {} \; || true
       - name: Tear down
         if: always()
         run: docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app down -v

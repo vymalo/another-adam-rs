@@ -38,6 +38,8 @@ struct Steps(std::sync::Mutex<Vec<EnvStep>>);
 
 impl EnvProgress for Steps {
     fn step(&self, step: EnvStep) {
+        // As they come, so that a build that hangs says in CI's log where it was.
+        eprintln!("step: {step:?}");
         self.0.lock().unwrap().push(step);
     }
 }
@@ -212,6 +214,12 @@ async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
     settings.network = Network::Inherit;
     settings.deployment = "adam-test".to_owned();
     settings.model_key = Some("sk-integration-test-key".to_owned().into());
+    if let Some(secs) = std::env::var("ADAM_TEST_DEVCONTAINER_UP_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        settings.up_timeout = Duration::from_secs(secs);
+    }
     let environment = DevContainer::new(settings);
 
     // Build it.
