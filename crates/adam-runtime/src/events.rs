@@ -15,6 +15,8 @@ use tokio::sync::broadcast;
 
 use adam_core::{RunId, RunStatus};
 
+use crate::step::StepEvent;
+
 /// A named piece of output produced while a run works (a file, a report, a
 /// structured result). A2A maps these to task artifacts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -43,6 +45,10 @@ pub enum RunEvent {
         /// What is going on.
         message: String,
     },
+    /// A step of the run's work started, moved, or ended, and under which step it runs (a tool
+    /// call, a sub-agent's work, a command it ran): see [`StepEvent`]. The A2A server serves it as
+    /// `steps/v1` to a client that asked for it, and as a line of text to one that did not.
+    Step(StepEvent),
     /// Application-defined event.
     Custom {
         /// Event kind.
@@ -237,6 +243,7 @@ impl RunSubscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::step::{StepIcon, StepKind, StepState};
 
     #[test]
     fn events_roundtrip_through_json() {
@@ -257,11 +264,32 @@ mod tests {
                 mime_type: Some("text/plain".into()),
                 data: serde_json::json!("x"),
             },
+            RunEvent::Step(
+                StepEvent::new("acp:c2:1", StepKind::Command, "npm test", StepState::Failed)
+                    .under("tool:c2")
+                    .with_icon(StepIcon::Execute)
+                    .with_detail("1 failed"),
+            ),
         ];
         for e in events {
             let json = serde_json::to_value(&e).expect("serialize");
             assert_eq!(serde_json::from_value::<RunEvent>(json).expect("parse"), e);
         }
+    }
+
+    #[test]
+    fn a_step_event_is_tagged_step_and_carries_the_steps_own_fields() {
+        let event = RunEvent::Step(StepEvent::new(
+            "tool:c1",
+            StepKind::Tool,
+            "run_checks",
+            StepState::Running,
+        ));
+        assert_eq!(
+            serde_json::to_value(&event).expect("serialize"),
+            serde_json::json!({"type": "step", "id": "tool:c1", "kind": "tool",
+                               "label": "run_checks", "state": "running"})
+        );
     }
 
     #[tokio::test]

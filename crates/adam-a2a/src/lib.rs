@@ -103,8 +103,8 @@ pub use auth::AuthConfig;
 pub use backend::{BackendError, Caller, DynTaskBackend, TaskBackend, TaskEvent};
 pub use card::{AgentCardConfig, ExtensionConfig, SkillConfig};
 pub use extensions::{
-    A2UI_BASIC_CATALOG_V0_9_1, A2UI_EXTENSION_V0_9_1, A2UI_MEDIA_TYPE, THREAD_TOOLS_EXTENSION,
-    UI_CATALOG_EXTENSION,
+    A2UI_BASIC_CATALOG_V0_9_1, A2UI_EXTENSION_V0_9_1, A2UI_MEDIA_TYPE, STEPS_EXTENSION,
+    THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION,
 };
 #[cfg(feature = "test-util")]
 pub use memory::{InMemoryBackend, InMemoryConfig};

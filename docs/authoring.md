@@ -395,7 +395,9 @@ of `adam-llm-agent`.
 * **Options:** `name = "..."`, `type = Ident`, `strict` (`deny_unknown_fields`, which also closes the
   schema), `classify` (the error is `adam_error::Classify`: retryable becomes `ToolError::Transient`,
   the rest `Permanent`), `asks_user` (the tool can end a call with `ToolError::NeedsInput`: the
-  generated `Tool::asks_user` says `true`, and `bind` refuses it on a subagent, added in S9) and
+  generated `Tool::asks_user` says `true`, and `bind` refuses it on a subagent, added in S9), `step`, `label` and
+  `icon` (how a call is drawn as a step, `Tool::step_style`: the kind, a label instead of the tool's name, and an
+  icon from the closed vocabulary of the orchestration layer's `steps/v1`; [ADR 0007](decisions/0007-progress-as-steps-and-streamed-text.md)) and
   `crate = path` (default `::adam`; `::adam_llm_agent` for a crate that does not use the facade).
   Reserved for later: `approval` (roadmap 5).
 * **Bad model input is the model's problem:** a deserialization failure becomes `ToolOutput::error`

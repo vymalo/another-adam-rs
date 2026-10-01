@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Three extensions, each optional (a client that does not know one ignores it), detected by the
+//! Four extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -8,10 +8,12 @@
 //! | A2UI v0.9.1 | [`A2UI_EXTENSION_V0_9_1`] | the agent can send A2UI surfaces (data parts of [`A2UI_MEDIA_TYPE`]) and receives the renderer's capabilities and actions |
 //! | `ui-catalog/v1` | [`UI_CATALOG_EXTENSION`] | the agent reads the screen's own component catalog and draws with it |
 //! | `thread-tools/v1` | [`THREAD_TOOLS_EXTENSION`] | the agent can use the per-thread tool endpoint a message announces |
+//! | `steps/v1` | [`STEPS_EXTENSION`] | the agent reports its tool calls and its sub-agents' work as nested steps, to a client whose request activated it |
 //!
-//! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md` and
-//! `docs/api/thread-tools-v1.md` of `vymalo/another-agentic-system`); what an agent does with the
-//! messages is `adam-a2a-runtime`'s `vymalo_inbound` and `adam-ui`.
+//! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`,
+//! `docs/api/thread-tools-v1.md` and `docs/api/steps-v1.md` of `vymalo/another-agentic-system`); what
+//! an agent does with the messages is `adam-a2a-runtime`'s `vymalo_inbound` and `adam-ui`, and what
+//! it reports is `adam-a2a-runtime`'s subscription.
 
 use serde_json::json;
 
@@ -34,6 +36,10 @@ pub const UI_CATALOG_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions
 /// The URI of the `thread-tools/v1` extension: a message carries the endpoint of the tools of its
 /// thread, and a token to call it.
 pub const THREAD_TOOLS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/thread-tools/v1";
+
+/// The URI of the `steps/v1` extension: the agent reports its work as nested steps, in the metadata
+/// of `working` status messages, to a client whose request activated the extension.
+pub const STEPS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/steps/v1";
 
 impl ExtensionConfig {
     /// The A2UI v0.9.1 extension, as the card of an agent that takes the screen's catalog inline
@@ -61,6 +67,15 @@ impl ExtensionConfig {
         extension
     }
 
+    /// The `steps/v1` extension: the agent reports its tool calls and its sub-agents' work as
+    /// nested steps. Optional, no parameters; a client that does not activate it gets plain text.
+    pub fn steps() -> Self {
+        let mut extension = Self::new(STEPS_EXTENSION);
+        extension.description =
+            Some("Reports its tool calls and its sub-agents' work as nested steps".into());
+        extension
+    }
+
     /// The `thread-tools/v1` extension: the agent calls the tools of the per-thread endpoint a
     /// message announces. Optional, no parameters.
     pub fn thread_tools() -> Self {
@@ -83,6 +98,10 @@ mod tests {
         assert_eq!(
             THREAD_TOOLS_EXTENSION,
             "https://agents.vymalo.com/a2a/extensions/thread-tools/v1"
+        );
+        assert_eq!(
+            STEPS_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/steps/v1"
         );
         assert_eq!(
             A2UI_EXTENSION_V0_9_1,
@@ -110,6 +129,7 @@ mod tests {
         for e in [
             ExtensionConfig::ui_catalog(),
             ExtensionConfig::thread_tools(),
+            ExtensionConfig::steps(),
         ] {
             assert!(!e.required, "{}", e.uri);
             assert!(e.params.is_empty(), "{}", e.uri);
@@ -117,5 +137,6 @@ mod tests {
         }
         assert_eq!(ExtensionConfig::ui_catalog().uri, UI_CATALOG_EXTENSION);
         assert_eq!(ExtensionConfig::thread_tools().uri, THREAD_TOOLS_EXTENSION);
+        assert_eq!(ExtensionConfig::steps().uri, STEPS_EXTENSION);
     }
 }

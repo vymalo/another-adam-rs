@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use adam::mcp::McpPolicy;
 use adam::prelude::*;
-use adam::{DynTool, StateKey};
+use adam::{DynTool, StateKey, StepStyle};
 use adam_error::{Classify, report};
 use adam_model::ToolSpec;
 use adam_ui::Ui;
@@ -274,6 +274,10 @@ impl Tool for Redacting {
 
     fn asks_user(&self) -> bool {
         self.inner.asks_user()
+    }
+
+    fn step_style(&self) -> StepStyle {
+        self.inner.step_style()
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {

@@ -151,6 +151,30 @@ include a digest of the interface, so a question with another interface is anoth
 exactly the id it had before. A run **artifact** whose media type is `application/a2ui+json` (what a `show` tool emits) carries
 the same two spellings on its data part.
 
+## Steps
+
+A run's work reaches an A2A client as **steps** ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md)):
+each `RunEvent::Step` that a subscription sees (live, in the process that steps the run, like every event) is a
+`working` status update whose message has one text part and, **for a client whose request activated `steps/v1`**
+(`Caller::extensions`, which `adam-a2a` fills from the `A2A-Extensions` header and `message.extensions`), the step
+itself in the message's `metadata` under the extension's URI (`STEPS_EXTENSION` of `adam-a2a`; the contract is
+`docs/api/steps-v1.md` of `vymalo/another-agentic-system`):
+
+```json
+{"https://agents.vymalo.com/a2a/extensions/steps/v1": {
+  "id": "acp:c2:1", "parentId": "tool:c2", "kind": "command", "label": "npm test",
+  "state": "failed", "icon": "execute", "detail": "1 failed"}}
+```
+
+The text is the plain line the contract asks for. Without the activation it is all a client gets, one line per report:
+the label for a start or a move; the detail alone for a progress line of a step at the top (what a tool's
+`emit_progress` always was); `label: detail` for one under another step; and `label: done`, `label: failed` or
+`label: canceled` (then the detail) for an end. For an activated client the subscription holds back a report of the
+state a step is already in for a second (a change of state, the start and the end always go out), because the
+contract asks for at most one update per step per second; a client without steps gets every line. Steps are live
+events: a subscription that attaches after they were emitted, or in another process without an event sink,
+does not see them (the durable record of the task is unchanged).
+
 ## Stable ids
 
 Ids are derived, never drawn at random per read, so a consumer that keys on
@@ -229,7 +253,7 @@ the backend whose model is shown the earlier messages (memory and PostgreSQL). U
 messages in `src/vymalo.rs` (each shape of answer, quoting, the cut, the context under every capability key, a catalog
 of another id, a malformed reference, the doubles) and `tests/vymalo.rs` (a real `Runtime` and `LlmAgent`: the
 extensions reaching the run's context, a question with an interface as `input-required` with two parts, and the person's
-answer as the tool result the model reads).
+answer as the tool result the model reads), and `tests/steps.rs` (a real `Runtime` and an agent that reports a tool call, a command under it that waits and fails, and the end: an activated client reads each step as a report in the metadata beside its line, with the same state held back within a second and a change of state not, one that did not reads every step as a line and nothing else, and another extension activates nothing) with the unit tests of `src/steps.rs` (the metadata, the message, the line of each state) and of the throttle in `src/subscribe.rs` (once a second a state, every change, the end, a retry starting afresh, the bound on what is remembered).
 
 | Variable | Meaning |
 |---|---|

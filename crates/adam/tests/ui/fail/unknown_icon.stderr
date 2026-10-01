@@ -1,0 +1,11 @@
+error: unknown `step` `agent` in `#[tool]`; expected one of: subagent, tool, command, message
+ --> tests/ui/fail/unknown_icon.rs:4:15
+  |
+4 | #[tool(step = "agent", icon = "rocket")]
+  |               ^^^^^^^
+
+error: unknown `icon` `rocket` in `#[tool]`; expected one of: agent, read, edit, delete, move, search, execute, think, fetch, web, git, test, file, tool
+ --> tests/ui/fail/unknown_icon.rs:4:31
+  |
+4 | #[tool(step = "agent", icon = "rocket")]
+  |                               ^^^^^^^^

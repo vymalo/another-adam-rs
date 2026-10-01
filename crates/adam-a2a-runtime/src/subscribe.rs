@@ -1,28 +1,38 @@
 //! Replayable subscriptions: durable polling merged with live events.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use a2a::{
     Message, Part, Role, TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
-use adam_a2a::{BackendError, Caller, TaskEvent};
-use adam_runtime::{RunEvent, RunSubscription, RunView};
+use adam_a2a::{BackendError, Caller, STEPS_EXTENSION, TaskEvent};
+use adam_runtime::{RunEvent, RunSubscription, RunView, StepEvent, StepState};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::convert::{StatusKey, artifact_id, artifact_of, status_key, status_of, task_from_view};
+use crate::steps::step_message;
 
 /// Consecutive failed reads of the durable run before a subscription gives up.
 const MAX_READ_FAILURES: u32 = 20;
 
 /// Buffered events between the pump and a slow HTTP client.
 const CHANNEL_CAPACITY: usize = 64;
+
+/// How often a step reports the same state again to a client that activated `steps/v1`: the
+/// contract asks agents for at most one update per step per second, and the orchestration layer
+/// keeps only a few. A change of state, and the start and the end of a step, always go out.
+const STEP_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The most steps whose last update a subscription remembers: past it the memory starts again
+/// (the next update of each goes out, which costs a line, not correctness).
+const MAX_TRACKED_STEPS: usize = 1024;
 
 pub(crate) fn subscribe(
     backend: RuntimeTaskBackend,
@@ -44,6 +54,11 @@ struct Tracker {
     context_id: String,
     seen_artifacts: HashSet<String>,
     last: StatusKey,
+    /// The request activated `steps/v1`: a step goes out with its report, at most one update a
+    /// second. Without it a step is a line of text, and every line goes out, as progress always did.
+    steps: bool,
+    /// The state each open step last reported to this subscriber, and when (only with `steps`).
+    reported: HashMap<String, (StepState, Instant)>,
 }
 
 impl Tracker {
@@ -103,6 +118,12 @@ impl Tracker {
                     vec![Part::text(message)],
                 ))]
             }
+            RunEvent::Step(step) => {
+                if self.steps && !admit(&mut self.reported, &step, Instant::now()) {
+                    return Vec::new();
+                }
+                vec![working(step_message(&step, self.steps))]
+            }
             RunEvent::Custom { kind, payload } => {
                 let part = Part::data(json!({ "kind": kind, "payload": payload }));
                 vec![working(Message::new(Role::Agent, vec![part]))]
@@ -126,6 +147,31 @@ impl Tracker {
             RunEvent::Status { .. } => Vec::new(),
         }
     }
+}
+
+/// Whether a client that activated `steps/v1` is sent this report: always at the start, at the end
+/// and on a change of state, and an update of the state it is in only once per
+/// [`STEP_UPDATE_INTERVAL`]. `reported` is what this subscriber has been told of each open step.
+fn admit(
+    reported: &mut HashMap<String, (StepState, Instant)>,
+    step: &StepEvent,
+    now: Instant,
+) -> bool {
+    if step.state.is_end() {
+        reported.remove(&step.id);
+        return true;
+    }
+    let quiet = reported.get(&step.id).is_some_and(|(state, at)| {
+        *state == step.state && now.saturating_duration_since(*at) < STEP_UPDATE_INTERVAL
+    });
+    if quiet {
+        return false;
+    }
+    if reported.len() >= MAX_TRACKED_STEPS {
+        reported.clear();
+    }
+    reported.insert(step.id.clone(), (step.state, now));
+    true
 }
 
 async fn send(
@@ -166,6 +212,8 @@ async fn pump(
         context_id,
         seen_artifacts: view.artifacts.iter().map(artifact_id).collect(),
         last: status_key(&task.status),
+        steps: caller.has_extension(STEPS_EXTENSION),
+        reported: HashMap::new(),
     };
     let ends = task.status.state.is_terminal()
         || matches!(
@@ -236,5 +284,78 @@ async fn pump(
             None | Some(true) => return Ok(()),
             Some(false) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use adam_runtime::StepKind;
+
+    use super::*;
+
+    fn step(id: &str, state: StepState) -> StepEvent {
+        StepEvent::new(id, StepKind::Command, "npm test", state)
+    }
+
+    /// `n` seconds after `t0`.
+    fn at(t0: Instant, n: u64) -> Instant {
+        t0 + Duration::from_secs(n)
+    }
+
+    #[test]
+    fn a_step_reports_the_same_state_once_a_second_and_every_change_of_state() {
+        let t0 = Instant::now();
+        let mut reported = HashMap::new();
+        let mut admitted = |id: &str, state, when| admit(&mut reported, &step(id, state), when);
+        // The start goes out; the same state again within the second does not ...
+        assert!(admitted("a", StepState::Running, t0));
+        assert!(!admitted("a", StepState::Running, at(t0, 0)));
+        assert!(!admitted(
+            "a",
+            StepState::Running,
+            t0 + Duration::from_millis(999)
+        ));
+        // ... and goes out once the second is over, from which the next second counts.
+        assert!(admitted("a", StepState::Running, at(t0, 1)));
+        assert!(!admitted(
+            "a",
+            StepState::Running,
+            at(t0, 1) + Duration::from_millis(500)
+        ));
+        // A change of state is never held back, even at once: a step that asks for a person has
+        // to say it is waiting.
+        assert!(admitted(
+            "a",
+            StepState::Waiting,
+            at(t0, 1) + Duration::from_millis(500)
+        ));
+        assert!(!admitted("a", StepState::Waiting, at(t0, 2)));
+        assert!(admitted("a", StepState::Running, at(t0, 2)));
+        // Another step has its own second.
+        assert!(admitted("b", StepState::Running, at(t0, 2)));
+        // The end always goes out, and a step that starts again (a retry) starts afresh.
+        assert!(admitted("a", StepState::Failed, at(t0, 2)));
+        assert!(admitted("a", StepState::Running, at(t0, 2)));
+    }
+
+    #[test]
+    fn what_is_remembered_is_bounded() {
+        let t0 = Instant::now();
+        let mut reported = HashMap::new();
+        for n in 0..MAX_TRACKED_STEPS {
+            assert!(admit(
+                &mut reported,
+                &step(&format!("s{n}"), StepState::Running),
+                t0
+            ));
+        }
+        assert_eq!(reported.len(), MAX_TRACKED_STEPS);
+        // One more starts the memory again: the cost is a line that might have been held back.
+        assert!(admit(
+            &mut reported,
+            &step("one-more", StepState::Running),
+            t0
+        ));
+        assert_eq!(reported.len(), 1);
     }
 }

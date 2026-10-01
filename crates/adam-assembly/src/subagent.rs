@@ -1,6 +1,6 @@
 //! [`SubagentTool`]: the tool a parent calls to run a subagent as a durable child run.
 
-use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
+use adam_llm_agent::{StepIcon, StepKind, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -85,6 +85,11 @@ impl Tool for SubagentTool {
         self.spec.clone()
     }
 
+    /// A call is an agent working for this one: a `subagent` step, drawn as an agent.
+    fn step_style(&self) -> StepStyle {
+        StepStyle::new(StepKind::Subagent).with_icon(StepIcon::Agent)
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         let message = match args.get("message") {
             Some(Value::String(text)) if !text.trim().is_empty() => text,
@@ -129,6 +134,14 @@ mod tests {
             SubagentTool::new("x", "a/x", " ").spec().description,
             NOT_SEEN
         );
+    }
+
+    #[test]
+    fn a_call_is_a_subagent_step_drawn_as_an_agent() {
+        let style = tool().step_style();
+        assert_eq!(style.kind, StepKind::Subagent);
+        assert_eq!(style.icon, Some(StepIcon::Agent));
+        assert_eq!(style.label, None, "the tool's name labels it");
     }
 
     #[tokio::test]

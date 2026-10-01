@@ -28,7 +28,8 @@ over A2A).
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
 | `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`) |
-| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events |
+| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status`, `Progress`, `Step`, `Custom`, `Artifact` |
+| `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `MAX_STEP_ID_BYTES`, `MAX_STEP_LABEL_CHARS`, `MAX_STEP_DETAIL_CHARS` | `RunEvent::Step`: a step of the run's work (a tool call, a sub-agent's work, a command) started, moved or ended, and which step it runs under; see *Steps* |
 | `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
 | `RetryPolicy`, `MAX_RETRY_AFTER` | exponential backoff for transient errors |
 | `Clock`, `SystemClock`, `ManualClock` | injectable time |
@@ -142,6 +143,32 @@ and an agent that parks without reading it sleeps until its timer. The design, t
 the tests that make each happen are in [`docs/architecture.md`](../../docs/architecture.md#child-runs).
 `adam-llm-agent` does all of this for a tool that returns `ToolError::AwaitRun`.
 
+## Steps
+
+`RunEvent::Step(StepEvent)` says that something the run does (a tool call, a sub-agent's work, a command it ran)
+started, moved or ended, and **under which step it runs**. It is the vocabulary of the orchestration layer's `steps/v1`
+extension (`docs/api/steps-v1.md` of `vymalo/another-agentic-system`), which `adam-a2a-runtime` serves to a client
+that asked for it ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md)):
+
+```rust
+use adam_runtime::{RunEvent, StepEvent, StepIcon, StepKind, StepState};
+
+ctx.emit(RunEvent::Step(
+    StepEvent::new("acp:c2:1", StepKind::Command, "npm test", StepState::Failed)
+        .under("tool:c2")           // a step reported earlier; none = at the top
+        .with_icon(StepIcon::Execute)
+        .with_detail("1 failed"),
+))
+.await;
+```
+
+The first report of an `id` starts the step, later ones update it, and a state that ends it (`completed`, `failed`,
+`canceled`: `StepState::is_end`) ends it; a report after the end starts it again (a retry). The constructors keep the
+contract's bounds: an id of at most 128 bytes (control characters become `_`), a one-line label of at most 200
+characters, a detail of at most 1000 (`…` marks a cut). Kinds, states and icons are closed enums
+(`#[non_exhaustive]`); `as_str()` is the word on the wire and `parse(..)` reads it. A step is best effort and not
+durable, like every event; `adam-llm-agent` reports every tool call as one.
+
 ## Several processes
 
 Processes share nothing but the store. A worker finds due runs by polling it
@@ -247,7 +274,7 @@ steps on one worker only) and its control
 `any_workers_let_a_run_move_between_workers` (a run seeded by one worker is finished by another), and the two
 `notifier_*` cases: two runtimes over one store and one `LocalNotifier`, a 30 s poll, a 5 s deadline, and the child-run cases: `a_finished_child_wakes_its_parent_once`, `a_lost_notice_is_recovered_by_the_timer`, `a_parent_that_loses_its_lease_does_not_start_or_resume_twice` and the rest, which use gates, a `ManualClock` and `FaultyStore::fail_run` and never sleep for a fixed time) run against `MemoryStore` always,
 against PostgreSQL and against MongoDB when their variables are set. Unit
-tests sit in `src/cancel.rs`, `erased.rs` (an override reaches an agent and a starter, the default is `init`, a prior state that does not decode falls back to `init`), `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs`, `events.rs`, `notify.rs` and `retry.rs`, and the
+tests sit in `src/cancel.rs`, `erased.rs` (an override reaches an agent and a starter, the default is `init`, a prior state that does not decode falls back to `init`), `child.rs` (the id derivation is pinned by a golden value, the notice payload), `ctx.rs`, `events.rs`, `step.rs` (the words of the kinds, states and icons are the contract's, a step is made within its bounds on a character boundary, the serde shape leaves out what a step does not say), `notify.rs` and `retry.rs`, and the
 class tables of `AgentError` and `RuntimeError` in `src/agent.rs`
 (`class_table`, `from_classified_maps_retryable_to_transient_and_keeps_the_hint`,
 `a_message_never_repeats_its_source`, `the_default_continuation_is_init_and_ignores_the_prior_state`) and `src/runtime.rs` (`error_tests`).

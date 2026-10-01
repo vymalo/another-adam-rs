@@ -66,7 +66,8 @@ impl Rig {
             .events()
             .into_iter()
             .filter_map(|e| match e.event {
-                RunEvent::Progress { message } => Some(message),
+                // What a tool says with `emit_progress`: the detail of an update of its own step.
+                RunEvent::Step(step) if step.parent.is_none() => step.detail,
                 _ => None,
             })
             .collect()

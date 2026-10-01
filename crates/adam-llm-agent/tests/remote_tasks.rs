@@ -19,7 +19,7 @@ use adam_llm_agent::{
 use adam_model::{DynModel, Message, MockModel, ToolCall, ToolSpec};
 use adam_runtime::{
     CollectingSink, ManualClock, RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder,
-    RuntimeError,
+    RuntimeError, StepState,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -247,8 +247,9 @@ fn ends(rig: &Rig, run: RunId) -> Vec<String> {
         .events_for(run)
         .into_iter()
         .filter_map(|e| match e {
-            RunEvent::Custom { kind, payload } if kind == "tool_end" => {
-                Some(payload["status"].as_str().unwrap().to_owned())
+            // The call's step after it started: waiting, then how it ended.
+            RunEvent::Step(step) if step.state != StepState::Running => {
+                Some(step.state.as_str().to_owned())
             }
             RunEvent::Custom { kind, .. } if kind == "awaiting_remote" => Some(kind),
             _ => None,
@@ -323,7 +324,7 @@ async fn the_run_polls_on_the_timer_until_the_task_is_over_and_starts_it_once() 
         assert_eq!(polls.load(SeqCst), 3, "{backend}");
         assert_eq!(
             ends(&rig, run),
-            ["awaiting_remote", "waiting", "ok"],
+            ["awaiting_remote", "waiting", "completed"],
             "{backend}"
         );
         assert_eq!(rig.mock.requests().len(), 2, "{backend}");
@@ -402,7 +403,7 @@ async fn a_task_that_failed_is_an_error_result_and_the_run_goes_on() {
         assert_eq!(polls.load(SeqCst), 1);
         assert_eq!(
             ends(&rig, run),
-            ["awaiting_remote", "waiting", "error"],
+            ["awaiting_remote", "waiting", "failed"],
             "{backend}"
         );
     }

@@ -48,6 +48,9 @@ mod expand;
 /// `classify` (the error is `adam_error::Classify`: retryable errors become
 /// `ToolError::Transient`, others `Permanent`), `asks_user` (the tool can end a call with
 /// `ToolError::NeedsInput`: `Tool::asks_user` says `true`, and a subagent may not have it) and
+/// `step = "subagent"`, `label = "OpenCode"` and `icon = "agent"` (how a call is drawn as a step,
+/// `Tool::step_style`: the kind, a label instead of the tool's name, and an icon; each from the closed
+/// vocabulary of the `steps/v1` extension, and any other word is an error that lists them) and
 /// `crate = path` (where
 /// `Tool` and `__private` are, default `::adam`; `::adam_llm_agent` for a
 /// crate without the facade).

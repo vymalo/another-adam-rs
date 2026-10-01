@@ -2084,7 +2084,7 @@ async fn opencode_crashing_every_time_fails_the_run_with_its_stderr(store: DynSt
     let transient = |seen: &Seen| {
         seen.messages
             .iter()
-            .filter(|m| m.contains("delegate_to_opencode") && m.contains("transient_error"))
+            .filter(|m| m.as_str() == "delegate_to_opencode: failed")
             .count()
     };
     assert_eq!(
@@ -2161,7 +2161,7 @@ async fn opencode_crashing_once_is_retried_and_completes(store: DynStore) {
     assert_eq!(
         seen.messages
             .iter()
-            .filter(|m| m.contains("delegate_to_opencode") && m.contains("transient_error"))
+            .filter(|m| m.as_str() == "delegate_to_opencode: failed")
             .count(),
         1,
         "the client sees the first attempt fail: {:#?}",

@@ -10,7 +10,9 @@ use adam::error::{Classify, ErrorClass};
 use adam::model::{DynModel, Message, MockModel, ToolCall};
 use adam::prelude::*;
 use adam::runtime::{CollectingSink, RunView, Runtime};
-use adam::{BuildError, Conversation, PendingWait, StateKey, user_message};
+use adam::{
+    BuildError, Conversation, PendingWait, StateKey, StepIcon, StepKind, StepStyle, user_message,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -544,4 +546,95 @@ async fn a_permanent_tool_error_is_the_models_to_read() {
         results[0].1 && results[0].0.contains("upstream is Invalid"),
         "{results:?}"
     );
+}
+
+// ------------------------------------------------------------------ steps
+
+/// Hand the task to OpenCode and report what it does.
+#[tool(step = "subagent", label = "OpenCode", icon = "agent")]
+pub async fn delegate(
+    /// What to do
+    task: String,
+) -> String {
+    task
+}
+
+/// Look something up.
+#[tool(icon = "search")]
+pub async fn lookup(
+    /// What to look up
+    query: String,
+) -> String {
+    query
+}
+
+/// Say hello.
+#[tool(label = "Greeting")]
+pub async fn greet_step(
+    /// Who
+    name: String,
+) -> String {
+    name
+}
+
+#[test]
+fn step_options_say_how_a_call_is_drawn_as_a_step() {
+    let style = Delegate.step_style();
+    assert_eq!(style.kind, StepKind::Subagent);
+    assert_eq!(style.label.as_deref(), Some("OpenCode"));
+    assert_eq!(style.icon, Some(StepIcon::Agent));
+    // An icon alone: a plain tool step, labelled with the tool's name (no label of its own).
+    let style = Lookup.step_style();
+    assert_eq!(
+        (style.kind, style.label, style.icon),
+        (StepKind::Tool, None, Some(StepIcon::Search))
+    );
+    let style = GreetStep.step_style();
+    assert_eq!(
+        (style.kind, style.label.as_deref(), style.icon),
+        (StepKind::Tool, Some("Greeting"), None)
+    );
+    // No option: the trait's default.
+    assert_eq!(Whoami.step_style(), StepStyle::default());
+}
+
+/// `#[tool(icon = ..)]` for every word, to compare with the runtime's own list.
+macro_rules! icon_tools {
+    ($($fn_name:ident $tool:ident $word:literal),+ $(,)?) => {
+        $(
+            /// Icon check.
+            #[tool(icon = $word)]
+            pub async fn $fn_name() -> String {
+                String::new()
+            }
+        )+
+
+        fn styled_icons() -> Vec<(&'static str, Option<StepIcon>)> {
+            vec![$(($word, $tool.step_style().icon)),+]
+        }
+    };
+}
+
+icon_tools!(
+    i_agent IAgent "agent", i_read IRead "read", i_edit IEdit "edit", i_delete IDelete "delete",
+    i_move IMove "move", i_search ISearch "search", i_execute IExecute "execute",
+    i_think IThink "think", i_fetch IFetch "fetch", i_web IWeb "web", i_git IGit "git",
+    i_test ITest "test", i_file IFile "file", i_tool ITool "tool",
+);
+
+#[test]
+fn the_macros_words_are_the_runtimes_vocabulary() {
+    let styled = styled_icons();
+    let words: Vec<&str> = styled.iter().map(|(w, _)| *w).collect();
+    let all: Vec<&str> = StepIcon::ALL.iter().map(|i| i.as_str()).collect();
+    assert_eq!(
+        words, all,
+        "the macro accepts exactly the contract's icons, in its order"
+    );
+    for (word, icon) in styled {
+        assert_eq!(icon, StepIcon::parse(word), "{word}");
+    }
+    for kind in ["subagent", "tool", "command", "message"] {
+        assert!(StepKind::parse(kind).is_some(), "{kind}");
+    }
 }

@@ -5,7 +5,10 @@ use std::sync::Arc;
 use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
 use adam_model::ToolSpec;
-use adam_runtime::{Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, RunEvent};
+use adam_runtime::{
+    Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, RunEvent, StepEvent, StepIcon,
+    StepKind, StepState,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -66,6 +69,17 @@ pub trait Tool: Send + Sync + 'static {
         false
     }
 
+    /// How a call of this tool is drawn as a step ([`RunEvent::Step`]): its kind, the label (the
+    /// tool's name when it says none) and an icon. The default is a plain tool: kind `tool`, the
+    /// name as the label, no icon. A tool that hands its work to another agent says
+    /// [`StepKind::Subagent`] here, so that the steps it reports nest under it
+    /// (`#[tool(step = "subagent", label = "OpenCode", icon = "agent")]` writes it for a function).
+    /// A tool that wraps another (see [`ToolSet::wrap`](crate::ToolSet::wrap)) must forward it, as
+    /// it forwards [`required_state`](Self::required_state).
+    fn step_style(&self) -> StepStyle {
+        StepStyle::default()
+    }
+
     /// How a task this tool started on another system stands. Only a tool that returns
     /// [`ToolError::AwaitRemote`] implements it.
     ///
@@ -87,6 +101,59 @@ pub trait Tool: Send + Sync + 'static {
             self.spec().name
         )))
     }
+}
+
+/// How a tool call is drawn as a step: see [`Tool::step_style`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StepStyle {
+    /// What kind of work the call is.
+    pub kind: StepKind,
+    /// The label; `None` is the tool's name.
+    pub label: Option<String>,
+    /// The picture; `None` is none.
+    pub icon: Option<StepIcon>,
+}
+
+impl StepStyle {
+    /// A step of `kind`, labelled with the tool's name, with no icon.
+    pub fn new(kind: StepKind) -> Self {
+        Self {
+            kind,
+            label: None,
+            icon: None,
+        }
+    }
+
+    /// Label the step `label` instead of the tool's name.
+    #[must_use]
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Draw the step with `icon`.
+    #[must_use]
+    pub fn with_icon(mut self, icon: StepIcon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// The report that says the call `call_id` of the tool `tool` is in `state`: id `tool:<call id>`,
+    /// at the top, with this style.
+    pub(crate) fn event(&self, tool: &str, call_id: &str, state: StepState) -> StepEvent {
+        let label = self.label.as_deref().unwrap_or(tool);
+        let step = StepEvent::new(step_id(call_id), self.kind, label, state);
+        match self.icon {
+            Some(icon) => step.with_icon(icon),
+            None => step,
+        }
+    }
+}
+
+/// The id of the step of the call `call_id`: `tool:<call id>`.
+pub(crate) fn step_id(call_id: &str) -> String {
+    format!("tool:{call_id}")
 }
 
 /// What [`Tool::poll_remote`] found. Journaled, hence serializable.
@@ -300,6 +367,9 @@ pub struct ToolCtx {
     extensions: Arc<Extensions>,
     children: Option<ChildStarter>,
     context: Arc<Map<String, Value>>,
+    /// The step of this call (id, kind, label, icon): what [`emit_progress`](Self::emit_progress)
+    /// updates and [`report_step`](Self::report_step) nests under.
+    step: StepEvent,
 }
 
 impl ToolCtx {
@@ -314,6 +384,7 @@ impl ToolCtx {
         extensions: Arc<Extensions>,
         children: Option<ChildStarter>,
         context: Arc<Map<String, Value>>,
+        step: StepEvent,
     ) -> Self {
         Self {
             run_id: emitter.run_id(),
@@ -326,6 +397,7 @@ impl ToolCtx {
             extensions,
             children,
             context,
+            step,
         }
     }
 
@@ -337,17 +409,20 @@ impl ToolCtx {
         sink: DynEventSink,
     ) -> Self {
         let tool_name = tool_name.into();
+        let call_id = call_id.into();
         let emitter = Emitter::new(RunId::new(), "detached", sink);
+        let step = StepStyle::default().event(&tool_name, &call_id, StepState::Running);
         Self::new(
             None,
             0,
-            call_id.into(),
+            call_id,
             tool_name,
             emitter,
             CancelToken::new(),
             Arc::default(),
             None,
             Arc::default(),
+            step,
         )
     }
 
@@ -505,14 +580,37 @@ impl ToolCtx {
         self.cancel.clone()
     }
 
-    /// Report progress to observers as [`RunEvent::Progress`]. Best effort and
-    /// not durable, like every event.
+    /// Say what the call is doing now: an update of its own step ([`step_id`](Self::step_id)),
+    /// whose detail is `message`. Best effort and not durable, like every event. A client that
+    /// asked for steps gets a bounded number of them (the orchestration layer keeps a few updates
+    /// per step); one that did not gets `message` as a line of text, as it always did.
     pub async fn emit_progress(&self, message: impl Into<String>) {
-        self.emitter
-            .emit(RunEvent::Progress {
-                message: message.into(),
-            })
-            .await;
+        let update = self.step.clone().with_detail(message.into());
+        self.emitter.emit(RunEvent::Step(update)).await;
+    }
+
+    /// The id of this call's own step: `tool:<call id>`. The agent reports its start before the
+    /// tool runs and its end after, so a tool that wants to say more about its work reports steps
+    /// that run under it ([`report_step`](Self::report_step)).
+    pub fn step_id(&self) -> &str {
+        &self.step.id
+    }
+
+    /// Report a step of the work this call does: a command it ran, a tool of the agent it drove.
+    /// It runs under this call's step unless `step` says it runs under another one
+    /// ([`StepEvent::under`]) the call reported before. The first report of an id starts the step,
+    /// the ones after update it, and a report whose state ends it ends it; a step the call leaves
+    /// open when it returns is closed by whoever shows the tree.
+    ///
+    /// Ids must be unique within the run: put the call id in them (`acp:<call id>:<n>`). Best effort
+    /// and not durable, like every event.
+    pub async fn report_step(&self, step: StepEvent) {
+        let step = if step.parent.is_some() {
+            step
+        } else {
+            step.under(self.step.id.clone())
+        };
+        self.emitter.emit(RunEvent::Step(step)).await;
     }
 }
 
