@@ -51,6 +51,7 @@ flowchart TB
         coder["adam-coder"]
         agent["adam-agent"]
         llm["adam-llm-agent"]
+        ui["adam-ui"]
     end
     subgraph runtime["Runtime"]
         a2art["adam-a2a-runtime"]
@@ -89,6 +90,11 @@ flowchart TB
     coder --> service
     coder --> ws
     coder --> host
+    coder --> ui
+    agent --> ui
+    ui --> a2a
+    ui --> a2art
+    ui --> llm
     agent --> a2a
     agent --> adam
     agent --> llm
@@ -227,6 +233,13 @@ The layers, from the bottom:
     subagents and `mcp.json` tools, read at startup from `ADAM_AGENT_DIR`) with `ask_user` as its only tool of
     its own, over the same `adam-service`. It has no embedded agent and requires the folder
     ([ADR 0005](decisions/0005-one-binary-serves-any-agent-folder.md), [README](../bin/adam-agent/README.md)).
+  * [`adam-ui`](../crates/adam-ui/README.md) turns the screen's UI catalog into model tools for any agent:
+    `ask_user` with `choices` (one form, the answers back as the result), `show` (blocks of the screen's
+    components, validated against the catalog's JSON Schema), `ui_catalog`, and `ThreadTools`, a
+    `ToolSource` of `adam-llm-agent` that offers every tool of the conversation's MCP endpoint at each model
+    turn. It reads what `adam-a2a-runtime`'s `vymalo_inbound` puts in the run's inbound context and reaches the
+    endpoint with `adam-mcp`'s `Endpoint`
+    ([ADR 0006](decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md)).
 * **Authoring.**
   * `adam-macros` is the `#[tool]` attribute macro: a proc-macro crate whose
     expansion is a pure function over token streams. It depends on `syn`,
@@ -2001,6 +2014,7 @@ What the diagrams cannot say:
 | `adam-a2a-runtime` | runtime | [crates/adam-a2a-runtime](../crates/adam-a2a-runtime/README.md) |
 | `adam-llm-agent` | agent | [crates/adam-llm-agent](../crates/adam-llm-agent/README.md) |
 | `adam-service` | runtime | [crates/adam-service](../crates/adam-service/README.md) |
+| `adam-ui` | agent | [crates/adam-ui](../crates/adam-ui/README.md) |
 | `adam-coder` | agent, binary | [bin/adam-coder](../bin/adam-coder/README.md) |
 | `adam-agent` | agent, binary | [bin/adam-agent](../bin/adam-agent/README.md) |
 | `adam-macros` | authoring, proc-macro | [crates/adam-macros](../crates/adam-macros/README.md) |

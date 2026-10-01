@@ -18,6 +18,7 @@
 mod connection;
 mod error;
 mod expand;
+mod once;
 mod policy;
 mod redact;
 mod servers;
@@ -27,6 +28,7 @@ mod url;
 
 pub use error::{Error, UrlProblem, VarProblem};
 pub use expand::Env;
+pub use once::{Endpoint, EndpointError, RemoteResult, RemoteTool};
 pub use policy::{DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, McpPolicy};
 pub use servers::McpServers;
 pub use text::MAX_RESULT_BYTES;

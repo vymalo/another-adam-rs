@@ -355,3 +355,68 @@ fn the_bound_stage_can_be_printed() {
     let def = family("", "", "");
     assert!(format!("{def:?}").contains("AgentDef"));
 }
+
+// --- tool sources ----------------------------------------------------------------------------
+
+/// A source that offers `ping` to every agent and answers it.
+struct PingSource;
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for PingSource {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        vec![ToolSpec {
+            name: "ping".into(),
+            description: "ping".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        (name == "ping").then(|| Ok(ToolOutput::text("pong")))
+    }
+}
+
+#[tokio::test]
+async fn a_tool_source_is_given_to_every_agent_and_the_model_is_offered_its_tools() {
+    let model = mock();
+    model
+        .push_tool_calls(vec![adam_model::ToolCall {
+            id: "c1".into(),
+            name: "ping".into(),
+            arguments: json!({}),
+        }])
+        .push_text("done");
+    let assembly = def(&[(INSTRUCTIONS, &instructions("name: coder", "Root."))])
+        .bind(tools(&["own"]))
+        .unwrap()
+        .tool_source(PingSource)
+        .model(model.clone(), "gateway")
+        .unwrap();
+    let rt = runtime(&assembly);
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start("coder", adam_llm_agent::user_message("go"), None)
+        .await
+        .unwrap();
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let requests = model.requests();
+    let offered: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        offered,
+        ["own", "ping"],
+        "its own tools first, then the source's"
+    );
+    assert_eq!(view.output.unwrap()["text"], "done");
+    // The source's answer was the tool result.
+    assert_eq!(
+        requests[1].messages.last(),
+        Some(&adam_model::Message::tool_result("c1", "pong"))
+    );
+}

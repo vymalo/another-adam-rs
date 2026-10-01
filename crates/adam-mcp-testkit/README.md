@@ -49,6 +49,30 @@ server.restart().await;                 // the same port again, with no sessions
 The server keeps its counters across `restart`, so a test can say "one `initialize`, then one more after the server
 came back".
 
+## The thread-tools endpoint
+
+`ThreadToolsServer` is a fake of the orchestration layer's per-thread tool endpoint
+([`thread-tools-v1`](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/thread-tools-v1.md)), in the
+shape the real one has: **stateless** streamable HTTP at `/thread-tools/{thread}/mcp` (rmcp's `StreamableHttpService`
+over a `NeverSessionManager`, JSON responses, no session id), a bearer check that answers `401` with
+`WWW-Authenticate: Bearer error="invalid_token"` for a token that is not on its list (`Bearer` alone for none), and a
+tool list computed on every request, so a tool added a moment ago is listed at once. It is how `adam-ui` and the
+coder's end-to-end tests meet an agent's thread-tools client.
+
+```rust
+let server = ThreadToolsServer::start(&["good-token"]).await;
+let url = server.url("thread-1");                         // http://127.0.0.1:<port>/thread-tools/thread-1/mcp
+server.set_catalog(Some((id, 2, digest, document)));      // what `get_ui_catalog` answers (none: isError)
+server.add_tool("relay__search", "Search.", schema, "found");   // listed from the next request; a call answers "found {args}"
+server.remove_tool("relay__search");
+server.set_tokens(&["another"]);                          // rotate what is accepted
+server.lists(); server.calls(); server.catalog_requests();   // what it was asked
+server.authorizations(); server.refused();                 // the headers it saw, and the 401s
+```
+
+`get_ui_catalog` has the contract's input (`knownDigest?`) and output (`structuredContent` and the same JSON as text:
+`{catalogId, version, digest, unchanged, catalog?}`); a name nobody owns is the protocol error `-32602`.
+
 ## Test helpers
 
 * `LogCapture::start()`: everything logged on this thread (at every level, so from `rmcp`, `hyper` and `reqwest`
@@ -62,4 +86,4 @@ came back".
 ## Tests
 
 `tests/stdio.rs` (see [`adam-mcp`](../adam-mcp/README.md#tests)). The rest of the kit is exercised by the tests
-that use it.
+that use it: `ThreadToolsServer` by `adam-mcp`'s `tests/endpoint.rs` and `adam-ui`'s `tests/`.
