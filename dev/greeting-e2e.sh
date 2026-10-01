@@ -19,7 +19,8 @@
 #      one-sentence summary, both read here from the folder the stack mounts (bin/adam-coder/agent),
 #      and asks which repository and what to change. No tool ran: there is no artifact. The greeting
 #      was written as it arrived (`text-stream/v1`, which the script activates): at least two `reply`
-#      chunks that add up to the question, and the question names the stream of the chunks.
+#      chunks that add up to the question, and the question names the stream of the chunks. The
+#      `reply` chunks are the answer's words, not a tool's artifact: they do not count as one.
 #   2. A message to the same task names http://git-server:8080/local/sandbox.git: the run goes on
 #      with the script and ends TASK_STATE_COMPLETED with a `branch` and a `pull_request` artifact.
 #   3. (unless NO_RESTART=1) a copy of the folder with `display_name: Cody` is mounted in its place
@@ -132,8 +133,10 @@ last_state() {
 words_of() {
   jq -r --arg s "$1" 'select((.result.statusUpdate.status.state // .result.task.status.state) == $s) | [.. | .text? // empty] | join(" ")' "$tmp/events.jsonl" | tail -n 1
 }
+# The names of the artifacts the run made. The `reply` chunks are not among them: they are the
+# words of the answer sent as they are written (`text-stream/v1`), not something a tool made.
 artifact_names() {
-  jq -r 'select(.result.artifactUpdate) | .result.artifactUpdate.artifact.name' "$tmp/events.jsonl" | sort -u | tr '\n' ' '
+  jq -r 'select(.result.artifactUpdate and .result.artifactUpdate.artifact.name != "reply") | .result.artifactUpdate.artifact.name' "$tmp/events.jsonl" | sort -u | tr '\n' ' '
 }
 
 # greets <name> <summary>: the last `send` was "Hi" and the answer is the greeting of that persona.
