@@ -132,6 +132,57 @@ pub struct PushedBranch {
     pub base: Option<String>,
 }
 
+/// What the person answered to a question a tool wrote for them (see [`consent`](super::consent)):
+/// the answer to `request_repository` ("may this repository join the workspace?").
+///
+/// Recorded by the agent before each step from the conversation, never from what the model says,
+/// and kept whether the person said yes or an explicit no: a no is remembered so that the tool does
+/// not ask again. An answer that is neither (`wait`, `?`) is not recorded, and the question can be
+/// asked again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Consent {
+    /// The tool call that asked. A provider may send the same id again in a later turn, so a
+    /// consent is told apart by its `subject` and `tool` as well.
+    pub call_id: String,
+    /// The tool that asked.
+    pub tool: String,
+    /// What the person was asked about: the repository's [`named`](super::named) key.
+    pub subject: String,
+    /// Whether the answer was a yes (`consent::answer_of`); an explicit no is recorded too, and any
+    /// other answer is not recorded at all.
+    pub agreed: bool,
+}
+
+/// A repository this run created (`create_repository`, after the person agreed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedRepo {
+    /// `owner/name`, lowercase, as the call spelled it: what a repeated call is recognised by.
+    pub full_name: String,
+    /// The repository as a [`named`](super::named) key **of its clone URL**: the grant, which is what
+    /// `prepare_workspace` and `publish_scratch` compare their argument with.
+    pub key: String,
+    /// The URL to clone and push over HTTP, as the host said.
+    pub clone_url: String,
+    /// The browser URL.
+    pub html_url: String,
+    /// Whether it was created private.
+    pub private: bool,
+}
+
+/// A repository creation that was begun and whose outcome this run has not noted: written by
+/// `create_repository` **before** it asks the host, and removed when the creation is noted or the
+/// host definitely refused it. One that is still here when `create_repository` is called again is
+/// what a process that died between the host's answer and the note leaves: a name that "already
+/// exists" is then the run's own repository (`create_repository` looks it up and adopts it) and not
+/// somebody else's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreationIntent {
+    /// `owner/name`, lowercase, as the call spelled it (the key of [`CreatedRepo::full_name`]).
+    pub full_name: String,
+    /// The visibility the person agreed to.
+    pub private: bool,
+}
+
 /// Everything remembered about one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunNotes {
@@ -149,11 +200,24 @@ pub struct RunNotes {
     /// (see `CoderAgent`) instead of completing.
     #[serde(default)]
     pub blocker: Option<String>,
-    /// The repositories the person named in their own messages of this run (the task and every
-    /// answer), as [`named`](super::named) keys. `prepare_workspace` works on no other. Filled by
-    /// the agent before each step from the conversation, never from what the model says.
+    /// The repositories that may be in this run's workspace, as [`named`](super::named) keys:
+    /// **granted** keys. `prepare_workspace` and `publish_scratch` work on no other. A key is
+    /// granted when the person named it in their own messages of this run (the task and every
+    /// answer), or agreed to the question `request_repository` wrote for it ([`consents`](Self::consents)).
+    /// Filled by the agent before each step from the conversation, never from what the model says.
     #[serde(default)]
     pub named_repos: Vec<String>,
+    /// The answers the person gave to the questions the coder's tools wrote (`request_repository`,
+    /// `create_repository`), in order. Filled by the agent before each step from the conversation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consents: Vec<Consent>,
+    /// The repositories this run created, in order. Written by `create_repository` itself, which
+    /// also grants the repository's key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_repos: Vec<CreatedRepo>,
+    /// The repository creations begun and not settled (see [`CreationIntent`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub creating: Vec<CreationIntent>,
     /// The branches that this run and the earlier tasks of the conversation pushed work for, which
     /// `prepare_workspace` may continue with its `branch`. `commit_and_push` writes its own; the
     /// agent adds, before each step, the ones in the notes of the run this one continues (and,
@@ -213,6 +277,75 @@ impl RunNotes {
             }
         }
         added
+    }
+
+    /// Remember the answers `consents` of the person, and grant the repository of every one that
+    /// agreed to `request_repository`'s question; returns whether anything was new. A consent is
+    /// the same as one already held when its call, tool and subject are, so recording the answers
+    /// of the whole conversation again at every step changes nothing.
+    pub fn record_consents(&mut self, consents: impl IntoIterator<Item = Consent>) -> bool {
+        let mut added = false;
+        for consent in consents {
+            if consent.agreed && consent.tool == super::consent::REQUEST_REPOSITORY {
+                added |= self.name_repos([consent.subject.clone()]);
+            }
+            let known = self.consents.iter().any(|c| {
+                c.call_id == consent.call_id
+                    && c.tool == consent.tool
+                    && c.subject == consent.subject
+            });
+            if !known {
+                self.consents.push(consent);
+                added = true;
+            }
+        }
+        added
+    }
+
+    /// Whether a creation of exactly this repository and visibility was begun and not settled.
+    pub fn is_creating(&self, full_name: &str, private: bool) -> bool {
+        self.creating
+            .iter()
+            .any(|c| c.full_name == full_name && c.private == private)
+    }
+
+    /// Note that a creation is about to be asked of the host; returns whether it was new.
+    pub fn begin_creating(&mut self, full_name: &str, private: bool) -> bool {
+        if self.is_creating(full_name, private) {
+            return false;
+        }
+        self.creating.push(CreationIntent {
+            full_name: full_name.to_owned(),
+            private,
+        });
+        true
+    }
+
+    /// Forget the creations of `full_name` (whatever the visibility): the host refused it, or it is
+    /// noted in [`created_repos`](Self::created_repos). Returns whether anything was removed.
+    pub fn settle_creating(&mut self, full_name: &str) -> bool {
+        let before = self.creating.len();
+        self.creating.retain(|c| c.full_name != full_name);
+        self.creating.len() != before
+    }
+
+    /// Whether the person agreed to `subject` when `tool` asked: the latest answer decides.
+    pub fn agreed(&self, tool: &str, subject: &str) -> bool {
+        self.consents
+            .iter()
+            .rev()
+            .find(|c| c.tool == tool && c.subject == subject)
+            .is_some_and(|c| c.agreed)
+    }
+
+    /// Whether the person was asked about `subject` by `tool` and said no (and has not said yes
+    /// since: the latest answer decides).
+    pub fn declined(&self, tool: &str, subject: &str) -> bool {
+        self.consents
+            .iter()
+            .rev()
+            .find(|c| c.tool == tool && c.subject == subject)
+            .is_some_and(|c| !c.agreed)
     }
 
     /// Remember the branches `pushed` names; returns whether anything was new.

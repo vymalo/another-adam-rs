@@ -139,7 +139,7 @@ external systems the code talks to, and a local git remote. Ports bind to
 `127.0.0.1` only and every credential in the file is a dummy.
 
 ```sh
-docker compose up -d --wait        # postgres, mongodb, mock-openai, mock-github, git-server
+docker compose up -d --wait        # postgres, mongodb, mock-openai, mock-github, mock-github-mcp, git-server
 docker compose --profile app up -d --build --wait   # ... plus the coder and the general agent, wired to the mocks
 docker compose down -v             # stop and forget all state (volumes included)
 ```
@@ -149,13 +149,14 @@ docker compose down -v             # stop and forget all state (volumes included
 | `postgres` | `127.0.0.1:5432` | PostgreSQL 16, database `adam_test`, user and password `postgres` |
 | `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone |
 | `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (`/v1/chat/completions` and `/chat/completions`, plus `/v1/models`); the models `mock-coder`, `mock-opencode`, `mock-assistant` and `mock-researcher` are scripted (see "Scripted models") |
-| `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests) and the GitHub App token trade (`POST /app/installations/{id}/access_tokens`: a JWT for an installation token that lasts four minutes) |
+| `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests, create a repository, the owner's kind, the login) and the GitHub App token trade (`POST /app/installations/{id}/access_tokens`: a JWT for an installation token that lasts four minutes) |
+| `mock-github-mcp` | `http://127.0.0.1:8085/mcp` | WireMock: the GitHub MCP server's streamable HTTP endpoint, as the coder reads GitHub through it: behind a bearer (`401` without), `initialize`, `tools/list` (the twelve read tools of the coder's allow-list) and `tools/call` of `get_me` and `list_branches`; any other tool is an error result "not scripted". The coder's `mcp.json` in this stack is `dev/coder-agent/mcp.json`, mounted over the folder's (production starts the real `github-mcp-server` as a child process) |
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git` and creating an empty repository on first use for the owners of `AUTO_CREATE_OWNERS` (`scratch` in the compose file); no authentication |
 | `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token`; its agent files are the folder `bin/adam-coder/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`, see "Changing what the coder says") |
 | `agent` (profile `app`) | `http://127.0.0.1:8084/` | the general agent: `adam-agent` from the **coder's image** (`entrypoint: ["tini", "--", "adam-agent"]`, so there is no second image), bearer token `dev-token`, serving the folder `dev/agents/assistant/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`); model `mock-assistant`; shares the coder's database (runs are scoped by the agent's name). See "A general agent from a folder" |
 
 Host ports can be moved with `POSTGRES_PORT`, `MONGODB_PORT`, `MOCK_OPENAI_PORT`,
-`MOCK_GITHUB_PORT`, `GIT_SERVER_PORT`, `CODER_PORT` and `AGENT_PORT` (for example in a `.env`
+`MOCK_GITHUB_PORT`, `MOCK_GITHUB_MCP_PORT`, `GIT_SERVER_PORT`, `CODER_PORT` and `AGENT_PORT` (for example in a `.env`
 file next to `compose.yaml`).
 
 ### Pointing the code at the mocks
@@ -218,6 +219,33 @@ body); `GET` requests can only use the header.
 | `already-exists` (on the `POST`) | `422` "A pull request already exists", and the **next** `GET` returns a pull request (#42) once, then the mock is back to normal: a lost race with another opener |
 | a `head` query containing `already-open` | the list returns pull request #7, so opening is idempotent |
 
+`dev/wiremock/mock-github/mappings/repos.json` is what the coder's `create_repository` needs
+([ADR 0009](docs/decisions/0009-github-per-installation-read-through-mcp.md), decision 9): `GET /users/{owner}` says
+`local` and `scratch` are organisations and any other owner a user, `GET /user` is `dev-user` and, for an
+installation token (`Bearer ghs_...`), `403 Resource not accessible by integration` (what GitHub says: a GitHub App
+has no user), and `POST /orgs/{owner}/repos` and `POST /user/repos` answer `201` with the repository as GitHub
+describes a new empty one, whose `clone_url` is `http://git-server:8080/<owner>/<name>.git` (git-server makes an
+empty repository for the owners of `AUTO_CREATE_OWNERS` on first use). The scenario `already-exists` (the keyword
+`[mock:already-exists]` in the body, or the header) answers `422 name already exists on this account`, and
+`Bearer bad-token` is `401`. The stack's coder has `CREATE_REPO_OWNERS: scratch`.
+
+### `mock-github-mcp`
+
+The coder reads GitHub through the official GitHub MCP server, read-only ([ADR
+0009](docs/decisions/0009-github-per-installation-read-through-mcp.md); "GitHub over MCP" in
+[`bin/adam-coder`](bin/adam-coder/README.md#github-over-mcp-read-only)). Production starts the real binary inside
+the coder image; this stack has no GitHub to talk to, so the mock stands in for it over the streamable HTTP
+transport and the coder's `mcp.json` is `dev/coder-agent/mcp.json`, mounted over the folder's own (the
+folder in `CODER_AGENT_DIR` must therefore have an `mcp.json`: a copy of `bin/adam-coder/agent` does). The coder is
+given `MCP_ALLOW_INSECURE=true` for it (plain `http` to another container; development only).
+
+Every `POST /mcp` needs `Authorization: Bearer <anything>` (the dev file sends `dev-github-mcp-token`) or gets
+`401`. The mock answers JSON (no session id, no standalone stream, `GET` and `DELETE` are `405`), which is
+what `rmcp`, the client of `adam-mcp`, accepts (*verified* by `cargo test -p adam-mcp --test wiremock_compose`,
+which CI runs against this service). Its scripted answers: `get_me` is `{"login":"dev-user"}`, `list_branches`
+is `[{"name":"main"}]`; the other ten tools are listed with their schemas and answer an error result.
+`dev/coder-e2e.sh` reads the mock's journal, see below.
+
 ### `git-server`
 
 ```sh
@@ -230,7 +258,7 @@ name. It has no authentication (any credentials are accepted) and its
 repositories live in the `git-data` volume. The layout is
 `/<owner>/<repo>.git`, the shape `adam-workspace` and the mock GitHub expect.
 
-It is seeded with every directory `dev/git-server/seed/<owner>/<name>/` (today `local/sandbox`), each
+It is seeded with every directory `dev/git-server/seed/<owner>/<name>/` (today `local/sandbox`, and `local/library`, a second repository with a `greeting.txt`, for the `second-repo` scenario below), each
 once. And it behaves like a place where repositories can be **created**: a request for
 `/<owner>/<name>.git` of an owner in `AUTO_CREATE_OWNERS` (a comma or space list; `scratch` in
 `compose.yaml`, empty means none) makes the bare repository first, empty, on branch `main`, with pushes
@@ -258,20 +286,28 @@ result; CI runs it on the image it has just built (`.github/workflows/coder.yml`
 step "Compose e2e"):
 
 ```sh
-docker compose --profile app up -d --build --wait postgres mock-openai mock-github git-server coder
+docker compose --profile app up -d --build --wait postgres mock-openai mock-github mock-github-mcp git-server coder
 sh dev/coder-e2e.sh                 # OpenCode makes the change
 NO_OPENCODE=1 sh dev/coder-e2e.sh   # the check command makes it, OpenCode is not started
 SCENARIO=files sh dev/coder-e2e.sh  # the coder reads and writes the file itself (read_file, write_file)
 SCENARIO=scratch sh dev/coder-e2e.sh  # no repository is named: a scratch project, published to one named later
+SCENARIO=second-repo sh dev/coder-e2e.sh              # another repository joins the workspace, the person says yes
+SCENARIO=second-repo ANSWER=no sh dev/coder-e2e.sh    # ... and with a no it does not
+SCENARIO=create-repo sh dev/coder-e2e.sh              # a repository is created for the scratch project, the person says yes
+SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh    # ... and with a no it is not
 ```
 
 The script sends the task with `SendStreamingMessage`, waits for
 `TASK_STATE_COMPLETED`, and checks that the `checks` (the last one passed, bound to the pushed commit), `branch` and `pull_request`
 artifacts are there, that `mock-github` saw exactly one
 `POST /repos/local/sandbox/pulls` (head = the branch, base = `main`), and that
-`git-server` has the branch with `hello.txt` containing `hello`. `TIMEOUT`,
-`CODER_URL`, `CODER_TOKEN`, `MOCK_GITHUB_URL` and `GIT_SERVER_URL` override the
-defaults (see the script's header).
+`git-server` has the branch with `hello.txt` containing `hello`. It also checks the GitHub MCP side: the journal of
+`mock-github-mcp` (not reset: the coder connects the server when it starts, before the script) holds `initialize` and
+`tools/list`, and the default scenario (the one with OpenCode, whose script reads `github__list_branches` right after
+`prepare_workspace`) added exactly one `tools/call` of `list_branches`, with the dev bearer, and the model was given
+its answer (the `mock-openai` journal has a request whose history holds the tool message that names `main`); every
+other scenario adds none. `TIMEOUT`, `CODER_URL`, `CODER_TOKEN`, `MOCK_GITHUB_URL`, `MOCK_GITHUB_MCP_URL`,
+`MOCK_OPENAI_URL` and `GIT_SERVER_URL` override the defaults (see the script's header).
 
 `SCENARIO=scratch` is two messages. The task names no repository ("Write a fib.sh that prints the first 7
 Fibonacci numbers. I'll give you the repo later."), so the coder builds `fib.sh` and its check in a scratch
@@ -284,6 +320,31 @@ plus that `main` is the one empty commit the coder gave it, that `fib.sh` is on 
 **tree** the checks ran on in the scratch project is the tree of the pushed commit: what was checked is what
 was pushed. `<id>` is new on every run, so a rerun on one stack never meets the last one's repository.
 
+`SCENARIO=second-repo` is two messages as well, and is about consent. The task names `local/sandbox` and asks for
+"our shared greeting", which lives in `local/library`. The coder prepares the sandbox, then calls
+`request_repository` for the library with a reason, and the task waits (`TASK_STATE_INPUT_REQUIRED`) on a question
+the tool wrote: `May I add the repository local/library ...`, with the reason quoted and the options `Yes, add
+local/library` and `No` (the script sends no screen, so they are in the text). The script checks that, that no pull
+request exists and that git-server has **not** been asked for `local/library` since the script began (the
+repository is seeded, so only git-server's access log tells: `GIT_SERVER_LOGS` is the command that prints it, by
+default `docker compose logs --no-color git-server`; the check is skipped, and says so, where that is not
+readable). Then it sends the answer, `ANSWER` (`yes` by default). With `yes` the task completes: the pull request
+is for the sandbox, `hello.txt` on its branch holds the library's `hello from library`, and git-server was asked
+for `local/library` after the answer. With `no` the task waits again (the coder says it could not add the
+library), git-server was never asked for `local/library` and no pull request was opened.
+
+`SCENARIO=create-repo` is three messages. Like `scratch`, the task names no repository: the coder builds `fib.sh` in a
+scratch project and says it can create a repository for it, and the task waits. The second message ("Create
+scratch/fib-<id> and put it there") makes it call `create_repository`: the task waits again, on a question the tool
+wrote (`May I create the repository scratch/fib-<id> on git-server? It will be private and empty.`), and the
+script checks that `mock-github` has seen no `POST /orgs/scratch/repos` and git-server does not know the repository.
+The third message is the answer, `ANSWER` (`yes` by default). With `yes` mock-github saw **exactly one** `POST
+/orgs/scratch/repos`, for that name, `private: true` and `auto_init: false`, and the task completes as `scratch`
+does: the project is published to the new repository (empty, until then), `main` is the one empty commit and the pull
+request is for it. With `no` the creation is never made, git-server never hears of the repository, no pull
+request is opened and the task waits. (`CREATE_REPO_OWNERS=scratch` is in `compose.yaml`; the App-mode run creates in
+the organisation too, since an installation token has no user.)
+
 #### The coder as a GitHub App installation
 
 An installation is a token or a GitHub App, never both
@@ -295,7 +356,7 @@ trades it at `mock-github` for an installation token and gives that to `git` and
 
 ```sh
 docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app up -d --build --wait \
-  postgres mock-openai mock-github git-server coder
+  postgres mock-openai mock-github mock-github-mcp git-server coder
 GITHUB_AUTH=app sh dev/coder-e2e.sh                  # likewise NO_OPENCODE=1, SCENARIO=files, SCENARIO=scratch
 ```
 
@@ -425,10 +486,12 @@ request gets the same answer and the script cannot drift out of step.
 
 | Model | Mapping | Script |
 |---|---|---|
-| `mock-coder` | `mappings/coder-script.json` | `prepare_workspace` (`http://git-server:8080/local/sandbox.git`, `main`, id `coder-call-1`), `delegate_to_opencode` (create `hello.txt` containing `hello`, `coder-call-2`), `run_checks` (`sh ./check.sh`, `coder-call-3`), `commit_and_push` (`coder-call-4`), `open_pull_request` (`coder-call-5`), then a final text (`stop`). Also as a stream (see below). |
+| `mock-coder` | `mappings/coder-script.json` | `prepare_workspace` (`http://git-server:8080/local/sandbox.git`, `main`, id `coder-call-1`), `github__list_branches` (`local/sandbox`, read through `mock-github-mcp`, id `coder-gh-1`), `delegate_to_opencode` (create `hello.txt` containing `hello`, `coder-call-2`), `run_checks` (`sh ./check.sh`, `coder-call-3`), `commit_and_push` (`coder-call-4`), `open_pull_request` (`coder-call-5`), then a final text (`stop`). Also as a stream (see below). |
 | `mock-coder`, the person's first message is a greeting (`hi`, `hello` or `hey`, then anything) | same file | a text answer (`stop`): `Hi! I'm <name>. <summary>. Which repository should I work on, and what should I change?`, **built from the first two lines of the system prompt** (`messages[0]`: `Your name is <name>.` and `In one sentence: <summary>.`, the persona lines the coder's `agent/instructions.md` opens with), so editing the instructions, or mounting another folder, changes the mocked answer. The run then waits for the person (`input-required`); the answer to it (the synthetic `ask_user` call `stop0000N` is in the history) continues with `prepare_workspace` (`coder-call-1`) and the script above. A greeting needs a system message first: a request with the user message alone is not one. |
 | `mock-coder`, task text contains `[mock:no-opencode]` | same file | `prepare_workspace` (`nc-call-1`), `run_checks` with `echo hello > hello.txt && sh ./check.sh` (the check command makes the change, `nc-call-2`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started: deterministic where OpenCode's own behaviour is not the subject. |
 | `mock-coder`, task text contains `[mock:files]` | same file | the coder edits the files itself, ids `fl-call-N`: `prepare_workspace` (`fl-call-1`), `read_file` `README.md` (`fl-call-2`), `write_file` `hello.txt` with `hello` (`fl-call-3`), `run_checks` (`sh ./check.sh`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started. `dev/coder-e2e.sh` runs it with `SCENARIO=files`. |
+| `mock-coder`, task text contains `[mock:second-repo]` | same file | ids `sr-call-N`: `prepare_workspace` (`local/sandbox`), `request_repository` (`http://git-server:8080/local/library.git`, a reason), which parks the run on the tool's question; once the answer is in the history, `prepare_workspace` (`local/library`), and then by what that said. **Added** (its `slot: library` is in the result): `read_file` (`greeting.txt`, `repo: library`), `write_file` (`hello.txt` in the sandbox, `hello from library`), `run_checks`, `commit_and_push` and `open_pull_request` (all `repo: sandbox`), final text. **Refused** (the refusal text is in the result): a final text that says the library could not be added, which parks the run. `dev/coder-e2e.sh` runs it with `SCENARIO=second-repo` and `ANSWER=yes` or `no`, and `wiremock_compose` plays both ways, in both forms. |
+| `mock-coder`, task text contains `[mock:create-repo] fib-<hex>` | same file | ids `cr-call-N`: `start_scratch`, two `write_file`, `run_checks`, a **text question** (it can create a repository), which parks the run. Once the person's answer holds `Create scratch/`: `create_repository` (`scratch`, `fib-<hex>`, a description; the name taken from the task text with `regexExtract`), which parks the run on the tool's question; once its answer is in the history, `create_repository` again. Then by what the tool said. **Created** (`(private, empty` is in the result): `publish_scratch` (`http://git-server:8080/scratch/fib-<hex>.git`), `commit_and_push` and `open_pull_request` (`repo: fib-<hex>`), final text. **Declined** (`declined` is in the result): a final text that says the repository was not created, which parks the run. `dev/coder-e2e.sh` runs it with `SCENARIO=create-repo` and `ANSWER=yes` or `no`, and `wiremock_compose` plays both ways, in both forms. |
 | `mock-coder`, task text contains `[mock:scratch] fib-<hex>` | same file | no repository is named, ids `sc-call-N`: `start_scratch` (`fib`), `write_file` `fib.sh` and `check.sh`, `run_checks` (`repo: fib`, `sh ./check.sh`), then a **text question** (which repository should I publish it to), which parks the run. Once the person's answer holds `Publish it to` (and the stop's `ask_user` call is in the history, which the greeting's second step also reads: that step excludes this switch): `publish_scratch` (`http://git-server:8080/scratch/fib-<hex>.git`, the repository named in the task text with `regexExtract`, so reruns on one stack never collide), `commit_and_push` and `open_pull_request` (both `repo: fib-<hex>`, the slot of the new repository), final text. OpenCode is never started. `dev/coder-e2e.sh` runs it with `SCENARIO=scratch`, and `wiremock_compose` plays it, in both forms, with the answer in the shape the coder gives it. |
 | `mock-coder`, task text contains `[mock:choices]` | `mappings/coder-choices.json` | `ask_user` (`choices-call-1`) with the question `Three quick questions before I start` and three `choices`: `db` (`pg`, `sqlite`), `auth` (`keycloak`, `none`), `deploy` (`k8s`, `compose`), priority 1; once its result holds `db: pg` (how the person's answers read to the model) the text `Going with Postgres, Keycloak and Compose.` (`stop`), priority 1; any other answers, `Thanks, I have your answers.`, priority 2. No workspace or repository is touched. `dev/coder-choices-e2e.sh` runs it through the stack. |
 | `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |

@@ -10,7 +10,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::code_host::{CodeHost, NewPullRequest, PullRequest};
+use crate::code_host::{
+    CodeHost, CreatedRepository, NewPullRequest, NewRepository, OwnerKind, PullRequest,
+};
 use crate::credentials::DynGitCredentials;
 use crate::error::{WorkspaceError, WorkspaceResult};
 use crate::repo::RepoRef;
@@ -207,6 +209,149 @@ impl CodeHost for GitHub {
             .map_err(|e| transport(e, &token))?;
         check(resp, &token).await.map(|_| ())
     }
+
+    #[tracing::instrument(skip(self, new), fields(repo = %new.repo.url, private = new.private))]
+    async fn create_repository(
+        &self,
+        new: NewRepository,
+    ) -> Result<CreatedRepository, WorkspaceError> {
+        // The credentials are asked for the address the repository will have: the host check and
+        // the token are those of that host, before anything is sent.
+        let token = self.creds.token_for(&new.repo).await?;
+        let (owner, name) = slug(&new.repo)?;
+        let path = match new.kind {
+            OwnerKind::Organization => format!("/orgs/{owner}/repos"),
+            OwnerKind::User => "/user/repos".to_owned(),
+        };
+        let mut body = json!({"name": name, "private": new.private, "auto_init": false});
+        if let Some(description) = &new.description {
+            body["description"] = json!(description);
+        }
+        let resp = self
+            .request(Method::POST, &path, &token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        let resp = check(resp, &token).await?;
+        let created: ApiRepository = resp.json().await.map_err(|e| decode_error(e, &token))?;
+        Ok(CreatedRepository {
+            full_name: created.full_name,
+            clone_url: created.clone_url,
+            html_url: created.html_url,
+            default_branch: created.default_branch.unwrap_or_else(|| "main".to_owned()),
+        })
+    }
+
+    #[tracing::instrument(skip(self, repo), fields(repo = %repo.url))]
+    async fn find_repository(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<Option<CreatedRepository>, WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        let (owner, name) = slug(repo)?;
+        let resp = self
+            .request(Method::GET, &format!("/repos/{owner}/{name}"), &token)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        let found = match check(resp, &token).await {
+            Ok(resp) => resp,
+            Err(WorkspaceError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let found: ApiRepository = found.json().await.map_err(|e| decode_error(e, &token))?;
+        Ok(Some(CreatedRepository {
+            full_name: found.full_name,
+            clone_url: found.clone_url,
+            html_url: found.html_url,
+            default_branch: found.default_branch.unwrap_or_else(|| "main".to_owned()),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, host_repo), fields(owner))]
+    async fn owner_kind(
+        &self,
+        owner: &str,
+        host_repo: &RepoRef,
+    ) -> Result<OwnerKind, WorkspaceError> {
+        let token = self.creds.token_for(host_repo).await?;
+        // The login is a path segment: only what a login can be.
+        if owner.is_empty()
+            || !owner
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(WorkspaceError::Invalid(format!(
+                "{owner:?} is not an account name"
+            )));
+        }
+        let resp = self
+            .request(Method::GET, &format!("/users/{owner}"), &token)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        let account: ApiAccount = check(resp, &token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, &token))?;
+        Ok(if account.kind.eq_ignore_ascii_case("Organization") {
+            OwnerKind::Organization
+        } else {
+            OwnerKind::User
+        })
+    }
+
+    #[tracing::instrument(skip(self, host_repo))]
+    async fn authenticated_login(
+        &self,
+        host_repo: &RepoRef,
+    ) -> Result<Option<String>, WorkspaceError> {
+        let token = self.creds.token_for(host_repo).await?;
+        let resp = self
+            .request(Method::GET, "/user", &token)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        // An installation token is not a user: GitHub answers `GET /user` with 403 "Resource not
+        // accessible by integration". That is "no login", not a failure.
+        if resp.status() == StatusCode::FORBIDDEN && !is_rate_limited(&resp) {
+            return Ok(None);
+        }
+        let account: ApiAccount = check(resp, &token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, &token))?;
+        Ok(account.login)
+    }
+}
+
+/// What a repository creation answers.
+#[derive(Deserialize)]
+struct ApiRepository {
+    full_name: String,
+    clone_url: String,
+    html_url: String,
+    default_branch: Option<String>,
+}
+
+/// A user or an organisation (`GET /users/{login}`, `GET /user`).
+#[derive(Deserialize)]
+struct ApiAccount {
+    login: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: String,
+}
+
+/// Whether a response says its rate limit is used up (as [`check`] reads it).
+fn is_rate_limited(resp: &Response) -> bool {
+    resp.status() == StatusCode::TOO_MANY_REQUESTS
+        || resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .is_some_and(|v| v == "0")
 }
 
 #[derive(Deserialize)]

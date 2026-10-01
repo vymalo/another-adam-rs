@@ -546,3 +546,278 @@ async fn a_transport_failure_keeps_the_reqwest_error_as_its_source() {
     );
     assert!(!adam_error::report(&err).contains(TOKEN));
 }
+
+// ------------------------------------------------------------------ creating a repository
+
+mod create {
+    use super::*;
+    use adam_workspace::{NewRepository, OwnerKind};
+
+    fn at(owner: &str, name: &str) -> RepoRef {
+        RepoRef::new(format!("https://github.com/{owner}/{name}"), "main")
+    }
+
+    fn new(owner: &str, name: &str, kind: OwnerKind) -> NewRepository {
+        NewRepository {
+            repo: at(owner, name),
+            private: true,
+            description: Some("a test".to_owned()),
+            kind,
+        }
+    }
+
+    fn api_repo(owner: &str, name: &str) -> serde_json::Value {
+        json!({
+            "full_name": format!("{owner}/{name}"),
+            "clone_url": format!("https://github.com/{owner}/{name}.git"),
+            "html_url": format!("https://github.com/{owner}/{name}"),
+            "default_branch": "main",
+            "private": true,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_organisation_repository_is_created_empty_and_private_with_the_documented_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/orgs/acme/repos"))
+            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+            .and(header("x-github-api-version", "2022-11-28"))
+            .and(body_json(json!({
+                "name": "fib", "private": true, "auto_init": false, "description": "a test"
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(api_repo("acme", "fib")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let created = client(&server)
+            .create_repository(new("acme", "fib", OwnerKind::Organization))
+            .await
+            .unwrap();
+        assert_eq!(created.full_name, "acme/fib");
+        assert_eq!(created.clone_url, "https://github.com/acme/fib.git");
+        assert_eq!(created.default_branch, "main");
+    }
+
+    #[tokio::test]
+    async fn a_users_repository_goes_to_user_repos_and_a_missing_description_is_not_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/user/repos"))
+            .and(body_json(
+                json!({"name": "fib", "private": false, "auto_init": false}),
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(api_repo("me", "fib")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut request = new("me", "fib", OwnerKind::User);
+        request.private = false;
+        request.description = None;
+        client(&server).create_repository(request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_exists_is_found_and_one_that_does_not_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/fib"))
+            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(api_repo("acme", "fib")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/none"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "Not Found"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let host = client(&server);
+        let found = host.find_repository(&at("acme", "fib")).await.unwrap();
+        assert_eq!(
+            found.map(|f| (f.full_name, f.clone_url)),
+            Some((
+                "acme/fib".to_owned(),
+                "https://github.com/acme/fib.git".to_owned()
+            ))
+        );
+        assert_eq!(
+            host.find_repository(&at("acme", "none")).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_name_is_invalid_and_a_refused_token_is_auth() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/orgs/acme/repos"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "Repository creation failed.",
+                "errors": [{"resource": "Repository", "code": "custom",
+                            "field": "name", "message": "name already exists on this account"}]
+            })))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .create_repository(new("acme", "fib", OwnerKind::Organization))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WorkspaceError::Invalid(m) if m.contains("already exists")),
+            "{err:?}"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"message": "Resource not accessible by integration"})),
+            )
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .create_repository(new("acme", "fib", OwnerKind::Organization))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::Auth(_)), "{err:?}");
+        assert!(!err.to_string().contains(TOKEN));
+    }
+
+    #[tokio::test]
+    async fn the_owner_is_an_organisation_or_a_user_by_what_github_says() {
+        let server = MockServer::start().await;
+        for (login, kind) in [("acme", "Organization"), ("octo", "User")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/users/{login}")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"login": login, "type": kind})),
+                )
+                .mount(&server)
+                .await;
+        }
+        let github = client(&server);
+        let host = at("x", "y");
+        assert_eq!(
+            github.owner_kind("acme", &host).await.unwrap(),
+            OwnerKind::Organization
+        );
+        assert_eq!(
+            github.owner_kind("octo", &host).await.unwrap(),
+            OwnerKind::User
+        );
+        // Not a path segment: refused before a request.
+        let err = github.owner_kind("a/b", &host).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::Invalid(_)));
+        let err = github.owner_kind("nobody", &host).await.unwrap_err();
+        assert!(matches!(err, WorkspaceError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_person_has_a_login_and_an_installation_token_has_none() {
+        let person = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"login": "octo", "type": "User"})),
+            )
+            .mount(&person)
+            .await;
+        assert_eq!(
+            client(&person)
+                .authenticated_login(&at("x", "y"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("octo")
+        );
+        // An installation token: GitHub says it is not a user.
+        let app = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"message": "Resource not accessible by integration"})),
+            )
+            .mount(&app)
+            .await;
+        assert_eq!(
+            client(&app)
+                .authenticated_login(&at("x", "y"))
+                .await
+                .unwrap(),
+            None
+        );
+        // A rate limit is a rate limit, not "no login".
+        let limited = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .respond_with(ResponseTemplate::new(403).insert_header("x-ratelimit-remaining", "0"))
+            .mount(&limited)
+            .await;
+        let err = client(&limited)
+            .authenticated_login(&at("x", "y"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::RateLimited { .. }), "{err:?}");
+        // A bad token is Auth.
+        let bad = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"message": "Bad credentials"})),
+            )
+            .mount(&bad)
+            .await;
+        let err = client(&bad)
+            .authenticated_login(&at("x", "y"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::Auth(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_create_says_so() {
+        // The defaults of the trait: no creation, no owner kind, no login.
+        struct Bare;
+        #[async_trait::async_trait]
+        impl CodeHost for Bare {
+            async fn open_pull_request(
+                &self,
+                _: NewPullRequest,
+            ) -> Result<PullRequest, WorkspaceError> {
+                unreachable!()
+            }
+            async fn find_pull_request(
+                &self,
+                _: &RepoRef,
+                _: &str,
+            ) -> Result<Option<PullRequest>, WorkspaceError> {
+                unreachable!()
+            }
+            async fn find_pull_request_on_head(
+                &self,
+                _: &RepoRef,
+                _: &str,
+            ) -> Result<Option<PullRequest>, WorkspaceError> {
+                unreachable!()
+            }
+            async fn comment_on_pull_request(
+                &self,
+                _: &RepoRef,
+                _: u64,
+                _: &str,
+            ) -> Result<(), WorkspaceError> {
+                unreachable!()
+            }
+        }
+        let err = Bare
+            .create_repository(new("a", "b", OwnerKind::User))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, WorkspaceError::Invalid(_)));
+        assert!(Bare.owner_kind("a", &at("a", "b")).await.is_err());
+        assert_eq!(Bare.authenticated_login(&at("a", "b")).await.unwrap(), None);
+    }
+}

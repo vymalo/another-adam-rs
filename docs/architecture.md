@@ -376,6 +376,9 @@ classDiagram
             <<interface>>
             open_pull_request()
             find_pull_request()
+            create_repository()
+            owner_kind()
+            authenticated_login()
         }
         class GitCredentials {
             <<interface>>
@@ -1943,6 +1946,16 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
   assemble with `CoderAgent::try_from_def`), and a folder's subagents are registered beside the coder. A restart applies an edit; there is no hot reload
   ([ADR 0004](decisions/0004-agent-folders-at-run-time.md)).
 * **Rules in code.**
+  * `prepare_workspace` and `publish_scratch` accept only a **granted** repository: one the person named, or
+    one the person agreed to add when `request_repository` asked
+    ([ADR 0008](decisions/0008-a-workspace-holds-several-repositories.md), decision 9). The question is the tool's
+    own (it names the repository and quotes the model's reason), the grant is recorded by the agent from the
+    person's answer to that call and from nothing the model says, and an explicit no is remembered so that it is not
+    asked again (any other message, `wait` or `?`, records nothing and the question can be asked again). See [`bin/adam-coder`](../bin/adam-coder/README.md#another-repository-only-with-the-persons-yes).
+  * `create_repository` makes a new, **empty** repository (private unless asked otherwise) for an owner `CREATE_REPO_OWNERS`
+    names, only after the person says yes to a question the tool writes, once per owner, name and visibility; the
+    repository it makes is granted. A GitHub App creates for organisations only. See
+    [`bin/adam-coder`](../bin/adam-coder/README.md#a-repository-of-its-own-on-request).
   * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`
     refuses to run. `commit_and_push` and `open_pull_request` refuse too.
   * `open_pull_request` refuses unless the pushed `HEAD` is the current commit
@@ -2016,6 +2029,15 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     gets to the shared `Redactor`, so a minted token is a secret from the moment it exists. The sequence and the
     states of the cached token are in the ADR and in the
     [`adam-workspace` README](../crates/adam-workspace/README.md#github-app-credentials).
+  * **GitHub is read through the official GitHub MCP server, read-only**
+    ([ADR 0009](decisions/0009-github-per-installation-read-through-mcp.md), decision 8). The coder's shipped
+    `agent/mcp.json` starts `github-mcp-server stdio --read-only` as a child process (the image carries it, pinned
+    by tag and digest, and sets `MCP_ALLOW_STDIO=true`), hands it the coder's own credentials by the names it reads
+    (`GITHUB_TOKEN` as `GITHUB_PERSONAL_ACCESS_TOKEN`, or the App's id, installation and key *file*; the other mode
+    is an empty variable, which the server counts as unset) and offers the model twelve of its tools as
+    `github__<name>`. Everything that writes stays the coder's own, behind the gate. The dev stack points the coder at
+    a WireMock of the server's HTTP endpoint instead (`dev/coder-agent/mcp.json`, `mock-github-mcp`). See
+    [`bin/adam-coder`](../bin/adam-coder/README.md#github-over-mcp-read-only).
   * OpenCode's child process gets `MODEL_API_KEY` through its environment (its
     config says `{env:MODEL_API_KEY}`, so the key is not inlined). `GITHUB_TOKEN`,
     `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` and `A2A_BEARER_TOKENS` are blanked in the child (they are the names the

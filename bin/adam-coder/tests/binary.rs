@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse, TaskState};
 use adam_core::{RunId, RunStatus};
 use common::pg::TestDb;
-use common::{chat_response, edit_instructions, folder, text_reply, tool_reply};
+// A folder here is the shipped agent without its `mcp.json` (the shipped one names the GitHub
+// server, a local process: see `common::plain_folder`); the tests of `mcp.json` write their own.
+use common::{chat_response, edit_instructions, plain_folder as folder, text_reply, tool_reply};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -34,15 +36,31 @@ struct Proc {
     readers: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// One folder for every test of this file that needs the shipped agent's files and no server of
+/// its `mcp.json`: made once, kept until the process ends.
+fn plain_agent_dir() -> &'static Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(folder).path()
+}
+
 /// The environment of a valid configuration, over an empty environment (plus
 /// `PATH` and `HOME`, which git and the shell need), so nothing of the
 /// developer's shell leaks in.
 ///
 /// The server binds port 0 (the operating system picks a free one, so parallel
 /// tests never collide) and logs the address it got; [`Proc::ready`] reads it.
+///
+/// The agent files are a folder: the shipped `agent/` without its `mcp.json` ([`plain_agent_dir`]),
+/// because the shipped file starts the GitHub MCP server, a local process that needs
+/// `MCP_ALLOW_STDIO` and the `github-mcp-server` binary. A test of the embedded copy removes
+/// `ADAM_AGENT_DIR`; [`the_embedded_agent_connects_the_real_github_mcp_server`] does, with both.
 fn valid_env(database_url: &str, workspace: &Path) -> Vec<(String, String)> {
     let env = |k: &str, v: String| (k.to_owned(), v);
     vec![
+        env(
+            "ADAM_AGENT_DIR",
+            plain_agent_dir().to_string_lossy().into_owned(),
+        ),
         env("DATABASE_URL", database_url.to_owned()),
         env("MODEL_BASE_URL", "http://127.0.0.1:9/v1".to_owned()),
         env("MODEL_API_KEY", String::new()),
@@ -692,7 +710,9 @@ async fn without_an_agent_folder_the_embedded_copy_is_served_and_logged() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    let mut p = Proc::spawn(&role_env("control-plane", &db.url(), tmp.path()));
+    let mut env = role_env("control-plane", &db.url(), tmp.path());
+    env.retain(|(k, _)| k != "ADAM_AGENT_DIR");
+    let mut p = Proc::spawn(&env);
     p.ready().await;
     let line = p
         .stdout()
@@ -860,6 +880,245 @@ async fn an_mcp_server_that_cannot_be_connected_stops_the_worker_with_the_code_o
             url.is_empty() || !err.contains(url),
             "the value of a variable is not in the failure:\n{err}"
         );
+    }
+    db.finish().await;
+}
+
+/// The shipped agent names the GitHub MCP server, a local process, so a worker on the embedded
+/// copy stops at startup unless the deployment allows local processes (`MCP_ALLOW_STDIO`, which
+/// the coder image sets) and the binary is there: 78 when it is not allowed, 69 when it is allowed
+/// and is not on `PATH` (a supervisor may retry: the image may be mid-roll). Never in the middle of
+/// a run, and never with a value of a variable in the message.
+#[tokio::test]
+async fn the_embedded_agent_needs_mcp_allow_stdio_and_the_github_server_on_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Failing before anything connects: Postgres need not exist.
+    let mut env = role_env("worker", "postgres://u:p@127.0.0.1:1/x", tmp.path());
+    env.retain(|(k, _)| k != "ADAM_AGENT_DIR");
+    let empty_path = tmp.path().join("no-binaries");
+    std::fs::create_dir_all(&empty_path).unwrap();
+    env.push(("PATH".into(), empty_path.to_string_lossy().into_owned()));
+
+    let mut p = Proc::spawn(&env);
+    let status = p.exit_within(Duration::from_secs(30)).await;
+    assert_eq!(status.code(), Some(78), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(err.contains("connecting the MCP servers"), "{err}");
+    assert!(err.contains("MCP_ALLOW_STDIO"), "{err}");
+    assert!(err.contains("github"), "the server is named:\n{err}");
+    assert!(!err.contains(GITHUB_TOKEN), "{err}");
+
+    env.push(("MCP_ALLOW_STDIO".into(), "true".into()));
+    let mut p = Proc::spawn(&env);
+    let status = p.exit_within(Duration::from_secs(30)).await;
+    assert_eq!(status.code(), Some(69), "{}", p.logs());
+    let err = failure(&p)["error"].as_str().unwrap().to_owned();
+    assert!(err.contains("github"), "{err}");
+    assert!(
+        err.contains("github-mcp-server"),
+        "the binary is named:\n{err}"
+    );
+    assert!(!err.contains(GITHUB_TOKEN), "{err}");
+}
+
+/// The shipped agent against the **real** `github-mcp-server` (the one the coder image carries,
+/// `ADAM_TEST_GITHUB_MCP_SERVER` = the path of that binary, for example copied out of the image
+/// with `docker cp`; skipped without it): a worker on the embedded copy connects it as a child
+/// process, the model is offered the twelve read tools and no write tool, a call reaches GitHub
+/// (a mock, through `GITHUB_MCP_HOST`) with the credentials of the mode the coder runs in, and no
+/// credential is in the logs. Two modes, in one test because they share the binary: a token (the
+/// server reads it as `GITHUB_PERSONAL_ACCESS_TOKEN`, and the `GITHUB_APP_*` variables the file
+/// passes are empty) and a GitHub App (the file passes an **empty** `GITHUB_PERSONAL_ACCESS_TOKEN`:
+/// the server counts it as unset, signs a JWT with the key file, trades it at the installation's
+/// token endpoint and calls with the token it gets).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_embedded_agent_connects_the_real_github_mcp_server() {
+    let Some(binary) = std::env::var_os("ADAM_TEST_GITHUB_MCP_SERVER")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+    else {
+        eprintln!("skipping: ADAM_TEST_GITHUB_MCP_SERVER is not the path of a github-mcp-server");
+        return;
+    };
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    // The binary, named as the shipped `mcp.json` names it, on the `PATH` of the coder only.
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(&binary, bin.join("github-mcp-server")).unwrap();
+    let search_path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let key = Arc::new(adam_workspace::testing::TestAppKey::generate());
+
+    for app in [false, true] {
+        let mode = if app { "App" } else { "token" };
+        let github = MockServer::start().await;
+        // What the server asks a classic token's scopes of at startup (`ghp_`), and the call below.
+        Mock::given(method("HEAD"))
+            .and(path("/api/v3/"))
+            .respond_with(ResponseTemplate::new(200).insert_header("X-OAuth-Scopes", "repo"))
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/user"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"login": "octocat", "id": 1, "type": "User"})),
+            )
+            .mount(&github)
+            .await;
+        let minted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .and(path("/api/v3/app/installations/67890/access_tokens"))
+            .respond_with(MintToken {
+                key: key.clone(),
+                minted: minted.clone(),
+            })
+            .mount(&github)
+            .await;
+
+        let model = MockServer::start().await;
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(Script {
+                replies: vec![
+                    tool_reply("g1", "github__get_me", json!({})),
+                    text_reply("You are octocat."),
+                ],
+                asked,
+            })
+            .mount(&model)
+            .await;
+
+        let work = tmp.path().join(format!("work-{mode}"));
+        let mut env = if app {
+            app_env(&db.url(), &work, &key, tmp.path())
+        } else {
+            valid_env(&db.url(), &work)
+        };
+        // The embedded copy, with the deployment's two settings: the image's `MCP_ALLOW_STDIO`, and
+        // (not the image's) the mock as the GitHub host, which is plain http to this machine.
+        env.retain(|(k, _)| k != "ADAM_AGENT_DIR");
+        env.extend([
+            ("MODEL_BASE_URL".to_owned(), model.uri()),
+            ("PATH".to_owned(), search_path.clone()),
+            ("MCP_ALLOW_STDIO".to_owned(), "true".to_owned()),
+            ("GITHUB_MCP_HOST".to_owned(), github.uri()),
+        ]);
+        let mut coder = Proc::spawn(&env);
+        let addr = coder.ready().await;
+        let client = common::a2a_client(addr, A2A_TOKEN).await;
+        let mut stream = client
+            .send_streaming_message(&SendMessageRequest {
+                message: Message::new(Role::User, vec![Part::text("Who am I on GitHub?")]),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let mut last = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while last != Some(TaskState::InputRequired) {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(Ok(StreamResponse::StatusUpdate(u)))) => last = Some(u.status.state),
+                Ok(Some(Ok(StreamResponse::Task(t)))) => last = Some(t.status.state),
+                Ok(Some(Ok(_))) => {}
+                other => panic!(
+                    "{mode}: the task did not wait for the person: {other:?}\n{}",
+                    coder.logs()
+                ),
+            }
+        }
+        drop(stream);
+
+        // The model was offered the twelve tools after the coder's own, and nothing that writes.
+        let requests = model.received_requests().await.unwrap();
+        let first: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let offered: Vec<&str> = first["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        let github_tools: Vec<&str> = offered
+            .iter()
+            .copied()
+            .filter(|t| t.starts_with("github__"))
+            .collect();
+        assert_eq!(
+            github_tools,
+            [
+                "github__get_me",
+                "github__search_repositories",
+                "github__get_file_contents",
+                "github__list_branches",
+                "github__list_commits",
+                "github__get_commit",
+                "github__search_code",
+                "github__list_issues",
+                "github__issue_read",
+                "github__search_issues",
+                "github__list_pull_requests",
+                "github__pull_request_read",
+            ],
+            "{mode}: {offered:?}"
+        );
+        assert_eq!(
+            offered[0], "prepare_workspace",
+            "the coder's own come first: {offered:?}"
+        );
+        // The call reached the real server, and the answer is what GitHub (the mock) said.
+        let second: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let answer = second["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(answer.contains("octocat"), "{mode}: {answer}");
+
+        // The credentials the server called GitHub with are the coder's own, in the mode it runs in.
+        let seen = github.received_requests().await.unwrap();
+        let user: Vec<_> = seen
+            .iter()
+            .filter(|r| r.url.path() == "/api/v3/user")
+            .collect();
+        assert_eq!(user.len(), 1, "{mode}: {seen:?}");
+        let bearer = user[0]
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| panic!("{mode}: no bearer: {seen:?}\n{}", coder.logs()));
+        if app {
+            assert_eq!(
+                bearer,
+                format!("Bearer {APP_TOKEN}"),
+                "the token it traded for"
+            );
+            assert_eq!(minted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(bearer, format!("Bearer {GITHUB_TOKEN}"));
+            assert_eq!(
+                minted.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no App, no trade"
+            );
+            // A classic token's scopes are asked of GitHub once, at startup, as the server does.
+            assert!(seen.iter().any(|r| r.method.as_str() == "HEAD"), "{seen:?}");
+        }
+
+        coder.sigterm().await;
+        let status = coder.exit_within(Duration::from_secs(30)).await;
+        assert_eq!(status.code(), Some(0), "{mode}: {}", coder.logs());
+        let visible = format!("{}{answer}", coder.logs());
+        for secret in [GITHUB_TOKEN, APP_TOKEN] {
+            assert!(!visible.contains(secret), "{mode}: {secret} is visible");
+        }
     }
     db.finish().await;
 }
@@ -1852,7 +2111,9 @@ impl Respond for MintToken {
             .and_then(|v| v.strip_prefix("Bearer "))
             .unwrap_or_default();
         match self.key.verify_jwt(jwt) {
-            Ok(claims) if claims["iss"] == 12345 => {
+            // The App's id, as a number (adam's own JWT) or as a string (github-mcp-server's): GitHub
+            // takes either.
+            Ok(claims) if claims["iss"] == 12345 || claims["iss"] == "12345" => {
                 self.minted
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 ResponseTemplate::new(201).set_body_json(json!({

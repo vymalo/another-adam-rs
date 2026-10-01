@@ -34,14 +34,43 @@ a GitHub App installation"):
 * GitHub began a staged rollout of a longer, stateless token format on 2026-04-27, so nothing may
   depend on a token's length or characters.
 
-The official GitHub MCP server (`github/github-mcp-server`), as the slice 7 plan read it on
-2026-10-01 (its README, `docs/github-app-auth.md`, `docs/streamable-http.md` and the releases; *not
-read again by this change*): the `stdio` mode takes either `GITHUB_PERSONAL_ACCESS_TOKEN` or a GitHub
-App (`GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and `GITHUB_APP_PRIVATE_KEY_PATH` or
-`GITHUB_APP_PRIVATE_KEY`) and mints and renews the installation token itself; the `http` mode takes
-the client's bearer on each request, and App auth is not documented for it. It has `--read-only` and
-`--toolsets`. Whether the exact tool names and the empty-variable behaviour hold for the pinned image
-is *unverified*, and the change that ships the server checks it.
+The official GitHub MCP server (`github/github-mcp-server`). The slice 7 plan read its README on
+2026-10-01; the change that ships it checked the rest against the **source at the tag `v1.12.2`**
+(commit `85598ba`) **and the binary of its image**, run here. *Verified 2026-10-01* (source:
+`cmd/github-mcp-server/main.go`, `internal/ghmcp/`, `internal/githubapp/`, `pkg/http/transport/`; the
+image `ghcr.io/github/github-mcp-server:v1.12.2`, index digest
+`sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6`, anonymous pull, built
+2026-09-16; `v1.13.0` was published the same day and was **not** checked):
+
+* **The image.** The binary is `/server/github-mcp-server`, a static Go binary (`CGO_ENABLED=0`) in a
+  distroless image whose entrypoint is that binary and whose default command is `stdio`; the index has
+  `linux/amd64` and `linux/arm64`. `docker/coder/Dockerfile` copies the binary out and pins the image by
+  tag and digest.
+* **The command line.** `github-mcp-server stdio` with `--read-only` and `--toolsets` (a comma list; the
+  names `context`, `repos`, `issues` and `pull_requests` exist) and the global `--gh-host`. Every flag has
+  an environment variable (prefix `GITHUB_`, dashes as underscores), so `GITHUB_HOST` is `--gh-host`.
+* **The credentials.** `GITHUB_PERSONAL_ACCESS_TOKEN`; or a GitHub App: `GITHUB_APP_ID`,
+  `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_PATH` or `GITHUB_APP_PRIVATE_KEY`. It mints
+  the installation token itself, signs the JWT with `iss` as a **string** (`"12345"`; the coder's own
+  JWT has a number when the ID is one, and GitHub takes either), refreshes it before it expires, and
+  calls the REST API with it. A token **and** an App are an error ("mutually exclusive"); an App without
+  its key is an error that names `GITHUB_APP_PRIVATE_KEY_PATH`.
+* **An empty variable is an unset one.** Every test is on the value (`token == ""`, `appID != ""`), and
+  the server was run both ways with the five variables the coder's `mcp.json` passes: a token and the
+  three App variables empty (calls GitHub with the token), and an **empty** token with an App (traded a
+  JWT at the installation's token endpoint, and called GitHub with the token it got:
+  `bin/adam-coder/tests/binary.rs`, `the_embedded_agent_connects_the_real_github_mcp_server`). An empty
+  `GITHUB_HOST` is github.com. So `${VAR:-}` in `mcp.json` is enough and adam-mcp needs no fallback.
+* **`tools/list` needs no token.** The server starts and lists its tools without calling GitHub, with no
+  credential at all: with `--read-only --toolsets context,repos,issues,pull_requests` it lists 25 tools,
+  and the twelve of the coder's allow-list are among them under exactly the names of the plan. A
+  *call* with no credential starts the server's OAuth device login (a tool result that says "Visit
+  https://github.com/login/device and enter the code ..."), so the image smoke test lists tools only.
+  A **classic** token makes the server ask GitHub for the token's scopes once at startup (`HEAD`,
+  `X-OAuth-Scopes`) and hide the tools whose scopes it lacks; the twelve survive any scope set tried (none,
+  `public_repo`, `repo`, `read:org`; the two hidden are the organisation's teams).
+* **`--read-only`** removes every write tool: without it the list holds `create_branch`,
+  `create_or_update_file`, `add_issue_comment` and the rest, with it none.
 
 ## Decision
 
@@ -93,7 +122,11 @@ is *unverified*, and the change that ships the server checks it.
    cannot write: **writes stay the coder's own** (decision 7), because they are what the gate guards.
    Production runs the binary inside the coder image; development and the e2e point the coder at a
    mock over http. In App mode the server gets the same `GITHUB_APP_*` variables, the key as a *file*
-   (the key in a variable is not passed to a child).
+   (the key in a variable is not passed to a child, and a server that has an App and no key does not
+   start: the coder then stops at startup, exit 69; the chart mounts the key as a file). The image sets
+   `MCP_ALLOW_STDIO=true`, which the coder's deployment policy needs to start a local process. The
+   allow-list is checked at startup (a name the server does not list stops the coder), and the image
+   build runs the same check over stdio with no credential.
 9. **Creating a repository is off unless the deployment says who it may be created for (D7.7).**
    `CREATE_REPO_OWNERS`, empty means off; the repository is private and empty; the person is asked
    every time, by a question the coder's tool writes; the credential is the same installation (an
@@ -183,6 +216,46 @@ stateDiagram-v2
 
 *2026-10-01: decisions 1 to 6 are built, in `adam-workspace` (`GitHubApp`, `AppKey`, `HostScoped`) and
 in the coder (`GitHubAuth`, the shared `Redactor`, `RedactingCredentials`; `bin/adam-coder/README.md`,
-"GitHub credentials"), with the chart (`github.auth`) and the compose override. Not built yet:
-decision 8 (the GitHub MCP server in the coder image and its mock) and decision 9 (the creation of a
-repository). Decision 7 is the state of the code.*
+"GitHub credentials"), with the chart (`github.auth`) and the compose override. Decision 7 is the state
+of the code.*
+
+*2026-10-01 (slice 7, A6): decision 8 is built. `bin/adam-coder/agent/mcp.json` names `github-mcp-server`
+(stdio, `--read-only`, four toolsets, twelve tools); the coder image carries v1.12.2 by tag and digest,
+sets `MCP_ALLOW_STDIO=true` and tests the tool list at build and in the container smoke test; the dev stack
+and the e2e read GitHub through `mock-github-mcp` over http (`dev/coder-agent/mcp.json`); a test runs the
+coder's binary against the real server in both modes (`ADAM_TEST_GITHUB_MCP_SERVER`; CI takes the binary
+out of the pinned image). The facts of the context are verified against that tag (see above); what is not:
+a live GitHub (the server was only run against a mock of its REST API), GitHub Enterprise Server, and
+v1.13.0. Because the shipped `mcp.json` names a local process, **a coder on the embedded files needs
+`MCP_ALLOW_STDIO=true` and the binary on `PATH`**, or it stops at startup (exit 78, or 69 when the binary
+is missing); the image has both.*
+
+*2026-10-01 (slice 7, A8): decision 9 is built (`bin/adam-coder/README.md`, "A repository of its own, on
+request"). `create_repository { owner, name, private?, description? }` is off unless `CREATE_REPO_OWNERS` (the
+chart's `github.createRepoOwners`) lists the owner; it asks the person with a question it writes (the repository, its
+visibility, the description quoted) before **every** creation, records the yes for exactly `owner/name` and the
+visibility, and creates the repository **empty** (`auto_init: false`) when the model calls it again; a yes to a
+private repository does not cover a public one. The credentials are asked for the new repository's address, so the
+allowed-hosts check applies, and the `clone_url` the host answers with must pass the workspace's policy. It creates
+with `POST /orgs/{owner}/repos` for an organisation and `POST /user/repos` for the person the credentials are
+(`CodeHost::owner_kind` and `CodeHost::authenticated_login`, which is `None` for an installation token), and refuses
+any other owner, a user included when the credentials are an installation, before asking the person. Checked
+against docs.github.com on 2026-10-01 (read through a summarising fetch, not the raw pages): both endpoints answer
+`201`, `403` or `422` (a name that exists is `422`); an OAuth or classic token needs `public_repo` or `repo` for a
+public repository and `repo` for a private one; and the page "Permissions required for GitHub Apps" lists
+`POST /orgs/{org}/repos` and `POST /user/repos` under the Administration repository permission (write) for user and
+installation tokens. **Unverified:** that an installation token can really create in an organisation (the code
+assumes the Administration permission is what is missing when GitHub says `403`, and says so to the model), that
+`GET /user` answers an installation token with a `403` (the code reads a `403` that is not a rate limit as "no
+login"; a live App was not tried), and that `POST /user/repos` is unusable for an installation (the code never
+sends it: an installation has no user to create for).*
+
+*2026-10-01 (review of slice 7, A8): `create_repository` is safe to repeat. It writes an intent
+(`owner/name`, visibility; `RunNotes::creating`) into the run's notes before it asks the host. If the process
+dies between the host's answer and the note of it, the replay meets "already exists" **with** that intent in the
+notes: it looks the repository up (`CodeHost::find_repository`, `GET /repos/{owner}/{name}`; a host that cannot
+say answers `None`), applies the same address policy as to a new repository, grants it and records it, instead of
+refusing it as a name the run did not create. A name that exists without an intent is still left alone, and the
+intent is removed when the creation is recorded or the host definitely refused it (it stays after a failure that
+may have happened after the host made the repository, a timeout). The consent rule is the one of ADR 0008: only
+an explicit yes or no is recorded, so a "wait" no longer ends the question for the task.*

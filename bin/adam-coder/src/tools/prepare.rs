@@ -75,7 +75,9 @@ pub async fn prepare_workspace(
                 url,
                 &notes.named_repos,
                 "work on (and which base branch), then call prepare_workspace with the one \
-                 they name.",
+                 they name. If the task needs this very repository besides the one they named, \
+                 call request_repository with it and a reason instead: the person is asked, and \
+                 only a yes adds it.",
             )));
         }
         if let Some(branch) = continuing {

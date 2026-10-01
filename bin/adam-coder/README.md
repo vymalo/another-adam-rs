@@ -43,10 +43,12 @@ sequenceDiagram
 
 | Tool | Does |
 |---|---|
-| `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository the person named** in their own messages of the run (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `ask_user`. Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
+| `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository that is granted**: one the person named in their own messages of the run, or agreed to add when `request_repository` asked (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `request_repository` (or to `ask_user`, when it has no repository to ask about). Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
 | `start_scratch { name? }` | `RunWorkspace::add_scratch` for the run (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. The result says the project is **temporary** (it exists only while the task is open, nothing is kept unless it is published) and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
-| `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **the person named** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
+| `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **that is granted** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
 | `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that changes go through `delegate_to_opencode`. Writes to ignored paths (build output) are not changes |
+| `request_repository { repo_url, reason }` | **asks the person** whether another repository may join the workspace: the run parks (`input-required`) on a question **the tool writes**, which names the repository and quotes the model's `reason` (one line, at most 300 characters: `May I add the repository acme/lib (https://github.com/acme/lib) to this workspace? The agent says why: "..."`) and offers `Yes, add acme/lib` and `No`, as a form (one `Choices` question, id `consent`) on a screen that can draw it and as text on one that cannot (the same machinery as `ask_user`'s `choices`, [below](#asking-with-choices)). Only a yes adds the repository (it is then **granted**: the model calls `prepare_workspace` with it); the model never grants, see [the rules](#another-repository-only-with-the-persons-yes). A repository already granted is a result that says so (nobody is asked); one the person turned down (an explicit `no`) is an error result that says not to ask again; a message that is neither a yes nor a no (`wait`, `?`) records nothing, and the tool asks again; one the workspace's policy would refuse (its host is not in `ALLOWED_REPO_HOSTS`, or it is a local path) is an error result **before** anyone is asked. `asks_user()` is `true`, so a subagent cannot have it |
+| `create_repository { owner, name, private?, description? }` | creates a new, **empty** repository (no commit: `publish_scratch` gives it its first), and only **after the person agrees, every time**. Off unless `CREATE_REPO_OWNERS` lists the owner (any other owner, and every owner when the variable is empty, is an error result that says so); private unless `private: false`; `name` is `^[A-Za-z0-9._-]{1,100}$`, not `.`/`..`, not ending `.git`; `description` is at most 350 characters. The first call parks the run on a question **the tool writes** (`May I create the repository acme/fib on github.com? It will be private and empty.`, with the description quoted, and the options `Create acme/fib` and `Don't create it`); the answer comes back as that call's result, and **the model calls the tool again** with the same arguments: with a recorded yes for exactly `owner/name` **and that visibility** it creates the repository (a yes to the private one does not cover a public one), waits up to 10 s for it to be reachable over git, and grants it (the key of its clone URL) and records it (`RunNotes::created_repos`); a repeat after that is the same result and creates nothing; after a no it is an error result that says not to ask again. See [below](#a-repository-of-its-own-on-request). `asks_user()` is `true` |
 | `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
@@ -58,11 +60,13 @@ sequenceDiagram
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the fourteen. The tools the conversation's endpoint lists
+folder](#mcp-tools-from-the-folder)); they are not part of the sixteen. The shipped folder's own `mcp.json` adds
+twelve **read-only** tools of GitHub, `github__get_me`, `github__get_file_contents`, `github__list_branches` and the
+rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)).
 
-Eleven tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the eleven is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Thirteen tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the thirteen is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
@@ -305,19 +309,23 @@ make them hold:
 * **A question is answered, not worked on.** The prompt says that a greeting or a question about the
   repository ("List all branches") gets a direct answer (after `prepare_workspace`, with `run_command`) and ends
   the turn; the run then parks as a question like any stop without a pull request, and the chat goes on.
-* **Only a repository the person named.** `prepare_workspace` and `publish_scratch` refuse a
-  repository that is not named in the person's own messages of the run (a scratch project is published
-  only to one the person named: nothing is copied, pushed or even asked of a remote otherwise): the
+* **Only a repository that is granted.** `prepare_workspace` and `publish_scratch` refuse a
+  repository whose key is not **granted** in the run's notes (`RunNotes::named_repos`; a scratch project is
+  published only to a granted one: nothing is copied, pushed or even asked of a remote otherwise). A
+  repository is granted in one of three ways. **The person named it** in their own messages of the run: the
   task, and every answer delivered to it (user messages and the results of
   `ask_user`, paired with the question by position in the history, because
   providers that send no call ids get `call_0`, `call_1` again in every turn; what
   the model or a tool wrote never counts, and neither does text quoted in a
   fence labelled `untrusted`, which is how the orchestrator's message that sends
   a job back quotes findings of checks and reviewers: its `request` fence, the
-  person's own words, does count). Before every step
+  person's own words, does count). Or **the person agreed to add it**: the model called
+  `request_repository`, the tool asked, and the answer was a yes
+  ([below](#another-repository-only-with-the-persons-yes)). Or **the coder created it**, after the person agreed
+  ([below](#a-repository-of-its-own-on-request)): `create_repository` grants the repository it made, by the key of its
+  clone URL. Before every step
   `CoderAgent` reads those messages (and the inbox, without consuming it:
-  `Ctx::peek_inbox`) and records the repositories they name in the run notes
-  (`RunNotes::named_repos`); the tool compares the argument with them and never
+  `Ctx::peek_inbox`) and records what they grant in the run notes; the tool compares the argument with them and never
   trusts the model alone. Repositories are compared as normalised
   `host/owner/name` ([`tools::named`](src/tools/named.rs)): case-insensitive,
   without scheme, credentials, `.git` or a trailing slash; `https://host/owner/name(.git)`,
@@ -328,7 +336,8 @@ make them hold:
   it is the scheme's default, and `www.github.com` is `github.com`. The
   refusal is a tool result that says which repositories were named (only what
   the person wrote, and not words that are files such as `src/main.rs`) and tells
-  the model to ask the person with `ask_user`; it is not a run failure. The tools
+  the model to ask the person with `ask_user` which repository to work on, or, when the task needs one more,
+  to call `request_repository`; it is not a run failure. The tools
   read what `CoderAgent` records, so `coder_tools` under another agent refuses
   every repository.
   A message that continues a parked run (same `contextId`, no `taskId`, while the
@@ -353,7 +362,7 @@ stateDiagram-v2
   Canceled --> [*]
 ```
 
-Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories named, branches the
+Per-run bookkeeping (cycles, last check, pushed sha, pull request, repositories granted and the answers that granted them, branches the
 conversation pushed) lives in
 `<WORKSPACE_ROOT>/coder/<run>.json` next to the worktree, written atomically.
 
@@ -557,6 +566,134 @@ stateDiagram-v2
   Pushed --> Released
   Released --> [*]
 ```
+
+### Another repository, only with the person's yes
+
+A task names the repository it is about. When it needs another (to read a shared file from, or to change too),
+the model does not get to decide: it calls `request_repository { repo_url, reason }`, which asks the person.
+
+```mermaid
+sequenceDiagram
+  participant M as the model
+  participant T as request_repository
+  participant P as the person
+  participant A as CoderAgent (before each step)
+  participant W as prepare_workspace
+  M->>T: repo_url, reason
+  T->>T: the address is a repository, the policy allows its host, nobody has been asked yet
+  T-->>P: May I add acme/lib? [Yes, add acme/lib] [No] (a form, or the options as text)
+  Note over T,P: the run waits (input-required), nothing of acme/lib is fetched
+  P-->>A: the answer (the result of the call, or the inbox while parked)
+  A->>A: paired with the call by position, a yes grants the call's repository in the notes
+  M->>W: prepare_workspace(acme/lib)
+  W-->>M: a slot (granted), or a refusal that points back to request_repository
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> NotGranted
+  [*] --> Granted: the person named it
+  NotGranted --> Asked: request_repository
+  Asked --> Granted: the person says yes
+  Asked --> Refused: an explicit no
+  Asked --> Asked: any other answer (nothing is recorded, the question can be asked again)
+  Granted --> [*]: prepare_workspace and publish_scratch accept it
+  Refused --> [*]: request_repository says no more asking, prepare_workspace refuses
+```
+
+* **The question is the tool's.** It is written by the tool from the repository's address (no space
+  or control character gets into it) and the model's `reason`, which is quoted on one line and cut at 300
+  characters. The same tool that `ask_user` is draws it, so a client sees one kind of question: a form of one
+  `Choices` question with the options `yes` and `no` on a screen that has the component, the options in the text
+  on any other.
+* **The model never grants.** What is recorded is the person's **answer to that call**: the result of a
+  `request_repository` call that did not fail, or, while the run is parked on it, the message waiting in the inbox
+  (`Ctx::peek_inbox`). It is paired with the call by position (providers repeat ids), and it grants the repository
+  of **that call's** argument, which is the one the question named. A yes to a question the model wrote with
+  `ask_user`, however it is worded, grants nothing; neither does anything a tool printed, and an error
+  result of `request_repository` is the tool's own words and counts for nothing, not even as the person naming a
+  repository (it may quote an address the model chose).
+* **What is a yes, what is a no.** The form's option `yes` (the answer comes back as `- consent: yes`), or, in words,
+  exactly `yes`, `y` or `Yes, add acme/lib`, whatever the case, is a **yes**. The form's option `no` (`- consent: no`), or
+  exactly `no`, `n` or the no option's label, is a **no**. Anything else is **neither** and records nothing: `wait`, `?`,
+  `yes please`, `no, use acme/other` (which does name `acme/other`, as every word of the person does). The model still
+  gets the person's words as the call's result, so it can answer them, and the tool asks again; only an explicit no
+  closes the question for the task.
+* **Replays are the same.** Before every step the agent reads the answers from the history again and records them
+  (`RunNotes::consents`, `Consent { call_id, tool, subject, agreed }`; the same call, tool and subject is not
+  recorded twice, and an explicit no is kept): a restarted worker, or another one, reaches the same grants, and a task
+  that continues this one reads them from the carried history.
+* **Asked until answered.** A repository the person explicitly turned down (`no`) is not asked about again in the
+  run: `request_repository` answers that they declined. A message that is neither a yes nor a no does not turn it
+  down: the question is asked again.
+
+### A repository of its own, on request
+
+A scratch project needs somewhere to go. When the person has no repository for it and says one may be made, the
+model calls `create_repository`. It is the one tool that makes something on the host, so it is the most guarded:
+
+```mermaid
+sequenceDiagram
+  participant M as the model
+  participant T as create_repository
+  participant P as the person
+  participant A as CoderAgent (before each step)
+  participant H as the code host
+  participant S as publish_scratch
+  M->>T: owner, name, private?, description?
+  T->>T: CREATE_REPO_OWNERS lists the owner? the name is valid? the host allows it? it can be made for this owner at all?
+  T-->>P: May I create acme/fib on github.com? It will be private and empty. [Create acme/fib] [Don't create it]
+  Note over T,P: the run waits (input-required), nothing is created
+  P-->>A: yes (the result of the call), recorded for acme/fib:private
+  M->>T: the same call again
+  T->>H: create the repository, empty (POST /orgs/acme/repos or /user/repos)
+  H-->>T: clone_url
+  T->>T: the clone URL is allowed? wait until git can reach it (10 s), grant its key, record it
+  T-->>M: Created acme/fib (private, empty), repository: <clone url>
+  M->>S: publish_scratch(<clone url>)
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Refused: the feature is off, the owner or the name is not allowed, the host cannot create for the owner
+  [*] --> Asked: no consent for owner/name:visibility yet
+  Asked --> Declined: the person says no (asking again is refused)
+  Asked --> Asked: any other answer (nothing is recorded)
+  Asked --> Consented: the person says yes
+  Consented --> Created: create_repository again (empty, granted, recorded)
+  Created --> Created: a repeated call is the same result
+  Created --> [*]: publish_scratch
+```
+
+* **Off unless the deployment says for whom.** `CREATE_REPO_OWNERS` names the owners (the chart: `github.createRepoOwners`);
+  empty means the tool refuses every call, and an owner that is not listed is refused with the list. The error
+  tells the model to say it cannot create one and to ask the person to make it and name it.
+* **Private and empty.** `private` defaults to true, and a public repository is made only when the model passes
+  `private: false` (the prompt reserves it for what the person asked); `auto_init` is false, so the repository has no
+  commit, no README and no licence: `publish_scratch` gives it the empty first commit and then the project.
+* **Consent is the person's, per repository and per visibility.** The recorded yes (`Consent { call_id, tool, subject }`,
+  `subject` being `owner/name:private` or `owner/name:public`) is read from the conversation like the answers to
+  `request_repository` ([above](#another-repository-only-with-the-persons-yes)), and a yes to one subject is no yes to another.
+  The person naming the repository in their own words does not replace the question.
+* **Who it can be made for.** The credentials are the installation's. An organisation uses `POST /orgs/{owner}/repos`.
+  The person the credentials are (a token's owner) uses `POST /user/repos` for their own login. Anything else is an
+  error result that says why **before the person is asked**: another person's account, and any user at all when the
+  credentials are a GitHub App installation (it has no user: `GET /user` is refused, which the host reports as "no
+  login"). A token needs the `repo` scope, an App the Administration permission on the organisation; a refusal
+  says so to the model.
+* **The credentials are asked for the new repository's address** (`https://<first of ALLOWED_REPO_HOSTS>/<owner>/<name>`),
+  so the allowed-hosts check and the scoped token apply as for any repository, before anything is sent. The `clone_url`
+  the host answers with must pass the workspace's policy too (a host that sends it somewhere else leaves the repository
+  made, ungranted, and tells the person to look at it).
+* **Replays.** The call is journaled like any tool, and it writes its **intent** (`owner/name`, visibility:
+  `RunNotes::creating`) into the run's notes *before* it asks the host. A worker that dies **after** the host created
+  the repository and **before** the notes say so runs the call again and finds the name taken **and** its own intent
+  there: it looks the repository up (`CodeHost::find_repository`, `GET /repos/{owner}/{name}`), applies the same
+  address policy as to a new one, grants it and records it, and the model gets the same answer as the first time. A
+  name that is taken **without** an intent is somebody else's and is left alone ("this run did not create it"). The
+  intent is removed when the creation is recorded and when the host definitely refused it (a name that exists, a
+  validation error, the credentials); a failure that may have happened after the host made it (a timeout) keeps it, so
+  that the retry adopts. The intent is not a consent: the person's yes is still read from the conversation.
 
 ### Where the processes of a run run
 
@@ -912,8 +1049,10 @@ rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
   another machine needs `MCP_ALLOW_INSECURE=true` (development only); `https` and loopback need nothing.
 * **A server that is down** at startup stops the process with exit 69, so a supervisor restarts it until the server
   is up; a mistake in the files or the policy is 78. A tool call that fails is an error result the model reads.
-* A folder without an `mcp.json` connects nothing (the embedded copy has none). A **control plane** serves the card
-  and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
+* A folder without an `mcp.json` connects nothing. **The embedded copy has one**: it names the GitHub MCP server, a
+  local process (see [GitHub over MCP](#github-over-mcp-read-only)), so a coder on the embedded files needs
+  `MCP_ALLOW_STDIO=true` and `github-mcp-server` on its `PATH`, which the image has. A **control plane** serves the
+  card and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
 
 ### Retry safety
 
@@ -964,6 +1103,7 @@ way; every problem is reported at once at startup):
 | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 as GitHub gives it, or PKCS#8): a file, or inline (`\n` escapes accepted). Exactly one. Parsed at startup | one required in App mode |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
+| `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees; empty turns the tool off. The chart's `github.createRepoOwners` | empty (off) |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs ([below](#the-workspace-of-a-run)); `0` turns it off | `300` |
@@ -975,7 +1115,7 @@ way; every problem is reported at once at startup):
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
-| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server | `false` |
+| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. **The coder image sets it** (it ships `github-mcp-server`, which the shipped `mcp.json` starts), so an `adam-agent` run from that image allows it too: set `MCP_ALLOW_STDIO=false` there to refuse local processes | `false` (the image: `true`) |
 | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
 | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills, subagents and `mcp.json`, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
@@ -1098,9 +1238,9 @@ is treated as hostile input. The GitHub credential (the token, or the App's inst
 token) is bound to `ALLOWED_REPO_HOSTS`
 twice over, and a third layer decides whether the repository may be used at all:
 
-0. **Only a repository the person named.** `prepare_workspace` refuses, before
-   anything else, a repository that is not named in the person's own messages
-   of the run (see [the rules](#the-rules-in-code)); quoted findings do not name
+0. **Only a repository that is granted.** `prepare_workspace` refuses, before
+   anything else, a repository that the person did not name in their own messages
+   of the run and did not agree to add (see [the rules](#the-rules-in-code)); quoted findings do not name
    one.
 1. `Workspaces::allow_hosts` refuses any other host before a process is
    spawned, a request is made or a credential is asked for (the model gets the
@@ -1179,6 +1319,77 @@ failure is transient. The token endpoint is `{GITHUB_API_URL}/app/installations/
 Enterprise Server and a mock need no other variable. The deployment's own example is
 `dev/compose.github-app.yaml` (an init service makes a throwaway key; the mock gives an installation token that
 lasts four minutes, so the coder renews it all the time) and `deploy/coder` (`github.auth: app`).
+
+### GitHub over MCP: read-only
+
+The coder **reads** GitHub (the files, branches, commits, issues and pull requests of any repository its credentials
+can see, including repositories it was not given) through the official
+[GitHub MCP server](https://github.com/github/github-mcp-server), and **writes** only through its own tools. The
+shipped `agent/mcp.json` ([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md),
+decision 8):
+
+```json
+{ "mcpServers": { "github": {
+  "command": "github-mcp-server",
+  "args": ["stdio", "--read-only", "--toolsets", "context,repos,issues,pull_requests"],
+  "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN:-}", "GITHUB_APP_ID": "${GITHUB_APP_ID:-}",
+           "GITHUB_APP_INSTALLATION_ID": "${GITHUB_APP_INSTALLATION_ID:-}",
+           "GITHUB_APP_PRIVATE_KEY_PATH": "${GITHUB_APP_PRIVATE_KEY_PATH:-}", "GITHUB_HOST": "${GITHUB_MCP_HOST:-}" },
+  "tools": ["get_me", "search_repositories", "get_file_contents", "list_branches", "list_commits", "get_commit",
+            "search_code", "list_issues", "issue_read", "search_issues", "list_pull_requests", "pull_request_read"] } } }
+```
+
+* **Read-only twice over.** The server is started with `--read-only` (it offers no write tool) and the `tools`
+  allow-list names twelve reads, so the model sees `github__get_me`, `github__search_repositories`,
+  `github__get_file_contents`, `github__list_branches`, `github__list_commits`, `github__get_commit`,
+  `github__search_code`, `github__list_issues`, `github__issue_read`, `github__search_issues`,
+  `github__list_pull_requests` and `github__pull_request_read`, after the coder's own tools, and nothing that
+  writes. Pushes and pull requests go through `commit_and_push` and `open_pull_request`, behind the gate. Reading a
+  repository there does not put it in the workspace and does not make it one the person named: it still cannot be
+  pushed to ([the rules](#the-rules-in-code)). A tool the server does not list stops the coder at startup (the
+  allow-list is checked), so a change of the server's tool names cannot go unseen.
+* **The credentials are the coder's.** The same variables, by the names the server reads, in either mode: a
+  **token** (`GITHUB_TOKEN`, handed over as `GITHUB_PERSONAL_ACCESS_TOKEN`) or a **GitHub App installation**
+  (`GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`; the server signs its own JWT and
+  trades it for an installation token). The mode that is not in use is an empty variable, which the server counts
+  as unset (*verified* 2026-10-01 against v1.12.2, by source and by running it in both modes), so no variable is
+  conditional. `GITHUB_MCP_HOST` (empty: github.com) is the server's `GITHUB_HOST`, for GitHub Enterprise
+  (`https://<host>`; the coder's own `GITHUB_API_URL` is separate).
+* **The App's key must be a file.** `GITHUB_APP_PRIVATE_KEY` (the key in a variable) is not handed to a child
+  process. A server that has an App and no key does not start, and the coder stops at startup (exit 69, with a "cannot
+  connect ... Broken pipe" message that does not say why: run the server by hand to read its own complaint);
+  the chart mounts the key as a file (`GITHUB_APP_PRIVATE_KEY_PATH`) and needs nothing. A deployment that keeps the key in a
+  variable has no GitHub MCP server: mount a copy of the folder without that server (`ADAM_AGENT_DIR`).
+* **A deployment must allow it.** The server is a local process: `MCP_ALLOW_STDIO=true` and the binary on `PATH`
+  (the image has both; a control plane connects nothing). Without the variable the process stops at startup with
+  exit 78 naming it, and with it and no binary with exit 69, never in the middle of a run, and no message holds a
+  credential. The image pins the binary by tag and digest (v1.12.2) and its build and the container smoke test list
+  its tools over stdio, with no credential at all (the server lists tools without calling GitHub, *verified*; a
+  *call* with no credential starts its OAuth login, so no credential is never a way to run).
+* **Development and the e2e do not start it.** The compose file mounts `dev/coder-agent/mcp.json` over the folder's
+  `mcp.json`: the same twelve tools from `mock-github-mcp`, a WireMock of the server's streamable HTTP endpoint over
+  plain `http` (`MCP_ALLOW_INSECURE=true`), behind a bearer. The default script of `mock-coder` reads
+  `github__list_branches` of `local/sandbox` right after `prepare_workspace`, and `dev/coder-e2e.sh` asserts the mock
+  saw `initialize`, `tools/list` and exactly one such call, and that the model was given the answer.
+
+```mermaid
+sequenceDiagram
+  participant P as the coder process (worker)
+  participant S as github-mcp-server (child, stdio)
+  participant G as GitHub
+  participant M as the model
+  P->>P: MCP_ALLOW_STDIO set? (else exit 78), the command on PATH? (else exit 69)
+  P->>S: start, env: the coder's credentials by the server's names
+  P->>S: initialize, tools/list
+  S-->>P: 25 tools (read-only, four toolsets): the twelve of the allow-list must all be there
+  Note over P,S: serving: the model is offered the twelve as github__<name>
+  M->>P: github__list_branches {owner, repo}
+  P->>S: tools/call
+  S->>G: REST or GraphQL, the token or the installation token
+  G-->>S: the answer
+  S-->>P: the result (an error result is the model's to read)
+  P-->>M: the tool result
+```
 
 ### Secrets in output
 
@@ -1303,6 +1514,54 @@ database of its own, so the role needs `CREATEDB`):
   `completed`, and a `working` update carrying the text of the worker's progress line (an update of
   its `prepare_workspace` step, `preparing a worktree of ...`), which exists only as a live event and so proves events
   crossed the two processes over `NOTIFY`. Both processes log `listening for notifications`.
+* **A repository of its own, on request** ([above](#a-repository-of-its-own-on-request)). `tests/tools.rs`:
+  off by default and for an owner the deployment does not name (the list is in the message), invalid names and
+  descriptions refused, an owner in another case is the same owner; the person is asked first with the tool's own
+  question (private and empty, the description quoted on one line, the options in the text where no screen was
+  announced) and nothing is created; a yes to the private repository is no yes to a public one; after a yes the
+  repository is created empty and private with the description, granted by the key of its clone URL, recorded, and a
+  repeat (in other letters) is the same result and creates nothing, and a scratch project then goes into it; a no is
+  remembered and nothing is created; a name that exists and was not made by the run is left alone and grants nothing;
+  a user owner needs credentials that are that user, an installation's are refused **before** the person is asked,
+  another person's account too; a clone URL the workspace may not use is an error that grants nothing; a repository
+  that git can only reach after a moment is waited for. `src/agent.rs` (unit): a yes is for `owner/name` and its
+  visibility, a yes to creating grants nothing by itself, and the tool's own results ("Created ...", "already
+  granted") are neither an answer nor the person's words. `tests/e2e.rs` (per store): scratch, the person asks for a
+  repository, the coder asks (nothing created while it waits), the yes, the creation (once, private, with the
+  description), the publication behind the gate and the pull request; and a no that creates nothing.
+  `src/config.rs` (unit): `CREATE_REPO_OWNERS` is a list, lowercased, empty means off, and a bad entry is a configuration
+  error. `crates/adam-workspace` has the host side: the request shape, `422`, `403`, the owner's kind and the login
+  (`None` for an installation token). `dev/coder-e2e.sh` (`SCENARIO=create-repo`, `ANSWER=yes` and `no`) runs it all
+  through the stack.
+* **Another repository, only with the person's yes** ([above](#another-repository-only-with-the-persons-yes)).
+  `src/agent.rs` (unit): a yes is a consent for the repository of *that call's* argument whatever the answer says
+  (the forms `yes`, `y`, the option's label and the form's `- consent: yes`); an explicit no (`no`, `n`, the form's
+  `no`) is a recorded refusal, and anything else (`wait`, `?`, `yes please`, `yes, add acme/other`, a form that picked
+  nothing) records nothing, also while the run is parked on the question (so it can be asked again); an `ask_user` the model wrote, a tool's result, an error result of the
+  tool and a call whose argument is no repository grant nothing and name nothing; the pairing holds when a provider
+  sends `call_0` again; an answer in the inbox while the run is parked on the question is recorded (and a finished-child
+  notice, or a run parked on another tool, records none); recording the same consents again changes nothing, an
+  explicit no is kept and the same id for another repository is another consent. `src/tools/consent.rs` (unit): what a yes
+  is, the reason cut at 300 characters and made one line, the question's two options. `tests/e2e.rs` (per store):
+  the second repository is not fetched while the question waits, the question names it, quotes the reason and
+  carries a form with a yes and a no, a yes picked on the form lets `prepare_workspace` add it and the notes say
+  so; a `no` adds nothing, the refusal points back to the tool, asking again is refused and nothing was ever
+  fetched; a `wait` adds nothing and records nothing, and the tool asks the same question again; a yes to a question the model wrote with `ask_user` grants nothing. `tests/tool_specs.rs` pins the
+  tool's spec and that it is one of the two tools that ask the person. `dev/coder-e2e.sh` (`SCENARIO=second-repo`,
+  with `ANSWER=yes` and `ANSWER=no`) runs the chain through the stack.
+* **GitHub over MCP** ([above](#github-over-mcp-read-only)). `tests/agent_files.rs`: the shipped `mcp.json` is the
+  GitHub server over stdio with `--read-only`, four toolsets and exactly the twelve reads (none starts with a verb
+  that writes), and hands the child only the credentials the coder holds (never the key itself); a deployment that
+  does not allow local processes does not get it and is told which variable decides. `tests/binary.rs`: the worker
+  on the embedded files stops with 78 without `MCP_ALLOW_STDIO` and 69 without the binary, naming the server and
+  never a credential; and, with `ADAM_TEST_GITHUB_MCP_SERVER` set to a `github-mcp-server` (CI copies it out of the
+  image the Dockerfile pins; the case skips itself without it), the whole binary connects the **real** server as a
+  child and a call reaches a mock of GitHub with the right credential: the model is offered the twelve tools in
+  order after the coder's own and none that writes, `github__get_me` returns the mock's user, no secret is in a log,
+  in both modes (a token, and an App with an empty token variable, where the server trades a JWT at the
+  installation's token endpoint). The other tests of those two files use the shipped folder without its `mcp.json`
+  (`common::plain_folder`), since a test machine has no such binary; `adam-mcp`'s `wiremock_compose` connects
+  `mock-github-mcp`; `dev/coder-e2e.sh` and `docker/coder/test/*.sh` check the stack and the image.
 * `tests/agent_files.rs`: the prompt, limits and card in `agent/instructions.md`, against the Rust they replaced and
   against the instruction snapshot. `the_prompt_carries_the_rules_the_code_relies_on` runs on the assembled prompt;
   `the_prompt_gives_the_agent_a_name_and_asks_for_plain_words` pins what #55 added (the persona lines first, the

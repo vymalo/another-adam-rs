@@ -4,6 +4,8 @@
 //! |---|---|
 //! | `prepare_workspace { repo_url, base_branch?, branch? }` | [`prepare`] |
 //! | `start_scratch { name? }`, `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | [`scratch`] |
+//! | `request_repository { repo_url, reason }` | [`consent`] |
+//! | `create_repository { owner, name, private?, description? }` | [`create`] |
 //! | `run_command { command, cwd? }` | [`inspect`] |
 //! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `apply_patch { patch }` | [`files`] |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
@@ -33,12 +35,21 @@
 //!   branch an earlier task opened it for, or the call is repeated), and
 //!   `CodeHost::open_pull_request` returns it instead of a second one in any case.
 //! * `run_checks`: failures are counted per call id ([`notes`]).
+//! * `request_repository { repo_url, reason }`: it only asks. A repeat after the person's yes finds the
+//!   repository granted and says so; after a no it says so; with no answer yet it asks again.
+//! * `create_repository { owner, name, private?, description? }`: a repository made is recorded under
+//!   its `owner/name` and a repeat returns the record. The call writes its intent to the run's notes
+//!   before it asks the host, so a repeat after a crash between the host's answer and the record
+//!   finds the name taken *and* the intent there: it looks the repository up, applies the same
+//!   address policy and records it. Without the intent a taken name is left alone ([`create`]).
 //!
 //! # The rules, in code
 //!
 //! The prompt tells the model the rules; these make them hold: `prepare_workspace` and
-//! `publish_scratch` refuse a repository the person did not name ([`named`]; the agent records the repositories of the
-//! person's own messages in the run notes before each step; it continues a branch only if a
+//! `publish_scratch` refuse a repository that is not **granted**: one the person named ([`named`]; the agent records
+//! the repositories of the person's own messages in the run notes before each step) or agreed to add
+//! when `request_repository` asked ([`consent`]; the agreeing answer is recorded the same way, from
+//! the conversation and never from the model). It continues a branch only if a
 //! `commit_and_push` of the conversation recorded it in the notes, which the agent carries from
 //! the run it continues, and as a fallback read from the result text, `publish::pushed_in`),
 //! after `MAX_CHECK_CYCLES` failed check runs `run_checks` refuses to run, and
@@ -76,6 +87,8 @@ use crate::redact::Redactor;
 const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific.";
 
 pub mod checks;
+pub mod consent;
+pub mod create;
 pub mod delegate;
 pub mod files;
 mod gitcli;
@@ -121,11 +134,15 @@ pub struct CoderSettings {
     /// The host `owner/name` stands for when the person writes a repository that way: the first
     /// of `ALLOWED_REPO_HOSTS` in the binary.
     pub default_repo_host: String,
+    /// The owners `create_repository` may create repositories for, lowercased: `CREATE_REPO_OWNERS`.
+    /// Empty: the tool refuses every call.
+    pub create_repo_owners: Vec<String>,
 }
 
 impl CoderSettings {
     /// Defaults: 3 cycles, 15 minutes and 16 KiB per check run, the
-    /// `adam-coder` identity, ready-for-review pull requests, `github.com` for `owner/name`.
+    /// `adam-coder` identity, ready-for-review pull requests, `github.com` for `owner/name`, and no
+    /// owner a repository may be created for.
     pub fn new(opencode: OpenCodeLaunch) -> Self {
         Self {
             max_check_cycles: 3,
@@ -135,6 +152,7 @@ impl CoderSettings {
             draft_pull_requests: false,
             opencode,
             default_repo_host: named::DEFAULT_HOST.to_owned(),
+            create_repo_owners: Vec::new(),
         }
     }
 }
@@ -378,7 +396,7 @@ pub(crate) fn resolve_slot(
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the eleven of the coding workflow,
+/// Every coder tool, in the order they are offered to the model: the thirteen of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
@@ -397,6 +415,8 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         prepare::PrepareWorkspace,
         scratch::StartScratch,
         scratch::PublishScratch,
+        consent::RequestRepository,
+        create::CreateRepository,
         inspect::RunCommand,
         files::ReadFile,
         files::WriteFile,

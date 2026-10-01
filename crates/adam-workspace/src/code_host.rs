@@ -47,6 +47,102 @@ pub trait CodeHost: Send + Sync + 'static {
         number: u64,
         body: &str,
     ) -> Result<(), WorkspaceError>;
+
+    /// Create an **empty** repository (no commit, no README) on the host. Not idempotent: a
+    /// repository that exists is [`WorkspaceError::Invalid`] ("already exists"), and the caller
+    /// decides whether that is its own earlier creation.
+    ///
+    /// The default is an error: a host that cannot create repositories need not say how.
+    async fn create_repository(
+        &self,
+        new: NewRepository,
+    ) -> Result<CreatedRepository, WorkspaceError> {
+        let _ = new;
+        Err(WorkspaceError::Invalid(
+            "this code host cannot create repositories".to_owned(),
+        ))
+    }
+
+    /// The repository `repo` names, if the host has it: what a caller that is not sure its own
+    /// [`create_repository`](Self::create_repository) took effect (the process died between the
+    /// host's answer and the caller's note of it) asks, instead of creating again. `Ok(None)` when
+    /// there is no such repository, and for a host that cannot say.
+    ///
+    /// The default is `Ok(None)`.
+    async fn find_repository(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<Option<CreatedRepository>, WorkspaceError> {
+        let _ = repo;
+        Ok(None)
+    }
+
+    /// Whether `owner` is a person or an organisation on the host that `host_repo` is on (the
+    /// credentials and the host check are those of `host_repo`; only its host matters).
+    ///
+    /// The default is an error, as for [`create_repository`](Self::create_repository).
+    async fn owner_kind(
+        &self,
+        owner: &str,
+        host_repo: &RepoRef,
+    ) -> Result<OwnerKind, WorkspaceError> {
+        let _ = (owner, host_repo);
+        Err(WorkspaceError::Invalid(
+            "this code host cannot say what an owner is".to_owned(),
+        ))
+    }
+
+    /// The login the credentials act as (a person's token), or `None` when they do not act as a
+    /// person (a GitHub App installation token has no user): the owner a repository can be created
+    /// for with `POST /user/repos`. `host_repo` is as for [`owner_kind`](Self::owner_kind).
+    ///
+    /// The default is `None`.
+    async fn authenticated_login(
+        &self,
+        host_repo: &RepoRef,
+    ) -> Result<Option<String>, WorkspaceError> {
+        let _ = host_repo;
+        Ok(None)
+    }
+}
+
+/// What owns repositories on a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerKind {
+    /// A person's account.
+    User,
+    /// An organisation.
+    Organization,
+}
+
+/// Input for [`CodeHost::create_repository`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewRepository {
+    /// The address the repository will have, `https://<host>/<owner>/<name>`: its owner and name are
+    /// what is created, and its host is where the credentials are asked for (and checked against
+    /// the allowed hosts) before anything is sent. `repo.base_branch` is not used.
+    pub repo: RepoRef,
+    /// Private (the default of the callers) or public.
+    pub private: bool,
+    /// Description, if any.
+    pub description: Option<String>,
+    /// Which API to call: an organisation's (`POST /orgs/{owner}/repos`) or the authenticated
+    /// user's (`POST /user/repos`). The caller knows it from [`CodeHost::owner_kind`] and
+    /// [`CodeHost::authenticated_login`].
+    pub kind: OwnerKind,
+}
+
+/// A repository that was created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedRepository {
+    /// `owner/name` as the host spells it.
+    pub full_name: String,
+    /// The URL to clone and push over HTTP.
+    pub clone_url: String,
+    /// The browser URL.
+    pub html_url: String,
+    /// The branch a first push creates (what the host says: `main`).
+    pub default_branch: String,
 }
 
 /// Shared handle to a [`CodeHost`] implementation.
@@ -89,7 +185,9 @@ mod memory {
 
     use async_trait::async_trait;
 
-    use super::{CodeHost, NewPullRequest, PullRequest};
+    use super::{
+        CodeHost, CreatedRepository, NewPullRequest, NewRepository, OwnerKind, PullRequest,
+    };
     use crate::error::WorkspaceError;
     use crate::repo::RepoRef;
 
@@ -103,6 +201,9 @@ mod memory {
     pub struct MemoryCodeHost {
         state: Mutex<Vec<(NewPullRequest, PullRequest)>>,
         comments: Mutex<Vec<(u64, String)>>,
+        created: Mutex<Vec<NewRepository>>,
+        organizations: Mutex<Vec<String>>,
+        login: Mutex<Option<String>>,
     }
 
     impl MemoryCodeHost {
@@ -119,6 +220,36 @@ mod memory {
         /// The requests that created them (title, body, draft, ...).
         pub fn requests(&self) -> Vec<NewPullRequest> {
             self.lock().iter().map(|(req, _)| req.clone()).collect()
+        }
+
+        /// Make `owner` an organisation: [`CodeHost::owner_kind`] says so for it, a user for any
+        /// other.
+        #[must_use]
+        pub fn with_organization(self, owner: &str) -> Self {
+            self.organizations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(owner.to_owned());
+            self
+        }
+
+        /// Act as the person `login`: [`CodeHost::authenticated_login`] returns it (without it,
+        /// the credentials are an installation's, which have none).
+        #[must_use]
+        pub fn with_login(self, login: &str) -> Self {
+            *self
+                .login
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(login.to_owned());
+            self
+        }
+
+        /// The repositories that were created, in order.
+        pub fn created(&self) -> Vec<NewRepository> {
+            self.created
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         /// The comments that were added, as `(pull request number, body)`, in order.
@@ -212,6 +343,78 @@ mod memory {
                 .push((number, body.to_owned()));
             Ok(())
         }
+
+        async fn create_repository(
+            &self,
+            new: NewRepository,
+        ) -> Result<CreatedRepository, WorkspaceError> {
+            let loc = new.repo.locate()?;
+            let mut created = self
+                .created
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if created.iter().any(|c| c.repo.url == new.repo.url) {
+                return Err(WorkspaceError::Invalid(
+                    "name already exists on this account".to_owned(),
+                ));
+            }
+            let full_name = format!("{}/{}", loc.owner, loc.name);
+            let out = CreatedRepository {
+                clone_url: format!("memory://{full_name}.git"),
+                html_url: format!("memory://{full_name}"),
+                default_branch: "main".to_owned(),
+                full_name,
+            };
+            created.push(new);
+            Ok(out)
+        }
+
+        async fn find_repository(
+            &self,
+            repo: &RepoRef,
+        ) -> Result<Option<CreatedRepository>, WorkspaceError> {
+            let loc = repo.locate()?;
+            let created = self
+                .created
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok(created.iter().any(|c| c.repo.url == repo.url).then(|| {
+                let full_name = format!("{}/{}", loc.owner, loc.name);
+                CreatedRepository {
+                    clone_url: format!("memory://{full_name}.git"),
+                    html_url: format!("memory://{full_name}"),
+                    default_branch: "main".to_owned(),
+                    full_name,
+                }
+            }))
+        }
+
+        async fn owner_kind(
+            &self,
+            owner: &str,
+            _host_repo: &RepoRef,
+        ) -> Result<OwnerKind, WorkspaceError> {
+            let organizations = self
+                .organizations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok(if organizations.iter().any(|o| o == owner) {
+                OwnerKind::Organization
+            } else {
+                OwnerKind::User
+            })
+        }
+
+        async fn authenticated_login(
+            &self,
+            _host_repo: &RepoRef,
+        ) -> Result<Option<String>, WorkspaceError> {
+            Ok(self
+                .login
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
+        }
     }
 
     #[cfg(test)]
@@ -294,6 +497,54 @@ mod memory {
                     .await
                     .unwrap(),
                 None
+            );
+        }
+
+        #[tokio::test]
+        async fn a_repository_is_created_once_and_the_owner_is_as_configured() {
+            let host = MemoryCodeHost::new()
+                .with_organization("acme")
+                .with_login("me");
+            let at = RepoRef::new("https://github.com/acme/fib", "main");
+            let request = NewRepository {
+                repo: at.clone(),
+                private: true,
+                description: None,
+                kind: OwnerKind::Organization,
+            };
+            let created = host.create_repository(request.clone()).await.unwrap();
+            let expected = [request.clone()];
+            assert_eq!(created.full_name, "acme/fib");
+            assert_eq!(host.created(), expected);
+            assert!(matches!(
+                host.create_repository(request).await,
+                Err(WorkspaceError::Invalid(m)) if m.contains("already exists")
+            ));
+            // What a caller that is unsure its creation took effect asks.
+            let found = host.find_repository(&at).await.unwrap().unwrap();
+            assert_eq!(found, created);
+            assert_eq!(
+                host.find_repository(&RepoRef::new("https://github.com/acme/other", "main"))
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                host.owner_kind("acme", &at).await.unwrap(),
+                OwnerKind::Organization
+            );
+            assert_eq!(host.owner_kind("me", &at).await.unwrap(), OwnerKind::User);
+            assert_eq!(
+                host.authenticated_login(&at).await.unwrap().as_deref(),
+                Some("me")
+            );
+            assert_eq!(
+                MemoryCodeHost::new()
+                    .authenticated_login(&at)
+                    .await
+                    .unwrap(),
+                None,
+                "an installation has no login"
             );
         }
 

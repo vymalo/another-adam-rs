@@ -21,6 +21,14 @@
 # 1.94.1-trixie has the same digest. The workspace's rust-version is 1.94.
 # Written inline in FROM (not through an ARG) so hadolint can see the tag.
 
+# The official GitHub MCP server (github.com/github/github-mcp-server), pinned by tag and digest of
+# its image index: the coder reads GitHub through it, read-only (bin/adam-coder/agent/mcp.json,
+# ADR 0009). Only its binary is taken: a static Go binary (CGO_ENABLED=0, no libc), at /server/ in
+# the upstream image (distroless). Verified 2026-10-01: an anonymous ghcr.io token and a manifest
+# request for the tag v1.12.2 (also 1.12.2) returned this index digest (amd64 and arm64), whose
+# labels say version 1.12.2, revision 85598ba. v1.13.0 was published the same day and has not been
+# verified; move the tag, the digest and the claims in ADR 0009 together.
+
 # Tag of the runtime base image, of the form <rust toolchain>-<sha7>: immutable,
 # published by vymalo/another-agentic-images (merged in #7 as bc97d51). Deployments
 # pin an immutable tag, never `latest`. Bump it when that image changes (the tag
@@ -43,6 +51,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && install -D -m 0755 target/release/adam-coder /out/adam-coder \
  && install -D -m 0755 target/release/adam-agent /out/adam-agent
 
+FROM ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6 AS github-mcp
+
 FROM ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}
 
 LABEL org.opencontainers.image.source="https://github.com/vymalo/another-adam-rs" \
@@ -52,6 +62,7 @@ LABEL org.opencontainers.image.source="https://github.com/vymalo/another-adam-rs
 # hadolint ignore=DL3066
 USER root
 COPY --from=build /out/adam-coder /out/adam-agent /usr/local/bin/
+COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
 # /work holds mirrors and worktrees; the deployment mounts a volume there. The
 # base image already creates it owned by uid 10001, as does this line for a
 # base that does not.
@@ -60,7 +71,8 @@ RUN install -d -o 10001 -g 10001 /work
 ENV WORKSPACE_ROOT=/work \
     LISTEN_ADDR=0.0.0.0:8080 \
     RUST_LOG=info \
-    OPENCODE_DISABLE_AUTOUPDATE=1
+    OPENCODE_DISABLE_AUTOUPDATE=1 \
+    MCP_ALLOW_STDIO=true
 
 # The runtime user of the workspace image (uid/gid 10001, `agent`).
 USER 10001
@@ -69,10 +81,15 @@ EXPOSE 8080
 
 # Smoke test in a login shell as uid 10001: both binaries start and reject an
 # empty environment (they fail closed) instead of crashing, adam-agent names the
-# folder it needs, and the tools the agent shells out to are on PATH.
-RUN bash -lc 'set -e; \
+# folder it needs, and the tools the agent shells out to are on PATH. The GitHub MCP server
+# is there, runs, and lists the twelve read tools of the coder's allow-list over stdio with no
+# credential (a missing name would stop the coder at startup).
+RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/github-mcp-tools.sh \
+    bash -lc 'set -e; \
       test "$(id -u)" = 10001; \
-      command -v adam-coder adam-agent git opencode tini; \
+      command -v adam-coder adam-agent git opencode tini github-mcp-server; \
+      github-mcp-server --version | grep -q "v1.12.2"; \
+      sh /tmp/github-mcp-tools.sh; \
       out="$(env -i PATH="$PATH" adam-coder 2>&1 || true)"; \
       echo "$out" | grep -q "invalid configuration"; \
       out="$(env -i PATH="$PATH" adam-agent 2>&1 || true)"; \

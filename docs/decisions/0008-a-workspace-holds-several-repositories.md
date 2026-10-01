@@ -196,3 +196,32 @@ unchanged, and it is what carries the project's checks over: they bind the pushe
 after the copy has the same tree, so a project that lands unchanged in an empty repository needs no second
 check, and any other tree is unchecked until `run_checks` has run on it. Not built yet: the coder's question
 about a repository the person did not name (decision 9), and the creation of a repository.*
+
+*2026-10-01 (slice 7, A7): the coder's question about another repository is built (decision 9, the part
+about the person's yes; `bin/adam-coder/README.md`, "Another repository, only with the person's yes").
+`request_repository { repo_url, reason }` parks the run on a question the **tool** writes (it names the
+repository, quotes the model's reason, capped at 300 characters, and offers a yes and a no: a form where the
+screen can draw one, the options as text where it cannot), and only a yes grants the repository. The grant is
+recorded by the agent before each step from the conversation: the person's answer to that call (the result of a
+call that did not fail, or the inbox while the run is parked on it) is paired with the call by position and
+grants the repository of that call's argument, never what the model said and never the answer to a question
+the model wrote with `ask_user`. A yes is the form's option or, in words, exactly `yes`, `y` or the option's
+label. `RunNotes::named_repos` now means the granted keys, and `RunNotes::consents` keeps every answer, a
+refusal included, so that a repository the person turned down is not asked about again. The workspace gained
+one thing for it: `Workspaces::check_repository`, the policy alone, so that a repository that could never be
+added is not asked about. `prepare_workspace` and `publish_scratch` are unchanged except that their refusal
+now points to the tool. The third way a repository is granted is built too (A8, below).*
+
+*2026-10-01 (slice 7, A8): the coder creates a repository on request (decision 9, the third way a repository
+is granted; [ADR 0009](0009-github-per-installation-read-through-mcp.md), decision 9, and `bin/adam-coder/README.md`,
+"A repository of its own, on request"). `create_repository` asks the person, creates the repository empty after
+a yes, and grants it by the key of its clone URL; `RunNotes::created_repos` records it. A scratch project is then
+published to it with `publish_scratch`, as to any granted repository.*
+
+*2026-10-01 (review of slice 7, A7 and A8): the rule for what counts as an answer is narrower than it was.
+A yes (the form's option, or exactly `yes`, `y` or the option's label) grants and is recorded; an **explicit no**
+(the form's option, or exactly `no`, `n` or the no option's label) is recorded as a refusal and is final for the
+task; **any other message** (`wait`, `?`, a question back, `yes please`) records nothing, so that it neither grants
+nor refuses, and the question can be asked again. The model still gets the person's words as the call's result.
+Before, any text that was not a yes was recorded as a refusal, which made a "wait" a permanent "do not ask again".
+`create_repository` follows the same rule, and is now safe to repeat (ADR 0009).*

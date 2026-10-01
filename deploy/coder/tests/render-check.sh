@@ -102,6 +102,15 @@ helm template coder "$chart" --namespace coder-ns \
 check "the repository allowlist is values-driven and comma-joined" has 'value: "github.com,ghe.example.com:8443"'
 check "the GitHub API URL is values-driven" has 'value: "https://ghe.example.com/api/v3"'
 
+check "creating repositories is off by default: no CREATE_REPO_OWNERS" lacks 'name: CREATE_REPO_OWNERS'
+helm template coder "$chart" --namespace coder-ns \
+  --set 'github.createRepoOwners={acme,scratch}' > "$out"
+check "the owners a repository may be created for are values-driven and comma-joined" has 'value: "acme,scratch"'
+check "CREATE_REPO_OWNERS is rendered once" count 'name: CREATE_REPO_OWNERS' 1
+helm template coder "$chart" --namespace coder-ns --set config.role=control-plane \
+  --set 'github.createRepoOwners={acme}' > "$out"
+check "a control plane gets no CREATE_REPO_OWNERS" lacks 'name: CREATE_REPO_OWNERS'
+
 helm template coder "$chart" --namespace coder-ns --set config.role=worker > "$out"
 check "ROLE is rendered when config.role is set" has 'name: ROLE'
 check "ROLE carries the value" has 'value: "worker"'

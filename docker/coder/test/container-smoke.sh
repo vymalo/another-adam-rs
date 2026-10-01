@@ -62,10 +62,23 @@ sh "$here/http-smoke.sh" "http://127.0.0.1:$coder_port" "$token" || fail=1
 # The runtime user and the tools the agent shells out to.
 uid=$(docker exec "$name" id -u)
 if [ "$uid" = 10001 ]; then ok "runs as uid 10001"; else bad "runs as uid $uid, want 10001"; fi
-if docker exec "$name" bash -lc 'git --version && opencode --version && command -v tini adam-coder' >/dev/null; then
-  ok "git, opencode, tini and adam-coder are on PATH in a login shell"
+if docker exec "$name" bash -lc 'git --version && opencode --version && github-mcp-server --version && command -v tini adam-coder' >/dev/null; then
+  ok "git, opencode, github-mcp-server, tini and adam-coder are on PATH in a login shell"
 else
   bad "a tool is missing from PATH in a login shell"
+fi
+# The GitHub MCP server of the shipped `mcp.json`: the coder (embedded agent files, the image's
+# MCP_ALLOW_STDIO) started it as a child process and connected it (the check above already needed it
+# to start), and it lists the twelve read tools and no write tool.
+if docker logs "$name" 2>&1 | grep -q 'connected to the MCP server.*github'; then
+  ok "the coder connected the GitHub MCP server"
+else
+  bad "the coder did not connect the GitHub MCP server"
+fi
+if docker exec -i "$name" sh -s < "$here/github-mcp-tools.sh" >/dev/null; then
+  ok "the GitHub MCP server lists the tools of the allow-list and none that writes"
+else
+  bad "the GitHub MCP server's tool list is not the allow-list"
 fi
 pid1=$(docker exec "$name" sh -c 'cat /proc/1/comm')
 if [ "$pid1" = tini ]; then ok "tini is PID 1"; else bad "PID 1 is $pid1, want tini"; fi

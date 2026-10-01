@@ -1,0 +1,251 @@
+{
+  "mappings": [
+    {
+      "name": "mcp: no Authorization header",
+      "priority": 10,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp"
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "WWW-Authenticate": "Bearer error=\"invalid_token\""
+        },
+        "body": "Unauthorized"
+      }
+    },
+    {
+      "name": "mcp: initialize",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer .+"
+          }
+        },
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "initialize"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"protocolVersion\":\"{{jsonPath request.body '$.params.protocolVersion'}}\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"mock-github-mcp\",\"version\":\"0.0.0\"}}}"
+      }
+    },
+    {
+      "name": "mcp: notifications",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer .+"
+          }
+        },
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "matches": "notifications/.*"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 202
+      }
+    },
+    {
+      "name": "mcp: tools/list",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer .+"
+          }
+        },
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "tools/list"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"tools\":[{\"name\":\"get_me\",\"description\":\"Get details of the authenticated GitHub user.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"search_repositories\",\"description\":\"Find GitHub repositories by name, description or topics.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"page\":{\"type\":\"number\"},\"perPage\":{\"type\":\"number\"}},\"required\":[\"query\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"get_file_contents\",\"description\":\"Get the contents of a file or directory of a repository.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"owner\":{\"type\":\"string\"},\"repo\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"ref\":{\"type\":\"string\"},\"sha\":{\"type\":\"string\"}},\"required\":[\"owner\",\"repo\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"list_branches\",\"description\":\"List the branches of a repository.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"owner\":{\"type\":\"string\"},\"repo\":{\"type\":\"string\"},\"page\":{\"type\":\"number\"},\"perPage\":{\"type\":\"number\"}},\"required\":[\"owner\",\"repo\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"list_commits\",\"description\":\"Get the commits of a branch of a repository.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"owner\":{\"type\":\"string\"},\"repo\":{\"type\":\"string\"},\"sha\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"page\":{\"type\":\"number\"},\"perPage\":{\"type\":\"number\"}},\"required\":[\"owner\",\"repo\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"get_commit\",\"description\":\"Get the details of a commit of a repository.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"owner\":{\"type\":\"string\"},\"repo\":{\"type\":\"string\"},\"sha\":{\"type\":\"string\"},\"page\":{\"type\":\"number\"},\"perPage\":{\"type\":\"number\"}},\"required\":[\"owner\",\"repo\",\"sha\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"search_code\",\"description\":\"Search for code across GitHub repositories.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"page\":{\"type\":\"number\"},\"perPage\":{\"type\":\"number\"}},\"required\":[\"query\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"list_issues\",\"description\":\"List the issues of a repository.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"owner\":{\"type\":\"string\"},\"repo\":{\"type\":\"string\"},\"state\":{\"type\":\"string\"},\"perPage\":{\"type\":\"number\"}},\"required\":[\"owner\",\"repo\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"issue_read\",\"description\":\"Get details of an issue: the issue, its comments, sub-issues or labels.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\"},\"owner\":{\"type\":\"string\"},\"repo\":{\"type\":\"string\"},\"issue_number\":{\"type\":\"number\"}},\"required\":[\"method\",\"owner\",\"repo\",\"issue_number\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"search_issues\",\"description\":\"Search for issues in GitHub repositories.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"page\":{\"type\":\"number\"},\"perPage\":{\"type\":\"number\"}},\"required\":[\"query\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"list_pull_requests\",\"description\":\"List the pull requests of a repository.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"owner\":{\"type\":\"string\"},\"repo\":{\"type\":\"string\"},\"state\":{\"type\":\"string\"},\"page\":{\"type\":\"number\"},\"perPage\":{\"type\":\"number\"}},\"required\":[\"owner\",\"repo\"]},\"annotations\":{\"readOnlyHint\":true}},{\"name\":\"pull_request_read\",\"description\":\"Get details of a pull request: the pull request, its diff, files, reviews or comments.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"method\":{\"type\":\"string\"},\"owner\":{\"type\":\"string\"},\"repo\":{\"type\":\"string\"},\"pullNumber\":{\"type\":\"number\"}},\"required\":[\"method\",\"owner\",\"repo\",\"pullNumber\"]},\"annotations\":{\"readOnlyHint\":true}}]}}"
+      }
+    },
+    {
+      "name": "mcp: tools/call get_me",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer .+"
+          }
+        },
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "tools/call"
+            }
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.params.name",
+              "equalTo": "get_me"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"login\\\":\\\"dev-user\\\"}\"}]}}"
+      }
+    },
+    {
+      "name": "mcp: tools/call list_branches",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer .+"
+          }
+        },
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "tools/call"
+            }
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.params.name",
+              "equalTo": "list_branches"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"[{\\\"name\\\":\\\"main\\\"}]\"}]}}"
+      }
+    },
+    {
+      "name": "mcp: tools/call, any other tool",
+      "priority": 5,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer .+"
+          }
+        },
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "tools/call"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"not scripted: the mock answers get_me and list_branches only\"}],\"isError\":true}}"
+      }
+    },
+    {
+      "name": "mcp: ping",
+      "priority": 1,
+      "request": {
+        "method": "POST",
+        "urlPath": "/mcp",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer .+"
+          }
+        },
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.method",
+              "equalTo": "ping"
+            }
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":{{{jsonPath request.body '$.id'}}},\"result\":{}}"
+      }
+    },
+    {
+      "name": "mcp: GET (no standalone stream)",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/mcp"
+      },
+      "response": {
+        "status": 405,
+        "headers": {
+          "Allow": "POST"
+        }
+      }
+    },
+    {
+      "name": "mcp: DELETE (no session to end)",
+      "priority": 1,
+      "request": {
+        "method": "DELETE",
+        "urlPath": "/mcp"
+      },
+      "response": {
+        "status": 405,
+        "headers": {
+          "Allow": "POST"
+        }
+      }
+    }
+  ]
+}
