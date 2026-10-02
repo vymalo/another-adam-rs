@@ -127,6 +127,11 @@ async fn the_prompt_carries_the_rules_the_code_relies_on() {
         "A tool that the **project** brings itself",
         "Do not start the coding workflow",
         "`base_branch` out to start from the repository's default branch",
+        // The answer is announced with the thread tool when the model has it, and the prompt reads
+        // the same without it (the reply that ends the turn is the answer, as before).
+        "**If you have a `turn_output` tool**",
+        "**do not repeat the answer after it**",
+        "your last words are your answer, as they are when you have\n  no such tool",
     ] {
         assert!(text.contains(needle), "prompt lost: {needle}");
     }

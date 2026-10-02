@@ -183,6 +183,14 @@ pub struct ToolOutput {
     /// `RunView::artifacts`).
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    /// Words the tool announces as **the run's answer**: when the run finishes, they are its
+    /// output's `text` (the A2A `completed` status message), not the closing words of the model.
+    /// See [`announcing`](Self::announcing). Never read from an error result.
+    ///
+    /// Journaled with the result, so a replay announces the same words; absent from a journal
+    /// written before it existed, and not written while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
 }
 
 impl ToolOutput {
@@ -192,6 +200,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             artifacts: Vec::new(),
+            answer: None,
         }
     }
 
@@ -202,7 +211,22 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             artifacts: Vec::new(),
+            answer: None,
         }
+    }
+
+    /// Announce `text` as the run's answer: once the run finishes, `text` is what it answered, and
+    /// what the model says in its last turn is not. A later call that announces replaces it (the
+    /// last announcement wins), and one that fails announces nothing: an error result's `answer`
+    /// is ignored. The announcement lasts until a new message reaches the run.
+    ///
+    /// For a tool that hands the final answer over by another route (the thread tool
+    /// `turn_output` of `adam-ui` does), so that a client that reads only the run's output reads the
+    /// same answer the person was shown.
+    #[must_use]
+    pub fn announcing(mut self, text: impl Into<String>) -> Self {
+        self.answer = Some(text.into());
+        self
     }
 
     /// Add an artifact.

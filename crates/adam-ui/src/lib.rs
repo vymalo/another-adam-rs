@@ -10,7 +10,7 @@
 //! | [`AskUser`] (`ask_user { question, choices? }`) | the plain question every agent has; with `choices`, one form (radio lists, checkboxes) and the person's answers as the result; as text when the screen cannot draw it |
 //! | [`Show`] (`show { blocks, title? }`) | draws blocks of the screen's components, each checked against the catalog's schema; the A2UI surface goes out as a run artifact |
 //! | [`UiCatalogTool`] (`ui_catalog {}`) | the components, what they are for, and their schemas |
-//! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, listed again at every model turn |
+//! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, listed again at every model turn; a successful `turn_output { text }` makes `text` the run's answer |
 //! | [`card_extensions`] | the card entries that announce all this (A2UI v0.9.1, `ui-catalog/v1`, `thread-tools/v1`) |
 //!
 //! A binary wires it in a few lines (the inbound function is `adam-a2a-runtime`'s `vymalo_inbound`):
@@ -61,7 +61,9 @@ pub use catalog::{
 };
 pub use show::{MAX_BLOCKS, SHOW, Show, UI_CATALOG, UiCatalogTool};
 pub use surface::A2UI_VERSION;
-pub use thread_tools::{Clock, GET_UI_CATALOG, ThreadTools, ThreadToolsClient};
+pub use thread_tools::{
+    Clock, GET_UI_CATALOG, TURN_OUTPUT, TURN_OUTPUT_DELIVERED, ThreadTools, ThreadToolsClient,
+};
 
 use resolve::UiState;
 

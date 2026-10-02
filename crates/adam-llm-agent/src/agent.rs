@@ -367,7 +367,9 @@ impl LlmAgentBuilder {
 ///    its result is appended. Then the step returns `Continue`, so every
 ///    turn is committed before the next begins. A turn without tool calls
 ///    returns `Done` with `{"text": <final text>, "artifacts": [{name,
-///    mime_type}...]}`.
+///    mime_type}...]}`. When a tool announced the answer
+///    ([`ToolOutput::announcing`](crate::ToolOutput::announcing)) in this turn of the conversation, the
+///    text is the last announcement and not the model's closing words (see "Announced answers").
 ///
 /// Because steps are journaled, a restarted worker replays recorded model and
 /// tool results instead of repeating them.
@@ -414,6 +416,15 @@ impl LlmAgentBuilder {
 /// failure, in the middle of the answer too, is the same failure as a failed
 /// [`complete`](adam_model::ModelClient::complete). The answer that ends the run names its stream in the run's output
 /// (`stream`), as `agent_text` does for the words before a tool call.
+///
+/// # Announced answers
+///
+/// A tool can say "this is my answer" before the model is done: [`ToolOutput::announcing`]. The words
+/// are kept in [`Conversation::announced`] (journaled with the call's result, so a replay announces the
+/// same ones), a later announcement replaces them, and an error result announces nothing. When the run
+/// finishes, they are the output's `text`, and so the text of the A2A `completed` status, whatever the
+/// model closes with; the closing words are still said, as `agent_text` with their `stream`, and the
+/// output names no stream. A message that reaches the run ends the turn and clears the announcement.
 ///
 /// # Child runs
 ///
@@ -559,6 +570,11 @@ impl LlmAgent {
             }
         }
         let mut texts = texts.into_iter();
+        // A message that reaches the run starts a new turn: what a tool announced as the answer of
+        // the one before is not the answer of this one.
+        if !texts.as_slice().is_empty() {
+            state.announced = None;
+        }
         if let Some(PendingWait::Question(q)) = &state.pending_wait {
             let Some(answer) = texts.next() else {
                 return false;
@@ -754,7 +770,9 @@ impl LlmAgent {
             // The words before a tool call are said whole, under the stream they were sent as, because
             // nothing else will say them: the turn goes on to its tools. The answer that ends the run
             // is said by the run itself, whose output names its stream (below).
-            if !calls.is_empty()
+            // So are the closing words of a turn whose answer a tool announced: the answer is the
+            // announced text, and what the model says after it is working text, stated here.
+            if (!calls.is_empty() || state.announced.is_some())
                 && let Some(stream) = &stream
             {
                 payload["stream"] = json!(stream);
@@ -768,6 +786,14 @@ impl LlmAgent {
         state.messages.push(message);
 
         if calls.is_empty() {
+            // What a tool announced as the answer is the run's answer (the last announcement wins);
+            // without one, the words that end the turn are.
+            if let Some(announced) = state.announced.clone() {
+                return Ok(Flow::Done(json!({
+                    "text": announced,
+                    "artifacts": state.artifacts,
+                })));
+            }
             let mut output = json!({
                 "text": text,
                 "artifacts": state.artifacts,
@@ -809,7 +835,16 @@ impl LlmAgent {
             let used = files_kept(&state.artifacts);
             let (message, artifacts) = match self.run_tool(ctx, &state.context, &call, used).await?
             {
-                ToolResult::Answered { message, artifacts } => (message, artifacts),
+                ToolResult::Answered {
+                    message,
+                    artifacts,
+                    answer,
+                } => {
+                    if answer.is_some() {
+                        state.announced = answer;
+                    }
+                    (message, artifacts)
+                }
                 ToolResult::NeedsInput { question, ui } => {
                     ctx.emit(RunEvent::Custom {
                         kind: "input_required".into(),
@@ -919,6 +954,7 @@ impl LlmAgent {
                 return Ok(ToolResult::Answered {
                     message: Message::tool_error(call.id.clone(), unknown),
                     artifacts: Vec::new(),
+                    answer: None,
                 });
             }
             None => {
@@ -939,7 +975,7 @@ impl LlmAgent {
 
         match outcome {
             Ok(output) => {
-                let (message, artifacts, outcome) =
+                let (message, artifacts, answer, outcome) =
                     output_message(ctx, &call.id, output, files_used).await;
                 // What the step says is what the model is told (the refusal of a file included).
                 let said = match &message {
@@ -950,7 +986,11 @@ impl LlmAgent {
                 };
                 ctx.emit(self.step_end(&call.name, &call.id, outcome, said))
                     .await;
-                Ok(ToolResult::Answered { message, artifacts })
+                Ok(ToolResult::Answered {
+                    message,
+                    artifacts,
+                    answer,
+                })
             }
             Err(ToolError::Permanent(reason)) => {
                 ctx.emit(self.step_end(
@@ -963,6 +1003,7 @@ impl LlmAgent {
                 Ok(ToolResult::Answered {
                     message: Message::tool_error(call.id.clone(), reason),
                     artifacts: Vec::new(),
+                    answer: None,
                 })
             }
             Err(ToolError::Transient(reason)) => {
@@ -1136,9 +1177,12 @@ impl LlmAgent {
             Ok(RemotePoll::Working) => Ok(None),
             Ok(RemotePoll::Ready(output)) => {
                 let used = files_kept(&state.artifacts);
-                let (message, artifacts, outcome) =
+                let (message, artifacts, answer, outcome) =
                     output_message(ctx, &wait.call_id, output, used).await;
                 state.artifacts.extend(artifacts);
+                if answer.is_some() {
+                    state.announced = answer;
+                }
                 owed(state, message);
                 Ok(Some(outcome))
             }
@@ -1169,8 +1213,9 @@ fn files_kept(artifacts: &[ArtifactRef]) -> u64 {
     artifacts.iter().filter_map(|a| a.bytes).sum()
 }
 
-/// A tool's output as the message that answers `call_id`, with the references to its artifacts and
-/// the state the end of the call's step carries. The artifacts are emitted here (and recorded with the
+/// A tool's output as the message that answers `call_id`, with the references to its artifacts, the
+/// words it announced as the run's answer (only from a result that is not an error, the refusal of a
+/// file included) and the state the end of the call's step carries. The artifacts are emitted here (and recorded with the
 /// transition's commit).
 ///
 /// **Files are bounded per run.** The files of a run are journaled with it, so the run keeps at most
@@ -1182,7 +1227,7 @@ async fn output_message(
     call_id: &str,
     mut output: ToolOutput,
     files_used: u64,
-) -> (Message, Vec<ArtifactRef>, StepState) {
+) -> (Message, Vec<ArtifactRef>, Option<String>, StepState) {
     let mut used = files_used;
     let mut refused: Vec<String> = Vec::new();
     output.artifacts.retain(|a| {
@@ -1224,12 +1269,13 @@ async fn output_message(
     for artifact in output.artifacts {
         ctx.emit(RunEvent::from(artifact)).await;
     }
+    let answer = output.answer.take().filter(|_| !output.is_error);
     let message = Message::Tool {
         call_id: call_id.to_owned(),
         content: output.content,
         is_error: output.is_error,
     };
-    (message, refs, outcome)
+    (message, refs, answer, outcome)
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -1316,6 +1362,8 @@ enum ToolResult {
     Answered {
         message: Message,
         artifacts: Vec<ArtifactRef>,
+        /// What the tool announced as the run's answer, from a result that is not an error.
+        answer: Option<String>,
     },
     NeedsInput {
         question: String,

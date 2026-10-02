@@ -57,6 +57,15 @@ use crate::show::{SHOW, describe_show};
 /// The tool of the endpoint that gives the thread's current catalog.
 pub const GET_UI_CATALOG: &str = "get_ui_catalog";
 
+/// The tool with which an agent says "this is my answer for this turn": `turn_output { text }`.
+/// What it is told when the call succeeds is [`TURN_OUTPUT_DELIVERED`], and the text is the run's
+/// answer ([`ToolOutput::announcing`]).
+pub const TURN_OUTPUT: &str = "turn_output";
+
+/// What the model is told when `turn_output` delivered its answer. The endpoint's own `{"delivered":
+/// true}` says nothing to a model about what to do next.
+pub const TURN_OUTPUT_DELIVERED: &str = "Delivered to the person as your answer. Finish now with one short line, and do not repeat the answer.";
+
 /// The longest a listing waits for the endpoint, whatever the policy's connect timeout: it is paid
 /// at every model turn.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -264,6 +273,13 @@ fn fits(name: &str) -> bool {
 /// answers a name it does not have with a protocol error, which the model reads as an error
 /// result), so the source belongs **last** among the sources of an agent.
 ///
+/// **`turn_output`.** The one tool of the endpoint this source knows by name: when a call to it
+/// succeeds, the model is told [`TURN_OUTPUT_DELIVERED`] and its `text` is announced as the run's
+/// answer ([`ToolOutput::announcing`]), so the run's output, and with it the A2A `completed` status,
+/// carries the Markdown the person was shown and not the model's closing line. A later successful call
+/// replaces it; a call the endpoint refuses (the turn is over, the text is empty or too long, the
+/// endpoint is down) announces nothing and the model reads the error.
+///
 /// [`Ui::source`](crate::Ui::source) makes one that **hides `get_ui_catalog`** from the model (the
 /// agent has `ui_catalog` for that, and two tools for one thing made models call whichever they
 /// remembered; the catalog is still read through the endpoint, by this crate, when a message does
@@ -398,15 +414,25 @@ impl ToolSource for ThreadTools {
             Value::Null => Map::new(),
             _ => return error_result(format!("`{name}` takes a JSON object of arguments")),
         };
+        // What the endpoint was given, for a tool whose input is the answer.
+        let announced = if name == TURN_OUTPUT {
+            arguments
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_owned)
+        } else {
+            None
+        };
         let called = match self.client.endpoint(&grant) {
             Ok(endpoint) => endpoint.call_tool(name, arguments).await,
             Err(e) => Err(e),
         };
         match called {
-            Ok(result) => Some(Ok(if result.is_error {
-                ToolOutput::error(result.text)
-            } else {
-                ToolOutput::text(result.text)
+            Ok(result) if result.is_error => Some(Ok(ToolOutput::error(result.text))),
+            Ok(result) => Some(Ok(match announced {
+                Some(text) => ToolOutput::text(TURN_OUTPUT_DELIVERED).announcing(text),
+                None => ToolOutput::text(result.text),
             })),
             Err(EndpointError::Unauthorized) => error_result(format!(
                 "`{name}` was refused: the endpoint does not accept this conversation's grant any \
@@ -691,6 +717,76 @@ mod tests {
             "{}",
             failing.content
         );
+    }
+
+    #[tokio::test]
+    async fn a_delivered_turn_output_tells_the_model_what_to_do_and_announces_its_text() {
+        let server = ThreadToolsServer::start(&["tok"]).await;
+        server.enable_turn_output();
+        let source = source("2026-10-01T12:00:00Z");
+        let ctx = ToolCtx::detached("turn_output", "c1", Arc::new(adam_runtime::NoopSink))
+            .with_context(context(&server.url("t1"), "tok", "2026-10-01T14:00:00Z"));
+
+        let ok = source
+            .call(&ctx, TURN_OUTPUT, json!({"text": "## Answer\n\n42"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!ok.is_error);
+        // The model reads what to do next, not the endpoint's `{"delivered": true}`.
+        assert_eq!(ok.content, TURN_OUTPUT_DELIVERED);
+        assert_eq!(ok.answer.as_deref(), Some("## Answer\n\n42"));
+        assert_eq!(server.announcements(), ["## Answer\n\n42"]);
+
+        // Refused by the endpoint: the model reads the error, and nothing is announced.
+        for (args, said) in [
+            (json!({"text": "   "}), "text must not be empty"),
+            (
+                json!({"text": "x".repeat(65_537)}),
+                "text must be at most 65536 bytes",
+            ),
+        ] {
+            let refused = source.call(&ctx, TURN_OUTPUT, args).await.unwrap().unwrap();
+            assert!(refused.is_error, "{said}");
+            assert_eq!(refused.content, said);
+            assert_eq!(refused.answer, None);
+        }
+        server.end_turn();
+        let over = source
+            .call(&ctx, TURN_OUTPUT, json!({"text": "late"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(over.is_error && over.answer.is_none());
+        assert_eq!(over.content, "this turn is over");
+        assert_eq!(server.announcements(), ["## Answer\n\n42"]);
+
+        // Another tool's answer is never an announcement, whatever its arguments say.
+        server.add_tool("relay__say", "Say.", json!({"type": "object"}), "said");
+        let other = source
+            .call(&ctx, "relay__say", json!({"text": "not an answer"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.answer, None);
+    }
+
+    #[tokio::test]
+    async fn a_turn_output_whose_grant_the_endpoint_refuses_announces_nothing() {
+        // The grant is refused (a token the endpoint does not accept): an error result, no answer.
+        let server = ThreadToolsServer::start(&["tok"]).await;
+        server.enable_turn_output();
+        let source = source("2026-10-01T12:00:00Z");
+        let ctx = ToolCtx::detached("turn_output", "c1", Arc::new(adam_runtime::NoopSink))
+            .with_context(context(&server.url("t1"), "wrong", "2026-10-01T14:00:00Z"));
+        let refused = source
+            .call(&ctx, TURN_OUTPUT, json!({"text": "answer"}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(refused.is_error);
+        assert_eq!(refused.answer, None);
+        assert!(server.announcements().is_empty());
     }
 
     #[tokio::test]
