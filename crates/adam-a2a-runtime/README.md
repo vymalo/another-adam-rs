@@ -45,7 +45,8 @@ same store. Nothing steps a task in the front itself.
 Mapping (full table in `src/backend.rs`): a task is a run (`task_id` is the run
 id); a new `SendMessage` is `Runtime::start_with_id` (delivering to the context's open task if it has one), or
 `Runtime::start_with_id_continuing` when it references a finished task (see *Continuing a task*); a message with `taskId` is
-`Runtime::deliver`, only while the task is `input-required`; `CancelTask` is
+`Runtime::deliver`, while the task is `input-required` and, when the request activated `steer/v1`, while it is `submitted` or
+`working` (see *Steering a running task*); `CancelTask` is
 `Runtime::cancel`. Ownership is encoded in the run's durable conversation id
 (`<subject>:<context id>`), so it survives restarts with no side table, and a
 task owned by someone else looks like one that does not exist. Subscriptions
@@ -59,6 +60,33 @@ subscription of a task another process is stepping advances at the durable poll.
 delivers a `CancelTask` to the running step at once (a `Notifier`), instead of at
 the next poll. `adam-coder` wires it in for every role (`Coder::new_with`,
 `Coder::control_plane_with`).
+
+## Steering a running task
+
+A2A does not say what a message with the `taskId` of a `working` task is. With the optional extension **`steer/v1`**
+([`docs/api/steer-v1.md`][steer], [ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)),
+a message that names a `submitted` or `working` task and **activates the extension** (the card declares
+`STEER_EXTENSION`, the client names it in `A2A-Extensions` or in `message.extensions`: `Caller::extensions`) is
+**delivered to the open task**: `Runtime::deliver`, so it is in the run's inbox in the store (durable: it survives a
+worker crash and a lease that moves), and the answer is the task as it is, still `working`. The agent reads it at its next step
+(`LlmAgent`: before its next model turn, after the result of a tool call it has started, never in the middle of it), and a run that
+is about to finish takes another step first (`Ctx::reopen_on_arrival`, which `LlmAgent` asks for; see the runtime's README).
+
+| The task | The request | Answer |
+|---|---|---|
+| `submitted` or `working` | activated | delivered; the task, `working` |
+| `submitted` or `working` | not activated | `InvalidParams`, exactly as before (the specification leaves it undefined) |
+| `completed`, `failed` or `canceled` | any | `UnsupportedOperation` (`-32004`, A2A's error for a message to a terminal task; before steer/v1 this was `InvalidParams`) |
+| `submitted` or `working`, another context than the message's | activated | `TaskNotFound` |
+| unknown, or another caller's | any | `TaskNotFound` |
+| `input-required` | any | the follow-up that resumes it, as plain A2A: the extension changes nothing |
+
+The backend does not deduplicate (the runtime keeps no record of consumed ids): a message sent twice is delivered twice, and
+**the agent** reads one copy per `messageId` (`LlmAgent` keeps the last 128 ids it has read in its state). Declaring the
+extension on the card (`adam_ui::card_extensions()` does, for `adam-agent` and the coder) is the host's promise that its agent
+does that and never loses an accepted message; a host that serves an agent which does not should not declare it.
+
+[steer]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/steer-v1.md
 
 ## Continuing a task
 
@@ -241,7 +269,8 @@ UUID of version 8):
   Not covered: a message delivered into an already open task of its context,
   and a follow-up to a `taskId`, are not recognised on a repeat (the runtime
   keeps no record of consumed inbound ids); a repeated follow-up is refused
-  because the task is no longer `input-required`.
+  because the task is no longer `input-required`. A repeated **steer** is delivered again, and the agent reads
+  it once (above).
 
 ## Errors
 
@@ -296,7 +325,7 @@ the backend whose model is shown the earlier messages (memory and PostgreSQL). U
 messages in `src/vymalo.rs` (each shape of answer, quoting, the cut, the context under every capability key, a catalog
 of another id, a malformed reference, the doubles) and `tests/vymalo.rs` (a real `Runtime` and `LlmAgent`: the
 extensions reaching the run's context, a question with an interface as `input-required` with two parts, and the person's
-answer as the tool result the model reads), and `tests/text_stream.rs` (a real `Runtime` and an `LlmAgent` with a model that writes slowly: an activated client reads chunks that begin where the one before ended and add up to the answer, all before the status that ends the turn, and that status carries the stream's id; the words before a tool call are a `working` status with the stream's id as the message id and the answer is another stream; a question that is the streamed reply is stated under its stream; a model that fails in the middle ends the stream abandoned and fails the task as it does without streaming; a client that did not activate reads no chunk and the same reply; a blocking send's task has no chunk; and over HTTP through the SDK the header activates it, the response names it, and `offset` is a whole number on the wire), `src/text_stream.rs` (the chunk, the marker and the stream id as pure functions), and `tests/steps.rs` (a real `Runtime` and an agent that reports a tool call, a command under it that waits and fails, and the end: an activated client reads each step as a report in the metadata beside its line, with the same state held back within a second and a change of state not, one that did not reads every step as a line and nothing else, and another extension activates nothing) with the unit tests of `src/steps.rs` (the metadata, the message, the line of each state) and of the throttle in `src/subscribe.rs` (once a second a state, every change, the end, a retry starting afresh, the bound on what is remembered).
+answer as the tool result the model reads), and `tests/steer.rs` (a real `Runtime` and `LlmAgent` behind the backend, on memory and PostgreSQL: a steered message is delivered to the working task and the model's next request carries it, once even when sent twice; a `submitted` task takes one; without the extension it is `InvalidParams` as before and nothing is delivered; a completed or canceled task is `-32004`, activated or not; an unknown, foreign or other-context task is not found; **a message sent while the model writes the final answer is answered**; and the whole path over HTTP through the real server and the official client, a streaming send whose first event is the working task, the activation by header alone, and the refusals), and `tests/text_stream.rs` (a real `Runtime` and an `LlmAgent` with a model that writes slowly: an activated client reads chunks that begin where the one before ended and add up to the answer, all before the status that ends the turn, and that status carries the stream's id; the words before a tool call are a `working` status with the stream's id as the message id and the answer is another stream; a question that is the streamed reply is stated under its stream; a model that fails in the middle ends the stream abandoned and fails the task as it does without streaming; a client that did not activate reads no chunk and the same reply; a blocking send's task has no chunk; and over HTTP through the SDK the header activates it, the response names it, and `offset` is a whole number on the wire), `src/text_stream.rs` (the chunk, the marker and the stream id as pure functions), and `tests/steps.rs` (a real `Runtime` and an agent that reports a tool call, a command under it that waits and fails, and the end: an activated client reads each step as a report in the metadata beside its line, with the same state held back within a second and a change of state not, one that did not reads every step as a line and nothing else, and another extension activates nothing) with the unit tests of `src/steps.rs` (the metadata, the message, the line of each state) and of the throttle in `src/subscribe.rs` (once a second a state, every change, the end, a retry starting afresh, the bound on what is remembered).
 
 | Variable | Meaning |
 |---|---|

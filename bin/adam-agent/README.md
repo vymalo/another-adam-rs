@@ -65,7 +65,13 @@ The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/REA
   agents" block (only then); see [`adam-ui`](../../crates/adam-ui/README.md) and
   [ADR 0015](../../docs/decisions/0015-tools-the-orchestrator-reports-long-calls-and-mentioned-agents.md).
 
-The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steps/v1` and
+**Sending while it works** (`steer/v1`, on the card): when a request activates the extension, a message that names the running task
+is delivered to it and read at its next step, and a final answer written while one is unread takes another model turn instead of
+ending the run, so a message sent during the last model call is answered; a finished task answers `-32004`, and without the
+activation the message is refused as before ([`adam-a2a-runtime`](../../crates/adam-a2a-runtime/README.md#steering-a-running-task),
+[ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)).
+
+The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`, `steps/v1` and
 `text-stream/v1` (`card_of`), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
 whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with the
 tool's name or, for an MCP tool whose server gave it a `title`, the title; running, then completed, failed or waiting for the person; with the

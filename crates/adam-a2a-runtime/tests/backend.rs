@@ -754,7 +754,11 @@ async fn follow_ups_are_only_for_tasks_waiting_for_input() {
         .submit(alice(), user("more"), Some(done.id.clone()), None)
         .await
         .unwrap_err();
-    assert!(matches!(err, BackendError::InvalidParams(_)), "{err:?}");
+    // A2A's error for a message to a task that has finished.
+    assert!(
+        matches!(err, BackendError::UnsupportedOperation(_)),
+        "{err:?}"
+    );
 
     let waiting = rig
         .backend

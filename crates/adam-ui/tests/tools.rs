@@ -766,6 +766,7 @@ fn the_tool_set_and_the_card_entries_are_the_documented_ones() {
             "https://agents.vymalo.com/a2a/extensions/ui-catalog/v1",
             "https://agents.vymalo.com/a2a/extensions/thread-tools/v1",
             "https://agents.vymalo.com/a2a/extensions/mentions/v1",
+            "https://agents.vymalo.com/a2a/extensions/steer/v1",
         ]
     );
     let card = adam_ui::with_card_extensions(adam_a2a::AgentCardConfig::new(
@@ -774,6 +775,6 @@ fn the_tool_set_and_the_card_entries_are_the_documented_ones() {
         "http://localhost/".parse().unwrap(),
         "1",
     ));
-    assert_eq!(card.extensions.len(), 4);
+    assert_eq!(card.extensions.len(), 5);
     assert!(format!("{ui:?}").contains("cached_catalogs"));
 }

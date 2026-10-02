@@ -268,6 +268,12 @@ impl TaskBackend for InMemoryBackend {
                             "contextId does not match the task".to_owned(),
                         ));
                     }
+                    if entry.task.status.state.is_terminal() {
+                        return Err(BackendError::UnsupportedOperation(format!(
+                            "task {id} is {:?} and cannot take a message",
+                            entry.task.status.state
+                        )));
+                    }
                     if entry.task.status.state != TaskState::InputRequired {
                         return Err(BackendError::InvalidParams(format!(
                             "task {id} is {:?} and cannot take a follow-up",

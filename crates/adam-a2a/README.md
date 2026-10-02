@@ -25,7 +25,7 @@ resubscribe only works inside one process.
 | `ServerOptions` | `with_keepalive_interval(..)` (the SDK sends an SSE comment every `SDK_KEEPALIVE_INTERVAL`, 15 s) |
 | `AuthConfig` | `BearerTokens(Vec<SecretString>)` (constant-time comparison) or `AllowAnonymous` (logs a warning) |
 | `AgentCardConfig`, `SkillConfig`, `ExtensionConfig` | the public agent card |
-| `ExtensionConfig::a2ui_v0_9_1()`, `ui_catalog()`, `thread_tools()`, `steps()`, `text_stream()`, `mentions()` | the card entries of an agent that draws on a screen, reports its work as steps or streams its reply: A2UI v0.9.1 (with `supportedCatalogIds` and `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `steps/v1`, `text-stream/v1` and `mentions/v1` (the last five optional, no parameters); `A2UI_EXTENSION_V0_9_1`, `A2UI_BASIC_CATALOG_V0_9_1`, `A2UI_MEDIA_TYPE`, `UI_CATALOG_EXTENSION`, `THREAD_TOOLS_EXTENSION`, `STEPS_EXTENSION`, `TEXT_STREAM_EXTENSION`, `MENTIONS_EXTENSION` are the URIs and the media type. The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`, `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`, `docs/api/mentions-v1.md` in `vymalo/another-agentic-system`); what an agent does with the messages is [`adam-a2a-runtime`](../adam-a2a-runtime/README.md) (`vymalo_inbound`) and [`adam-ui`](../adam-ui/README.md) |
+| `ExtensionConfig::a2ui_v0_9_1()`, `ui_catalog()`, `thread_tools()`, `steps()`, `text_stream()`, `mentions()`, `steer()` | the card entries of an agent that draws on a screen, reports its work as steps or streams its reply: A2UI v0.9.1 (with `supportedCatalogIds` and `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `steps/v1`, `text-stream/v1`, `mentions/v1` and `steer/v1` (the last six optional, no parameters); `A2UI_EXTENSION_V0_9_1`, `A2UI_BASIC_CATALOG_V0_9_1`, `A2UI_MEDIA_TYPE`, `UI_CATALOG_EXTENSION`, `THREAD_TOOLS_EXTENSION`, `STEPS_EXTENSION`, `TEXT_STREAM_EXTENSION`, `MENTIONS_EXTENSION`, `STEER_EXTENSION` are the URIs and the media type. The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`, `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`, `docs/api/mentions-v1.md`, `docs/api/steer-v1.md` in `vymalo/another-agentic-system`); what an agent does with the messages is [`adam-a2a-runtime`](../adam-a2a-runtime/README.md) (`vymalo_inbound`) and [`adam-ui`](../adam-ui/README.md) |
 | `InMemoryBackend`, `InMemoryConfig` | reference backend, **only with feature `test-util`** |
 
 ```rust
@@ -86,6 +86,7 @@ recorded in the crate docs from the SDK versions `a2a-lf` 0.3 and
 |---|---|---|
 | `TaskNotFound` (also another caller's task) | `NotFound` | `-32001` task not found |
 | `NotCancelable` | `Rejected` | `-32002` task not cancelable |
+| `UnsupportedOperation` | `Rejected` | `-32004` unsupported operation: a message to a task that has finished (A2A's error for it) |
 | `InvalidParams` | `Invalid` | `-32602` invalid params, with the message |
 | `Unavailable { message, source }` | `Transient` | `-32603` "backend temporarily unavailable" |
 | `Internal { message, source }` | `Internal` | `-32603` "internal error" |
@@ -110,13 +111,13 @@ No environment variables.
 
 `tests/round_trip.rs`: a real A2A client (`a2a-client-lf`) against the router
 over TCP, using `InMemoryBackend` (card, send, streaming, get, cancel,
-resubscribe, `input-required` follow-ups, error mapping, malformed bodies
+resubscribe, `input-required` follow-ups, a message to a finished task as `-32004`, error mapping, malformed bodies
 (`malformed_json_with_a_valid_token_is_rejected_cleanly`,
 `wrong_content_type_is_rejected_cleanly`,
 `an_oversized_body_is_an_invalid_request`), authentication on every route,
 keepalive frames, caller isolation). Unit tests in `src/backend.rs`
 (`class_table`, `the_source_is_kept_and_not_repeated_in_the_message`,
-`a2a_errors_do_not_leak_the_cause`, and the three extension entries of `src/extensions.rs`). The crate's own
+`a2a_errors_do_not_leak_the_cause`, and the extension entries of `src/extensions.rs`, `steer/v1` included). The crate's own
 dev-dependency turns on `test-util`. Offline, no environment variables.
 
 ## See also
