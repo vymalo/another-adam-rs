@@ -898,6 +898,123 @@ mod cases {
         );
     }
 
+    /// One agent for the three cases below: phase 0 holds at a gate (so a message is delivered
+    /// *during* the step), says what `Ctx::arrived` reported, and returns `Done`; phase 1 reads the
+    /// inbox and returns `Done` with what it read. `reopen` is whether it asked to go on.
+    async fn finishing_agent(
+        store: &DynStore,
+        name: &str,
+        reopen: bool,
+        deliver: bool,
+    ) -> (Runtime, RunId, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let phase0_runs = Arc::new(AtomicUsize::new(0));
+        let arrived = Arc::new(AtomicUsize::new(usize::MAX));
+        let started = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
+        let agent = fn_agent(
+            name,
+            step_fn({
+                let (phase0_runs, arrived, started, gate) = (
+                    phase0_runs.clone(),
+                    arrived.clone(),
+                    started.clone(),
+                    gate.clone(),
+                );
+                move |ctx, state| {
+                    let (phase0_runs, arrived, started, gate) = (
+                        phase0_runs.clone(),
+                        arrived.clone(),
+                        started.clone(),
+                        gate.clone(),
+                    );
+                    async move {
+                        if phase(&state) == 0 {
+                            phase0_runs.fetch_add(1, SeqCst);
+                            if reopen {
+                                ctx.reopen_on_arrival();
+                            }
+                            started.notify_one();
+                            notified(&gate, "the message to be delivered").await;
+                            arrived.store(ctx.arrived().await.expect("arrived"), SeqCst);
+                            return Ok(Transition::Done {
+                                state: json!({"phase": 1}),
+                                output: json!("first"),
+                            });
+                        }
+                        let texts: Vec<Value> = ctx
+                            .take_inbox()
+                            .into_iter()
+                            .map(|m| m.payload["text"].clone())
+                            .collect();
+                        Ok(Transition::Done {
+                            state,
+                            output: json!(texts),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let rt = runtime(store, &agent);
+        let run = rt.start(name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        notified(&started, "step 0").await;
+        if deliver {
+            rt.deliver(run, Inbound::new("message", json!({"text": "late"})))
+                .await
+                .expect("deliver");
+        }
+        gate.notify_one(); // only now may the step return and commit
+        wait_done(&rt, run).await;
+        worker.stop().await;
+        (rt, run, phase0_runs, arrived)
+    }
+
+    /// An agent that asked to go on is not finished past a message that arrived while it stepped:
+    /// the `Done` is committed as a step that goes on, the next transition reads the message, and
+    /// only the `Done` after it ends the run. The first transition is not replayed, and
+    /// `Ctx::arrived` said one message had come meanwhile.
+    pub async fn a_done_that_asked_to_reopen_goes_on_when_a_message_arrived(store: DynStore) {
+        let name = uniq("reopen");
+        let (rt, run, phase0_runs, arrived) = finishing_agent(&store, &name, true, true).await;
+        let view = rt.view(run).await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(
+            view.output,
+            Some(json!(["late"])),
+            "the run finished after reading the message, not with the first answer"
+        );
+        assert_eq!(view.pending_inbox, 0, "nothing is left unread");
+        assert_eq!(
+            count(&phase0_runs),
+            1,
+            "the first transition is not replayed"
+        );
+        assert_eq!(arrived.load(SeqCst), 1);
+    }
+
+    /// Asking to go on costs nothing when nothing arrived: the `Done` ends the run as always.
+    pub async fn a_done_that_asked_to_reopen_finishes_when_nothing_arrived(store: DynStore) {
+        let name = uniq("reopen-quiet");
+        let (rt, run, phase0_runs, arrived) = finishing_agent(&store, &name, true, false).await;
+        let view = rt.view(run).await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(view.output, Some(json!("first")));
+        assert_eq!(count(&phase0_runs), 1);
+        assert_eq!(arrived.load(SeqCst), 0);
+    }
+
+    /// An agent that did not ask is committed exactly as before: it finishes, and the message that
+    /// arrived meanwhile stays unread in a run that is over.
+    pub async fn a_done_that_did_not_ask_finishes_past_a_message(store: DynStore) {
+        let name = uniq("reopen-off");
+        let (rt, run, _, _) = finishing_agent(&store, &name, false, true).await;
+        let view = rt.view(run).await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(view.output, Some(json!("first")));
+        assert_eq!(view.pending_inbox, 1);
+    }
+
     /// A message arriving during the step that parks must not be slept through.
     /// The step is held at a gate until the message is delivered.
     pub async fn message_during_parking_step_wakes_the_run(store: DynStore) {
@@ -4462,6 +4579,9 @@ macro_rules! runtime_suite {
                 park_and_deliver,
                 deliver_during_step_is_merged,
                 message_during_parking_step_wakes_the_run,
+                a_done_that_asked_to_reopen_goes_on_when_a_message_arrived,
+                a_done_that_asked_to_reopen_finishes_when_nothing_arrived,
+                a_done_that_did_not_ask_finishes_past_a_message,
                 timers,
                 timers_with_manual_clock,
                 retries_back_off_then_fail,
