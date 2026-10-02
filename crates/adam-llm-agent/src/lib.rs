@@ -162,7 +162,7 @@ pub use fn_tool::{FnToolBuilder, TypedFnToolBuilder};
 pub use history::TRUNCATION_MARKER_PREFIX;
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
-pub use source::{DynToolSource, MAX_SOURCE_TOOLS, SourceCtx, ToolSource};
+pub use source::{DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource};
 pub use state::{Extensions, State, StateKey};
 pub use step_io::StepIo;
 pub use tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};

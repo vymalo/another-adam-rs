@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::conversation::user_message;
+use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
 
 /// A capability the model may call.
@@ -394,6 +395,9 @@ pub struct ToolCtx {
     /// The step of this call (id, kind, label, icon): what [`emit_progress`](Self::emit_progress)
     /// updates and [`report_step`](Self::report_step) nests under.
     step: StepEvent,
+    /// What the [`ToolSource`](crate::ToolSource) that offered this tool said about it when it listed
+    /// it; `None` for the agent's own tools and for a listing that said nothing.
+    note: Option<ToolNote>,
 }
 
 impl ToolCtx {
@@ -422,7 +426,39 @@ impl ToolCtx {
             children,
             context,
             step,
+            note: None,
         }
+    }
+
+    /// Give the call the note its source made about the tool when it listed it
+    /// ([`ToolNote`]): what [`note`](Self::note) answers. The agent does it for the calls of a
+    /// source's tools; a test of a source does it to say what a listing said.
+    #[must_use]
+    pub fn with_note(mut self, note: impl Into<Option<ToolNote>>) -> Self {
+        self.note = note.into();
+        self
+    }
+
+    /// What the source that offered this tool said about it when it listed it: whether the system
+    /// behind the source reports each call as a step itself, and how long a call may run. `None`
+    /// for the agent's own tools and when the listing said nothing.
+    pub fn note(&self) -> Option<&ToolNote> {
+        self.note.as_ref()
+    }
+
+    /// Say that this call runs under the step `parent` (reported earlier): what
+    /// [`parent_step_id`](Self::parent_step_id) answers. For a call made on behalf of a step the caller
+    /// reported; a call of the model's own, from the agent loop, has none.
+    #[must_use]
+    pub fn under_step(mut self, parent: impl Into<String>) -> Self {
+        self.step = self.step.under(parent);
+        self
+    }
+
+    /// The step this call runs under, if one was reported for it ([`under_step`](Self::under_step)):
+    /// `None` for a call the model asked for, which is at the top.
+    pub fn parent_step_id(&self) -> Option<&str> {
+        self.step.parent.as_deref()
     }
 
     /// A context detached from any run, for unit-testing a tool: a fresh run
