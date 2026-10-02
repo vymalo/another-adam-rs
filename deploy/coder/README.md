@@ -25,6 +25,25 @@ helm template coder deploy/coder --set topology=split   # front Deployment + wor
 `image.tag` is bumped by `.github/workflows/coder.yml` on every green build of
 main (`deploy/coder/bump-tag.sh`, also run as a dry run on pull requests).
 
+## Devcontainers are off here
+
+The coder image carries the devcontainer CLI and Podman's client, and the coder can run a repository's commands, checks and OpenCode in
+that repository's `devcontainer.json` on a rootless Podman service (`DEVCONTAINER_RUNTIME=podman`, [ADR 0010](../../docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)).
+**The chart does not turn it on, and sets none of the `DEVCONTAINER_*` variables**: the default, `off`, keeps every command in the coder's own
+pod, as before. Why a pod cannot have it yet:
+
+* The Podman service must see the coder's `/work` volume **at the same path** (a bind source is resolved by the service), so it is a
+  container of the same pod (a sidecar sharing the volume) or of a pod on the same node and claim.
+* A rootless Podman inside a container needs a seccomp profile that allows `unshare`, `clone` and `mount`, and `systempaths=unconfined`
+  (`dev/podman/README.md`). In Kubernetes that is a custom or `Unconfined` seccomp profile and an unmasked `/proc`, which the Pod Security
+  Standards' `baseline` level does not allow a workload (*unverified*: from memory of the standards, and this cluster's admission policy was
+  not looked at), so it needs the cluster's agreement.
+* The service is the trust boundary and sees every run's files: a deployment that has it should have the platform's sandbox
+  provider (`another-agentic-platform`) make one environment per run, not one shared service.
+
+Until then a repository's devcontainer is not used on Kubernetes: a run whose first repository has one says so in a step ("This repository has
+a devcontainer, but this deployment runs without a container runtime"), and a tool that only the devcontainer has is reported as missing.
+
 ## Secrets
 
 | Env | AWS property (default) | Rendered for |

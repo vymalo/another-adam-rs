@@ -10,9 +10,16 @@
 # the service), so one service serves one workspace volume. The three variables below let a test put
 # a host directory where the volumes are: PODMAN_SOCKET_DIR, PODMAN_WORK and PODMAN_WORK_TARGET.
 #
-# The coder image does not carry the devcontainer CLI and Podman's client yet (the next change of this
-# series builds them in): until it does, the coder starts, probes, finds no way to run a devcontainer,
-# and goes on in its own environment with a step that says so. Nothing breaks.
+# The coder image carries the devcontainer CLI and Podman's client (docker/coder/Dockerfile), and the
+# coder reads its DEVCONTAINER_* configuration (bin/adam-coder/README.md, "Configuration"): with this file
+# a run's commands, checks and OpenCode run in the devcontainer of the run's first repository, or in the
+# default image, and a run whose repository's file cannot be used asks the person. If the service does not
+# answer, the coder goes on in its own container with a step that says so. dev/coder-e2e.sh runs the
+# scenarios `devcontainer`, `default-env`, `broken-env` and `no-runtime` against this stack.
+#
+# The service hosts every run's devcontainers, so the coder must see the service's work volume at the same
+# path (the next lines). On an Ubuntu 24.04 host (a CI runner, a desktop) unprivileged user namespaces
+# are restricted by AppArmor: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` first (dev/podman/README.md).
 
 services:
   podman:

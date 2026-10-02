@@ -343,6 +343,40 @@ async fn write_file_scenario_writes_through_the_client() {
     );
 }
 
+/// The names the agent says it was started with.
+async fn env_names_of(cmd: AcpCommand, dir: &Path) -> Vec<String> {
+    let (_client, session) = start(cmd, ClientPolicy::new(dir), dir).await;
+    let items = ok(collect(session.prompt("which variables?".into())).await);
+    let said = items
+        .iter()
+        .find_map(|item| match item {
+            AcpUpdate::AgentText(t) => t.strip_prefix("env: ").map(str::to_owned),
+            _ => None,
+        })
+        .expect("the agent says its variables");
+    said.split(',').map(str::to_owned).collect()
+}
+
+#[tokio::test]
+async fn the_child_has_the_parents_environment_unless_it_is_cleared() {
+    let dir = root();
+    let kept = env_names_of(fake(dir.path(), "env-names"), dir.path()).await;
+    assert!(
+        kept.iter().any(|n| n == "PATH"),
+        "the parent's PATH is inherited: {kept:?}"
+    );
+
+    let mut cleared = env_names_of(fake(dir.path(), "env-names").clear_env(), dir.path()).await;
+    // Under coverage the fake agent is instrumented, and LLVM's profiling runtime sets variables
+    // of its own (`__LLVM_PROFILE_RT_INIT_ONCE`) in the child when it starts: not the parent's.
+    cleared.retain(|n| !n.starts_with("__LLVM_PROFILE"));
+    assert_eq!(
+        cleared,
+        ["FAKE_ACP_SCENARIO"],
+        "only what the command set reaches a cleared child"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn symlink_escape_is_denied_through_the_protocol() {

@@ -87,6 +87,9 @@ spec:
               value: {{ .Values.config.checkTimeoutSecs | quote }}
             - name: WORKSPACE_SWEEP_SECS
               value: {{ .Values.config.workspaceSweepSecs | quote }}
+            {{- /* The shipped mcp.json starts the pinned github-mcp-server, a local process: the coder's alone to allow (the image sets nothing; ADR 0009, decision 8). A control plane connects no MCP server. */}}
+            - name: MCP_ALLOW_STDIO
+              value: "true"
             - name: ALLOWED_REPO_HOSTS
               value: {{ join "," .Values.config.allowedRepoHosts | quote }}
             - name: GITHUB_API_URL

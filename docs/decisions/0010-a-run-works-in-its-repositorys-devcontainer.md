@@ -5,10 +5,9 @@ then "Go with 7b after slice 7"). It follows the orchestration layer's
 [ADR 0028](https://github.com/vymalo/another-agentic-system/blob/main/docs/decisions/0028-devcontainer-json-is-the-workspace-environment-contract.md)
 (`devcontainer.json` is the workspace environment contract), which decides *what*; this record decides *how
 adam-rs does it*. The defaults listed under [Defaults the owner may revisit](#defaults-the-owner-may-revisit) were
-chosen by the plan, not by the owner. **Built in this change:** the crate `adam-devcontainer`
-(`DevContainer`, an `Environment` of `adam-workspace`), the Podman service of the dev stack, its tests and CI job.
-**Not built yet:** the coder's use of it (its configuration, its tools, OpenCode inside, the image), which is the next
-change; until then nothing in a binary composes it. The status notes at the end say which is which.
+chosen by the plan, not by the owner. **Built:** the crate `adam-devcontainer` (`DevContainer`, an `Environment` of
+`adam-workspace`), the Podman service of the dev stack, their tests and CI job, and the coder's use of them (its configuration, its
+tools, OpenCode inside, the image, the end to end). The status notes at the end say which change built what.
 
 ## Context
 
@@ -96,7 +95,7 @@ bind-mounted directory stay 10001's outside), `--network=none` and the shared ne
   names the option it refused, so the first run says), and that the nested container's `Mounts` has no bind of the
   service's `/proc` (the upstream image's user-level `containers.conf` adds one; the `agent` user of `dev/podman/Containerfile`
   has none, and the inspect check refuses a bind that is not ours either way).
-* `git status` inside a slot whose mirror is read-only; OpenCode's native binary inside a glibc image (the next change).
+* `git status` inside a slot whose mirror is read-only; OpenCode's native binary inside a glibc image (the coder's change: its end to end, `dev/coder-e2e.sh` `SCENARIO=devcontainer`, runs OpenCode there).
 
 ## Decision
 
@@ -109,8 +108,9 @@ bind-mounted directory stay 10001's outside), `--network=none` and the shared ne
    `ExecSpec` has a `hide` list (names of the caller's own variables a process must not see), `Local::kill` does nothing,
    `ExecId` is a string, and the janitor releases the runs `held_runs()` returns that are over. `DevContainer` makes a
    `PreparedCommand` that is `devcontainer exec` with an empty environment plus an allow-list, and the file tools and git
-   stay in the coder. The one addition to `adam-workspace` is `Worktree::mirror()`, which an environment that runs `git`
-   in a worktree needs (the `.git` file of a worktree points into the shared bare mirror).
+   stay in the coder. The one addition to `adam-workspace` was `Worktree::mirror()`, which an environment that runs `git`
+   in a worktree needs (the `.git` file of a worktree points into the shared bare mirror); the coder's change adds two defaulted methods to the port
+   (see the 2026-10-02 status note).
 3. **Which file.** The first slot in `Slot::seq` order decides, once, for the whole run; a scratch slot counts. The lookup is
    `.devcontainer/devcontainer.json`, `.devcontainer.json`, then the first of `.devcontainer/<folder>/devcontainer.json` in
    sorted order (a step names the others). A first slot with none gets `Settings::default_image`. Later repositories are mounted
@@ -258,3 +258,34 @@ environment's session, OpenCode inside the container (`AcpCommand` cannot clear 
 tool, the janitor's use of `held_runs`, the image with the CLI and Podman's client, the fixtures `local/devbox` and
 `local/devbox-broken` for the end to end, and the orchestration layer's end to end (slices 7b-2, S7b-1 and S7b-2). The facts
 marked unverified above have not run yet in this repository.*
+
+*2026-10-02: the coder uses it (slice 7b, A7b-2; `bin/adam-coder/README.md`, "The work environment"):*
+
+* **Configuration and start.** `DEVCONTAINER_RUNTIME` (`off` by default, or `podman`), `CONTAINER_HOST`, `DEVCONTAINER_DEFAULT_IMAGE` (default: the
+  `workspace` image of `another-agentic-images` the coder is built on, **by digest only**, *verified* 2026-10-01 by an anonymous manifest request and
+  its config's `devcontainer.metadata` label; the devcontainer CLI 0.89.0 cannot parse a reference with both a tag and a digest, which CI's real-Podman job
+  found, so a value for it is `name@sha256:...` too; a test keeps the tag that digest was published as equal to the Dockerfile's `WORKSPACE_TAG`), `DEVCONTAINER_NETWORK`, `DEVCONTAINER_DEPLOYMENT_ID`,
+  the two timeouts, `DEVCONTAINER_PREPULL`, `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` and `OPENCODE_BINARY` (a native executable, checked at start): an
+  invalid value is exit 78, nothing connects first. A start with `podman` writes the tools directory (a failure stops it), probes the service (a
+  service that does not answer is a warning: runs fall back to the coder's own container, with a step, until it does) and pulls the default image in
+  the background. **`DevContainer` is the coder's `Environment` even with the runtime `off`**, which is how a repository that has a devcontainer is
+  told, once per run, that this deployment does not use it.
+* **Routing.** `run_command`, `run_checks` and `delegate_to_opencode` went through the session already (slice 7); what this change adds is
+  OpenCode from where the environment has it (`EnvSession::tool_path`), its key as `{file:...}` (`EnvSession::secret_ref`), `AcpCommand::clear_env` for the CLI's
+  own empty environment, `opencode --version` once per environment (a musl image gets a refusal and the other tools go on), the refusal under
+  `DEVCONTAINER_NETWORK=none`, the `environment {kind, source?, image}` of the `checks` artifact, and a missing tool's answer that says which environment
+  lacks it. A broken environment is a **permanent** error that tells the model to ask the person (OD-B4: no fallback), and `rebuild_environment {use_default?}` is
+  the way out. The port gained two defaulted methods for this, `Environment::rebuild(run, use_default) -> bool` and `EnvSession::tool_path(name)`, beside
+  `Worktree::mirror()` of decision 2.
+* **Image and stack.** The coder image has `@devcontainers/cli` 0.89.0 and the static `podman-remote` of containers/podman v5.8.7, the service's own release,
+  pinned by the release's sha256 (the settled finding above; a distribution's package is not used), and its smoke test and the container smoke test check both and that the
+  OpenCode on `PATH` is an ELF. The fixtures `local/devbox` and `local/devbox-broken` are on the dev git-server, the mock scripts `[mock:devcontainer]`,
+  `[mock:default-env]`, `[mock:broken-env]` and `[mock:no-runtime]` (and OpenCode's `[mock:oc-devbox]`) are in `dev/wiremock/mock-openai`, and
+  `dev/coder-e2e.sh` runs `SCENARIO=devcontainer`, `default-env`, `broken-env` and `no-runtime` in CI's `coder.yml`.
+* **Not verified here, and why.** This change was written where no rootless Podman runs and the coder image does not fit. The unit and stub-based tests, the
+  coder's tests against a fake environment, the binary's start against a service that does not answer, and the mock scripts (against a WireMock, both ways)
+  ran; the facts marked *unverified* above (the sysctl, DNS and egress from a nested container, OpenCode's binary
+  in a glibc image, `git status` over the read-only mirror) and that the static client in the coder image reaches the service are the end to end's to show, in CI's `coder.yml`.
+* **Kubernetes** keeps `DEVCONTAINER_RUNTIME=off` (decision 9); the chart sets nothing and its README says why.
+* **Not built:** the orchestration layer's end to end (S7b-2), and a periodic `podman image prune` (the release removes the run's own images; the layers a failed
+  build leaves are the operator's `podman system prune`, because another worker may be building on the same service).

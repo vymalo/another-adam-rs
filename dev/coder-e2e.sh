@@ -10,6 +10,10 @@
 #   SCENARIO=second-repo ANSWER=no dev/coder-e2e.sh  # ... and with a no it does not
 #   SCENARIO=create-repo dev/coder-e2e.sh            # a repository is created for the scratch project, the person says yes
 #   SCENARIO=create-repo ANSWER=no dev/coder-e2e.sh  # ... and with a no it is not
+#   SCENARIO=devcontainer dev/coder-e2e.sh   # the repository's own devcontainer is the environment (see below)
+#   SCENARIO=default-env dev/coder-e2e.sh    # a repository without one gets the default environment
+#   SCENARIO=broken-env dev/coder-e2e.sh     # a devcontainer.json that cannot be used: the person decides
+#   SCENARIO=no-runtime dev/coder-e2e.sh     # the Podman service is stopped: the run goes on in the coder's own container
 #   GITHUB_AUTH=app dev/coder-e2e.sh  # the stack runs the coder as a GitHub App (see below)
 #
 # Start the stack first (the coder's models are the scripts in
@@ -78,6 +82,30 @@
 #         `POST /app/installations/67890/access_tokens` (the trade of a signed JWT for a token), and
 #         every call to `/repos/...`, the pull request's included, carried the installation token it
 #         gave, `Bearer ghs_mockinstallationtoken...`, and never the JWT (`Bearer eyJ...`).
+#   * The four devcontainer scenarios (slice 7b, ADR 0010) need the Podman service of
+#     dev/compose.devcontainer.yaml (the stack started with `-f compose.yaml -f dev/compose.devcontainer.yaml`;
+#     COMPOSE_CMD says how to reach `docker compose` for it) and the mock scripts `[mock:devcontainer]`, `[mock:default-env]`,
+#     `[mock:broken-env]` and `[mock:no-runtime]`. They assert durable things (the model's journal: what a tool
+#     returned; the checks artifact; the pushed branch; what Podman lists) and, besides, the lines of the
+#     steps the environment reports, which come after the first tool call (the clone), so the stream has attached:
+#       devcontainer: `local/devbox` ships `devbox-tool`, which only its devcontainer has. `run_command`
+#         (`dc-call-2`), `run_checks` and OpenCode's own bash command all ran there: the result of the first says
+#         `devbox-tool 1.0 (from the devcontainer)`, `tool.txt` on the pushed branch says the same, and the last
+#         `checks` artifact has `environment {kind: devcontainer, source: .devcontainer/devcontainer.json}`; the
+#         step `Building the environment from .devcontainer/devcontainer.json (local/devbox)` ends done; the task
+#         completes and the gate is green; `env` there (`dc-call-3`) has no GITHUB_TOKEN, DATABASE_URL or
+#         A2A_BEARER_TOKENS; the label `adam.vymalo.com/run` lists a container while the run lasts, and none
+#         within a minute of its end (the janitor, WORKSPACE_SWEEP_SECS=10); and the Podman service has no
+#         `privileged`, `cap_add` or `devices`, and no service mounts a Docker socket.
+#       default-env: `local/sandbox` has no devcontainer: the step `Using the default environment (<image>)`,
+#         and `de-call-2` prints `devcontainer-env` (only the coder's own image has /opt/flutter).
+#       broken-env: `local/devbox-broken` asks for `privileged`: the failed step names it, the result of the first
+#         command (`be-call-2`) names the file and the key and says to ask the person, the task waits for the
+#         person (TASK_STATE_INPUT_REQUIRED, with the coder's question), no pull request is opened, and
+#         /work/INIT-RAN (its `initializeCommand`) does not exist in the coder.
+#       no-runtime: the script stops the Podman service (and starts it again at the end) and waits out the coder's
+#         30-second probe cache: the step says the runtime is not reachable and commands run in the coder's own
+#         environment, `devbox-tool` is reported as a missing tool (`nr-call-2`), and the task waits for the person.
 # It prints one "ok" or "FAIL" line per check and exits 1 if any failed.
 #
 # Environment (defaults match compose.yaml on one machine):
@@ -92,8 +120,13 @@
 #   SCENARIO         default `default` (the script above), `files` (the [mock:files] script:
 #                    read_file, write_file; every check above holds, and so do the two lines),
 #                    `scratch` (the [mock:scratch] script, above) or `second-repo` (the
-#                    [mock:second-repo] script, above) or `create-repo` (the [mock:create-repo] script)
+#                    [mock:second-repo] script, above) or `create-repo` (the [mock:create-repo] script), or
+#                    `devcontainer`, `default-env`, `broken-env` or `no-runtime` (above)
 #   ANSWER           yes     with SCENARIO=second-repo: the person's answer, `yes` or `no`
+#   COMPOSE_CMD      docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app   how the devcontainer scenarios reach
+#                    the stack's `podman`, `coder` and `config` (run from the repository root)
+#   PRELOAD_FROM_DOCKER  unset  1 = load the default image into the Podman service from the host's Docker (no internet for containers)
+#   PODMAN_WAIT_SECS 90      how long to wait for the Podman service to hold no container of the run after it ended
 #   GIT_SERVER_LOGS  docker compose logs --no-color git-server   a command that prints git-server's access log
 #                    (second-repo: which repositories it was asked for); without docker, set it to a command
 #                    that reads the log of your git-server, or the check is skipped
@@ -126,12 +159,25 @@ repo_base=${REPO_BASE_URL:-http://git-server:8080}
 repo_base=${repo_base%/}
 repo_url=$repo_base/$repo_path.git
 
+# The devcontainer scenarios reach the stack's Podman service (and the coder) through this.
+compose=${COMPOSE_CMD:-docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app}
+
 fail=0
 ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+watcher=""
+podman_stopped=0
+cleanup() {
+  if [ -n "$watcher" ]; then kill "$watcher" 2>/dev/null || true; fi
+  if [ "$podman_stopped" = 1 ]; then
+    # shellcheck disable=SC2086 # COMPOSE_CMD is a command line
+    $compose up -d --wait podman >/dev/null 2>&1 || echo "could not start the Podman service again: start it before the next scenario" >&2
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 github_auth=${GITHUB_AUTH:-token}
 case "$github_auth" in
@@ -140,8 +186,8 @@ case "$github_auth" in
 esac
 scenario=${SCENARIO:-default}
 case "$scenario" in
-  default | files | scratch | second-repo | create-repo) ;;
-  *) echo "SCENARIO must be default, files, scratch, second-repo or create-repo, not '$scenario'" >&2; exit 2 ;;
+  default | files | scratch | second-repo | create-repo | devcontainer | default-env | broken-env | no-runtime) ;;
+  *) echo "SCENARIO must be default, files, scratch, second-repo, create-repo, devcontainer, default-env, broken-env or no-runtime, not '$scenario'" >&2; exit 2 ;;
 esac
 answer=${ANSWER:-yes}
 case "$answer" in
@@ -152,6 +198,9 @@ if [ "$scenario" != default ] && [ "${NO_OPENCODE:-}" = 1 ]; then
   echo "NO_OPENCODE=1 and SCENARIO=$scenario are two different scripts: set one" >&2
   exit 2
 fi
+
+devcontainers=0
+case "$scenario" in devcontainer | default-env | broken-env | no-runtime) devcontainers=1 ;; esac
 
 text="In $repo_url (base branch main), add hello.txt containing hello."
 slot=${repo_path##*/}
@@ -173,6 +222,26 @@ if [ "$scratchlike" = 1 ]; then
     text="Write a fib.sh that prints the first 7 Fibonacci numbers. I'll give you the repo later. [mock:scratch] $name"
     echo "variant: no repository is named, a scratch project is published to $repo_path ([mock:scratch])"
   fi
+elif [ "$scenario" = devcontainer ] || [ "$scenario" = no-runtime ]; then
+  # A repository whose own devcontainer has `devbox-tool`; the repository's name is the slot's.
+  repo_path=local/devbox
+  repo_url=$repo_base/$repo_path.git
+  slot=devbox
+  text="In $repo_url (base branch main), record where devbox-tool runs in tool.txt. [mock:$scenario]"
+  if [ "$scenario" = devcontainer ]; then
+    echo "variant: the repository's own devcontainer is the environment ([mock:devcontainer])"
+  else
+    echo "variant: the Podman service is stopped, the run goes on in the coder's own container ([mock:no-runtime])"
+  fi
+elif [ "$scenario" = broken-env ]; then
+  repo_path=local/devbox-broken
+  repo_url=$repo_base/$repo_path.git
+  slot=devbox-broken
+  text="In $repo_url (base branch main), record where devbox-tool runs in tool.txt. [mock:broken-env]"
+  echo "variant: the devcontainer.json cannot be used, the person decides ([mock:broken-env])"
+elif [ "$scenario" = default-env ]; then
+  text="$text [mock:default-env]"
+  echo "variant: a repository without a devcontainer gets the default environment ([mock:default-env])"
 elif [ "$scenario" = second-repo ]; then
   text="In $repo_url (base branch main), put our shared greeting into hello.txt. [mock:second-repo]"
   echo "variant: another repository joins the workspace only if the person says yes, and they say $answer ([mock:second-repo])"
@@ -189,6 +258,57 @@ fi
 # --- reset the journal, then send the task ------------------------------------
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE "$github/__admin/requests" || true)
 if [ "$code" = 200 ]; then ok "mock-github journal reset"; else bad "mock-github journal reset: HTTP $code"; fi
+
+# --- the devcontainer scenarios: helpers, and what has to be true before the task ----------------------
+# podman_ps: the ids of the containers that carry a run's label, as the Podman service lists them (all of
+# them, stopped ones too). Podman's remote client, in the service's own container, on its own socket.
+podman_ps() {
+  # shellcheck disable=SC2086 # COMPOSE_CMD is a command line
+  $compose exec -T podman podman --remote --url unix:///run/podman/podman.sock \
+    ps -a --filter label=adam.vymalo.com/run --format '{{.ID}}' 2>/dev/null
+}
+# tool_result_has <call id> <text>: how many requests the model got whose history holds the result of that
+# tool call with <text> in it (a newline in <text> is a newline). The journal of mock-openai is reset at the
+# start of these scenarios.
+tool_result_has() {
+  expr="\$.messages[?(@.tool_call_id == '$1')].content"
+  curl -s --max-time 30 -X POST "$openai/__admin/requests/count" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg e "$expr" --arg t "$2" '{method: "POST", urlPathPattern: "(/v1)?/chat/completions", bodyPatterns: [{matchesJsonPath: {expression: $e, contains: $t}}]}')" \
+    | jq -r '.count' 2>/dev/null || echo '?'
+}
+if [ "$devcontainers" = 1 ]; then
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE "$openai/__admin/requests" || true)
+  if [ "$code" = 200 ]; then ok "mock-openai journal reset"; else bad "mock-openai journal reset: HTTP $code"; fi
+  if ! sh -c "$compose ps --status running --services" 2>/dev/null | grep -qx podman; then
+    echo "FAIL the Podman service is not running in this stack: start it with -f compose.yaml -f dev/compose.devcontainer.yaml (COMPOSE_CMD='$compose')"
+    exit 1
+  fi
+fi
+if [ "$devcontainers" = 1 ] && [ "${PRELOAD_FROM_DOCKER:-}" = 1 ]; then
+  # Where the containers have no direct internet: the default image goes from the host's Docker into the
+  # Podman service (docker save | podman load), so that nothing is pulled. *Unverified*: the digest of a
+  # loaded image may differ from the one the pin names; then the pull is what the service does.
+  preload_image=${DEVCONTAINER_DEFAULT_IMAGE:-mcr.microsoft.com/devcontainers/base@sha256:1f851004adcd3dff3776b4a1da86727cf52280b0fdc9d5b0568c9c7d74274286}
+  docker image inspect "$preload_image" >/dev/null 2>&1 || docker pull -q "$preload_image" >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086 # COMPOSE_CMD is a command line
+  if docker save "$preload_image" 2>/dev/null | $compose exec -T podman podman --remote --url unix:///run/podman/podman.sock load >/dev/null 2>&1; then
+    ok "the default image was loaded into the Podman service from the host's Docker"
+  else
+    echo "skip the default image could not be preloaded (PRELOAD_FROM_DOCKER=1): the service will pull it"
+  fi
+fi
+if [ "$scenario" = no-runtime ]; then
+  # shellcheck disable=SC2086 # COMPOSE_CMD is a command line
+  if $compose stop podman >/dev/null 2>&1; then podman_stopped=1; ok "the Podman service is stopped"; else bad "cannot stop the Podman service"; fi
+  # The coder keeps a probe's answer for 30 seconds: a run that starts before that would still find the
+  # service there. (The coder's workers reuse an answer; a run that has fallen back stays there.)
+  sleep 32
+fi
+if [ "$scenario" = devcontainer ]; then
+  # The run's label lists a container while the run lasts: look every second until the task is over.
+  ( while :; do podman_ps; sleep 1; done > "$tmp/containers-seen.txt" ) &
+  watcher=$!
+fi
 
 # mock-github-mcp's journal is kept (the coder connected the server at its start, and the stack's other
 # runs are in it): what this run added is the count now minus the count here.
@@ -417,6 +537,41 @@ if [ "$scenario" = second-repo ]; then
   fi
 fi
 
+# lines_of <events file>: the plain text of every event (the tool's progress, and the steps of the environment, which a
+# client that did not ask for `steps/v1` gets as one line each: `<label>: <state>[: <detail>]`).
+lines_of() { jq -r '.. | .text? // empty' "$1" 2>/dev/null || true; }
+
+if [ "$scenario" = broken-env ] || [ "$scenario" = no-runtime ]; then
+  # The environment cannot be had, and the person decides: the task waits, nothing was delivered.
+  state=$(state_of "$events")
+  if [ "$state" = TASK_STATE_INPUT_REQUIRED ]; then ok "the task waits for the person (TASK_STATE_INPUT_REQUIRED)"; else bad "the task is '${state:-none}', want TASK_STATE_INPUT_REQUIRED"; fi
+  lines_of "$events" > "$tmp/lines-1.txt"
+  posts=$(curl -s --max-time 30 -X POST "$github/__admin/requests/find" -H 'Content-Type: application/json' \
+    -d '{"method":"POST","urlPathPattern":"/repos/.*/pulls"}' | jq -r '.requests | length' 2>/dev/null || echo '?')
+  if [ "$posts" = 0 ]; then ok "no pull request was opened"; else bad "$posts pull request(s) were opened"; fi
+  if [ "$scenario" = broken-env ]; then
+    step="Building the environment from .devcontainer/devcontainer.json ($repo_path)"
+    if grep -F "$step: failed" "$tmp/lines-1.txt" | grep -q privileged; then ok "the step '$step' failed and names privileged"; else bad "no failed step '$step' that names privileged in the stream"; fi
+    # What the model was told: the file, the key, and that the way on is the person's.
+    for want in '.devcontainer/devcontainer.json' 'privileged' 'ask_user' 'rebuild_environment'; do
+      n=$(tool_result_has be-call-2 "$want")
+      if [ "$n" != '?' ] && [ "$n" -ge 1 ]; then ok "the result of the command names '$want'"; else bad "the result of the first command does not name '$want' ($n requests)"; fi
+    done
+    if grep -q "go on in the default environment" "$tmp/lines-1.txt"; then ok "the coder asks the person how to go on"; else bad "the coder's question about how to go on is not in the stream"; fi
+    # initializeCommand runs on the host side, which is the coder: it was removed, and never ran.
+    # shellcheck disable=SC2086 # COMPOSE_CMD is a command line
+    if $compose exec -T coder test ! -e /work/INIT-RAN; then ok "/work/INIT-RAN does not exist: the initializeCommand did not run"; else bad "/work/INIT-RAN exists: the initializeCommand ran in the coder"; fi
+  else
+    step="The container runtime is not reachable: commands run in the coder's own environment"
+    if grep -Fq "$step: done" "$tmp/lines-1.txt"; then ok "a step says the container runtime is not reachable and commands run in the coder's own environment"; else bad "no step '$step' in the stream"; fi
+    n=$(tool_result_has nr-call-2 "no \`devbox-tool\`")
+    if [ "$n" != '?' ] && [ "$n" -ge 1 ]; then ok "devbox-tool is reported as a missing tool"; else bad "the result of the first command does not report devbox-tool as missing ($n requests)"; fi
+    if grep -q "commands run here without a container runtime" "$tmp/lines-1.txt"; then ok "the coder asks the person what to do"; else bad "the coder's question is not in the stream"; fi
+  fi
+  if [ "$fail" -eq 0 ]; then echo "coder e2e passed"; else echo "coder e2e FAILED"; exit 1; fi
+  exit 0
+fi
+
 state=$(state_of "$events")
 case "$state" in
   TASK_STATE_COMPLETED) ok "the task ended TASK_STATE_COMPLETED" ;;
@@ -469,6 +624,46 @@ if [ "$scenario" = files ] || [ "$scratchlike" = 1 ]; then
     if grep -qx "copying fib into $slot (.)" "$lines"; then ok "the project was copied into the slot of the repository"; else bad "no 'copying fib into $slot (.)' line in the stream"; fi
   fi
   if grep -q 'starting OpenCode' "$lines"; then bad "OpenCode was started, and this script does not delegate"; else ok "OpenCode was not started"; fi
+fi
+
+# --- the work environment (devcontainer, default-env) --------------------------------------------
+if [ "$scenario" = devcontainer ] || [ "$scenario" = default-env ]; then
+  # The steps of the environment, as lines (the clone before them is the first tool call, so the stream has attached).
+  lines_of "$every_event" > "$tmp/lines.txt"
+  if [ "$scenario" = devcontainer ]; then
+    step="Building the environment from .devcontainer/devcontainer.json ($repo_path)"
+    if grep -Fq "$step: done" "$tmp/lines.txt"; then ok "the step '$step' ended done"; else bad "no done step '$step' in the stream"; fi
+    # run_command, run_checks and OpenCode ran in the devcontainer: devbox-tool is only there.
+    n=$(tool_result_has dc-call-2 'devbox-tool 1.0 (from the devcontainer)')
+    if [ "$n" != '?' ] && [ "$n" -ge 1 ]; then ok "run_command found devbox-tool, which only the devcontainer has"; else bad "run_command's result does not say 'devbox-tool 1.0 (from the devcontainer)' ($n requests)"; fi
+    # No secret of the coder is in the environment of a devcontainer.
+    n=$(tool_result_has dc-call-3 'PATH=')
+    if [ "$n" != '?' ] && [ "$n" -ge 1 ]; then ok "the result of \`env\` in the devcontainer is there (PATH=)"; else bad "the result of \`env\` has no PATH= ($n requests)"; fi
+    for secret in GITHUB_TOKEN DATABASE_URL A2A_BEARER_TOKENS MODEL_API_KEY dev-github-token mock-api-key postgres://; do
+      n=$(tool_result_has dc-call-3 "$secret")
+      if [ "$n" = 0 ]; then ok "env in the devcontainer has no $secret"; else bad "env in the devcontainer shows $secret ($n requests)"; fi
+    done
+  else
+    step="Using the default environment"
+    if grep -Eq "^Using the default environment \(.+\): done" "$tmp/lines.txt"; then ok "a step says the default environment is used"; else bad "no done step '$step (<image>)' in the stream"; fi
+    # Only the coder's own image has /opt/flutter: the output (not the command's own text) says where it ran.
+    n=$(tool_result_has de-call-2 "$(printf -- '--- output ---\ndevcontainer-env')")
+    if [ "$n" != '?' ] && [ "$n" -ge 1 ]; then ok "the command ran in the default environment, not in the coder's (devcontainer-env)"; else bad "the output of the probe is not 'devcontainer-env' ($n requests)"; fi
+  fi
+  # The last `checks` artifact says where the checks ran.
+  env_kind=$(jq -r 'select(.result.artifactUpdate.artifact.name == "checks") | .result.artifactUpdate.artifact.parts[0].data.environment.kind // empty' "$every_event" | tail -n 1)
+  env_source=$(jq -r 'select(.result.artifactUpdate.artifact.name == "checks") | .result.artifactUpdate.artifact.parts[0].data.environment.source // empty' "$every_event" | tail -n 1)
+  if [ "$env_kind" = devcontainer ]; then ok "the checks artifact says the checks ran in a devcontainer"; else bad "the checks artifact's environment kind is '${env_kind:-absent}', want devcontainer"; fi
+  if [ "$scenario" = devcontainer ]; then
+    if [ "$env_source" = .devcontainer/devcontainer.json ]; then ok "... built from .devcontainer/devcontainer.json"; else bad "the checks artifact's environment source is '${env_source:-absent}', want .devcontainer/devcontainer.json"; fi
+  else
+    if [ -z "$env_source" ]; then ok "... from the default image (no source file)"; else bad "the default environment has a source '$env_source'"; fi
+  fi
+  if grep -q 'starting OpenCode' "$tmp/lines.txt"; then
+    if [ "$scenario" = devcontainer ]; then ok "OpenCode was started (in the devcontainer)"; else bad "OpenCode was started, and this script does not delegate"; fi
+  elif [ "$scenario" = devcontainer ]; then
+    bad "OpenCode was not started"
+  fi
 fi
 
 # --- artifacts ---------------------------------------------------------------------
@@ -574,6 +769,10 @@ if [ -n "$branch" ]; then
       content=$(cat "$tmp/clone/fib.sh" 2>/dev/null || echo '<missing>')
       if [ "$content" = 'echo 0 1 1 2 3 5 8' ]; then ok "fib.sh on the branch is the project's"; else bad "fib.sh on the branch is '$content', want 'echo 0 1 1 2 3 5 8'"; fi
       if [ "$(sh "$tmp/clone/fib.sh" 2>/dev/null)" = '0 1 1 2 3 5 8' ]; then ok "fib.sh prints the first 7 Fibonacci numbers"; else bad "fib.sh does not print '0 1 1 2 3 5 8'"; fi
+    elif [ "$scenario" = devcontainer ]; then
+      # OpenCode's own bash command ran devbox-tool, and what it printed is in the pushed commit.
+      content=$(cat "$tmp/clone/tool.txt" 2>/dev/null || echo '<missing>')
+      if [ "$content" = 'devbox-tool 1.0 (from the devcontainer)' ]; then ok "tool.txt on the branch says it came from the devcontainer"; else bad "tool.txt on the branch is '$content', want 'devbox-tool 1.0 (from the devcontainer)'"; fi
     elif [ "$scenario" = second-repo ]; then
       content=$(cat "$tmp/clone/hello.txt" 2>/dev/null || echo '<missing>')
       if [ "$content" = 'hello from library' ]; then ok "hello.txt on the branch is the library's greeting"; else bad "hello.txt on the branch is '$content', want 'hello from library'"; fi
@@ -593,6 +792,34 @@ if [ -n "$branch" ]; then
   fi
 else
   bad "no branch to look for on git-server"
+fi
+
+# --- the environment's life: a container while the run lasts, none after it (devcontainer, default-env) ------
+if [ "$scenario" = devcontainer ]; then
+  if [ -n "$watcher" ]; then kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true; watcher=""; fi
+  if [ -s "$tmp/containers-seen.txt" ]; then ok "Podman listed a container with the run's label while the run lasted"; else bad "Podman never listed a container with the run's label while the run lasted"; fi
+fi
+if [ "$scenario" = devcontainer ] || [ "$scenario" = default-env ]; then
+  # The run is over; the janitor (WORKSPACE_SWEEP_SECS=10) releases its environment: its container and its image.
+  waited=0
+  left=$(podman_ps)
+  while [ -n "$left" ] && [ "$waited" -lt "${PODMAN_WAIT_SECS:-90}" ]; do
+    sleep 3; waited=$((waited + 3)); left=$(podman_ps)
+  done
+  if [ -z "$left" ]; then ok "after the run ended and the sweep, Podman lists no container with the run's label"; else bad "Podman still lists a container with the run's label ${PODMAN_WAIT_SECS:-90} s after the run ended: $left"; fi
+fi
+if [ "$scenario" = devcontainer ]; then
+  # Least privilege: the Podman service has no `privileged`, no `cap_add`, no `devices`, and nothing in the
+  # stack mounts a Docker socket.
+  # shellcheck disable=SC2086 # COMPOSE_CMD is a command line
+  if $compose config --format json > "$tmp/compose.json" 2>/dev/null; then
+    bad_flags=$(jq -r '.services.podman | [(.privileged // false | tostring | select(. == "true") | "privileged"), (if (.cap_add // []) | length > 0 then "cap_add" else empty end), (if (.devices // []) | length > 0 then "devices" else empty end)] | join(",")' "$tmp/compose.json")
+    if [ -z "$bad_flags" ]; then ok "the Podman service has no privileged, cap_add or devices"; else bad "the Podman service has: $bad_flags"; fi
+    sockets=$(jq -r '[.services[] | (.volumes // [])[] | select((.source // "") | test("docker\\.sock")) | .source] | length' "$tmp/compose.json")
+    if [ "$sockets" = 0 ]; then ok "no service mounts a Docker socket"; else bad "$sockets volume(s) mount a Docker socket"; fi
+  else
+    bad "cannot read the stack's compose model ($compose config)"
+  fi
 fi
 
 # The repository was empty: the coder gave it a first commit, of nothing, to be the base of the

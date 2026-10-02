@@ -25,6 +25,9 @@ use crate::policy::{SECRETS_TARGET, TOOLS_TARGET};
 /// The name the model key has for [`EnvSession::secret_ref`].
 const MODEL_KEY: &str = "model-key";
 
+/// The program the coder brings along (the name [`EnvSession::tool_path`] is asked for).
+const OPENCODE: &str = "opencode";
+
 /// Where the CLI keeps its per-container cache inside the container.
 pub(crate) const CONTAINER_SESSION_DATA: &str = "/tmp/adam-devcontainer";
 
@@ -218,6 +221,13 @@ impl EnvSession for DevSession {
         {
             tracing::warn!(error = %e, exec = %exec, "could not stop what the command left in the container");
         }
+    }
+
+    fn tool_path(&self, name: &str) -> Option<PathBuf> {
+        // The coder's own OpenCode, which `install_tools` put in the directory every container
+        // mounts; there is none when the coder has no binary to mount.
+        (name == OPENCODE && self.inner.settings.opencode.is_some())
+            .then(|| PathBuf::from(format!("{TOOLS_TARGET}/{OPENCODE}")))
     }
 
     fn secret_ref(&self, name: &str) -> Option<SecretRef> {

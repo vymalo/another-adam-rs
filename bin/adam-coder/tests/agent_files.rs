@@ -62,7 +62,7 @@ fn expected_prompt(cycles: u32) -> String {
 }
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 16] = [
+const TOOLS: [&str; 17] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -74,6 +74,7 @@ const TOOLS: [&str; 16] = [
     "apply_patch",
     "delegate_to_opencode",
     "run_checks",
+    "rebuild_environment",
     "commit_and_push",
     "open_pull_request",
     "ask_user",
@@ -916,7 +917,7 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
 }
 
 /// A deployment that does not allow local processes does not get the GitHub server, and says so
-/// at startup, naming the variable that decides (78); the image allows them (`MCP_ALLOW_STDIO`).
+/// at startup, naming the variable that decides (78); the coder's deployment allows them (`MCP_ALLOW_STDIO`).
 #[tokio::test]
 async fn the_shipped_mcp_json_starts_no_local_process_unless_the_deployment_allows_it() {
     let error = AgentFiles::Embedded

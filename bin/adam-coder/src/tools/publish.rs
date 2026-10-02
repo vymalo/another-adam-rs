@@ -222,6 +222,7 @@ fn checks_for_pushed(
                 commit: sha.to_owned(),
                 tree: Some(tree.to_owned()),
                 repository: None,
+                environment: None,
                 summary: Some(format!(
                     "`{}` {}; checked on the identical tree before it was committed",
                     record.command,

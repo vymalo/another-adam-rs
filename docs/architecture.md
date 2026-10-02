@@ -751,8 +751,10 @@ the repository's own `devcontainer.json` (the first slot of the run decides, a d
 Podman service and never the host's Docker socket; the file is untrusted and checked three times, nothing of the coder's
 environment enters the container, and every step of making it is shown
 ([ADR 0010](decisions/0010-a-run-works-in-its-repositorys-devcontainer.md), which has the sequence and the lifecycle of that
-environment). It is chosen when the binary is composed (swapped at build time, not by a plugin); the coder composes it in the
-next change of the series.
+environment). It is chosen when the binary is composed (swapped at build time, not by a plugin): `adam-coder` composes it when
+`DEVCONTAINER_RUNTIME=podman` (off by default, and off on Kubernetes), starts OpenCode inside it too (the coder's own binary, mounted
+read-only; the model key as a file), has a `rebuild_environment` tool for the way out of a file that cannot be used, and has its
+janitor release a run's environment before it removes the run's workspace ([the coder's README](../bin/adam-coder/README.md#the-work-environment-the-repositorys-devcontainer)).
 
 ```mermaid
 sequenceDiagram
@@ -2044,7 +2046,7 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
   * **GitHub is read through the official GitHub MCP server, read-only**
     ([ADR 0009](decisions/0009-github-per-installation-read-through-mcp.md), decision 8). The coder's shipped
     `agent/mcp.json` starts `github-mcp-server stdio --read-only` as a child process (the image carries it, pinned
-    by tag and digest, and sets `MCP_ALLOW_STDIO=true`), hands it the coder's own credentials by the names it reads
+    by tag and digest; the coder's deployment, not the image, sets `MCP_ALLOW_STDIO=true`), hands it the coder's own credentials by the names it reads
     (`GITHUB_TOKEN` as `GITHUB_PERSONAL_ACCESS_TOKEN`, or the App's id, installation and key *file*; the other mode
     is an empty variable, which the server counts as unset) and offers the model twelve of its tools as
     `github__<name>`. Everything that writes stays the coder's own, behind the gate. The dev stack points the coder at

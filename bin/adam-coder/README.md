@@ -54,19 +54,20 @@ sequenceDiagram
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
 | `delegate_to_opencode { instructions, repo? }` | spawns the ACP agent in the worktree of the slot, as the run's environment prepared the command ([below](#where-the-processes-of-a-run-run); `ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
 | `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
+| `rebuild_environment { use_default? }` | the way out of a **broken work environment**, once the person has decided ([below](#the-work-environment-the-repositorys-devcontainer)): the run's environment is thrown away and made again now (its steps are shown under this call, and a failure is this call's result), from the repository's file as it is (`{}`) or, with `use_default: true`, from the default image for the rest of the run. The decision is the person's, so the tool is for the model to call only after it has asked (`ask_user`); the choice is kept in the run's notes (`environment.use_default`) and in the environment's own state. With no container runtime there is nothing to rebuild and it says so. Where the commands run in this container it changes nothing |
 | `commit_and_push { message, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository). In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
 | `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
 | `ask_user { question, choices? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions of 2 to 8 options, as one form) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the sixteen. The shipped folder's own `mcp.json` adds
+folder](#mcp-tools-from-the-folder)); they are not part of the seventeen. The shipped folder's own `mcp.json` adds
 twelve **read-only** tools of GitHub, `github__get_me`, `github__get_file_contents`, `github__list_branches` and the
 rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)).
 
-Thirteen tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the thirteen is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Fourteen tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the fourteen is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
@@ -703,7 +704,9 @@ stateDiagram-v2
 comes back in a process group of its own. The default is `Local`, this container, and it behaves exactly as the tools always
 did (a login shell, the same `cwd`, the same hidden secrets); a deployment composing the coder with another `Environment`
 (`ToolEnv::with_environment`, and the same value for `Janitor::with_environment`) runs the processes of a run somewhere
-else without the tools changing. There is no setting for it yet: `serve` builds `Local`.
+else without the tools changing. `serve` composes [`adam-devcontainer`](../../crates/adam-devcontainer/README.md)'s `DevContainer`
+(`DEVCONTAINER_RUNTIME`, [below](#the-work-environment-the-repositorys-devcontainer)): with `off`, the default, a run's
+processes are in this container exactly as above; with `podman` they run in the devcontainer of the run's first repository.
 
 ```mermaid
 sequenceDiagram
@@ -739,7 +742,8 @@ stateDiagram-v2
 
 * **Paths are the same everywhere.** The `cwd` of a spec is the slot's own path, so the file tools, `resolve_cwd`, OpenCode's
   `fs_root` and the git snapshots of `run_command` need no mapping. The file tools and all git work stay in this process.
-* **No secret in a spec.** `ExecSpec.env` carries the OpenCode configuration (which names the key as `{env:MODEL_API_KEY}`) and
+* **No secret in a spec.** `ExecSpec.env` carries the OpenCode configuration (which names the key by reference: `{env:MODEL_API_KEY}`
+  here, `{file:/run/adam/secrets/model-key}` in a devcontainer, what `EnvSession::secret_ref("model-key")` says) and
   never a value of a secret; what the process must not see of this process's own environment is `ExecSpec.hide`:
   `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` and `MODEL_API_KEY` for the project's commands,
   the first four for OpenCode (which reads the model key from its environment). The App's key as a *file*
@@ -750,8 +754,88 @@ stateDiagram-v2
   the wait for `ensure`.
 * **A timeout or a cancel** kills the process group here and then calls `EnvSession::kill` with the id of the command, for what
   lives where this process cannot reach. For OpenCode the same call follows the stop (`session/cancel`, then the kill).
-* **The ACP client cannot yet start a process with an empty environment**: a session whose `PreparedCommand` has `env_clear`
-  is refused for OpenCode with `the ACP client cannot start a process with an empty environment`. `Local` never asks for it.
+* **An environment may start OpenCode from nothing.** A session whose `PreparedCommand` has `env_clear` (the devcontainer's: its
+  command is the devcontainer CLI, which must not see this process's environment) is started by the ACP client with
+  `AcpCommand::clear_env()`: only what the environment set. `Local` never asks for it. OpenCode is where the environment says
+  it is (`EnvSession::tool_path("opencode")`: in a devcontainer, this container's own copy, mounted read-only).
+
+### The work environment: the repository's devcontainer
+
+With `DEVCONTAINER_RUNTIME=podman` the commands of a run (`run_command`, `run_checks`), OpenCode and everything OpenCode starts run
+in the **devcontainer of the run's first repository** ([ADR 0010](../../docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md),
+[`adam-devcontainer`](../../crates/adam-devcontainer/README.md): the official devcontainer CLI against a rootless Podman service,
+never the host's Docker socket). The repository's `.devcontainer/devcontainer.json` says what it needs, and the coder's own
+image no longer has to be every repository's environment. A repository without one gets `DEVCONTAINER_DEFAULT_IMAGE` (the
+`workspace` image of `another-agentic-images`, a dev container base). The files, the paths and all git work stay in this container,
+which holds the credentials; **a path means the same inside**.
+
+```mermaid
+sequenceDiagram
+  participant M as the model
+  participant T as run_command, run_checks, delegate_to_opencode
+  participant E as DevContainer (adam-devcontainer)
+  participant C as devcontainer CLI, Podman service
+  participant J as janitor
+  M->>T: a command
+  T->>E: ensure(workspace, progress)
+  E->>C: read the file, check it, build, create, check the container, run its lifecycle commands
+  E-->>T: steps while it is built (Building the environment from .devcontainer/devcontainer.json)
+  E-->>T: the session
+  T->>C: devcontainer exec ... adam-exec run|shell (the command prepare made)
+  C-->>T: output and exit code
+  T-->>M: the result (a checks artifact says where it ran)
+  Note over T,C: a file that cannot be used is an error naming the file and the problem, and the person decides
+  M->>T: rebuild_environment (only after the person answered)
+  T->>E: rebuild(run, use_default), then ensure
+  J->>E: release(run) before the workspace is removed, held_runs() for what a crash left
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Local: DEVCONTAINER_RUNTIME=off, or the service does not answer (a step says so)
+  [*] --> Building: the first command of the run needs an environment
+  Building --> Ready: built, checked, set up
+  Building --> Broken: a file that cannot be read, a refused privilege, a build or a lifecycle command that fails, a timeout
+  Broken --> Broken: every command gets the same error (the model asks the person)
+  Broken --> Building: rebuild_environment (use_default for the default image)
+  Ready --> Building: a repository joined, or the container is gone
+  Ready --> [*]: the janitor releases it
+```
+
+* **Broken is the person's decision.** A file that cannot be used (it does not parse, it asks for `privileged` or a bind mount, its image does not
+  build, a lifecycle command fails, a phase ran out of time) is a **permanent** error result for every tool that needs the environment, naming the
+  file and the key or phase (the end of the log follows, scrubbed), and ending with what to do: the model asks the person with `ask_user`
+  (fix the file, or go on in the default environment), and only after the answer calls `rebuild_environment`. There is **no silent fallback**
+  to the default image. A service that is not there (or not answering) is another thing: that run is `Local`, with a step ("The container
+  runtime is not reachable: commands run in the coder's own environment"), and the next run probes again.
+* **The steps** are the environment's own, under the tool call that needed it (`env:<run>:<step>`): `Building the environment from
+  .devcontainer/devcontainer.json (owner/name)` (its detail follows the CLI: pulling, building, the repository's lifecycle commands; it ends
+  `done` with how long it took, or `failed` with the reason), `Using the default environment (<image>)`, `Restarting the environment: <repo>
+  joined the workspace`, `The environment was lost; rebuilding it`, and the fallback lines.
+* **The `checks` artifact** has `environment {kind: "devcontainer", source?, image}` when the check ran in a devcontainer (absent for this
+  container, so nothing changes for a deployment without them); a consumer that does not know the field ignores it.
+* **A missing tool says where it is missing.** In a devcontainer built from a file: the tool has to be added to that file (a devcontainer feature, or
+  its Dockerfile), and `rebuild_environment` makes the environment again after the change. On the default image: the repository has no devcontainer,
+  and one can provide it.
+* **OpenCode inside.** The coder's own `opencode` (resolved from `OPENCODE_BINARY`, else from `OPENCODE_COMMAND`'s program, to its real file: the npm
+  package's `bin` entry is the native binary its postinstall put there) is mounted read-only in every container; it needs glibc. The
+  first `delegate_to_opencode` of a run in a container runs `opencode --version` there once, and keeps the answer in the run's notes
+  (`environment.opencode`): an image that cannot run it (musl, another architecture) gets a clear refusal that sends the model to
+  `read_file`, `write_file` and `apply_patch`; the other tools still work. With `DEVCONTAINER_NETWORK=none` OpenCode cannot reach its
+  model, and `delegate_to_opencode` refuses in a container for that reason.
+* **Secrets.** The CLI and Podman's client start from an empty environment plus an allow-list: nothing of this process's environment (`GITHUB_TOKEN`, the
+  App's key, `DATABASE_URL`, `A2A_BEARER_TOKENS`, the thread-tools token) is in a container, and `${localEnv:X}` in a repository's file is empty.
+  The one secret a container gets is the **model key**, as the read-only file `/run/adam/secrets/model-key` that OpenCode reads with
+  `{file:...}` (never an argument or a variable). Code that runs in the container (a repository's own scripts, a build) can read that file, as it
+  can the model key anywhere OpenCode runs; the key is the model gateway's and not GitHub's. The untrusted file is checked three times against a
+  [policy](../../crates/adam-devcontainer/README.md#the-file-is-untrusted).
+* **Kubernetes.** The Helm chart keeps `DEVCONTAINER_RUNTIME` off ([`deploy/coder/README.md`](../../deploy/coder/README.md)): the Podman service
+  needs the same workspace volume at the same path and relaxed seccomp, which a pod does not give; the platform's sandbox provider is the way
+  there.
+* **At startup** (`serve`, through `environment_for`) with `podman`: the tools directory every container mounts (`<root>/environments/.tools/`: `adam-exec` and
+  OpenCode) is written (a failure stops the start), the service is probed (a service that does not answer is a warning: runs fall back to
+  this container until it does), and the default image is pulled in the background (`DEVCONTAINER_PREPULL`). The janitor releases the
+  environment of a run **before** it removes the run's workspace, and releases what `held_runs()` finds for runs that are over (a crash left it).
 
 ### Looking around, and what it may not do
 
@@ -1051,7 +1135,7 @@ rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
   is up; a mistake in the files or the policy is 78. A tool call that fails is an error result the model reads.
 * A folder without an `mcp.json` connects nothing. **The embedded copy has one**: it names the GitHub MCP server, a
   local process (see [GitHub over MCP](#github-over-mcp-read-only)), so a coder on the embedded files needs
-  `MCP_ALLOW_STDIO=true` and `github-mcp-server` on its `PATH`, which the image has. A **control plane** serves the
+  `MCP_ALLOW_STDIO=true` (the coder's deployment sets it, not the image) and `github-mcp-server` on its `PATH` (which the image has). A **control plane** serves the
   card and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
 
 ### Retry safety
@@ -1115,9 +1199,18 @@ way; every problem is reported at once at startup):
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
-| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. **The coder image sets it** (it ships `github-mcp-server`, which the shipped `mcp.json` starts), so an `adam-agent` run from that image allows it too: set `MCP_ALLOW_STDIO=false` there to refuse local processes | `false` (the image: `true`) |
+| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. **The coder's deployment sets it, the image does not** (the image carries `github-mcp-server`, which the shipped `mcp.json` starts, but also `adam-agent`, which must refuse local processes unless its own deployment opts in): the chart sets it on the roles that run workers, `compose.yaml` on the `coder` service, and the container smoke test passes it | `false` |
 | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
+| `DEVCONTAINER_RUNTIME` | where a run's commands and OpenCode run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service; see [The work environment](#the-work-environment-the-repositorys-devcontainer)). Anything else: exit 78 | `off` |
+| `CONTAINER_HOST` | Podman's own variable: where the service is, e.g. `unix:///run/podman/podman.sock`; **required** with `podman` | unset |
+| `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository that has no `devcontainer.json`. **Name it by digest only** (`registry/name@sha256:...`): the devcontainer CLI (0.89.0) cannot parse a reference that has both a tag and a digest ("Could not parse image name"), and then skips the image's details, the metadata that sets the remote user | the `workspace` image of `another-agentic-images` the coder is built on, by digest (`DEFAULT_DEVCONTAINER_IMAGE`; its tag, `DEFAULT_DEVCONTAINER_IMAGE_TAG`, is kept equal to the Dockerfile's `WORKSPACE_TAG` by a test) |
+| `DEVCONTAINER_NETWORK` | `inherit` (the Podman service's network, which the deployment limits) or `none` (then `delegate_to_opencode` refuses: OpenCode cannot reach its model) | `inherit` |
+| `DEVCONTAINER_DEPLOYMENT_ID` | the label the orphan sweep finds this deployment's containers by | `WORKER_ID`, else `adam-coder` |
+| `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | how long pulling, building and creating a container may take, and how long the repository's lifecycle commands may take | `1200`, `900` |
+| `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
+| `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (the image sets them) | `devcontainer`, `podman-remote` |
+| `OPENCODE_BINARY` | with `podman`: the OpenCode mounted into every container; **a native executable (an ELF file)**, since it is mounted and run there | `OPENCODE_COMMAND`'s program, found on `PATH` and resolved to its real file |
 | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills, subagents and `mcp.json`, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
 
 Everything from `MODEL_BASE_URL` down, except `ADAM_AGENT_DIR` (every role reads that one), is read by the roles that run workers (`all`, `worker`)
@@ -1126,8 +1219,8 @@ A control plane neither needs nor validates any of it (see [Roles](#roles)).
 
 OpenCode's configuration is generated at startup into
 `OPENCODE_CONFIG_CONTENT` (custom `@ai-sdk/openai-compatible` provider at
-`MODEL_BASE_URL`, model `OPENCODE_MODEL`, key by reference `{env:MODEL_API_KEY}`,
-never inlined) together with `OPENCODE_DISABLE_AUTOUPDATE=1`; see
+`MODEL_BASE_URL`, model `OPENCODE_MODEL`, key by reference, `{env:MODEL_API_KEY}` in this container and
+`{file:/run/adam/secrets/model-key}` in a devcontainer, never inlined) together with `OPENCODE_DISABLE_AUTOUPDATE=1`; see
 `src/opencode.rs` for what was verified against the OpenCode sources. The
 OpenCode child does not see `GITHUB_TOKEN`, `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL` or
 `A2A_BEARER_TOKENS`, and the checks do not see those or `MODEL_API_KEY`.
@@ -1361,7 +1454,8 @@ decision 8):
   the chart mounts the key as a file (`GITHUB_APP_PRIVATE_KEY_PATH`) and needs nothing. A deployment that keeps the key in a
   variable has no GitHub MCP server: mount a copy of the folder without that server (`ADAM_AGENT_DIR`).
 * **A deployment must allow it.** The server is a local process: `MCP_ALLOW_STDIO=true` and the binary on `PATH`
-  (the image has both; a control plane connects nothing). Without the variable the process stops at startup with
+  (the image has the binary; **the coder's deployment sets the variable**, since the image also carries `adam-agent`, which
+  must refuse local processes unless its own deployment opts in; a control plane connects nothing). Without the variable the process stops at startup with
   exit 78 naming it, and with it and no binary with exit 69, never in the middle of a run, and no message holds a
   credential. The image pins the binary by tag and digest (v1.12.2) and its build and the container smoke test list
   its tools over stdio, with no credential at all (the server lists tools without calling GitHub, *verified*; a
@@ -1492,7 +1586,10 @@ database of its own, so the role needs `CREATEDB`):
   to the model and called; a screen the coder cannot read (no inline catalog, no grant) getting the options as
   text, with no A2UI part.
 * `tests/binary.rs`: the `adam-coder` binary as a process. All problems of a
-  bad configuration reported together with exit 78; Postgres unreachable at boot
+  bad configuration reported together with exit 78 (the `DEVCONTAINER_*` ones among them: a runtime that is neither `off` nor `podman`, `podman`
+  with no `CONTAINER_HOST`, an OpenCode that is a script and cannot be mounted, a timeout that is not a number); with
+  `DEVCONTAINER_RUNTIME=podman` and a service that does not answer, the worker starts, writes the tools directory
+  (`adam-exec` and OpenCode), says so, and stops cleanly; Postgres unreachable at boot
   (a clear "connecting to Postgres: ..." chain in exactly one `adam-coder failed`
   line, exit 69, nothing on stderr, no password, no panic; sqlx retries the
   connection for its 30 s acquire timeout first); with Postgres: the card and
@@ -1704,7 +1801,16 @@ database of its own, so the role needs `CREATEDB`):
   secret, a check that times out and an OpenCode that is cancelled each tell the session which command to kill, what `ensure`
   says shows as steps of the tool call with the secret scrubbed from a detail, an environment that cannot be made (a build
   that failed with its log, a runtime that is down) is a permanent or a transient result for the model that runs nothing, uses
-  no check cycle and records nothing, and is made again at the next call, and a cancel stops the wait for `ensure`.
+  no check cycle and records nothing, and is made again at the next call, and a cancel stops the wait for `ensure`. The devcontainer
+  side (slice 7b, A7b-2), against the same fake: a **broken** environment is a permanent result for `run_command`, `run_checks` and
+  `delegate_to_opencode` that names the file and the problem and says to ask the person (nothing ran, the coder never rebuilds
+  by itself), one that is only unavailable is transient and says nothing of rebuilding; `rebuild_environment` (with `use_default`: asks
+  the environment, notes the choice, makes the environment now and says so; without: forgets what the notes knew of OpenCode; with no
+  container runtime: "Nothing was rebuilt", no environment asked for; a rebuild that fails again: the same kind of result); OpenCode
+  started from the path the environment names with the key as `{file:...}` and no secret value in any argument or variable;
+  `opencode --version` run once per environment and refused for good, with the other tools unaffected, when it fails; `DEVCONTAINER_NETWORK=none`
+  refusing OpenCode in a container and not in this one; the `checks` artifact's `environment` (a devcontainer's file or the default image;
+  absent for this container); a missing tool's answer in each of the three environments; and the **real** `DevContainer`, composed by `environment_for` as `serve` does it, over a Podman client that says the service is down: the start goes on, the tools directory is written, a command runs in the coder's own container, exactly one fallback step is shown for the run, and the second command does not probe again.
 * `tests/janitor.rs` also covers the environment: it is released before the workspace is removed (and never for an open run),
   a release that fails keeps the workspace for the next sweep, and what an environment holds for runs that are over or unknown
   is released without a workspace (`orphans`), once, leaving an open run's and a name that is no run.

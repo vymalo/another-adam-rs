@@ -321,6 +321,22 @@ pub trait Environment: Send + Sync + 'static {
     ///
     /// [`EnvError`] when it cannot find out.
     async fn held_runs(&self) -> Result<Vec<String>, EnvError>;
+
+    /// Throw away what is held for `run` and make it again on the next
+    /// [`ensure`](Self::ensure): the way out of an environment that is broken (a repository's
+    /// configuration that cannot be built), once the person has decided. With `use_default`, the
+    /// repository's own configuration is ignored for the rest of the run and the default
+    /// environment is used. The run's files are not touched. Returns whether this environment has
+    /// anything of its own to make again: the default (an environment that is the caller's own
+    /// container) has not, and says `false`.
+    ///
+    /// # Errors
+    ///
+    /// As [`release`](Self::release): something that is held cannot be freed.
+    async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
+        let _ = (run, use_default);
+        Ok(false)
+    }
 }
 
 /// A run's view of its environment.
@@ -342,6 +358,15 @@ pub trait EnvSession: Send + Sync {
     /// what lives where the caller cannot reach: [`Local`] has nothing more to do. It never fails:
     /// what it cannot do is logged, and a process that is already gone is not an error.
     async fn kill(&self, exec: &ExecId);
+
+    /// Where the program `name` is in this environment, when it is **not** where the caller finds
+    /// it: an environment that runs processes elsewhere brings along the caller's own copy of a
+    /// program the caller needs inside (the coder's `opencode`), at a path of its own. `None`: the
+    /// caller uses the program as it names it (the default, and [`Local`]).
+    fn tool_path(&self, name: &str) -> Option<PathBuf> {
+        let _ = name;
+        None
+    }
 
     /// How a process in this environment reads the secret called `name`, if it can be given:
     /// [`Local`] gives `"model-key"` as the variable `MODEL_API_KEY` of the caller's own
@@ -641,5 +666,12 @@ mod tests {
         assert!(Local.held_runs().await.unwrap().is_empty());
         Local.release("any-run").await.unwrap();
         Local.release("any-run").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_has_nothing_to_make_again_and_brings_no_program_of_its_own() {
+        assert!(!Local.rebuild("any-run", false).await.unwrap());
+        assert!(!Local.rebuild("any-run", true).await.unwrap());
+        assert_eq!(LocalSession.tool_path("opencode"), None);
     }
 }

@@ -22,6 +22,7 @@
 
 use adam::Artifact;
 use adam::prelude::*;
+use adam_workspace::{EnvDescription, EnvKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -65,6 +66,35 @@ pub struct Finding {
     pub message: String,
 }
 
+/// Where a check ran, when it was not in the coder's own container: the `environment` of the
+/// `checks` artifact. Absent for a run in this container, so nothing changes for a deployment without
+/// devcontainers; a consumer that does not know the field ignores it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentReport {
+    /// What the environment is: `devcontainer`.
+    pub kind: String,
+    /// The `devcontainer.json` it was built from, as the repository calls it; absent for the default
+    /// image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The image it runs.
+    pub image: String,
+}
+
+impl EnvironmentReport {
+    /// What `description` says, or `None` for the coder's own container.
+    pub fn of(description: &EnvDescription) -> Option<Self> {
+        match &description.kind {
+            EnvKind::DevContainer { source, image } => Some(Self {
+                kind: "devcontainer".to_owned(),
+                source: source.as_deref().map(super::repository_file),
+                image: image.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// The data part of the `checks` artifact.
 ///
 /// | Field | |
@@ -73,6 +103,7 @@ pub struct Finding {
 /// | `commit` | the 40-hex SHA of the `HEAD` of the run's workspace when the check ran; empty only when it could not be determined (`passed` is then `false`) |
 /// | `tree` | the git tree id (40 hex) of the code the check ran on, as `git add -A` would commit it; absent when it could not be computed |
 /// | `repository` | the URL of the repository of the slot the check ran in (for the verdict on a pushed commit, the repository it was pushed to); absent for a scratch project and in reports of an older coder |
+/// | `environment` | where the check ran, when that was a devcontainer: `{kind, source?, image}`; absent for a run in the coder's own container and in reports of an older coder |
 /// | `summary` | one line |
 /// | `findings` | the failing checks; at most [`MAX_FINDINGS`] and [`MAX_FINDINGS_BYTES`] in total, the cut marked |
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +118,9 @@ pub struct ChecksReport {
     /// The repository of the slot the check ran in, or the repository the commit was pushed to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    /// Where it ran, if not in the coder's own container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentReport>,
     /// One line about the run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -112,6 +146,8 @@ struct Run<'a> {
     tree: Option<&'a str>,
     /// The repository of the slot the command ran in.
     repository: Option<&'a str>,
+    /// Where the command ran.
+    environment: Option<EnvironmentReport>,
 }
 
 impl ChecksReport {
@@ -156,6 +192,7 @@ impl ChecksReport {
             commit: commit.unwrap_or_default().to_owned(),
             tree: run.tree.filter(|t| is_sha(t)).map(str::to_owned),
             repository: run.repository.map(str::to_owned),
+            environment: run.environment.clone(),
             summary: Some(summary),
             findings: cap_findings(findings),
         }
@@ -191,6 +228,7 @@ impl ChecksReport {
             commit: commit.to_owned(),
             tree: Some(tree.to_owned()),
             repository: None,
+            environment: self.environment.clone(),
             summary: Some(format!(
                 "{core}; checked on the identical tree before it was committed as {}",
                 &commit[..commit.len().min(10)]
@@ -219,6 +257,7 @@ impl ChecksReport {
             commit: commit.to_owned(),
             tree: tree.filter(|t| is_sha(t)).map(str::to_owned),
             repository: None,
+            environment: None,
             summary: Some(format!(
                 "the pushed commit {} was not checked",
                 &commit[..commit.len().min(10)]
@@ -353,6 +392,7 @@ pub(crate) async fn missing_tool_answer(
     ctx: &ToolCtx,
     missing: &MissingTool,
     dirs: &[&std::path::Path],
+    environment: &EnvKind,
 ) -> Result<String, ToolError> {
     let run = ctx.run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
@@ -366,7 +406,12 @@ pub(crate) async fn missing_tool_answer(
     } else {
         None
     };
-    Ok(missing_tool_text(missing, install.as_deref(), earlier > 0))
+    Ok(missing_tool_text(
+        missing,
+        install.as_deref(),
+        earlier > 0,
+        environment,
+    ))
 }
 
 /// What the model is told when a command failed because the workspace lacks a tool: what is
@@ -376,11 +421,13 @@ pub(crate) async fn missing_tool_answer(
 /// project's dependencies are installed with the project's own command, **through
 /// `delegate_to_opencode` and not `run_checks`** (an install that passes is a green check on code
 /// nobody tested, and `run_checks` is for the project's real checks). `repeated`: the same tool was
-/// already reported, so whatever was tried did not work, and the person decides.
+/// already reported, so whatever was tried did not work, and the person decides. In a devcontainer
+/// the answer says which environment lacks it and how the tool gets there (`environment`).
 pub(crate) fn missing_tool_text(
     missing: &MissingTool,
     install: Option<&str>,
     repeated: bool,
+    environment: &EnvKind,
 ) -> String {
     let name = &missing.name;
     if let Some(install) = install {
@@ -399,13 +446,33 @@ pub(crate) fn missing_tool_text(
     } else {
         ""
     };
+    let place = match environment {
+        EnvKind::DevContainer {
+            source: Some(file), ..
+        } => format!(
+            " The commands of this workspace run in the devcontainer built from `{}`: the tool \
+             has to be in that environment, so say that `{name}` must be added to it (a \
+             devcontainer feature, or its Dockerfile); once the file is changed, \
+             rebuild_environment makes the environment again.",
+            super::repository_file(file)
+        ),
+        EnvKind::DevContainer {
+            source: None,
+            image,
+        } => format!(
+            " This repository has no devcontainer, so the commands run in the default \
+             environment ({image}), which lacks `{name}`: a `.devcontainer/devcontainer.json` in \
+             the repository can provide it."
+        ),
+        _ => String::new(),
+    };
     format!(
         "The workspace has no `{name}`: the shell could not find it (exit code 127). That is a \
          missing toolchain, not a failing check: no check cycle was used and nothing was \
          recorded as a check. Do not retry variants of the command, do not search the \
          filesystem for the tool and do not try to install it (system toolchains are not yours to \
          install). Tell the person which toolchain is missing (`{name}`) with ask_user, and wait \
-         for their answer.{again}"
+         for their answer.{place}{again}"
     )
 }
 
@@ -446,7 +513,8 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 //   tool no longer runs anything and tells the model to stop and report.
 
 /// Run one of the project's own checks in your worktree (the commands its CI, README or
-/// Makefile run: `cargo test`, `pnpm test`, `just ci`) and get its exit code and the tail of
+/// Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (the
+/// repository's own devcontainer when it has one), and get its exit code and the tail of
 /// its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited
 /// check cycles and is reported as a check: never use it to look around (use run_command). A
 /// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
@@ -455,7 +523,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 pub async fn run_checks(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
-    /// Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree
+    /// Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree, in the workspace's environment
     command: String,
     /// Optional sub-directory of the worktree to run in (relative, inside the worktree)
     cwd: Option<String>,
@@ -522,7 +590,14 @@ pub async fn run_checks(
     if let Some(missing) = missing_tool(&outcome, command) {
         ctx.emit_progress(format!("the workspace lacks a tool: {shown}"))
             .await;
-        let said = missing_tool_answer(&env, ctx, &missing, &[dir.as_path(), slot.path()]).await?;
+        let said = missing_tool_answer(
+            &env,
+            ctx,
+            &missing,
+            &[dir.as_path(), slot.path()],
+            &environment.describe().kind,
+        )
+        .await?;
         return Ok(ToolOutput::error(said));
     }
 
@@ -544,6 +619,7 @@ pub async fn run_checks(
         tree: tree.as_deref(),
         // A scratch project has no repository (yet).
         repository: slot.worktree().map(|wt| wt.repo().url.as_str()),
+        environment: EnvironmentReport::of(&environment.describe()),
     })
     .scrubbed(redactor);
     let artifact = report.clone().into_artifact(redactor);
@@ -618,6 +694,7 @@ mod tests {
             dirty,
             tree: Some(TREE),
             repository: None,
+            environment: None,
         })
     }
 
@@ -720,6 +797,7 @@ mod tests {
             dirty: false,
             tree: None,
             repository: None,
+            environment: None,
         });
         let summary = r.summary.unwrap();
         assert!(!summary.contains('\n'));
@@ -798,6 +876,7 @@ mod tests {
             dirty: false,
             tree: None,
             repository: None,
+            environment: None,
         })
     }
 

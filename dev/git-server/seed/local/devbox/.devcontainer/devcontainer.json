@@ -1,0 +1,7 @@
+// The devbox fixture: a repository whose work environment is its own devcontainer. Its
+// Dockerfile adds `devbox-tool`, which nothing else has, so a command that finds it ran here.
+{
+  "build": { "dockerfile": "Dockerfile" },
+  "remoteUser": "vscode",
+  "postCreateCommand": "devbox-tool --version > /tmp/devbox-ready",
+}

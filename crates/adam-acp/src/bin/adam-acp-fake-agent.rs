@@ -21,6 +21,7 @@
 //! | `prompt-error` | answers `session/prompt` with a JSON-RPC error: code `FAKE_ACP_ERROR_CODE` (default `-32603`), message `fake prompt failure` |
 //! | `session-error` | answers `session/new` with a JSON-RPC error (code `FAKE_ACP_ERROR_CODE`, default `-32000`, which clients read as "authentication required") |
 //! | `stop-reason` | one text chunk, then ends the turn with `FAKE_ACP_STOP_REASON` (`end_turn`, `max_tokens`, `max_turn_requests`, `refusal` or `cancelled`; default `max_tokens`) |
+//! | `env-names` | one text chunk, `env: ` and the names of the environment variables the agent was started with, sorted and joined by commas, then `end_turn`: what a test reads to see whether the parent's environment reached the child |
 //! | `crash-once` | like `crash` if the marker file `FAKE_ACP_ONCE_FILE` does not exist (it is created first), like `write-file` afterwards: "crashes once, then works" across process restarts |
 //!
 //! `FAKE_ACP_PID_FILE`, if set, receives the process id at `initialize`.
@@ -210,6 +211,14 @@ async fn run_turn(
                 }
                 _ => write_file_turn(cx, &sid, &cwd).await,
             }
+        }
+        "env-names" => {
+            let mut names: Vec<String> = std::env::vars_os()
+                .map(|(name, _)| name.to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            say(cx, &sid, format!("env: {}", names.join(",")))?;
+            Ok(PromptResponse::new(StopReason::EndTurn))
         }
         "garbage-stdout" => {
             use std::io::Write as _;

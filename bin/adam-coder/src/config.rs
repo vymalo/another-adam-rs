@@ -38,6 +38,15 @@
 //! | `MCP_ALLOW_STDIO` | let an agent folder's `mcp.json` start local processes (`command` servers) | `false` |
 //! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
 //! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
+//! | `DEVCONTAINER_RUNTIME` | where a run's commands and OpenCode run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service, [ADR 0010](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)) | `off` |
+//! | `CONTAINER_HOST` | Podman's own variable: where the service is, `unix:///run/podman/podman.sock`; required with `podman` | unset |
+//! | `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository that has no `devcontainer.json`; **by digest only** (`name@sha256:...`): the devcontainer CLI cannot parse a tag together with a digest | the `workspace` image of `another-agentic-images` ([`DEFAULT_DEVCONTAINER_IMAGE`]) |
+//! | `DEVCONTAINER_NETWORK` | `inherit` (the Podman service's network) or `none` (and then `delegate_to_opencode` refuses: OpenCode cannot reach its model) | `inherit` |
+//! | `DEVCONTAINER_DEPLOYMENT_ID` | the label the orphan sweep finds this deployment's containers by | `WORKER_ID`, else `adam-coder` |
+//! | `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | how long pulling, building and creating the container may take, and how long the repository's lifecycle commands may take | `1200`, `900` |
+//! | `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
+//! | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (set by the image) | `devcontainer`, `podman-remote` |
+//! | `OPENCODE_BINARY` | with `podman`: the OpenCode that is mounted into every devcontainer; a native executable (an ELF file) | `OPENCODE_COMMAND`'s program, found on `PATH` and resolved to its real file |
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
 //!
 //! # Roles
@@ -85,9 +94,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use adam::AGENT_DIR_ENV;
+use adam_devcontainer::{Network, Runtime, Settings};
 use adam_host::Placement;
 pub use adam_service::{ConfigError, McpSettings};
-use adam_service::{ModelConfig, ServiceConfig, WorkerSettings, parse_flag, parse_or};
+use adam_service::{
+    ModelConfig, ServiceConfig, WorkerSettings, is_worker_id, parse_flag, parse_or,
+};
 use adam_workspace::{AppKey, WorkspaceError};
 use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
@@ -161,6 +173,247 @@ pub struct WorkerConfig {
     pub opencode_command: Vec<String>,
     /// `MCP_ALLOW_*`: what the MCP servers of the agent folder's `mcp.json` may be.
     pub mcp: McpSettings,
+    /// `DEVCONTAINER_*`: where the run's commands and OpenCode run.
+    pub devcontainer: DevcontainerConfig,
+}
+
+/// The image of a repository that has no `devcontainer.json` when `DEVCONTAINER_DEFAULT_IMAGE` is not
+/// set: the `workspace` image of `vymalo/another-agentic-images`, **by digest only**: the devcontainer
+/// CLI (0.89.0) cannot parse a reference that has both a tag and a digest ("Could not parse image name"),
+/// and then skips the image's details, the metadata that sets the remote user. It is the image this
+/// binary's own is built on ([`DEFAULT_DEVCONTAINER_IMAGE_TAG`] is its tag, which a test keeps equal to the
+/// `WORKSPACE_TAG` of `docker/coder/Dockerfile`), and it is a dev container base: its
+/// `devcontainer.metadata` label names the user. *Verified 2026-10-01*: an anonymous ghcr.io token and a
+/// manifest request for the tag returned this digest (linux/amd64), and its config blob has the label.
+pub const DEFAULT_DEVCONTAINER_IMAGE: &str = "ghcr.io/vymalo/another-agentic-images/workspace@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a";
+
+/// The tag [`DEFAULT_DEVCONTAINER_IMAGE`]'s digest was published as: not part of the reference (see
+/// there), but what a person reads to know which build it is, and what a test keeps with the Dockerfile.
+pub const DEFAULT_DEVCONTAINER_IMAGE_TAG: &str = "1.98.1-ee2273e";
+
+/// The devcontainer variables of a worker: see the table at the top of this module.
+#[derive(Debug, Clone)]
+pub struct DevcontainerConfig {
+    /// `DEVCONTAINER_RUNTIME`.
+    pub runtime: Runtime,
+    /// `CONTAINER_HOST`; `Some` whenever the runtime is [`Runtime::Podman`].
+    pub container_host: Option<String>,
+    /// `DEVCONTAINER_DEFAULT_IMAGE`.
+    pub default_image: String,
+    /// `DEVCONTAINER_NETWORK`.
+    pub network: Network,
+    /// `DEVCONTAINER_DEPLOYMENT_ID`.
+    pub deployment_id: String,
+    /// `DEVCONTAINER_UP_TIMEOUT_SECS`.
+    pub up_timeout: Duration,
+    /// `DEVCONTAINER_SETUP_TIMEOUT_SECS`.
+    pub setup_timeout: Duration,
+    /// `DEVCONTAINER_PREPULL`.
+    pub prepull: bool,
+    /// `DEVCONTAINER_CLI`.
+    pub cli: PathBuf,
+    /// `DEVCONTAINER_PODMAN`.
+    pub podman: PathBuf,
+    /// `OPENCODE_BINARY`, resolved and checked; `Some` whenever the runtime is [`Runtime::Podman`].
+    pub opencode_binary: Option<PathBuf>,
+}
+
+impl DevcontainerConfig {
+    /// The settings of [`adam_devcontainer::DevContainer`] for the workspace root `root` and the
+    /// model key OpenCode reads as a file inside a container (`None` when the gateway needs none).
+    pub fn settings(&self, root: PathBuf, model_key: Option<SecretString>) -> Settings {
+        let mut settings = Settings::new(root);
+        settings.runtime = self.runtime;
+        settings.cli.clone_from(&self.cli);
+        settings.podman.clone_from(&self.podman);
+        settings.container_host = self.container_host.clone().unwrap_or_default();
+        settings.default_image.clone_from(&self.default_image);
+        settings.network = self.network;
+        settings.deployment.clone_from(&self.deployment_id);
+        settings.up_timeout = self.up_timeout;
+        settings.setup_timeout = self.setup_timeout;
+        settings.opencode.clone_from(&self.opencode_binary);
+        settings.model_key = model_key;
+        settings
+    }
+
+    /// Read the variables, adding a problem per invalid one. Without a runtime (`off`) nothing that
+    /// needs the file system or the service is checked.
+    fn parse(
+        get: &impl Fn(&str) -> Option<String>,
+        worker_id: Option<&str>,
+        opencode_command: &[String],
+        problems: &mut Vec<String>,
+    ) -> Self {
+        let runtime = match get("DEVCONTAINER_RUNTIME")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("off") => Runtime::Off,
+            Some("podman") => Runtime::Podman,
+            Some(other) => {
+                problems.push(format!(
+                    "DEVCONTAINER_RUNTIME must be off or podman, got {other:?}"
+                ));
+                Runtime::Off
+            }
+        };
+        let container_host = get("CONTAINER_HOST").map(|h| h.trim().to_owned());
+        if runtime == Runtime::Podman {
+            match container_host.as_deref() {
+                None => problems.push(
+                    "CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman: where the Podman service is, such as unix:///run/podman/podman.sock"
+                        .into(),
+                ),
+                Some(host) if !is_container_host(host) => problems.push(format!(
+                    "CONTAINER_HOST {host:?} is not a Podman service address (unix://, tcp:// or ssh:// and a path or host)"
+                )),
+                Some(_) => {}
+            }
+        }
+        let default_image = get("DEVCONTAINER_DEFAULT_IMAGE")
+            .map(|i| i.trim().to_owned())
+            .unwrap_or_else(|| DEFAULT_DEVCONTAINER_IMAGE.to_owned());
+        if default_image.chars().any(char::is_whitespace) || default_image.starts_with(['-', ':']) {
+            problems.push(format!(
+                "DEVCONTAINER_DEFAULT_IMAGE {default_image:?} is not an image reference (one word with no spaces, such as `registry/name@sha256:<digest>`)"
+            ));
+        }
+        let network = match get("DEVCONTAINER_NETWORK")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("inherit") => Network::Inherit,
+            Some("none") => Network::None,
+            Some(other) => {
+                problems.push(format!(
+                    "DEVCONTAINER_NETWORK must be inherit or none, got {other:?}"
+                ));
+                Network::Inherit
+            }
+        };
+        let deployment_id = get("DEVCONTAINER_DEPLOYMENT_ID")
+            .map(|v| v.trim().to_owned())
+            .or_else(|| worker_id.map(str::to_owned))
+            .unwrap_or_else(|| "adam-coder".to_owned());
+        if !is_worker_id(&deployment_id) {
+            problems.push(format!(
+                "DEVCONTAINER_DEPLOYMENT_ID {deployment_id:?} is not a label value (letters, digits, `.`, `_` and `-`, up to 128, not starting with `.`)"
+            ));
+        }
+        let up_timeout = Duration::from_secs(
+            parse_or(get, "DEVCONTAINER_UP_TIMEOUT_SECS", 1200u64, problems).max(1),
+        );
+        let setup_timeout = Duration::from_secs(
+            parse_or(get, "DEVCONTAINER_SETUP_TIMEOUT_SECS", 900u64, problems).max(1),
+        );
+        // On unless it says otherwise.
+        let prepull = if get("DEVCONTAINER_PREPULL").is_none() {
+            true
+        } else {
+            parse_flag(get, "DEVCONTAINER_PREPULL", problems)
+        };
+        let opencode_binary = (runtime == Runtime::Podman)
+            .then(|| opencode_binary(get, opencode_command, problems))
+            .flatten();
+        Self {
+            runtime,
+            container_host,
+            default_image,
+            network,
+            deployment_id,
+            up_timeout,
+            setup_timeout,
+            prepull,
+            cli: PathBuf::from(
+                get("DEVCONTAINER_CLI").unwrap_or_else(|| "devcontainer".to_owned()),
+            ),
+            podman: PathBuf::from(
+                get("DEVCONTAINER_PODMAN").unwrap_or_else(|| "podman-remote".to_owned()),
+            ),
+            opencode_binary,
+        }
+    }
+}
+
+/// Whether `host` can be Podman's `CONTAINER_HOST`: `unix:///path`, `tcp://host:port` or `ssh://...`.
+fn is_container_host(host: &str) -> bool {
+    ["unix://", "tcp://", "ssh://"].iter().any(|scheme| {
+        host.strip_prefix(scheme)
+            .is_some_and(|rest| !rest.is_empty())
+    })
+}
+
+/// The OpenCode that is mounted into every devcontainer: `OPENCODE_BINARY`, else the program of
+/// `OPENCODE_COMMAND` found on `PATH`, resolved to its real file (the npm package's `bin` entry is a
+/// link to the native binary its postinstall put there). It must be a native executable: a script
+/// needs an interpreter the container may not have.
+fn opencode_binary(
+    get: &impl Fn(&str) -> Option<String>,
+    command: &[String],
+    problems: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let (name, named) = match get("OPENCODE_BINARY") {
+        Some(path) => ("OPENCODE_BINARY", path),
+        None => (
+            "OPENCODE_COMMAND's program",
+            command
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "opencode".to_owned()),
+        ),
+    };
+    let named = PathBuf::from(named.trim());
+    let found = if named.components().count() > 1 {
+        Some(named.clone())
+    } else {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(&named))
+                .find(|candidate| candidate.is_file())
+        })
+    };
+    let Some(found) = found else {
+        problems.push(format!(
+            "{name} {} is not on PATH: DEVCONTAINER_RUNTIME=podman mounts the coder's OpenCode into every devcontainer (set OPENCODE_BINARY to its file)",
+            named.display()
+        ));
+        return None;
+    };
+    let real = match found.canonicalize() {
+        Ok(real) => real,
+        Err(e) => {
+            problems.push(format!("{name} {}: {e}", found.display()));
+            return None;
+        }
+    };
+    match is_native_executable(&real) {
+        Ok(true) => Some(real),
+        Ok(false) => {
+            problems.push(format!(
+                "{name} {} is not a native executable (an ELF file, not a script): it is mounted into the devcontainers, which may have no interpreter; point OPENCODE_BINARY at the binary itself",
+                real.display()
+            ));
+            None
+        }
+        Err(e) => {
+            problems.push(format!("{name} {}: {e}", real.display()));
+            None
+        }
+    }
+}
+
+/// Whether `path` is an executable ELF file.
+fn is_native_executable(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return Ok(false);
+    }
+    let mut magic = [0u8; 4];
+    let read = std::fs::File::open(path)?.read(&mut magic)?;
+    Ok(read == 4 && magic == *b"\x7fELF")
 }
 
 /// How the coder authenticates to GitHub, chosen per installation: **exactly one** of a personal
@@ -370,6 +623,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("pr_draft", &self.pr_draft)
             .field("opencode_command", &self.opencode_command)
             .field("mcp", &self.mcp)
+            .field("devcontainer", &self.devcontainer)
             .finish_non_exhaustive()
     }
 }
@@ -576,6 +830,12 @@ impl WorkerConfig {
             git_author_email: get("GIT_AUTHOR_EMAIL")
                 .unwrap_or_else(|| "adam-coder@users.noreply.github.com".to_owned()),
             pr_draft,
+            devcontainer: DevcontainerConfig::parse(
+                get,
+                settings.worker_id.as_deref(),
+                &opencode_command,
+                problems,
+            ),
             opencode_command,
             mcp,
         })
@@ -1582,5 +1842,286 @@ mod tests {
         assert!(parse_owned(&vars).is_ok());
         vars.insert("ROLE".into(), "worker".into());
         assert!(parse_owned(&vars).is_err(), "a worker does");
+    }
+
+    // -------------------------------------------------------------------- devcontainers
+
+    /// A native executable file (the magic of an ELF), as `OPENCODE_BINARY` wants.
+    fn elf_in(dir: &std::path::Path, name: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        std::fs::write(&path, b"\x7fELF and then whatever").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn parse_dc(vars: &HashMap<&'static str, String>) -> Result<Config, ConfigError> {
+        Config::from_lookup(|k| vars.get(k).cloned())
+    }
+
+    fn devcontainer_of(vars: &HashMap<&'static str, String>) -> DevcontainerConfig {
+        parse_dc(vars)
+            .expect("valid")
+            .worker
+            .expect("a worker")
+            .devcontainer
+    }
+
+    fn owned_full() -> HashMap<&'static str, String> {
+        full().into_iter().map(|(k, v)| (k, v.to_owned())).collect()
+    }
+
+    #[test]
+    fn devcontainers_are_off_by_default_and_the_other_defaults_are_the_documented_ones() {
+        let dc = devcontainer_of(&owned_full());
+        assert_eq!(dc.runtime, Runtime::Off);
+        assert_eq!(dc.container_host, None);
+        assert_eq!(dc.default_image, DEFAULT_DEVCONTAINER_IMAGE);
+        assert_eq!(dc.network, Network::Inherit);
+        assert_eq!(dc.deployment_id, "adam-coder");
+        assert_eq!(dc.up_timeout, Duration::from_secs(1200));
+        assert_eq!(dc.setup_timeout, Duration::from_secs(900));
+        assert!(dc.prepull);
+        assert_eq!(dc.cli, PathBuf::from("devcontainer"));
+        assert_eq!(dc.podman, PathBuf::from("podman-remote"));
+        assert_eq!(
+            dc.opencode_binary, None,
+            "off: nothing is mounted, so nothing is looked for"
+        );
+        // Without a runtime nothing that needs the service or the file system is checked.
+        let mut vars = owned_full();
+        vars.insert("OPENCODE_BINARY", "/no/such/file".into());
+        vars.insert("CONTAINER_HOST", "not an address".into());
+        assert!(parse_dc(&vars).is_ok());
+    }
+
+    /// The default image is the base image of this binary's own image (`WORKSPACE_TAG`), by tag and digest.
+    #[test]
+    fn the_default_devcontainer_image_is_the_workspace_image_the_coder_is_built_on() {
+        let dockerfile = include_str!("../../../docker/coder/Dockerfile");
+        let tag = dockerfile
+            .lines()
+            .find_map(|l| l.strip_prefix("ARG WORKSPACE_TAG="))
+            .expect("the Dockerfile pins WORKSPACE_TAG")
+            .trim();
+        let (name, digest) = DEFAULT_DEVCONTAINER_IMAGE
+            .split_once("@sha256:")
+            .expect("a digest");
+        assert_eq!(
+            name, "ghcr.io/vymalo/another-agentic-images/workspace",
+            "by digest only: the devcontainer CLI cannot parse a tag together with a digest"
+        );
+        assert_eq!(
+            DEFAULT_DEVCONTAINER_IMAGE_TAG, tag,
+            "WORKSPACE_TAG and DEFAULT_DEVCONTAINER_IMAGE move together"
+        );
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn podman_needs_the_service_and_an_opencode_that_can_be_mounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode = elf_in(dir.path(), "opencode");
+        let mut vars = owned_full();
+        vars.insert("DEVCONTAINER_RUNTIME", " Podman ".into());
+        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
+        vars.insert("OPENCODE_BINARY", opencode.clone());
+        vars.insert("DEVCONTAINER_NETWORK", "none".into());
+        vars.insert(
+            "DEVCONTAINER_DEFAULT_IMAGE",
+            "registry.example/base:1".into(),
+        );
+        vars.insert("DEVCONTAINER_DEPLOYMENT_ID", "coder-a".into());
+        vars.insert("DEVCONTAINER_UP_TIMEOUT_SECS", "60".into());
+        vars.insert("DEVCONTAINER_SETUP_TIMEOUT_SECS", "30".into());
+        vars.insert("DEVCONTAINER_PREPULL", "false".into());
+        vars.insert("DEVCONTAINER_CLI", "/usr/local/bin/devcontainer".into());
+        vars.insert("DEVCONTAINER_PODMAN", "/usr/bin/podman-remote".into());
+        let dc = devcontainer_of(&vars);
+        assert_eq!(dc.runtime, Runtime::Podman);
+        assert_eq!(
+            dc.container_host.as_deref(),
+            Some("unix:///run/podman/podman.sock")
+        );
+        assert_eq!(dc.network, Network::None);
+        assert_eq!(dc.default_image, "registry.example/base:1");
+        assert_eq!(dc.deployment_id, "coder-a");
+        assert_eq!(dc.up_timeout, Duration::from_secs(60));
+        assert_eq!(dc.setup_timeout, Duration::from_secs(30));
+        assert!(!dc.prepull);
+        assert_eq!(
+            dc.opencode_binary.as_deref(),
+            Some(
+                std::path::Path::new(&opencode)
+                    .canonicalize()
+                    .unwrap()
+                    .as_path()
+            )
+        );
+        // The settings the environment is made with.
+        let settings = dc.settings(PathBuf::from("/work"), None);
+        assert_eq!(settings.runtime, Runtime::Podman);
+        assert_eq!(settings.container_host, "unix:///run/podman/podman.sock");
+        assert_eq!(settings.deployment, "coder-a");
+        assert_eq!(settings.network, Network::None);
+        assert_eq!(settings.opencode, dc.opencode_binary);
+        assert!(settings.model_key.is_none());
+    }
+
+    #[test]
+    fn the_deployment_label_follows_the_worker_id_unless_it_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = owned_full();
+        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
+        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
+        vars.insert("OPENCODE_BINARY", elf_in(dir.path(), "opencode"));
+        vars.insert("WORKER_ID", "coder-0".into());
+        assert_eq!(devcontainer_of(&vars).deployment_id, "coder-0");
+        vars.insert("DEVCONTAINER_DEPLOYMENT_ID", "pool-a".into());
+        assert_eq!(devcontainer_of(&vars).deployment_id, "pool-a");
+    }
+
+    #[test]
+    fn an_invalid_devcontainer_variable_is_a_problem_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("opencode.js");
+        std::fs::write(&script, "#!/usr/bin/env node\n").unwrap();
+        let cases: [(&str, &str, &str); 9] = [
+            (
+                "DEVCONTAINER_RUNTIME",
+                "docker",
+                "DEVCONTAINER_RUNTIME must be off or podman",
+            ),
+            (
+                "DEVCONTAINER_NETWORK",
+                "host",
+                "DEVCONTAINER_NETWORK must be inherit or none",
+            ),
+            (
+                "DEVCONTAINER_UP_TIMEOUT_SECS",
+                "soon",
+                "DEVCONTAINER_UP_TIMEOUT_SECS is invalid",
+            ),
+            (
+                "DEVCONTAINER_SETUP_TIMEOUT_SECS",
+                "-3",
+                "DEVCONTAINER_SETUP_TIMEOUT_SECS is invalid",
+            ),
+            (
+                "DEVCONTAINER_PREPULL",
+                "maybe",
+                "DEVCONTAINER_PREPULL must be true or false",
+            ),
+            (
+                "DEVCONTAINER_DEPLOYMENT_ID",
+                "a b",
+                "DEVCONTAINER_DEPLOYMENT_ID",
+            ),
+            (
+                "DEVCONTAINER_DEFAULT_IMAGE",
+                "two words",
+                "DEVCONTAINER_DEFAULT_IMAGE",
+            ),
+            ("CONTAINER_HOST", "podman.sock", "CONTAINER_HOST"),
+            (
+                "OPENCODE_BINARY",
+                script.to_str().unwrap(),
+                "OPENCODE_BINARY",
+            ),
+        ];
+        for (name, value, expected) in cases {
+            let mut vars = owned_full();
+            vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
+            vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
+            vars.insert("OPENCODE_BINARY", elf_in(dir.path(), "opencode"));
+            vars.insert(name, value.to_owned());
+            if name == "DEVCONTAINER_RUNTIME" {
+                vars.insert(name, value.to_owned());
+            }
+            let err = parse_dc(&vars).unwrap_err();
+            assert!(
+                err.problems.iter().any(|p| p.starts_with(expected)),
+                "{name}={value}: {:?}",
+                err.problems
+            );
+            assert_eq!(err.class(), ErrorClass::Invalid, "{name}");
+        }
+    }
+
+    #[test]
+    fn podman_without_an_address_or_an_opencode_is_refused_with_both_problems_listed() {
+        let mut vars = owned_full();
+        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
+        vars.insert("OPENCODE_BINARY", "/no/such/dir/opencode".into());
+        let err = parse_dc(&vars).unwrap_err();
+        let all = err.problems.join("\n");
+        // A message a person pastes into a report has no runs of spaces (a re-wrapping slip, #68).
+        assert!(!all.contains("  "), "{all}");
+        assert!(
+            all.contains("CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman"),
+            "{all}"
+        );
+        assert!(
+            all.contains("OPENCODE_BINARY /no/such/dir/opencode"),
+            "{all}"
+        );
+        // A script is not a native executable, and says why.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("opencode");
+        std::fs::write(&script, "#!/bin/sh\n").unwrap();
+        vars.insert("OPENCODE_BINARY", script.to_string_lossy().into_owned());
+        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
+        let err = parse_dc(&vars).unwrap_err();
+        assert!(
+            err.problems.iter().all(|p| !p.contains("  ")),
+            "{:?}",
+            err.problems
+        );
+        assert!(
+            err.problems
+                .iter()
+                .any(|p| p.contains("not a native executable")),
+            "{:?}",
+            err.problems
+        );
+    }
+
+    #[test]
+    fn opencode_is_found_through_the_command_when_no_binary_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = elf_in(dir.path(), "oc-real");
+        let link = dir.path().join("opencode.exe");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut vars = owned_full();
+        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
+        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
+        // The program of OPENCODE_COMMAND, here with a directory, is resolved to the real file the
+        // npm package's `bin` entry links to.
+        vars.insert(
+            "OPENCODE_COMMAND",
+            format!("{} acp", link.to_string_lossy()),
+        );
+        let dc = devcontainer_of(&vars);
+        assert_eq!(
+            dc.opencode_binary.as_deref(),
+            Some(
+                std::path::Path::new(&real)
+                    .canonicalize()
+                    .unwrap()
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn a_control_plane_runs_no_commands_and_neither_reads_nor_checks_the_devcontainer_variables() {
+        let mut vars = owned_full();
+        vars.insert("ROLE", "control-plane".into());
+        vars.insert("DEVCONTAINER_RUNTIME", "docker".into());
+        vars.insert("DEVCONTAINER_NETWORK", "host".into());
+        assert!(parse_dc(&vars).is_ok());
+        vars.insert("ROLE", "worker".into());
+        assert!(parse_dc(&vars).is_err(), "a worker does");
     }
 }

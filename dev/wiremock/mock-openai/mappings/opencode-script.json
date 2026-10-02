@@ -1,6 +1,78 @@
 {
   "mappings": [
     {
+      "name": "opencode script (devbox): the bash tool result is in, say it is done",
+      "priority": 0,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-opencode"
+            }
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          },
+          {
+            "contains": "oc-dc-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "opencode-devbox-done.sse",
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        }
+      }
+    },
+    {
+      "name": "opencode script (devbox): first turn of the task records the tool's output",
+      "priority": 0,
+      "request": {
+        "method": "POST",
+        "urlPathPattern": "(/v1)?/chat/completions",
+        "bodyPatterns": [
+          {
+            "matchesJsonPath": {
+              "expression": "$.model",
+              "equalTo": "mock-opencode"
+            }
+          },
+          {
+            "matchesJsonPath": {
+              "expression": "$.stream",
+              "equalTo": "true"
+            }
+          },
+          {
+            "matchesJsonPath": "$.tools[?(@.function.name == 'bash')]"
+          },
+          {
+            "contains": "[mock:oc-devbox]"
+          },
+          {
+            "doesNotContain": "oc-dc-1"
+          }
+        ]
+      },
+      "response": {
+        "status": 200,
+        "bodyFileName": "opencode-devbox-bash.sse",
+        "headers": {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache"
+        }
+      }
+    },
+    {
       "name": "opencode script: the bash tool result is in, say it is done",
       "priority": 1,
       "request": {

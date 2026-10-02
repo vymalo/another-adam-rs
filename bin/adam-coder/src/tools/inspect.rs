@@ -29,7 +29,9 @@ use super::shell::{ShellOutcome, missing_tool, resolve_cwd, run_in, shell_spec};
 use super::{Outcome, ToolEnv, non_empty, run_error};
 
 /// Look around in your worktree with a shell command: `git branch -r`, `git log --oneline`,
-/// `ls`, `cat README.md`, `grep -rn name src`. You get the exit code and the tail of the output.
+/// `ls`, `cat README.md`, `grep -rn name src`. It runs in the workspace's environment (the
+/// repository's own devcontainer when it has one, so its tools are there). You get the exit code and
+/// the tail of the output.
 /// It costs no check cycle and reports no checks, and it is for looking: changes it makes to
 /// HEAD, the branch and the working tree are undone and refused (make changes with
 /// delegate_to_opencode). Use it to explore; use run_checks only for the project's real checks.
@@ -37,7 +39,7 @@ use super::{Outcome, ToolEnv, non_empty, run_error};
 pub async fn run_command(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
-    /// Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree
+    /// Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree, in the workspace's environment
     command: String,
     /// Optional sub-directory of the worktree to run in (relative, inside the worktree)
     cwd: Option<String>,
@@ -95,7 +97,14 @@ pub async fn run_command(
     if let Some(missing) = missing_tool(&outcome, command) {
         ctx.emit_progress("the workspace lacks a tool".to_owned())
             .await;
-        let said = missing_tool_answer(&env, ctx, &missing, &[dir.as_path(), slot.path()]).await?;
+        let said = missing_tool_answer(
+            &env,
+            ctx,
+            &missing,
+            &[dir.as_path(), slot.path()],
+            &environment.describe().kind,
+        )
+        .await?;
         return Ok(ToolOutput::error(said));
     }
     Ok(ToolOutput::text(render(&shown, &outcome)))

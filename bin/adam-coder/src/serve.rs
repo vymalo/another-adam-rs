@@ -27,10 +27,12 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use adam_devcontainer::{DevContainer, Network, Runtime};
 use adam_model::DynModel;
 use adam_service::{Agents, RuntimeOptions, claim_scope_for};
-use adam_workspace::{DynCodeHost, GitHub, GitIdentity};
+use adam_workspace::{DynCodeHost, DynEnvironment, GitHub, GitIdentity};
 use anyhow::Context as _;
+use secrecy::{ExposeSecret as _, SecretString};
 
 use crate::agent::CoderStarter;
 use crate::janitor::Janitor;
@@ -86,13 +88,16 @@ async fn build_agent(
     settings
         .create_repo_owners
         .clone_from(&worker.create_repo_owners);
+    settings.container_network_none = worker.devcontainer.network == Network::None;
     settings.check_timeout = worker.check_timeout;
     settings.check_output_tail = worker.check_output_tail;
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 
+    let environment = environment_for(worker, &root).await?;
     let env = Arc::new(
         ToolEnv::new(workspaces, code_host, settings)
+            .with_environment(environment)
             .with_redactor(redactor)
             // What a rejected credential tells the model to check depends on which kind they are.
             .with_credentials_hint(worker.github.check_hint())
@@ -126,6 +131,79 @@ async fn build_agent(
         .map_err(|e| *e)
         .context("assembling the coder agent")?;
     Ok((agent, janitor))
+}
+
+/// Where this worker's runs run their commands and OpenCode: the repository's devcontainer, on the
+/// rootless Podman service `CONTAINER_HOST` names, or this container.
+///
+/// [`DevContainer`] is the environment either way: with `DEVCONTAINER_RUNTIME=off` it is the coder's own
+/// container and says, once per run, that a repository's devcontainer is not used here. With `podman`
+/// it starts up like this:
+///
+/// 1. the tools directory every devcontainer mounts (`adam-exec`, the coder's OpenCode) is written,
+///    which fails the start: a binary that cannot be read is a mistake of the deployment;
+/// 2. the service is probed. **A service that does not answer does not stop the coder**: it may start
+///    after it, and every run probes again (at most every 30 seconds) and falls back to this container,
+///    with a step that says so, until it answers;
+/// 3. the default image is pulled in the background (`DEVCONTAINER_PREPULL`), so that the first run
+///    that needs it does not wait for it.
+///
+/// The orphan sweep is the janitor's: it asks this environment what it holds, at startup and every
+/// `WORKSPACE_SWEEP_SECS` ([`Janitor`]).
+///
+/// # Errors
+///
+/// The tools directory cannot be written (an `OPENCODE_BINARY` that cannot be read, a volume that
+/// refuses): the process does not start. Nothing else here fails it.
+pub async fn environment_for(
+    worker: &WorkerConfig,
+    root: &std::path::Path,
+) -> anyhow::Result<DynEnvironment> {
+    let config = &worker.devcontainer;
+    let key = &worker.model.api_key;
+    let model_key: Option<SecretString> = (!key.expose_secret().is_empty()).then(|| key.clone());
+    let environment = DevContainer::new(config.settings(root.to_path_buf(), model_key));
+    if config.runtime == Runtime::Podman {
+        let tools = environment
+            .install_tools()
+            .await
+            .context("writing the tools every devcontainer mounts")?;
+        tracing::info!(
+            runtime = "podman",
+            host = config.container_host.as_deref(),
+            default_image = %config.default_image,
+            network = ?config.network,
+            deployment = %config.deployment_id,
+            tools = %tools.display(),
+            "devcontainers are on"
+        );
+        match environment.probe().await {
+            Ok(()) => tracing::info!("the Podman service answers"),
+            Err(e) => tracing::warn!(
+                error = %adam_error::report(&e),
+                "the Podman service does not answer; runs go on in this container until it does"
+            ),
+        }
+        if config.prepull {
+            let pulling = environment.clone();
+            let image = config.default_image.clone();
+            tokio::spawn(async move {
+                match pulling.prepull().await {
+                    Ok(()) => tracing::info!(%image, "the default devcontainer image is pulled"),
+                    Err(e) => tracing::warn!(
+                        %image,
+                        error = %adam_error::report(&e),
+                        "cannot pull the default devcontainer image; the first run that needs it will"
+                    ),
+                }
+            });
+        }
+    } else {
+        tracing::info!(
+            "DEVCONTAINER_RUNTIME=off: commands run in this container; a repository's devcontainer is not used"
+        );
+    }
+    Ok(Arc::new(environment))
 }
 
 /// The runtime options of a worker: its id, how many runs at once, and whose runs it claims (its own

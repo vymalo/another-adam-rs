@@ -171,6 +171,11 @@ services:
       # The folder's mcp.json is replaced (below) by one that reaches mock-github-mcp over plain
       # http, which a deployment must allow: development only, never set it in production.
       MCP_ALLOW_INSECURE: "true"
+      # Local-process MCP servers are the coder's alone (the image sets nothing): its own folder's
+      # mcp.json starts github-mcp-server in production. The mock replaces that file here, so this only
+      # keeps a CODER_AGENT_DIR whose folder has a `command` server working. The `agent` service below
+      # leaves it unset, which refuses such servers.
+      MCP_ALLOW_STDIO: "true"
     ports: ["127.0.0.1:${CODER_PORT:-8080}:8080"]
     volumes:
       - coder-work:/work

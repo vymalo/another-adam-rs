@@ -542,6 +542,103 @@ async fn the_scratch_script_asks_where_to_publish_and_goes_on_when_told() {
     }
 }
 
+/// The devcontainer scripts (slice 7b): each plays from its task to its answer, as a completion and as a
+/// stream, and says the same. `devcontainer` works in the repository's own environment (it looks for a
+/// tool only that has, looks at the environment, has OpenCode record the tool's output, checks, pushes
+/// and opens the pull request); `default-env` asks where it is, then does the default task;
+/// `broken-env` meets an environment that is broken and asks the person; `no-runtime` meets a tool that
+/// the repository's environment would have and the deployment lacks, and asks the person.
+#[tokio::test]
+async fn the_devcontainer_scripts_play_to_their_answers_both_ways() {
+    let Some(root) = mock_url() else {
+        eprintln!("skipping: ADAM_TEST_MOCK_OPENAI_URL not set");
+        return;
+    };
+    let client = client(&format!("{root}/v1"), None);
+    let named = |repo: &str, switch: &str| {
+        vec![Message::user_text(format!(
+            "In http://git-server:8080/{repo}.git (base branch main), do the task. {switch}"
+        ))]
+    };
+    let calls_of = |history: &[Message]| -> Vec<(String, serde_json::Value)> {
+        history
+            .iter()
+            .flat_map(|m| m.tool_calls().to_vec())
+            .map(|c| (c.name, c.arguments))
+            .collect()
+    };
+
+    let mut history = named("local/devbox", "[mock:devcontainer]");
+    let turns = play_on(&client, "mock-coder", "x", &mut history).await;
+    assert_eq!(turns.len(), 8, "seven calls, then the answer");
+    grows(&turns, 6, "the coder's last answer in the devcontainer");
+    let calls = calls_of(&history);
+    let names: Vec<&str> = calls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "prepare_workspace",
+            "run_command",
+            "run_command",
+            "delegate_to_opencode",
+            "run_checks",
+            "commit_and_push",
+            "open_pull_request"
+        ]
+    );
+    assert_eq!(
+        calls[0].1["repo_url"],
+        "http://git-server:8080/local/devbox.git"
+    );
+    assert_eq!(calls[1].1["command"], "devbox-tool --version");
+    assert_eq!(calls[2].1["command"], "env");
+    assert!(
+        calls[3].1["instructions"]
+            .as_str()
+            .is_some_and(|i| i.contains("[mock:oc-devbox]")),
+        "OpenCode's script is selected by its instructions: {}",
+        calls[3].1
+    );
+    assert_eq!(calls[4].1["command"], "sh ./check.sh");
+
+    let mut history = named("local/sandbox", "[mock:default-env]");
+    let turns = play_on(&client, "mock-coder", "x", &mut history).await;
+    assert_eq!(turns.len(), 6, "five calls, then the answer");
+    grows(
+        &turns,
+        6,
+        "the coder's last answer in the default environment",
+    );
+    let calls = calls_of(&history);
+    assert_eq!(
+        calls[0].1["repo_url"],
+        "http://git-server:8080/local/sandbox.git"
+    );
+    assert_eq!(
+        calls[1].1["command"], "test -d /opt/flutter && echo coder-env || echo devcontainer-env",
+        "only the coder's own image has /opt/flutter"
+    );
+
+    let mut history = named("local/devbox-broken", "[mock:broken-env]");
+    let turns = play_on(&client, "mock-coder", "x", &mut history).await;
+    assert_eq!(turns.len(), 3, "two calls, then the question");
+    let question = turns.last().expect("a turn").concat();
+    assert!(
+        question.contains("privileged") && question.contains("go on in the default environment"),
+        "{question}"
+    );
+    assert_eq!(calls_of(&history)[1].1["command"], "true");
+
+    let mut history = named("local/devbox", "[mock:no-runtime]");
+    let turns = play_on(&client, "mock-coder", "x", &mut history).await;
+    assert_eq!(turns.len(), 3, "two calls, then the question");
+    let question = turns.last().expect("a turn").concat();
+    assert!(
+        question.contains("devbox-tool") && question.contains("without a container runtime"),
+        "{question}"
+    );
+}
+
 /// The second-repository script: the coder prepares the sandbox and asks the person whether it may
 /// add the library, then goes by what `prepare_workspace` says of it. Added (its slot is in the
 /// result): it reads the greeting, writes it in the sandbox, checks, pushes and opens the pull

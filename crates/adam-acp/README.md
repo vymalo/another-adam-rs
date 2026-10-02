@@ -16,7 +16,7 @@ prompts.
 
 | Item | What |
 |---|---|
-| `AcpCommand` | the program to spawn: `new(program, cwd)`, `opencode(cwd)`, `.arg(..)`, `.env(k, v)`, `.with_config_content(json)` |
+| `AcpCommand` | the program to spawn: `new(program, cwd)`, `opencode(cwd)`, `.arg(..)`, `.env(k, v)`, `.clear_env()` (start from an empty environment: only what `.env` set), `.with_config_content(json)` |
 | `AcpClient` | `spawn(cmd, policy)`, `spawn_with(..)` (with `AcpOptions`), `agent_info()`, `new_session(cwd, mcp_servers)`, `shutdown()`, `kill()` |
 | `Session` | `prompt(text)` returns a stream of `AcpUpdate`; `cancel()`; `id()` |
 | `AcpUpdate`, `PlanEntry`, `McpServerSpec` | streamed updates (text, thoughts, plan, tool calls, `TurnEnded { stop_reason }`) |
@@ -81,7 +81,11 @@ message no longer repeats it, so `adam_error::report` prints the cause once.
 
 No Cargo features. Runtime configuration is the `AcpCommand` (program,
 arguments, working directory, `OPENCODE_CONFIG_CONTENT`); the crate reads no
-environment variables itself.
+environment variables itself. The child gets the parent's environment plus
+`AcpCommand::env`, unless the command says `.clear_env()`: then it gets only what
+`.env` set (the parent still resolves a bare program name on its own `PATH`). The coder
+clears it for a command that is the client of something that runs the real agent
+elsewhere, the devcontainer CLI, so that nothing of the coder's environment reaches it.
 
 *Unverified:* how `opencode acp` behaves (which requests it sends, its
 configuration keys) is taken from OpenCode's sources as recorded in
@@ -92,7 +96,7 @@ re-checked here.
 
 * `tests/fake_agent.rs`: the client against the fake agent (updates, `fs_root` and symlink
   escapes, the permission modes, cancel, idle timeout, crash and hang handling,
-  killing the child and its process group). Always
+  killing the child and its process group, a cleared environment). Always
   runs; the binary comes from `CARGO_BIN_EXE_adam-acp-fake-agent`.
 * `tests/live_opencode.rs`: a real `opencode acp` creating a file.
 * Unit tests in `src/error.rs` (`class_table`,

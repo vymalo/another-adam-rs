@@ -100,5 +100,5 @@ pub use files::{AgentFiles, AgentFilesError};
 pub use janitor::Janitor;
 pub use redact::{RedactingCredentials, Redactor};
 pub use repos::workspaces_for;
-pub use serve::serve;
+pub use serve::{environment_for, serve};
 pub use tools::{CoderSettings, ToolEnv, coder_tools};

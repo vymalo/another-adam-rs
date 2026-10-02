@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "devbox-tool 1.0 (from the devcontainer)"
