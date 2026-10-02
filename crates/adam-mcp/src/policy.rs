@@ -10,6 +10,10 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long one tool call waits for its answer (the default of [`McpPolicy::call_timeout`]).
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The longest a call to the thread-tools endpoint may be waited for, whatever the tool says (the
+/// default of [`McpPolicy::thread_tools_max_call`]): one hour.
+pub const DEFAULT_THREAD_TOOLS_MAX_CALL: Duration = Duration::from_secs(3600);
+
 /// What the deployment allows and how long it waits. The default is the safe one: no local
 /// processes, no plain `http` to other machines, no `${VAR}` in a URL, a child that inherits
 /// nothing from the environment.
@@ -33,6 +37,7 @@ pub struct McpPolicy {
     inherit_env: bool,
     connect_timeout: Duration,
     call_timeout: Duration,
+    thread_tools_max_call: Duration,
 }
 
 impl Default for McpPolicy {
@@ -44,6 +49,7 @@ impl Default for McpPolicy {
             inherit_env: false,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             call_timeout: DEFAULT_CALL_TIMEOUT,
+            thread_tools_max_call: DEFAULT_THREAD_TOOLS_MAX_CALL,
         }
     }
 }
@@ -113,7 +119,9 @@ impl McpPolicy {
 
     /// How long one tool call waits for the server's answer before it is answered with an error
     /// result (the call may still be running on the server). Default 60 seconds. A zero is raised
-    /// to one millisecond.
+    /// to one millisecond. For a call to the thread-tools endpoint this is the wait for a tool that
+    /// does not say how long it may take ([`thread_tools_max_call`](Self::thread_tools_max_call) caps
+    /// the ones that do).
     #[must_use]
     pub fn call_timeout(mut self, timeout: Duration) -> Self {
         self.call_timeout = timeout.max(Duration::from_millis(1));
@@ -140,6 +148,16 @@ impl McpPolicy {
         self.inherit_env
     }
 
+    /// The longest an agent waits for one call to a tool of the thread-tools endpoint, whatever
+    /// time the tool says it may take (`_meta["thread-tools/v1"].timeoutSecs`): a cap, never a
+    /// default. Default one hour ([`DEFAULT_THREAD_TOOLS_MAX_CALL`]). A zero is raised to one
+    /// millisecond. The `THREAD_TOOLS_MAX_CALL_SECS` variable of the binaries.
+    #[must_use]
+    pub fn thread_tools_max_call(mut self, cap: Duration) -> Self {
+        self.thread_tools_max_call = cap.max(Duration::from_millis(1));
+        self
+    }
+
     /// The connect timeout.
     pub fn connect_timeout_value(&self) -> Duration {
         self.connect_timeout
@@ -148,5 +166,10 @@ impl McpPolicy {
     /// The call timeout.
     pub fn call_timeout_value(&self) -> Duration {
         self.call_timeout
+    }
+
+    /// The cap on a call to the thread-tools endpoint.
+    pub fn thread_tools_max_call_value(&self) -> Duration {
+        self.thread_tools_max_call
     }
 }

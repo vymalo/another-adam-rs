@@ -35,7 +35,9 @@ use std::time::Duration;
 use adam_model::ToolSpec;
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::ServiceError;
-use rmcp::model::{CallToolRequestParams, CallToolResponse, Tool as ListedTool};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, MetaObject, RequestMetaObject, Tool as ListedTool,
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Value};
 
@@ -84,6 +86,9 @@ pub struct RemoteTool {
     pub description: String,
     /// The JSON Schema of its arguments (an object schema).
     pub input_schema: Value,
+    /// The tool's own `_meta`, as the endpoint listed it (empty when it listed none). Where a key
+    /// of it means something to the caller (`thread-tools/v1`) the caller reads it.
+    pub meta: Map<String, Value>,
 }
 
 impl RemoteTool {
@@ -94,6 +99,61 @@ impl RemoteTool {
             description: self.description.clone(),
             parameters: self.input_schema.clone(),
         }
+    }
+}
+
+/// What one call to an endpoint's tool is sent with and waits for: [`Endpoint::call_tool_with`].
+///
+/// The default is a call with no request `_meta` that waits as long as the policy's call timeout.
+///
+/// ```
+/// use std::time::Duration;
+/// use adam_mcp::CallOptions;
+/// use serde_json::json;
+///
+/// let options = CallOptions::new()
+///     .timeout(Duration::from_secs(900))
+///     .meta("thread-tools/v1", json!({"callId": "run-1:call_7"}));
+/// assert_eq!(options.timeout_value(), Some(Duration::from_secs(900)));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct CallOptions {
+    timeout: Option<Duration>,
+    meta: Map<String, Value>,
+}
+
+impl CallOptions {
+    /// A call with the policy's timeout and no `_meta`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wait this long for the answer instead of the policy's call timeout. A zero is raised to one
+    /// millisecond. The caller decides what the time is and caps it: the endpoint adds no limit
+    /// of its own.
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout.max(Duration::from_millis(1)));
+        self
+    }
+
+    /// Send `value` under `key` in the request's `_meta` (a later call with the same key
+    /// replaces it).
+    #[must_use]
+    pub fn meta(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.meta.insert(key.into(), value);
+        self
+    }
+
+    /// The timeout this call was given, if any.
+    pub fn timeout_value(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    /// The request `_meta` this call is sent with.
+    pub fn meta_value(&self) -> &Map<String, Value> {
+        &self.meta
     }
 }
 
@@ -182,7 +242,7 @@ impl Endpoint {
         let _ = service.close_with_timeout(CLOSE_GRACE).await;
         match listed {
             Ok(Ok(tools)) => Ok(tools.into_iter().map(remote_tool).collect()),
-            Ok(Err(e)) => Err(self.error_of(&e)),
+            Ok(Err(e)) => Err(self.error_of(&e, self.recipe.connect_timeout)),
             Err(_) => Err(EndpointError::Timeout(
                 self.recipe.connect_timeout.as_millis(),
             )),
@@ -204,14 +264,34 @@ impl Endpoint {
         name: &str,
         arguments: Map<String, Value>,
     ) -> Result<RemoteResult, EndpointError> {
+        self.call_tool_with(name, arguments, CallOptions::new())
+            .await
+    }
+
+    /// Call the tool `name` with `arguments`, as [`call_tool`](Self::call_tool), with the request
+    /// `_meta` and the time to wait that `options` says: a tool of the thread-tools endpoint that may
+    /// take an hour is waited for an hour, not for the policy's call timeout.
+    ///
+    /// # Errors
+    ///
+    /// As [`call_tool`](Self::call_tool); [`EndpointError::Timeout`] names the time of this call.
+    pub async fn call_tool_with(
+        &self,
+        name: &str,
+        arguments: Map<String, Value>,
+        options: CallOptions,
+    ) -> Result<RemoteResult, EndpointError> {
+        let wait = options.timeout.unwrap_or(self.call_timeout);
         let mut service = self
             .recipe
             .dial()
             .await
             .map_err(|e| self.failed(&e.to_string()))?;
-        let params = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
-        let called =
-            tokio::time::timeout(self.call_timeout, service.peer().call_tool_once(params)).await;
+        let mut params = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
+        if !options.meta.is_empty() {
+            params.meta = Some(RequestMetaObject(MetaObject::from(options.meta)));
+        }
+        let called = tokio::time::timeout(wait, service.peer().call_tool_once(params)).await;
         let _ = service.close_with_timeout(CLOSE_GRACE).await;
         match called {
             Ok(Ok(CallToolResponse::Complete(result))) => {
@@ -231,8 +311,8 @@ impl Endpoint {
                  poll, or a request for more input)"
                     .to_owned(),
             )),
-            Ok(Err(e)) => Err(self.error_of(&e)),
-            Err(_) => Err(EndpointError::Timeout(self.call_timeout.as_millis())),
+            Ok(Err(e)) => Err(self.error_of(&e, wait)),
+            Err(_) => Err(EndpointError::Timeout(wait.as_millis())),
         }
     }
 
@@ -244,10 +324,10 @@ impl Endpoint {
         }
     }
 
-    fn error_of(&self, error: &ServiceError) -> EndpointError {
+    fn error_of(&self, error: &ServiceError, wait: Duration) -> EndpointError {
         match error {
             ServiceError::McpError(e) => EndpointError::Rejected(self.recipe.scrub(&e.message)),
-            ServiceError::Timeout { .. } => EndpointError::Timeout(self.call_timeout.as_millis()),
+            ServiceError::Timeout { .. } => EndpointError::Timeout(wait.as_millis()),
             other => self.failed(&adam_error::report(other)),
         }
     }
@@ -287,10 +367,12 @@ fn remote_tool(tool: ListedTool) -> RemoteTool {
     schema
         .entry("type")
         .or_insert_with(|| Value::String("object".to_owned()));
+    let meta = tool.meta.map(|m| (*m).clone()).unwrap_or_default();
     RemoteTool {
         name,
         description: cap_text(description, MAX_DESCRIPTION_BYTES),
         input_schema: Value::Object(schema),
+        meta,
     }
 }
 

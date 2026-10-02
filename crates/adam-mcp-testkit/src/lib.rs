@@ -40,7 +40,7 @@ mod thread_tools;
 
 pub use http::TestHttpServer;
 pub use logs::{LogCapture, wait_until};
-pub use thread_tools::{GET_UI_CATALOG, TURN_OUTPUT, ThreadToolsServer};
+pub use thread_tools::{Call, GET_UI_CATALOG, TURN_OUTPUT, ThreadToolsServer};
 
 /// What a server has been asked, shared by every session of it.
 #[derive(Debug, Default)]

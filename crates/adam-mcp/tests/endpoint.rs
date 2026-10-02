@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use adam_mcp::{Endpoint, EndpointError, McpPolicy};
+use adam_mcp::{CallOptions, Endpoint, EndpointError, McpPolicy};
 use adam_mcp_testkit::{GET_UI_CATALOG, ThreadToolsServer};
 use secrecy::SecretString;
 use serde_json::{Map, Value, json};
@@ -230,4 +230,88 @@ async fn plain_http_to_another_machine_is_refused_before_anything_is_sent() {
         "{error:?}"
     );
     assert!(!error.to_string().contains("good-token"));
+}
+
+#[tokio::test]
+async fn a_listed_tool_carries_its_own_meta() {
+    let server = ThreadToolsServer::start(&["good-token"]).await;
+    server.add_tool_with_meta(
+        "relay__search",
+        "Search.",
+        json!({"type": "object"}),
+        "found",
+        json!({"thread-tools/v1": {"reportsStep": true, "timeoutSecs": 125}}),
+    );
+    let tools = endpoint(&server, "good-token").list_tools().await.unwrap();
+    let relay = tools.iter().find(|t| t.name == "relay__search").unwrap();
+    assert_eq!(
+        relay.meta["thread-tools/v1"],
+        json!({"reportsStep": true, "timeoutSecs": 125})
+    );
+    // A tool that lists none has an empty `_meta`.
+    assert!(tools.iter().find(|t| t.name == GET_UI_CATALOG).unwrap().meta.is_empty());
+}
+
+#[tokio::test]
+async fn a_call_is_sent_with_the_meta_it_was_given_and_a_plain_call_with_none() {
+    let server = ThreadToolsServer::start(&["good-token"]).await;
+    server.add_tool("echo", "Echo.", json!({"type": "object"}), "echo");
+    let endpoint = endpoint(&server, "good-token");
+
+    endpoint.call_tool("echo", args(json!({"a": 1}))).await.unwrap();
+    let options = CallOptions::new().meta(
+        "thread-tools/v1",
+        json!({"callId": "run-1:call_7", "parentStepId": "tool:outer"}),
+    );
+    let result = endpoint
+        .call_tool_with("echo", args(json!({"a": 2})), options)
+        .await
+        .unwrap();
+    assert!(!result.is_error);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].meta, None, "a plain call sends no _meta");
+    assert_eq!(
+        requests[1].meta,
+        Some(json!({"thread-tools/v1": {"callId": "run-1:call_7", "parentStepId": "tool:outer"}}))
+    );
+    assert_eq!(requests[1].arguments, json!({"a": 2}));
+}
+
+#[tokio::test]
+async fn a_call_waits_as_long_as_its_options_say_and_not_as_long_as_the_policy() {
+    let server = ThreadToolsServer::start(&["good-token"]).await;
+    server.add_tool("slow", "Slow.", json!({"type": "object"}), "done");
+    server.set_delay("slow", Duration::from_millis(600));
+    let short = McpPolicy::default().call_timeout(Duration::from_millis(150));
+    let endpoint = Endpoint::new(&server.url("t"), &token("good-token"), &short).unwrap();
+
+    // The policy's time is the default: the call is given up on.
+    let started = std::time::Instant::now();
+    let error = endpoint.call_tool("slow", Map::new()).await.unwrap_err();
+    assert!(matches!(error, EndpointError::Timeout(150)), "{error:?}");
+    assert!(started.elapsed() < Duration::from_millis(550), "{:?}", started.elapsed());
+
+    // This call says it may take longer, and is waited for.
+    let result = endpoint
+        .call_tool_with(
+            "slow",
+            Map::new(),
+            CallOptions::new().timeout(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert!(result.text.starts_with("done"), "{}", result.text);
+
+    // And a time shorter than the policy's is honoured too, with its own time in the error.
+    let error = endpoint
+        .call_tool_with(
+            "slow",
+            Map::new(),
+            CallOptions::new().timeout(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, EndpointError::Timeout(50)), "{error:?}");
 }
