@@ -170,11 +170,11 @@ pub async fn commit_and_push(
     );
     Ok(ToolOutput::text(summary)
         .with_artifact(checks)
-        .with_artifact(Artifact {
-            name: "branch".into(),
-            mime_type: Some("application/json".into()),
-            data: branch_data(wt.repo().url.as_str(), &wt, base, &sha),
-        }))
+        .with_artifact(Artifact::new(
+            "branch",
+            Some("application/json".into()),
+            branch_data(wt.repo().url.as_str(), &wt, base, &sha),
+        )))
 }
 
 /// The data of the `branch` artifact: the branch the commit was pushed to (the run's own), and,
@@ -498,18 +498,18 @@ pub async fn open_pull_request(
             names.join(", ")
         ));
     }
-    Ok(ToolOutput::text(text).with_artifact(Artifact {
-        name: "pull_request".into(),
-        mime_type: Some("application/json".into()),
-        // The number is a string: A2A carries JSON numbers as
-        // floats (`7` would arrive as `7.0`).
-        data: json!({
-            "url": pr.url,
-            "number": pr.number.to_string(),
-            "branch": pr.head,
-            "repository": wt.repo().url,
-        }),
-    }))
+    // The number is a string: A2A carries JSON numbers as floats (`7` would arrive as `7.0`).
+    let data = json!({
+        "url": pr.url,
+        "number": pr.number.to_string(),
+        "branch": pr.head,
+        "repository": wt.repo().url,
+    });
+    Ok(ToolOutput::text(text).with_artifact(Artifact::new(
+        "pull_request",
+        Some("application/json".into()),
+        data,
+    )))
 }
 
 /// What a pull request opened on unverified code says in its body.

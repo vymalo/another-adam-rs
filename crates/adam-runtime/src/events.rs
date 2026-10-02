@@ -18,16 +18,168 @@ use adam_core::{RunId, RunStatus};
 use crate::step::StepEvent;
 use crate::text::is_false;
 
+/// The most bytes of one file artifact: 4 MiB.
+///
+/// A file artifact is journaled with the run: its bytes, as base64 (a third more), are in the
+/// journal entry of the tool call that made it and in every commit of the run's state after
+/// it. The cap keeps that bounded, and sits under the orchestration layer's own limit for a file
+/// it keeps (10 MiB), so an agent never makes a file the other side would refuse.
+pub const MAX_ARTIFACT_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most bytes of file artifacts one run keeps, all of its files together: 6 MiB. Enforced by
+/// the agent loop (`adam-llm-agent`), which refuses a tool's file that would go over it and tells
+/// the model; the runtime itself keeps what it is given. About 8 MiB of base64 in a run's state, which
+/// stays under the 16 MiB document of MongoDB.
+pub const MAX_RUN_FILE_BYTES: usize = 6 * 1024 * 1024;
+
+/// The longest filename of a file artifact, in bytes (what a file system takes).
+pub const MAX_ARTIFACT_FILENAME_BYTES: usize = 255;
+
+/// Why a file cannot be an artifact.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ArtifactFileError {
+    /// The file is over [`MAX_ARTIFACT_FILE_BYTES`].
+    #[error("the file is {len} bytes, over the limit of {max} bytes for a shared file")]
+    TooLarge {
+        /// Its size.
+        len: usize,
+        /// The limit.
+        max: usize,
+    },
+    /// The filename is empty, too long, or holds a path separator or a control character: it is a
+    /// name, not a path.
+    #[error("`{0}` is not a file name (no path, no control characters, at most 255 bytes)")]
+    BadFilename(String),
+    /// The media type is not of the form `type/subtype`.
+    #[error("`{0}` is not a media type (type/subtype)")]
+    BadMediaType(String),
+}
+
+/// The file of a file artifact: its name and its bytes. The media type is the artifact's
+/// [`mime_type`](Artifact::mime_type).
+///
+/// Journaled as `{"filename": "...", "bytes": "<base64>"}`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ArtifactFile {
+    /// The name the file is saved under: a name, never a path.
+    pub filename: String,
+    /// The content.
+    #[serde(with = "base64_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for ArtifactFile {
+    // The bytes are not printed: a log line or a failed assertion must not carry megabytes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArtifactFile")
+            .field("filename", &self.filename)
+            .field("bytes", &format_args!("<{} bytes>", self.bytes.len()))
+            .finish()
+    }
+}
+
+/// Bytes as a base64 string, the way A2A's `raw` part carries them.
+mod base64_bytes {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD.decode(text).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A named piece of output produced while a run works (a file, a report, a
 /// structured result). A2A maps these to task artifacts.
+///
+/// Two forms. A **JSON artifact** has `data` (a string becomes a text part, anything else a data
+/// part). A **file artifact** ([`Artifact::file`]) has `file`, and its media type is
+/// `mime_type`; its `data` is `null`. The A2A server serves a file as a `raw` part with the media
+/// type and the filename, which any A2A client reads as a file. Artifacts journaled before the
+/// file form existed have no `file` and read as they did.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Artifact {
     /// Artifact name.
     pub name: String,
-    /// Media type of `data`, if known.
+    /// Media type of `data` (or of the file), if known.
     pub mime_type: Option<String>,
-    /// The content.
+    /// The content of a JSON artifact; `null` for a file.
     pub data: Value,
+    /// The file, for a file artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<ArtifactFile>,
+}
+
+impl Artifact {
+    /// A JSON artifact: `data` with its media type, if it has one.
+    pub fn new(name: impl Into<String>, mime_type: Option<String>, data: Value) -> Self {
+        Self {
+            name: name.into(),
+            mime_type,
+            data,
+            file: None,
+        }
+    }
+
+    /// A file artifact: `bytes`, saved as `filename`, of `media_type`.
+    ///
+    /// # Errors
+    ///
+    /// [`ArtifactFileError`]: the file is over [`MAX_ARTIFACT_FILE_BYTES`], the filename is not a name,
+    /// or the media type is not `type/subtype`.
+    pub fn file(
+        name: impl Into<String>,
+        media_type: impl Into<String>,
+        filename: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Result<Self, ArtifactFileError> {
+        let (media_type, filename) = (media_type.into(), filename.into());
+        if bytes.len() > MAX_ARTIFACT_FILE_BYTES {
+            return Err(ArtifactFileError::TooLarge {
+                len: bytes.len(),
+                max: MAX_ARTIFACT_FILE_BYTES,
+            });
+        }
+        let bad_name = filename.is_empty()
+            || filename.len() > MAX_ARTIFACT_FILENAME_BYTES
+            || filename == "."
+            || filename == ".."
+            || filename
+                .chars()
+                .any(|c| c.is_control() || c == '/' || c == '\\');
+        if bad_name {
+            return Err(ArtifactFileError::BadFilename(filename));
+        }
+        let bad_type = media_type.split_once('/').is_none_or(|(kind, sub)| {
+            kind.is_empty()
+                || sub.is_empty()
+                || media_type
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace())
+        });
+        if bad_type {
+            return Err(ArtifactFileError::BadMediaType(media_type));
+        }
+        Ok(Self {
+            name: name.into(),
+            mime_type: Some(media_type),
+            data: Value::Null,
+            file: Some(ArtifactFile { filename, bytes }),
+        })
+    }
+
+    /// The bytes of the file, `0` for a JSON artifact.
+    pub fn file_len(&self) -> usize {
+        self.file.as_ref().map_or(0, |f| f.bytes.len())
+    }
 }
 
 /// Something observers may want to know about a run.
@@ -89,10 +241,14 @@ pub enum RunEvent {
     Artifact {
         /// Artifact name.
         name: String,
-        /// Media type of `data`, if known.
+        /// Media type of `data` (or of the file), if known.
         mime_type: Option<String>,
-        /// The content.
+        /// The content of a JSON artifact; `null` for a file.
         data: Value,
+        /// The file, for a file artifact (see [`Artifact::file`]). Absent in events written before
+        /// the file form existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<ArtifactFile>,
     },
 }
 
@@ -102,6 +258,7 @@ impl From<Artifact> for RunEvent {
             name: a.name,
             mime_type: a.mime_type,
             data: a.data,
+            file: a.file,
         }
     }
 }
@@ -291,6 +448,7 @@ mod tests {
                 name: "report".into(),
                 mime_type: Some("text/plain".into()),
                 data: serde_json::json!("x"),
+                file: None,
             },
             RunEvent::Step(
                 StepEvent::new("acp:c2:1", StepKind::Command, "npm test", StepState::Failed)
@@ -357,6 +515,125 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<RunEvent>(bare).expect("parse"),
             piece(false, false)
+        );
+    }
+
+    const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg'/>";
+
+    /// A file artifact is journaled as JSON with its bytes in base64, and comes back the same;
+    /// a JSON artifact has no `file` member at all.
+    #[test]
+    fn a_file_artifact_roundtrips_through_json_as_base64() {
+        let artifact = Artifact::file("logo", "image/svg+xml", "logo.svg", SVG.to_vec())
+            .expect("a small file");
+        assert_eq!(artifact.data, Value::Null);
+        assert_eq!(artifact.mime_type.as_deref(), Some("image/svg+xml"));
+        assert_eq!(artifact.file_len(), SVG.len());
+
+        let json = serde_json::to_value(&artifact).expect("serialize");
+        assert_eq!(json["file"]["filename"], "logo.svg");
+        assert_eq!(
+            json["file"]["bytes"],
+            "PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnLz4="
+        );
+        assert_eq!(
+            serde_json::from_value::<Artifact>(json).expect("parse"),
+            artifact
+        );
+
+        let plain = serde_json::to_value(Artifact::new("r", None, serde_json::json!("x")))
+            .expect("serialize");
+        assert!(plain.get("file").is_none(), "{plain}");
+
+        // The same through the event.
+        let event = RunEvent::from(artifact.clone());
+        let back: RunEvent =
+            serde_json::from_value(serde_json::to_value(&event).expect("serialize"))
+                .expect("parse");
+        assert_eq!(back, event);
+    }
+
+    /// What was journaled before files existed (an envelope's artifact, a `NOTIFY` payload) still
+    /// reads, as a JSON artifact.
+    #[test]
+    fn artifacts_journaled_before_the_file_form_still_decode() {
+        let old = serde_json::json!({"name": "checks", "mime_type": "application/json", "data": {"ok": true}});
+        let artifact: Artifact = serde_json::from_value(old).expect("an old artifact");
+        assert_eq!(artifact.file, None);
+        assert_eq!(artifact.data, serde_json::json!({"ok": true}));
+
+        let old =
+            serde_json::json!({"type": "artifact", "name": "n", "mime_type": null, "data": "x"});
+        let event: RunEvent = serde_json::from_value(old).expect("an old event");
+        assert_eq!(
+            event,
+            RunEvent::Artifact {
+                name: "n".into(),
+                mime_type: None,
+                data: serde_json::json!("x"),
+                file: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_file_must_be_within_the_cap_and_named_and_typed_properly() {
+        let big = vec![0u8; MAX_ARTIFACT_FILE_BYTES + 1];
+        assert_eq!(
+            Artifact::file("f", "text/plain", "f.txt", big),
+            Err(ArtifactFileError::TooLarge {
+                len: MAX_ARTIFACT_FILE_BYTES + 1,
+                max: MAX_ARTIFACT_FILE_BYTES
+            })
+        );
+        let at_cap = vec![0u8; MAX_ARTIFACT_FILE_BYTES];
+        assert!(Artifact::file("f", "application/octet-stream", "f.bin", at_cap).is_ok());
+        assert!(Artifact::file("f", "text/plain", "empty.txt", Vec::new()).is_ok());
+
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b.txt",
+            "a\\b.txt",
+            "x\ny.txt",
+            &"n".repeat(256),
+        ] {
+            assert!(
+                matches!(
+                    Artifact::file("f", "text/plain", bad, vec![1]),
+                    Err(ArtifactFileError::BadFilename(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        for bad in [
+            "",
+            "text",
+            "text/",
+            "/plain",
+            "text/plain; x",
+            "te xt/plain",
+        ] {
+            assert!(
+                matches!(
+                    Artifact::file("f", bad, "f.txt", vec![1]),
+                    Err(ArtifactFileError::BadMediaType(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// A log line or a failed assertion does not carry the file.
+    #[test]
+    fn debug_does_not_print_the_bytes() {
+        let artifact =
+            Artifact::file("f", "text/plain", "f.txt", b"SECRETBYTES".to_vec()).expect("file");
+        let shown = format!("{artifact:?}");
+        assert!(
+            !shown.contains("SECRETBYTES") && shown.contains("<11 bytes>"),
+            "{shown}"
         );
     }
 

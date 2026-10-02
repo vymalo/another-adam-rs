@@ -285,11 +285,11 @@ impl Tool for Show {
         let id = format!("show-{}", safe_id(ctx.call_id()));
         let messages = surface(&id, catalog.catalog_id(), components);
         Ok(
-            ToolOutput::text("Shown to the person.").with_artifact(Artifact {
-                name: "ui".to_owned(),
-                mime_type: Some(A2UI_MEDIA_TYPE.to_owned()),
-                data: messages,
-            }),
+            ToolOutput::text("Shown to the person.").with_artifact(Artifact::new(
+                "ui",
+                Some(A2UI_MEDIA_TYPE.to_owned()),
+                messages,
+            )),
         )
     }
 }

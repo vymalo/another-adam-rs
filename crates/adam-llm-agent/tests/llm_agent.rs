@@ -546,11 +546,11 @@ async fn artifacts_progress_and_context_reach_observers() {
                         ctx.tool_name().to_owned(),
                     ));
                     ctx.emit_progress("halfway").await;
-                    Ok(ToolOutput::text("wrote it").with_artifact(Artifact {
-                        name: "report.md".into(),
-                        mime_type: Some("text/markdown".into()),
-                        data: json!("# hi"),
-                    }))
+                    Ok(ToolOutput::text("wrote it").with_artifact(Artifact::new(
+                        "report.md",
+                        Some("text/markdown".into()),
+                        json!("# hi"),
+                    )))
                 }
             })
         })
@@ -573,11 +573,11 @@ async fn artifacts_progress_and_context_reach_observers() {
     );
     assert_eq!(
         view.artifacts,
-        vec![adam_runtime::Artifact {
-            name: "report.md".into(),
-            mime_type: Some("text/markdown".into()),
-            data: json!("# hi"),
-        }]
+        vec![Artifact::new(
+            "report.md",
+            Some("text/markdown".into()),
+            json!("# hi")
+        )]
     );
     assert_eq!(
         output_of(&view),
@@ -605,11 +605,157 @@ async fn artifacts_progress_and_context_reach_observers() {
                 name: "report.md".into(),
                 mime_type: Some("text/markdown".into()),
                 data: json!("# hi"),
+                file: None,
             },
             tool_end("async_tool", "c1", "ok", Some("wrote it")),
             custom("agent_text", json!({"text": "here you go", "turn": 1})),
         ]
     );
+}
+
+/// A tool shares a file: it is an artifact of the run, byte for byte, and the model reads one line
+/// about it. The bytes are in the journal and in the run's artifacts, never in the model's history,
+/// in its requests, in the step the observer sees, or in the run's output.
+#[tokio::test]
+async fn a_shared_file_is_an_artifact_and_its_bytes_never_reach_the_model() {
+    use base64::Engine as _;
+
+    // Bytes that are neither text nor short, so that any copy of them would show.
+    let bytes: Vec<u8> = (0..3000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .tool({
+            let bytes = bytes.clone();
+            AsyncTool(move |_ctx: ToolCtx| {
+                let bytes = bytes.clone();
+                async move {
+                    Ok(
+                        ToolOutput::text("Shared chart.png (2.9 KiB, image/png).").with_artifact(
+                            Artifact::file("chart.png", "image/png", "chart.png", bytes).unwrap(),
+                        ),
+                    )
+                }
+            })
+        })
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "async_tool", json!({}))])
+        .push_text("here is the chart");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("draw"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    // The file is the run's artifact, whole.
+    assert_eq!(view.artifacts.len(), 1);
+    let file = view.artifacts[0].file.as_ref().expect("a file artifact");
+    assert_eq!((file.filename.as_str(), &file.bytes), ("chart.png", &bytes));
+    assert_eq!(view.artifacts[0].mime_type.as_deref(), Some("image/png"));
+
+    // The model read the line the tool wrote, in the history and in its next request.
+    let requests = h.mock.requests();
+    let second = serde_json::to_string(&requests[1]).unwrap();
+    assert!(
+        second.contains("Shared chart.png (2.9 KiB, image/png)."),
+        "{second}"
+    );
+    assert!(!second.contains(&b64[..64]), "the bytes are in the request");
+    let history = serde_json::to_string(&conversation(&view).messages).unwrap();
+    assert!(
+        !history.contains(&b64[..64]),
+        "the bytes are in the history"
+    );
+
+    // The reference the run keeps, and the answer's summary, carry the size and nothing else.
+    assert_eq!(
+        output_of(&view),
+        Some(json!({
+            "text": "here is the chart",
+            "artifacts": [{"name": "chart.png", "mime_type": "image/png", "bytes": 3000}]
+        }))
+    );
+    // The step the observer sees says the same line.
+    assert!(
+        h.events(run).contains(&tool_end(
+            "async_tool",
+            "c1",
+            "ok",
+            Some("Shared chart.png (2.9 KiB, image/png).")
+        )),
+        "{:?}",
+        h.events(run)
+    );
+}
+
+/// The files of one run are bounded in all: a file that would go over the run's budget is not
+/// shared, and the model is told so (an error result) and can go on.
+#[tokio::test]
+async fn a_run_may_share_only_so_many_bytes_of_files() {
+    use adam_runtime::MAX_RUN_FILE_BYTES;
+
+    let h = Harness::new();
+    let n = std::sync::atomic::AtomicUsize::new(0);
+    let n = Arc::new(n);
+    let agent = h
+        .agent()
+        .tool(AsyncTool(move |_ctx: ToolCtx| {
+            let nth = n.fetch_add(1, SeqCst);
+            async move {
+                // Four MiB each: the first fits the 6 MiB budget, the second does not.
+                let bytes = vec![nth as u8; 4 * 1024 * 1024];
+                Ok(
+                    ToolOutput::text(format!("Shared f{nth}.bin.")).with_artifact(
+                        Artifact::file(
+                            format!("f{nth}"),
+                            "application/octet-stream",
+                            format!("f{nth}.bin"),
+                            bytes,
+                        )
+                        .unwrap(),
+                    ),
+                )
+            }
+        }))
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "async_tool", json!({}))])
+        .push_tool_calls(vec![call("c2", "async_tool", json!({}))])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("two files"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    const { assert!(4 * 1024 * 1024 * 2 > MAX_RUN_FILE_BYTES) };
+    let names: Vec<_> = view.artifacts.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["f0"], "the second file was not kept");
+    let history = conversation(&view).messages;
+    let told = history
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tool {
+                content, is_error, ..
+            } => Some((content.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(told.len(), 2);
+    assert!(!told[0].1, "{told:?}");
+    assert!(
+        told[1].1 && told[1].0.contains("Not shared: f1"),
+        "{told:?}"
+    );
+    assert!(told[1].0.contains("6 MiB"), "{told:?}");
 }
 
 /// A tool named `async_tool` backed by an async closure.

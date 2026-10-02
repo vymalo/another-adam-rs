@@ -87,7 +87,8 @@ another `v`, or one that does not parse, is ignored (debug log).
   (1024 bytes) and a stream id of at most 128 bytes: even a piece of control characters, which JSON writes in six bytes
   each, is about 6.5 KiB, and a unit test builds the largest of each kind, so it always fits and crosses whole;
 * any other oversize event (`Progress`, `Custom`, `Artifact`) is not sent to
-  other processes (debug log). Artifacts still reach subscribers through the
+  other processes (debug log). A file artifact whose bytes alone are over a payload is dropped without being serialized
+  (a file is up to 4 MiB; only a tiny one fits); Artifacts still reach subscribers through the
   durable poll, which reads `RunView::artifacts`. **There is no events table**: a table would make events replayable but add a
   write, a schema, a sequence and a retention job to every event, for a
   best-effort stream whose durable half (status and artifacts) is already the

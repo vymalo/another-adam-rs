@@ -8,6 +8,7 @@
 //! | `create_repository { owner, name, private?, description? }` | [`create`] |
 //! | `run_command { command, cwd? }` | [`inspect`] |
 //! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `apply_patch { patch }` | [`files`] |
+//! | `share_file { path, repo?, name? }` | [`share`]: a file of the workspace, shown to the person as a file artifact |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
 //! | `run_checks { command }` | [`checks`] |
 //! | `rebuild_environment { use_default? }` | [`environment`] |
@@ -104,6 +105,7 @@ pub mod notes;
 pub mod prepare;
 pub mod publish;
 pub mod scratch;
+pub mod share;
 pub mod shell;
 
 pub use notes::{NotesStore, RunNotes};
@@ -406,7 +408,7 @@ pub(crate) fn resolve_slot(
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the fourteen of the coding workflow,
+/// Every coder tool, in the order they are offered to the model: the fifteen of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
@@ -431,6 +433,7 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         files::ReadFile,
         files::WriteFile,
         files::ApplyPatch,
+        share::ShareFile,
         delegate::DelegateToOpenCode,
         checks::RunChecks,
         environment::RebuildEnvironment,
@@ -484,6 +487,14 @@ impl Tool for Redacting {
                 out.content = r.scrub_string(out.content);
                 for artifact in &mut out.artifacts {
                     r.scrub_value(&mut artifact.data);
+                    // A text file may hold what the process knows to hide (a token a command
+                    // printed into it); a file that is not text has no string to match.
+                    if let Some(file) = &mut artifact.file
+                        && let Ok(text) = std::str::from_utf8(&file.bytes)
+                        && let std::borrow::Cow::Owned(scrubbed) = r.scrub(text)
+                    {
+                        file.bytes = scrubbed.into_bytes();
+                    }
                 }
                 Ok(out)
             }

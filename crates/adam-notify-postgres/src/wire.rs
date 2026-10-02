@@ -3,7 +3,8 @@
 //! PostgreSQL rejects a payload of 8000 bytes or more, and a rejected `NOTIFY`
 //! would fail the statement, so nothing bigger than [`MAX_PAYLOAD_BYTES`] is
 //! ever sent: a `Status` event loses the tail of its detail, a `Step` loses its
-//! input and output, and anything else that does not fit is dropped.
+//! input and output, and anything else that does not fit is dropped (a file artifact
+//! almost always: it reaches subscribers through the durable record).
 
 use adam_core::RunId;
 use adam_runtime::{RunEvent, Signal};
@@ -75,6 +76,16 @@ fn event_json(origin: Uuid, run: RunId, agent: &str, event: &RunEvent) -> Option
 }
 
 pub(crate) fn encode_event(origin: Uuid, run: RunId, agent: &str, event: &RunEvent) -> Encoded {
+    // A file that cannot fit a payload (its base64 is a third more than its bytes) is not
+    // serialized to find out: it reaches subscribers through the durable record, like any
+    // artifact that does not fit.
+    if let RunEvent::Artifact {
+        file: Some(file), ..
+    } = event
+        && file.bytes.len() > MAX_PAYLOAD_BYTES
+    {
+        return Encoded::Dropped;
+    }
     let Some(full) = event_json(origin, run, agent, event) else {
         return Encoded::Dropped;
     };
@@ -164,6 +175,18 @@ mod tests {
 
     use super::*;
 
+    /// A file small enough for a payload.
+    fn small_file() -> adam_runtime::ArtifactFile {
+        let artifact = adam_runtime::Artifact::file(
+            "logo",
+            "image/svg+xml",
+            "logo.svg",
+            b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec(),
+        )
+        .expect("a small file");
+        artifact.file.expect("a file")
+    }
+
     fn decode(json: &str) -> EventIn {
         serde_json::from_str(json).expect("decodes")
     }
@@ -188,6 +211,13 @@ mod tests {
                 name: "n".into(),
                 mime_type: None,
                 data: json!("x"),
+                file: None,
+            },
+            RunEvent::Artifact {
+                name: "logo".into(),
+                mime_type: Some("image/svg+xml".into()),
+                data: serde_json::Value::Null,
+                file: Some(small_file()),
             },
             RunEvent::Step(
                 StepEvent::new("tool:c1", StepKind::Tool, "run_checks", StepState::Running)
@@ -478,7 +508,13 @@ mod tests {
                 name: "n".into(),
                 mime_type: None,
                 data: json!(big.clone()),
+                file: None,
             },
+            // A file whose bytes alone are over a payload, dropped without being serialized.
+            RunEvent::from(
+                adam_runtime::Artifact::file("f", "image/png", "f.png", vec![7; 10_000])
+                    .expect("a file within the cap"),
+            ),
             RunEvent::Status {
                 status: RunStatus::Done,
                 detail: None,

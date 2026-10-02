@@ -19,9 +19,10 @@ use std::time::{Duration, Instant};
 
 use adam_core::{ClaimScope, DynStore, JournalEntry, MemoryStore, NewRun, RunId, RunStatus};
 use adam_runtime::{
-    Agent, AgentError, AgentStarter, BroadcastSink, ChildStatus, Classify, Clock, CollectingSink,
-    Ctx, Inbound, LocalNotifier, MAX_RETRY_AFTER, ManualClock, RUN_FINISHED_KIND, RetryPolicy,
-    RunEvent, RunView, Runtime, RuntimeBuilder, RuntimeError, Transition, child_run_id,
+    Agent, AgentError, AgentStarter, Artifact, BroadcastSink, ChildStatus, Classify, Clock,
+    CollectingSink, Ctx, Inbound, LocalNotifier, MAX_RETRY_AFTER, ManualClock, RUN_FINISHED_KIND,
+    RetryPolicy, RunEvent, RunView, Runtime, RuntimeBuilder, RuntimeError, Transition,
+    child_run_id,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -362,6 +363,9 @@ impl Hold {
 }
 
 const WAIT: chrono::Duration = chrono::Duration::seconds(60);
+
+/// A small file for the artifact tests.
+const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='4'/>";
 
 /// A parent: in its first step it starts a child of `child_agent` in a journaled step, as a tool
 /// does, then parks on a 60 s timer; on the next step it reads the child's finished message, or
@@ -2061,7 +2065,13 @@ mod cases {
                             name: "report".into(),
                             mime_type: Some("text/markdown".into()),
                             data: json!("# hi"),
+                            file: None,
                         })
+                        .await;
+                        ctx.emit(RunEvent::from(
+                            Artifact::file("chart", "image/svg+xml", "chart.svg", SVG.to_vec())
+                                .expect("a small file"),
+                        ))
                         .await;
                         return Ok(Transition::Continue(json!({"phase": 1})));
                     }
@@ -2102,7 +2112,12 @@ mod cases {
                     name: "report".into(),
                     mime_type: Some("text/markdown".into()),
                     data: json!("# hi"),
+                    file: None,
                 },
+                RunEvent::from(
+                    Artifact::file("chart", "image/svg+xml", "chart.svg", SVG.to_vec())
+                        .expect("a small file")
+                ),
                 RunEvent::Custom {
                     kind: "k".into(),
                     payload: json!(1)
@@ -2120,9 +2135,18 @@ mod cases {
         let view = fresh.view(run).await.expect("view").expect("run");
         assert_eq!(view.status, RunStatus::Done);
         assert_eq!(view.output, Some(json!("finished")));
-        assert_eq!(view.artifacts.len(), 1);
+        assert_eq!(view.artifacts.len(), 2);
         assert_eq!(view.artifacts[0].name, "report");
         assert_eq!(view.artifacts[0].data, json!("# hi"));
+        assert_eq!(view.artifacts[0].file, None);
+        // A file comes back from the store byte for byte, with its name and type.
+        let chart = &view.artifacts[1];
+        assert_eq!(chart.mime_type.as_deref(), Some("image/svg+xml"));
+        let file = chart.file.as_ref().expect("the file");
+        assert_eq!(
+            (file.filename.as_str(), file.bytes.as_slice()),
+            ("chart.svg", SVG)
+        );
     }
 
     /// Live fan-out through `BroadcastSink`.

@@ -146,6 +146,11 @@ pub struct ArtifactRef {
     pub name: String,
     /// Media type, if known.
     pub mime_type: Option<String>,
+    /// The size of the file, for a file artifact; absent for any other. The loop adds these up to
+    /// keep the files of one run within [`MAX_RUN_FILE_BYTES`](adam_runtime::MAX_RUN_FILE_BYTES).
+    /// Absent from state written before files existed, and not written for a JSON artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
 }
 
 /// The state of an [`LlmAgent`](crate::LlmAgent) run: the persisted history
@@ -788,6 +793,7 @@ mod tests {
         prior.artifacts = vec![ArtifactRef {
             name: "report".into(),
             mime_type: None,
+            bytes: None,
         }];
         let run = RunId::new();
 

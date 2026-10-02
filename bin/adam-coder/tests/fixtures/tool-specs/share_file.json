@@ -1,0 +1,24 @@
+{
+  "name": "share_file",
+  "description": "Share a file of your worktree with the person, so that they can see it or download it: an image, a chart, an export, a report, anything they asked for as a result. Make the file first (write_file, or a command that produces it), then share it with its `path` relative to the root of the worktree. The person gets it in the conversation: do not paste its contents into your reply, and say in a sentence what it is. The file may be at most 4 MiB, and a task may share at most 6 MiB in all. Nothing inside `.git`, and nothing that a symlink leads out of the worktree to, can be shared. Share a file again after you change it.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Path of the file, relative to the root of the worktree (no `..`, nothing inside `.git`)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot the file is in: its name, or the repository's address. Leave out when the workspace has one."
+      },
+      "name": {
+        "type": "string",
+        "description": "What the person sees it called. Leave out to use the file's own name."
+      }
+    },
+    "required": [
+      "path"
+    ]
+  }
+}

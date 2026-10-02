@@ -167,12 +167,10 @@ impl Tracker {
                 name,
                 mime_type,
                 data,
+                file,
             } => {
-                let artifact = adam_runtime::Artifact {
-                    name,
-                    mime_type,
-                    data,
-                };
+                let mut artifact = adam_runtime::Artifact::new(name, mime_type, data);
+                artifact.file = file;
                 if self.seen_artifacts.insert(artifact_id(&artifact)) {
                     vec![self.artifact_event(&artifact)]
                 } else {

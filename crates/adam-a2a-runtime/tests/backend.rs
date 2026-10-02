@@ -15,7 +15,8 @@ use adam_core::{DynStore, MemoryStore, RunId};
 use adam_llm_agent::{Conversation, LlmAgent, LlmStarter};
 use adam_model::{Message as ModelMessage, MockModel};
 use adam_runtime::{
-    Agent, AgentError, AgentStarter, BroadcastSink, Ctx, Inbound, RunEvent, Runtime, Transition,
+    Agent, AgentError, AgentStarter, Artifact as RunArtifact, BroadcastSink, Ctx, Inbound,
+    RunEvent, Runtime, Transition,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -23,12 +24,16 @@ use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
+/// The file `[file]` shares.
+const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2'/>";
+
 /// Behaviour is chosen by markers in the first message:
 ///
 /// * (none): progress, artifact `report`, then done with `finished`;
 /// * `[input]`: asks "which colour?", parks; the answer completes the run;
 /// * `[hold]`: parks on a far timer (so it is `working` until cancelled);
 /// * `[fail]`: fails with `boom`;
+/// * `[file]`: like (none), and also shares the file `logo.svg`;
 /// * `[reject]`: `init` refuses the start message, like an agent that cannot read it.
 ///
 /// A task started as the continuation of another lists the texts of the tasks before it in
@@ -148,6 +153,7 @@ impl Agent for Scripted {
                 name: "answer".into(),
                 mime_type: Some("text/plain".into()),
                 data: json!(answer),
+                file: None,
             })
             .await;
             return Ok(Transition::Done {
@@ -164,8 +170,15 @@ impl Agent for Scripted {
                 name: "report".into(),
                 mime_type: Some("text/markdown".into()),
                 data: json!("# done"),
+                file: None,
             })
             .await;
+            if text.contains("[file]") {
+                ctx.emit(RunEvent::from(
+                    RunArtifact::file("logo", "image/svg+xml", "logo.svg", SVG.to_vec()).unwrap(),
+                ))
+                .await;
+            }
             state["phase"] = json!(1);
             return Ok(Transition::Continue(state));
         }
@@ -436,6 +449,49 @@ async fn a_new_task_is_a_run_and_streams_snapshot_progress_artifact_completed() 
     let artifacts = done.artifacts.expect("artifacts on the task");
     assert_eq!(artifacts[0].name.as_deref(), Some("report"));
     assert_eq!(artifacts[0].parts[0].as_text(), Some("# done"));
+}
+
+/// A file the agent shares reaches an A2A client as a standard artifact: one `raw` part with its
+/// media type and filename, once in the stream (the live event and the durable copy are one) and
+/// in the task a client reads afterwards.
+#[tokio::test]
+async fn a_shared_file_is_a_raw_part_in_the_stream_and_in_the_task() {
+    use a2a::PartContent;
+
+    let rig = Rig::new();
+    let task = rig
+        .backend
+        .submit(alice(), user("[file] draw it"), None, None)
+        .await
+        .expect("submit");
+    let mut events = rig.backend.subscribe(&alice(), &task.id);
+    let _snapshot = next(&mut events).await;
+    let worker = rig.worker();
+    let events = rest(&mut events).await;
+    worker.stop().await;
+
+    let streamed: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            TaskEvent::Artifact(u) if u.artifact.name.as_deref() == Some("logo") => {
+                Some(u.artifact.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(streamed.len(), 1, "one event for the file: {events:?}");
+    let part = &streamed[0].parts[0];
+    assert_eq!(part.content, PartContent::Raw(SVG.to_vec()));
+    assert_eq!(part.media_type.as_deref(), Some("image/svg+xml"));
+    assert_eq!(part.filename.as_deref(), Some("logo.svg"));
+
+    let done = rig.backend.get(&alice(), &task.id).await.unwrap().unwrap();
+    let artifacts = done.artifacts.expect("artifacts on the task");
+    let kept = artifacts
+        .iter()
+        .find(|a| a.name.as_deref() == Some("logo"))
+        .expect("the file is on the task");
+    assert_eq!(kept, &streamed[0], "the same artifact, id included");
 }
 
 #[tokio::test]

@@ -32,6 +32,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 schemars = { workspace = true, features = ["derive"] }
 proptest.workspace = true
 adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.1.0" }

@@ -18,6 +18,7 @@ use adam_coder::tools::notes::{Consent, PushedBranch};
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
 use adam_coder::tools::scratch::{PublishScratch, StartScratch};
+use adam_coder::tools::share::ShareFile;
 use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
 use adam_runtime::{
     CancelToken, CollectingSink, RunEvent, StepEvent, StepIcon, StepKind, StepState,
@@ -4612,5 +4613,232 @@ async fn the_tool_waits_for_the_new_repository_to_be_reachable() {
     assert!(
         started.elapsed() >= Duration::from_millis(600),
         "it waited for it"
+    );
+}
+
+// ------------------------------------------------------------------ share_file
+
+const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><rect width='8' height='8'/></svg>";
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01";
+
+/// The one file artifact of a tool result: `(name, media type, filename, bytes)`.
+fn shared(out: &ToolOutput) -> (String, String, String, Vec<u8>) {
+    assert_eq!(out.artifacts.len(), 1, "{out:?}");
+    let artifact = &out.artifacts[0];
+    let file = artifact.file.as_ref().expect("a file artifact");
+    (
+        artifact.name.clone(),
+        artifact.mime_type.clone().expect("a media type"),
+        file.filename.clone(),
+        file.bytes.clone(),
+    )
+}
+
+#[tokio::test]
+async fn share_file_needs_a_workspace_like_the_others() {
+    let rig = Rig::new().await;
+    let out = ShareFile.call(&rig.ctx, json!({"path": "chart.svg"})).await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("prepare_workspace"));
+}
+
+/// The coder makes an SVG and shares it: the result is one line for the model and the whole file,
+/// with its type and name, as an artifact.
+#[tokio::test]
+async fn share_file_returns_the_file_as_an_artifact_and_tells_the_model_one_line() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "out/chart.svg", "content": String::from_utf8_lossy(SVG)}),
+        )
+        .await
+        .unwrap();
+
+    let out = ShareFile
+        .call(&rig.ctx, json!({"path": "out/chart.svg"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        out.content,
+        format!("Shared chart.svg ({} bytes, image/svg+xml).", SVG.len())
+    );
+    assert_eq!(
+        shared(&out),
+        (
+            "chart.svg".to_owned(),
+            "image/svg+xml".to_owned(),
+            "chart.svg".to_owned(),
+            SVG.to_vec()
+        )
+    );
+    assert!(
+        rig.progress()
+            .contains(&"sharing out/chart.svg (remote)".to_owned()),
+        "{:?}",
+        rig.progress()
+    );
+
+    // A name of the model's own, and a PNG.
+    std::fs::write(rig.worktree().join("shot.png"), PNG).unwrap();
+    let named = ShareFile
+        .call(&rig.ctx, json!({"path": "shot.png", "name": "Screenshot"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        shared(&named),
+        (
+            "Screenshot".to_owned(),
+            "image/png".to_owned(),
+            "shot.png".to_owned(),
+            PNG.to_vec()
+        )
+    );
+    // Sharing it again is the same artifact (its id follows its bytes).
+    let again = ShareFile
+        .call(&rig.ctx, json!({"path": "shot.png", "name": "Screenshot"}))
+        .await
+        .unwrap();
+    assert_eq!(again.artifacts, named.artifacts);
+}
+
+/// What a command made is shared like what the coder wrote: the workspace is one directory, whatever
+/// runs in it (the repository's devcontainer mounts the same one).
+#[tokio::test]
+async fn share_file_shares_what_a_command_produced() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let made = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": "printf '<svg xmlns=\"http://www.w3.org/2000/svg\"/>' > made.svg"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(checks_of(&made)["passed"], true);
+    let out = ShareFile
+        .call(&rig.ctx, json!({"path": "made.svg"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let (_, media_type, filename, bytes) = shared(&out);
+    assert_eq!(
+        (media_type.as_str(), filename.as_str()),
+        ("image/svg+xml", "made.svg")
+    );
+    assert_eq!(bytes, b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>");
+}
+
+#[tokio::test]
+async fn share_file_types_by_extension_and_bytes() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    for (name, bytes, expected) in [
+        ("good.png", PNG, "image/png"),
+        ("logo.svg", SVG, "image/svg+xml"),
+        ("notes.md", b"# notes\n".as_slice(), "text/markdown"),
+        ("table.csv", b"a,b\n".as_slice(), "text/csv"),
+        // The bytes are a PNG, the name says text; the name says PNG, the bytes are HTML.
+        ("lying.txt", PNG, "application/octet-stream"),
+        (
+            "lying.png",
+            b"<html></html>".as_slice(),
+            "application/octet-stream",
+        ),
+        ("blob.bin", b"\0\x01".as_slice(), "application/octet-stream"),
+    ] {
+        std::fs::write(wt.join(name), bytes).unwrap();
+        let out = ShareFile
+            .call(&rig.ctx, json!({"path": name}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{name}: {}", out.content);
+        assert_eq!(shared(&out).1, expected, "{name}");
+        assert!(out.content.contains(expected), "{name}: {}", out.content);
+    }
+}
+
+/// Whatever the model passes, a path that leaves the worktree, enters `.git`, is not a file, or is
+/// too big shares nothing and says why (as `read_file` refuses the same paths).
+#[tokio::test]
+async fn share_file_refuses_what_it_must() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "s3cr3t").unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret.txt"), wt.join("leak.txt")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), wt.join("outdir")).unwrap();
+    std::os::unix::fs::symlink(".git", wt.join("gitlink")).unwrap();
+    std::fs::create_dir_all(wt.join("empty_dir")).unwrap();
+    std::fs::write(wt.join("big.bin"), vec![0u8; 4 * 1024 * 1024 + 1]).unwrap();
+
+    for (path, needle) in [
+        ("../secret.txt", "`..`"),
+        ("sub/../../secret.txt", "`..`"),
+        ("/etc/hostname", "absolute"),
+        (".git/config", ".git"),
+        (".GIT/HEAD", ".git"),
+        ("leak.txt", "outside the worktree"),
+        ("outdir/secret.txt", "outside the worktree"),
+        ("gitlink", ".git"),
+        ("missing.png", "does not exist"),
+        ("empty_dir", "is a directory"),
+        ("big.bin", "over the limit"),
+        ("  ", "path is required"),
+    ] {
+        let out = ShareFile.call(&rig.ctx, json!({"path": path})).await;
+        assert!(is_error(&out), "{path}: {out:?}");
+        let (message, artifacts) = {
+            let o = out.unwrap();
+            (o.content, o.artifacts)
+        };
+        assert!(message.contains(needle), "{path}: {message}");
+        assert!(!message.contains("s3cr3t"), "{path}: {message}");
+        assert!(artifacts.is_empty(), "{path}: nothing is shared");
+    }
+}
+
+/// The coder's tools are wrapped by its redactor: a text file that holds a value the process hides
+/// is shared with the value taken out, and a file that is not text is left as it is.
+#[tokio::test]
+async fn a_shared_text_file_is_scrubbed_of_the_secrets_the_process_knows() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let wt = rig.worktree();
+    std::fs::write(
+        wt.join("env.txt"),
+        format!("TOKEN={}\nrest\n", common::GITHUB_TOKEN),
+    )
+    .unwrap();
+    let mut binary = PNG.to_vec();
+    binary.extend_from_slice(common::GITHUB_TOKEN.as_bytes());
+    binary.push(0xFF);
+    std::fs::write(wt.join("shot.png"), &binary).unwrap();
+
+    let tool = adam_coder::coder_tools(&rig.fx.env)
+        .into_iter()
+        .find(|t| t.spec().name == "share_file")
+        .expect("share_file is a coder tool");
+    let out = tool
+        .call(&rig.ctx, json!({"path": "env.txt"}))
+        .await
+        .unwrap();
+    let (_, _, _, bytes) = shared(&out);
+    let shown = String::from_utf8(bytes).unwrap();
+    assert!(!shown.contains(common::GITHUB_TOKEN), "{shown}");
+    assert!(shown.contains("rest"), "{shown}");
+
+    let out = tool
+        .call(&rig.ctx, json!({"path": "shot.png"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        shared(&out).3,
+        binary,
+        "bytes that are not text are not rewritten"
     );
 }

@@ -1893,6 +1893,12 @@ the last run's report if it ran on the tree that was pushed, else `passed: false
 pushed tree was not checked. An orchestrator gates on the last `checks` whose `commit` is the pushed SHA. The
 schema, caps, binding rule and redaction are in the [coder README](../bin/adam-coder/README.md#artifacts).
 
+A file the coder made is shared with `share_file`, and its artifact is different in kind: one A2A `raw` part (the bytes, base64
+in JSON) with `mediaType` and `filename`, which any A2A client reads as a file ([ADR 0012](decisions/0012-files-as-a2a-artifacts.md)).
+`adam_runtime::Artifact` has two forms, JSON and file; the file's bytes are journaled with the run (capped at 4 MiB a file and
+6 MiB a run) and never reach the model, which is told one line. How the tool, the journal and the A2A server hand a file over
+is the diagram in the ADR; the coder's side is in the [coder README](../bin/adam-coder/README.md#sharing-a-file).
+
 The same flow as states, from the point of view of the run notes and the
 tools' guards:
 

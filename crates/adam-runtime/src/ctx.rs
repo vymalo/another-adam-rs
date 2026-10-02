@@ -97,16 +97,15 @@ impl Emitter {
             name,
             mime_type,
             data,
+            file,
         } = &event
         {
+            let mut artifact = Artifact::new(name.clone(), mime_type.clone(), data.clone());
+            artifact.file.clone_from(file);
             self.artifacts
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(Artifact {
-                    name: name.clone(),
-                    mime_type: mime_type.clone(),
-                    data: data.clone(),
-                });
+                .push(artifact);
         }
         self.sink.emit(self.run, &self.agent, event).await;
     }
@@ -493,6 +492,7 @@ mod tests {
                     name: "report".into(),
                     mime_type: None,
                     data: serde_json::json!(1),
+                    file: None,
                 })
                 .await;
         });

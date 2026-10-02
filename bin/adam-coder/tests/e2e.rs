@@ -504,6 +504,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "read_file",
             "write_file",
             "apply_patch",
+            "share_file",
             "delegate_to_opencode",
             "run_checks",
             "rebuild_environment",
@@ -619,6 +620,109 @@ async fn the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request(stor
     };
     assert_eq!(bound["passed"], true, "{bound}");
     assert_eq!(bound["commit"], pushed.as_str(), "{bound}");
+    assert_eq!(fx.created_pulls().await.len(), 1);
+}
+
+/// The coder draws an SVG, shares it, and opens the pull request. The file reaches an A2A client
+/// as a standard artifact (one `raw` part with the media type and the filename), and the model is
+/// told one line about it, never the bytes.
+async fn the_coder_shares_the_svg_it_made_as_an_a2a_file_artifact(store: DynStore) {
+    use base64::Engine as _;
+
+    const SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\"><circle cx=\"8\" cy=\"8\" r=\"6\"/></svg>\n";
+    let fx = Fixture::with("never written\n", |s| {
+        s.opencode = OpenCodeLaunch::program("/nonexistent/opencode-must-not-run");
+    })
+    .await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "g1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
+        "g2",
+        "write_file",
+        json!({"path": "docs/dot.svg", "content": SVG}),
+    )])
+    .push_tool_calls(vec![call("g3", "run_checks", json!({"command": "test -s docs/dot.svg"}))])
+    .push_tool_calls(vec![call(
+        "g4",
+        "share_file",
+        json!({"path": "docs/dot.svg", "name": "The dot"}),
+    )])
+    .push_tool_calls(vec![call(
+        "g5",
+        "commit_and_push",
+        json!({"message": "docs: add the dot"}),
+    )])
+    .push_tool_calls(vec![call(
+        "g6",
+        "open_pull_request",
+        json!({"title": "docs: add the dot", "body": "Adds docs/dot.svg.\n\n## Verification\n- `test -s docs/dot.svg`: passed"}),
+    )])
+    .push_text("Here is the dot, and the pull request is open.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(
+        &server,
+        &format!(
+            "In {} (base branch main) draw a dot as docs/dot.svg and show it to me",
+            fx.remote_url()
+        ),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        seen.labels
+    );
+
+    // The artifact: a standard A2A file, whole.
+    let files: Vec<_> = seen
+        .artifacts
+        .iter()
+        .filter(|(name, _)| name == "The dot")
+        .collect();
+    assert_eq!(files.len(), 1, "the file once: {:?}", seen.labels);
+    let artifact = &files[0].1;
+    assert_eq!(artifact.parts.len(), 1);
+    let part = &artifact.parts[0];
+    assert_eq!(part.content, a2a::PartContent::Raw(SVG.as_bytes().to_vec()));
+    assert_eq!(part.media_type.as_deref(), Some("image/svg+xml"));
+    assert_eq!(part.filename.as_deref(), Some("dot.svg"));
+    // On the wire it is the `raw` member, base64.
+    let wire = serde_json::to_value(part).unwrap();
+    assert_eq!(
+        wire["raw"],
+        base64::engine::general_purpose::STANDARD.encode(SVG)
+    );
+
+    // The model read one line about it, and no request carries the bytes in either form.
+    let requests = mock.requests();
+    let told = requests
+        .iter()
+        .flat_map(|r| r.messages.iter())
+        .find_map(|m| match m {
+            adam_model::Message::Tool {
+                call_id, content, ..
+            } if call_id == "g4" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("a result for share_file");
+    assert_eq!(
+        told,
+        format!("Shared dot.svg ({} bytes, image/svg+xml).", SVG.len())
+    );
+    let everything = serde_json::to_string(&requests).unwrap();
+    assert!(
+        !everything.contains(&base64::engine::general_purpose::STANDARD.encode(SVG)[..40]),
+        "the bytes reached the model"
+    );
+    // The pull request is for the code the checks passed on, as ever.
     assert_eq!(fx.created_pulls().await.len(), 1);
 }
 
@@ -4155,6 +4259,7 @@ macro_rules! coder_suite {
             coder_suite!(@cases $make;
                 add_hello_txt_streams_working_progress_checks_artifact_completed,
                 the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request,
+                the_coder_shares_the_svg_it_made_as_an_a2a_file_artifact,
                 a_scratch_project_is_published_to_the_repository_the_person_names,
                 ask_user_parks_and_an_a2a_follow_up_resumes,
                 a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,
