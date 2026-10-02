@@ -347,7 +347,9 @@ async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
         .kill_on_drop(true);
     let mut client = running.spawn().unwrap();
     let alive = |text: &str| text.lines().any(|l| l.trim() == "yes");
-    let probe = "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null; echo; done | grep -q 'sleep 3137' && echo yes || echo no";
+    // A whole command line, `sleep 3137` (its NULs read as spaces): the probe's own shell has the text in
+    // its command line too, and a substring match would always find it.
+    let probe = "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null; echo; done | grep -qx 'sleep 3137 ' && echo yes || echo no";
     let mut seen = false;
     for _ in 0..30 {
         if alive(&inside.run(probe, None).await.1) {
@@ -374,7 +376,7 @@ async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
                 &format!(
                     "id; ls -la /tmp/adam-exec; cat /tmp/adam-exec/{id}.pid; \
                      for p in /proc/[0-9]*; do c=$(tr '\\0' ' ' < $p/cmdline 2>/dev/null); \
-                     case $c in *'sleep 3137'*) echo \"$p: $c\"; cut -d' ' -f1-8,22 $p/stat;; esac; done; \
+                     case $c in 'sleep 3137 ') echo \"$p: $c\"; cut -d' ' -f1-8,22 $p/stat;; esac; done; \
                      /opt/adam/bin/adam-exec kill {id}; echo \"adam-exec kill as this user: $?\""
                 ),
                 None,
