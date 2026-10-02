@@ -54,13 +54,18 @@ The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/REA
   them lists the tools it does want in `tools:`.
 * **The conversation's tools.** A message from the orchestration layer's chat announces one MCP endpoint for the
   conversation (`thread-tools/v1`); whatever it lists is offered to the model at every turn under its listed name
-  (the relayed tools of attached servers later; not `get_ui_catalog`, which the model has as `ui_catalog`), through a
+  (the relayed tools of attached servers; not `get_ui_catalog`, which the model has as `ui_catalog`), through a
   `ToolSource` that `assemble` gives every agent, and that also describes `show` with the components of the
   conversation's screen. `show` refuses a `Choices` form (a dead form: ask with `ask_user` and `choices`). The URL
   is an MCP server's: **`MCP_ALLOW_INSECURE=true`** lets it be plain `http` on another host (a compose stack); https
-  and loopback need nothing. No grant, or an expired one, offers nothing.
+  and loopback need nothing. No grant, or an expired one, offers nothing. A tool may say how long it can take
+  (`_meta["thread-tools/v1"].timeoutSecs`): the call waits that long, at most **`THREAD_TOOLS_MAX_CALL_SECS`** (default 3600;
+  60 s for a tool that says nothing), carries a `callId` that a retried step repeats, and a tool the orchestrator reports as
+  a step (`reportsStep`) gets no step of the agent's. When the person mentioned agents, the instructions gain a "Mentioned
+  agents" block (only then); see [`adam-ui`](../../crates/adam-ui/README.md) and
+  [ADR 0015](../../docs/decisions/0015-tools-the-orchestrator-reports-long-calls-and-mentioned-agents.md).
 
-The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `steps/v1` and
+The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steps/v1` and
 `text-stream/v1` (`card_of`), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
 whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with the
 tool's name or, for an MCP tool whose server gave it a `title`, the title; running, then completed, failed or waiting for the person; with the
@@ -166,6 +171,7 @@ same way; every problem is reported at once at startup):
 | `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required by `all` and `worker` (key may be empty) |
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the folder's MCP servers may be (see above) | `false` each |
+| `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 | `RUST_LOG` | log filter (JSON logs on stdout) | `info` |
 
 There is no `GITHUB_TOKEN`, no workspace and no placement: the agent has no worktree. Runs are not pinned to a

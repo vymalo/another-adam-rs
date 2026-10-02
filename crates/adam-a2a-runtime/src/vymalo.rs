@@ -845,7 +845,11 @@ mod tests {
     #[test]
     fn a_message_that_names_no_agent_takes_the_earlier_mentions_away() {
         // Mentions metadata with nothing usable in it, alone: a delete.
-        for entry in [json!({"mentions": []}), json!({"mentions": [{"label": "@x"}]}), json!("x")] {
+        for entry in [
+            json!({"mentions": []}),
+            json!({"mentions": [{"label": "@x"}]}),
+            json!("x"),
+        ] {
             assert_eq!(
                 context_of_mentions(json!({MENTIONS_EXTENSION: entry})),
                 Some(Value::Null)
@@ -856,7 +860,12 @@ mod tests {
         let m = with_metadata(text_message("hi"), json!({THREAD_TOOLS_EXTENSION: grant}));
         let payload = vymalo_inbound(&m).unwrap().payload;
         assert!(payload["context"][CONTEXT_MENTIONS].is_null());
-        assert!(payload["context"].as_object().unwrap().contains_key(CONTEXT_MENTIONS));
+        assert!(
+            payload["context"]
+                .as_object()
+                .unwrap()
+                .contains_key(CONTEXT_MENTIONS)
+        );
         // A message with no extension metadata at all changes nothing (no context).
         assert_eq!(context_of_mentions(json!({"something": 1})), None);
     }

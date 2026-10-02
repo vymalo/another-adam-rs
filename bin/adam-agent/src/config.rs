@@ -19,6 +19,7 @@
 //! | `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers) | `false` |
 //! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
 //! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
+//! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 //!
 //! Every problem is reported at once, so a misconfigured deployment is fixed in one round trip.
 //! What a role does not use is not validated (a control plane connects no model and no MCP

@@ -33,12 +33,12 @@ own.
 | Item | What |
 |---|---|
 | `McpServers` | `connect(&McpConfig, &Env, &McpPolicy)`, `tools()` (a `ToolSet`), `names()`, `shutdown()`; `Debug` shows server and tool names only |
-| `McpPolicy` | what the deployment decides: `allow_stdio` (default off), `allow_insecure` (off), `allow_url_secrets` (off: no `${VAR}` in a `url`; if on, filter the `rmcp` log target), `inherit_env` (off), `connect_timeout` (30 s), `call_timeout` (60 s) |
+| `McpPolicy` | what the deployment decides: `allow_stdio` (default off), `allow_insecure` (off), `allow_url_secrets` (off: no `${VAR}` in a `url`; if on, filter the `rmcp` log target), `inherit_env` (off), `connect_timeout` (30 s), `call_timeout` (60 s), `thread_tools_max_call` (3600 s: the cap a caller puts on a call to the thread-tools endpoint) |
 | `Env` | values for `${VAR}`, taken before the process environment; held as secrets, `Debug` shows names only |
 | `Error` | closed enum, every variant names the server and none carries a value from a variable: `Var`, `StdioNotAllowed`, `SseUnsupported`, `Url`, `UrlSecret` (names the variable), `Header`, `Name`, `Spawn`, `Connect`, `ListTools`, `UnknownTool` |
 | `VarProblem`, `UrlProblem` | closed enums inside `Error::Var` and `Error::Url` |
 | `MAX_RESULT_BYTES` | 64 KiB: the most of an answer that reaches the model |
-| `Endpoint::new(url, &SecretString, &McpPolicy)`, `list_tools()`, `call_tool(name, args)`, `EndpointError`, `RemoteTool`, `RemoteResult` | one MCP endpoint a **message** announced, with a bearer token known only at run time, one connection per request: see *An endpoint a message announces* |
+| `Endpoint::new(url, &SecretString, &McpPolicy)`, `list_tools()`, `call_tool(name, args)`, `call_tool_with(name, args, CallOptions)`, `CallOptions`, `EndpointError`, `RemoteTool` (with the tool's own `meta`), `RemoteResult` | one MCP endpoint a **message** announced, with a bearer token known only at run time, one connection per request: see *An endpoint a message announces* |
 
 `Connect`, `Spawn` and `ListTools` are `ErrorClass::Transient` (the server may be up later); every other variant is
 `Invalid` (the same files and policy never succeed).
@@ -86,6 +86,13 @@ as for any MCP call; a tool that ran and failed is a `RemoteResult` with `is_err
 tool) is `EndpointError::Rejected`. A 401 is told apart from other failures by the text the transport reports (the
 SDK gives no status code in a type); a wrong guess only changes the wording of an error. `adam-ui`'s thread-tools
 client is its user.
+
+**A call with its own time and `_meta`.** `call_tool_with(name, args, CallOptions::new().timeout(d).meta(key, value))`
+waits `d` for the answer instead of the policy's `call_timeout` (the caller decides and caps it: the endpoint adds no
+limit of its own; `EndpointError::Timeout` names the time of that call) and sends `value` under `key` in the request's
+`_meta`. The thread-tools client sends `_meta["thread-tools/v1"] = {callId, parentStepId?}` and waits as long as the
+listed tool's own `_meta["thread-tools/v1"].timeoutSecs` says (`RemoteTool::meta` is the tool's `_meta` as listed), capped
+by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A plain `call_tool` is a call with neither.
 
 ## What `mcp.json` means here
 

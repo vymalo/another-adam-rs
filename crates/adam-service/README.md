@@ -32,7 +32,7 @@ an agent does.
 | `ServiceConfig::parse(&lookup, &mut problems)` | `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`, and for a role that runs workers `WORKERS` and `WORKER_ID`. A role reads only what it uses; every problem is collected, none stops the parse |
 | `WorkerSettings` | `WORKERS` (at least 1) and `WORKER_ID` (`is_worker_id`); `options()` gives the `RuntimeOptions` |
 | `ModelConfig::parse`, `client()` | `MODEL_BASE_URL`, `MODEL_API_KEY` (may be empty, not unset), `MODEL`; the OpenAI-compatible client over them |
-| `McpSettings::parse`, `policy()` (feature `mcp`) | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS`; the `McpPolicy` for `AgentDef::connect_mcp` |
+| `McpSettings::parse`, `policy()` (feature `mcp`) | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` and `THREAD_TOOLS_MAX_CALL_SECS`; the `McpPolicy` for `AgentDef::connect_mcp` and the thread-tools client |
 | `parse_or`, `parse_flag`, `is_worker_id` | the helpers a binary parses its own variables with, into the same list of problems |
 | `ConfigError { problems }` | what a non-empty list becomes (`ConfigError::check(problems)`); `Classify` gives `Invalid` |
 | `RuntimeOptions`, `LiveSignals` | how the runtime is set up (worker id, claim scope, concurrency, lease, poll), and how a process learns of other processes (`LiveSignals::local()` or the Postgres `NOTIFY` ones `serve` builds) |
@@ -56,6 +56,7 @@ an agent does.
 | `WORKER_ID` | lease identity: 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process (roles that run workers) |
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL` | the model (`ModelConfig`) | required by the binaries that call `ModelConfig::parse`, for the roles that run workers |
 | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what an agent folder's MCP servers may be (`McpSettings`, feature `mcp`) | `false` each |
+| `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400; `McpSettings`, feature `mcp`); a tool that says nothing is waited for 60 s | `3600` |
 
 A binary that uses these keeps its own variables beside them (the coder's `GITHUB_TOKEN`,
 `WORKSPACE_*`, ...). What a role does not use is not validated, so a chart may set a variable for every

@@ -193,7 +193,10 @@ async fn the_mentions_of_a_message_are_the_runs_context_and_the_next_task_does_n
                        "expiresAt": "2999-01-01T00:00:00Z"});
 
     let first = with_metadata(
-        Message::new(Role::User, vec![Part::text("first @researcher then @coder")]),
+        Message::new(
+            Role::User,
+            vec![Part::text("first @researcher then @coder")],
+        ),
         json!({
             THREAD_TOOLS_EXTENSION: grant,
             MENTIONS_EXTENSION: {
@@ -211,7 +214,10 @@ async fn the_mentions_of_a_message_are_the_runs_context_and_the_next_task_does_n
         .await
         .unwrap();
     let context = rig.state(&one).await.context;
-    assert_eq!(context[CONTEXT_MENTIONS]["coordinate"], json!({"tool": "ask_agent"}));
+    assert_eq!(
+        context[CONTEXT_MENTIONS]["coordinate"],
+        json!({"tool": "ask_agent"})
+    );
     let mentioned: Vec<(&str, i64)> = context[CONTEXT_MENTIONS]["mentions"]
         .as_array()
         .unwrap()
@@ -237,7 +243,10 @@ async fn the_mentions_of_a_message_are_the_runs_context_and_the_next_task_does_n
         context.get(CONTEXT_MENTIONS).is_none(),
         "the earlier message's mentions are not this one's: {context:?}"
     );
-    assert_eq!(context[CONTEXT_THREAD_TOOLS]["token"], "a.b.c", "the rest is carried");
+    assert_eq!(
+        context[CONTEXT_THREAD_TOOLS]["token"], "a.b.c",
+        "the rest is carried"
+    );
     wait_task(&rig, &two.id, TaskState::Completed).await;
     stop.send(()).unwrap();
     handle.await.unwrap();

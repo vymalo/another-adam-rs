@@ -226,7 +226,12 @@ impl ServerHandler for Endpoint {
         });
         let delay = lock(&self.shared.delays).get(&name).copied();
         if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
+            // A caller that gives up (drops the connection, or says `notifications/cancelled`) ends
+            // the wait: the call is no longer in flight.
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = context.ct.cancelled() => {}
+            }
         }
         if name == GET_UI_CATALOG {
             return Ok(CallToolResponse::Complete(self.catalog_answer(&arguments)));

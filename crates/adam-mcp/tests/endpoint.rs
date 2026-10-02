@@ -249,7 +249,14 @@ async fn a_listed_tool_carries_its_own_meta() {
         json!({"reportsStep": true, "timeoutSecs": 125})
     );
     // A tool that lists none has an empty `_meta`.
-    assert!(tools.iter().find(|t| t.name == GET_UI_CATALOG).unwrap().meta.is_empty());
+    assert!(
+        tools
+            .iter()
+            .find(|t| t.name == GET_UI_CATALOG)
+            .unwrap()
+            .meta
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -258,7 +265,10 @@ async fn a_call_is_sent_with_the_meta_it_was_given_and_a_plain_call_with_none() 
     server.add_tool("echo", "Echo.", json!({"type": "object"}), "echo");
     let endpoint = endpoint(&server, "good-token");
 
-    endpoint.call_tool("echo", args(json!({"a": 1}))).await.unwrap();
+    endpoint
+        .call_tool("echo", args(json!({"a": 1})))
+        .await
+        .unwrap();
     let options = CallOptions::new().meta(
         "thread-tools/v1",
         json!({"callId": "run-1:call_7", "parentStepId": "tool:outer"}),
@@ -291,7 +301,11 @@ async fn a_call_waits_as_long_as_its_options_say_and_not_as_long_as_the_policy()
     let started = std::time::Instant::now();
     let error = endpoint.call_tool("slow", Map::new()).await.unwrap_err();
     assert!(matches!(error, EndpointError::Timeout(150)), "{error:?}");
-    assert!(started.elapsed() < Duration::from_millis(550), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(550),
+        "{:?}",
+        started.elapsed()
+    );
 
     // This call says it may take longer, and is waited for.
     let result = endpoint
