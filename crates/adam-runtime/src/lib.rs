@@ -109,7 +109,8 @@ pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};
 pub use step::{
-    MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, StepEvent, StepIcon, StepKind,
+    MAX_STEP_DETAIL_CHARS, MAX_STEP_ID_BYTES, MAX_STEP_LABEL_CHARS, STEP_INPUT_MAX_BYTES,
+    STEP_INPUT_STRING_MAX_CHARS, STEP_OUTPUT_MAX_BYTES, StepEvent, StepIcon, StepKind, StepOutput,
     StepState,
 };
 pub use text::{AGENT_TEXT_KIND, MAX_STREAM_ID_BYTES, MAX_TEXT_DELTA_BYTES, floor_boundary};

@@ -13,6 +13,7 @@ use crate::agent::{WorkerParts, agents, card_of};
 use crate::config::Config;
 use crate::error::AgentError;
 use crate::folder;
+use crate::redact;
 
 /// Run the agent until `shutdown` resolves (SIGTERM in the binary).
 ///
@@ -49,6 +50,9 @@ pub async fn serve(
             alias: &worker.model.alias,
             mcp: worker.mcp.policy(),
             options: settings.options(),
+            // What a call was given and what it answered go into its step: the secrets of this
+            // process (the configuration's and the environment's) are scrubbed from both.
+            step_io: redact::step_io(&config, redact::process_vars()),
         }),
         _ => None,
     };

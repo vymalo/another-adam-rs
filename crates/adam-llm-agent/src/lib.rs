@@ -143,12 +143,13 @@ mod history;
 mod schema;
 mod source;
 mod state;
+mod step_io;
 mod text_stream;
 mod tool;
 mod toolset;
 mod typed;
 
-pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepState};
+pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{BuildError, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter};
 pub use conversation::{
     ArtifactRef, Conversation, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MESSAGE_KIND,
@@ -162,6 +163,7 @@ pub use history::TRUNCATION_MARKER_PREFIX;
 pub use schema::{ToolSpecExt, spec_for};
 pub use source::{DynToolSource, MAX_SOURCE_TOOLS, SourceCtx, ToolSource};
 pub use state::{Extensions, State, StateKey};
+pub use step_io::StepIo;
 pub use tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 pub use toolset::ToolSet;
 pub use typed::{IntoToolOutput, IntoToolResult, Json, parse_args};

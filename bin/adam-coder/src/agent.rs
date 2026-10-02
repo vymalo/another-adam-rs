@@ -238,6 +238,9 @@ impl CoderAgent {
             // The tools of the conversation's endpoint, offered at every model turn.
             .tool_source(env.ui.source())
             .state(env.clone())
+            // What a call was given and what it answered go into its step: the process's secrets
+            // are scrubbed from both first (ADR 0011).
+            .step_io(env.redactor.step_io())
             .model(model, model_alias)?;
         Ok(Self { assembly, env })
     }

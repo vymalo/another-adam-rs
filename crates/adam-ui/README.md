@@ -25,11 +25,11 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 |---|---|
 | `Ui::new(McpPolicy)`, `Ui::with_client(..)` | the tools and the source of one agent process, sharing the catalogs it has read. `McpPolicy` is the deployment's (`MCP_ALLOW_INSECURE` decides whether the thread-tools URL may be plain `http` to another machine; the call timeout) |
 | `Ui::tools() -> ToolSet`, `Ui::with_ask_lead(text)`, `DEFAULT_ASK_LEAD` | `ask_user`, `show`, `ui_catalog`, in that order. `with_ask_lead` opens the description of `ask_user` with the agent's own words about when to ask (the coder names pull requests); what follows, about `choices`, is the same |
-| `Ui::source() -> ThreadTools` | a `ToolSource` that offers **every tool the thread-tools endpoint lists, under its listed name**, listed again at every model turn (`get_ui_catalog` today; the relayed tools of attached servers and `ask_agent` appear with no change here). Add it last among an agent's sources |
+| `Ui::source() -> ThreadTools` | a `ToolSource` that offers **every tool the thread-tools endpoint lists, under its listed name**, listed again at every model turn, **except `get_ui_catalog`** (the model has `ui_catalog`; the relayed tools of attached servers and `ask_agent` appear with no change here), and that **describes `show` with the components of the conversation's screen** (`ToolSource::refine`, from the catalogs this process holds). Add it last among an agent's sources, and register `Ui::tools()` on the same agent |
 | `AskUser`, `ASK_USER` | `ask_user { question, choices? }`: see *The tools* |
-| `Show`, `SHOW`, `MAX_BLOCKS` | `show { blocks, title? }`, at most 16 blocks |
+| `Show`, `SHOW`, `MAX_BLOCKS` | `show { blocks, title? }`, at most 16 blocks; refuses a `Choices` block |
 | `UiCatalogTool`, `UI_CATALOG` | `ui_catalog {}` |
-| `ThreadTools`, `ThreadToolsClient`, `GET_UI_CATALOG` | the source, and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
+| `ThreadTools`, `ThreadToolsClient`, `GET_UI_CATALOG` | the source (`ThreadTools::new` lists everything the endpoint lists; `hiding(name)` leaves one out), and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
 | `Catalog`, `Claimed`, `Component`, `CatalogError`, `canonical_json`, `catalog_digest` | a catalog read and checked against the digest it claims; `validate(instance)` against a component's schema; the canonical form and the digest of [the contract](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md#2-digest-version-and-the-lock) |
 | `CatalogCache`, `MAX_CACHED_CATALOGS` | the catalogs this process holds, by digest (8, the oldest dropped) |
 | `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v0.9.1 (`acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1` |
@@ -68,12 +68,22 @@ inbound function reads a screen's action as JSON text.
   (a refusal names the block, the component and the place, and a long offending value is elided in the middle so the reason is never cut off; an unknown component lists the ones there are). A good
   call is a run **artifact** `ui` of media type `application/a2ui+json` (the A2UI messages, surface `show-<call id>`,
   stable across a replay), which the A2A server sends as a data part; the model reads `Shown to the person.`.
+  **`show` is for what is looked at, never for a question**: a `Choices` block is refused ("a dead form": the screen
+  enables a form only while the conversation is blocked on one, which only `ask_user` does), and the refusal says to ask
+  with `ask_user` and `choices`. The description lists the screen's components, one line each (its first sentence, at most
+  2 KiB, then "and n more"), once the process holds the conversation's catalog (see below); until then it says to call
+  `ui_catalog` first.
 * **`ui_catalog {}`** gives the components: for each its name, what it is for and the schema of its properties, as
   compact JSON. The model calls it before `show`.
 * **The thread tools** are not tools of this crate: `ThreadTools` lists the endpoint (`tools/list` over one
   connection, with the grant's bearer token) each time the model is about to be called, and answers a call to a
   tool that is none of the agent's own by calling the endpoint (`tools/call`). A listed tool whose name no model
-  provider accepts is left out (with a warning); one that clashes with an own tool loses to it.
+  provider accepts is left out (with a warning); one that clashes with an own tool loses to it. The source of a
+  `Ui` leaves **`get_ui_catalog`** out and refuses a call to it: the model has `ui_catalog` for the same thing, and
+  two tools for one thing made it call whichever it remembered (the catalog is still read again through the endpoint,
+  by this crate, when a message does not carry it). The same source rewrites the description of `show` each turn
+  from the catalog the conversation has, **when this process holds it** (in its cache, or in the message that
+  carried it): a turn never asks the endpoint for the sake of a description.
 
 None of them fails a run. With no catalog, or one that cannot be read, `show` and `ui_catalog` return an error result
 that says to answer in text; with no grant, or an expired or refused one, the source offers nothing and a call says
@@ -143,11 +153,16 @@ stateDiagram-v2
   three questions as one Choices (the surface is a golden file, `tests/golden/ask_choices.json`); text for a screen
   that cannot draw it; a stale digest read again once and then cached; a refetch that returns a newer catalog; an
   expired, refused, missing or malformed grant and a dead endpoint; a catalog that does not hash to its claim; `show`
-  (a golden, `tests/golden/show_blocks.json`; a replay emits the same surface; every refusal) and `ui_catalog`.
+  (a golden, `tests/golden/show_blocks.json`; a replay emits the same surface; every refusal) and `ui_catalog`; the
+  description of `show` is made from the catalog once it is held and no turn fetches it.
+  `src/thread_tools.rs` also pins that the source of a `Ui` hides `get_ui_catalog` and refuses a call to it.
 * `tests/cards.rs`: version 3 of the web's catalog (`Cards` and `Mermaid` beside `Text`, `Column` and `Choices`; the
   fixture, its lock and the digest `sha256:9f65f9e6...` pinned, and the three components of version 2 unchanged in it):
   what a researcher draws (a Text, three source cards and a graph) is one surface, a golden file
   (`tests/golden/show_cards_mermaid.json`), every component of it valid for the catalog and stable across a replay;
+  the description of `show` lists the five components of version 3 (with a `Choices` line that says it is not for `show`),
+  stays as it was without a catalog, and is bounded for a catalog of sixty-four components; a `Choices` block is
+  refused, alone or among others, and nothing is drawn;
   one card list or one graph alone is the root; every limit of `Cards` and `Mermaid` holds at its edge and is refused
   beyond it, with the block and the place; a card with no title, a link that is not `http(s)` (`javascript:`, `data:`,
   a protocol-relative one), a property the schema does not have and a layout it does not list are refused;

@@ -94,7 +94,16 @@ tree under it:
 | a tool call that never said it ended | ended `canceled` with the turn; `failed` when the turn failed, `canceled` when the run was cancelled |
 
 Every label and detail comes from OpenCode, so it is **scrubbed of the secrets the process holds and cut** before it is
-reported, like every other line. A client that did not activate steps reads the same work as lines of text: the title of
+reported, like every other line.
+
+**A tool call's step also carries what the tool was given and what it answered** ([ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)):
+the arguments of `write_file`, `run_checks`, `prepare_workspace` and the rest as `input` on the report that starts the step
+(strings cut at 512 characters, 4 KiB in all), and the tool's result, or the error it ended with, as `output` on the report
+that ends it (8 KiB, head and tail). The coder's `Redactor` goes over every string of both **before** the cut
+(`Redactor::step_io()`, given to the assembly in `CoderAgent::try_from_def`), so a token the model was told or found, and an
+installation token as soon as it is minted, never reaches the steps; `tests/e2e.rs`
+(`a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_holds`) pins it. The orchestration layer redacts patterns
+on top and has a switch to drop both. A client that did not activate steps reads the same work as lines of text: the title of
 a tool call when it starts, `<title>: done` or `<title>: failed: <output>` when it ends, the lines of OpenCode's reply
 and its plan as they are, and `OpenCode: done` when the call ends (`tests/e2e.rs`, `tests/tools.rs`).
 
@@ -130,7 +139,7 @@ sequenceDiagram
   S->>C: message: text, ui-catalog/v1 {version, digest}, the catalog inline or only referenced, thread-tools/v1 {url, token}
   C->>E: tools/list (at every model turn, with the grant)
   E-->>C: get_ui_catalog and the tools attached since
-  C->>M: the coder's tools, ask_user, show, ui_catalog, then the listed ones
+  C->>M: the coder's tools, ask_user, show, ui_catalog, then the listed ones except get_ui_catalog
   M->>C: ask_user {question, choices: [db, auth, deploy]}
   C->>C: the catalog: inline, held by digest, or get_ui_catalog once (digest checked)
   C-->>S: input-required: the question and an application/a2ui+json surface (one Choices)
@@ -984,6 +993,12 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
   `Your name is {{display_name}}.`, and the `card.name` the A2A card advertises. "What is your name?" is answered
   with it, never with "I don't have a name". A deployment that mounts its own folder
   ([`ADAM_AGENT_DIR`](#a-folder-at-run-time-adam_agent_dir)) changes the name by changing the var (and `card.name`).
+* **What the person sees** (the section of the same name in the prompt): the words written before a tool call are
+  working notes, shown in the activity panel beside the steps and not as part of the conversation, one line each; the reply
+  that ends the turn is the only text of the coder's in the conversation, so it is complete on its own (never "as I said
+  above") and puts the result first; and replies render as Markdown (headings, bold, lists, tables, links, code
+  blocks), so the coder uses them when they help and not for a one-line answer. `show` and `ui_catalog` are as
+  [`adam-ui`](../../crates/adam-ui/README.md) makes them (`show` refuses a `Choices` form: ask with `ask_user`).
 * **A greeting gets a greeting**: "hi" is answered with a short greeting that says the name and what the agent does
   in one sentence (the second persona line, `In one sentence: <summary>.`) and asks one question, which repository
   and what to change. It is not a task with something missing, so no tool is called and nothing is asked for "the
@@ -1503,7 +1518,8 @@ and cut to `MAX_FAILURE_TEXT` (2048 bytes, ` [truncated]` appended) *after*
 scrubbing, so a secret on the cut cannot leave its front half. The retry hint
 survives; the `source` does not. It is exact-value replacement, not a detector: a secret that
 was transformed (hashed, split) is not found, and values shorter than 4
-characters are not registered.
+characters are not registered. The same redactor scrubs the input and the output of every tool-call step
+(`Redactor::step_io()`).
 
 SIGTERM stops accepting connections and lets in-flight steps finish and commit
 (see [Roles](#roles) for what stops in which order); a step cut short by a hard kill

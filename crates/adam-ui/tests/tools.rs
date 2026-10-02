@@ -332,6 +332,66 @@ async fn a_stale_digest_is_read_again_once_and_then_kept() {
     assert!(server.authorizations().iter().all(|a| a == "Bearer tok"));
 }
 
+/// A model turn asks nobody for the catalog: `show` is described with the screen's components once
+/// this process holds the catalog, which a tool reading it (here `ui_catalog`) brings about. Before,
+/// the description says to call `ui_catalog`, and no request is made for the sake of the description.
+#[tokio::test]
+async fn show_is_described_from_the_turn_after_the_catalog_was_read_and_no_turn_fetches_it() {
+    use adam_llm_agent::{SourceCtx, ToolSource as _};
+
+    let c = claimed();
+    let server = endpoint_with_catalog(&document(), &c).await;
+    let ui = ui();
+    let context = ref_context(&c, Some((&server.url("t1"), "tok", future())));
+    let described = |specs: &[adam_model::ToolSpec]| {
+        specs
+            .iter()
+            .find(|s| s.name == "show")
+            .unwrap()
+            .description
+            .clone()
+    };
+    let refine = |ui: &Ui| {
+        let mut specs: Vec<_> = ui.tools().into_iter().map(|t| t.spec()).collect();
+        let source = ui.source();
+        let context = context.clone();
+        async move {
+            source
+                .refine(&SourceCtx::detached(context), &mut specs)
+                .await;
+            specs
+        }
+    };
+
+    // First turn: the process holds nothing, and nobody is asked.
+    let first = described(&refine(&ui).await);
+    assert!(!first.contains("The components of this screen"), "{first}");
+    assert!(server.catalog_requests().is_empty());
+
+    // The model reads the catalog (one request); the next turn's description lists its components.
+    let listed = text_of(
+        tool(&ui, "ui_catalog")
+            .call(&ctx("ui_catalog", "c1", context.clone()), json!({}))
+            .await,
+    );
+    assert!(!listed.is_error, "{}", listed.content);
+    assert_eq!(server.catalog_requests().len(), 1);
+    let second = described(&refine(&ui).await);
+    assert!(
+        second.contains("The components of this screen:\n- "),
+        "{second}"
+    );
+    assert!(
+        second.contains("\n- Choices: a form of questions"),
+        "{second}"
+    );
+    assert_eq!(
+        server.catalog_requests().len(),
+        1,
+        "no request for a description"
+    );
+}
+
 #[tokio::test]
 async fn an_inline_catalog_that_is_not_the_current_one_triggers_the_refetch() {
     let c = claimed();

@@ -77,6 +77,7 @@ impl TestServer {
         };
         let none = || schema(json!({"type": "object", "properties": {}}));
         vec![
+            // The only tool with a `title`: what its step is called.
             Tool::new(
                 "echo",
                 "Answers with the text it is given.",
@@ -85,7 +86,8 @@ impl TestServer {
                     "properties": {"text": {"type": "string"}},
                     "required": ["text"]
                 })),
-            ),
+            )
+            .with_title("Echo it back"),
             Tool::new("fail", "Always answers with an error result.", none()),
             Tool::new(
                 "big",

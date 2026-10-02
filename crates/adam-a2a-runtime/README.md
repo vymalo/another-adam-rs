@@ -166,6 +166,18 @@ itself in the message's `metadata` under the extension's URI (`STEPS_EXTENSION` 
   "state": "failed", "icon": "execute", "detail": "1 failed"}}
 ```
 
+A tool call's report also carries what the tool was given (`input`, on the report that starts the step) and what it
+answered (`output`, `{text, truncated?, bytes?, error?}`, on the one that ends it), cut and redacted by the agent
+([ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)):
+
+```json
+{"https://agents.vymalo.com/a2a/extensions/steps/v1": {
+  "id": "tool:call_1", "kind": "tool", "label": "Search the web", "state": "completed",
+  "output": {"text": "1. Example Domain ..."}}}
+```
+
+The members are in the metadata only: the plain line does not carry them.
+
 The text is the plain line the contract asks for. Without the activation it is all a client gets, one line per report:
 the label for a start or a move; the detail alone for a progress line of a step at the top (what a tool's
 `emit_progress` always was); `label: detail` for one under another step; and `label: done`, `label: failed` or

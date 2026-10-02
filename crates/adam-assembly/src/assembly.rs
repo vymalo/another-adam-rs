@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent};
-use adam_llm_agent::{DynToolSource, Limits, LlmAgent, LlmAgentBuilder, ToolSource};
+use adam_llm_agent::{DynToolSource, Limits, LlmAgent, LlmAgentBuilder, StepIo, ToolSource};
 use adam_model::DynModel;
 use adam_runtime::RuntimeBuilder;
 
@@ -30,6 +30,7 @@ pub struct BoundDef {
     sources: Vec<DynToolSource>,
     aliases: Option<Vec<String>>,
     wait_poll: Option<Duration>,
+    step_io: Option<StepIo>,
 }
 
 impl std::fmt::Debug for BoundDef {
@@ -60,6 +61,7 @@ impl BoundDef {
             sources: Vec::new(),
             aliases: None,
             wait_poll: None,
+            step_io: None,
         }
     }
 
@@ -105,6 +107,16 @@ impl BoundDef {
     #[must_use]
     pub fn wait_poll(mut self, every: Duration) -> Self {
         self.wait_poll = Some(every);
+        self
+    }
+
+    /// How the step of a tool call reports its input and output, for every agent:
+    /// [`LlmAgentBuilder::step_io`]. A deployment that holds secrets gives the redactor that knows
+    /// them here ([`StepIo::redact`]); without it, both are sent as the model and the tool had them,
+    /// cut to the contract's bounds.
+    #[must_use]
+    pub fn step_io(mut self, step_io: StepIo) -> Self {
+        self.step_io = Some(step_io);
         self
     }
 
@@ -217,6 +229,9 @@ impl BoundDef {
             .limits(node.limits);
         if let Some(every) = self.wait_poll {
             builder = builder.wait_poll(every);
+        }
+        if let Some(step_io) = &self.step_io {
+            builder = builder.step_io(step_io.clone());
         }
         for (_, tool) in &node.tools {
             builder = builder.dyn_tool(Arc::clone(tool));

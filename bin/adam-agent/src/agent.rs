@@ -4,7 +4,7 @@
 use adam::mcp::McpPolicy;
 use adam::{AgentDef, Assembly};
 use adam_a2a::AgentCardConfig;
-use adam_llm_agent::LlmStarter;
+use adam_llm_agent::{LlmStarter, StepIo};
 use adam_model::DynModel;
 use adam_service::{Agents, RuntimeOptions};
 use adam_ui::Ui;
@@ -45,6 +45,10 @@ pub struct WorkerParts<'a> {
     pub mcp: McpPolicy,
     /// How the runtime that steps the runs is set up.
     pub options: RuntimeOptions,
+    /// How the step of a tool call reports its input and output: the secrets of this process
+    /// scrubbed from both ([`redact::step_io`](crate::redact::step_io)), then the contract's cuts.
+    /// [`StepIo::default`] sends both unscrubbed.
+    pub step_io: StepIo,
 }
 
 /// Assemble the agent of `def` for a role that runs workers: connect the MCP servers of its
@@ -63,6 +67,22 @@ pub async fn assemble(
     alias: &str,
     mcp: &McpPolicy,
 ) -> Result<Assembly, AgentError> {
+    assemble_with(def, model, alias, mcp, StepIo::default()).await
+}
+
+/// [`assemble`], with `step_io` saying how the step of each tool call reports its input and output
+/// (the secrets to scrub from them: [`redact::step_io`](crate::redact::step_io)).
+///
+/// # Errors
+///
+/// As [`assemble`].
+pub async fn assemble_with(
+    def: AgentDef,
+    model: DynModel,
+    alias: &str,
+    mcp: &McpPolicy,
+    step_io: StepIo,
+) -> Result<Assembly, AgentError> {
     // The servers are connected now, at startup, before the agent is bound: a server that is down,
     // a local process the policy does not allow, a `${VAR}` that is unset are startup errors with
     // their own exit code, never something found in the middle of a run.
@@ -77,7 +97,8 @@ pub async fn assemble(
     let bound = def
         .bind(ui.tools())
         .map_err(|e| AgentError::Assembly(Box::new(e)))?
-        .tool_source(ui.source());
+        .tool_source(ui.source())
+        .step_io(step_io);
     bound
         .model(model, alias)
         .map_err(|e| AgentError::Assembly(Box::new(e)))
@@ -103,7 +124,8 @@ pub async fn agents(
     let name = def.name().to_owned();
     let agents = match workers {
         Some(parts) => {
-            let assembly = assemble(def, parts.model, parts.alias, &parts.mcp).await?;
+            let assembly =
+                assemble_with(def, parts.model, parts.alias, &parts.mcp, parts.step_io).await?;
             Agents::new(name, move |builder| assembly.register(builder)).options(parts.options)
         }
         None => {

@@ -95,6 +95,161 @@ fn researcher_blocks() -> Value {
     ])
 }
 
+// ---- the model is told what the screen can draw, and that a form is not drawn with `show` ----
+
+/// The specs of the three UI tools, as the agent offers them, then refined by the UI's source for
+/// the conversation whose context is `context`.
+async fn offered_with(context: Map<String, Value>) -> Vec<adam_model::ToolSpec> {
+    use adam_llm_agent::{SourceCtx, ToolSource as _};
+    let ui = Ui::new(McpPolicy::default());
+    let mut specs: Vec<_> = ui.tools().into_iter().map(|t| t.spec()).collect();
+    ui.source()
+        .refine(&SourceCtx::detached(context), &mut specs)
+        .await;
+    specs
+}
+
+fn description<'a>(specs: &'a [adam_model::ToolSpec], name: &str) -> &'a str {
+    &specs.iter().find(|s| s.name == name).unwrap().description
+}
+
+#[tokio::test]
+async fn show_is_described_with_the_components_of_the_screen_it_draws_on() {
+    let specs = offered_with(inline_context()).await;
+    let show = description(&specs, "show");
+    // Version 3 of the catalog: every component by name, and what it is for.
+    for name in ["Cards", "Choices", "Column", "Mermaid", "Text"] {
+        assert!(show.contains(&format!("\n- {name}")), "{name}: {show}");
+    }
+    assert!(show.contains("\n- Cards: "), "{show}");
+    // A form is not for `show`, whatever the catalog says of it.
+    assert!(
+        show.contains("\n- Choices: a form of questions: not for `show`, ask with `ask_user`"),
+        "{show}"
+    );
+    assert!(show.contains("`ui_catalog`"), "{show}");
+    assert!(
+        show.contains("Never use it to ask the person something"),
+        "{show}"
+    );
+    // The names and the schemas are untouched, and so is every other tool.
+    assert_eq!(
+        specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        ["ask_user", "show", "ui_catalog"]
+    );
+    let plain = offered_with(Map::new()).await;
+    assert_eq!(
+        specs.iter().find(|s| s.name == "show").unwrap().parameters,
+        plain.iter().find(|s| s.name == "show").unwrap().parameters
+    );
+    assert_eq!(
+        description(&specs, "ui_catalog"),
+        description(&plain, "ui_catalog")
+    );
+    assert_eq!(
+        description(&specs, "ask_user"),
+        description(&plain, "ask_user")
+    );
+}
+
+#[tokio::test]
+async fn show_keeps_its_own_description_when_the_screen_sent_no_catalog() {
+    let specs = offered_with(Map::new()).await;
+    let show = description(&specs, "show");
+    assert!(
+        show.starts_with("Show the person something on their screen"),
+        "{show}"
+    );
+    assert!(!show.contains("The components of this screen"), "{show}");
+    assert!(show.contains("Call `ui_catalog` first"), "{show}");
+}
+
+#[tokio::test]
+async fn the_list_of_components_is_one_short_line_each_and_bounded() {
+    // Sixty-four components with long descriptions: each is one line of its first sentence, and the
+    // list stops where a screenful would end, saying how many it left out.
+    let components: Map<String, Value> = (0..64)
+        .map(|n| {
+            (
+                format!("Component{n:02}"),
+                json!({"type": "object", "description": format!(
+                    "First sentence of {n}. {}", "More detail that the model does not need here. ".repeat(20))}),
+            )
+        })
+        .collect();
+    let document = json!({"catalogId": CATALOG_ID, "components": components});
+    let digest = catalog_digest(&document).unwrap();
+    let c = Claimed {
+        catalog_id: CATALOG_ID.to_owned(),
+        version: 9,
+        digest,
+    };
+    let catalog = Catalog::from_document(document.clone(), &c).unwrap();
+    let context = json!({
+        CONTEXT_UI_REF: {"catalogId": c.catalog_id, "version": c.version, "digest": c.digest},
+        CONTEXT_UI_CATALOG: {
+            "catalogId": c.catalog_id, "version": c.version, "digest": c.digest,
+            "catalog": as_doubles(&document)},
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    assert_eq!(catalog.components().len(), 64);
+    let specs = offered_with(context).await;
+    let show = description(&specs, "show");
+    assert!(
+        show.contains("\n- Component00: First sentence of 0."),
+        "{show}"
+    );
+    assert!(!show.contains("More detail"), "{show}");
+    assert!(show.contains("more: see `ui_catalog`"), "{show}");
+    assert!(show.len() < 3 * 1024, "{} bytes", show.len());
+}
+
+#[tokio::test]
+async fn a_choices_block_is_refused_because_a_form_drawn_by_show_would_be_dead() {
+    let refused = show(
+        "c1",
+        json!({"blocks": [
+            {"component": "Text", "text": "Pick one:"},
+            {"component": "Choices", "questions": [
+                {"id": "db", "question": "Which database?",
+                 "options": [{"value": "pg", "label": "Postgres"}, {"value": "my", "label": "MySQL"}]}],
+             "action": {"event": {"name": "choices.answer"}}}]}),
+    )
+    .await;
+    assert!(refused.is_error, "{}", refused.content);
+    assert!(
+        refused.content.contains("block 2 is a `Choices` form"),
+        "{}",
+        refused.content
+    );
+    assert!(refused.content.contains("dead form"), "{}", refused.content);
+    assert!(
+        refused.content.contains("`ask_user`"),
+        "{}",
+        refused.content
+    );
+    assert!(refused.artifacts.is_empty(), "nothing was drawn");
+    // Alone, it is refused as well; the other components are drawn as before.
+    let alone = show(
+        "c2",
+        json!({"blocks": [{"component": "Choices", "questions": [], "action": {"event": {"name": "x"}}}]}),
+    )
+    .await;
+    assert!(
+        alone.is_error && alone.content.contains("`Choices` form"),
+        "{}",
+        alone.content
+    );
+    let fine = show(
+        "c3",
+        json!({"blocks": [{"component": "Text", "text": "hi"}]}),
+    )
+    .await;
+    assert!(!fine.is_error, "{}", fine.content);
+}
+
 // ---- the fixture is the web's catalog, version 3 ----
 
 #[test]

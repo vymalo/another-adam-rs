@@ -1,6 +1,6 @@
 {
   "name": "show",
-  "description": "Show the person something on their screen, beside your text answer: a list of blocks, each a component of the screen with its properties, drawn one under the other (at most 16). Call `ui_catalog` first to learn the components and their properties; a block that breaks a component's schema is refused with the reason, and you can correct it. Use it when a card, a list or a diagram says it better than text; the result is \"Shown to the person.\", and you still answer in text.",
+  "description": "Show the person something on their screen, beside your text answer: a list of blocks, each a component of the screen with its properties, drawn one under the other (at most 16). Call `ui_catalog` first to learn the components and their properties; a block that breaks a component's schema is refused with the reason, and you can correct it. Use it when a card, a list or a diagram says it better than text; the result is \"Shown to the person.\", and you still answer in text. Never use it to ask the person something: a `Choices` form drawn here has nobody to answer it, so `show` refuses it. Ask with `ask_user`, which takes `choices`.",
   "parameters": {
     "type": "object",
     "properties": {

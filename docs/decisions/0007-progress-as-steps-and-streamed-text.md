@@ -25,6 +25,11 @@ commit `d411249`:*
 * A request's `A2A-Extensions` header never reached a backend: `Caller` held the subject and nothing else, so an
   agent could not tell a client that wants steps from one that does not.
 
+> **Amended 2026-10-02 by [ADR 0011](0011-a-tool-calls-step-carries-its-input-and-output.md):** decision 3's sentence "the
+> agent never puts a tool's output in a step's detail" still holds for the `detail`, but a step now has two members of
+> its own, `input` (on the report that starts it) and `output` (on the one that ends it), cut to 4 KiB and 8 KiB and
+> redacted by the agent first, so that a screen can open a step and show what the tool was given and answered.
+
 ## Decision
 
 1. **The extensions a request activates reach the backend.** `Caller::extensions` holds the URIs a request named (its
@@ -128,7 +133,7 @@ stateDiagram-v2
   read a data part (`tool_start`, `tool_end`), and a line for each update, as it did. A client that wants fewer
   asks for steps.
 * **A failed step carries no reason unless the tool says one** (decision 3): the screen shows "failed" and the
-  model's own words say why.
+  model's own words say why. *(Since ADR 0011 a failed step's `output` is the error the tool returned.)*
 * **`Caller` equality includes the extensions.** A test that compares a `Caller` with `Caller::new(subject)` after a
   request with extensions would differ; ownership compares subjects.
 * **Throttling by subscription costs a map** (the state and time of each open step, at most 1024, then it starts

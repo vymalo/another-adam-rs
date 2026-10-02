@@ -28,6 +28,7 @@ adam-runtime.workspace = true
 adam-service = { workspace = true, features = ["mcp"] }
 adam-ui.workspace = true
 anyhow.workspace = true
+secrecy.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
@@ -45,7 +46,6 @@ adam-store-postgres.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 futures.workspace = true
-secrecy.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
 tempfile.workspace = true
 uuid.workspace = true

@@ -34,8 +34,9 @@
 //!
 //! `NOTIFY` rejects a payload of 8000 bytes or more, so nothing over
 //! [`MAX_PAYLOAD_BYTES`] is sent. An oversize `Status` keeps going with its
-//! `detail` cut on a character boundary; any other oversize event is dropped
-//! (its artifact is still in the durable run). There is no events table and no
+//! `detail` cut on a character boundary; an oversize `Step` keeps going without its `input` and
+//! `output` (up to 4 KiB and 8 KiB: a courtesy, the step and its state are what matter); any other
+//! oversize event is dropped (its artifact is still in the durable run). There is no events table and no
 //! sequence number: events are not replayable.
 //!
 //! # Running
@@ -474,7 +475,7 @@ impl EventSink for PgEventSink {
                 payload,
             }),
             Encoded::Truncated(payload) => {
-                tracing::debug!(%run, "status detail cut to fit a notification");
+                tracing::debug!(%run, "event cut to fit a notification (a status's detail, a step's input and output)");
                 self.inner.enqueue(Outgoing {
                     signals: false,
                     payload,
