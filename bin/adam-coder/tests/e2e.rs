@@ -2979,6 +2979,220 @@ async fn cancel_during_opencode_turn_cancels_without_push_or_pr(store: DynStore)
     assert!(fx.created_pulls().await.is_empty(), "no pull request");
 }
 
+// ------------------------------------------------ cancel: the model call and a command
+
+/// A model that takes 30 s to answer a call (the provider is slow, or the connection hangs), and
+/// counts the calls that are still alive: a call whose request was dropped is not.
+struct StalledModel {
+    inner: Arc<MockModel>,
+    /// The call that stalls (0 is the first); the others answer from `inner` at once.
+    stalls: usize,
+    calls: AtomicUsize,
+    /// Signalled when the stalled call has begun.
+    begun: Notify,
+    in_flight: AtomicUsize,
+}
+
+/// Counts a call for as long as it lives.
+struct Alive<'a>(&'a AtomicUsize);
+
+impl<'a> Alive<'a> {
+    fn begin(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Alive<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, SeqCst);
+    }
+}
+
+impl StalledModel {
+    fn new(inner: &Arc<MockModel>, stalls: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: inner.clone(),
+            stalls,
+            calls: AtomicUsize::new(0),
+            begun: Notify::new(),
+            in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    async fn stall(&self) -> Option<Alive<'_>> {
+        if self.calls.fetch_add(1, SeqCst) != self.stalls {
+            return None;
+        }
+        let alive = Alive::begin(&self.in_flight);
+        self.begun.notify_one();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Some(alive)
+    }
+}
+
+#[async_trait]
+impl ModelClient for StalledModel {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        let _alive = self.stall().await;
+        self.inner.complete(req).await
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        let _alive = self.stall().await;
+        self.inner.stream(req).await
+    }
+}
+
+/// CancelTask on a task and how long it takes to end: until the client sees `canceled`, and until
+/// the worker has nothing left running for it (the step that was cancelled has ended). Both within
+/// 2 s, and the stream of the task ends.
+async fn cancel_and_time(
+    server: &Server,
+    seen: &mut Seen,
+    stream: &mut (impl futures::Stream<Item = Result<StreamResponse, a2a::A2AError>> + Unpin),
+    worker: Worker,
+) -> (Duration, Duration) {
+    let cancelled_at = Instant::now();
+    let canceled = server
+        .client
+        .cancel_task(&a2a::CancelTaskRequest {
+            id: seen.task_id.clone(),
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("the stream ends after the cancel")
+    {
+        seen.record(item.unwrap());
+    }
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Canceled),
+        "{:?}",
+        seen.labels
+    );
+    let to_canceled = cancelled_at.elapsed();
+    // The worker stops when its steps have: a step that went on with the model or the command
+    // would hold it for 30 or 60 s.
+    worker.stop().await;
+    let to_idle = cancelled_at.elapsed();
+    eprintln!("cancel to canceled: {to_canceled:?}, to the end of the step: {to_idle:?}");
+    assert!(
+        to_canceled < Duration::from_secs(2),
+        "canceled within 2 s, took {to_canceled:?}"
+    );
+    assert!(
+        to_idle < Duration::from_secs(2),
+        "the step ended within 2 s, took {to_idle:?}"
+    );
+    (to_canceled, to_idle)
+}
+
+/// CancelTask while the model has not answered (it would take 30 s): the request is dropped, the
+/// task ends `canceled` within 2 s, and the worker is free as soon as it does.
+async fn a_cancel_ends_the_task_canceled_while_the_model_has_not_answered(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_text("never said");
+    let model = StalledModel::new(&mock, 0);
+    let dynamic: DynModel = model.clone();
+    let coder = Coder::new(
+        store,
+        CoderAgent::new(dynamic, "test-model", fx.env.clone()),
+        &options(),
+    );
+    let server = Server::start(coder).await;
+
+    let mut stream = server
+        .client
+        .send_streaming_message(&request(user("say hello")))
+        .await
+        .unwrap();
+    let mut seen = Seen::default();
+    seen.record(stream.next().await.expect("snapshot").unwrap());
+    let worker = spawn_worker(&server.coder);
+    tokio::time::timeout(Duration::from_secs(20), model.begun.notified())
+        .await
+        .expect("the model call begins");
+    assert_eq!(model.in_flight.load(SeqCst), 1);
+
+    cancel_and_time(&server, &mut seen, &mut stream, worker).await;
+
+    assert_eq!(
+        model.in_flight.load(SeqCst),
+        0,
+        "the request was dropped, not left to finish"
+    );
+    assert_eq!(mock.requests().len(), 0, "the model never answered");
+    let done = server
+        .client
+        .get_task(&a2a::GetTaskRequest {
+            id: seen.task_id.clone(),
+            history_length: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(done.status.state, TaskState::Canceled);
+}
+
+/// CancelTask while `run_command` is in a `sleep 60`: the command's process is killed at once, the
+/// task ends `canceled` within 2 s, and the model is not asked again.
+async fn a_cancel_ends_the_task_canceled_while_run_command_sleeps(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("sleep.pid");
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "c1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
+        "c2",
+        "run_command",
+        // `exec` makes the shell the sleep: its pid is the process to find gone.
+        json!({"command": format!("echo $$ > {}; exec sleep 60", pid_file.display())}),
+    )])
+    .push_text("never said");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+
+    let mut stream = server
+        .client
+        .send_streaming_message(&request(user(&format!("look at {}", fx.remote_url()))))
+        .await
+        .unwrap();
+    let mut seen = Seen::default();
+    seen.record(stream.next().await.expect("snapshot").unwrap());
+    let worker = spawn_worker(&server.coder);
+    let sleeper = common::wait_for_pid(&pid_file).await;
+    assert!(
+        !common::process_gone(sleeper, true),
+        "the sleep should be running"
+    );
+
+    cancel_and_time(&server, &mut seen, &mut stream, worker).await;
+
+    assert!(
+        common::wait_gone(sleeper, true, Duration::from_secs(2)).await,
+        "the sleep (pid {sleeper}) is still there after the cancel"
+    );
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "no model turn after the cancel: the prepare and the command"
+    );
+    assert!(fx.agent_branches().is_empty(), "nothing was pushed");
+}
+
 // ------------------------------------------------------- concurrent tasks
 
 /// One scripted model per task, chosen by a marker in the task's text: two
@@ -4451,6 +4665,8 @@ macro_rules! coder_suite {
                 opencode_crashing_once_is_retried_and_completes,
                 rate_limited_model_backs_off_and_completes,
                 cancel_during_opencode_turn_cancels_without_push_or_pr,
+                a_cancel_ends_the_task_canceled_while_the_model_has_not_answered,
+                a_cancel_ends_the_task_canceled_while_run_command_sleeps,
                 two_concurrent_tasks_on_one_repo_get_two_branches_and_two_prs,
                 a_github_401_fails_the_run_with_a_clear_message,
                 a_refused_github_app_fails_the_run_naming_its_own_variables,

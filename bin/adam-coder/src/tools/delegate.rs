@@ -84,6 +84,7 @@ async fn opencode_refusal(
                 env.settings.opencode.version_spec(dir, session),
                 VERSION_TIMEOUT,
                 1024,
+                &ctx.cancel_token(),
             )
             .await
             .map_err(|e| run_error(&env.redactor, &e))?;
