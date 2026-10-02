@@ -8,7 +8,6 @@
 
 mod common;
 
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -130,45 +129,6 @@ async fn wait_parked(rt: &Runtime, run: RunId) {
     .await;
 }
 
-/// Log lines of the test's thread, as text.
-#[derive(Clone, Default)]
-struct Logs(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Logs {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
-    type Writer = Logs;
-    fn make_writer(&'a self) -> Logs {
-        self.clone()
-    }
-}
-
-impl Logs {
-    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
-        let logs = Self::default();
-        let guard = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .with_writer(logs.clone())
-                .finish(),
-        );
-        (logs, guard)
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
 // --- an edit reaches the next step ---------------------------------------------------------
 
 #[tokio::test]
@@ -284,7 +244,9 @@ async fn a_reload_of_unchanged_files_swaps_and_says_nothing_changed() {
 
 #[tokio::test]
 async fn an_invalid_edit_keeps_the_old_version_logs_and_exposes_the_diagnostic() {
-    let (logs, _guard) = Logs::capture();
+    // One global subscriber and a buffer per thread: a scoped `set_default` subscriber can miss
+    // the line when a sibling test caches "nobody listens" on the same callsite (see `LogCapture`).
+    let logs = adam_mcp_testkit::LogCapture::start();
     let name = uniq("helper");
     let store: DynStore = Arc::new(MemoryStore::new());
     let dir = tempfile::tempdir().unwrap();
