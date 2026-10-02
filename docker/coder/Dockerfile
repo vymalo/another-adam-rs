@@ -84,13 +84,15 @@ COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-serve
 # base image already creates it owned by uid 10001, as does this line for a
 # base that does not.
 RUN install -d -o 10001 -g 10001 /work
-# `ADD --checksum` stops the build when the download is not the pinned file.
-ADD --checksum=sha256:${PODMAN_REMOTE_SHA256} \
-    https://github.com/containers/podman/releases/download/v${PODMAN_REMOTE_VERSION}/podman-remote-static-linux_amd64.tar.gz \
-    /tmp/podman-remote.tar.gz
-RUN tar -xzf /tmp/podman-remote.tar.gz -C /tmp \
+# The static client of the service's own release; `sha256sum -c` stops the build when the download is not
+# the pinned file. (Not `ADD --checksum`: the hadolint of the `lint Dockerfile` job cannot parse the flag.)
+RUN curl -fsSL -o /tmp/podman-remote.tar.gz \
+      "https://github.com/containers/podman/releases/download/v${PODMAN_REMOTE_VERSION}/podman-remote-static-linux_amd64.tar.gz" \
+ && printf '%s  %s\n' "${PODMAN_REMOTE_SHA256}" /tmp/podman-remote.tar.gz > /tmp/podman-remote.sha256 \
+ && sha256sum -c /tmp/podman-remote.sha256 \
+ && tar -xzf /tmp/podman-remote.tar.gz -C /tmp \
  && install -m 0755 /tmp/bin/podman-remote-static-linux_amd64 /usr/local/bin/podman-remote \
- && rm -rf /tmp/podman-remote.tar.gz /tmp/bin \
+ && rm -rf /tmp/podman-remote.tar.gz /tmp/podman-remote.sha256 /tmp/bin \
  && npm install -g --no-fund --no-audit "@devcontainers/cli@${DEVCONTAINERS_CLI_VERSION}"
 
 # MCP_ALLOW_STDIO is **not** set here: the image carries two binaries, and only the coder (whose shipped
