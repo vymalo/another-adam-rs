@@ -20,7 +20,7 @@ use crate::redact::Redactor;
 use crate::tools::consent::{
     Answer, answer_of, asked_by, is_answered_by_the_person, is_consent_tool, is_tools_own_result,
 };
-use crate::tools::named::{key_of_argument, named_in, without_untrusted};
+use crate::tools::named::{key_of_argument, listed, named_in, without_untrusted};
 use crate::tools::notes::{Consent, PushedBranch, RunNotes};
 use crate::tools::publish::{COMMIT_AND_PUSH, pushed_in};
 use crate::tools::{ToolEnv, coder_tools};
@@ -81,7 +81,9 @@ impl AgentStarter for CoderStarter {
 /// the policy below (see the README, "Where the prompt and the card live").
 ///
 /// When the model stops (a turn without tool calls) the run completes only if it
-/// delivered: it opened a pull request. Otherwise:
+/// delivered: it opened a pull request, or it did the one other thing that is delivery
+/// (`delivered_a_result`): in scratch work, with no repository in play, it shared a file the
+/// person asked for. Otherwise:
 ///
 /// * A run that ends with the last check run red, the check-cycle budget used up
 ///   and no pull request fails, with the findings as the error. That is what "at
@@ -97,7 +99,7 @@ impl AgentStarter for CoderStarter {
 ///   person's answer resumes the run.
 ///
 /// So a run that has nothing to deliver never completes on its own. It ends with a pull
-/// request, with a failure (the two rules above, a model or tool error that is not retried,
+/// request, with a result shared from scratch work, with a failure (the two rules above, a model or tool error that is not retried,
 /// `max_turns` or `max_tool_calls`), or when the caller cancels it (A2A `CancelTask`); until then
 /// it waits for the person, who can say something else or stop it. There is no limit on how
 /// often it asks.
@@ -232,6 +234,20 @@ impl CoderAgent {
         env: Arc<ToolEnv>,
         tools: impl IntoIterator<Item = DynTool>,
     ) -> Result<Self, Box<AssemblyError>> {
+        // The budget of scratch work is told to the model when the folder's prompt has a place for
+        // it (the shipped one does). A folder written before it existed does not, and a var the
+        // folder does not declare is an error: it keeps working, and the tool says the limit when
+        // it is reached.
+        let def = if def
+            .manifest()
+            .frontmatter
+            .vars
+            .contains_key("scratch_check_cycles")
+        {
+            def.var("scratch_check_cycles", env.settings.scratch_check_cycles)
+        } else {
+            def
+        };
         let assembly = def
             .var("max_check_cycles", env.settings.max_check_cycles)
             .bind(tools.into_iter().collect::<ToolSet>())?
@@ -336,12 +352,43 @@ impl CoderAgent {
 
     /// Why the run must fail instead of completing, if it must.
     fn verdict(&self, notes: &RunNotes) -> Option<String> {
-        verdict_of(notes, self.env.settings.max_check_cycles)
+        verdict_of(
+            notes,
+            self.env.settings.max_check_cycles,
+            self.env.settings.scratch_check_cycles,
+        )
     }
 }
 
-/// [`CoderAgent::verdict`] for run `notes` and a budget of `max` check cycles.
-fn verdict_of(notes: &RunNotes, max: u32) -> Option<String> {
+/// Whether a run that has no pull request delivered what it was asked for anyway: **scratch work
+/// that shared a result** (owner decision of 2026-10-02: a person who asks for a file or an answer,
+/// and not for a change to a repository, is not owed a pull request).
+///
+/// All of these hold, and each one is something the tools wrote, never something the model said:
+///
+/// * the run shared a file (`share_file`, [`RunNotes::shared`]): that is the result, handed over;
+/// * its workspace has scratch projects and nothing else (`scratch_only`): no repository's worktree
+///   is in it, so nothing there could be pushed, and a project published into a repository
+///   (`publish_scratch` adds its slot) is repository work and needs its pull request;
+/// * the person named no repository ([`listed`] of the notes: a word such as `src/main.rs`
+///   that only reads like one is left out), the run created none, pushed nothing and continues no
+///   branch.
+///
+/// A scratch run that answered a question without sharing anything is not this: it waits for the
+/// person, as an answer always did. A model that needs something from the person asks with
+/// `ask_user`, which parks the run whatever it shared.
+fn delivered_a_result(notes: &RunNotes, scratch_only: bool) -> bool {
+    scratch_only
+        && !notes.shared.is_empty()
+        && listed(&notes.named_repos).is_empty()
+        && notes.created_repos.is_empty()
+        && notes.pushed_branches.is_empty()
+        && notes.continues.is_none()
+}
+
+/// [`CoderAgent::verdict`] for run `notes` and the budgets of `max` check cycles in repositories
+/// and `scratch_max` in scratch projects.
+fn verdict_of(notes: &RunNotes, max: u32, scratch_max: u32) -> Option<String> {
     {
         if notes.pull_request.is_some() {
             return None;
@@ -360,15 +407,18 @@ fn verdict_of(notes: &RunNotes, max: u32) -> Option<String> {
             return Some(format!("{not_delivered}: {blocker}"));
         }
         // Red checks with cycles left are the model's to fix, or to ask about: only a spent
-        // budget is a verdict.
-        if !notes.cycles_exhausted(max) {
-            return None;
-        }
-        let last = notes.checks.last.as_ref()?;
+        // budget is a verdict. Scratch work and repositories each have one.
+        let (scratch, max) = [(false, max), (true, scratch_max)]
+            .into_iter()
+            .find(|(scratch, max)| notes.cycles_exhausted(*scratch, *max))?;
+        let last = notes.last_in(scratch)?;
         Some(format!(
             "checks are failing and {not_delivered} ({} of {max} check cycles used). \
              Findings from `{}` (exit code {:?}):\n{}",
-            notes.checks.failures, last.command, last.exit_code, last.tail
+            notes.failures_in(scratch),
+            last.command,
+            last.exit_code,
+            last.tail
         ))
     }
 }
@@ -716,13 +766,18 @@ impl Agent for CoderAgent {
                     },
                     None if notes.pull_request.is_some() => Transition::Done { state, output },
                     None => {
-                        let prepared = match self.env.workspaces.run(&run) {
-                            Ok(workspace) => {
-                                matches!(workspace.slots().await, Ok(slots) if !slots.is_empty())
-                            }
-                            Err(_) => false,
+                        let slots = match self.env.workspaces.run(&run) {
+                            Ok(workspace) => workspace.slots().await.unwrap_or_default(),
+                            Err(_) => Vec::new(),
                         };
-                        stop_as_question(ctx, state, output, prepared).await
+                        let scratch_only =
+                            !slots.is_empty() && slots.iter().all(|s| s.scratch().is_some());
+                        if delivered_a_result(&notes, scratch_only) {
+                            // Shared from scratch work: what was asked for is handed over.
+                            Transition::Done { state, output }
+                        } else {
+                            stop_as_question(ctx, state, output, !slots.is_empty()).await
+                        }
                     }
                 })
             }
@@ -1616,17 +1671,18 @@ mod tests {
                 tree: None,
                 report: None,
                 slot: None,
+                scratch: false,
             });
         };
 
         // Nothing wrong yet, or cycles left: the model's call, not a verdict.
         let mut notes = RunNotes::default();
-        assert_eq!(verdict_of(&notes, 2), None);
+        assert_eq!(verdict_of(&notes, 2, 9), None);
         red(&mut notes, "first");
-        assert_eq!(verdict_of(&notes, 2), None);
+        assert_eq!(verdict_of(&notes, 2, 9), None);
         // A spent budget on a run with a branch of its own: no pull request was opened.
         red(&mut notes, "second");
-        let own = verdict_of(&notes, 2).unwrap();
+        let own = verdict_of(&notes, 2, 9).unwrap();
         assert!(own.contains("no pull request was opened"), "{own}");
         assert!(
             own.contains("test a ... FAILED") && own.contains("2 of 2"),
@@ -1634,7 +1690,7 @@ mod tests {
         );
         // On a continued branch, where an open pull request exists: that one was not updated.
         notes.continues = Some("agent/abc".into());
-        let continued = verdict_of(&notes, 2).unwrap();
+        let continued = verdict_of(&notes, 2, 9).unwrap();
         assert!(
             continued.contains("the pull request for agent/abc was not updated"),
             "{continued}"
@@ -1649,13 +1705,13 @@ mod tests {
             ..RunNotes::default()
         };
         assert!(
-            verdict_of(&blocked, 2)
+            verdict_of(&blocked, 2, 9)
                 .unwrap()
                 .starts_with("no pull request was opened: the credentials")
         );
         blocked.continues = Some("agent/abc".into());
         assert!(
-            verdict_of(&blocked, 2)
+            verdict_of(&blocked, 2, 9)
                 .unwrap()
                 .starts_with("the pull request for agent/abc was not updated: the credentials")
         );
@@ -1666,7 +1722,94 @@ mod tests {
             red_checks_accepted: false,
             commented_sha: None,
         });
-        assert_eq!(verdict_of(&blocked, 2), None);
+        assert_eq!(verdict_of(&blocked, 2, 9), None);
+    }
+
+    /// The budgets of scratch work and of repositories are each a verdict of their own.
+    #[test]
+    fn each_kind_of_work_has_its_own_budget_in_the_verdict() {
+        use crate::tools::notes::CheckRecord;
+        let red = |notes: &mut RunNotes, call: &str, scratch: bool| {
+            notes.record_check(CheckRecord {
+                call_id: call.to_owned(),
+                command: if scratch { "sh check.sh" } else { "cargo test" }.into(),
+                passed: false,
+                exit_code: Some(1),
+                tail: "boom".into(),
+                tree: None,
+                report: None,
+                slot: None,
+                scratch,
+            });
+        };
+        let mut notes = RunNotes::default();
+        for i in 0..3 {
+            red(&mut notes, &format!("s{i}"), true);
+        }
+        // Three red runs in a scratch project, with five allowed: not a verdict.
+        assert_eq!(verdict_of(&notes, 3, 5), None);
+        red(&mut notes, "s3", true);
+        red(&mut notes, "s4", true);
+        let spent = verdict_of(&notes, 3, 5).unwrap();
+        assert!(
+            spent.contains("5 of 5") && spent.contains("sh check.sh"),
+            "{spent}"
+        );
+        // The same failures against a repository's budget of three would have been one.
+        assert!(verdict_of(&notes, 3, 6).is_none());
+        let mut repository = RunNotes::default();
+        for i in 0..3 {
+            red(&mut repository, &format!("r{i}"), false);
+        }
+        let spent = verdict_of(&repository, 3, 5).unwrap();
+        assert!(
+            spent.contains("3 of 3") && spent.contains("cargo test"),
+            "{spent}"
+        );
+    }
+
+    /// What lets a run end without a pull request: scratch work that shared a result, with no
+    /// repository in play. Every other combination waits for the person, as it always did.
+    #[test]
+    fn only_shared_scratch_work_with_no_repository_delivers_without_a_pull_request() {
+        use crate::tools::notes::{CreatedRepo, PushedBranch};
+        let mut shared = RunNotes::default();
+        shared.record_shared("scratch/chart.svg");
+        assert!(delivered_a_result(&shared, true));
+
+        // Nothing shared: an answer, or work not yet handed over.
+        assert!(!delivered_a_result(&RunNotes::default(), true));
+        // A repository's worktree is in the workspace (or there is no workspace): a pull request is
+        // owed.
+        assert!(!delivered_a_result(&shared, false));
+        // The person named a repository: repository work, whatever the model built meanwhile.
+        let mut named = shared.clone();
+        named.name_repos(["github.com/acme/widgets".to_owned()]);
+        assert!(!delivered_a_result(&named, true));
+        // A word that only reads like a repository (a path) does not count as naming one.
+        let mut path = shared.clone();
+        path.name_repos(["github.com/src/main.rs".to_owned()]);
+        assert!(delivered_a_result(&path, true));
+        // A repository this run created, a branch it pushed or continues.
+        let mut created = shared.clone();
+        created.created_repos.push(CreatedRepo {
+            full_name: "acme/fib".into(),
+            key: "github.com/acme/fib".into(),
+            clone_url: "https://github.com/acme/fib.git".into(),
+            html_url: "https://github.com/acme/fib".into(),
+            private: true,
+        });
+        assert!(!delivered_a_result(&created, true));
+        let mut pushed = shared.clone();
+        pushed.name_pushed_branches([PushedBranch {
+            repo: "github.com/acme/widgets".into(),
+            branch: "agent/abc".into(),
+            base: None,
+        }]);
+        assert!(!delivered_a_result(&pushed, true));
+        let mut continues = shared;
+        continues.continues = Some("agent/abc".into());
+        assert!(!delivered_a_result(&continues, true));
     }
 
     #[test]

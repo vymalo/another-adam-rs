@@ -77,7 +77,10 @@ pub async fn commit_and_push(
     };
     let run = ctx.run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-    if notes.cycles_exhausted(env.settings.max_check_cycles) {
+    if notes.cycles_exhausted(
+        slot.worktree().is_none(),
+        env.settings.cycle_limit(slot.worktree().is_none()),
+    ) {
         return Ok(ToolOutput::error(
             "Check-cycle limit reached with failing checks: nothing may be committed or \
              pushed. Stop now and report what you did and which check still fails.",
@@ -300,11 +303,11 @@ pub async fn open_pull_request(
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     let max = env.settings.max_check_cycles;
 
-    if notes.cycles_exhausted(max) {
+    if notes.cycles_exhausted(false, max) {
         return Ok(ToolOutput::error(format!(
             "Check-cycle limit reached ({} of {max}) with failing checks: no pull request may \
              be opened. Stop now and report what you did and which check still fails.",
-            notes.checks.failures
+            notes.failures_in(false)
         )));
     }
     let Some(head) = head_sha(wt.path()).await else {

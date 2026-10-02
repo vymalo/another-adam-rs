@@ -1,0 +1,34 @@
+{
+  "name": "edit_file",
+  "description": "Replace exact text in a file of your worktree: every character of `old`, blanks and line breaks included, is replaced by `new`. It is the way to make a small change without writing a diff: read the file, copy the lines you mean to change as `old`, write what they become as `new`. It refuses, and changes nothing, when `old` is not in the file (the error shows the closest region with line numbers, so you can copy it right) or when `old` is in the file more than once and `replace_all` is not set (the error lists the lines: add more of the text around it to make it unique). The path is relative to the root of the worktree; nothing inside `.git` and nothing through a symlink can be edited. The file must be text of at most 1 MiB. To create a file or replace it whole use write_file, for several files at once apply_patch.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Path of the file, relative to the root of the worktree"
+      },
+      "old": {
+        "type": "string",
+        "description": "The exact text to replace, copied from the file (blanks and line breaks too). Must be in the file; and once, unless replace_all is set."
+      },
+      "new": {
+        "type": "string",
+        "description": "What it becomes. May be empty, to delete the text."
+      },
+      "replace_all": {
+        "type": "boolean",
+        "description": "Replace every place `old` is in. Leave out to replace the one place that has it."
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to edit in: its name, or the repository's address. Leave out when the workspace has one."
+      }
+    },
+    "required": [
+      "path",
+      "old",
+      "new"
+    ]
+  }
+}

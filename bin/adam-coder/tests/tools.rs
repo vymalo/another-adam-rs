@@ -11,10 +11,11 @@ use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::tools::checks::RunChecks;
 use adam_coder::tools::create::CreateRepository;
 use adam_coder::tools::delegate::DelegateToOpenCode;
-use adam_coder::tools::files::{ApplyPatch, ReadFile, WriteFile};
+use adam_coder::tools::files::{ApplyPatch, EditFile, ReadFile, WriteFile};
 use adam_coder::tools::inspect::RunCommand;
+use adam_coder::tools::make::Run;
 use adam_coder::tools::named::{named_in, without_untrusted};
-use adam_coder::tools::notes::{Consent, PushedBranch};
+use adam_coder::tools::notes::{CheckRecord, Consent, PushedBranch};
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::publish::{CommitAndPush, OpenPullRequest};
 use adam_coder::tools::scratch::{PublishScratch, StartScratch};
@@ -1797,7 +1798,7 @@ async fn a_missing_toolchain_is_reported_and_costs_nothing() {
         notes.checks.last.is_none(),
         "not recorded: the gate sees no check"
     );
-    assert!(!notes.cycles_exhausted(rig.fx.env.settings.max_check_cycles));
+    assert!(!notes.cycles_exhausted(false, rig.fx.env.settings.max_check_cycles));
 
     // The same in a script, and from run_command (which also leaves the worktree alone).
     std::fs::write(
@@ -4840,5 +4841,679 @@ async fn a_shared_text_file_is_scrubbed_of_the_secrets_the_process_knows() {
         shared(&out).3,
         binary,
         "bytes that are not text are not rewritten"
+    );
+}
+
+// ------------------------------------------------ run: making something, and keeping it
+
+async fn notes_of(rig: &Rig) -> adam_coder::tools::notes::RunNotes {
+    rig.fx
+        .env
+        .notes
+        .load(&rig.ctx.run_id().to_string())
+        .await
+        .unwrap()
+}
+
+/// `run` keeps what a command makes, and is never a check: no artifact, no cycle, nothing in the
+/// notes for the gate to read, and the files it changed make the earlier checks stale.
+#[tokio::test]
+async fn run_keeps_what_a_command_makes_and_is_never_a_check() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+
+    let made = Run
+        .call(
+            &rig.ctx,
+            json!({"command": "mkdir -p out && printf '<svg xmlns=\"http://www.w3.org/2000/svg\"/>' > out/chart.svg && echo rendered"}),
+        )
+        .await
+        .unwrap();
+    assert!(!made.is_error, "{}", made.content);
+    assert!(
+        made.content.contains("exit code 0")
+            && made.content.contains("rendered")
+            && made.content.contains("?? out/chart.svg")
+            && made.content.contains("run the project's checks again"),
+        "{}",
+        made.content
+    );
+    assert!(made.artifacts.is_empty(), "no checks artifact");
+    // Kept: the file is in the worktree, run_command sees it, and share_file can show it.
+    assert!(dir.join("out/chart.svg").exists());
+    let seen = RunCommand
+        .call(&rig.ctx, json!({"command": "ls out"}))
+        .await
+        .unwrap();
+    assert!(seen.content.contains("chart.svg"), "{}", seen.content);
+    let shown = ShareFile
+        .call(&rig.ctx, json!({"path": "out/chart.svg"}))
+        .await
+        .unwrap();
+    assert_eq!(shared(&shown).1, "image/svg+xml");
+
+    // Not a check: the cycles are whole, and the notes know of no check at all.
+    let notes = notes_of(&rig).await;
+    assert_eq!(notes.checks.failures, 0);
+    assert!(notes.checks.last.is_none() && notes.checks.history.is_empty());
+    // A failing command is an answer too, and costs nothing, however often.
+    for _ in 0..(rig.fx.env.settings.max_check_cycles + 2) {
+        let out = Run
+            .call(&rig.ctx, json!({"command": "echo nope >&2; exit 3"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("exit code 3") && out.content.contains("nope"));
+        assert!(
+            out.content.contains("git sees no change"),
+            "{}",
+            out.content
+        );
+    }
+    assert!(notes_of(&rig).await.checks.history.is_empty());
+
+    // The gate: a check that passed is for the tree it ran on; what `run` changes afterwards is not
+    // covered by it, and `run` itself never stands in for it.
+    let checked = RunChecks
+        .call(&rig.ctx, json!({"command": "test -s out/chart.svg"}))
+        .await
+        .unwrap();
+    let checked_tree = checks_of(&checked)["tree"].as_str().unwrap().to_owned();
+    Run.call(&rig.ctx, json!({"command": "echo more >> out/chart.svg"}))
+        .await
+        .unwrap();
+    let out = CommitAndPush
+        .call(&rig.ctx, json!({"message": "docs: add the chart"}))
+        .await
+        .unwrap();
+    let (bound, _) = commit_artifacts(&out);
+    assert_eq!(bound["passed"], false, "{bound}");
+    assert!(
+        bound["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&checked_tree[..10]),
+        "the pushed tree was not checked: {bound}"
+    );
+    // Exactly one check ran in the whole run.
+    assert_eq!(notes_of(&rig).await.checks.history.len(), 1);
+}
+
+/// What a command may not do: change git. Whatever it made on the way is undone with it, and the
+/// model is told where commits go.
+#[tokio::test]
+async fn run_undoes_a_command_that_touches_git_entirely_and_refuses_it() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    std::fs::write(dir.join("README.md"), "widgets\nedited\n").unwrap();
+    std::fs::write(dir.join("notes.txt"), "mine\n").unwrap();
+    let before = worktree_state(&rig);
+    let diff_before = common::git(&dir, &["diff", "HEAD"]);
+
+    for command in [
+        // A commit (with a file made first), a new branch, a reset, HEAD moved by hand.
+        "echo made > made.txt && git add -A && git -c user.name=a -c user.email=a@b commit -qm sneaky",
+        "echo made > made.txt && git checkout -q -b elsewhere",
+        "git -c user.name=a -c user.email=a@b commit -q --allow-empty -m e",
+        "git update-ref --no-deref HEAD HEAD",
+        // A branch, a tag-like ref in a namespace nobody else moves, a config key, a hook path.
+        "echo made > made.txt; git branch rogue",
+        "echo made > made.txt; git update-ref refs/notes/x HEAD",
+        "echo made > made.txt; git config core.fsmonitor true",
+        "echo made > made.txt; git config alias.st status",
+        // The `.git` file of the worktree.
+        "echo made > made.txt; printf 'gitdir: /tmp/elsewhere\\n' > .git",
+    ] {
+        let out = Run
+            .call(&rig.ctx, json!({ "command": command }))
+            .await
+            .unwrap();
+        assert!(out.is_error, "{command}: {}", out.content);
+        assert!(
+            out.content
+                .contains("`run` may change files and nothing of git")
+                && out.content.contains("files included")
+                && out.content.contains("commit_and_push"),
+            "{command}: {}",
+            out.content
+        );
+        assert!(out.artifacts.is_empty());
+        assert_eq!(
+            worktree_state(&rig),
+            before,
+            "{command}: status, HEAD, branch"
+        );
+        assert!(
+            !dir.join("made.txt").exists(),
+            "{command}: its file went with it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+            "mine\n",
+            "{command}: the run's own work is as it was"
+        );
+        assert_eq!(
+            common::git(&dir, &["diff", "HEAD"]),
+            diff_before,
+            "{command}"
+        );
+    }
+    assert!(common::git(&dir, &["symbolic-ref", "--short", "HEAD"]).starts_with("agent/"));
+    assert!(
+        common::git(&dir, &["config", "--local", "--list"])
+            .lines()
+            .all(|l| !l.starts_with("alias."))
+    );
+    // Refused or not, it was never a check.
+    assert_eq!(failures(&rig).await, 0);
+    assert!(notes_of(&rig).await.checks.history.is_empty());
+
+    // Reading git is not touching it, and a file made beside it is kept.
+    let ok = Run
+        .call(
+            &rig.ctx,
+            json!({"command": "git status --short >/dev/null; git log -1 --format=%s; echo kept > kept.txt"}),
+        )
+        .await
+        .unwrap();
+    assert!(!ok.is_error, "{}", ok.content);
+    assert!(dir.join("kept.txt").exists());
+}
+
+/// The same environment, `cwd` rule and timeout as `run_command`; what it had written when the
+/// time ran out stays; a missing workspace and a missing tool are said as for the others.
+#[tokio::test]
+async fn run_respects_the_timeout_the_cwd_rule_and_a_missing_tool() {
+    let fx = Fixture::with("hello\n", |s| {
+        // Long enough for a login shell to start on a loaded machine, short enough to wait for.
+        s.check_timeout = std::time::Duration::from_secs(4);
+    })
+    .await;
+    let rig = Rig::from(fx);
+    let none = Run.call(&rig.ctx, json!({"command": "ls"})).await.unwrap();
+    assert!(
+        none.is_error && none.content.contains("prepare_workspace"),
+        "{}",
+        none.content
+    );
+    rig.prepare().await;
+    let dir = rig.worktree();
+
+    let started = Instant::now();
+    let slow = Run
+        .call(
+            &rig.ctx,
+            json!({"command": "echo partial > partial.txt; echo before; sleep 60"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the command was killed"
+    );
+    assert!(
+        slow.content.contains("timed out") && slow.content.contains("--- output ---\nbefore"),
+        "{}",
+        slow.content
+    );
+    assert!(
+        dir.join("partial.txt").exists(),
+        "what it wrote before the end stays: {}",
+        slow.content
+    );
+    assert_eq!(failures(&rig).await, 0, "a timeout is no failed check");
+
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let sub = Run
+        .call(
+            &rig.ctx,
+            json!({"command": "echo here > f.txt", "cwd": "sub"}),
+        )
+        .await
+        .unwrap();
+    assert!(!sub.is_error, "{}", sub.content);
+    assert!(dir.join("sub/f.txt").exists());
+    for cwd in ["..", "../..", "/etc", "sub/../.."] {
+        let out = Run
+            .call(&rig.ctx, json!({"command": "ls", "cwd": cwd}))
+            .await
+            .unwrap();
+        assert!(
+            out.is_error && out.content.contains("cwd"),
+            "{cwd}: {}",
+            out.content
+        );
+    }
+    let blank = Run.call(&rig.ctx, json!({"command": "  "})).await.unwrap();
+    assert!(blank.is_error);
+
+    let missing = Run
+        .call(&rig.ctx, json!({"command": "no-such-toolchain build"}))
+        .await
+        .unwrap();
+    assert!(
+        missing.is_error
+            && missing
+                .content
+                .contains("The workspace has no `no-such-toolchain`")
+            && missing.content.contains("no check cycle was used"),
+        "{}",
+        missing.content
+    );
+    // The secrets of this process are hidden from what it runs, as for the checks.
+    let hidden = Run
+        .call(
+            &rig.ctx,
+            json!({"command": "echo \"[${GITHUB_TOKEN:-unset}]\""}),
+        )
+        .await
+        .unwrap();
+    assert!(hidden.content.contains("[unset]"), "{}", hidden.content);
+}
+
+/// In a scratch project it makes files the same way, and the files the project ignores are kept
+/// too (a build directory), with the listing saying so.
+#[tokio::test]
+async fn run_works_in_a_scratch_project_and_keeps_what_git_ignores() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "chart").await;
+    let dir = slot_of(&rig, "chart");
+    WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": ".gitignore", "content": "dist/\n"}),
+        )
+        .await
+        .unwrap();
+    let made = Run
+        .call(
+            &rig.ctx,
+            json!({"command": "mkdir -p dist && echo built > dist/out.txt"}),
+        )
+        .await
+        .unwrap();
+    assert!(!made.is_error, "{}", made.content);
+    assert!(dir.join("dist/out.txt").exists());
+    // Git sees nothing new (the file is ignored), and the result says it is kept all the same.
+    assert!(
+        made.content.contains("git sees no change")
+            && made.content.contains("ignores are kept too"),
+        "{}",
+        made.content
+    );
+    let both = Run
+        .call(
+            &rig.ctx,
+            json!({"command": "echo again > dist/out2.txt; echo shown > shown.txt"}),
+        )
+        .await
+        .unwrap();
+    assert!(both.content.contains("?? shown.txt"), "{}", both.content);
+    assert!(dir.join("dist/out2.txt").exists() && dir.join("shown.txt").exists());
+}
+
+// ------------------------------------------------ edit_file
+
+#[tokio::test]
+async fn edit_file_needs_a_workspace_like_the_others() {
+    let rig = Rig::new().await;
+    let out = EditFile
+        .call(&rig.ctx, json!({"path": "a", "old": "a", "new": "b"}))
+        .await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("prepare_workspace"));
+}
+
+/// The change reaches the worktree, the checks see it, and the gate binds to it (as for the other
+/// file tools).
+#[tokio::test]
+async fn edit_file_replaces_once_or_everywhere_and_the_checks_see_it() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    std::fs::write(dir.join("a.txt"), "one\ntwo\none\n").unwrap();
+    let out = EditFile
+        .call(&rig.ctx, json!({"path": "a.txt", "old": "two", "new": "2"}))
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content
+            .contains("Edited a.txt: replaced 1 place (line 2)")
+            && out.content.contains("Run the checks again"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "one\n2\none\n"
+    );
+    assert!(
+        rig.progress().contains(&"edited a.txt (remote)".to_owned()),
+        "{:?}",
+        rig.progress()
+    );
+
+    let all = EditFile
+        .call(
+            &rig.ctx,
+            json!({"path": "a.txt", "old": "one", "new": "1", "replace_all": true}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        all.content.contains("replaced 2 places (lines 1, 3)"),
+        "{}",
+        all.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "1\n2\n1\n"
+    );
+    let seen = RunChecks
+        .call(&rig.ctx, json!({"command": "grep -c '^1$' a.txt"}))
+        .await
+        .unwrap();
+    assert!(seen.content.contains("2"), "{}", seen.content);
+    assert_eq!(checks_of(&seen)["passed"], true);
+}
+
+/// A try that does not match changes nothing and shows where to look, so that the next one does.
+#[tokio::test]
+async fn edit_file_that_does_not_match_shows_the_closest_region_and_changes_nothing() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    let body = "fn main() {\n    let a = 1;\n    let b = 2;\n    println!(\"{}\", a + b);\n}\n";
+    std::fs::write(dir.join("m.rs"), body).unwrap();
+    let before = worktree_state(&rig);
+
+    let out = EditFile
+        .call(
+            &rig.ctx,
+            json!({"path": "m.rs", "old": "    let a = 1;\n    let c = 2;\n", "new": "x"}),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("was not found")
+            && out.content.contains("closest region is lines 2-3")
+            && out.content.contains(">     2\t    let a = 1;")
+            && out.content.contains(">     3\t    let b = 2;")
+            && out
+                .content
+                .contains("First difference, at line 3: the file has `    let b = 2;`"),
+        "{}",
+        out.content
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("m.rs")).unwrap(), body);
+    assert_eq!(worktree_state(&rig), before);
+    // Retrying with what the error showed works.
+    let again = EditFile
+        .call(
+            &rig.ctx,
+            json!({"path": "m.rs", "old": "    let b = 2;", "new": "    let b = 3;"}),
+        )
+        .await
+        .unwrap();
+    assert!(!again.is_error, "{}", again.content);
+}
+
+#[tokio::test]
+async fn edit_file_refuses_two_places_without_replace_all_and_says_where() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    std::fs::write(dir.join("a.txt"), "x\nfoo\ny\nfoo\n").unwrap();
+    let out = EditFile
+        .call(
+            &rig.ctx,
+            json!({"path": "a.txt", "old": "foo", "new": "bar"}),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error);
+    assert!(
+        out.content.contains("2 times (starting at lines 2, 4)")
+            && out.content.contains("replace_all"),
+        "{}",
+        out.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+        "x\nfoo\ny\nfoo\n"
+    );
+}
+
+/// The rules of `write_file` hold for it: nothing outside the worktree, nothing in `.git`, no
+/// symlink, and the files it cannot edit are said.
+#[tokio::test]
+async fn edit_file_keeps_to_the_worktree_like_write_file() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = rig.worktree();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret"), "s3cr3t").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path().join("secret"), dir.join("link")).unwrap();
+    let before = worktree_state(&rig);
+
+    let mut cases = vec![
+        ("../x", "`..`"),
+        ("sub/../../x", "`..`"),
+        ("/etc/hostname", "absolute"),
+        (".git/config", ".git"),
+        (".GIT/HEAD", ".git"),
+        ("missing.txt", "does not exist"),
+    ];
+    if cfg!(unix) {
+        cases.push(("link", "symlink"));
+    }
+    for (path, expected) in cases {
+        let out = EditFile
+            .call(&rig.ctx, json!({"path": path, "old": "a", "new": "b"}))
+            .await
+            .unwrap();
+        assert!(
+            out.is_error && out.content.contains(expected),
+            "{path}: {}",
+            out.content
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("secret")).unwrap(),
+        "s3cr3t"
+    );
+    assert_eq!(worktree_state(&rig), before);
+    for args in [
+        json!({"path": "README.md", "old": "", "new": "x"}),
+        json!({"path": "README.md", "old": "widgets", "new": "widgets"}),
+    ] {
+        let out = EditFile.call(&rig.ctx, args).await.unwrap();
+        assert!(out.is_error, "{}", out.content);
+    }
+    // A scratch project is edited the same way.
+    start_scratch(&rig, "fib").await;
+    WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "fib.sh", "content": "echo 1\n", "repo": "fib"}),
+        )
+        .await
+        .unwrap();
+    let out = EditFile
+        .call(
+            &rig.ctx,
+            json!({"path": "fib.sh", "old": "echo 1", "new": "echo 2", "repo": "fib"}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        std::fs::read_to_string(slot_of(&rig, "fib").join("fib.sh")).unwrap(),
+        "echo 2\n"
+    );
+}
+
+// ------------------------------------------------ what scratch completion rests on, and the budgets
+
+/// `share_file` writes down that something was shared (a scratch run that did may end without a
+/// pull request), once however often it is shared; a refused share writes nothing.
+#[tokio::test]
+async fn share_file_notes_what_was_shared_once() {
+    let rig = Rig::new().await;
+    start_scratch(&rig, "chart").await;
+    assert!(notes_of(&rig).await.shared.is_empty());
+    let refused = ShareFile
+        .call(&rig.ctx, json!({"path": "missing.svg"}))
+        .await
+        .unwrap();
+    assert!(refused.is_error);
+    assert!(notes_of(&rig).await.shared.is_empty(), "nothing was shared");
+    WriteFile
+        .call(
+            &rig.ctx,
+            json!({"path": "chart.svg", "content": String::from_utf8_lossy(SVG)}),
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let out = ShareFile
+            .call(&rig.ctx, json!({"path": "chart.svg"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+    }
+    assert_eq!(notes_of(&rig).await.shared, ["chart/chart.svg"]);
+}
+
+fn failed(call: &str, scratch: bool) -> CheckRecord {
+    CheckRecord {
+        call_id: call.to_owned(),
+        command: "check".into(),
+        passed: false,
+        exit_code: Some(1),
+        tail: "red".into(),
+        tree: None,
+        report: None,
+        slot: None,
+        scratch,
+    }
+}
+
+/// A rig with a repository (`remote`) and a scratch project (`fib`) in its workspace, and `red`
+/// failed checks already noted: `(repository's, scratch's)`.
+async fn with_red_checks(red: (u32, u32)) -> Rig {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    start_scratch(&rig, "fib").await;
+    let run = rig.ctx.run_id().to_string();
+    let mut notes = notes_of(&rig).await;
+    for i in 0..red.0 {
+        notes.record_check(failed(&format!("r{i}"), false));
+    }
+    for i in 0..red.1 {
+        notes.record_check(failed(&format!("s{i}"), true));
+    }
+    rig.fx.env.notes.save(&run, &notes).await.unwrap();
+    rig
+}
+
+/// A repository keeps three check cycles and scratch work gets five, counted apart: the budget a
+/// call spends is the one of the slot it runs in, and a spent budget refuses only that slot.
+#[tokio::test]
+async fn scratch_work_gets_five_check_cycles_and_a_repository_three() {
+    let rig = Rig::new().await;
+    assert_eq!(
+        (
+            rig.fx.env.settings.max_check_cycles,
+            rig.fx.env.settings.scratch_check_cycles
+        ),
+        (3, 5)
+    );
+
+    // The repository's three are spent: it is refused, and the scratch project still runs.
+    let rig = with_red_checks((3, 0)).await;
+    let repo = RunChecks
+        .call(&rig.ctx, json!({"command": "true", "repo": "remote"}))
+        .await
+        .unwrap();
+    assert!(
+        repo.is_error
+            && repo
+                .content
+                .contains("Check-cycle limit reached: 3 failed check runs (limit 3)"),
+        "{}",
+        repo.content
+    );
+    let scratch = RunChecks
+        .call(&rig.ctx, json!({"command": "exit 1", "repo": "fib"}))
+        .await
+        .unwrap();
+    assert!(
+        scratch.is_error && scratch.content.contains("failed check run 1 of 5"),
+        "{}",
+        scratch.content
+    );
+
+    // Three red runs in the scratch project are not its budget; five are, and the repository,
+    // which has used none, runs with its own three.
+    let rig = with_red_checks((0, 3)).await;
+    let scratch = RunChecks
+        .call(&rig.ctx, json!({"command": "exit 1", "repo": "fib"}))
+        .await
+        .unwrap();
+    assert!(
+        scratch.content.contains("failed check run 4 of 5"),
+        "{}",
+        scratch.content
+    );
+    let rig = with_red_checks((0, 5)).await;
+    let spent = RunChecks
+        .call(&rig.ctx, json!({"command": "true", "repo": "fib"}))
+        .await
+        .unwrap();
+    assert!(
+        spent.is_error
+            && spent
+                .content
+                .contains("Check-cycle limit reached: 5 failed check runs (limit 5)"),
+        "{}",
+        spent.content
+    );
+    let repo = RunChecks
+        .call(&rig.ctx, json!({"command": "exit 1", "repo": "remote"}))
+        .await
+        .unwrap();
+    assert!(
+        repo.content.contains("failed check run 1 of 3"),
+        "{}",
+        repo.content
+    );
+
+    // The fifth red run of the scratch project is the one that says to stop, and a commit there is
+    // refused from then on.
+    let rig = with_red_checks((0, 4)).await;
+    let fifth = RunChecks
+        .call(&rig.ctx, json!({"command": "exit 1", "repo": "fib"}))
+        .await
+        .unwrap();
+    assert!(
+        fifth.content.contains("Check-cycle limit reached (5 of 5)"),
+        "{}",
+        fifth.content
+    );
+    assert!(notes_of(&rig).await.cycles_exhausted(true, 5));
+    let commit = CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: x", "repo": "fib"}))
+        .await
+        .unwrap();
+    assert!(
+        commit.is_error && commit.content.contains("Check-cycle limit reached"),
+        "{}",
+        commit.content
     );
 }

@@ -512,7 +512,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 /// Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (the
 /// repository's own devcontainer when it has one), and get its exit code and the tail of
 /// its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited
-/// check cycles and is reported as a check: never use it to look around (use run_command). A
+/// check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A
 /// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
 /// cycle, and is for the person to decide.
 #[tool]
@@ -529,33 +529,33 @@ pub async fn run_checks(
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
     };
-    let max = env.settings.max_check_cycles;
     let run = ctx.run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-
-    // A replayed call that was already counted may run again; a new call
-    // past the limit may not.
-    let replay = notes.checks.counted.iter().any(|c| c == ctx.call_id());
-    if notes.cycles_exhausted(max) && !replay {
-        let findings = notes
-            .checks
-            .last
-            .as_ref()
-            .map(|c| c.tail.clone())
-            .unwrap_or_default();
-        return Ok(ToolOutput::error(format!(
-            "Check-cycle limit reached: {} failed check runs (limit {max}). Do not run \
-             checks, commit, push or open a pull request any more. Stop now and report \
-             what you did, which check still fails, and these findings from the last run:\n{findings}",
-            notes.checks.failures
-        )));
-    }
 
     // A repository's worktree or a scratch project: the checks run on either.
     let slot = match env.slot(ctx, repo.as_deref()).await {
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
+    // Scratch work and repositories have a budget each, and a call spends the one of its slot.
+    let scratch = slot.worktree().is_none();
+    let max = env.settings.cycle_limit(scratch);
+
+    // A replayed call that was already counted may run again; a new call
+    // past the limit may not.
+    let replay = notes.checks.counted.iter().any(|c| c == ctx.call_id());
+    if notes.cycles_exhausted(scratch, max) && !replay {
+        let findings = notes
+            .last_in(scratch)
+            .map(|c| c.tail.clone())
+            .unwrap_or_default();
+        return Ok(ToolOutput::error(format!(
+            "Check-cycle limit reached: {} failed check runs (limit {max}). Do not run \
+             checks, commit, push or open a pull request any more. Stop now and report \
+             what you did, which check still fails, and these findings from the last run:\n{findings}",
+            notes.failures_in(scratch)
+        )));
+    }
     let dir = match resolve_cwd(slot.path(), cwd.as_deref().and_then(non_empty)) {
         Ok(dir) => dir,
         Err(reason) => return Ok(ToolOutput::error(reason)),
@@ -629,6 +629,7 @@ pub async fn run_checks(
         tree,
         report: Some(report),
         slot: Some(slot.dir().to_owned()),
+        scratch,
     });
     env.notes
         .save(&run, &notes)

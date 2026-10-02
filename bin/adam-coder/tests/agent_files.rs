@@ -47,12 +47,16 @@ use serde_json::json;
 /// where the limit goes and `{{display_name}}` where the name goes.
 const SNAPSHOT: &str = include_str!("fixtures/agent/prompt.txt");
 
+/// The check cycles of scratch work that [`coder`] gives the agent (the shipped default).
+const SCRATCH_CYCLES: u32 = 5;
+
 /// What the model is sent for `cycles` and the shipped name: the snapshot with both put in. The
 /// snapshot's final newline is dropped, as the loader drops it from every body
 /// (`adam-agent-fs` trims trailing whitespace).
 fn expected_prompt(cycles: u32) -> String {
     let rendered = SNAPSHOT
         .replace("{{max_check_cycles}}", &cycles.to_string())
+        .replace("{{scratch_check_cycles}}", &SCRATCH_CYCLES.to_string())
         .replace("{{display_name}}", "Coder");
     assert!(
         rendered.ends_with(".\n"),
@@ -62,16 +66,18 @@ fn expected_prompt(cycles: u32) -> String {
 }
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 18] = [
+const TOOLS: [&str; 20] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
     "request_repository",
     "create_repository",
     "run_command",
+    "run",
     "read_file",
     "write_file",
     "apply_patch",
+    "edit_file",
     "share_file",
     "delegate_to_opencode",
     "run_checks",
@@ -169,6 +175,11 @@ async fn the_prompt_equals_the_snapshot() {
         SNAPSHOT.matches("{{max_check_cycles}}").count(),
         1,
         "one limit placeholder"
+    );
+    assert_eq!(
+        SNAPSHOT.matches("{{scratch_check_cycles}}").count(),
+        1,
+        "one placeholder for the limit of scratch work"
     );
     assert!(
         SNAPSHOT.starts_with("Your name is {{display_name}}.\nIn one sentence: "),

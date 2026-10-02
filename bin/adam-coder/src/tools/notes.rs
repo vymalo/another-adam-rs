@@ -44,6 +44,10 @@ pub struct CheckRecord {
     /// before a workspace had several.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<String>,
+    /// The command ran in a scratch project, not in a repository's worktree: it counts against the
+    /// scratch budget of check cycles. Absent (false) in notes written before the two budgets.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scratch: bool,
 }
 
 /// Most check runs [`ChecksNotes::history`] keeps.
@@ -52,8 +56,12 @@ pub const MAX_CHECK_HISTORY: usize = 32;
 /// State of the check/fix cycle.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChecksNotes {
-    /// Failed `run_checks` calls so far.
+    /// Failed `run_checks` calls so far, in every kind of slot.
     pub failures: u32,
+    /// Of `failures`, those that ran in a scratch project. Scratch work and repositories each have
+    /// a budget of their own (`CoderSettings::cycle_limit`), counted apart.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub scratch_failures: u32,
     /// Call ids already counted in `failures`.
     pub counted: Vec<String>,
     /// The most recent run, in any slot.
@@ -64,6 +72,10 @@ pub struct ChecksNotes {
     /// the history existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<CheckRecord>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// The pull request the run opened.
@@ -278,7 +290,15 @@ pub struct RunNotes {
     /// branch has the run's commits, whether or not the pull request could be reported.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub published: bool,
+    /// The files this run showed the person (`share_file`), as `<slot>/<path>`, in the order they
+    /// were first shared. A scratch run that shared a file delivered what it was asked for, and may
+    /// end without a pull request (see `CoderAgent`); sharing one file again notes it once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared: Vec<String>,
 }
+
+/// Most shared files [`RunNotes::shared`] lists.
+pub const MAX_SHARED: usize = 64;
 
 impl RunNotes {
     /// The check that decides for the code with tree id `tree`: **the most recent run, in any
@@ -430,18 +450,59 @@ impl RunNotes {
         self.checks.last.as_ref().is_some_and(|c| !c.passed)
     }
 
-    /// Whether the cycle limit is used up: `max` failures and the last run red.
-    pub fn cycles_exhausted(&self, max: u32) -> bool {
-        self.checks.failures >= max && self.last_check_failed()
+    /// Failed check runs of one kind of work: in scratch projects, or in repositories.
+    pub fn failures_in(&self, scratch: bool) -> u32 {
+        if scratch {
+            self.checks.scratch_failures
+        } else {
+            self.checks
+                .failures
+                .saturating_sub(self.checks.scratch_failures)
+        }
+    }
+
+    /// The most recent check run of one kind of work, in any slot of that kind.
+    pub fn last_in(&self, scratch: bool) -> Option<&CheckRecord> {
+        let checks = &self.checks;
+        // Notes from before the history have only `last`.
+        let legacy = checks.last.iter().filter(|_| checks.history.is_empty());
+        checks
+            .history
+            .iter()
+            .rev()
+            .chain(legacy)
+            .find(|record| record.scratch == scratch)
+    }
+
+    /// Whether the budget of one kind of work is used up: `max` failures in it and its last run
+    /// red. Scratch projects and repositories are counted apart (see
+    /// [`CoderSettings::cycle_limit`](super::CoderSettings::cycle_limit)).
+    pub fn cycles_exhausted(&self, scratch: bool, max: u32) -> bool {
+        self.failures_in(scratch) >= max && self.last_in(scratch).is_some_and(|c| !c.passed)
+    }
+
+    /// Note that the run shared `entry` (`<slot>/<path>`); returns whether it was new. A repeat, or
+    /// a file beyond [`MAX_SHARED`], changes nothing (what is kept only has to say that something
+    /// was shared).
+    pub fn record_shared(&mut self, entry: &str) -> bool {
+        if self.shared.len() >= MAX_SHARED || self.shared.iter().any(|s| s == entry) {
+            return false;
+        }
+        self.shared.push(entry.to_owned());
+        true
     }
 
     /// Record a check run. A failed call counts once, however often it is
-    /// replayed. Returns the failure count afterwards.
+    /// replayed. Returns the failure count of its kind of work afterwards.
     pub fn record_check(&mut self, record: CheckRecord) -> u32 {
         if !record.passed && !self.checks.counted.contains(&record.call_id) {
             self.checks.counted.push(record.call_id.clone());
             self.checks.failures += 1;
+            if record.scratch {
+                self.checks.scratch_failures += 1;
+            }
         }
+        let scratch = record.scratch;
         // A call that runs again (a replay) replaces its own record instead of crowding the history.
         self.checks.history.retain(|r| r.call_id != record.call_id);
         self.checks.history.push(record.clone());
@@ -450,7 +511,7 @@ impl RunNotes {
             self.checks.history.drain(..extra);
         }
         self.checks.last = Some(record);
-        self.checks.failures
+        self.failures_in(scratch)
     }
 }
 
@@ -544,6 +605,7 @@ mod tests {
             tree: Some("t1".into()),
             report: None,
             slot: None,
+            scratch: false,
         }
     }
 
@@ -554,12 +616,98 @@ mod tests {
         assert_eq!(notes.record_check(record("c1", false)), 1, "same call id");
         assert_eq!(notes.record_check(record("c2", false)), 2);
         assert!(notes.last_check_failed());
-        assert!(notes.cycles_exhausted(2));
-        assert!(!notes.cycles_exhausted(3));
+        assert!(notes.cycles_exhausted(false, 2));
+        assert!(!notes.cycles_exhausted(false, 3));
         notes.record_check(record("c3", true));
         assert!(!notes.last_check_failed());
-        assert!(!notes.cycles_exhausted(2), "green now");
+        assert!(!notes.cycles_exhausted(false, 2), "green now");
         assert_eq!(notes.checks.failures, 2, "cumulative");
+    }
+
+    fn scratch(call: &str, passed: bool) -> CheckRecord {
+        CheckRecord {
+            scratch: true,
+            slot: Some("scratch".into()),
+            ..record(call, passed)
+        }
+    }
+
+    /// Scratch work and repositories each have a budget, counted apart: failures of one never use
+    /// the other's, and each budget is judged by the last run of its own kind.
+    #[test]
+    fn scratch_work_and_repositories_are_counted_apart() {
+        let mut notes = RunNotes::default();
+        for i in 0..4 {
+            notes.record_check(scratch(&format!("s{i}"), false));
+        }
+        assert_eq!(notes.failures_in(true), 4);
+        assert_eq!(notes.failures_in(false), 0);
+        assert_eq!(notes.checks.failures, 4, "the total is still the total");
+        assert!(!notes.cycles_exhausted(true, 5));
+        assert!(notes.cycles_exhausted(true, 4));
+        assert!(
+            !notes.cycles_exhausted(false, 3),
+            "a repository has used none"
+        );
+
+        // Repository failures do not touch the scratch count, and are the repository's alone.
+        notes.record_check(record("r1", false));
+        notes.record_check(record("r2", false));
+        assert_eq!((notes.failures_in(true), notes.failures_in(false)), (4, 2));
+        assert!(!notes.cycles_exhausted(false, 3));
+        assert!(notes.record_check(record("r3", false)) == 3);
+        assert!(notes.cycles_exhausted(false, 3));
+        // Each kind is judged by its own last run: a green scratch run does not clear the
+        // repository's red one, and the repository's red one does not make scratch work red.
+        notes.record_check(scratch("s4", true));
+        assert!(
+            notes.cycles_exhausted(false, 3),
+            "the repository's last run is red"
+        );
+        assert!(
+            !notes.cycles_exhausted(true, 4),
+            "the scratch project's is green"
+        );
+        assert_eq!(notes.last_in(true).unwrap().call_id, "s4");
+        assert_eq!(notes.last_in(false).unwrap().call_id, "r3");
+        // A replay of a failed scratch call counts once.
+        assert_eq!(notes.record_check(scratch("s0", false)), 4);
+    }
+
+    #[test]
+    fn notes_written_before_the_two_budgets_count_as_repository_work() {
+        let notes: RunNotes = serde_json::from_value(serde_json::json!({
+            "checks": {"failures": 2, "counted": ["a", "b"], "last": {
+                "call_id": "b", "command": "x", "passed": false, "exit_code": 1, "tail": ""
+            }}
+        }))
+        .unwrap();
+        assert_eq!((notes.failures_in(false), notes.failures_in(true)), (2, 0));
+        assert!(notes.cycles_exhausted(false, 2));
+        assert!(!notes.cycles_exhausted(true, 1));
+    }
+
+    #[test]
+    fn a_shared_file_is_noted_once_and_the_list_has_a_limit() {
+        let mut notes = RunNotes::default();
+        assert!(notes.record_shared("scratch/chart.svg"));
+        assert!(
+            !notes.record_shared("scratch/chart.svg"),
+            "sharing it again changes nothing"
+        );
+        assert!(notes.record_shared("scratch/report.md"));
+        assert_eq!(notes.shared, ["scratch/chart.svg", "scratch/report.md"]);
+        for i in 0..MAX_SHARED * 2 {
+            notes.record_shared(&format!("scratch/f{i}"));
+        }
+        assert_eq!(notes.shared.len(), MAX_SHARED);
+        // Notes written before the list have none.
+        assert!(
+            serde_json::from_str::<RunNotes>("{}")
+                .unwrap()
+                .shared
+                .is_empty()
+        );
     }
 
     fn on_tree(call: &str, tree: &str, passed: bool, slot: &str) -> CheckRecord {

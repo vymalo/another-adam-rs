@@ -6,8 +6,9 @@
 //! | `start_scratch { name? }`, `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | [`scratch`] |
 //! | `request_repository { repo_url, reason }` | [`consent`] |
 //! | `create_repository { owner, name, private?, description? }` | [`create`] |
-//! | `run_command { command, cwd? }` | [`inspect`] |
-//! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `apply_patch { patch }` | [`files`] |
+//! | `run_command { command, cwd? }`: look around, changes undone | [`inspect`] |
+//! | `run { command, cwd? }`: make something with a command, changes kept, never a check | [`make`] |
+//! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `edit_file { path, old, new, replace_all? }`, `apply_patch { patch }` | [`files`] |
 //! | `share_file { path, repo?, name? }` | [`share`]: a file of the workspace, shown to the person as a file artifact |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
 //! | `run_checks { command }` | [`checks`] |
@@ -37,6 +38,11 @@
 //!   branch an earlier task opened it for, or the call is repeated), and
 //!   `CodeHost::open_pull_request` returns it instead of a second one in any case.
 //! * `run_checks`: failures are counted per call id ([`notes`]).
+//! * `run`: a command that was killed or never recorded runs again and makes the same files (it
+//!   is for commands that can run twice, as every build is); it writes nothing to the notes.
+//! * `edit_file`: the replacement is exact and the file is written whole, so a repeat after a
+//!   crash finds `old` gone and says so (the result of the first call is what the model had).
+//! * `share_file`: shares the file again and notes it once (`RunNotes::shared`).
 //! * `rebuild_environment`: throwing the environment away and making it again twice is the same as once (the
 //!   second call finds the first one's result and makes it once more, which costs time and nothing else); a
 //!   choice of the default image is kept in the notes and in the environment's own state, and a repeat of it
@@ -58,7 +64,7 @@
 //! the conversation and never from the model). It continues a branch only if a
 //! `commit_and_push` of the conversation recorded it in the notes, which the agent carries from
 //! the run it continues, and as a fallback read from the result text, `publish::pushed_in`),
-//! after `MAX_CHECK_CYCLES` failed check runs `run_checks` refuses to run, and
+//! after `MAX_CHECK_CYCLES` failed check runs in repositories (`SCRATCH_CHECK_CYCLES` in scratch projects, counted apart) `run_checks` refuses to run, and
 //! `open_pull_request` refuses unless the most recent check run of exactly the
 //! code the pull request contains (the tree of the pushed `HEAD`, whichever slot of the
 //! workspace ran it: [`notes::RunNotes::checked`]) passed, or the model
@@ -100,6 +106,7 @@ pub mod environment;
 pub mod files;
 mod gitcli;
 pub mod inspect;
+pub mod make;
 pub mod named;
 pub mod notes;
 pub mod prepare;
@@ -127,8 +134,11 @@ pub(crate) fn cancelled(what: &str) -> ToolError {
 /// Tunables of the tools.
 #[derive(Debug, Clone)]
 pub struct CoderSettings {
-    /// Failed `run_checks` calls after which the agent must stop.
+    /// Failed `run_checks` calls in repositories after which the agent must stop.
     pub max_check_cycles: u32,
+    /// The same for scratch projects, which are counted apart: building something new takes more
+    /// tries than a change to a project that has checks of its own.
+    pub scratch_check_cycles: u32,
     /// Time limit of one `run_checks` command.
     pub check_timeout: Duration,
     /// Bytes of output tail `run_checks` returns.
@@ -151,12 +161,22 @@ pub struct CoderSettings {
 }
 
 impl CoderSettings {
-    /// Defaults: 3 cycles, 15 minutes and 16 KiB per check run, the
+    /// The check-cycle budget of one kind of work: a scratch project's, or a repository's.
+    pub fn cycle_limit(&self, scratch: bool) -> u32 {
+        if scratch {
+            self.scratch_check_cycles
+        } else {
+            self.max_check_cycles
+        }
+    }
+
+    /// Defaults: 3 check cycles in a repository and 5 in a scratch project, 15 minutes and 16 KiB per check run, the
     /// `adam-coder` identity, ready-for-review pull requests, `github.com` for `owner/name`, and no
     /// owner a repository may be created for.
     pub fn new(opencode: OpenCodeLaunch) -> Self {
         Self {
             max_check_cycles: 3,
+            scratch_check_cycles: 5,
             check_timeout: Duration::from_secs(900),
             check_output_tail: 16 * 1024,
             identity: GitIdentity::new("adam-coder", "adam-coder@users.noreply.github.com"),
@@ -408,7 +428,7 @@ pub(crate) fn resolve_slot(
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the fifteen of the coding workflow,
+/// Every coder tool, in the order they are offered to the model: the seventeen of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
@@ -430,9 +450,11 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         consent::RequestRepository,
         create::CreateRepository,
         inspect::RunCommand,
+        make::Run,
         files::ReadFile,
         files::WriteFile,
         files::ApplyPatch,
+        files::EditFile,
         share::ShareFile,
         delegate::DelegateToOpenCode,
         checks::RunChecks,

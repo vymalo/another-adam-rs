@@ -47,7 +47,7 @@ use adam::prelude::*;
 use adam_runtime::{Artifact, MAX_ARTIFACT_FILE_BYTES};
 
 use super::files::{Access, confine};
-use super::{Outcome, ToolEnv, non_empty};
+use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// Longest name of a shared file's artifact, in characters.
 const MAX_NAME_CHARS: usize = 120;
@@ -112,17 +112,26 @@ pub async fn share_file(
         shared.media_type
     );
     // The name or the type may still be refused by the artifact (a filename with a control character).
-    Ok(
-        match Artifact::file(
-            shared.name,
-            shared.media_type,
-            shared.filename,
-            shared.bytes,
-        ) {
-            Ok(artifact) => ToolOutput::text(line).with_artifact(artifact),
-            Err(e) => ToolOutput::error(e.to_string()),
-        },
-    )
+    let artifact = match Artifact::file(
+        shared.name,
+        shared.media_type,
+        shared.filename,
+        shared.bytes,
+    ) {
+        Ok(artifact) => artifact,
+        Err(e) => return Ok(ToolOutput::error(e.to_string())),
+    };
+    // The run delivered something: a scratch run that ends here may complete without a pull
+    // request (`CoderAgent`). Noted once however often the file is shared.
+    let run = ctx.run_id().to_string();
+    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    if notes.record_shared(&format!("{}/{}", slot.dir(), path)) {
+        env.notes
+            .save(&run, &notes)
+            .await
+            .map_err(|e| notes_error(&e))?;
+    }
+    Ok(ToolOutput::text(line).with_artifact(artifact))
 }
 
 /// Read `rel` under `root` for sharing, or the reason the model is told.

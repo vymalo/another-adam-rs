@@ -1,0 +1,24 @@
+{
+  "name": "run",
+  "description": "Make something with a shell command in your worktree and keep what it changes: generate or export a file (`npm run render`, `python chart.py`, `convert a.png b.jpg`), install a project's dependencies, run a formatter, build an artifact. It runs in the workspace's environment (the repository's own devcontainer when it has one, so its tools are there), with the same time limit as the checks, and you get the exit code, the tail of the output and the files that changed. Unlike run_command (for looking, it undoes changes) the files stay, and unlike run_checks it is not a check: it costs no check cycle and the pull request gate never sees it. It cannot touch git: a command that changes HEAD, the branch, a ref, .git or the git configuration is undone completely and refused, so commit with commit_and_push. After it changes the files, run the project's checks again before you commit. Show the person a file it made with share_file.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree, in the workspace's environment"
+      },
+      "cwd": {
+        "type": "string",
+        "description": "Optional sub-directory of the worktree to run in (relative, inside the worktree)"
+      },
+      "repo": {
+        "type": "string",
+        "description": "The slot to run in: its name, or the repository's address. Leave out when the workspace has one."
+      }
+    },
+    "required": [
+      "command"
+    ]
+  }
+}

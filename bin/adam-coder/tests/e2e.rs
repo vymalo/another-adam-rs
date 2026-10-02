@@ -501,9 +501,11 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "request_repository",
             "create_repository",
             "run_command",
+            "run",
             "read_file",
             "write_file",
             "apply_patch",
+            "edit_file",
             "share_file",
             "delegate_to_opencode",
             "run_checks",
@@ -724,6 +726,169 @@ async fn the_coder_shares_the_svg_it_made_as_an_a2a_file_artifact(store: DynStor
     );
     // The pull request is for the code the checks passed on, as ever.
     assert_eq!(fx.created_pulls().await.len(), 1);
+}
+
+/// The result of the tool call `id`, as the model was told it (the history the mock was sent).
+fn told(mock: &MockModel, id: &str) -> String {
+    mock.requests()
+        .iter()
+        .flat_map(|r| r.messages.iter())
+        .find_map(|m| match m {
+            adam_model::Message::Tool {
+                call_id, content, ..
+            } if call_id == id => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no result for {id}"))
+}
+
+const CHART: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"><rect width=\"8\" height=\"8\"/></svg>\n";
+
+/// The scratch script of the next tests: a command that makes `chart.svg`.
+fn push_a_chart_in_scratch(mock: &MockModel) {
+    mock.push_tool_calls(vec![call("c1", "start_scratch", json!({"name": "chart"}))])
+        .push_tool_calls(vec![call(
+            "c2",
+            "write_file",
+            json!({"path": "render.sh", "content": format!("printf '%s' '{}' > chart.svg\n", CHART.trim_end())}),
+        )])
+        .push_tool_calls(vec![call("c3", "run", json!({"command": "sh render.sh"}))]);
+}
+
+/// The owner's case (2026-10-02): the person asks for a result, not for a change to a repository.
+/// The coder builds it in a scratch project, makes the file with `run` (which is not a check),
+/// shares it and says so in a reply: the run **completes**, with the file as an artifact and no
+/// pull request, instead of waiting for an answer that nobody needs to give.
+async fn a_scratch_run_that_made_and_shared_a_file_completes_without_a_pull_request(
+    store: DynStore,
+) {
+    let fx = Fixture::with("never used\n", |s| {
+        s.opencode = OpenCodeLaunch::program("/nonexistent/opencode-must-not-run");
+    })
+    .await;
+    let mock = Arc::new(MockModel::new());
+    push_a_chart_in_scratch(&mock);
+    mock.push_tool_calls(vec![call(
+        "c4",
+        "share_file",
+        json!({"path": "chart.svg", "name": "Chart"}),
+    )])
+    .push_text("Here is the chart. If you name a repository I can put the project in it.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "Draw me a small black square as an SVG file.").await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        seen.labels
+    );
+
+    // The file reached the client whole, once; nothing else was handed over.
+    let files: Vec<_> = seen
+        .artifacts
+        .iter()
+        .filter(|(n, _)| n == "Chart")
+        .collect();
+    assert_eq!(files.len(), 1, "{:?}", seen.labels);
+    let part = &files[0].1.parts[0];
+    assert_eq!(
+        part.content,
+        a2a::PartContent::Raw(CHART.trim_end().as_bytes().to_vec())
+    );
+    assert_eq!(part.media_type.as_deref(), Some("image/svg+xml"));
+    assert_eq!(part.filename.as_deref(), Some("chart.svg"));
+    assert!(
+        seen.artifacts
+            .iter()
+            .all(|(name, _)| name != "checks" && name != "pull_request"),
+        "run is no check, and nothing was opened: {:?}",
+        seen.labels
+    );
+    assert!(fx.created_pulls().await.is_empty());
+
+    // What the model was told: the command ran and made the file, and the share was one line.
+    let ran = told(&mock, "c3");
+    assert!(
+        ran.contains("exit code 0") && ran.contains("?? chart.svg"),
+        "{ran}"
+    );
+    assert!(told(&mock, "c4").starts_with("Shared chart.svg ("));
+    // The run's notes: something was shared, and no check was ever recorded.
+    let run = run_id(&seen.task_id);
+    let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
+    assert_eq!(notes.shared, ["chart/chart.svg"]);
+    assert!(notes.checks.history.is_empty() && notes.checks.failures == 0);
+    assert!(notes.pull_request.is_none());
+    let view = server
+        .coder
+        .runtime
+        .view(run)
+        .await
+        .unwrap()
+        .expect("run exists");
+    assert_eq!(view.status, RunStatus::Done, "{:?}", view.error);
+}
+
+/// A file that was made and not shared is not delivered: the run waits for the person, as ever,
+/// and the reply that ends the turn is the question it parks on.
+async fn a_scratch_file_that_was_not_shared_does_not_complete_the_run(store: DynStore) {
+    let fx = Fixture::new("never used\n").await;
+    let mock = Arc::new(MockModel::new());
+    push_a_chart_in_scratch(&mock);
+    let reply = "chart.svg is made. Do you want it shown to you?";
+    mock.push_text(reply);
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(&server, "Draw me a small black square as an SVG file.").await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    assert!(seen.saw_message(reply), "{:#?}", seen.messages);
+    assert!(seen.artifacts.iter().all(|(name, _)| name != "chart.svg"));
+}
+
+/// Repository work still needs its pull request: a file shared from a repository's worktree, or
+/// from a scratch project of a run in which the person named a repository, does not end the run.
+async fn a_run_in_a_repository_that_shared_a_file_but_opened_no_pull_request_still_waits(
+    store: DynStore,
+) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "r1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call("r2", "share_file", json!({"path": "README.md"}))]);
+    let reply = "That is the README. Shall I change it?";
+    mock.push_text(reply);
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(
+        &server,
+        &format!(
+            "Show me the README of {} (base branch main)",
+            fx.remote_url()
+        ),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "{:?}",
+        seen.labels
+    );
+    assert!(seen.saw_message(reply), "{:#?}", seen.messages);
 }
 
 /// The issue's path, through the runtime: the person gives a task and no repository, the coder
@@ -4260,6 +4425,9 @@ macro_rules! coder_suite {
                 add_hello_txt_streams_working_progress_checks_artifact_completed,
                 the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request,
                 the_coder_shares_the_svg_it_made_as_an_a2a_file_artifact,
+                a_scratch_run_that_made_and_shared_a_file_completes_without_a_pull_request,
+                a_scratch_file_that_was_not_shared_does_not_complete_the_run,
+                a_run_in_a_repository_that_shared_a_file_but_opened_no_pull_request_still_waits,
                 a_scratch_project_is_published_to_the_repository_the_person_names,
                 ask_user_parks_and_an_a2a_follow_up_resumes,
                 a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,

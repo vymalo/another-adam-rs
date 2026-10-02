@@ -1,6 +1,6 @@
 {
   "name": "apply_patch",
-  "description": "Apply a unified diff to the worktree: one or several files, `--- a/<path>` and `+++ b/<path>` then hunks (`@@ -12,3 +12,4 @@`, with context lines), as `git diff` writes them. Every path is checked first (inside the worktree, not `.git`, not a symlink); a patch that creates a symlink is refused; and it is all or nothing: if a hunk does not match the file, nothing is changed and you are told why. Read the file first, so the context lines match it exactly. Use it for small, well-located changes; delegate broad, multi-file changes to OpenCode.",
+  "description": "Apply a unified diff to the worktree: one or several files, `--- a/<path>` and `+++ b/<path>` then hunks (`@@ -12,3 +12,4 @@`, with context lines), as `git diff` writes them. Every path is checked first (inside the worktree, not `.git`, not a symlink); a patch that creates a symlink is refused; and it is all or nothing: if a hunk does not match the file, nothing is changed and you are told why. Read the file first, so the context lines match it exactly. Use it for several changes at once, in one file or several; for one exact replacement edit_file is simpler. Delegate broad, multi-file changes to OpenCode.",
   "parameters": {
     "type": "object",
     "properties": {
