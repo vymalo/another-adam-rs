@@ -273,6 +273,30 @@ asks for `complete` as before (for a model client that cannot stream, or a provi
   delivers nothing) puts the stream in `PendingQuestion::stream`, so the `input-required` status that carries the question
   says which stream its text was.
 
+## Messages sent while the run works
+
+A message delivered to a run while it steps (`steer/v1` on the A2A side, [ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md))
+is read at **the run's next step**: every `step` drains the inbox first and puts each user text in the history, behind the
+result of a tool call that is still owed (`deferred`, as before), so the model reads it at its next turn and never in the
+middle of a call. What is new is the end of the run:
+
+* **A final answer is not the last word while a message is unread.** After the model answers with no tool call, the step asks
+  the runtime whether a message arrived meanwhile (`Ctx::arrived`). If one did, the answer is kept in the history and said as
+  the words of a turn that goes on (`agent_text` with its stream's id), the step returns `Continue`, and the next one reads the
+  message and calls the model again: the answer to a message sent during the final model call reflects it. **The window between
+  that check and the commit** is closed by the runtime: the agent calls `Ctx::reopen_on_arrival()` in every step, so a `Done`
+  committed past a message that arrived after the check becomes a `Continue` (see `adam-runtime`).
+* **An answer recorded before a message the run read is dropped.** The recorded model step carries `seen`, how long the history
+  was when the call was made (`Recorded`, a serde default: a journal written before it reads as "current"). A transition that
+  replays the step (the commit that followed the recording was lost) and has read a message that came in between sees a longer
+  history, drops the stale answer (its text is not said, it is not kept) and calls the model again with the message in front.
+  An answer that asks for tool calls is not dropped: the calls are valid, and the next turn reads the message.
+* **A message is read once.** `Conversation::read_ids` keeps the ids (`Inbound::id`, an A2A `messageId`) of the last
+  `MAX_READ_IDS` (128) messages the run has read, oldest first, and a message whose id is there is ignored, whether it is
+  still in the inbox or was read transitions ago: the orchestration layer repeats a steer after a lost lease. An empty id is
+  never remembered. Part of the durable state (serde default, not written while empty); a run that continues another starts
+  with none.
+
 ## Cancel
 
 `Runtime::cancel` fails the run and fires the step's `CancelToken`. The model call listens to it: the journaled step
@@ -398,6 +422,13 @@ invalid params.
 No environment variables.
 
 ## Tests
+
+`tests/steer.rs`: a message sent while a tool runs is the first thing the model reads after the tool's result; **a message sent
+during the final model call is answered** (a second model turn whose request has the first answer and the message after it,
+the run's answer the second one); no message, no extra turn; the same message sent three times is read once and another
+message is read; a recorded answer that predates a message read in the next transition is dropped and not said; a journal
+from before `seen` reads as current; state from before `read_ids` loads. Memory always, PostgreSQL when
+`ADAM_TEST_POSTGRES_URL` is set; models and tools are held at gates, nothing sleeps. `src/conversation.rs` bounds the ids.
 
 `tests/child_runs.rs` is the child-run suite (one case per failure interleaving, see *Child runs*), run against
 `MemoryStore` always, against PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set and against MongoDB when

@@ -5,6 +5,8 @@ Status: **Accepted** (2026-10-01), decided on the owner's delegation; the owner 
 entries gains `mentions/v1`; a source can say more about its tools than a spec (`ToolSource::listing`, kept with the model's answer,
 not a step of its own, so "Journaling the tool listing" below still stands), add words to the instructions, and a call waits as long
 as the tool says, capped, with a stable `callId`.
+*Amended 2026-10-02 ([ADR 0016](0016-a-message-sent-to-a-working-task-is-steered-into-it.md)):* decision 8's list of card entries
+gains `steer/v1`; a message sent to a running task is read at its next step, and a message of the run is read once.
 Builds on [ADR 0001](0001-library-first-host-roles.md) (libraries first, binaries compose),
 [ADR 0003](0003-a-new-task-continues-the-task-it-references.md) (a new task carries the conversation) and
 [ADR 0005](0005-one-binary-serves-any-agent-folder.md) (`adam-agent`). The other side of the contract is the
