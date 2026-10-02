@@ -52,6 +52,7 @@ sequenceDiagram
 | `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
+| `share_file { path, repo?, name? }` | shows the person **a file of the workspace**: the file is read in this process (confined like `read_file`: relative to the slot, no `..`, nothing inside `.git`, a symlink only while it stays inside the worktree), must be a regular file of at most 4 MiB, and comes back as a **file artifact** with its media type and filename; the model's result is one line, `Shared chart.svg (1.2 KiB, image/svg+xml).`, never the bytes. It works on what a command made inside the repository's devcontainer too (the workspace is one directory). See [Sharing a file](#sharing-a-file) and [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md). Progress line: `sharing <path> (<slot>)` |
 | `delegate_to_opencode { instructions, repo? }` | spawns the ACP agent in the worktree of the slot, as the run's environment prepared the command ([below](#where-the-processes-of-a-run-run); `ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
 | `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
 | `rebuild_environment { use_default? }` | the way out of a **broken work environment**, once the person has decided ([below](#the-work-environment-the-repositorys-devcontainer)): the run's environment is thrown away and made again now (its steps are shown under this call, and a failure is this call's result), from the repository's file as it is (`{}`) or, with `use_default: true`, from the default image for the rest of the run. The decision is the person's, so the tool is for the model to call only after it has asked (`ask_user`); the choice is kept in the run's notes (`environment.use_default`) and in the environment's own state. With no container runtime there is nothing to rebuild and it says so. Where the commands run in this container it changes nothing |
@@ -61,13 +62,13 @@ sequenceDiagram
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the seventeen. The shipped folder's own `mcp.json` adds
+folder](#mcp-tools-from-the-folder)); they are not part of the eighteen. The shipped folder's own `mcp.json` adds
 twelve **read-only** tools of GitHub, `github__get_me`, `github__get_file_contents`, `github__list_branches` and the
 rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)).
 
-Fourteen tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the fourteen is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Fifteen tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the fifteen is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
 `tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor`, and
@@ -170,13 +171,15 @@ task that carries `[mock:choices]` (`dev/wiremock/mock-openai/mappings/coder-cho
 
 A run reports its work as A2A artifacts (`adam_a2a_runtime::artifact_of`): one data part of media type
 `application/json`, with an id derived from the content, so a replayed step's artifact carries the same id and a
-subscriber sees it once.
+subscriber sees it once. The exception is a file the coder shares with `share_file`: its artifact is one `raw` part
+(see [Sharing a file](#sharing-a-file)).
 
 | Name | From | Data |
 |---|---|---|
 | `checks` | every `run_checks` call that ran its command, and `commit_and_push` (bound, below) | `passed`, `commit`, `tree?`, `summary?`, `findings?` (below) |
 | `branch` | `commit_and_push`, after its bound `checks` | `repository`, `branch` (the branch the commit was pushed to: the run's own), `base_branch`, `commit`, and `continues` when the run continues another branch that the commit has not been published to yet (it is, by `open_pull_request`, after the gate) |
 | `pull_request` | `open_pull_request` | `url`, `number` (a string), `branch`, `repository`, then an A2A `url` part |
+| the file's own name (or the `name` the model gave) | `share_file` | no data: one `raw` part, the bytes, with `mediaType` and `filename` ([below](#sharing-a-file)) |
 
 **`checks`** is what an orchestrator gates on. Its data part:
 
@@ -440,6 +443,36 @@ stateDiagram-v2
 Limits: 256 KiB of a file read, 1 MiB of content or patch. The checks and the write are not one atomic step; the tools of
 a run are called one at a time and what a command leaves running is killed with it, and a write goes to a new file that is
 renamed over its target, which replaces a symlink that appeared meanwhile instead of following it.
+
+### Sharing a file
+
+A reply holds text, cards and diagrams; a picture, an export or a report is a file. `share_file { path, repo?, name? }`
+(`src/tools/share.rs`) reads one file of the workspace and returns it as a **file artifact**
+([ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): `adam_runtime::Artifact::file(name, media_type, filename, bytes)`,
+which the A2A server serves as one `raw` part with `mediaType` and `filename`. A plain A2A client gets a standard
+artifact; the orchestration layer keeps the bytes in its artifact store and shows them.
+
+* **The path** is confined by the rule of `read_file` (`confine(.., Access::Read)`): relative to the root of the slot, no
+  `..`, nothing inside `.git` (any case), and a symlink is followed only while it stays inside the worktree. A directory, a
+  file that is not a regular file (a pipe), a missing file and a file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`) are results
+  for the model, which can shrink the file or tell the person. The bytes are read up to the cap plus one, so a file that grows
+  under the call is refused, not cut. The workspace is one directory whatever environment the commands run in, so a file a
+  command made in the repository's devcontainer is shared like one the coder wrote.
+* **The media type** is derived from the extension and **checked against the bytes for images** (`media_type_of`): `.png`
+  must start with the PNG signature, `.jpg` with JPEG's, `.gif`, `.webp`, and `.svg` must hold an `<svg` element after any
+  declaration, doctype or comment. A file whose extension and bytes disagree (a PNG named `.txt`, an HTML page named `.png`)
+  and one with an extension the table does not know are `application/octet-stream`; with no known extension, an image is the
+  image its bytes say. The orchestration layer sniffs again on its side.
+* **The model reads one line**, `Shared <filename> (<size>, <type>).`; the bytes are in the artifact only, never in the
+  history, the step's output or the run's final output (which lists the artifact's name, type and size).
+* **Bounded.** A run keeps at most 6 MiB of files in all (`MAX_RUN_FILE_BYTES`, enforced by the agent loop: a file that would
+  go over is not shared and the result, marked as an error, says so), because a file is journaled with the run.
+* **Scrubbed.** The coder's tools are wrapped by its `Redactor`; a file that is valid UTF-8 has the values the redactor knows
+  taken out of it, and a file that is not text is left as it is.
+
+Tests: the path and media-type rules in `src/tools/share.rs`; the tool against a worktree, a command's output and the
+redacting wrapper in `tests/tools.rs` (`share_file_*`); the whole chain, through the runtime on both stores and over A2A, in
+`tests/e2e.rs` (`the_coder_shares_the_svg_it_made_as_an_a2a_file_artifact`).
 
 ### The workspace of a run
 

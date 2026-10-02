@@ -245,7 +245,27 @@ pub(crate) fn task_from_view(view: &RunView, context_id: &str, prompt: &PromptFn
 /// A2A v1 `a2a.proto`: "a `url` pointing to the file's content") carrying that
 /// URL, so a client shows a link where it would otherwise show JSON. The data
 /// part is unchanged, and the artifact id does not depend on the extra part.
+///
+/// **A file is a file.** A file artifact ([`adam_runtime::Artifact::file`]) becomes one A2A `raw`
+/// part (`Part.raw` of the A2A v1 `a2a.proto`: the bytes, base64 in JSON) with the `mediaType`
+/// and the `filename`, and nothing else: no extension is needed, a plain A2A client gets a
+/// standard artifact. The artifact id is derived from the file's digest, not from its bytes
+/// serialized, so it costs one pass over them.
 pub fn artifact_of(artifact: &adam_runtime::Artifact) -> Artifact {
+    if let Some(file) = &artifact.file {
+        let mut part = Part::raw(file.bytes.clone()).with_filename(file.filename.clone());
+        if let Some(mime) = &artifact.mime_type {
+            part = part.with_media_type(mime.clone());
+        }
+        return Artifact {
+            artifact_id: artifact_id(artifact),
+            name: Some(artifact.name.clone()),
+            description: None,
+            parts: vec![part],
+            metadata: None,
+            extensions: None,
+        };
+    }
     let part = match &artifact.data {
         Value::String(s) => Part::text(s.clone()),
         other => Part::data(other.clone()),
@@ -286,18 +306,37 @@ fn link_of(data: &Value) -> Option<&str> {
 }
 
 /// Content-derived artifact id: `<name>-<12 hex digits>`.
+///
+/// For a file the digest covers its filename and the digest of its bytes, so two files that differ
+/// by one byte have two ids and the same file twice has one.
 pub fn artifact_id(artifact: &adam_runtime::Artifact) -> String {
-    let digest = Sha256::digest(
-        serde_json::to_vec(&(&artifact.name, &artifact.mime_type, &artifact.data))
+    let digest = match &artifact.file {
+        Some(file) => Sha256::digest(
+            serde_json::to_vec(&(
+                &artifact.name,
+                &artifact.mime_type,
+                &file.filename,
+                hex(&Sha256::digest(&file.bytes)),
+            ))
             .unwrap_or_default(),
-    );
-    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+        ),
+        None => Sha256::digest(
+            serde_json::to_vec(&(&artifact.name, &artifact.mime_type, &artifact.data))
+                .unwrap_or_default(),
+        ),
+    };
+    let hex: String = hex(&digest[..6]);
     let name: String = artifact
         .name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     format!("{name}-{hex}")
+}
+
+/// Lowercase hex of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Conversation id under which a caller's context is stored: the subject is
@@ -523,11 +562,7 @@ mod tests {
 
     #[test]
     fn an_a2ui_artifact_is_marked_in_both_spellings() {
-        let artifact = artifact_of(&RunArtifact {
-            name: "ui".into(),
-            mime_type: Some(A2UI_MEDIA_TYPE.into()),
-            data: ui(),
-        });
+        let artifact = artifact_of(&RunArtifact::new("ui", Some(A2UI_MEDIA_TYPE.into()), ui()));
         let part = &artifact.parts[0];
         assert_eq!(part.media_type.as_deref(), Some(A2UI_MEDIA_TYPE));
         assert_eq!(
@@ -536,21 +571,21 @@ mod tests {
         );
         assert_eq!(part.content, a2a::PartContent::Data(ui()));
         // Any other artifact carries no part metadata.
-        let other = artifact_of(&RunArtifact {
-            name: "d".into(),
-            mime_type: Some("application/json".into()),
-            data: json!({"k": 1}),
-        });
+        let other = artifact_of(&RunArtifact::new(
+            "d",
+            Some("application/json".into()),
+            json!({"k": 1}),
+        ));
         assert!(other.parts[0].metadata.is_none());
     }
 
     #[test]
     fn artifacts_map_to_text_or_data_parts_with_stable_ids() {
-        let text = RunArtifact {
-            name: "pull request".into(),
-            mime_type: Some("text/uri-list".into()),
-            data: json!("https://example.com/pr/1"),
-        };
+        let text = RunArtifact::new(
+            "pull request",
+            Some("text/uri-list".into()),
+            json!("https://example.com/pr/1"),
+        );
         let a = artifact_of(&text);
         assert_eq!(a.name.as_deref(), Some("pull request"));
         assert_eq!(a.parts[0].as_text(), Some("https://example.com/pr/1"));
@@ -558,11 +593,7 @@ mod tests {
         assert_eq!(a.artifact_id, artifact_of(&text).artifact_id);
         assert!(a.artifact_id.starts_with("pull-request-"));
 
-        let data = RunArtifact {
-            name: "d".into(),
-            mime_type: None,
-            data: json!({"k": "v"}),
-        };
+        let data = RunArtifact::new("d", None, json!({"k": "v"}));
         assert!(matches!(
             artifact_of(&data).parts[0].content,
             a2a::PartContent::Data(_)
@@ -570,13 +601,64 @@ mod tests {
         assert_ne!(artifact_id(&data), artifact_id(&text));
     }
 
+    /// A file is one `raw` part with its media type and filename, and on the wire the bytes are
+    /// base64: what any A2A client reads as a file.
+    #[test]
+    fn a_file_artifact_is_one_raw_part_with_its_type_and_filename() {
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg'/>";
+        let file = RunArtifact::file("logo", "image/svg+xml", "logo.svg", svg.to_vec()).unwrap();
+        let a = artifact_of(&file);
+        assert_eq!(a.name.as_deref(), Some("logo"));
+        assert!(a.artifact_id.starts_with("logo-"));
+        assert_eq!(a.parts.len(), 1);
+        let part = &a.parts[0];
+        assert_eq!(part.content, a2a::PartContent::Raw(svg.to_vec()));
+        assert_eq!(part.media_type.as_deref(), Some("image/svg+xml"));
+        assert_eq!(part.filename.as_deref(), Some("logo.svg"));
+        assert!(part.metadata.is_none());
+        assert_eq!(
+            serde_json::to_value(part).unwrap(),
+            json!({
+                "raw": "PHN2ZyB4bWxucz0naHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmcnLz4=",
+                "filename": "logo.svg",
+                "mediaType": "image/svg+xml",
+            })
+        );
+        // The whole artifact survives the wire, as a client reads it.
+        let back: Artifact = serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
+        assert_eq!(back, a);
+    }
+
+    /// The id of a file follows its bytes and its name, so the live event and the durable copy
+    /// agree and a changed file is a new artifact.
+    #[test]
+    fn a_files_id_follows_its_name_type_and_bytes() {
+        let make = |name: &str, filename: &str, bytes: &[u8]| {
+            RunArtifact::file(name, "text/plain", filename, bytes.to_vec()).unwrap()
+        };
+        let one = make("report", "r.txt", b"one");
+        assert_eq!(
+            artifact_id(&one),
+            artifact_id(&make("report", "r.txt", b"one"))
+        );
+        assert_ne!(
+            artifact_id(&one),
+            artifact_id(&make("report", "r.txt", b"two"))
+        );
+        assert_ne!(
+            artifact_id(&one),
+            artifact_id(&make("report", "s.txt", b"one"))
+        );
+        assert!(artifact_id(&one).starts_with("report-"));
+    }
+
     #[test]
     fn a_link_in_the_data_is_also_a_url_part_after_the_data_part() {
-        let pr = RunArtifact {
-            name: "pull_request".into(),
-            mime_type: Some("application/json".into()),
-            data: json!({"url": "https://github.com/octo/widgets/pull/7", "number": "7"}),
-        };
+        let pr = RunArtifact::new(
+            "pull_request",
+            Some("application/json".into()),
+            json!({"url": "https://github.com/octo/widgets/pull/7", "number": "7"}),
+        );
         let a = artifact_of(&pr);
         assert_eq!(a.parts.len(), 2);
         assert_eq!(
@@ -602,15 +684,7 @@ mod tests {
 
     #[test]
     fn only_an_absolute_http_url_in_an_object_is_a_link() {
-        let parts = |data: Value| {
-            artifact_of(&RunArtifact {
-                name: "x".into(),
-                mime_type: None,
-                data,
-            })
-            .parts
-            .len()
-        };
+        let parts = |data: Value| artifact_of(&RunArtifact::new("x", None, data)).parts.len();
         assert_eq!(parts(json!({"url": "http://example.com/a"})), 2);
         for not_a_link in [
             json!({"url": "ftp://example.com/a"}),

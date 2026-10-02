@@ -102,8 +102,9 @@ pub use child::{ChildStarter, ChildStatus, RUN_FINISHED_KIND, child_run_id};
 pub use clock::{Clock, DynClock, ManualClock, SystemClock};
 pub use ctx::{Ctx, Emitter};
 pub use events::{
-    Artifact, BroadcastSink, CollectingSink, DynEventSink, EventSink, NoopSink, RunEvent,
-    RunSubscription, SinkEvent,
+    Artifact, ArtifactFile, ArtifactFileError, BroadcastSink, CollectingSink, DynEventSink,
+    EventSink, MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_FILENAME_BYTES, MAX_RUN_FILE_BYTES, NoopSink,
+    RunEvent, RunSubscription, SinkEvent,
 };
 pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};

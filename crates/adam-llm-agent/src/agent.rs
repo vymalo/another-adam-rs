@@ -11,8 +11,8 @@ use adam_model::{
     ToolSpec,
 };
 use adam_runtime::{
-    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, ChildStatus, Ctx, Inbound, RUN_FINISHED_KIND,
-    RunEvent, StepState, Transition,
+    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, ChildStatus, Ctx, Inbound,
+    MAX_RUN_FILE_BYTES, RUN_FINISHED_KIND, RunEvent, StepState, Transition,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -806,7 +806,9 @@ impl LlmAgent {
         notices: &[(RunId, ChildStatus)],
     ) -> Result<Flow, AgentError> {
         while let Some(call) = state.pending_calls.first().cloned() {
-            let (message, artifacts) = match self.run_tool(ctx, &state.context, &call).await? {
+            let used = files_kept(&state.artifacts);
+            let (message, artifacts) = match self.run_tool(ctx, &state.context, &call, used).await?
+            {
                 ToolResult::Answered { message, artifacts } => (message, artifacts),
                 ToolResult::NeedsInput { question, ui } => {
                     ctx.emit(RunEvent::Custom {
@@ -881,6 +883,7 @@ impl LlmAgent {
         ctx: &mut Ctx,
         context: &Map<String, Value>,
         call: &ToolCall,
+        files_used: u64,
     ) -> Result<ToolResult, AgentError> {
         let end = |state: StepState| self.step_event(&call.name, &call.id, state);
         // The report that starts the step says what the call was given (and, with a title the tool
@@ -936,15 +939,17 @@ impl LlmAgent {
 
         match outcome {
             Ok(output) => {
-                let said = (output.content.clone(), output.is_error);
-                let (message, artifacts, outcome) = output_message(ctx, &call.id, output).await;
-                ctx.emit(self.step_end(
-                    &call.name,
-                    &call.id,
-                    outcome,
-                    Some((said.0.as_str(), said.1)),
-                ))
-                .await;
+                let (message, artifacts, outcome) =
+                    output_message(ctx, &call.id, output, files_used).await;
+                // What the step says is what the model is told (the refusal of a file included).
+                let said = match &message {
+                    Message::Tool {
+                        content, is_error, ..
+                    } => Some((content.as_str(), *is_error)),
+                    _ => None,
+                };
+                ctx.emit(self.step_end(&call.name, &call.id, outcome, said))
+                    .await;
                 Ok(ToolResult::Answered { message, artifacts })
             }
             Err(ToolError::Permanent(reason)) => {
@@ -1130,8 +1135,9 @@ impl LlmAgent {
         match polled {
             Ok(RemotePoll::Working) => Ok(None),
             Ok(RemotePoll::Ready(output)) => {
+                let used = files_kept(&state.artifacts);
                 let (message, artifacts, outcome) =
-                    output_message(ctx, &wait.call_id, output).await;
+                    output_message(ctx, &wait.call_id, output, used).await;
                 state.artifacts.extend(artifacts);
                 owed(state, message);
                 Ok(Some(outcome))
@@ -1158,14 +1164,49 @@ impl LlmAgent {
     }
 }
 
+/// The bytes of the files the run has shared so far, by the references the state keeps.
+fn files_kept(artifacts: &[ArtifactRef]) -> u64 {
+    artifacts.iter().filter_map(|a| a.bytes).sum()
+}
+
 /// A tool's output as the message that answers `call_id`, with the references to its artifacts and
 /// the state the end of the call's step carries. The artifacts are emitted here (and recorded with the
 /// transition's commit).
+///
+/// **Files are bounded per run.** The files of a run are journaled with it, so the run keeps at most
+/// [`MAX_RUN_FILE_BYTES`] of them: `files_used` is what it kept so far, and a file that would go over is
+/// not emitted. The model is told so in the tool's result (marked as an error), which is also where it
+/// learns what was shared: the result says nothing of a file's bytes, so they are never in the history.
 async fn output_message(
     ctx: &Ctx,
     call_id: &str,
-    output: ToolOutput,
+    mut output: ToolOutput,
+    files_used: u64,
 ) -> (Message, Vec<ArtifactRef>, StepState) {
+    let mut used = files_used;
+    let mut refused: Vec<String> = Vec::new();
+    output.artifacts.retain(|a| {
+        let len = a.file_len() as u64;
+        if len == 0 {
+            return true;
+        }
+        if used + len > MAX_RUN_FILE_BYTES as u64 {
+            refused.push(a.name.clone());
+            return false;
+        }
+        used += len;
+        true
+    });
+    if !refused.is_empty() {
+        output.is_error = true;
+        output.content.push_str(&format!(
+            "\nNot shared: {}. A run may share at most {} MiB of files in all, and it has shared \
+             {} KiB so far.",
+            refused.join(", "),
+            MAX_RUN_FILE_BYTES / (1024 * 1024),
+            files_used / 1024
+        ));
+    }
     let outcome = if output.is_error {
         StepState::Failed
     } else {
@@ -1177,6 +1218,7 @@ async fn output_message(
         .map(|a| ArtifactRef {
             name: a.name.clone(),
             mime_type: a.mime_type.clone(),
+            bytes: a.file.as_ref().map(|f| f.bytes.len() as u64),
         })
         .collect();
     for artifact in output.artifacts {

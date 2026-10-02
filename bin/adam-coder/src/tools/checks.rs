@@ -273,11 +273,7 @@ impl ChecksReport {
     pub fn into_artifact(self, redactor: &Redactor) -> Artifact {
         let mut data = serde_json::to_value(&self).unwrap_or(Value::Null);
         redactor.scrub_value(&mut data);
-        Artifact {
-            name: CHECKS_ARTIFACT.into(),
-            mime_type: Some("application/json".into()),
-            data,
-        }
+        Artifact::new(CHECKS_ARTIFACT, Some("application/json".into()), data)
     }
 }
 
