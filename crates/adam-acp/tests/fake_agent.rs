@@ -366,7 +366,10 @@ async fn the_child_has_the_parents_environment_unless_it_is_cleared() {
         "the parent's PATH is inherited: {kept:?}"
     );
 
-    let cleared = env_names_of(fake(dir.path(), "env-names").clear_env(), dir.path()).await;
+    let mut cleared = env_names_of(fake(dir.path(), "env-names").clear_env(), dir.path()).await;
+    // Under coverage the fake agent is instrumented, and LLVM's profiling runtime sets variables
+    // of its own (`__LLVM_PROFILE_RT_INIT_ONCE`) in the child when it starts: not the parent's.
+    cleared.retain(|n| !n.starts_with("__LLVM_PROFILE"));
     assert_eq!(
         cleared,
         ["FAKE_ACP_SCENARIO"],
