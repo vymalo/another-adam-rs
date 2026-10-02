@@ -262,11 +262,11 @@ impl DevcontainerConfig {
         if runtime == Runtime::Podman {
             match container_host.as_deref() {
                 None => problems.push(
-                    "CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman: where the Podman                      service is, such as unix:///run/podman/podman.sock"
+                    "CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman: where the Podman service is, such as unix:///run/podman/podman.sock"
                         .into(),
                 ),
                 Some(host) if !is_container_host(host) => problems.push(format!(
-                    "CONTAINER_HOST {host:?} is not a Podman service address (unix://, tcp:// or ssh://                      and a path or host)"
+                    "CONTAINER_HOST {host:?} is not a Podman service address (unix://, tcp:// or ssh:// and a path or host)"
                 )),
                 Some(_) => {}
             }
@@ -276,7 +276,7 @@ impl DevcontainerConfig {
             .unwrap_or_else(|| DEFAULT_DEVCONTAINER_IMAGE.to_owned());
         if default_image.chars().any(char::is_whitespace) || default_image.starts_with(['-', ':']) {
             problems.push(format!(
-                "DEVCONTAINER_DEFAULT_IMAGE {default_image:?} is not an image reference (no spaces;                  `registry/name:tag@sha256:digest`)"
+                "DEVCONTAINER_DEFAULT_IMAGE {default_image:?} is not an image reference (one word with no spaces, such as `registry/name@sha256:<digest>`)"
             ));
         }
         let network = match get("DEVCONTAINER_NETWORK")
@@ -375,7 +375,7 @@ fn opencode_binary(
     };
     let Some(found) = found else {
         problems.push(format!(
-            "{name} {} is not on PATH: DEVCONTAINER_RUNTIME=podman mounts the coder's OpenCode into              every devcontainer (set OPENCODE_BINARY to its file)",
+            "{name} {} is not on PATH: DEVCONTAINER_RUNTIME=podman mounts the coder's OpenCode into every devcontainer (set OPENCODE_BINARY to its file)",
             named.display()
         ));
         return None;
@@ -391,7 +391,7 @@ fn opencode_binary(
         Ok(true) => Some(real),
         Ok(false) => {
             problems.push(format!(
-                "{name} {} is not a native executable (an ELF file, not a script): it is mounted                  into the devcontainers, which may have no interpreter; point OPENCODE_BINARY at the                  binary itself",
+                "{name} {} is not a native executable (an ELF file, not a script): it is mounted into the devcontainers, which may have no interpreter; point OPENCODE_BINARY at the binary itself",
                 real.display()
             ));
             None
@@ -2056,6 +2056,8 @@ mod tests {
         vars.insert("OPENCODE_BINARY", "/no/such/dir/opencode".into());
         let err = parse_dc(&vars).unwrap_err();
         let all = err.problems.join("\n");
+        // A message a person pastes into a report has no runs of spaces (a re-wrapping slip, #68).
+        assert!(!all.contains("  "), "{all}");
         assert!(
             all.contains("CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman"),
             "{all}"
@@ -2071,6 +2073,11 @@ mod tests {
         vars.insert("OPENCODE_BINARY", script.to_string_lossy().into_owned());
         vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
         let err = parse_dc(&vars).unwrap_err();
+        assert!(
+            err.problems.iter().all(|p| !p.contains("  ")),
+            "{:?}",
+            err.problems
+        );
         assert!(
             err.problems
                 .iter()
