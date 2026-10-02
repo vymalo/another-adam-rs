@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Six extensions, each optional (a client that does not know one ignores it), detected by the
+//! Seven extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -11,10 +11,11 @@
 //! | `steps/v1` | [`STEPS_EXTENSION`] | the agent reports its tool calls and its sub-agents' work as nested steps, to a client whose request activated it |
 //! | `text-stream/v1` | [`TEXT_STREAM_EXTENSION`] | the agent sends its reply as the model writes it (chunks, transient) and says the whole text once, to a client whose request activated it |
 //! | `mentions/v1` | [`MENTIONS_EXTENSION`] | the agent reads the agents a person mentioned in a message, and asks them (with the tool `ask_agent` of `thread-tools/v1`) |
+//! | `steer/v1` | [`STEER_EXTENSION`] | a message that names a running task and activates the extension is added to that task's input, and the agent reads it at its next step |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`,
-//! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md` and
-//! `docs/api/mentions-v1.md` of `vymalo/another-agentic-system`); what an agent does with the messages is `adam-a2a-runtime`'s
+//! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
+//! `docs/api/mentions-v1.md` and `docs/api/steer-v1.md` of `vymalo/another-agentic-system`); what an agent does with the messages is `adam-a2a-runtime`'s
 //! `vymalo_inbound` and `adam-ui`, and what it reports is `adam-a2a-runtime`'s subscription.
 
 use serde_json::json;
@@ -51,6 +52,11 @@ pub const TEXT_STREAM_EXTENSION: &str = "https://agents.vymalo.com/a2a/extension
 /// The URI of the `mentions/v1` extension: a message carries the agents the person mentioned in it
 /// (`agentId`, label, position in the text), in the metadata under this URI.
 pub const MENTIONS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/mentions/v1";
+
+/// The URI of the `steer/v1` extension: a message that names a `submitted` or `working` task and
+/// activates this extension is added to that task's input, and the agent reads it at its next step.
+/// Without the activation such a message is refused, as plain A2A leaves it undefined.
+pub const STEER_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/steer/v1";
 
 impl ExtensionConfig {
     /// The A2UI v0.9.1 extension, as the card of an agent that takes the screen's catalog inline
@@ -104,6 +110,16 @@ impl ExtensionConfig {
         extension
     }
 
+    /// The `steer/v1` extension: the agent reads a message sent to its running task at its next
+    /// step. Optional, no parameters; the description is the contract's. Declaring it is a promise
+    /// that an accepted message is never lost (see `docs/api/steer-v1.md`).
+    pub fn steer() -> Self {
+        let mut extension = Self::new(STEER_EXTENSION);
+        extension.description =
+            Some("Reads a message sent to its running task at its next step.".into());
+        extension
+    }
+
     /// The `mentions/v1` extension: the agent reads the agents a person mentioned in a message and
     /// asks them. Optional, no parameters; the description is the contract's.
     pub fn mentions() -> Self {
@@ -141,6 +157,10 @@ mod tests {
             "https://agents.vymalo.com/a2a/extensions/mentions/v1"
         );
         assert_eq!(
+            STEER_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/steer/v1"
+        );
+        assert_eq!(
             A2UI_EXTENSION_V0_9_1,
             "https://a2ui.org/a2a-extension/a2ui/v0.9.1"
         );
@@ -169,6 +189,7 @@ mod tests {
             ExtensionConfig::steps(),
             ExtensionConfig::text_stream(),
             ExtensionConfig::mentions(),
+            ExtensionConfig::steer(),
         ] {
             assert!(!e.required, "{}", e.uri);
             assert!(e.params.is_empty(), "{}", e.uri);
@@ -179,5 +200,6 @@ mod tests {
         assert_eq!(ExtensionConfig::steps().uri, STEPS_EXTENSION);
         assert_eq!(ExtensionConfig::text_stream().uri, TEXT_STREAM_EXTENSION);
         assert_eq!(ExtensionConfig::mentions().uri, MENTIONS_EXTENSION);
+        assert_eq!(ExtensionConfig::steer().uri, STEER_EXTENSION);
     }
 }

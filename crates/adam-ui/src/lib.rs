@@ -11,7 +11,7 @@
 //! | [`Show`] (`show { blocks, title? }`) | draws blocks of the screen's components, each checked against the catalog's schema; the A2UI surface goes out as a run artifact |
 //! | [`UiCatalogTool`] (`ui_catalog {}`) | the components, what they are for, and their schemas |
 //! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, listed again at every model turn; a successful `turn_output { text }` makes `text` the run's answer; a tool the orchestrator reports as a step (`reportsStep`) gets no step of the agent's, a call waits as long as the tool's `timeoutSecs` (capped by `THREAD_TOOLS_MAX_CALL_SECS`) and carries a stable `callId`; with mentions in the run's context it adds a "Mentioned agents" block to the instructions |
-//! | [`card_extensions`] | the card entries that announce all this (A2UI v0.9.1, `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`) |
+//! | [`card_extensions`] | the card entries that announce all this (A2UI v0.9.1, `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`) |
 //!
 //! A binary wires it in a few lines (the inbound function is `adam-a2a-runtime`'s `vymalo_inbound`):
 //!
@@ -137,7 +137,7 @@ impl Ui {
 }
 
 /// The card entries of an agent that draws on a screen: A2UI v0.9.1 (with `acceptsInlineCatalogs`),
-/// `ui-catalog/v1`, `thread-tools/v1` and `mentions/v1`. All optional, no parameters beyond A2UI's own; a client
+/// `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1` and `steer/v1`. All optional, no parameters beyond A2UI's own; a client
 /// that does not know one ignores it.
 pub fn card_extensions() -> Vec<ExtensionConfig> {
     vec![
@@ -145,6 +145,7 @@ pub fn card_extensions() -> Vec<ExtensionConfig> {
         ExtensionConfig::ui_catalog(),
         ExtensionConfig::thread_tools(),
         ExtensionConfig::mentions(),
+        ExtensionConfig::steer(),
     ]
 }
 

@@ -13,6 +13,7 @@ use crate::agent::{AgentError, Inbound};
 use crate::cancel::CancelToken;
 use crate::child::{ChildStarter, ChildStatus};
 use crate::clock::DynClock;
+use crate::envelope::Envelope;
 use crate::events::{Artifact, DynEventSink, RunEvent};
 use crate::runtime::Runtime;
 
@@ -34,7 +35,10 @@ pub struct Ctx {
     attempt: u32,
     seq: u64,
     inbox: Vec<Inbound>,
+    /// How many messages the inbox held when the transition began.
+    base_inbox: usize,
     consumed: usize,
+    reopen: bool,
     store: DynStore,
     clock: DynClock,
     cancel: CancelToken,
@@ -115,6 +119,8 @@ impl Emitter {
 pub(crate) struct CtxOutcome {
     pub seq: u64,
     pub consumed: usize,
+    /// See [`Ctx::reopen_on_arrival`].
+    pub reopen: bool,
     pub artifacts: Vec<Artifact>,
 }
 
@@ -140,8 +146,10 @@ impl Ctx {
             conversation_id: p.conversation_id,
             attempt: p.attempt,
             seq: p.seq,
+            base_inbox: p.inbox.len(),
             inbox: p.inbox,
             consumed: 0,
+            reopen: false,
             store: p.store,
             clock: p.clock,
             cancel: p.cancel,
@@ -159,6 +167,7 @@ impl Ctx {
         CtxOutcome {
             seq: self.seq,
             consumed: self.consumed,
+            reopen: self.reopen,
             artifacts: std::mem::take(
                 &mut *self
                     .emitter
@@ -316,6 +325,50 @@ impl Ctx {
     /// Reading is not consuming: nothing is committed for a peek.
     pub fn peek_inbox(&self) -> &[Inbound] {
         &self.inbox
+    }
+
+    /// How many messages were delivered to this run **while this transition runs**: the ones that
+    /// arrived after it began, which [`take_inbox`](Self::take_inbox) and
+    /// [`peek_inbox`](Self::peek_inbox) do not show (they show what was there at the start), and
+    /// which the next transition reads.
+    ///
+    /// **Not journaled**: it is a live read of the run's record, and a replay sees the messages
+    /// that are there then. An agent that is about to finish asks it, to answer what a person said
+    /// meanwhile instead of ending; [`reopen_on_arrival`](Self::reopen_on_arrival) closes the
+    /// window that is left between asking and committing.
+    ///
+    /// # Errors
+    ///
+    /// A store failure is [`AgentError::Store`]; a record that does not decode is
+    /// [`AgentError::Permanent`].
+    pub async fn arrived(&self) -> Result<usize, AgentError> {
+        let Some(rec) = self.store.load_run(self.run).await.map_err(store_error)? else {
+            return Ok(0);
+        };
+        let env = Envelope::decode(self.run, &rec.state)
+            .map_err(|e| AgentError::permanent(format!("the run's record is unreadable: {e}")))?;
+        Ok(env.inbox.len().saturating_sub(self.base_inbox))
+    }
+
+    /// Ask the runtime not to finish the run past a message that arrives while this transition
+    /// runs.
+    ///
+    /// By default a `Done` this transition returns finishes the run, and a message delivered while
+    /// it ran, which this transition never saw, stays unread in a run that is over. After this
+    /// call, when a message arrived by the time the transition is committed, a returned
+    /// [`Transition::Done`](crate::Transition::Done) is committed as
+    /// [`Transition::Continue`](crate::Transition::Continue) instead: the run stays runnable with
+    /// the state `Done` carried (its output is dropped), and the next transition reads the message
+    /// before the agent can finish again. The check is made in the commit itself (the commit is a
+    /// compare-and-set on the record, which a delivery changes), so no message can slip in between
+    /// the check and the commit. A `Fail`, a `Park` and a `Continue` are committed as always (a
+    /// parked run is woken by a message that arrived, as ever), and a transition that does not
+    /// call this is committed as before.
+    ///
+    /// An agent that calls this promises that its next `step` reads the inbox and that stepping it
+    /// again after a `Done` is harmless.
+    pub fn reopen_on_arrival(&mut self) {
+        self.reopen = true;
     }
 
     /// Where the child run `run` stands now, read from the store.

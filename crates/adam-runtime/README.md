@@ -22,7 +22,7 @@ over A2A).
 | `AgentStarter` (trait) | the start-only half of an agent: `name`, `init(Inbound) -> State`, `init_continuing(Inbound, &State, RunId) -> State` (default: `init`), no `step`; `State` is `Serialize + DeserializeOwned`, as the agent's is (new: a starter whose state was only `Serialize` must derive `Deserialize` too, because it reads the prior state). See *Starting without stepping* |
 | `Transition` | `Continue`, `Park` (timer and/or inbound message), `Done`, `Fail` |
 | `AgentError` | `Transient { retry_after, .. }` (`retry_after` is a minimum wait, e.g. `Retry-After`), `Permanent`, `NonDeterminism`, `Store`; `#[non_exhaustive]`, see *Errors* |
-| `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children, and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
+| `Ctx`, `Emitter` | `Ctx::step` journals a side effect's outcome; `Ctx::take_inbox` drains the delivered messages and `Ctx::peek_inbox` reads them without consuming; `Ctx::arrived()` counts the messages delivered while the transition runs, and `Ctx::reopen_on_arrival()` makes a `Done` that the transition returns go on instead (see *A message that arrives while a run finishes*); `Ctx::cancelled` / `CancelToken` observe a cancel; `Ctx::child_status(run)` reads one of the run's own children, and `Ctx::child_starter()` gives an owned `ChildStarter` that starts children of the run on the runtime stepping it (see *Child runs*) |
 | `Runtime`, `RuntimeBuilder` | `Runtime::builder(store).agent(a).event_sink(s).build()`; `.starter(s)` registers a start-only agent; `start`, `start_with_id`, `start_child`, `start_continuing`, `start_with_id_continuing`, `deliver`, `cancel`, `view`, `run_worker(shutdown)`, `agent_names()` (every registered name); `.worker_id(..)`, `.claim_scope(ClaimScope)` (default `Any`; see *Pinning runs to a worker*) and the getters `worker_id()`, `claim_scope()` |
 | `RunView`, `RuntimeError` | the durable read side, and errors (`#[non_exhaustive]`) |
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
@@ -51,6 +51,23 @@ A recorded step outcome is never re-executed, but a side effect is
 at-least-once (a crash between the effect and its journal write runs it
 again): keep effects idempotent. The lifecycle and guarantees are in the crate
 docs (`src/lib.rs`) and the [root README](../../README.md#the-model).
+
+## A message that arrives while a run finishes
+
+A message delivered while a transition runs is not in the `Ctx` inbox of that transition: the next transition
+reads it, and a `Park` that was returned meanwhile is woken by it. A `Done` is different: it ends the run, and
+the message would stay unread in a run that is over. An agent that must not do that (the `steer/v1` agents of
+`adam-llm-agent`, which promise an accepted message is never lost) calls `Ctx::reopen_on_arrival()` in the
+transition. Then, **in the commit itself** (a compare-and-set on the record, which a delivery changes, so no
+message can slip in between a check and the commit), a `Done` committed with a message that arrived meanwhile
+is committed as a `Continue`: the run stays runnable with the state the `Done` carried, its output is dropped,
+and the next transition reads the message before the agent can finish again. `Fail`, `Park` and `Continue` are
+committed as always, and a transition that did not call it is committed as before. The agent promises that its
+next `step` reads the inbox and that stepping it again after a `Done` is harmless. `Ctx::arrived()` is the live
+(not journaled) count of the messages that came during the transition, for an agent that wants to answer them
+in the same step instead of finishing and being reopened. Tests: `a_done_that_asked_to_reopen_goes_on_when_a_message_arrived`,
+`a_done_that_asked_to_reopen_finishes_when_nothing_arrived` and `a_done_that_did_not_ask_finishes_past_a_message`,
+on every store of the suite.
 
 ## Starting without stepping
 

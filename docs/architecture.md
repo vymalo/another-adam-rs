@@ -886,8 +886,12 @@ What the diagram cannot say:
   therefore optional on both sides: an agent behaves as plain A2A for a client that names none, and a client cannot
   switch on what the card never declared ([ADR 0008 of the orchestration layer](https://github.com/vymalo/another-agentic-system/blob/main/docs/decisions/0008-platform-integration-via-a2a-extension.md)).
 * **Follow-ups.** A message that carries a `taskId` is delivered to the run
-  with `Runtime::deliver`, and only while the task is `input-required`. Any
-  other state gives `-32602`. A message with a `contextId` and no `taskId`
+  with `Runtime::deliver` while the task is `input-required`. A task that has finished answers
+  `-32004` (A2A's `UnsupportedOperationError`); any other state gives `-32602`, **unless the
+  request activated `steer/v1`**: then a `submitted` or `working` task takes the message into
+  its inbox and the answer is the task, still working. The agent reads it at its next step, and a
+  run about to finish takes another step first
+  ([ADR 0016](decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)). A message with a `contextId` and no `taskId`
   is delivered to the context's open task, or starts a new one when there is
   none. A new task whose message has `referenceTaskIds` starts from the
   conversation of one of them, see
@@ -1359,7 +1363,10 @@ How the two fit:
   cancel ends the step in milliseconds, not when the provider or the command is done.
 * **Deliver.** `Runtime::deliver` appends to the inbox. A `Parked` run becomes
   `Runnable` at once, even if it was waiting on a timer. A run that is `Done`
-  or `Failed` answers `Finished`.
+  or `Failed` answers `Finished`. A message that arrives while a step runs is read by the
+  next one; and a step that asked for it (`Ctx::reopen_on_arrival`, which `LlmAgent` does) is not
+  committed as `Done` past such a message: the commit, a compare-and-set that the delivery
+  changed, makes it a `Continue`, so the message is read before the run can finish.
 * **Children.** A run started with `Runtime::start_child` records its parent. When it reaches `Done` or
   `Failed` (by a step, by a cancel, or because its state cannot be read), the runtime delivers
   `adam.run.finished` to the parent after the commit. See [Child runs](#child-runs).

@@ -329,6 +329,9 @@ struct Next {
     artifacts: Vec<Artifact>,
     /// Set on a scheduled retry; shown in the status event.
     retry_detail: Option<String>,
+    /// The agent asked that a `Done` not end the run past a message that arrived while it stepped
+    /// ([`Ctx::reopen_on_arrival`]).
+    reopen: bool,
 }
 
 enum Plan {
@@ -444,6 +447,7 @@ fn plan(
     let CtxOutcome {
         seq,
         consumed,
+        reopen,
         artifacts,
     } = out;
     // Starting point for a transition that made progress.
@@ -458,6 +462,7 @@ fn plan(
         consumed,
         artifacts: artifacts.clone(),
         retry_detail: None,
+        reopen,
     };
     // Starting point for a failure that ends the run: state untouched.
     let failed = |error: String| Next {
@@ -471,6 +476,7 @@ fn plan(
         consumed: 0,
         artifacts: artifacts.clone(),
         retry_detail: None,
+        reopen: false,
     };
 
     // A transient failure: schedule the retry, or give up when the policy's
@@ -511,6 +517,7 @@ fn plan(
                     "attempt {failures} of {} failed, retrying in {delay:?}: {msg}",
                     policy.max_attempts
                 )),
+                reopen: false,
             }
         }
     };
@@ -577,7 +584,8 @@ fn build_update(
     // Messages that arrived while stepping sit after the ones we started
     // with. A parked agent must not sleep through them.
     let arrived = cur.inbox.len() > base_inbox_len;
-    let (status, wake_at) = if next.status == RunStatus::Parked && arrived {
+    let reopened = reopens(next, arrived);
+    let (status, wake_at) = if reopened || (next.status == RunStatus::Parked && arrived) {
         (RunStatus::Runnable, None)
     } else {
         (next.status, next.wake_at)
@@ -591,13 +599,23 @@ fn build_update(
         seq: next.seq,
         attempt: next.attempt,
         rev: base_rev + 1,
-        output: next.output.clone(),
+        output: if reopened {
+            Value::Null
+        } else {
+            next.output.clone()
+        },
         error: next.error.clone(),
         artifacts,
     };
     let mut update = RunUpdate::new(status, env.encode()?);
     update.wake_at = wake_at;
     Ok(update)
+}
+
+/// Whether a `Done` is committed as a step that goes on: the agent asked for it
+/// ([`Ctx::reopen_on_arrival`]) and a message arrived while it stepped.
+fn reopens(next: &Next, arrived: bool) -> bool {
+    next.reopen && arrived && next.status == RunStatus::Done
 }
 
 /// Commit with CAS. A conflict caused only by messages delivered while we
@@ -635,7 +653,12 @@ async fn commit(
         }
         let update = build_update(next, &cur_env, base.inbox.len(), base.rev)?;
         match inner.store.commit_run(run, cur_rec.version, update).await {
-            Ok(rec) => return Ok(Some(rec)),
+            Ok(rec) => {
+                if reopens(next, cur_env.inbox.len() > base.inbox.len()) {
+                    tracing::info!(%run, "a message arrived while the run finished: the run goes on instead");
+                }
+                return Ok(Some(rec));
+            }
             Err(StoreError::Conflict { .. }) => {}
             Err(StoreError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),

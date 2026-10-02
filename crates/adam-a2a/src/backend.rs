@@ -113,7 +113,7 @@ pub(crate) fn state_ends_stream(state: &TaskState) -> bool {
 ///
 /// Each variant maps to one A2A error code (see the `From<BackendError>` impl
 /// for `a2a::A2AError`), and to one [`ErrorClass`] (see the [`Classify`] impl): `TaskNotFound`
-/// is `NotFound`, `NotCancelable` is `Rejected`, `InvalidParams` is `Invalid`, `Unavailable` is
+/// is `NotFound`, `NotCancelable` and `UnsupportedOperation` are `Rejected`, `InvalidParams` is `Invalid`, `Unavailable` is
 /// `Transient` and `Internal` is `Internal`. The message of `Unavailable` and `Internal`
 /// describes this layer only; the lower error is the [`source`](std::error::Error::source).
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +131,10 @@ pub enum BackendError {
         /// Its current state, rendered for humans.
         state: String,
     },
+    /// The task is in a state that cannot take the message: a message to a task that has finished
+    /// (A2A's `UnsupportedOperationError`, code `-32004`).
+    #[error("unsupported operation: {0}")]
+    UnsupportedOperation(String),
     /// The request is well-formed JSON-RPC but semantically unacceptable, for
     /// example a follow-up to a task that is not waiting for input.
     /// JSON-RPC code `-32602`.
@@ -190,7 +194,7 @@ impl Classify for BackendError {
     fn class(&self) -> ErrorClass {
         match self {
             Self::TaskNotFound(_) => ErrorClass::NotFound,
-            Self::NotCancelable { .. } => ErrorClass::Rejected,
+            Self::NotCancelable { .. } | Self::UnsupportedOperation(_) => ErrorClass::Rejected,
             Self::InvalidParams(_) => ErrorClass::Invalid,
             Self::Unavailable { .. } => ErrorClass::Transient,
             Self::Internal { .. } => ErrorClass::Internal,
@@ -205,6 +209,7 @@ impl From<BackendError> for a2a::A2AError {
             BackendError::NotCancelable { task_id, .. } => {
                 a2a::A2AError::task_not_cancelable(&task_id)
             }
+            BackendError::UnsupportedOperation(msg) => a2a::A2AError::unsupported_operation(msg),
             BackendError::InvalidParams(msg) => a2a::A2AError::invalid_params(msg),
             // The trust boundary: the client gets a generic message, the log gets the chain.
             err @ BackendError::Unavailable { .. } => {
@@ -239,8 +244,11 @@ impl From<BackendError> for a2a::A2AError {
 /// * **Follow-ups.** [`submit`](Self::submit) with the id of a task that is
 ///   `input-required` resumes it and returns it already in `working`, so an
 ///   immediate `subscribe` does not see the stale interrupted state. A
-///   follow-up to a task in any other state is
-///   [`BackendError::InvalidParams`]; an unknown id is
+///   follow-up to a task that has finished is
+///   [`BackendError::UnsupportedOperation`] (A2A's error for a message to a
+///   terminal task); to a task in any other state, [`BackendError::InvalidParams`]
+///   (a backend may accept it when the caller activated an extension that says what such
+///   a message is, as `steer/v1` does for a running task); an unknown id is
 ///   [`BackendError::TaskNotFound`].
 /// * **Cancel** of an already-canceled task returns it unchanged; cancel of a
 ///   task in another terminal state is [`BackendError::NotCancelable`].
@@ -287,7 +295,9 @@ mod tests {
     fn expected(e: &BackendError) -> ErrorClass {
         match e {
             BackendError::TaskNotFound(_) => ErrorClass::NotFound,
-            BackendError::NotCancelable { .. } => ErrorClass::Rejected,
+            BackendError::NotCancelable { .. } | BackendError::UnsupportedOperation(_) => {
+                ErrorClass::Rejected
+            }
             BackendError::InvalidParams(_) => ErrorClass::Invalid,
             BackendError::Unavailable { .. } => ErrorClass::Transient,
             BackendError::Internal { .. } => ErrorClass::Internal,
@@ -304,6 +314,7 @@ mod tests {
             BackendError::InvalidParams("x".into()),
             BackendError::unavailable("database").with_source(Lower),
             BackendError::internal("bug").with_source(Lower),
+            BackendError::UnsupportedOperation("task t is completed".into()),
         ]
     }
 
@@ -313,12 +324,12 @@ mod tests {
             assert_eq!(e.class(), expected(&e), "{e}");
         }
         let retryable: Vec<bool> = samples().iter().map(Classify::is_retryable).collect();
-        assert_eq!(retryable, [false, false, false, true, false]);
+        assert_eq!(retryable, [false, false, false, true, false, false]);
     }
 
     #[test]
     fn the_source_is_kept_and_not_repeated_in_the_message() {
-        for e in samples().into_iter().skip(3) {
+        for e in samples().into_iter().skip(3).take(2) {
             let source = std::error::Error::source(&e).expect("source kept");
             assert!(source.is::<Lower>());
             assert!(!e.to_string().contains("pool exhausted"), "{e}");
@@ -341,5 +352,6 @@ mod tests {
         assert_eq!(codes[2].0, -32602);
         assert_eq!(codes[3], (-32603, "backend temporarily unavailable".into()));
         assert_eq!(codes[4], (-32603, "internal error".into()));
+        assert_eq!(codes[5].0, -32004);
     }
 }

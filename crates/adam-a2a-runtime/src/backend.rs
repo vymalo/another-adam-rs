@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
-use adam_a2a::{BackendError, Caller, TaskBackend, TaskEvent};
+use adam_a2a::{BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskEvent};
 use adam_core::{RunId, StoreError};
 use adam_error::ErrorClass;
 use adam_runtime::{AgentError, BroadcastSink, Classify, RunView, Runtime, RuntimeError};
@@ -43,7 +43,7 @@ pub const MAX_REFERENCES: usize = 8;
 /// |---|---|
 /// | `SendMessage` (new) | `Runtime::start_with_id` with [`task_id_for`], conversation `<subject>:<context id>` |
 /// | `SendMessage` (new) with `referenceTaskIds` | `Runtime::start_with_id_continuing` from the first reference that qualifies (see below) |
-/// | `SendMessage` with `taskId` | `Runtime::deliver` (only while `input-required`) |
+/// | `SendMessage` with `taskId` | `Runtime::deliver` while `input-required`; and, with `steer/v1` activated, while `submitted` or `working` (see "A message for a running task") |
 /// | `input-required` | run parked with no timer (`RunView::waiting`); the question comes from [`PromptFn`] |
 /// | `completed` | `Done`; `output.text` is the status message, `RunView::artifacts` are the task artifacts |
 /// | `failed` | `Failed`; the error is the status message |
@@ -66,6 +66,32 @@ pub const MAX_REFERENCES: usize = 8;
 /// still has an open task is delivered to that task (the runtime allows one
 /// open run per conversation); once it is finished the message starts a new
 /// task in the same context.
+///
+/// # A message for a running task (`steer/v1`)
+///
+/// A2A does not say what a message with the `taskId` of a `working` task is. When the request
+/// **activated** [`STEER_EXTENSION`] (the card declares it, and the client named it in the
+/// `A2A-Extensions` header or in `message.extensions`: `Caller::extensions`), a message for a task
+/// that is `submitted` or `working` is **delivered to the open task**, to the run's inbox
+/// (`Runtime::deliver`, durable in the store, so it survives a worker crash or a lease that moves),
+/// and the answer is the task in its current state. The agent reads it at its next step, and a run
+/// that is about to finish takes another step first (`Ctx::reopen_on_arrival`, which the agent loop
+/// asks for). Without the activation the message is refused exactly as before
+/// (`InvalidParams`, "cannot take a follow-up"), because the specification leaves it undefined.
+///
+/// | The task | The request | Answer |
+/// |---|---|---|
+/// | `submitted` or `working` | activated | delivered; the task |
+/// | `submitted` or `working` | not activated | `InvalidParams`, as before |
+/// | terminal (`completed`, `failed`, `canceled`) | any | `UnsupportedOperation` (A2A's error) |
+/// | `submitted` or `working`, another context | activated | `TaskNotFound` |
+/// | unknown, or another caller's | any | `TaskNotFound` |
+/// | `input-required` | any | the follow-up that resumes it, as plain A2A: the extension changes nothing |
+///
+/// The backend does not deduplicate: a message sent twice is delivered twice, and **the agent**
+/// reads one copy per `messageId` (the inbound's id; `adam-llm-agent` keeps the ids it has read in
+/// its state). Declaring the extension on the card is the host's promise that its agent does that
+/// and never loses an accepted message.
 ///
 /// # A new task continues the task it references
 ///
@@ -472,6 +498,33 @@ impl RuntimeTaskBackend {
         Err(BackendError::unavailable("the conversation is contended"))
     }
 
+    /// Deliver `inbound` to the open task `run` (`steer/v1`) and answer with the task as it is
+    /// then. A task that finished between the read and the delivery is the terminal task's error;
+    /// one that vanished is not found.
+    async fn steer(
+        &self,
+        run: RunId,
+        context: &str,
+        inbound: adam_runtime::Inbound,
+        task_id: &str,
+    ) -> Result<Task, BackendError> {
+        match self.runtime.deliver(run, inbound).await {
+            Ok(()) => {}
+            Err(RuntimeError::Finished { status, .. }) => {
+                return Err(BackendError::UnsupportedOperation(format!(
+                    "task {task_id} is {status} and cannot take a message"
+                )));
+            }
+            Err(RuntimeError::NotFound(_)) => {
+                return Err(BackendError::TaskNotFound(task_id.to_owned()));
+            }
+            Err(e) => return Err(map_err(e)),
+        }
+        // The delivery is a commit, so a run nobody has stepped yet reads `working` from here on.
+        let view = self.view_of(run).await?;
+        Ok(task_from_view(&view, context, &self.prompt))
+    }
+
     async fn view_of(&self, run: RunId) -> Result<RunView, BackendError> {
         self.runtime
             .view(run)
@@ -664,15 +717,27 @@ impl TaskBackend for RuntimeTaskBackend {
             .owned(&caller, &task_id)
             .await?
             .ok_or_else(|| BackendError::TaskNotFound(task_id.clone()))?;
+        let state = crate::task_state(&view);
+        let steering = caller.has_extension(STEER_EXTENSION)
+            && matches!(state, TaskState::Submitted | TaskState::Working);
         if context_id.is_some_and(|c| c != context) {
-            return Err(BackendError::InvalidParams(
-                "contextId does not match the task".to_owned(),
-            ));
+            return Err(if steering {
+                BackendError::TaskNotFound(task_id)
+            } else {
+                BackendError::InvalidParams("contextId does not match the task".to_owned())
+            });
+        }
+        if state.is_terminal() {
+            return Err(BackendError::UnsupportedOperation(format!(
+                "task {task_id} is {state:?} and cannot take a message"
+            )));
+        }
+        if steering {
+            return self.steer(run, &context, inbound, &task_id).await;
         }
         if !view.waiting {
             return Err(BackendError::InvalidParams(format!(
-                "task {task_id} is {:?} and cannot take a follow-up",
-                crate::task_state(&view)
+                "task {task_id} is {state:?} and cannot take a follow-up"
             )));
         }
         self.runtime.deliver(run, inbound).await.map_err(map_err)?;

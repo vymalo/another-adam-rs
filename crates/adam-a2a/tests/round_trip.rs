@@ -572,7 +572,7 @@ async fn follow_ups_to_unknown_or_finished_tasks_are_rejected() {
         .send_message(&user_message("again", Some(&done.id)))
         .await
         .unwrap_err();
-    assert_eq!(err.code, error_code::INVALID_PARAMS);
+    assert_eq!(err.code, error_code::UNSUPPORTED_OPERATION);
 }
 
 #[tokio::test]
