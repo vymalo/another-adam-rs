@@ -412,8 +412,10 @@ jobs:
           set -eu
           # Outside the runner's home (/home/runner is mode 0750): uid 10001 must reach both, and the
           # test binary that runs as uid 10001 is copied into the first.
-          work=/tmp/adam-devcontainer
-          sock=/tmp/adam-podman
+          # (Not /tmp/adam-devcontainer: that is where the CLI keeps its session data inside a container, and
+          # the work tree is bound at the same path inside as outside.)
+          work=/tmp/adam-ci-work
+          sock=/tmp/adam-ci-podman
           # uid 10001 is `agent` in the coder's image; the runner has no such user, and the devcontainer
           # CLI asks for the name of the user it runs as (`id -u -n`) before it reads a configuration.
           getent passwd 10001 >/dev/null || sudo useradd --uid 10001 --user-group --no-create-home \

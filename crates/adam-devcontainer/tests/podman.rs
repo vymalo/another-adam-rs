@@ -136,6 +136,11 @@ impl Inside<'_> {
 
 #[tokio::test]
 async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
+    // The crate's warnings (a kill or a removal that failed) go to the test's output.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
     let (enabled, required) = (
         std::env::var("ADAM_TEST_DEVCONTAINER").as_deref() == Ok("1"),
         std::env::var("ADAM_TEST_REQUIRE_DEVCONTAINER").as_deref() == Ok("1"),
@@ -361,7 +366,22 @@ async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
     );
     session.kill(&prepared.exec).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(!alive(&inside.run(probe, None).await.1), "kill stopped it");
+    if alive(&inside.run(probe, None).await.1) {
+        // Say what the kill had to go on, as the user the command ran as.
+        let id = prepared.exec.as_str();
+        let (_, seen) = inside
+            .run(
+                &format!(
+                    "id; ls -la /tmp/adam-exec; cat /tmp/adam-exec/{id}.pid; \
+                     for p in /proc/[0-9]*; do c=$(tr '\\0' ' ' < $p/cmdline 2>/dev/null); \
+                     case $c in *'sleep 3137'*) echo \"$p: $c\"; cut -d' ' -f1-8,22 $p/stat;; esac; done; \
+                     /opt/adam/bin/adam-exec kill {id}; echo \"adam-exec kill as this user: $?\""
+                ),
+                None,
+            )
+            .await;
+        panic!("kill did not stop the command; inside the container:\n{seen}");
+    }
 
     // Reused: the next command does not build again.
     let again = Steps::default();
