@@ -460,7 +460,7 @@ model behaves with the folder is *unverified*, as for the coder.
 
 The coder (and `adam-agent`) asks several questions at once as one form when the screen can draw it
 ([`adam-ui`](crates/adam-ui/README.md), [ADR 0006](docs/decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md)):
-the card lists A2UI v0.9.1, `ui-catalog/v1` and `thread-tools/v1`, a message from the orchestration layer carries the
+the card lists A2UI v0.9.1, `ui-catalog/v1`, `thread-tools/v1` and `mentions/v1`, a message from the orchestration layer carries the
 screen's catalog (or its digest and a grant for the conversation's MCP endpoint), `ask_user` takes `choices`, and the
 person's answers come back as one A2UI action. The task that proves it, on the mocks: three questions as radio lists
 (a database, a login, where it runs), the answers, and the coder going on (`dev/coder-choices-e2e.sh`; no repository,

@@ -155,7 +155,7 @@ pub fn agent_card_from(
 }
 
 /// `card` with the extensions the coder speaks: the screen's (A2UI, `ui-catalog/v1`,
-/// `thread-tools/v1`), `steps/v1` (every tool call, and OpenCode's, is reported as a step to a
+/// `thread-tools/v1`, `mentions/v1`), `steps/v1` (every tool call, and OpenCode's, is reported as a step to a
 /// client that activates it) and `text-stream/v1` (its answers are sent as the model writes them to a
 /// client that activates it: the agent streams its model calls).
 fn with_extensions(card: AgentCardConfig) -> AgentCardConfig {

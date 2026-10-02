@@ -68,7 +68,7 @@ folder](#mcp-tools-from-the-folder)); they are not part of the twenty. The shipp
 twelve **read-only** tools of GitHub, `github__get_me`, `github__get_file_contents`, `github__list_branches` and the
 rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
-this crate (see [Asking with choices](#asking-with-choices)).
+this crate (see [Asking with choices](#asking-with-choices)). A call to one waits as long as the tool says it may take (`_meta["thread-tools/v1"].timeoutSecs`), at most `THREAD_TOOLS_MAX_CALL_SECS`; a tool the orchestrator reports as a step gets no step of the coder's; and a message that mentions agents adds a "Mentioned agents" block to the instructions ([`adam-ui`](../../crates/adam-ui/README.md), [ADR 0015](../../docs/decisions/0015-tools-the-orchestrator-reports-long-calls-and-mentioned-agents.md)).
 
 Fifteen tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the fifteen is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
@@ -128,7 +128,7 @@ models of `dev/wiremock/mock-openai` answer a stream as they answer a completion
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
 (`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
-`thread-tools/v1`; `agent_card_from` adds them, with `steps/v1` and `text-stream/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
+`thread-tools/v1`, `mentions/v1`; `agent_card_from` adds them, with `steps/v1` and `text-stream/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, choices? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, and the
 person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
@@ -1360,6 +1360,7 @@ way; every problem is reported at once at startup):
 | `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. **The coder's deployment sets it, the image does not** (the image carries `github-mcp-server`, which the shipped `mcp.json` starts, but also `adam-agent`, which must refuse local processes unless its own deployment opts in): the chart sets it on the roles that run workers, `compose.yaml` on the `coder` service, and the container smoke test passes it | `false` |
 | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
+| `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 | `DEVCONTAINER_RUNTIME` | where a run's commands and OpenCode run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service; see [The work environment](#the-work-environment-the-repositorys-devcontainer)). Anything else: exit 78 | `off` |
 | `CONTAINER_HOST` | Podman's own variable: where the service is, e.g. `unix:///run/podman/podman.sock`; **required** with `podman` | unset |
 | `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository that has no `devcontainer.json`. **Name it by digest only** (`registry/name@sha256:...`): the devcontainer CLI (0.89.0) cannot parse a reference that has both a tag and a digest ("Could not parse image name"), and then skips the image's details, the metadata that sets the remote user | the `workspace` image of `another-agentic-images` the coder is built on, by digest (`DEFAULT_DEVCONTAINER_IMAGE`; its tag, `DEFAULT_DEVCONTAINER_IMAGE_TAG`, is kept equal to the Dockerfile's `WORKSPACE_TAG` by a test) |

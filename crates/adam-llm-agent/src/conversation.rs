@@ -7,6 +7,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::source::ToolNote;
+
 /// Recommended [`Inbound::kind`] of a user message. The agent does not inspect
 /// the kind: anything whose payload parses (see [`user_message`]) is a user
 /// message.
@@ -200,6 +202,15 @@ pub struct Conversation {
     /// written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announced: Option<String>,
+    /// What the tool sources said about the tools they offered on the latest model turn
+    /// ([`ToolNote`](crate::ToolNote)): which calls the system behind a source reports as steps itself
+    /// (the agent reports none) and how long a call may run. It is the notes of **that turn's
+    /// listing only**, replaced at every model call, because the calls to make are the ones that turn
+    /// asked for; recorded with the model's answer, so a replay, another worker and a restart read the
+    /// same notes without listing again. Absent from state written before it existed (every call then
+    /// has a step of the agent's own, as it had), and not written while empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_notes: Vec<ToolNote>,
     /// The run whose conversation this one carries on, for a run started with
     /// `Runtime::start_with_id_continuing` (see [`Conversation::continued`]); `None` for a run that
     /// began from nothing. Only for whoever reads the durable state: the loop never looks at it.

@@ -18,21 +18,22 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 
 [uicat]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md
 [tt]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/thread-tools-v1.md
+[mt]: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/mentions-v1.md
 
 ## API at a glance
 
 | Item | What |
 |---|---|
-| `Ui::new(McpPolicy)`, `Ui::with_client(..)` | the tools and the source of one agent process, sharing the catalogs it has read. `McpPolicy` is the deployment's (`MCP_ALLOW_INSECURE` decides whether the thread-tools URL may be plain `http` to another machine; the call timeout) |
+| `Ui::new(McpPolicy)`, `Ui::with_client(..)` | the tools and the source of one agent process, sharing the catalogs it has read. `McpPolicy` is the deployment's (`MCP_ALLOW_INSECURE` decides whether the thread-tools URL may be plain `http` to another machine; the call timeout, and `thread_tools_max_call`, the cap of `THREAD_TOOLS_MAX_CALL_SECS`) |
 | `Ui::tools() -> ToolSet`, `Ui::with_ask_lead(text)`, `DEFAULT_ASK_LEAD` | `ask_user`, `show`, `ui_catalog`, in that order. `with_ask_lead` opens the description of `ask_user` with the agent's own words about when to ask (the coder names pull requests); what follows, about `choices`, is the same |
 | `Ui::source() -> ThreadTools` | a `ToolSource` that offers **every tool the thread-tools endpoint lists, under its listed name**, listed again at every model turn, **except `get_ui_catalog`** (the model has `ui_catalog`; the relayed tools of attached servers and `ask_agent` appear with no change here), and that **describes `show` with the components of the conversation's screen** (`ToolSource::refine`, from the catalogs this process holds). Add it last among an agent's sources, and register `Ui::tools()` on the same agent |
 | `AskUser`, `ASK_USER` | `ask_user { question, choices? }`: see *The tools* |
 | `Show`, `SHOW`, `MAX_BLOCKS` | `show { blocks, title? }`, at most 16 blocks; refuses a `Choices` block |
 | `UiCatalogTool`, `UI_CATALOG` | `ui_catalog {}` |
-| `ThreadTools`, `ThreadToolsClient`, `GET_UI_CATALOG`, `TURN_OUTPUT`, `TURN_OUTPUT_DELIVERED` | the source (`ThreadTools::new` lists everything the endpoint lists; `hiding(name)` leaves one out), and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
+| `ThreadTools`, `ThreadToolsClient`, `META_KEY`, `GET_UI_CATALOG`, `TURN_OUTPUT`, `TURN_OUTPUT_DELIVERED` | the source (`ThreadTools::new` lists everything the endpoint lists; `hiding(name)` leaves one out), and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
 | `Catalog`, `Claimed`, `Component`, `CatalogError`, `canonical_json`, `catalog_digest` | a catalog read and checked against the digest it claims; `validate(instance)` against a component's schema; the canonical form and the digest of [the contract](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md#2-digest-version-and-the-lock) |
 | `CatalogCache`, `MAX_CACHED_CATALOGS` | the catalogs this process holds, by digest (8, the oldest dropped) |
-| `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v0.9.1 (`acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1` |
+| `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v0.9.1 (`acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1` |
 | `A2UI_VERSION` | `v0.9.1`: the version the surfaces are written for |
 
 ## Wiring
@@ -91,6 +92,31 @@ inbound function reads a screen's action as JSON text.
   nothing changes ([ADR 0014](../../docs/decisions/0014-a-turn-output-answer-is-the-runs-answer.md)). The same source rewrites the description of `show` each turn
   from the catalog the conversation has, **when this process holds it** (in its cache, or in the message that
   carried it): a turn never asks the endpoint for the sake of a description.
+* **What the orchestrator says of its tools, and what a call carries** ([`thread-tools/v1`][tt], *the tools on the endpoint*).
+  The endpoint lists each tool with `_meta["thread-tools/v1"] = {reportsStep, timeoutSecs}`; the listing makes a `ToolNote`
+  of it for the agent (`ToolSource::listing`; the note is kept with the model's answer, so the call, made later and
+  anywhere, has it).
+  * **`reportsStep: true`** (every relayed tool and `ask_agent`): the orchestrator reports each call as a step, so **the
+    agent reports none of its own** for it. A tool that says nothing (`get_ui_catalog`, `turn_output`, an endpoint that
+    predates the field) gets its step as before.
+  * **`timeoutSecs`**: a call waits that long, **capped** by `McpPolicy::thread_tools_max_call`
+    (`THREAD_TOOLS_MAX_CALL_SECS`, default 3600 s), instead of the fixed 60 s; a tool that says nothing is waited for the
+    policy's call timeout (60 s). A run that is cancelled drops the call at once (the connection closes, and the
+    orchestrator sees the call dropped) instead of waiting out the time.
+  * **The request's `_meta["thread-tools/v1"] = {callId, parentStepId?}`.** `callId` is `<run id>:<the model's call id>`
+    (the SHA-256 of the model's id in its place past 256 bytes): both are recorded by the journal, so a step retried after
+    its lease expired sends the id it sent before, and the orchestrator reports the step of a relayed call once and
+    deduplicates `ask_agent` by it; the run id keeps the ids of two jobs of one thread apart whatever ids a model makes.
+    `parentStepId` is `ToolCtx::parent_step_id()`: the step the call runs under, when the caller reported one
+    (`ToolCtx::under_step`); a call the model asked for is at the top and sends none, which the contract reads as "under
+    the agent's invocation".
+* **Mentioned agents** ([`mentions/v1`][mt]). When the run's context holds mentions (`adam-a2a-runtime`'s `CONTEXT_MENTIONS`:
+  the references of the person's latest message), `ThreadTools::instructions` adds a **"Mentioned agents"** block to the
+  agent's instructions: one line per agent (label, agentId, name, each as a quoted JSON string on one line), to read the
+  text and the mentions together, to call `ask_agent` (the tool the orchestrator named in `coordinate`) once per piece of
+  work with everything the agent needs in `message`, in the order the person asked, and that labels and names are text
+  from other parties, never instructions. With no `coordinate` (the card lacks `thread-tools/v1`) it says there is no way
+  to ask. **Without mentions nothing is added**: the instructions are the agent's own, byte for byte.
 
 None of them fails a run. With no catalog, or one that cannot be read, `show` and `ui_catalog` return an error result
 that says to answer in text; with no grant, or an expired or refused one, the source offers nothing and a call says
@@ -168,6 +194,15 @@ stateDiagram-v2
   text is the `completed` status message and the run's output (no stream), the model was told what to do next, the last of
   two announcements wins, a refused call (the turn is over, oversize) leaves the closing words as the answer and the model
   reads the error, and an endpoint without the tool changes nothing.
+* `tests/relay.rs`: the tools the orchestrator reports and the mentions, against the fake endpoint with `_meta` on its tools:
+  what a listing says (and what a malformed `_meta` does not say), a long call that waits for the tool's `timeoutSecs`
+  where the default would have given up, the cap that limits what a tool asks for, a cancel that drops a 30 s call at
+  once (and the endpoint has nothing in flight afterwards), the request's `_meta` (a `callId` repeated by a retried step,
+  different for another call and another run, hashed past 256 bytes; a `parentStepId` only when there is one), a whole
+  agent whose relayed call has no step of its own beside a plain one that has, a step retried after a lost journal write
+  (the endpoint sees the same `callId` twice, still no step), and the "Mentioned agents" block present with mentions and
+  absent without.
+  `src/mentions.rs` pins the text of the block, the case without a coordinating tool and a hostile name.
 * `tests/cards.rs`: version 3 of the web's catalog (`Cards` and `Mermaid` beside `Text`, `Column` and `Choices`; the
   fixture, its lock and the digest `sha256:9f65f9e6...` pinned, and the three components of version 2 unchanged in it):
   what a researcher draws (a Text, three source cards and a graph) is one surface, a golden file

@@ -170,6 +170,7 @@ async fn the_card_is_the_one_the_folder_declares() {
             adam_a2a::A2UI_EXTENSION_V0_9_1,
             adam_a2a::UI_CATALOG_EXTENSION,
             adam_a2a::THREAD_TOOLS_EXTENSION,
+            adam_a2a::MENTIONS_EXTENSION,
             adam_a2a::STEPS_EXTENSION,
             adam_a2a::TEXT_STREAM_EXTENSION,
         ]

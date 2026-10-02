@@ -35,6 +35,17 @@
 //!     Usable --> Refused: the endpoint answers 401
 //! ```
 //!
+//! **What a call carries and waits for.** The endpoint lists each tool with `_meta["thread-tools/v1"]`
+//! (`{reportsStep, timeoutSecs}`); the listing is read once per model turn and its notes ride in the run's
+//! state ([`ToolNote`]), so the call, made later and possibly elsewhere, knows them. A call waits as
+//! long as the tool's `timeoutSecs` says, **capped** by [`McpPolicy::thread_tools_max_call`] (`THREAD_TOOLS_MAX_CALL_SECS`,
+//! default 3600 s), and by the policy's call timeout (60 s) for a tool that says nothing; it is sent with
+//! the request `_meta["thread-tools/v1"] = {callId, parentStepId?}`. The `callId` is made from the run
+//! and the model's call id, both fixed by the journal, so a step retried after its lease expired sends the
+//! one it sent before (the orchestrator deduplicates `ask_agent` by it and reports a relayed call's step
+//! under it). A tool that `reportsStep` is reported by the orchestrator: the agent emits no step of its
+//! own for it. A cancel of the run drops the call (the connection closes) instead of waiting out an hour.
+//!
 //! Nothing here fails a run: with no usable grant the source offers no tools and a call is an
 //! error result that says the tools are gone; an endpoint that is down is a warning and no tools.
 
@@ -42,17 +53,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_a2a_runtime::{CONTEXT_THREAD_TOOLS, integral_numbers};
-use adam_llm_agent::{SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource};
-use adam_mcp::{Endpoint, EndpointError, McpPolicy};
+use adam_llm_agent::{Listing, SourceCtx, ToolCtx, ToolError, ToolNote, ToolOutput, ToolSource};
+use adam_mcp::{CallOptions, Endpoint, EndpointError, McpPolicy, RemoteTool};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use secrecy::SecretString;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::catalog::Claimed;
+use crate::mentions::mentioned_agents;
 use crate::resolve::UiState;
 use crate::show::{SHOW, describe_show};
+
+/// The key of the thread-tools extension in a tool's `_meta` and in a request's `_meta`.
+pub const META_KEY: &str = "thread-tools/v1";
+
+/// The longest `callId` the contract takes, in bytes.
+const MAX_CALL_ID_BYTES: usize = 256;
 
 /// The tool of the endpoint that gives the thread's current catalog.
 pub const GET_UI_CATALOG: &str = "get_ui_catalog";
@@ -120,6 +139,10 @@ pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 pub struct ThreadToolsClient {
     policy: McpPolicy,
     clock: Clock,
+    /// How long a call to a tool that does not say how long it may take is waited for.
+    default_call: Duration,
+    /// The longest any call is waited for, whatever the tool says.
+    max_call: Duration,
 }
 
 impl std::fmt::Debug for ThreadToolsClient {
@@ -139,13 +162,26 @@ pub(crate) struct Fetched {
 impl ThreadToolsClient {
     /// A client under `policy`: its URL rules (https, or plain `http` only to this machine unless
     /// [`McpPolicy::allow_insecure`] says otherwise) and its timeouts. A listing waits at most ten
-    /// seconds, whatever the connect timeout, because it is paid at every model turn.
+    /// seconds, whatever the connect timeout, because it is paid at every model turn. A call waits
+    /// as long as its tool says it may take ([`ToolNote::timeout`]), and at most
+    /// [`McpPolicy::thread_tools_max_call`]; for a tool that says nothing, [`McpPolicy::call_timeout`]
+    /// (60 s by default), under the same cap.
     pub fn new(policy: McpPolicy) -> Self {
         let listing = policy.connect_timeout_value().min(LIST_TIMEOUT);
         Self {
+            default_call: policy.call_timeout_value(),
+            max_call: policy.thread_tools_max_call_value(),
             policy: policy.connect_timeout(listing),
             clock: Arc::new(Utc::now),
         }
+    }
+
+    /// How long a call of a tool with `note` is waited for: the time the tool says, else the policy's
+    /// call timeout, and never more than the cap.
+    pub fn wait_for(&self, note: Option<&ToolNote>) -> Duration {
+        note.and_then(ToolNote::timeout)
+            .unwrap_or(self.default_call)
+            .min(self.max_call)
     }
 
     /// Read the time from `clock` instead of the system clock (for tests of the expiry).
@@ -253,6 +289,56 @@ fn fetched_from(body: &Value) -> Result<Fetched, String> {
     })
 }
 
+/// What the endpoint's listing says about `tool` for the agent (`_meta["thread-tools/v1"]`): whether
+/// the orchestrator reports each call as a step (`reportsStep: true`) and how long it lets a call run
+/// (`timeoutSecs`, a positive whole number). `None` when it says neither, or says something that is not
+/// that shape (nothing is assumed from a malformed entry).
+fn note_of(tool: &RemoteTool) -> Option<ToolNote> {
+    let meta = tool.meta.get(META_KEY)?.as_object()?;
+    let mut note = ToolNote::new(tool.name.clone());
+    if meta.get("reportsStep").and_then(Value::as_bool) == Some(true) {
+        note = note.reporting_steps();
+    }
+    let secs = meta.get("timeoutSecs").and_then(|v| {
+        v.as_u64().or_else(|| {
+            v.as_f64()
+                .filter(|f| f.fract() == 0.0 && *f >= 1.0 && *f <= 1e9)
+                .map(|f| f as u64)
+        })
+    });
+    if let Some(secs) = secs.filter(|s| *s >= 1) {
+        note = note.with_timeout(Duration::from_secs(secs));
+    }
+    (note.reports_step || note.timeout_ms.is_some()).then_some(note)
+}
+
+/// The `callId` of a call: stable across a retry of the journaled step, and different for every call of
+/// the thread. It is made from the run (a task is a run, and a thread's jobs are different runs) and the
+/// model's call id (`ToolCall::id`, recorded with the model's answer), both of which a retry, a replay
+/// and another worker see unchanged. Over 256 bytes (a model with long call ids) the call id is
+/// replaced by its SHA-256, which is as stable.
+fn call_id_of(ctx: &ToolCtx) -> String {
+    let id = format!("{}:{}", ctx.run_id(), ctx.call_id());
+    if id.len() <= MAX_CALL_ID_BYTES {
+        return id;
+    }
+    let digest = Sha256::digest(ctx.call_id().as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}:sha256-{hex}", ctx.run_id())
+}
+
+/// The request `_meta` member of a call: `{callId, parentStepId?}`.
+fn request_meta(ctx: &ToolCtx) -> Value {
+    let mut meta = json!({"callId": call_id_of(ctx)});
+    if let Some(parent) = ctx
+        .parent_step_id()
+        .filter(|p| p.len() <= MAX_CALL_ID_BYTES)
+    {
+        meta["parentStepId"] = json!(parent);
+    }
+    meta
+}
+
 /// Whether `name` can be shown to a model as a tool name: letters, digits, `-` and `_`, at most 64
 /// characters, not starting with `_` (what every provider accepts).
 fn fits(name: &str) -> bool {
@@ -339,12 +425,16 @@ fn error_result(text: impl Into<String>) -> Option<Result<ToolOutput, ToolError>
 #[async_trait]
 impl ToolSource for ThreadTools {
     async fn specs(&self, ctx: &SourceCtx) -> Vec<ToolSpec> {
+        self.listing(ctx).await.specs
+    }
+
+    async fn listing(&self, ctx: &SourceCtx) -> Listing {
         let grant = match self.client.grant(ctx.context_map()) {
             Ok(grant) => grant,
-            Err(Unavailable::Absent) => return Vec::new(),
+            Err(Unavailable::Absent) => return Listing::default(),
             Err(why) => {
                 tracing::debug!(reason = why.reason(), "no thread tools are offered");
-                return Vec::new();
+                return Listing::default();
             }
         };
         let listed = match self.client.endpoint(&grant) {
@@ -352,26 +442,35 @@ impl ToolSource for ThreadTools {
             Err(e) => Err(e),
         };
         match listed {
-            Ok(tools) => tools
-                .into_iter()
-                .filter(|tool| !self.hidden.contains(&tool.name.as_str()))
-                .filter(|tool| {
-                    let fine = fits(&tool.name);
-                    if !fine {
-                        tracing::warn!(
-                            tool = %tool.name,
-                            "the thread tools list a tool whose name cannot be shown to a model: left out"
-                        );
-                    }
-                    fine
-                })
-                .map(|tool| tool.spec())
-                .collect(),
+            Ok(tools) => {
+                let tools: Vec<RemoteTool> = tools
+                    .into_iter()
+                    .filter(|tool| !self.hidden.contains(&tool.name.as_str()))
+                    .filter(|tool| {
+                        let fine = fits(&tool.name);
+                        if !fine {
+                            tracing::warn!(
+                                tool = %tool.name,
+                                "the thread tools list a tool whose name cannot be shown to a model: left out"
+                            );
+                        }
+                        fine
+                    })
+                    .collect();
+                Listing {
+                    specs: tools.iter().map(RemoteTool::spec).collect(),
+                    notes: tools.iter().filter_map(note_of).collect(),
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "the thread tools could not be listed; none are offered this turn");
-                Vec::new()
+                Listing::default()
             }
         }
+    }
+
+    async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
+        mentioned_agents(ctx.context_map())
     }
 
     async fn refine(&self, ctx: &SourceCtx, specs: &mut [ToolSpec]) {
@@ -424,8 +523,24 @@ impl ToolSource for ThreadTools {
         } else {
             None
         };
+        // The call waits as long as its tool says it may take, within the cap, carries the id the
+        // orchestrator reports its step under (and dedupes an ask by), and stops at once when the
+        // run is cancelled: an hour is too long to wait for a call nobody will read.
+        let options = CallOptions::new()
+            .timeout(self.client.wait_for(ctx.note()))
+            .meta(META_KEY, request_meta(ctx));
         let called = match self.client.endpoint(&grant) {
-            Ok(endpoint) => endpoint.call_tool(name, arguments).await,
+            Ok(endpoint) => {
+                tokio::select! {
+                    biased;
+                    () = ctx.cancelled() => {
+                        return error_result(format!(
+                            "the call to `{name}` was cancelled: the run was stopped"
+                        ));
+                    }
+                    called = endpoint.call_tool_with(name, arguments, options) => called,
+                }
+            }
             Err(e) => Err(e),
         };
         match called {

@@ -16,11 +16,20 @@
 //! | `turn_output` (only after [`enable_turn_output`](ThreadToolsServer::enable_turn_output)) | `text` | `{"delivered": true}` as `structuredContent` and as the same JSON text, and the text is kept ([`announcements`](ThreadToolsServer::announcements)); `isError` for blank text (`text must not be empty`), more than 65536 bytes (`text must be at most 65536 bytes`) and, after [`end_turn`](ThreadToolsServer::end_turn), every call (`this turn is over`) |
 //! | each tool of [`add_tool`](ThreadToolsServer::add_tool) | an object | the text it was given, with the arguments it was called with echoed after it |
 //!
+//! A tool can carry the `_meta` of the orchestrator's relayed tools
+//! ([`add_tool_with_meta`](ThreadToolsServer::add_tool_with_meta):
+//! `{"thread-tools/v1": {"reportsStep": true, "timeoutSecs": 125}}`), and can be slow
+//! ([`set_delay`](ThreadToolsServer::set_delay), with [`in_flight`](ThreadToolsServer::in_flight) counting the
+//! calls that have not answered). Every `tools/call` is recorded with the request's `_meta`
+//! ([`requests`](ThreadToolsServer::requests)): the `callId` and `parentStepId` an agent sends.
+//!
 //! Test code, not a product: it panics when the machine cannot give it a port.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -31,8 +40,8 @@ use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, InitializeRequestParams,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
-    Tool,
+    InitializeResult, ListToolsResult, MetaObject, PaginatedRequestParams, ServerCapabilities,
+    ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::StreamableHttpServerConfig;
@@ -62,6 +71,35 @@ struct TurnOutput {
     announced: Vec<String>,
 }
 
+/// One `tools/call` the endpoint received.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+    /// The tool's name.
+    pub name: String,
+    /// The arguments (an object; empty when none were sent).
+    pub arguments: Value,
+    /// The request's `_meta` without the client library's own `progressToken` (`None` when nothing
+    /// else was sent): where an agent puts the `thread-tools/v1` member with its `callId` and
+    /// `parentStepId`.
+    pub meta: Option<Value>,
+}
+
+/// Counts a call as in flight until the handler's future is dropped or ends.
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// What the endpoint saw, and what it answers. Shared by every request.
 #[derive(Default)]
 struct Shared {
@@ -75,8 +113,12 @@ struct Shared {
     extra: Mutex<Vec<(Tool, String)>>,
     initializations: AtomicUsize,
     lists: AtomicUsize,
-    /// Every `tools/call`: `(name, arguments)`.
-    calls: Mutex<Vec<(String, Value)>>,
+    /// Every `tools/call`.
+    calls: Mutex<Vec<Call>>,
+    /// How long each extra tool takes to answer (none: at once).
+    delays: Mutex<HashMap<String, Duration>>,
+    /// The calls that have not answered (or were dropped).
+    in_flight: Arc<AtomicUsize>,
     /// Every `Authorization` header that came in, accepted or not.
     authorizations: Mutex<Vec<String>>,
     /// Every request that was refused with 401.
@@ -162,11 +204,35 @@ impl ServerHandler for Endpoint {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        let _in_flight = InFlight::enter(&self.shared.in_flight);
         let name = request.name.to_string();
         let arguments = Value::Object(request.arguments.unwrap_or_default());
-        lock(&self.shared.calls).push((name.clone(), arguments.clone()));
+        lock(&self.shared.calls).push(Call {
+            name: name.clone(),
+            arguments: arguments.clone(),
+            // The library moves the request's `_meta` into the context, and adds a `progressToken`
+            // of its own to every request: neither is what the caller sent.
+            meta: serde_json::to_value(&context.meta)
+                .ok()
+                .map(|mut meta| {
+                    if let Some(object) = meta.as_object_mut() {
+                        object.remove("progressToken");
+                    }
+                    meta
+                })
+                .filter(|meta| meta.as_object().is_some_and(|m| !m.is_empty())),
+        });
+        let delay = lock(&self.shared.delays).get(&name).copied();
+        if let Some(delay) = delay {
+            // A caller that gives up (drops the connection, or says `notifications/cancelled`) ends
+            // the wait: the call is no longer in flight.
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = context.ct.cancelled() => {}
+            }
+        }
         if name == GET_UI_CATALOG {
             return Ok(CallToolResponse::Complete(self.catalog_answer(&arguments)));
         }
@@ -332,6 +398,46 @@ impl ThreadToolsServer {
         extra.push((tool, text.to_owned()));
     }
 
+    /// List a tool from now on, as [`add_tool`](Self::add_tool), with `meta` as its `_meta`: what the
+    /// orchestrator's relayed tools say about themselves, `{"thread-tools/v1": {"reportsStep": true,
+    /// "timeoutSecs": 125}}`.
+    ///
+    /// # Panics
+    ///
+    /// When `meta` is not a JSON object.
+    pub fn add_tool_with_meta(
+        &self,
+        name: &str,
+        description: &str,
+        input_schema: Value,
+        text: &str,
+        meta: Value,
+    ) {
+        let Value::Object(meta) = meta else {
+            panic!("a tool's _meta is a JSON object");
+        };
+        let tool = Tool::new(
+            name.to_owned(),
+            description.to_owned(),
+            object(input_schema),
+        )
+        .with_meta(MetaObject::from(meta));
+        let mut extra = lock(&self.shared.extra);
+        extra.retain(|(t, _)| t.name != name);
+        extra.push((tool, text.to_owned()));
+    }
+
+    /// Make the tool `name` take `delay` to answer (it answers after that, whatever it is asked).
+    pub fn set_delay(&self, name: &str, delay: Duration) {
+        lock(&self.shared.delays).insert(name.to_owned(), delay);
+    }
+
+    /// How many `tools/call` requests are being served: received and not yet answered or dropped. A
+    /// caller that gave up on a slow call (it dropped the connection) takes this back to zero.
+    pub fn in_flight(&self) -> usize {
+        self.shared.in_flight.load(Ordering::SeqCst)
+    }
+
     /// List the built-in `turn_output` from now on, as the orchestrator does: it takes
     /// `{text}`, keeps what it accepted ([`announcements`](Self::announcements)) and answers
     /// `{"delivered": true}`.
@@ -366,6 +472,14 @@ impl ThreadToolsServer {
 
     /// Every `tools/call` that reached the handler: the tool and its arguments, in order.
     pub fn calls(&self) -> Vec<(String, Value)> {
+        lock(&self.shared.calls)
+            .iter()
+            .map(|call| (call.name.clone(), call.arguments.clone()))
+            .collect()
+    }
+
+    /// Every `tools/call` that reached the handler, with the request's `_meta`, in order.
+    pub fn requests(&self) -> Vec<Call> {
         lock(&self.shared.calls).clone()
     }
 
@@ -373,9 +487,10 @@ impl ThreadToolsServer {
     pub fn catalog_requests(&self) -> Vec<Option<String>> {
         lock(&self.shared.calls)
             .iter()
-            .filter(|(name, _)| name == GET_UI_CATALOG)
-            .map(|(_, args)| {
-                args.get("knownDigest")
+            .filter(|call| call.name == GET_UI_CATALOG)
+            .map(|call| {
+                call.arguments
+                    .get("knownDigest")
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })

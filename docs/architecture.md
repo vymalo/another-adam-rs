@@ -249,7 +249,10 @@ The layers, from the bottom:
     `ToolSource` of `adam-llm-agent` that offers every tool of the conversation's MCP endpoint at each model
     turn. It reads what `adam-a2a-runtime`'s `vymalo_inbound` puts in the run's inbound context and reaches the
     endpoint with `adam-mcp`'s `Endpoint`
-    ([ADR 0006](decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md)).
+    ([ADR 0006](decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md)). A call waits as long as the tool's
+    `timeoutSecs` says (capped by `THREAD_TOOLS_MAX_CALL_SECS`), carries a stable `callId`, and gets no step of the
+    agent's when the orchestrator reports it; the mentions of a message become a block of the instructions
+    ([ADR 0015](decisions/0015-tools-the-orchestrator-reports-long-calls-and-mentioned-agents.md)).
 * **Authoring.**
   * `adam-macros` is the `#[tool]` attribute macro: a proc-macro crate whose
     expansion is a pure function over token streams. It depends on `syn`,

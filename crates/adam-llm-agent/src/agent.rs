@@ -24,7 +24,7 @@ use crate::conversation::{
     parse_context, parse_user_text,
 };
 use crate::history::fit_history;
-use crate::source::{DynToolSource, SourceCtx, ToolSource, offered, refined};
+use crate::source::{DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined};
 use crate::state::Extensions;
 use crate::step_io::StepIo;
 use crate::text_stream;
@@ -132,6 +132,10 @@ struct Recorded {
     /// Absent when the words were not streamed, and in journals written before they could be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream: Option<String>,
+    /// What the tool sources said about the tools they offered for this call ([`ToolNote`]); absent
+    /// when they said nothing and in journals written before the notes existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<ToolNote>,
 }
 
 /// The id of the stream of the words of turn `turn` of `run`: unique within the task, because the
@@ -528,6 +532,21 @@ impl std::fmt::Debug for LlmAgent {
     }
 }
 
+/// Send a step report, unless `silent`: the system behind the tool's source reports its calls itself.
+async fn say(ctx: &mut Ctx, silent: bool, event: RunEvent) {
+    if !silent {
+        ctx.emit(event).await;
+    }
+}
+
+/// Whether the call of tool `name` goes unreported by the agent: the tool is a source's and its
+/// listing said the system behind the source reports its calls.
+fn silent_call(agent: &LlmAgent, state: &Conversation, name: &str) -> bool {
+    agent
+        .source_note(&state.source_notes, name)
+        .is_some_and(|n| n.reports_step)
+}
+
 /// What a part of a step decided.
 enum Flow {
     /// Nothing terminal happened; carry on.
@@ -733,10 +752,20 @@ impl LlmAgent {
                 // The sources are read here, inside the step, so that a replay of a turn whose model
                 // call is recorded does not read them again: only the answer is journaled, not the
                 // tools it was given.
+                let mut notes = Vec::new();
                 if let Some(source_ctx) = &source_ctx {
-                    let more = offered(&sources, source_ctx, &request.tools).await;
+                    let (more, said) = offered(&sources, source_ctx, &request.tools).await;
                     request.tools.extend(more);
+                    notes = said;
                     refined(&sources, source_ctx, &mut request.tools).await;
+                    // What the sources add to the instructions (the agents a person mentioned): read
+                    // here with the tools, so a replay of a recorded turn reads nothing.
+                    if let Some(more) = instructed(&sources, source_ctx).await {
+                        request.system = Some(match request.system.take() {
+                            Some(own) if !own.trim().is_empty() => format!("{own}\n\n{more}"),
+                            _ => more,
+                        });
+                    }
                 }
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
@@ -748,6 +777,7 @@ impl LlmAgent {
                             .map(|response| Recorded {
                                 response,
                                 stream: None,
+                                notes,
                             })
                             .map_err(ModelFailure::from),
                     };
@@ -762,6 +792,7 @@ impl LlmAgent {
                 .map(|streamed| Recorded {
                     response: streamed.response,
                     stream: streamed.stream,
+                    notes,
                 })
                 .map_err(ModelFailure::from)
             })
@@ -773,7 +804,15 @@ impl LlmAgent {
             return Ok(Flow::Fail(CANCELLED.into()));
         }
         let (response, stream) = match recorded {
-            Ok(Recorded { response, stream }) => (response, stream),
+            Ok(Recorded {
+                response,
+                stream,
+                notes,
+            }) => {
+                // The calls this turn asks for are the ones its listing described.
+                state.source_notes = notes;
+                (response, stream)
+            }
             // A recorded error is replayed forever on crash-replay, but a
             // transient retry starts at a fresh seq, so it calls again.
             Err(f) if f.retryable => {
@@ -879,7 +918,9 @@ impl LlmAgent {
                 return Ok(Flow::Fail(CANCELLED.into()));
             }
             let used = files_kept(&state.artifacts);
-            let (message, artifacts) = match self.run_tool(ctx, &state.context, &call, used).await?
+            let (message, artifacts) = match self
+                .run_tool(ctx, &state.context, &state.source_notes, &call, used)
+                .await?
             {
                 ToolResult::Answered {
                     message,
@@ -918,14 +959,22 @@ impl LlmAgent {
                             payload: json!({ "call_id": call.id, "run": run }),
                         })
                         .await;
-                        ctx.emit(self.step_event(&call.name, &call.id, StepState::Waiting))
-                            .await;
+                        say(
+                            ctx,
+                            silent_call(self, state, &call.name),
+                            self.step_event(&call.name, &call.id, StepState::Waiting),
+                        )
+                        .await;
                         state.pending_wait = Some(PendingWait::Run(wait));
                         return Ok(Flow::Wait);
                     };
                     let outcome = Self::answer_run(state, &wait, child);
-                    ctx.emit(self.step_end_with_result(state, &call.name, &call.id, outcome))
-                        .await;
+                    say(
+                        ctx,
+                        silent_call(self, state, &call.name),
+                        self.step_end_with_result(state, &call.name, &call.id, outcome),
+                    )
+                    .await;
                     continue;
                 }
                 ToolResult::AwaitRemote { task, timeout_ms } => {
@@ -940,8 +989,12 @@ impl LlmAgent {
                         payload: json!({ "call_id": call.id, "task": task }),
                     })
                     .await;
-                    ctx.emit(self.step_event(&call.name, &call.id, StepState::Waiting))
-                        .await;
+                    say(
+                        ctx,
+                        silent_call(self, state, &call.name),
+                        self.step_event(&call.name, &call.id, StepState::Waiting),
+                    )
+                    .await;
                     state.pending_wait = Some(PendingWait::Remote(PendingRemote {
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
@@ -963,10 +1016,16 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         context: &Map<String, Value>,
+        notes: &[ToolNote],
         call: &ToolCall,
         files_used: u64,
     ) -> Result<ToolResult, AgentError> {
         let end = |state: StepState| self.step_event(&call.name, &call.id, state);
+        // What the listing that offered this tool said about it. Only a source's tool has a note: the
+        // agent's own tools win a name clash.
+        let note = self.source_note(notes, &call.name);
+        // The system behind the source reports each call itself: the agent reports no step of its own.
+        let silent = note.is_some_and(|n| n.reports_step);
         // The report that starts the step says what the call was given (and, with a title the tool
         // has for itself, what to call it: `Tool::step_style`).
         let mut start = self
@@ -975,9 +1034,11 @@ impl LlmAgent {
         if let Some((input, max)) = self.step_io.input(&call.arguments) {
             start = start.with_input_within(input, max);
         }
-        ctx.emit(RunEvent::Step(start)).await;
+        say(ctx, silent, RunEvent::Step(start)).await;
 
-        let tool_ctx = self.tool_ctx(ctx, context, &call.id, &call.name);
+        let tool_ctx = self
+            .tool_ctx(ctx, context, &call.id, &call.name)
+            .with_note(note.cloned());
         let args = call.arguments.clone();
         let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
             Some(tool) => {
@@ -990,12 +1051,16 @@ impl LlmAgent {
             // one with sources asks them, inside the step that records the answer.
             None if self.sources.is_empty() => {
                 let unknown = self.unknown_tool(&call.name);
-                ctx.emit(self.step_end(
-                    &call.name,
-                    &call.id,
-                    StepState::Failed,
-                    Some((&unknown, true)),
-                ))
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((&unknown, true)),
+                    ),
+                )
                 .await;
                 return Ok(ToolResult::Answered {
                     message: Message::tool_error(call.id.clone(), unknown),
@@ -1030,8 +1095,12 @@ impl LlmAgent {
                     } => Some((content.as_str(), *is_error)),
                     _ => None,
                 };
-                ctx.emit(self.step_end(&call.name, &call.id, outcome, said))
-                    .await;
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(&call.name, &call.id, outcome, said),
+                )
+                .await;
                 Ok(ToolResult::Answered {
                     message,
                     artifacts,
@@ -1039,12 +1108,16 @@ impl LlmAgent {
                 })
             }
             Err(ToolError::Permanent(reason)) => {
-                ctx.emit(self.step_end(
-                    &call.name,
-                    &call.id,
-                    StepState::Failed,
-                    Some((&reason, true)),
-                ))
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((&reason, true)),
+                    ),
+                )
                 .await;
                 Ok(ToolResult::Answered {
                     message: Message::tool_error(call.id.clone(), reason),
@@ -1053,12 +1126,16 @@ impl LlmAgent {
                 })
             }
             Err(ToolError::Transient(reason)) => {
-                ctx.emit(self.step_end(
-                    &call.name,
-                    &call.id,
-                    StepState::Failed,
-                    Some((&reason, true)),
-                ))
+                say(
+                    ctx,
+                    silent,
+                    self.step_end(
+                        &call.name,
+                        &call.id,
+                        StepState::Failed,
+                        Some((&reason, true)),
+                    ),
+                )
                 .await;
                 Err(AgentError::transient(format!(
                     "tool `{}` failed: {reason}",
@@ -1066,7 +1143,7 @@ impl LlmAgent {
                 )))
             }
             Err(ToolError::NeedsInput { question, ui }) => {
-                ctx.emit(end(StepState::Waiting)).await;
+                say(ctx, silent, end(StepState::Waiting)).await;
                 Ok(ToolResult::NeedsInput { question, ui })
             }
             // No end event yet: `run_pending` says "waiting", or the final state when the
@@ -1076,6 +1153,15 @@ impl LlmAgent {
                 Ok(ToolResult::AwaitRemote { task, timeout_ms })
             }
         }
+    }
+
+    /// The note the listing that offered tool `name` made about it, if the tool is a source's (the
+    /// agent's own tools win a name clash) and the listing said something.
+    fn source_note<'n>(&self, notes: &'n [ToolNote], name: &str) -> Option<&'n ToolNote> {
+        if self.tool(name).is_some() {
+            return None;
+        }
+        notes.iter().find(|n| n.tool == name)
     }
 
     /// The context a tool sees for the call `call_id`, made from this transition's `Ctx` and the
@@ -1657,6 +1743,7 @@ mod failure_tests {
         let streamed = Recorded {
             response: ModelResponse::text("hi"),
             stream: Some("run-m0-a1b2c3d4".into()),
+            notes: Vec::new(),
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -1673,8 +1760,25 @@ mod failure_tests {
         let plain = Recorded {
             response: ModelResponse::text("hi"),
             stream: None,
+            notes: Vec::new(),
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
+
+        // With notes the record has them beside the response; an older reader of the record ignores
+        // the member, and a record without it reads as no notes.
+        let noted = Recorded {
+            response: ModelResponse::text("hi"),
+            stream: None,
+            notes: vec![ToolNote::new("relay__search").reporting_steps()],
+        };
+        let json = serde_json::to_value(&noted).unwrap();
+        assert_eq!(
+            json["notes"],
+            json!([{"tool": "relay__search", "reports_step": true}])
+        );
+        let back: Recorded = serde_json::from_value(json).unwrap();
+        assert_eq!(back.notes, noted.notes);
+        assert!(old.notes.is_empty());
     }
 
     #[test]

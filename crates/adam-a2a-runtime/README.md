@@ -106,7 +106,7 @@ An agent only continues if it overrides `init_continuing` (`LlmAgent`, `LlmStart
 ## A screen as the sender
 
 `RuntimeTaskBackend::with_inbound(vymalo_inbound)` reads a message the way the orchestration layer's chat
-sends it (contracts: `docs/api/ui-catalog-v1.md` and `docs/api/thread-tools-v1.md` of
+sends it (contracts: `docs/api/ui-catalog-v1.md`, `docs/api/thread-tools-v1.md` and `docs/api/mentions-v1.md` of
 `vymalo/another-agentic-system`; the card entries that announce them are in [`adam-a2a`](../adam-a2a/README.md)):
 
 | In the message | In the run |
@@ -117,6 +117,7 @@ sends it (contracts: `docs/api/ui-catalog-v1.md` and `docs/api/thread-tools-v1.m
 | `metadata[ui-catalog/v1]` | `Conversation::context["vymalo.ui.ref"]` = `{catalogId, version, digest}` |
 | an inline catalog with that `catalogId` in the renderer's capabilities (`a2uiClientCapabilities` under `v0.9.1`, else `v0.9`; `a2uiRendererCapabilities` under `v1.0`) | `context["vymalo.ui.catalog"]` = `{catalogId, version, digest, catalog}`; an inline catalog of another id is ignored |
 | `metadata[thread-tools/v1]` `{url, token, expiresAt}` | `context["vymalo.threadTools"]`, copied exactly; the entry expires at `expiresAt` (`Conversation::drop_expired_context`) |
+| `metadata[mentions/v1]` `{mentions: [{agentId, label, start, end, name?, cardUrl?}], coordinate?: {tool}}` | `context["vymalo.mentions"]` = `{mentions, coordinate?}` (`CONTEXT_MENTIONS`): the references that are well formed (an `agentId`, a `label` of at most 64 UTF-16 code units; the `name` cut at 200 characters), at most 16, in order, and `coordinate` only as `{tool}` with a tool name a model can be shown. **The mentions of the latest message:** a message that carries other extension metadata and no mentions sets the key to `null`, which deletes it, so a run that continues another does not read the earlier message's mentions as its own. The text is not rewritten; `adam-ui` turns the entry into the "Mentioned agents" block of the prompt |
 
 A message with none of these has no `context`, so it changes nothing in the run. An A2A server holds the numbers of
 metadata as doubles (a catalog's `maxLength: 256` arrives as `256.0`, `version` as `2.0`); every whole number that goes into

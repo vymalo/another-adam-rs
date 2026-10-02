@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use a2a::{Message, Part, PartContent};
-use adam_a2a::{A2UI_MEDIA_TYPE, THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION};
+use adam_a2a::{A2UI_MEDIA_TYPE, MENTIONS_EXTENSION, THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION};
 use adam_runtime::Inbound;
 use serde_json::{Map, Number, Value, json};
 
@@ -21,6 +21,16 @@ pub const CONTEXT_UI_CATALOG: &str = "vymalo.ui.catalog";
 /// The context key of the thread-tools grant: `{url, token, expiresAt}`. A credential; the entry
 /// expires at `expiresAt`.
 pub const CONTEXT_THREAD_TOOLS: &str = "vymalo.threadTools";
+
+/// The context key of the agents the person mentioned in the **latest message**:
+/// `{mentions: [{agentId, label, start?, end?, name?, cardUrl?}], coordinate?: {tool}}`
+/// (`mentions/v1`). A message that carries the orchestration layer's extensions but no mentions sets
+/// it to `null`, which deletes it: a run that continues another must not read the earlier message's
+/// mentions as its own.
+pub const CONTEXT_MENTIONS: &str = "vymalo.mentions";
+
+/// The most mentions one message carries (the contract's limit); the ones after it are dropped.
+pub const MAX_MENTIONS: usize = 16;
 
 /// The most characters of an action's `context` that the text for the model carries.
 pub const MAX_ACTION_CONTEXT_CHARS: usize = 4096;
@@ -59,6 +69,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// | `metadata[ui-catalog/v1]` `{catalogId, version, digest, inline}` | context [`CONTEXT_UI_REF`] `{catalogId, version, digest}` |
 /// | the renderer's capabilities (`a2uiClientCapabilities.v0.9.1`, else `.v0.9`, else `a2uiRendererCapabilities.v1.0`) holding an inline catalog with the ref's `catalogId` | context [`CONTEXT_UI_CATALOG`] `{catalogId, version, digest, catalog}` |
 /// | `metadata[thread-tools/v1]` `{url, token, expiresAt}` | context [`CONTEXT_THREAD_TOOLS`], the same three members |
+/// | `metadata[mentions/v1]` `{mentions: [{agentId, label, start, end, name?, cardUrl?}], coordinate?: {tool}}` | context [`CONTEXT_MENTIONS`], the mentions that are well formed (at most [`MAX_MENTIONS`]) and the `coordinate` tool; a message with other extension metadata and no mentions sets it to `null` |
 ///
 /// A message with none of the metadata has no `context` at all, so it changes nothing in the run.
 /// The capability key is read under both `v0.9` and `v0.9.1` because A2UI's own files disagree on
@@ -240,7 +251,96 @@ fn context_of(metadata: &HashMap<String, Value>) -> Option<Map<String, Value>> {
     if let Some(grant) = metadata.get(THREAD_TOOLS_EXTENSION).and_then(thread_tools) {
         context.insert(CONTEXT_THREAD_TOOLS.to_owned(), grant);
     }
+    // The mentions are the ones of this message: a message that speaks for the screen and names none
+    // takes the earlier ones away (a run that continues another carries its context along).
+    let wants_mentions = metadata.contains_key(MENTIONS_EXTENSION);
+    match metadata.get(MENTIONS_EXTENSION).and_then(mentions) {
+        Some(found) => {
+            context.insert(CONTEXT_MENTIONS.to_owned(), found);
+        }
+        None if wants_mentions || !context.is_empty() => {
+            context.insert(CONTEXT_MENTIONS.to_owned(), Value::Null);
+        }
+        None => {}
+    }
     (!context.is_empty()).then_some(context)
+}
+
+/// The longest `agentId` kept, in bytes.
+const MAX_AGENT_ID_BYTES: usize = 256;
+/// The longest `label` kept, in UTF-16 code units (the contract's limit).
+const MAX_LABEL_UNITS: usize = 64;
+/// The longest display `name` kept, in characters; a longer one is cut.
+const MAX_NAME_CHARS: usize = 200;
+/// The longest `cardUrl` kept, in bytes; a longer one is left out.
+const MAX_CARD_URL_BYTES: usize = 2048;
+
+/// `{mentions, coordinate?}` of the `mentions/v1` metadata. A mention that is not an object with a
+/// non-empty `agentId` and a `label` of at most 64 UTF-16 code units is dropped, the others are kept
+/// in order (at most [`MAX_MENTIONS`]); `None` when none is left. The `coordinate` is kept only as
+/// `{tool}` with a tool name a model can be shown. Everything here is **text from other parties** (a
+/// display name comes from a card, a label is the person's): it is read, bounded and passed on, never
+/// obeyed.
+fn mentions(value: &Value) -> Option<Value> {
+    let kept: Vec<Value> = value
+        .get("mentions")?
+        .as_array()?
+        .iter()
+        .filter_map(mention)
+        .take(MAX_MENTIONS)
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let mut entry = json!({ "mentions": kept });
+    let tool = value
+        .pointer("/coordinate/tool")
+        .and_then(Value::as_str)
+        .filter(|t| is_tool_name(t));
+    if let Some(tool) = tool {
+        entry["coordinate"] = json!({ "tool": tool });
+    }
+    Some(entry)
+}
+
+/// One reference of the `mentions/v1` metadata, as the context keeps it.
+fn mention(value: &Value) -> Option<Value> {
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let agent_id = text("agentId").filter(|id| id.len() <= MAX_AGENT_ID_BYTES)?;
+    let label = text("label").filter(|l| l.encode_utf16().count() <= MAX_LABEL_UNITS)?;
+    let mut kept = json!({ "agentId": agent_id, "label": label });
+    if let Some(name) = text("name") {
+        kept["name"] = json!(name.chars().take(MAX_NAME_CHARS).collect::<String>());
+    }
+    if let Some(url) = text("cardUrl").filter(|u| u.len() <= MAX_CARD_URL_BYTES) {
+        kept["cardUrl"] = json!(url);
+    }
+    // Where the label sits in the message text (UTF-16 code units); a producer that cannot say
+    // leaves both out, and the label is still the way to find it.
+    if let (Some(start), Some(end)) = (
+        value.get("start").and_then(whole_number),
+        value.get("end").and_then(whole_number),
+    ) && 0 <= start
+        && start < end
+    {
+        kept["start"] = json!(start);
+        kept["end"] = json!(end);
+    }
+    Some(kept)
+}
+
+/// Whether `name` can be shown to a model as a tool name: letters, digits, `-` and `_`, at most 64.
+fn is_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// `{catalogId, version, digest}` of the `ui-catalog/v1` metadata, with `version` as an integer;
@@ -554,7 +654,9 @@ mod tests {
         let payload = vymalo_inbound(&m).unwrap().payload;
         assert_eq!(
             payload["context"],
-            json!({CONTEXT_UI_REF: {"catalogId": CATALOG_ID, "version": 2, "digest": DIGEST}})
+            // A message that speaks for the screen and names no agent takes the earlier mentions away.
+            json!({CONTEXT_UI_REF: {"catalogId": CATALOG_ID, "version": 2, "digest": DIGEST},
+                   CONTEXT_MENTIONS: null})
         );
         assert!(payload["context"]["vymalo.ui.ref"]["version"].is_i64());
     }
@@ -630,7 +732,7 @@ mod tests {
         let m = with_metadata(text_message("hi"), json!({THREAD_TOOLS_EXTENSION: grant}));
         assert_eq!(
             vymalo_inbound(&m).unwrap().payload["context"],
-            json!({CONTEXT_THREAD_TOOLS: grant})
+            json!({CONTEXT_THREAD_TOOLS: grant, CONTEXT_MENTIONS: null})
         );
         for missing in ["url", "token", "expiresAt"] {
             let mut partial = grant.clone();
@@ -638,6 +740,140 @@ mod tests {
             let m = with_metadata(text_message("hi"), json!({THREAD_TOOLS_EXTENSION: partial}));
             assert!(vymalo_inbound(&m).unwrap().payload.get("context").is_none());
         }
+    }
+
+    // ---- mentions ----
+
+    fn mention(id: &str, label: &str, start: Value, end: Value) -> Value {
+        json!({"agentId": id, "name": "Mock researcher", "label": label, "start": start, "end": end,
+               "cardUrl": format!("http://{id}:8080/.well-known/agent-card.json")})
+    }
+
+    fn context_of_mentions(metadata: Value) -> Option<Value> {
+        let m = with_metadata(text_message("first @researcher then @coder"), metadata);
+        vymalo_inbound(&m)
+            .unwrap()
+            .payload
+            .get("context")
+            .map(|c| c[CONTEXT_MENTIONS].clone())
+    }
+
+    #[test]
+    fn mentions_reach_the_context_as_sent_with_their_positions_as_integers() {
+        // As an A2A server hands the numbers over: doubles.
+        let given = json!({MENTIONS_EXTENSION: {
+            "mentions": [
+                mention("mock-researcher", "@researcher", json!(6.0), json!(17.0)),
+                {"agentId": "mock-coder", "label": "@coder"}],
+            "coordinate": {"tool": "ask_agent"}}});
+        let got = context_of_mentions(given).unwrap();
+        assert_eq!(
+            got,
+            json!({"mentions": [
+                {"agentId": "mock-researcher", "name": "Mock researcher", "label": "@researcher",
+                 "start": 6, "end": 17,
+                 "cardUrl": "http://mock-researcher:8080/.well-known/agent-card.json"},
+                // One the orchestrator could not resolve at send time: the four members, no name.
+                {"agentId": "mock-coder", "label": "@coder"}],
+                "coordinate": {"tool": "ask_agent"}})
+        );
+        assert!(got["mentions"][0]["start"].is_i64());
+    }
+
+    #[test]
+    fn without_a_coordinate_tool_the_agent_has_the_references_and_no_way_to_ask() {
+        for coordinate in [
+            None,
+            Some(json!({"tool": ""})),
+            Some(json!({"tool": "ask agent!"})),
+            Some(json!({"tool": 7})),
+            Some(json!("ask_agent")),
+        ] {
+            let mut entry = json!({"mentions": [mention("a", "@a", json!(0), json!(2))]});
+            if let Some(coordinate) = coordinate {
+                entry["coordinate"] = coordinate;
+            }
+            let got = context_of_mentions(json!({MENTIONS_EXTENSION: entry})).unwrap();
+            assert!(got.get("coordinate").is_none(), "{got}");
+            assert_eq!(got["mentions"][0]["agentId"], "a");
+        }
+    }
+
+    #[test]
+    fn a_mention_that_is_not_well_formed_is_dropped_and_the_others_are_kept() {
+        let long_label = format!("@{}", "x".repeat(64));
+        let got = context_of_mentions(json!({MENTIONS_EXTENSION: {"mentions": [
+            {"label": "@no-id"},
+            {"agentId": "", "label": "@empty-id"},
+            {"agentId": "no-label"},
+            {"agentId": "long", "label": long_label},
+            "not an object",
+            // Positions that cannot be (end before start, negative) are left out; the label stays.
+            {"agentId": "odd", "label": "@odd", "start": 9, "end": 3},
+            {"agentId": "neg", "label": "@neg", "start": -1, "end": 3},
+            // 64 UTF-16 code units exactly: 63 emoji are 126 units, so 32 emoji and '@' is 65: too long;
+            // 31 emoji and '@' is 63: fine.
+            {"agentId": "emoji", "label": format!("@{}", "😄".repeat(31))},
+            {"agentId": "emoji-long", "label": format!("@{}", "😄".repeat(32))},
+        ]}}))
+        .unwrap();
+        let ids: Vec<&str> = got["mentions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["agentId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["odd", "neg", "emoji"]);
+        assert!(got["mentions"][0].get("start").is_none());
+        assert!(got["mentions"][1].get("end").is_none());
+    }
+
+    #[test]
+    fn at_most_sixteen_mentions_and_a_long_name_is_cut() {
+        let many: Vec<Value> = (0..20)
+            .map(|i| json!({"agentId": format!("a{i}"), "label": format!("@a{i}")}))
+            .collect();
+        let got = context_of_mentions(json!({MENTIONS_EXTENSION: {"mentions": many}})).unwrap();
+        assert_eq!(got["mentions"].as_array().unwrap().len(), MAX_MENTIONS);
+        assert_eq!(got["mentions"][15]["agentId"], "a15");
+        let named = context_of_mentions(json!({MENTIONS_EXTENSION: {"mentions": [
+            {"agentId": "a", "label": "@a", "name": "n".repeat(500)}]}}))
+        .unwrap();
+        assert_eq!(named["mentions"][0]["name"].as_str().unwrap().len(), 200);
+    }
+
+    #[test]
+    fn a_message_that_names_no_agent_takes_the_earlier_mentions_away() {
+        // Mentions metadata with nothing usable in it, alone: a delete.
+        for entry in [
+            json!({"mentions": []}),
+            json!({"mentions": [{"label": "@x"}]}),
+            json!("x"),
+        ] {
+            assert_eq!(
+                context_of_mentions(json!({MENTIONS_EXTENSION: entry})),
+                Some(Value::Null)
+            );
+        }
+        // The grant of a screen's message and no mentions: a delete beside it.
+        let grant = json!({"url": "http://o/t", "token": "t", "expiresAt": "2999-01-01T00:00:00Z"});
+        let m = with_metadata(text_message("hi"), json!({THREAD_TOOLS_EXTENSION: grant}));
+        let payload = vymalo_inbound(&m).unwrap().payload;
+        assert!(payload["context"][CONTEXT_MENTIONS].is_null());
+        assert!(
+            payload["context"]
+                .as_object()
+                .unwrap()
+                .contains_key(CONTEXT_MENTIONS)
+        );
+        // A message with no extension metadata at all changes nothing (no context).
+        assert_eq!(context_of_mentions(json!({"something": 1})), None);
+    }
+
+    #[test]
+    fn a_message_says_nothing_about_mentions_when_it_says_nothing_at_all() {
+        let m = with_metadata(text_message("hi"), json!({}));
+        assert!(vymalo_inbound(&m).unwrap().payload.get("context").is_none());
     }
 
     #[test]

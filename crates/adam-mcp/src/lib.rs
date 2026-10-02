@@ -28,7 +28,9 @@ mod url;
 
 pub use error::{Error, UrlProblem, VarProblem};
 pub use expand::Env;
-pub use once::{Endpoint, EndpointError, RemoteResult, RemoteTool};
-pub use policy::{DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, McpPolicy};
+pub use once::{CallOptions, Endpoint, EndpointError, RemoteResult, RemoteTool};
+pub use policy::{
+    DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_THREAD_TOOLS_MAX_CALL, McpPolicy,
+};
 pub use servers::McpServers;
 pub use text::MAX_RESULT_BYTES;

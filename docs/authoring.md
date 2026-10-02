@@ -892,7 +892,8 @@ stateDiagram-v2
   ([ADR 0004](decisions/0004-agent-folders-at-run-time.md), [ADR 0005](decisions/0005-one-binary-serves-any-agent-folder.md))
   and call `connect_mcp` in every role that runs workers,
   with the policy of three variables: `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE` and `MCP_ALLOW_URL_VARS` (each
-  `McpPolicy` opt-in above, all off by default). `${VAR}` in `headers`, `args` and `env` reads the process
+  `McpPolicy` opt-in above, all off by default), and `THREAD_TOOLS_MAX_CALL_SECS` (the longest a call to the thread's
+  tools endpoint is waited for, default 3600; not about an `mcp.json` server). `${VAR}` in `headers`, `args` and `env` reads the process
   environment. A server that is down is exit code 69, anything the files or the policy get wrong is 78; see
   [the coder's README](../bin/adam-coder/README.md#mcp-tools-from-the-folder) and
   [`adam-agent`'s](../bin/adam-agent/README.md#mcp-servers-from-the-folder).

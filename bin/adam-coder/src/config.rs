@@ -39,6 +39,7 @@
 //! | `MCP_ALLOW_STDIO` | let an agent folder's `mcp.json` start local processes (`command` servers) | `false` |
 //! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
 //! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
+//! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 //! | `DEVCONTAINER_RUNTIME` | where a run's commands and OpenCode run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service, [ADR 0010](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)) | `off` |
 //! | `CONTAINER_HOST` | Podman's own variable: where the service is, `unix:///run/podman/podman.sock`; required with `podman` | unset |
 //! | `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository that has no `devcontainer.json`; **by digest only** (`name@sha256:...`): the devcontainer CLI cannot parse a tag together with a digest | the `workspace` image of `another-agentic-images` ([`DEFAULT_DEVCONTAINER_IMAGE`]) |
@@ -1142,7 +1143,8 @@ mod tests {
             McpSettings {
                 allow_stdio: true,
                 allow_insecure: true,
-                allow_url_vars: true
+                allow_url_vars: true,
+                thread_tools_max_call_secs: 3600,
             }
         );
         let policy = w.mcp.policy();
