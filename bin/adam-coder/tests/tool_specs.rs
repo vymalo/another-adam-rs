@@ -22,7 +22,7 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 16] = [
+const TOOLS: [&str; 17] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -34,6 +34,7 @@ const TOOLS: [&str; 16] = [
     "apply_patch",
     "delegate_to_opencode",
     "run_checks",
+    "rebuild_environment",
     "commit_and_push",
     "open_pull_request",
     "ask_user",
@@ -168,6 +169,7 @@ async fn only_the_optional_arguments_are_nullable() {
             "read_file.end_line",
             "read_file.repo",
             "read_file.start_line",
+            "rebuild_environment.use_default",
             "run_checks.cwd",
             "run_checks.repo",
             "run_command.cwd",

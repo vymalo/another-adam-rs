@@ -1094,6 +1094,13 @@ impl Environment for DevContainer {
         result
     }
 
+    async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
+        // The inherent method of the same name does the work; with no runtime there is nothing
+        // of its own to make again (a run is in the coder's own environment).
+        DevContainer::rebuild(self, run, use_default).await?;
+        Ok(self.inner.settings.runtime == Runtime::Podman)
+    }
+
     async fn held_runs(&self) -> Result<Vec<String>, EnvError> {
         let s = &self.inner.settings;
         let mut runs = BTreeSet::new();

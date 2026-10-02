@@ -10,6 +10,7 @@
 //! | `read_file { path, start_line?, end_line? }`, `write_file { path, content }`, `apply_patch { patch }` | [`files`] |
 //! | `delegate_to_opencode { instructions }` | [`delegate`] |
 //! | `run_checks { command }` | [`checks`] |
+//! | `rebuild_environment { use_default? }` | [`environment`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
 //! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}` | [`adam_ui`]: the person's screen as tools |
 //!
@@ -35,6 +36,10 @@
 //!   branch an earlier task opened it for, or the call is repeated), and
 //!   `CodeHost::open_pull_request` returns it instead of a second one in any case.
 //! * `run_checks`: failures are counted per call id ([`notes`]).
+//! * `rebuild_environment`: throwing the environment away and making it again twice is the same as once (the
+//!   second call finds the first one's result and makes it once more, which costs time and nothing else); a
+//!   choice of the default image is kept in the notes and in the environment's own state, and a repeat of it
+//!   changes nothing.
 //! * `request_repository { repo_url, reason }`: it only asks. A repeat after the person's yes finds the
 //!   repository granted and says so; after a no it says so; with no answer yet it asks again.
 //! * `create_repository { owner, name, private?, description? }`: a repository made is recorded under
@@ -90,6 +95,7 @@ pub mod checks;
 pub mod consent;
 pub mod create;
 pub mod delegate;
+pub mod environment;
 pub mod files;
 mod gitcli;
 pub mod inspect;
@@ -137,6 +143,9 @@ pub struct CoderSettings {
     /// The owners `create_repository` may create repositories for, lowercased: `CREATE_REPO_OWNERS`.
     /// Empty: the tool refuses every call.
     pub create_repo_owners: Vec<String>,
+    /// The devcontainers have no network (`DEVCONTAINER_NETWORK=none`): OpenCode, inside one,
+    /// cannot reach its model, so `delegate_to_opencode` refuses there and says what to use instead.
+    pub container_network_none: bool,
 }
 
 impl CoderSettings {
@@ -153,6 +162,7 @@ impl CoderSettings {
             opencode,
             default_repo_host: named::DEFAULT_HOST.to_owned(),
             create_repo_owners: Vec::new(),
+            container_network_none: false,
         }
     }
 }
@@ -286,7 +296,7 @@ impl ToolEnv {
         while let Ok(step) = reported.try_recv() {
             self.show_step(ctx, &run, step).await;
         }
-        made.map_err(|e| environment_error(&self.redactor, &e))
+        made.map_err(|e| session_error(&self.redactor, &e))
     }
 
     /// A step of making the environment, as a step of the tool call.
@@ -396,7 +406,7 @@ pub(crate) fn resolve_slot(
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the thirteen of the coding workflow,
+/// Every coder tool, in the order they are offered to the model: the fourteen of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
@@ -423,6 +433,7 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         files::ApplyPatch,
         delegate::DelegateToOpenCode,
         checks::RunChecks,
+        environment::RebuildEnvironment,
         publish::CommitAndPush,
         publish::OpenPullRequest,
     ]
@@ -529,6 +540,50 @@ pub(crate) fn environment_error(redactor: &Redactor, e: &EnvError) -> ToolError 
         ToolError::Transient(text)
     } else {
         ToolError::Permanent(text)
+    }
+}
+
+/// What the model is told when the environment of the run cannot be made and will not be made by
+/// asking again (a repository's `devcontainer.json` that is wrong, refused, or does not build).
+const BROKEN_ENVIRONMENT: &str = "\n\nThe environment is broken and stays broken until the person \
+decides, so this is not something to work around: do not run the command another way, and do not \
+look for the tool elsewhere. Ask the person with ask_user, in plain words, what is wrong and what \
+you can do: they can fix the file in the repository (then you call rebuild_environment), or you can \
+go on in the default environment (rebuild_environment with use_default: true). Call \
+rebuild_environment only after they have answered.";
+
+/// The failure of [`ToolEnv::session`]: [`environment_error`], and for an environment that cannot be
+/// made at all (its file is wrong, refused or does not build; a phase that ran out of time, which
+/// the environment keeps as broken) a permanent error that says what to do: ask the person.
+pub(crate) fn session_error(redactor: &Redactor, e: &EnvError) -> ToolError {
+    let broken = matches!(
+        e,
+        EnvError::Config { .. }
+            | EnvError::Refused(_)
+            | EnvError::Build { .. }
+            | EnvError::Timeout { .. }
+    );
+    if !broken {
+        return environment_error(redactor, e);
+    }
+    let mut text = match environment_error(redactor, e) {
+        ToolError::Transient(text) | ToolError::Permanent(text) => text,
+        other => report(&other),
+    };
+    text.push_str(BROKEN_ENVIRONMENT);
+    ToolError::Permanent(text)
+}
+
+/// The file a devcontainer was built from, as the repository calls it: the part of `path` that starts
+/// at `.devcontainer` (`.devcontainer/devcontainer.json`, `.devcontainer.json`).
+pub(crate) fn repository_file(path: &std::path::Path) -> String {
+    let names: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    match names.iter().position(|n| n.starts_with(".devcontainer")) {
+        Some(at) => names[at..].join("/"),
+        None => path.display().to_string(),
     }
 }
 

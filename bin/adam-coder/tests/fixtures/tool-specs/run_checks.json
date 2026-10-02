@@ -1,12 +1,12 @@
 {
   "name": "run_checks",
-  "description": "Run one of the project's own checks in your worktree (the commands its CI, README or Makefile run: `cargo test`, `pnpm test`, `just ci`) and get its exit code and the tail of its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited check cycles and is reported as a check: never use it to look around (use run_command). A command the shell cannot find means the workspace lacks that tool: that is reported, costs no cycle, and is for the person to decide.",
+  "description": "Run one of the project's own checks in your worktree (the commands its CI, README or Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (the repository's own devcontainer when it has one), and get its exit code and the tail of its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited check cycles and is reported as a check: never use it to look around (use run_command). A command the shell cannot find means the workspace lacks that tool: that is reported, costs no cycle, and is for the person to decide.",
   "parameters": {
     "type": "object",
     "properties": {
       "command": {
         "type": "string",
-        "description": "Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree"
+        "description": "Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree, in the workspace's environment"
       },
       "cwd": {
         "type": "string",

@@ -259,7 +259,7 @@ name. It has no authentication (any credentials are accepted) and its
 repositories live in the `git-data` volume. The layout is
 `/<owner>/<repo>.git`, the shape `adam-workspace` and the mock GitHub expect.
 
-It is seeded with every directory `dev/git-server/seed/<owner>/<name>/` (today `local/sandbox`, and `local/library`, a second repository with a `greeting.txt`, for the `second-repo` scenario below), each
+It is seeded with every directory `dev/git-server/seed/<owner>/<name>/` (today `local/sandbox`; `local/library`, a second repository with a `greeting.txt`, for the `second-repo` scenario below; `local/devbox`, whose own devcontainer has the tool `devbox-tool`, and `local/devbox-broken`, whose devcontainer file asks for what is not allowed, for the work-environment scenarios below), each
 once. And it behaves like a place where repositories can be **created**: a request for
 `/<owner>/<name>.git` of an owner in `AUTO_CREATE_OWNERS` (a comma or space list; `scratch` in
 `compose.yaml`, empty means none) makes the bare repository first, empty, on branch `main`, with pushes
@@ -345,6 +345,32 @@ does: the project is published to the new repository (empty, until then), `main`
 request is for it. With `no` the creation is never made, git-server never hears of the repository, no pull
 request is opened and the task waits. (`CREATE_REPO_OWNERS=scratch` is in `compose.yaml`; the App-mode run creates in
 the organisation too, since an installation token has no user.)
+
+#### The work environment: the repository's devcontainer (slice 7b)
+
+`SCENARIO=devcontainer`, `default-env`, `broken-env` and `no-runtime` run against the stack **with a rootless Podman service beside the
+coder** ([ADR 0010](docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md); `dev/podman/README.md` says what the service
+is given and why: no `privileged`, no `cap_add`, no `devices`, three `security_opt`):
+
+```sh
+# Ubuntu 24.04 hosts (CI runners, desktops) stop unprivileged user namespaces under AppArmor, which a rootless Podman needs:
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0      # only where the key exists
+docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app up -d --build --wait
+SCENARIO=devcontainer sh dev/coder-e2e.sh    # the repository's own devcontainer (local/devbox: devbox-tool is only there)
+SCENARIO=default-env  sh dev/coder-e2e.sh    # a repository without one: the default image, not the coder's own
+SCENARIO=broken-env   sh dev/coder-e2e.sh    # local/devbox-broken: refused, the person decides, nothing in the file ran
+SCENARIO=no-runtime   sh dev/coder-e2e.sh    # the service stopped: the coder's own container, with a step that says so
+```
+
+The first image pull and build take minutes (the 367 MiB `devcontainers/base` image of the default environment, and `devbox`'s own build on
+it); where the containers have no direct internet, `PRELOAD_FROM_DOCKER=1` loads the default image into the service from the host's
+Docker (*unverified*). `COMPOSE_CMD` says how the script reaches `docker compose` for the stack. Each scenario asserts durable things (what the
+model's journal says a tool returned, the `checks` artifact's `environment`, the pushed `tool.txt`, what Podman lists with the run's label) and the
+steps of the environment as lines of the stream: `devcontainer` also that `env` inside has no `GITHUB_TOKEN`, `DATABASE_URL` or
+`A2A_BEARER_TOKENS`, that Podman lists a container while the run lasts and none within a minute of its end (the janitor, `WORKSPACE_SWEEP_SECS=10`),
+and that the Podman service has no `privileged`, `cap_add` or `devices` and no service mounts a Docker socket; `broken-env` that
+`/work/INIT-RAN` (the fixture's `initializeCommand`) does not exist in the coder. The coder image in the stack needs the devcontainer
+CLI and `podman-remote` (`docker/coder/Dockerfile`).
 
 #### The coder as a GitHub App installation
 
@@ -493,6 +519,10 @@ request gets the same answer and the script cannot drift out of step.
 | `mock-coder`, task text contains `[mock:files]` | same file | the coder edits the files itself, ids `fl-call-N`: `prepare_workspace` (`fl-call-1`), `read_file` `README.md` (`fl-call-2`), `write_file` `hello.txt` with `hello` (`fl-call-3`), `run_checks` (`sh ./check.sh`), `commit_and_push`, `open_pull_request`, final text. OpenCode is never started. `dev/coder-e2e.sh` runs it with `SCENARIO=files`. |
 | `mock-coder`, task text contains `[mock:second-repo]` | same file | ids `sr-call-N`: `prepare_workspace` (`local/sandbox`), `request_repository` (`http://git-server:8080/local/library.git`, a reason), which parks the run on the tool's question; once the answer is in the history, `prepare_workspace` (`local/library`), and then by what that said. **Added** (its `slot: library` is in the result): `read_file` (`greeting.txt`, `repo: library`), `write_file` (`hello.txt` in the sandbox, `hello from library`), `run_checks`, `commit_and_push` and `open_pull_request` (all `repo: sandbox`), final text. **Refused** (the refusal text is in the result): a final text that says the library could not be added, which parks the run. `dev/coder-e2e.sh` runs it with `SCENARIO=second-repo` and `ANSWER=yes` or `no`, and `wiremock_compose` plays both ways, in both forms. |
 | `mock-coder`, task text contains `[mock:create-repo] fib-<hex>` | same file | ids `cr-call-N`: `start_scratch`, two `write_file`, `run_checks`, a **text question** (it can create a repository), which parks the run. Once the person's answer holds `Create scratch/`: `create_repository` (`scratch`, `fib-<hex>`, a description; the name taken from the task text with `regexExtract`), which parks the run on the tool's question; once its answer is in the history, `create_repository` again. Then by what the tool said. **Created** (`(private, empty` is in the result): `publish_scratch` (`http://git-server:8080/scratch/fib-<hex>.git`), `commit_and_push` and `open_pull_request` (`repo: fib-<hex>`), final text. **Declined** (`declined` is in the result): a final text that says the repository was not created, which parks the run. `dev/coder-e2e.sh` runs it with `SCENARIO=create-repo` and `ANSWER=yes` or `no`, and `wiremock_compose` plays both ways, in both forms. |
+| `mock-coder`, task text contains `[mock:devcontainer]` | same file | the repository's own devcontainer is the environment (slice 7b), ids `dc-call-N`: `prepare_workspace` (`local/devbox`), `run_command` `devbox-tool --version` (`dc-call-2`; the tool only the devcontainer has), `run_command` `env` (`dc-call-3`; the e2e asserts it shows no secret), `delegate_to_opencode` (`dc-call-4`, with `[mock:oc-devbox]` in the instructions: `mock-opencode` then calls `bash` with `devbox-tool --version > tool.txt`, ids `oc-dc-1`, and says it is done), `run_checks` (`sh ./check.sh`, which passes only where `devbox-tool` is the devcontainer's), `commit_and_push`, `open_pull_request`, final text. `dev/coder-e2e.sh` runs it with `SCENARIO=devcontainer`, on the stack with `dev/compose.devcontainer.yaml`, and `wiremock_compose` plays all four scripts below both ways. |
+| `mock-coder`, task text contains `[mock:default-env]` | same file | a repository without a devcontainer, ids `de-call-N`: `prepare_workspace` (`local/sandbox`), `run_command` `test -d /opt/flutter && echo coder-env || echo devcontainer-env` (only the coder's own image has `/opt/flutter`: the output says which environment ran it), `run_checks` (the check command makes the change, as `[mock:no-opencode]`), `commit_and_push`, `open_pull_request`, final text. `SCENARIO=default-env`. |
+| `mock-coder`, task text contains `[mock:broken-env]` | same file | `local/devbox-broken`, whose file asks for `privileged`, ids `be-call-N`: `prepare_workspace`, `run_command` `true` (the result is the broken environment's error, which names the file and says to ask the person), then a final **question** (wait for the fix, or go on in the default environment), which parks the run. `SCENARIO=broken-env`. |
+| `mock-coder`, task text contains `[mock:no-runtime]` | same file | `local/devbox` with the Podman service stopped, ids `nr-call-N`: `prepare_workspace`, `run_command` `devbox-tool --version` (reported as a missing tool), then a final question, which parks the run. `SCENARIO=no-runtime` stops the service first and starts it again at the end. |
 | `mock-coder`, task text contains `[mock:scratch] fib-<hex>` | same file | no repository is named, ids `sc-call-N`: `start_scratch` (`fib`), `write_file` `fib.sh` and `check.sh`, `run_checks` (`repo: fib`, `sh ./check.sh`), then a **text question** (which repository should I publish it to), which parks the run. Once the person's answer holds `Publish it to` (and the stop's `ask_user` call is in the history, which the greeting's second step also reads: that step excludes this switch): `publish_scratch` (`http://git-server:8080/scratch/fib-<hex>.git`, the repository named in the task text with `regexExtract`, so reruns on one stack never collide), `commit_and_push` and `open_pull_request` (both `repo: fib-<hex>`, the slot of the new repository), final text. OpenCode is never started. `dev/coder-e2e.sh` runs it with `SCENARIO=scratch`, and `wiremock_compose` plays it, in both forms, with the answer in the shape the coder gives it. |
 | `mock-coder`, task text contains `[mock:choices]` | `mappings/coder-choices.json` | `ask_user` (`choices-call-1`) with the question `Three quick questions before I start` and three `choices`: `db` (`pg`, `sqlite`), `auth` (`keycloak`, `none`), `deploy` (`k8s`, `compose`), priority 1; once its result holds `db: pg` (how the person's answers read to the model) the text `Going with Postgres, Keycloak and Compose.` (`stop`), priority 1; any other answers, `Thanks, I have your answers.`, priority 2. No workspace or repository is touched. `dev/coder-choices-e2e.sh` runs it through the stack. |
 | `mock-opencode` | `mappings/opencode-script.json`, `__files/opencode-*.sse` | streamed: a `bash` tool call `oc-call-1` with `echo hello > hello.txt`, then, once its result is in the history, a final text. Any other request of that model (for example OpenCode's title generation) gets the canned text of the default scenario. |

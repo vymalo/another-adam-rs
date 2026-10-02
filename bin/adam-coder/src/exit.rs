@@ -22,7 +22,7 @@ use std::error::Error;
 
 use adam::AssemblyError;
 use adam_error::{Classify, ErrorClass};
-use adam_workspace::WorkspaceError;
+use adam_workspace::{EnvError, WorkspaceError};
 
 use crate::AgentFilesError;
 
@@ -40,6 +40,10 @@ pub fn exit_code(err: &anyhow::Error) -> u8 {
 /// The class of `cause` when it is one of the typed errors of the coder's own steps.
 fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
     if let Some(e) = cause.downcast_ref::<WorkspaceError>() {
+        return Some(e.class());
+    }
+    // The work environment (its tools directory that cannot be written at startup, for one).
+    if let Some(e) = cause.downcast_ref::<EnvError>() {
         return Some(e.class());
     }
     // The agent files and the code disagreeing is a mistake in the deployment's files, which a
@@ -189,6 +193,19 @@ mod tests {
     fn anything_else_is_1() {
         assert_eq!(exit_code(&anyhow::anyhow!("something odd")), 1);
         assert_eq!(coded(WorkspaceError::Auth("bad token".into())), 1);
+    }
+
+    /// The work environment is the coder's own typed error: an `Io` one (the tools directory that
+    /// every devcontainer mounts cannot be written) is internal, a refusal is the deployment's.
+    #[test]
+    fn a_work_environment_error_has_the_code_of_its_class() {
+        let io = EnvError::from(std::io::Error::other("disk full"));
+        let chained = Err::<(), _>(io)
+            .context("writing the tools every devcontainer mounts")
+            .unwrap_err();
+        assert_eq!(exit_code(&chained), 70);
+        assert_eq!(coded(EnvError::Refused("no".into())), 78);
+        assert_eq!(coded(EnvError::Unavailable("down".into())), 69);
     }
 
     #[tokio::test]

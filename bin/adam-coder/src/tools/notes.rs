@@ -90,6 +90,41 @@ pub struct MissingHit {
     pub tool: String,
 }
 
+/// What the coder remembers about the run's environment (the devcontainer the commands run in).
+///
+/// The environment itself keeps its own state on the volume (`<root>/environments/<run>/state.json`);
+/// this is what the tools need to answer without asking it, and what survives the environment being
+/// made again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentNotes {
+    /// The person decided to go on in the default environment (`rebuild_environment` with
+    /// `use_default`): the repository's own `devcontainer.json` is not used for the rest of the run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_default: bool,
+    /// Whether OpenCode starts in the environment (`opencode --version` ran there once): `Some(false)`
+    /// refuses `delegate_to_opencode` without running anything again, until the environment is made
+    /// again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode: Option<OpenCodeCheck>,
+}
+
+/// The answer of `opencode --version` in the run's environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenCodeCheck {
+    /// It started and exited 0.
+    pub works: bool,
+    /// What it said (the end of its output, scrubbed) when it did not.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+impl EnvironmentNotes {
+    /// Nothing is remembered: the notes of a run that never left this container keep their shape.
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 impl RunNotes {
     /// Record that call `call_id` found `tool` missing and return how many **earlier** calls found
     /// the same tool missing. Recording the same call again changes nothing and returns the same
@@ -236,6 +271,9 @@ pub struct RunNotes {
     /// answer is to ask the person, whatever the project says.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_tools: Vec<MissingHit>,
+    /// What the coder remembers about the run's environment.
+    #[serde(default, skip_serializing_if = "EnvironmentNotes::is_empty")]
+    pub environment: EnvironmentNotes,
     /// `open_pull_request` moved the continued branch to the pushed commit. From then on the
     /// branch has the run's commits, whether or not the pull request could be reported.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

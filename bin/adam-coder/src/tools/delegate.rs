@@ -10,10 +10,14 @@ use adam_error::{Classify, report};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
+use adam_workspace::{EnvKind, EnvSession};
+
 use crate::opencode::acp_command;
 use crate::redact::Redactor;
 
-use super::{Outcome, ToolEnv, cancelled, environment_error, non_empty};
+use super::notes::OpenCodeCheck;
+use super::shell::run_in;
+use super::{Outcome, ToolEnv, cancelled, environment_error, non_empty, notes_error, run_error};
 
 /// Most of the agent's reply kept for the summary.
 const SUMMARY_CAP: usize = 8 * 1024;
@@ -39,6 +43,81 @@ fn acp_error(e: &AcpError) -> ToolError {
     } else {
         ToolError::Permanent(text)
     }
+}
+
+/// How long `opencode --version` gets in a devcontainer.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What the model is told when OpenCode cannot reach its model from a devcontainer with no network.
+const NO_NETWORK: &str = "OpenCode cannot work in this workspace: its commands run in a devcontainer \
+that has no network (this deployment sets DEVCONTAINER_NETWORK=none), and OpenCode reaches its model \
+over the network. Make the change yourself with read_file, write_file and apply_patch; run_command \
+and run_checks work.";
+
+/// Whether OpenCode starts in the run's devcontainer: `opencode --version` is run there once and the
+/// answer is kept in the run's notes (until the environment is made again). `Some(why)` is the
+/// refusal to give the model: OpenCode cannot run there (a musl image, another architecture), and
+/// the other tools still work. Nothing is asked of the coder's own container, which has the
+/// OpenCode it was built with, and nothing of a launcher that is not OpenCode.
+async fn opencode_refusal(
+    env: &ToolEnv,
+    ctx: &ToolCtx,
+    session: &dyn EnvSession,
+    dir: &std::path::Path,
+) -> Result<Option<String>, ToolError> {
+    let description = session.describe();
+    if !env.settings.opencode.is_opencode()
+        || !matches!(description.kind, EnvKind::DevContainer { .. })
+    {
+        return Ok(None);
+    }
+    if env.settings.container_network_none {
+        return Ok(Some(NO_NETWORK.to_owned()));
+    }
+    let run = ctx.run_id().to_string();
+    let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    let check = match notes.environment.opencode.clone() {
+        Some(check) => check,
+        None => {
+            let outcome = run_in(
+                session,
+                env.settings.opencode.version_spec(dir, session),
+                VERSION_TIMEOUT,
+                1024,
+            )
+            .await
+            .map_err(|e| run_error(&env.redactor, &e))?;
+            let check = OpenCodeCheck {
+                works: outcome.passed(),
+                detail: if outcome.passed() {
+                    String::new()
+                } else {
+                    let said = env.redactor.scrub(outcome.tail.trim()).into_owned();
+                    match outcome.exit_code {
+                        _ if outcome.timed_out => "it did not answer in time".to_owned(),
+                        Some(code) => format!("exit code {code}: {said}"),
+                        None => format!("killed by a signal: {said}"),
+                    }
+                },
+            };
+            notes.environment.opencode = Some(check.clone());
+            env.notes
+                .save(&run, &notes)
+                .await
+                .map_err(|e| notes_error(&e))?;
+            check
+        }
+    };
+    Ok((!check.works).then(|| {
+        format!(
+            "OpenCode cannot start in this workspace's environment ({}): `opencode --version` \
+             failed there ({}). The coder's OpenCode is a native Linux binary built for glibc, so an \
+             image of another kind (musl, another architecture) cannot run it. Do not retry. Make \
+             the change yourself with read_file, write_file and apply_patch; run_command and \
+             run_checks work.",
+            description.summary, check.detail
+        )
+    }))
 }
 
 /// Stop OpenCode after a cancel: ask it to end its turn (`session/cancel`),
@@ -106,8 +185,9 @@ fn tail(text: &str, cap: usize) -> &str {
 // process group) and waits until it is reaped, before returning. Nothing is
 // left running once the tool has returned.
 
-/// Have OpenCode, a coding agent working inside your worktree, make a change.
-/// Give precise instructions: what to change, where, and how it will be
+/// Have OpenCode, a coding agent working inside your worktree, make a change. It runs in the
+/// workspace's environment, like your commands (the repository's own devcontainer when it has one),
+/// so everything it starts has the repository's tools. Give precise instructions: what to change, where, and how it will be
 /// verified. One concern per call. It reads and edits files itself; do not ask
 /// it to commit, push or open pull requests. Returns its summary and the files
 /// that changed.
@@ -134,8 +214,11 @@ pub async fn delegate_to_opencode(
     // OpenCode runs where the run's processes run, and the command is the one that environment
     // prepared (the files it works on are the same ones, at the same paths).
     let environment = env.session(ctx).await?;
+    if let Some(refusal) = opencode_refusal(&env, ctx, &*environment, &dir).await? {
+        return Ok(ToolOutput::error(refusal));
+    }
     let prepared = environment
-        .prepare(&env.settings.opencode.exec_spec(&dir))
+        .prepare(&env.settings.opencode.exec_spec(&dir, &*environment))
         .map_err(|e| environment_error(&env.redactor, &e))?;
     let command = acp_command(&prepared).map_err(|e| environment_error(&env.redactor, &e))?;
     // A cancel before the process is up needs no cleanup here: the spawn

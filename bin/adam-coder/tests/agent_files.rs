@@ -62,7 +62,7 @@ fn expected_prompt(cycles: u32) -> String {
 }
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 16] = [
+const TOOLS: [&str; 17] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -74,6 +74,7 @@ const TOOLS: [&str; 16] = [
     "apply_patch",
     "delegate_to_opencode",
     "run_checks",
+    "rebuild_environment",
     "commit_and_push",
     "open_pull_request",
     "ask_user",

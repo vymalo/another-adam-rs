@@ -1258,3 +1258,53 @@ async fn the_tools_directory_is_written_once_for_every_run() {
     assert_ne!(dir_with, dir);
     assert!(dir_with.join("opencode").is_file());
 }
+
+#[tokio::test]
+async fn the_coders_opencode_is_where_the_tools_directory_is_mounted_and_only_when_there_is_one() {
+    let rig = Rig::new();
+    let ws = rig.run(RUN);
+    rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
+        .await;
+    rig.inspect_for(&ws, true).await;
+    let session = rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    assert_eq!(
+        session.tool_path("opencode"),
+        None,
+        "no binary was given to mount"
+    );
+
+    let binary = rig.tmp.path().join("opencode");
+    std::fs::write(&binary, b"\x7fELF").unwrap();
+    let rig = Rig::with(|s| s.opencode = Some(binary));
+    let ws = rig.run(RUN);
+    rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
+        .await;
+    rig.inspect_for(&ws, true).await;
+    let session = rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    assert_eq!(
+        session.tool_path("opencode"),
+        Some(PathBuf::from("/opt/adam/bin/opencode"))
+    );
+    assert_eq!(session.tool_path("git"), None, "only what the coder brings");
+}
+
+#[tokio::test]
+async fn the_port_rebuild_makes_the_environment_again_and_says_whether_there_was_one() {
+    let rig = Rig::new();
+    let ws = rig.run(RUN);
+    rig.repository(&ws, "devbox", &as_refs(&devbox_files()))
+        .await;
+    rig.inspect_for(&ws, true).await;
+    rig.env.ensure(&ws, &Steps::default()).await.unwrap();
+    let ports: &dyn Environment = &rig.env;
+    assert!(ports.rebuild(RUN, true).await.unwrap());
+    assert_eq!(rig.state(RUN)["use_default"], true);
+    assert_eq!(rig.state(RUN)["phase"], "building");
+
+    let off = Rig::with(|s| s.runtime = Runtime::Off);
+    let ports: &dyn Environment = &off.env;
+    assert!(
+        !ports.rebuild(RUN, false).await.unwrap(),
+        "with no runtime the run is in the coder's own environment: nothing to make again"
+    );
+}

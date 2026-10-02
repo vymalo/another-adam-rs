@@ -1103,6 +1103,12 @@ pub struct FakeEnvironment {
     pub release_fails: AtomicBool,
     /// `ensure` never returns while this is set (an environment that takes forever to build).
     pub hang: AtomicBool,
+    /// The runs `rebuild` was called for, and whether it was to use the default.
+    pub rebuilt: Mutex<Vec<(String, bool)>>,
+    /// What `rebuild` says: whether there is anything of its own to make again.
+    pub rebuild_says: AtomicBool,
+    /// `ensure` fails with this after a `rebuild` (a build that goes wrong again).
+    pub ensure_fails_after_rebuild: Mutex<Option<fn() -> EnvError>>,
 }
 
 /// The session of a [`FakeEnvironment`].
@@ -1116,6 +1122,10 @@ pub struct FakeSession {
     pub killed: Mutex<Vec<ExecId>>,
     /// Variables added to every prepared command.
     pub extra_env: Mutex<BTreeMap<String, String>>,
+    /// What the session says it is; a devcontainer of an image `fake` when not set.
+    pub kind: Mutex<Option<EnvKind>>,
+    /// Where the session says the coder's OpenCode is (`EnvSession::tool_path`).
+    pub opencode_at: Mutex<Option<PathBuf>>,
 }
 
 impl FakeEnvironment {
@@ -1138,6 +1148,9 @@ impl FakeEnvironment {
             ensure_fails: Mutex::new(None),
             release_fails: AtomicBool::new(false),
             hang: AtomicBool::new(false),
+            rebuilt: Mutex::new(Vec::new()),
+            rebuild_says: AtomicBool::new(true),
+            ensure_fails_after_rebuild: Mutex::new(None),
         })
     }
 }
@@ -1184,17 +1197,40 @@ impl Environment for FakeEnvironment {
     async fn held_runs(&self) -> Result<Vec<String>, EnvError> {
         Ok(self.held.lock().unwrap().clone())
     }
+
+    async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
+        self.rebuilt
+            .lock()
+            .unwrap()
+            .push((run.to_owned(), use_default));
+        // What a rebuild clears: a broken environment is made again at the next `ensure`.
+        *self.ensure_fails.lock().unwrap() = self.ensure_fails_after_rebuild.lock().unwrap().take();
+        Ok(self.rebuild_says.load(Ordering::SeqCst))
+    }
 }
 
 #[async_trait]
 impl EnvSession for FakeSession {
     fn describe(&self) -> EnvDescription {
         EnvDescription {
-            kind: EnvKind::DevContainer {
-                source: None,
-                image: "fake".to_owned(),
-            },
+            kind: self
+                .kind
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(EnvKind::DevContainer {
+                    source: None,
+                    image: "fake".to_owned(),
+                }),
             summary: "a fake environment".to_owned(),
+        }
+    }
+
+    fn tool_path(&self, name: &str) -> Option<PathBuf> {
+        if name == "opencode" {
+            self.opencode_at.lock().unwrap().clone()
+        } else {
+            None
         }
     }
 

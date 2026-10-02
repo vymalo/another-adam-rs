@@ -12,7 +12,11 @@ name: coder
 # repository, which ends in a pull request on a repository named later; and all of them again with
 # the coder as a GitHub App installation, dev/compose.github-app.yaml; also a task that needs another
 # repository, which the coder may add only if the person says yes, and a no leaves it out; and a task
-# for which the coder creates a repository, again only after a yes (SCENARIO=create-repo); the default one also reads a
+# for which the coder creates a repository, again only after a yes (SCENARIO=create-repo); a work environment
+# for the run's commands, checks and OpenCode (slice 7b, ADR 0010): the repository's own devcontainer on a
+# rootless Podman service (dev/compose.devcontainer.yaml) in SCENARIO=devcontainer, the default image for a
+# repository without one (default-env), a devcontainer.json that cannot be used, which the person decides
+# (broken-env), and a stopped service (no-runtime); the default one also reads a
 # repository's branches through the GitHub MCP server, here its mock `mock-github-mcp`; the image build
 # itself runs the real server's tool list over stdio), and with
 # "Hi", which must get a greeting that says the agent's name, and with a changed
@@ -291,6 +295,28 @@ jobs:
           # a no it sees none.
           SCENARIO=create-repo ANSWER=yes sh dev/coder-e2e.sh
           SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
+          # The work environments: the stack again with a rootless Podman service beside the coder
+          # (dev/compose.devcontainer.yaml), and the coder pointed at it. Ubuntu 24.04 stops unprivileged user
+          # namespaces under AppArmor, which a rootless Podman needs; where the key does not exist there is
+          # nothing to set. Without it the coder falls back to its own container, and these scenarios say so.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          export COMPOSE_CMD="docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app"
+          $COMPOSE_CMD build podman
+          $COMPOSE_CMD up -d --no-build --wait podman coder
+          # local/devbox ships devbox-tool, which only its devcontainer has: run_command, run_checks and OpenCode's
+          # own bash command all run there, the pull request is for what they made, and the run's container
+          # and its image are gone after the sweep.
+          SCENARIO=devcontainer sh dev/coder-e2e.sh
+          # local/sandbox has no devcontainer: the default environment (not the coder's own image).
+          SCENARIO=default-env sh dev/coder-e2e.sh
+          # local/devbox-broken asks for privileged and tries an initializeCommand: refused, the person decides.
+          SCENARIO=broken-env sh dev/coder-e2e.sh
+          # The service stopped: the run goes on in the coder's own container, with a step that says so.
+          SCENARIO=no-runtime sh dev/coder-e2e.sh
+          # The plain stack again (the scripts below restart the coder without the override).
+          docker compose --profile app up -d --no-build --wait coder
           # The greeting, and the mounted agent folder (it restarts the coder on an edited copy).
           sh dev/greeting-e2e.sh
           # The general agent: "hi" answered in role by its folder, and an edited folder changes the
@@ -321,10 +347,10 @@ jobs:
           SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
       - name: Compose e2e logs
         if: failure() && steps.guard.outputs.ready == 'true'
-        run: docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app logs --no-color
+        run: docker compose -f compose.yaml -f dev/compose.github-app.yaml -f dev/compose.devcontainer.yaml --profile app logs --no-color
       - name: Compose e2e teardown
         if: always() && steps.guard.outputs.ready == 'true'
-        run: docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app down -v
+        run: docker compose -f compose.yaml -f dev/compose.github-app.yaml -f dev/compose.devcontainer.yaml --profile app down -v
       - uses: docker/login-action@v3
         if: steps.guard.outputs.push == 'true'
         with:

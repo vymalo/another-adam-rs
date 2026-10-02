@@ -751,8 +751,10 @@ the repository's own `devcontainer.json` (the first slot of the run decides, a d
 Podman service and never the host's Docker socket; the file is untrusted and checked three times, nothing of the coder's
 environment enters the container, and every step of making it is shown
 ([ADR 0010](decisions/0010-a-run-works-in-its-repositorys-devcontainer.md), which has the sequence and the lifecycle of that
-environment). It is chosen when the binary is composed (swapped at build time, not by a plugin); the coder composes it in the
-next change of the series.
+environment). It is chosen when the binary is composed (swapped at build time, not by a plugin): `adam-coder` composes it when
+`DEVCONTAINER_RUNTIME=podman` (off by default, and off on Kubernetes), starts OpenCode inside it too (the coder's own binary, mounted
+read-only; the model key as a file), has a `rebuild_environment` tool for the way out of a file that cannot be used, and has its
+janitor release a run's environment before it removes the run's workspace ([the coder's README](../bin/adam-coder/README.md#the-work-environment-the-repositorys-devcontainer)).
 
 ```mermaid
 sequenceDiagram

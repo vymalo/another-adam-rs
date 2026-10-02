@@ -287,6 +287,7 @@ dependencies = [
  "adam-acp",
  "adam-agent-fs",
  "adam-core",
+ "adam-devcontainer",
  "adam-error",
  "adam-host",
  "adam-llm-agent",

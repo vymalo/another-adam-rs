@@ -506,6 +506,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "apply_patch",
             "delegate_to_opencode",
             "run_checks",
+            "rebuild_environment",
             "commit_and_push",
             "open_pull_request",
             "ask_user",

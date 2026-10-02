@@ -33,9 +33,13 @@
 # published by vymalo/another-agentic-images (merged in #7 as bc97d51). Deployments
 # pin an immutable tag, never `latest`. Bump it when that image changes (the tag
 # of its newest build on main), together with anything here that depends on it.
-# Anonymous pull verified 2026-09-29: the manifest request for this tag with an
-# anonymous ghcr.io token returned 200.
-ARG WORKSPACE_TAG=1.98.1-bc97d51
+# Anonymous pull verified 2026-10-01: the manifest request for this tag with an
+# anonymous ghcr.io token returned 200, and the image's config has the
+# `devcontainer.metadata` label (it is a dev container base: the default environment of the
+# coder's devcontainers, ADR 0010). The same build is the default of DEVCONTAINER_DEFAULT_IMAGE,
+# by its digest alone (bin/adam-coder/src/config.rs: the devcontainer CLI cannot parse a tag together
+# with a digest); a test keeps this tag equal to the tag that digest was published as.
+ARG WORKSPACE_TAG=1.98.1-ee2273e
 
 FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS build
 WORKDIR /src
@@ -55,6 +59,19 @@ FROM ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193
 
 FROM ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}
 
+# The devcontainer CLI (MIT, no runtime dependencies, needs node 20 or newer: the base has 24), which
+# makes and enters a repository's devcontainer, and Podman's remote client, which it drives against
+# the rootless Podman service CONTAINER_HOST names (ADR 0010). Both are only clients: nothing in this image
+# runs containers. Verified 2026-10-01: @devcontainers/cli 0.89.0 is the newest release (npm registry).
+# The client must be the **service's own release** (5.8.7, dev/podman/Containerfile): CI's real-Podman job
+# found that a distribution's older client (Ubuntu's 4.9.3) pulls and inspects but then hangs in the CLI's
+# image build against the 5.x service. So it is the static client of containers/podman v5.8.7, pinned by
+# the release's sha256 (verified 2026-10-01), and not a distribution's package. Bump both together with
+# the service.
+ARG DEVCONTAINERS_CLI_VERSION=0.89.0
+ARG PODMAN_REMOTE_VERSION=5.8.7
+ARG PODMAN_REMOTE_SHA256=01b5ac597de2f7d55a7d52ba82c8e59df9e90355c5331849d6b7dbecf2345e7e
+
 LABEL org.opencontainers.image.source="https://github.com/vymalo/another-adam-rs" \
       org.opencontainers.image.description="adam-coder: coding task to verified pull request over A2A; adam-agent: any agent folder over A2A (entrypoint override)" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
@@ -67,12 +84,22 @@ COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-serve
 # base image already creates it owned by uid 10001, as does this line for a
 # base that does not.
 RUN install -d -o 10001 -g 10001 /work
+# `ADD --checksum` stops the build when the download is not the pinned file.
+ADD --checksum=sha256:${PODMAN_REMOTE_SHA256} \
+    https://github.com/containers/podman/releases/download/v${PODMAN_REMOTE_VERSION}/podman-remote-static-linux_amd64.tar.gz \
+    /tmp/podman-remote.tar.gz
+RUN tar -xzf /tmp/podman-remote.tar.gz -C /tmp \
+ && install -m 0755 /tmp/bin/podman-remote-static-linux_amd64 /usr/local/bin/podman-remote \
+ && rm -rf /tmp/podman-remote.tar.gz /tmp/bin \
+ && npm install -g --no-fund --no-audit "@devcontainers/cli@${DEVCONTAINERS_CLI_VERSION}"
 
 ENV WORKSPACE_ROOT=/work \
     LISTEN_ADDR=0.0.0.0:8080 \
     RUST_LOG=info \
     OPENCODE_DISABLE_AUTOUPDATE=1 \
-    MCP_ALLOW_STDIO=true
+    MCP_ALLOW_STDIO=true \
+    DEVCONTAINER_CLI=devcontainer \
+    DEVCONTAINER_PODMAN=podman-remote
 
 # The runtime user of the workspace image (uid/gid 10001, `agent`).
 USER 10001
@@ -83,11 +110,16 @@ EXPOSE 8080
 # empty environment (they fail closed) instead of crashing, adam-agent names the
 # folder it needs, and the tools the agent shells out to are on PATH. The GitHub MCP server
 # is there, runs, and lists the twelve read tools of the coder's allow-list over stdio with no
-# credential (a missing name would stop the coder at startup).
+# credential (a missing name would stop the coder at startup). The devcontainer CLI and Podman's client
+# run, and the OpenCode that is mounted into every devcontainer is a native executable (an ELF file, not
+# the npm package's script: DEVCONTAINER_RUNTIME=podman refuses to start otherwise).
 RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/github-mcp-tools.sh \
     bash -lc 'set -e; \
       test "$(id -u)" = 10001; \
-      command -v adam-coder adam-agent git opencode tini github-mcp-server; \
+      command -v adam-coder adam-agent git opencode tini github-mcp-server devcontainer podman-remote; \
+      test "$(devcontainer --version)" = "0.89.0"; \
+      podman-remote --version | grep -q "5\.8\.7"; \
+      test "$(head -c 4 "$(readlink -f "$(command -v opencode)")" | tail -c 3)" = ELF; \
       github-mcp-server --version | grep -q "v1.12.2"; \
       sh /tmp/github-mcp-tools.sh; \
       out="$(env -i PATH="$PATH" adam-coder 2>&1 || true)"; \

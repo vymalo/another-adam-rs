@@ -1968,6 +1968,145 @@ async fn a_sweep_of_zero_seconds_turns_the_janitor_off() {
     db.finish().await;
 }
 
+// ------------------------------------------------------------------------------ devcontainers
+
+/// A file that is a native executable as far as the configuration can tell (the ELF magic, and
+/// executable): what `OPENCODE_BINARY` must be when the runtime is `podman`.
+fn native_stub(dir: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join("opencode-native");
+    std::fs::write(&path, b"\x7fELF this is only a stub").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// The devcontainer variables are checked before anything connects: a value that is not one, a
+/// runtime with no service address, an OpenCode that cannot be mounted. Exit 78, with the variable
+/// named.
+#[tokio::test]
+async fn a_bad_devcontainer_configuration_exits_78_naming_the_variable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("opencode.js");
+    std::fs::write(&script, "#!/usr/bin/env node\n").unwrap();
+    let cases: [(&str, Vec<(&str, String)>); 5] = [
+        (
+            "DEVCONTAINER_RUNTIME must be off or podman",
+            vec![("DEVCONTAINER_RUNTIME", "docker".into())],
+        ),
+        (
+            "DEVCONTAINER_NETWORK must be inherit or none",
+            vec![("DEVCONTAINER_NETWORK", "host".into())],
+        ),
+        (
+            "CONTAINER_HOST is required with DEVCONTAINER_RUNTIME=podman",
+            vec![
+                ("DEVCONTAINER_RUNTIME", "podman".into()),
+                ("OPENCODE_BINARY", native_stub(tmp.path())),
+            ],
+        ),
+        (
+            "is not a native executable",
+            vec![
+                ("DEVCONTAINER_RUNTIME", "podman".into()),
+                ("CONTAINER_HOST", "unix:///run/podman/podman.sock".into()),
+                ("OPENCODE_BINARY", script.to_string_lossy().into_owned()),
+            ],
+        ),
+        (
+            "DEVCONTAINER_UP_TIMEOUT_SECS is invalid",
+            vec![("DEVCONTAINER_UP_TIMEOUT_SECS", "later".into())],
+        ),
+    ];
+    for (wants, vars) in cases {
+        let mut env = valid_env("postgres://u:p@127.0.0.1:1/x", tmp.path());
+        env.extend(vars.into_iter().map(|(k, v)| (k.to_owned(), v)));
+        let mut p = Proc::spawn(&env);
+        let status = p.exit_within(Duration::from_secs(30)).await;
+        assert_eq!(status.code(), Some(78), "{wants}: {}", p.logs());
+        let err = failure(&p)["error"].as_str().unwrap().to_owned();
+        assert!(err.contains(wants), "{wants:?} missing from:\n{err}");
+        assert!(
+            !err.contains("connecting to Postgres"),
+            "a bad configuration must stop before anything connects:\n{err}"
+        );
+    }
+}
+
+/// With devcontainers on and the Podman service not answering, the worker starts anyway: it writes
+/// the tools every devcontainer would mount, says that the service does not answer, and stops
+/// cleanly on SIGTERM. (A run then goes on in the coder's own container, with a step: the
+/// environment's own tests.) The service may start after the coder.
+#[tokio::test]
+async fn a_worker_with_devcontainers_on_starts_when_the_service_does_not_answer() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("work");
+    // A client that says the service is down, as it would for a socket that is not there.
+    let client = tmp.path().join("podman-remote");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(
+            &client,
+            "#!/bin/sh\necho 'Cannot connect to Podman: connection refused' >&2\nexit 125\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut env = valid_env(&db.url(), &workspace);
+    env.extend(
+        [
+            ("DEVCONTAINER_RUNTIME", "podman".to_owned()),
+            (
+                "CONTAINER_HOST",
+                "unix:///nonexistent/podman.sock".to_owned(),
+            ),
+            ("DEVCONTAINER_PODMAN", client.to_string_lossy().into_owned()),
+            ("DEVCONTAINER_PREPULL", "false".to_owned()),
+            ("OPENCODE_BINARY", native_stub(tmp.path())),
+        ]
+        .map(|(k, v)| (k.to_owned(), v)),
+    );
+    let mut p = Proc::spawn(&env);
+    p.ready().await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !p.stdout().contains("the Podman service does not answer") {
+        assert!(
+            Instant::now() < deadline,
+            "it never said the service does not answer\n{}",
+            p.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let out = p.stdout();
+    assert!(out.contains("devcontainers are on"), "{out}");
+    assert!(
+        !out.contains(A2A_TOKEN) && !out.contains(GITHUB_TOKEN),
+        "nothing secret is logged: {out}"
+    );
+    let tools = workspace.join("environments/.tools");
+    let written: Vec<_> = std::fs::read_dir(&tools)
+        .expect("the tools directory is written at startup")
+        .flatten()
+        .collect();
+    assert_eq!(written.len(), 1, "{written:?}");
+    let dir = written[0].path();
+    assert!(dir.join("adam-exec").is_file(), "{dir:?}");
+    assert!(
+        dir.join("opencode").is_file(),
+        "the coder's OpenCode is in it: {dir:?}"
+    );
+    p.sigterm().await;
+    assert_eq!(
+        p.exit_within(Duration::from_secs(15)).await.code(),
+        Some(0),
+        "{}",
+        p.logs()
+    );
+    db.finish().await;
+}
+
 // ------------------------------------------------------ GitHub credentials, per installation
 
 /// `valid_env` for a GitHub App installation instead of a token: `GITHUB_TOKEN` is gone, and the key

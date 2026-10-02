@@ -340,6 +340,9 @@ impl AcpClient {
         }
         let program = cmd.resolve_program()?;
         let mut command = tokio::process::Command::new(&program);
+        if cmd.env_clear {
+            command.env_clear();
+        }
         command
             .args(&cmd.args)
             .envs(&cmd.env)

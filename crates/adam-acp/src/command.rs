@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use crate::error::AcpError;
 
 /// The agent process to spawn: `program args...` in `cwd`, with `env` added on
-/// top of the parent's environment (nothing is cleared: agents need `HOME`,
-/// `PATH`, proxy settings, ...).
+/// top of the parent's environment (nothing is cleared unless [`clear_env`](Self::clear_env) says so:
+/// agents need `HOME`, `PATH`, proxy settings, ...).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpCommand {
     /// The program. A bare name is looked up on `PATH` (a `PATH` entry in
@@ -19,6 +19,11 @@ pub struct AcpCommand {
     pub args: Vec<String>,
     /// Extra environment variables.
     pub env: BTreeMap<String, String>,
+    /// Start the child from an **empty** environment: it sees only [`env`](Self::env). For a
+    /// command that is a client of something that runs the real process elsewhere (the devcontainer
+    /// CLI), so that nothing of the parent's environment reaches it. See
+    /// [`clear_env`](Self::clear_env).
+    pub env_clear: bool,
     /// Working directory of the child.
     pub cwd: PathBuf,
 }
@@ -30,6 +35,7 @@ impl AcpCommand {
             program: program.into(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            env_clear: false,
             cwd: cwd.into(),
         }
     }
@@ -57,6 +63,18 @@ impl AcpCommand {
     #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Start the child from an empty environment: it sees only the variables set with
+    /// [`env`](Self::env), not the parent's.
+    ///
+    /// A bare program name is still looked up on the **parent's** `PATH` (a `PATH` entry in
+    /// [`env`](Self::env) wins), because the program is resolved before the child starts; the child
+    /// itself has the `PATH` you gave it, or none.
+    #[must_use]
+    pub fn clear_env(mut self) -> Self {
+        self.env_clear = true;
         self
     }
 
@@ -164,6 +182,19 @@ mod tests {
         assert_eq!(
             cmd.env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
             Some("{}")
+        );
+    }
+
+    #[test]
+    fn the_environment_is_kept_unless_it_is_cleared() {
+        let cmd = AcpCommand::new("agent", "/w").env("A", "1");
+        assert!(!cmd.env_clear, "the parent's environment is the default");
+        let cleared = cmd.clear_env();
+        assert!(cleared.env_clear);
+        assert_eq!(
+            cleared.env.get("A").map(String::as_str),
+            Some("1"),
+            "what was set stays"
         );
     }
 

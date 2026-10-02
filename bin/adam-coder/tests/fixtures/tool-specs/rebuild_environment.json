@@ -1,0 +1,13 @@
+{
+  "name": "rebuild_environment",
+  "description": "Make the run's work environment again, after the person has decided what to do about a broken one. Call it only after they answered: when the commands report that the environment is broken, ask them (ask_user) whether they will fix `.devcontainer/devcontainer.json` or you should go on in the default environment, and then call this with `use_default: true` only if they chose the default. Without `use_default` the environment is built again from the repository's file as it is now (after the person fixed it, or after the file was changed to add a tool). Your files are not touched. It builds the environment before it returns, which can take minutes.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "use_default": {
+        "type": "boolean",
+        "description": "true only when the person chose to go on in the default environment instead of the repository's own"
+      }
+    }
+  }
+}

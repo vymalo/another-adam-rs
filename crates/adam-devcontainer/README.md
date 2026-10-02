@@ -10,8 +10,10 @@ A run's processes in its repository's devcontainer, on a rootless Podman service
 An **implementation** of the `Environment` port (swapped at build time, ADR 0009 of the orchestration
 layer: a binary composes it, no plugin). It depends on `adam-workspace` for the port and on nothing that
 runs containers: it drives the official devcontainer CLI and Podman's remote client as child processes, with
-an empty environment plus an allow-list. The coder (`adam-coder`) composes it in the next change of this
-series; until then nothing in this repository calls it except its own tests.
+an empty environment plus an allow-list. The coder (`adam-coder`) composes it (`DEVCONTAINER_RUNTIME=podman`, off by default; see
+[its README](../../bin/adam-coder/README.md#the-work-environment-the-repositorys-devcontainer)): it builds the settings from its
+configuration, calls `install_tools`, `probe` and `prepull` at startup, hands the value to its tools and to its janitor, and a binary that
+composes it differently does the same.
 
 A run's commands (`run_command`, `run_checks`, OpenCode and everything OpenCode starts) go through the
 run's `EnvSession`: the coder `prepare`s a command and spawns it. The files, the paths and all git work stay
@@ -21,7 +23,7 @@ in the coder (it holds the credentials); **a path means the same inside the cont
 
 | Item | What |
 |---|---|
-| `DevContainer` | the `Environment`: `new(Settings)`, plus `probe()`, `prepull()`, `install_tools()`, `prune()` and `rebuild(run, use_default)` for the coder's startup, sweep and `rebuild_environment` tool |
+| `DevContainer` | the `Environment`: `new(Settings)`, plus `probe()`, `prepull()`, `install_tools()` and `prune()` for a binary's startup and care, and `rebuild(run, use_default)` (also the port's own `Environment::rebuild`, which the coder's `rebuild_environment` tool calls). Its session answers `EnvSession::tool_path("opencode")` with `/opt/adam/bin/opencode` when `Settings::opencode` is set, and `secret_ref("model-key")` with the file `/run/adam/secrets/model-key` |
 | `Settings` | the root, the CLI and Podman programs, `CONTAINER_HOST`, the default image, the network, the deployment label, the timeouts, the OpenCode binary and the model key; `Settings::new(root)` has the defaults |
 | `Runtime` | `Off` (every run is in the coder's own container; the default) or `Podman` |
 | `Network` | `Inherit` (the Podman service's own network, which the deployment limits) or `None` |

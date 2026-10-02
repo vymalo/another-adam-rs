@@ -67,6 +67,23 @@ if docker exec "$name" bash -lc 'git --version && opencode --version && github-m
 else
   bad "a tool is missing from PATH in a login shell"
 fi
+# The devcontainer client side (ADR 0010): the CLI that makes a repository's devcontainer and
+# Podman's client it drives. Nothing in this image runs containers.
+if docker exec "$name" bash -lc 'test "$(devcontainer --version)" = 0.89.0 && podman-remote --version | grep -q "5\\.8\\.7"' >/dev/null; then
+  ok "the devcontainer CLI is 0.89.0 and podman-remote is 5.8.7, the service's release"
+else
+  bad "the devcontainer CLI or podman-remote is missing or not the pinned version (0.89.0, 5.8.7)"
+fi
+# DEVCONTAINER_RUNTIME=podman mounts the coder's OpenCode into every devcontainer, so the
+# configuration checks that it is a native executable (not the npm package's script) and resolves
+# the link of the PATH entry to the file: with only the runtime set, the problems listed must not
+# name OpenCode (they name the database, the model and so on).
+out=$(docker run --rm -e DEVCONTAINER_RUNTIME=podman -e CONTAINER_HOST=unix:///run/podman/podman.sock "$image" 2>&1 || true)
+if echo "$out" | grep -q "invalid configuration" && ! echo "$out" | grep -qi "opencode"; then
+  ok "DEVCONTAINER_RUNTIME=podman finds the image's OpenCode as a native executable"
+else
+  bad "DEVCONTAINER_RUNTIME=podman does not accept the image's OpenCode: $out"
+fi
 # The GitHub MCP server of the shipped `mcp.json`: the coder (embedded agent files, the image's
 # MCP_ALLOW_STDIO) started it as a child process and connected it (the check above already needed it
 # to start), and it lists the twelve read tools and no write tool.
