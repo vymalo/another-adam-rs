@@ -153,7 +153,8 @@ pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, Step
 pub use agent::{BuildError, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter};
 pub use conversation::{
     ArtifactRef, Conversation, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MESSAGE_KIND,
-    OMITTED_MARKER_PREFIX, PendingQuestion, PendingRemote, PendingRun, PendingWait, user_message,
+    OMITTED_MARKER_PREFIX, PendingQuestion, PendingRemote, PendingRun, PendingWait,
+    STOPPED_BY_THE_PERSON, user_message,
 };
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
