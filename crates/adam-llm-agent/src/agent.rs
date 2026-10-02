@@ -136,6 +136,12 @@ struct Recorded {
     /// when they said nothing and in journals written before the notes existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     notes: Vec<ToolNote>,
+    /// How many messages the history held when the call was made. A turn that is replayed in a later
+    /// transition (the commit of the first was lost) sees a longer history if a message arrived in
+    /// between, and then knows its answer did not read it. Absent in journals written before, which
+    /// read as "the answer is current".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seen: Option<usize>,
 }
 
 /// The id of the stream of the words of turn `turn` of `run`: unique within the task, because the
@@ -601,8 +607,15 @@ impl LlmAgent {
     fn absorb_inbox(&self, state: &mut Conversation, inbox: Vec<Inbound>) -> bool {
         let mut texts = Vec::new();
         for inbound in inbox {
+            // A message the run has read is not read again: the orchestration layer sends the same
+            // one a second time after a lost lease (`steer/v1`: the `messageId` is the key).
+            if state.has_read(&inbound.id) {
+                tracing::debug!(inbound = %inbound.id, "ignoring a message the run has already read");
+                continue;
+            }
             match parse_user_text(&inbound.payload) {
                 Ok(text) => {
+                    state.note_read(&inbound.id);
                     // What the message says about its sender is read along with what it says.
                     if let Some(context) = parse_context(&inbound.payload) {
                         state.merge_context(context);
@@ -743,6 +756,7 @@ impl LlmAgent {
             )
         });
         let turn = state.turns;
+        let seen = state.messages.len();
         let run = ctx.run_id();
         let emitter = ctx.emitter();
         let stream_text = self.stream_text;
@@ -778,6 +792,7 @@ impl LlmAgent {
                                 response,
                                 stream: None,
                                 notes,
+                                seen: Some(seen),
                             })
                             .map_err(ModelFailure::from),
                     };
@@ -793,6 +808,7 @@ impl LlmAgent {
                     response: streamed.response,
                     stream: streamed.stream,
                     notes,
+                    seen: Some(seen),
                 })
                 .map_err(ModelFailure::from)
             })
@@ -803,14 +819,18 @@ impl LlmAgent {
         if ctx.is_cancelled() {
             return Ok(Flow::Fail(CANCELLED.into()));
         }
+        let answered_stale: bool;
         let (response, stream) = match recorded {
             Ok(Recorded {
                 response,
                 stream,
                 notes,
+                seen,
             }) => {
                 // The calls this turn asks for are the ones its listing described.
                 state.source_notes = notes;
+                // An answer recorded before a message that this transition read did not read it.
+                answered_stale = seen.is_some_and(|seen| seen < state.messages.len());
                 (response, stream)
             }
             // A recorded error is replayed forever on crash-replay, but a
@@ -846,14 +866,31 @@ impl LlmAgent {
 
         let text = message.text();
         let calls: Vec<ToolCall> = message.tool_calls().to_vec();
+        // An answer that was recorded before a message this transition has read (the commit of the
+        // transition that recorded it was lost, and the message arrived before this one began) did
+        // not read it: it is dropped and the model answers again, with the message in front of it.
+        if calls.is_empty() && answered_stale {
+            tracing::debug!(
+                run = %ctx.run_id(),
+                turn,
+                "the recorded answer predates a message the run has read: the model answers again"
+            );
+            return Ok(Flow::Next);
+        }
+        // A message that reached the run while the model wrote its answer has not been read by it:
+        // the answer is not the last word, and the run takes another turn instead of ending
+        // (`steer/v1`: an accepted message is never lost). What arrives after this check is caught
+        // by the commit (`Ctx::reopen_on_arrival`).
+        let unread = calls.is_empty() && ctx.arrived().await? > 0;
         if !text.is_empty() {
             let mut payload = json!({ "text": text, "turn": turn });
             // The words before a tool call are said whole, under the stream they were sent as, because
             // nothing else will say them: the turn goes on to its tools. The answer that ends the run
             // is said by the run itself, whose output names its stream (below).
             // So are the closing words of a turn whose answer a tool announced: the answer is the
-            // announced text, and what the model says after it is working text, stated here.
-            if (!calls.is_empty() || state.announced.is_some())
+            // announced text, and what the model says after it is working text, stated here. And
+            // so are the words of an answer that does not end the run because a message is unread.
+            if (!calls.is_empty() || state.announced.is_some() || unread)
                 && let Some(stream) = &stream
             {
                 payload["stream"] = json!(stream);
@@ -866,6 +903,14 @@ impl LlmAgent {
         }
         state.messages.push(message);
 
+        if unread {
+            tracing::debug!(
+                run = %ctx.run_id(),
+                turn,
+                "a message arrived while the model answered: the run takes another turn"
+            );
+            return Ok(Flow::Next);
+        }
         if calls.is_empty() {
             // What a tool announced as the answer is the run's answer (the last announcement wins);
             // without one, the words that end the turn are.
@@ -1562,6 +1607,9 @@ impl Agent for LlmAgent {
         ctx: &mut Ctx,
         mut state: Conversation,
     ) -> Result<Transition<Conversation>, AgentError> {
+        // A message that arrives while this step finishes the run is read, not dropped: see
+        // `Ctx::reopen_on_arrival`.
+        ctx.reopen_on_arrival();
         let (finished, inbox): (Vec<_>, Vec<_>) = ctx
             .take_inbox()
             .into_iter()
@@ -1744,6 +1792,7 @@ mod failure_tests {
             response: ModelResponse::text("hi"),
             stream: Some("run-m0-a1b2c3d4".into()),
             notes: Vec::new(),
+            seen: None,
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -1761,6 +1810,7 @@ mod failure_tests {
             response: ModelResponse::text("hi"),
             stream: None,
             notes: Vec::new(),
+            seen: None,
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
 
@@ -1770,6 +1820,7 @@ mod failure_tests {
             response: ModelResponse::text("hi"),
             stream: None,
             notes: vec![ToolNote::new("relay__search").reporting_steps()],
+            seen: None,
         };
         let json = serde_json::to_value(&noted).unwrap();
         assert_eq!(

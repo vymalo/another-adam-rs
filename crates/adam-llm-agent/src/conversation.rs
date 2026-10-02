@@ -243,6 +243,37 @@ pub struct Conversation {
     /// is empty.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub context: Map<String, Value>,
+    /// The ids (`Inbound::id`, an A2A `messageId`) of the messages the run has read after its first,
+    /// the last [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them
+    /// (the same one sent twice, as the orchestration layer does after a lost lease) is not read a
+    /// second time, whether it is still in the inbox or was read transitions ago. Part of the durable
+    /// state, so another worker and a restart keep it. Absent from state written before it existed,
+    /// and not written while empty; a run that continues another starts with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_ids: Vec<String>,
+}
+
+/// How many message ids a run remembers having read ([`Conversation::read_ids`]). A person does not
+/// steer a task a hundred times, and the oldest id is the one given up, so a retry of an old message
+/// is the only thing this can let through.
+pub const MAX_READ_IDS: usize = 128;
+
+impl Conversation {
+    /// Whether a message with this id has been read (an empty id is nobody's).
+    pub(crate) fn has_read(&self, id: &str) -> bool {
+        !id.is_empty() && self.read_ids.iter().any(|read| read == id)
+    }
+
+    /// Remember that the message with this id was read, giving up the oldest id past
+    /// [`MAX_READ_IDS`].
+    pub(crate) fn note_read(&mut self, id: &str) {
+        if id.is_empty() {
+            return;
+        }
+        self.read_ids.push(id.to_owned());
+        let extra = self.read_ids.len().saturating_sub(MAX_READ_IDS);
+        self.read_ids.drain(..extra);
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -630,6 +661,22 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ids_a_run_remembers_are_bounded_and_the_oldest_is_given_up() {
+        let mut c = Conversation::default();
+        for n in 0..MAX_READ_IDS + 5 {
+            c.note_read(&format!("m-{n}"));
+        }
+        assert_eq!(c.read_ids.len(), MAX_READ_IDS);
+        assert_eq!(c.read_ids[0], "m-5", "the first five were given up");
+        assert!(!c.has_read("m-4"));
+        assert!(c.has_read(&format!("m-{}", MAX_READ_IDS + 4)));
+        // An empty id is nobody's: never remembered, never matched.
+        c.note_read("");
+        assert!(!c.has_read(""));
+        assert_eq!(c.read_ids.len(), MAX_READ_IDS);
+    }
 
     #[test]
     fn parses_object_and_bare_string_payloads() {
