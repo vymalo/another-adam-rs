@@ -51,6 +51,31 @@ async fn lists_and_calls_over_streamable_http() {
 }
 
 #[tokio::test]
+async fn a_tool_is_labelled_in_its_step_with_the_title_its_server_gave() {
+    use adam_llm_agent::StepStyle;
+
+    let server = TestHttpServer::start(None).await;
+    let servers = connect(&http_config("t", &server.url(), "")).await;
+    let tools = servers.tools();
+    // `echo` has a title: that is what its step is called. The others have none: the step says
+    // the name the model knows (the default label), whatever the description says.
+    assert_eq!(
+        tools.get("t__echo").unwrap().step_style(),
+        StepStyle::default().with_label("Echo it back")
+    );
+    assert_eq!(
+        tools.get("t__pid").unwrap().step_style(),
+        StepStyle::default()
+    );
+    // The title is for the person: the model still sees the description.
+    assert_eq!(
+        tools.get("t__echo").unwrap().spec().description,
+        "Answers with the text it is given."
+    );
+    servers.shutdown().await;
+}
+
+#[tokio::test]
 async fn servers_connect_in_name_order_and_tools_are_prefixed() {
     let server = TestHttpServer::start(None).await;
     let url = server.url();

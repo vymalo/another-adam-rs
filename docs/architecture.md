@@ -1180,7 +1180,10 @@ every call, in the style of `Tool::step_style`; a tool says more with `ToolCtx::
 `ToolCtx::report_step`, whose steps run under the call's. The subscription of a client that **activated `steps/v1`**
 (the request named the extension and the card declares it, so `Caller::extensions` has it) turns each into a
 `working` status whose message carries the report in its metadata; any other client reads the same step as a line of
-text.
+text. The report of a tool call also carries what the tool was given (`input`, on the report that starts it) and what it
+answered (`output`, on the one that ends it), redacted by the agent and cut to 4 KiB and 8 KiB
+([ADR 0011](decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)); a step too big for a Postgres
+`NOTIFY` crosses between processes without them.
 
 ```mermaid
 sequenceDiagram

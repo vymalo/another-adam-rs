@@ -4045,6 +4045,104 @@ async fn a_no_to_creating_a_repository_creates_nothing(store: DynStore) {
 
 // ------------------------------------------------------- one suite per store
 
+/// What a tool call was given and answered goes into its step (ADR 0011), and the process's secrets
+/// are scrubbed from both first: the model's own arguments carry a token (a model that was told one,
+/// or found one), and no event of the run holds it.
+#[tokio::test]
+async fn a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_holds() {
+    use adam_runtime::{CollectingSink, RunEvent, StepEvent, StepState};
+
+    let fx = Fixture::new("hello\n").await;
+    let token = common::GITHUB_TOKEN;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call("s1", "start_scratch", json!({"name": "notes"}))])
+        .push_tool_calls(vec![call(
+            "s2",
+            "write_file",
+            json!({"path": "t.txt", "content": format!("token={token}\n")}),
+        )])
+        .push_tool_calls(vec![call(
+            "s3",
+            "run_checks",
+            json!({"command": format!("echo checked {token}")}),
+        )])
+        .push_text("done");
+    let model: DynModel = mock.clone();
+    let sink = CollectingSink::new();
+    let runtime = Runtime::builder(Arc::new(MemoryStore::new()))
+        .agent(CoderAgent::new(model, "test-model", fx.env.clone()))
+        .event_sink(sink.clone())
+        .poll_interval(Duration::from_millis(20))
+        .build();
+    let run = runtime
+        .start(
+            AGENT_NAME,
+            adam_llm_agent::user_message("scratch something"),
+            None,
+        )
+        .await
+        .expect("start");
+    let (stop, rx) = oneshot::channel::<()>();
+    let worker = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            let _ = runtime
+                .run_worker(async {
+                    let _ = rx.await;
+                })
+                .await;
+        })
+    };
+    // The coder's last words are no pull request, so the run waits for the person: that is its end here.
+    wait_for(&runtime, run, "the run to wait for the person", |v| {
+        v.status == RunStatus::Parked
+    })
+    .await;
+    let _ = stop.send(());
+    worker.await.unwrap();
+
+    let steps: Vec<StepEvent> = sink
+        .events_for(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) if step.id.starts_with("tool:") => Some(step),
+            _ => None,
+        })
+        .collect();
+    let of = |id: &str, end: bool| {
+        steps
+            .iter()
+            .find(|s| s.id == id && s.state.is_end() == end)
+            .unwrap_or_else(|| panic!("no {id} (end: {end}) in {steps:#?}"))
+    };
+    // The arguments are there, with the token replaced.
+    let wrote = of("tool:s2", false).input.as_ref().expect("an input");
+    assert_eq!(wrote["path"], "t.txt");
+    assert_eq!(wrote["content"], "token=[redacted]\n");
+    let checked = of("tool:s3", false).input.as_ref().expect("an input");
+    assert_eq!(checked["command"], "echo checked [redacted]");
+    // The answer of a check is its output, and it is ended as completed with it.
+    let done = of("tool:s3", true);
+    assert_eq!(done.state, StepState::Completed);
+    let output = done.output.as_ref().expect("an output");
+    assert!(
+        output.text.contains("checked [redacted]"),
+        "{}",
+        output.text
+    );
+    assert!(!output.error);
+    // And nowhere in the run's events, whatever they are, is the token.
+    let everything = serde_json::to_string(
+        &sink
+            .events_for(run)
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(!everything.contains(token), "{everything}");
+}
+
 /// Every case runs once per store: in memory always, and on PostgreSQL when
 /// `ADAM_TEST_POSTGRES_URL` is set (each case gets a private database).
 macro_rules! coder_suite {

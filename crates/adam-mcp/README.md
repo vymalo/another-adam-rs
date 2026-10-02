@@ -127,6 +127,11 @@ client is its user.
 * **What the model sees.** The description is the server's, else its title, else `` `<tool>` from the MCP server
   `<server>`. ``, cut at 8 KiB; the parameters are the server's `inputSchema` as it is, with `"type": "object"` added
   when the server left it out.
+* **What the person sees.** The tool's `title`, when the server gave one (trimmed, not blank), is the **label of its
+  step** (`Tool::step_style`: `Search the web`, not `search__web_search`), so that a screen's step list reads as words
+  ([ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)); without one the step is
+  labelled with the name the model knows. The model never sees the title as a name: it is only the description's fallback,
+  as above.
 
 ## Startup
 

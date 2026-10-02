@@ -10,6 +10,16 @@
 //!   "state": "failed", "icon": "execute", "detail": "1 failed"}}
 //! ```
 //!
+//! A tool call's step also says what the tool was given (`input`, a JSON object, on the report that
+//! starts the step) and what it answered (`output`, on the report that ends it), cut to the bounds
+//! of the contract and redacted by the agent (ADR 0011):
+//!
+//! ```json
+//! {"https://agents.vymalo.com/a2a/extensions/steps/v1": {
+//!   "id": "tool:call_1", "kind": "tool", "label": "Search the web", "state": "completed",
+//!   "output": {"text": "1. Example Domain ..."}}}
+//! ```
+//!
 //! (the contract is the orchestration layer's, `docs/api/steps-v1.md` of
 //! `vymalo/another-agentic-system`). Without the activation the message is the line alone, which
 //! is what a client that knows nothing of steps reads.
@@ -51,6 +61,16 @@ pub(crate) fn step_metadata(step: &StepEvent) -> Value {
     if let Some(detail) = &step.detail {
         report.insert("detail".into(), detail.clone().into());
     }
+    if let Some(input) = &step.input {
+        report.insert("input".into(), Value::Object(input.clone()));
+    }
+    if let Some(output) = &step.output {
+        // A `StepOutput` serializes without the members that are not so (`truncated`, `bytes`,
+        // `error`): the contract's shape.
+        if let Ok(output) = serde_json::to_value(output) {
+            report.insert("output".into(), output);
+        }
+    }
     Value::Object(report)
 }
 
@@ -80,7 +100,7 @@ pub(crate) fn plain_text(step: &StepEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use adam_runtime::{StepIcon, StepKind};
+    use adam_runtime::{StepIcon, StepKind, StepOutput};
     use serde_json::json;
 
     use super::*;
@@ -105,6 +125,42 @@ mod tests {
             json!({"id": "acp:c2:1", "kind": "command", "label": "npm test", "state": "running"}),
             "no parent, icon or detail: no member"
         );
+    }
+
+    #[test]
+    fn a_tool_calls_input_and_output_are_members_of_the_report() {
+        let start = StepEvent::new(
+            "tool:c1",
+            StepKind::Tool,
+            "Search the web",
+            StepState::Running,
+        )
+        .with_input(match json!({"query": "adam"}) {
+            Value::Object(map) => map,
+            _ => unreachable!(),
+        });
+        assert_eq!(
+            step_metadata(&start),
+            json!({"id": "tool:c1", "kind": "tool", "label": "Search the web", "state": "running",
+                   "input": {"query": "adam"}})
+        );
+        let end = StepEvent::new(
+            "tool:c1",
+            StepKind::Tool,
+            "Search the web",
+            StepState::Failed,
+        )
+        .with_output(StepOutput::new("x".repeat(20_000), true));
+        let report = step_metadata(&end);
+        assert!(report.get("input").is_none(), "the end report has no input");
+        let output = &report["output"];
+        assert_eq!(output["error"], json!(true));
+        assert_eq!(output["truncated"], json!(true));
+        assert_eq!(output["bytes"], json!(20_000));
+        assert!(output["text"].as_str().unwrap().len() <= 8192);
+        // The line a client that ignores steps reads does not carry either of them.
+        assert_eq!(plain_text(&start), "Search the web");
+        assert_eq!(plain_text(&end), "Search the web: failed");
     }
 
     #[test]

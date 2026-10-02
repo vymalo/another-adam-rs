@@ -77,8 +77,12 @@ another `v`, or one that does not parse, is ignored (debug log).
 * a `Status` whose payload is too big keeps its status and loses the tail of its
   `detail`, cut at a character boundary as little as possible (the full failure
   text is in the run itself);
-* a `Step` is bounded by its constructors (an id of at most 128 bytes, a label of at most 200 characters, a detail of
-  at most 1000: about 5 KiB at four bytes a character, a unit test builds the largest), so it always fits;
+* a `Step` without input or output is bounded by its constructors (an id of at most 128 bytes, a label of at most 200
+  characters, a detail of at most 1000: about 5 KiB at four bytes a character, a unit test builds the largest), so it
+  always fits. A tool call's step can also carry its `input` (up to 4 KiB) and `output` (up to 8 KiB;
+  [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)): one that does not fit
+  crosses **without them** (`Encoded::Truncated`, debug log), the step, its state and its label whole, so that an end that
+  lost its output is still an end. In a single process (`ROLE=all`) nothing is lost;
 * a `TextDelta` (a piece of the model's answer as it is written) holds at most `MAX_TEXT_DELTA_BYTES` of `adam-runtime`
   (1024 bytes) and a stream id of at most 128 bytes: even a piece of control characters, which JSON writes in six bytes
   each, is about 6.5 KiB, and a unit test builds the largest of each kind, so it always fits and crosses whole;

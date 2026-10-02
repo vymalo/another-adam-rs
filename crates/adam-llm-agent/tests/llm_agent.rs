@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     Artifact, Conversation, Limits, LlmAgent, LlmAgentBuilder, LlmStarter, MAX_CARRIED_BYTES,
-    OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepStyle, TRUNCATION_MARKER_PREFIX, Tool,
-    ToolCtx, ToolError, ToolOutput, user_message,
+    OMITTED_MARKER_PREFIX, PendingQuestion, PendingWait, StepIo, StepStyle,
+    TRUNCATION_MARKER_PREFIX, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
     ContentPart, DynModel, FinishReason, Message, MockModel, ModelClient, ModelDelta, ModelError,
@@ -19,7 +19,8 @@ use adam_model::{
 };
 use adam_runtime::{
     Agent, AgentStarter, CancelToken, Clock, CollectingSink, Inbound, ManualClock, RetryPolicy,
-    RunEvent, RunView, Runtime, RuntimeBuilder, StepEvent, StepIcon, StepKind, StepState,
+    RunEvent, RunView, Runtime, RuntimeBuilder, StepEvent, StepIcon, StepKind, StepOutput,
+    StepState,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -245,31 +246,38 @@ fn custom(kind: &str, payload: Value) -> RunEvent {
     }
 }
 
-/// The report that the call `id` of the tool `name` started.
-fn tool_start(name: &str, id: &str) -> RunEvent {
-    step_of(name, id, StepState::Running)
+/// The report that the call `id` of the tool `name` started, with the arguments it was given.
+fn tool_start(name: &str, id: &str, input: Value) -> RunEvent {
+    let Value::Object(input) = input else {
+        panic!("the arguments of a call are an object");
+    };
+    RunEvent::Step(
+        StepEvent::new(
+            format!("tool:{id}"),
+            StepKind::Tool,
+            name,
+            StepState::Running,
+        )
+        .with_input(input),
+    )
 }
 
 /// The report that the call `id` of the tool `name` is in the state `status` names, in the words
 /// the events had before they were steps: `ok` (completed), `error` and `transient_error`
-/// (failed), `needs_input` and `waiting`.
-fn tool_end(name: &str, id: &str, status: &str) -> RunEvent {
+/// (failed), `needs_input` and `waiting`. `said` is what the call answered (the step's `output`): the
+/// result, or the error (`error` and `transient_error` are errors).
+fn tool_end(name: &str, id: &str, status: &str, said: Option<&str>) -> RunEvent {
     let state = match status {
         "ok" => StepState::Completed,
         "error" | "transient_error" => StepState::Failed,
         "needs_input" | "waiting" => StepState::Waiting,
         other => panic!("no such status {other}"),
     };
-    step_of(name, id, state)
-}
-
-fn step_of(name: &str, id: &str, state: StepState) -> RunEvent {
-    RunEvent::Step(StepEvent::new(
-        format!("tool:{id}"),
-        StepKind::Tool,
-        name,
-        state,
-    ))
+    let step = StepEvent::new(format!("tool:{id}"), StepKind::Tool, name, state);
+    RunEvent::Step(match said {
+        Some(text) => step.with_output(StepOutput::new(text, state == StepState::Failed)),
+        None => step,
+    })
 }
 
 async fn notified(n: &Notify, what: &str) {
@@ -355,10 +363,10 @@ async fn model_calls_tool_a_then_b_then_answers() {
     assert_eq!(
         h.events(run),
         vec![
-            tool_start("a", "c1"),
-            tool_end("a", "c1", "ok"),
-            tool_start("b", "c2"),
-            tool_end("b", "c2", "ok"),
+            tool_start("a", "c1", json!({"x": "1"})),
+            tool_end("a", "c1", "ok", Some("a-out")),
+            tool_start("b", "c2", json!({"x": "2"})),
+            tool_end("b", "c2", "ok", Some("b-out")),
             custom("agent_text", json!({"text": "all done", "turn": 2})),
         ]
     );
@@ -483,6 +491,7 @@ async fn unknown_tool_and_tool_errors_go_back_to_the_model() {
 
     let state = conversation(&view);
     let results = &state.messages[2..5];
+    let mut unknown = String::new();
     match &results[0] {
         Message::Tool {
             call_id,
@@ -493,6 +502,7 @@ async fn unknown_tool_and_tool_errors_go_back_to_the_model() {
             assert!(*is_error);
             assert!(content.contains("unknown tool `nope`"), "{content}");
             assert!(content.contains("bad_args, broken"), "{content}");
+            unknown.clone_from(content);
         }
         other => panic!("{other:?}"),
     }
@@ -509,9 +519,10 @@ async fn unknown_tool_and_tool_errors_go_back_to_the_model() {
     assert_eq!(
         ends,
         vec![
-            tool_end("nope", "c1", "error"),
-            tool_end("bad_args", "c2", "error"),
-            tool_end("broken", "c3", "error"),
+            // Each says why it failed, as the model reads it.
+            tool_end("nope", "c1", "error", Some(&unknown)),
+            tool_end("bad_args", "c2", "error", Some("missing field x")),
+            tool_end("broken", "c3", "error", Some("disk on fire")),
         ]
     );
 }
@@ -578,7 +589,13 @@ async fn artifacts_progress_and_context_reach_observers() {
     assert_eq!(
         h.events(run),
         vec![
-            tool_start("async_tool", "c1"),
+            // No arguments, so no input.
+            RunEvent::Step(StepEvent::new(
+                "tool:c1",
+                StepKind::Tool,
+                "async_tool",
+                StepState::Running
+            )),
             // `emit_progress` is an update of the call's own step, the text in its detail.
             RunEvent::Step(
                 StepEvent::new("tool:c1", StepKind::Tool, "async_tool", StepState::Running)
@@ -589,7 +606,7 @@ async fn artifacts_progress_and_context_reach_observers() {
                 mime_type: Some("text/markdown".into()),
                 data: json!("# hi"),
             },
-            tool_end("async_tool", "c1", "ok"),
+            tool_end("async_tool", "c1", "ok", Some("wrote it")),
             custom("agent_text", json!({"text": "here you go", "turn": 1})),
         ]
     );
@@ -662,7 +679,7 @@ async fn transient_tool_error_retries_the_step() {
     );
     assert!(
         h.events(run)
-            .contains(&tool_end("flaky", "c1", "transient_error"))
+            .contains(&tool_end("flaky", "c1", "transient_error", Some("timeout")))
     );
 }
 
@@ -1102,6 +1119,19 @@ async fn needs_input_parks_and_the_answer_becomes_the_tool_result() {
         ]
     );
 
+    // The step that waited ends with the person's answer as its output; the one that started the
+    // wait had none.
+    let ended: Vec<Option<StepOutput>> = h
+        .events(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) if step.id == "tool:c1" && step.state.is_end() => {
+                Some(step.output)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ended, [Some(StepOutput::new("prod", false))]);
     assert_eq!(echo_calls.load(SeqCst), 1);
     let state = conversation(&view);
     assert!(state.pending_wait.is_none() && state.pending_calls.is_empty());
@@ -1991,15 +2021,14 @@ async fn a_tool_is_a_step_in_its_own_style_and_reports_the_steps_that_run_under_
     worker.stop().await;
 
     let own = |state| {
-        RunEvent::Step(
-            StepEvent::new("tool:c1", StepKind::Subagent, "OpenCode", state)
-                .with_icon(StepIcon::Agent),
-        )
+        StepEvent::new("tool:c1", StepKind::Subagent, "OpenCode", state).with_icon(StepIcon::Agent)
     };
     assert_eq!(
         h.events(run),
         vec![
-            own(StepState::Running),
+            // The call starts without arguments (the model gave none, so there is no input) and
+            // ends with what it answered.
+            RunEvent::Step(own(StepState::Running)),
             // The progress line is an update of the call's own step, in its style.
             RunEvent::Step(
                 StepEvent::new(
@@ -2032,7 +2061,7 @@ async fn a_tool_is_a_step_in_its_own_style_and_reports_the_steps_that_run_under_
                 StepEvent::new("acp:c1:2", StepKind::Tool, "edit", StepState::Completed)
                     .under("acp:c1:1")
             ),
-            own(StepState::Completed),
+            RunEvent::Step(own(StepState::Completed).with_output(StepOutput::new("done", false))),
             custom("agent_text", json!({"text": "all done", "turn": 1})),
         ]
     );
@@ -2067,14 +2096,17 @@ async fn a_tool_that_says_nothing_is_a_plain_step_labelled_with_its_name() {
         })
         .collect();
     let plain = |id: &str, name: &str, state| StepEvent::new(id, StepKind::Tool, name, state);
+    let unknown = steps[3].output.clone().expect("it says why it failed");
+    assert!(unknown.error && unknown.text.contains("unknown tool `nobody_has_this`"));
     assert_eq!(
         steps,
         [
             plain("tool:c1", "lookup", StepState::Running),
-            plain("tool:c1", "lookup", StepState::Completed),
+            plain("tool:c1", "lookup", StepState::Completed)
+                .with_output(StepOutput::new("lookup-out", false)),
             // A name that is none of the agent's tools is a failed step with that name.
             plain("tool:c2", "nobody_has_this", StepState::Running),
-            plain("tool:c2", "nobody_has_this", StepState::Failed),
+            plain("tool:c2", "nobody_has_this", StepState::Failed).with_output(unknown),
         ]
     );
     assert!(
@@ -2082,6 +2114,198 @@ async fn a_tool_that_says_nothing_is_a_plain_step_labelled_with_its_name() {
             .iter()
             .all(|s| s.parent.is_none() && s.icon.is_none() && s.detail.is_none())
     );
+}
+
+/// A tool that answers with the `answer` it is given, or fails with it (`fail`: `result` or `error`).
+struct Said(&'static str);
+
+#[async_trait]
+impl Tool for Said {
+    fn spec(&self) -> ToolSpec {
+        spec(self.0)
+    }
+    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let answer = args["answer"].as_str().unwrap_or_default().to_owned();
+        match args["fail"].as_str() {
+            Some("result") => Ok(ToolOutput::error(answer)),
+            Some("error") => Err(ToolError::Permanent(answer)),
+            _ => Ok(ToolOutput::text(answer)),
+        }
+    }
+}
+
+/// The steps a run reported, in order.
+fn steps_of(h: &Harness, run: RunId) -> Vec<StepEvent> {
+    h.events(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) => Some(step),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The step of a call says what the call was given and what it answered, scrubbed by the agent's
+/// redactor first and cut to the contract's bounds after (ADR 0011).
+#[tokio::test]
+async fn a_calls_step_carries_its_input_and_output_scrubbed_and_cut() {
+    const SECRET: &str = "hunter2-hunter2";
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .tool(Said("search"))
+        .step_io(StepIo::default().redact(|text| text.replace(SECRET, "[redacted]")))
+        .build();
+    // A result of 20 KiB with the secret in the middle and the reason of the failure at the end.
+    let long = format!(
+        "start {}{SECRET}{} the end: boom",
+        "a".repeat(10_000),
+        "b".repeat(10_000)
+    );
+    h.mock
+        .push_tool_calls(vec![
+            call(
+                "c1",
+                "search",
+                json!({"answer": format!("found {SECRET}"), "query": {"q": [format!("x {SECRET}"), 3]}}),
+            ),
+            call("c2", "search", json!({"answer": long, "fail": "result"})),
+            call("c3", "search", json!({"answer": "denied", "fail": "error"})),
+            call("c4", "search", json!({"pad": "p".repeat(5000)})),
+        ])
+        .push_text("ok");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let steps = steps_of(&h, run);
+    let by = |id: &str, ends: bool| {
+        steps
+            .iter()
+            .find(|s| s.id == id && s.state.is_end() == ends)
+            .unwrap_or_else(|| panic!("no step {id} (end: {ends}) in {steps:#?}"))
+    };
+    // The start has the arguments, scrubbed, and no output.
+    let c1 = by("tool:c1", false);
+    assert_eq!(
+        c1.input,
+        json!({"answer": "found [redacted]", "query": {"q": ["x [redacted]", 3]}})
+            .as_object()
+            .cloned()
+    );
+    assert_eq!(c1.output, None);
+    // The end has the result, scrubbed, and no input.
+    let end = by("tool:c1", true);
+    assert_eq!(
+        (end.state, end.input.as_ref()),
+        (StepState::Completed, None)
+    );
+    assert_eq!(end.output, Some(StepOutput::new("found [redacted]", false)));
+    // What the model was told is its own business: the model got the raw result (the tools
+    // scrub for the model, the step for the observer).
+    assert_eq!(
+        conversation(&view).messages[2],
+        Message::tool_result("c1", format!("found {SECRET}"))
+    );
+    // A result of 20 KiB is cut to 8 KiB, head and tail, marked as an error; the secret is gone.
+    let c2 = by("tool:c2", true);
+    assert_eq!(c2.state, StepState::Failed);
+    let output = c2.output.as_ref().expect("an output");
+    assert!(output.error && output.truncated);
+    assert_eq!(
+        output.bytes,
+        Some(long.len() as u64 - SECRET.len() as u64 + "[redacted]".len() as u64)
+    );
+    assert!(output.text.len() <= 8192, "{}", output.text.len());
+    assert!(output.text.starts_with("start aaa") && output.text.ends_with("the end: boom"));
+    assert!(!output.text.contains(SECRET));
+    // A tool that failed outright says why.
+    assert_eq!(
+        by("tool:c3", true).output,
+        Some(StepOutput::new("denied", true))
+    );
+    // An input over the bound is replaced by its size (the string is cut first, to 512
+    // characters, which fits: 5000 characters of padding become 512).
+    let c4 = by("tool:c4", false).input.as_ref().expect("an input");
+    assert_eq!(c4["pad"].as_str().map(|p| p.chars().count()), Some(512));
+}
+
+/// A step is a label and a state when the agent says it sends neither input nor output.
+#[tokio::test]
+async fn a_calls_step_carries_neither_when_the_agent_turns_them_off() {
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .tool(Said("search"))
+        .step_io(StepIo::off())
+        .build();
+    h.mock
+        .push_tool_calls(vec![call(
+            "c1",
+            "search",
+            json!({"answer": "secret stuff"}),
+        )])
+        .push_text("ok");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    let plain = |state| StepEvent::new("tool:c1", StepKind::Tool, "search", state);
+    assert_eq!(
+        steps_of(&h, run),
+        [plain(StepState::Running), plain(StepState::Completed)]
+    );
+}
+
+/// A tool that says what it is called is labelled so in its step; the model still knows it by its name.
+#[tokio::test]
+async fn a_tools_own_label_is_the_label_of_its_step() {
+    struct Titled;
+    #[async_trait]
+    impl Tool for Titled {
+        fn spec(&self) -> ToolSpec {
+            spec("search__web_search")
+        }
+        fn step_style(&self) -> StepStyle {
+            StepStyle::default().with_label("Search the web")
+        }
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("1. Example"))
+        }
+    }
+    let h = Harness::new();
+    let agent = h.agent().tool(Titled).build();
+    h.mock
+        .push_tool_calls(vec![call(
+            "c1",
+            "search__web_search",
+            json!({"query": "adam"}),
+        )])
+        .push_text("ok");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    let steps = steps_of(&h, run);
+    assert!(
+        steps.iter().all(|s| s.label == "Search the web"),
+        "{steps:#?}"
+    );
+    assert_eq!(steps[0].input.as_ref().unwrap()["query"], "adam");
+    assert_eq!(steps[1].output, Some(StepOutput::new("1. Example", false)));
 }
 
 #[tokio::test]

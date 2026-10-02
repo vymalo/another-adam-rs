@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_llm_agent::{Tool, ToolCtx, ToolError, ToolOutput};
+use adam_llm_agent::{StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use rmcp::ServiceError;
@@ -47,6 +47,8 @@ pub(crate) struct McpTool {
     server: String,
     /// The tool's name on the server.
     remote: String,
+    /// The tool's title, when the server gave one: the label of its step.
+    title: Option<String>,
     connection: Arc<Connection>,
     call_timeout: Duration,
 }
@@ -64,6 +66,7 @@ impl McpTool {
         spec: ToolSpec,
         server: String,
         remote: String,
+        title: Option<String>,
         connection: Arc<Connection>,
         call_timeout: Duration,
     ) -> Self {
@@ -71,6 +74,7 @@ impl McpTool {
             spec,
             server,
             remote,
+            title,
             connection,
             call_timeout,
         }
@@ -142,6 +146,15 @@ impl McpTool {
 impl Tool for McpTool {
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
+    }
+
+    /// The step of a call is labelled with the tool's `title` when its server gave one (`Search the
+    /// web`), and with `<server>__<tool>` otherwise, as the model knows it.
+    fn step_style(&self) -> StepStyle {
+        match &self.title {
+            Some(title) => StepStyle::default().with_label(title.clone()),
+            None => StepStyle::default(),
+        }
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {

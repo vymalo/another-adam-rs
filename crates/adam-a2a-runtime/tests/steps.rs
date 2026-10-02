@@ -12,7 +12,7 @@ use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::MemoryStore;
 use adam_runtime::{
     Agent, AgentError, BroadcastSink, Ctx, Inbound, RunEvent, Runtime, StepEvent, StepIcon,
-    StepKind, StepState, Transition,
+    StepKind, StepOutput, StepState, Transition,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -44,8 +44,14 @@ impl Agent for Stepper {
         let command = |state| {
             StepEvent::new("acp:c1:1", StepKind::Command, "npm test", state).under("tool:c1")
         };
+        // The call is given a task and answers with a result: the input is on the report that starts
+        // it, the output on the one that ends it.
+        let task = match json!({"task": "fix the build"}) {
+            Value::Object(task) => task,
+            _ => unreachable!(),
+        };
         for step in [
-            call(StepState::Running),
+            call(StepState::Running).with_input(task),
             call(StepState::Running).with_detail("starting OpenCode"),
             command(StepState::Running).with_icon(StepIcon::Execute),
             // The same state again, at once: a client that activated steps does not need it.
@@ -53,7 +59,7 @@ impl Agent for Stepper {
             // A change of state: it needs it.
             command(StepState::Waiting),
             command(StepState::Failed).with_detail("1 failed"),
-            call(StepState::Completed),
+            call(StepState::Completed).with_output(StepOutput::new("fixed", false)),
         ] {
             ctx.emit(RunEvent::Step(step)).await;
         }
@@ -166,7 +172,7 @@ async fn a_client_that_activated_steps_reads_each_step_as_a_report_beside_its_li
     assert_eq!(
         reports[0],
         &json!({"id": "tool:c1", "kind": "subagent", "label": "OpenCode", "state": "running",
-                "icon": "agent"})
+                "icon": "agent", "input": {"task": "fix the build"}})
     );
     assert_eq!(
         reports[1],
@@ -179,7 +185,11 @@ async fn a_client_that_activated_steps_reads_each_step_as_a_report_beside_its_li
         &json!({"id": "acp:c1:1", "parentId": "tool:c1", "kind": "command", "label": "npm test",
                 "state": "failed", "detail": "1 failed"})
     );
-    assert_eq!(reports[4]["state"], "completed");
+    assert_eq!(
+        reports[4],
+        &json!({"id": "tool:c1", "kind": "subagent", "label": "OpenCode", "state": "completed",
+                "icon": "agent", "output": {"text": "fixed"}})
+    );
     // The message says which extension it uses.
     assert!(
         messages

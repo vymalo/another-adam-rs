@@ -50,6 +50,7 @@ fn worker(model: DynModel, mcp: McpPolicy) -> WorkerParts<'static> {
         alias: "test-model",
         mcp,
         options: options(),
+        step_io: adam_llm_agent::StepIo::default(),
     }
 }
 
@@ -510,6 +511,109 @@ async fn the_servers_of_mcp_json_give_the_agent_their_tools() {
         other => panic!("{other:?}"),
     }
     worker.stop().await;
+}
+
+/// What an MCP tool was given and answered is in its step (ADR 0011), under the title its server gave
+/// it, and the process's secrets are scrubbed from both: the model's key (from the configuration), a
+/// variable named like a secret (from the environment) and the token of the MCP server itself.
+#[tokio::test]
+async fn an_mcp_tools_step_carries_its_title_input_and_output_without_the_processs_secrets() {
+    use futures::StreamExt as _;
+    const FROM_THE_ENVIRONMENT: &str = "env-secret-4f9a1c7d";
+    const MODEL_KEY: &str = "sk-model-key-8b2e";
+
+    let server = TestHttpServer::start(Some(MCP_TOKEN)).await;
+    let folder = chat();
+    write_mcp_json(&folder, &server.url());
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "m1".into(),
+        name: "test__echo".into(),
+        arguments: json!({"text": format!("found {FROM_THE_ENVIRONMENT} and {MODEL_KEY}")}),
+    }])
+    .push_text("ok");
+    let model: DynModel = mock.clone();
+
+    // The configuration of the process: the model's key is in it, and the variable is in its environment.
+    let lookup = |name: &str| {
+        Some(
+            match name {
+                "DATABASE_URL" => "postgres://u:db-pass-77@db/adam",
+                "MODEL_BASE_URL" => "https://gw.example/v1",
+                "MODEL_API_KEY" => MODEL_KEY,
+                "MODEL" => "large",
+                "A2A_BEARER_TOKENS" => "bearer-one",
+                "PUBLIC_URL" => "http://agent.svc:8080/",
+                other if other == adam::AGENT_DIR_ENV => {
+                    return Some(folder.path().display().to_string());
+                }
+                _ => return None,
+            }
+            .to_owned(),
+        )
+    };
+    let config = adam_agent::Config::from_lookup(lookup).expect("a valid configuration");
+    let mut parts = worker_parts(model);
+    parts.step_io = adam_agent::redact::step_io(
+        &config,
+        [("SEARCH_API_KEY".to_owned(), FROM_THE_ENVIRONMENT.to_owned())],
+    );
+    let agents = build(def_with_env(&folder, None), None, Some(parts))
+        .await
+        .expect("the folder assembles with its MCP tools");
+    let service = service_over(agents, &store());
+
+    // A client that activated `steps/v1`, subscribed before the worker steps the run.
+    let caller = Caller::new("token-0").with_extensions([adam_a2a::STEPS_EXTENSION]);
+    let task = service
+        .backend
+        .submit(caller.clone(), user("echo it"), None, None)
+        .await
+        .expect("submit");
+    let mut stream = service.backend.subscribe(&caller, &task.id);
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        TaskEvent::Snapshot(_)
+    ));
+    let worker = Worker::start(&service);
+    let mut reports: Vec<serde_json::Value> = Vec::new();
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(20), stream.next())
+        .await
+        .expect("the stream goes on")
+    {
+        if let TaskEvent::Status(update) = event.unwrap()
+            && let Some(message) = update.status.message
+            && let Some(report) = message
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(adam_a2a::STEPS_EXTENSION))
+        {
+            reports.push(report.clone());
+        }
+    }
+    worker.stop().await;
+
+    let report = |end: bool| {
+        reports
+            .iter()
+            .find(|r| (r["state"] == "completed") == end && r["id"] == "tool:m1")
+            .unwrap_or_else(|| panic!("no report (end: {end}) in {reports:#?}"))
+    };
+    // Under the title the server gave the tool, not `test__echo`.
+    assert_eq!(report(false)["label"], "Echo it back");
+    assert_eq!(
+        report(false)["input"],
+        json!({"text": "found [redacted] and [redacted]"})
+    );
+    assert_eq!(
+        report(true)["output"],
+        json!({"text": "found [redacted] and [redacted]"})
+    );
+    // What the model was told is what the tool answered: the copy for the observer is the one scrubbed.
+    let everything = serde_json::to_string(&reports).unwrap();
+    for secret in [FROM_THE_ENVIRONMENT, MODEL_KEY, MCP_TOKEN] {
+        assert!(!everything.contains(secret), "{secret} in {everything}");
+    }
 }
 
 /// `${VAR}` in a `url` is refused unless the deployment opts in (`MCP_ALLOW_URL_VARS`), and the

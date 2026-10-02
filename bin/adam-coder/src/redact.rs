@@ -19,6 +19,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
+use adam_llm_agent::StepIo;
 use adam_workspace::{DynGitCredentials, GitCredentials, RepoRef, WorkspaceError};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -175,6 +176,16 @@ impl Redactor {
             }
         }
         Self::new(secrets)
+    }
+
+    /// How a tool call's step reports its input and output ([`StepIo`]), with this redactor
+    /// over every string of both: the arguments the model gave and what the tool answered are sent to
+    /// whoever reads the steps, so the process's secrets are scrubbed first. The redactor shared
+    /// with this one, so a token registered later (an installation token the GitHub App minted) is
+    /// scrubbed from the steps too.
+    pub fn step_io(&self) -> StepIo {
+        let redactor = self.clone();
+        StepIo::default().redact(move |text| redactor.scrub(text).into_owned())
     }
 
     /// Whether nothing is registered.

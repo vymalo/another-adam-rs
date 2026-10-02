@@ -23,7 +23,8 @@ instructions + a model + a toolset. It is served over A2A by
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "OpenCode", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) |
 | `ToolOutput` | `text`, `error`, `with_artifact` |
-| `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
+| `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
+| `StepIo` | how a call's step reports its input and output: `StepIo::default().redact(\|text\| ..).input_max(n).output_max(n)`, or `StepIo::off()`; given to the builder with `step_io(..)` (see *Steps*) |
 | `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `step_id()` (`tool:<call id>`), `report_step(StepEvent)` (a step that runs under this call's), `emit_progress` (an update of the call's own step, the text in its detail), `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), and for tests `detached(..).with_state(..).with_context(..)` |
 | `ToolError` | `Transient`, `Permanent`, `NeedsInput { question, ui }` (parks the run; A2A reports `input-required`; `ui` is an interface that comes with the question; build one with `ToolError::needs_input(q)` or `needs_input_with_ui(q, ui)`), `AwaitRun { run }` (the result is a child run's outcome; the run parks with a timer, A2A reports `working`), `AwaitRemote { task, timeout_ms }` (the result is the outcome of a task on another system, polled on the timer); `#[non_exhaustive]`, see *Errors* |
 | `LlmAgentBuilder::state`, `try_build`, `tools` | `state(Arc<T>)` shares a value with the tools (one per type); `try_build() -> Result<LlmAgent, BuildError>` fails on a tool whose `required_state` was not given (`BuildError::MissingState`) or on two tools with one name (`BuildError::DuplicateTool`); `tools(ToolSet)` registers a group. `build()` is unchanged (last duplicate wins, no state check) |
@@ -183,7 +184,26 @@ step `tool:<call id>` as `running` before the tool runs and, after it, `complete
 result, a `Permanent` error, an unknown tool, or a `Transient` failure the run retries) or `waiting` (the tool asked
 the person with `NeedsInput`, or the run parked on a child run or a remote task); a `waiting` step ends when the
 answer, the child's outcome or the remote task's result arrives (`completed`, or `failed` for an error result). The
-agent never puts a tool's output in the step: a step is shown to the person, and a result is for the model.
+step's `detail` never holds a tool's result: it is a short line shown with the label.
+
+The result and the arguments have members of their own ([ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)):
+the `running` report carries the call's arguments as `input`, and the report that ends the step carries what the tool
+answered, or the error it ended with, as `output` (`{text, truncated?, bytes?, error?}`), so that a screen can open a step
+and show "params, then output". The agent's [`StepIo`](src/step_io.rs) says how:
+
+```rust
+let agent = LlmAgent::builder("assistant", model, "alias")
+    .step_io(StepIo::default().redact(move |text| redactor.scrub(text)))   // every string, before the cut
+    .tool(my_tool)
+    .build();
+```
+
+Redaction comes first (every string of the arguments, every key, and the result, so a cut cannot leave half a secret),
+then the contract's bounds (4 KiB of input, 8 KiB of output keeping head and tail; `input_max` and `output_max` lower
+them, never raise them). The default sends both with no redactor, so **an agent that holds secrets sets one**;
+`StepIo::off()` sends neither. What the model is told is not touched: the copy for the observer is the cut one. A tool that
+says how it is called (`Tool::step_style`'s label) is labelled so in the step; an MCP tool's `title` is its label
+(`adam-mcp`).
 
 A tool chooses how its call is drawn with `Tool::step_style` (`StepStyle { kind, label, icon }`; the default is kind
 `tool`, the tool's name as the label, no icon) and says more while it runs:

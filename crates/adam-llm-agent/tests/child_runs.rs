@@ -22,7 +22,8 @@ use adam_model::{
 };
 use adam_runtime::{
     Clock, CollectingSink, Inbound, ManualClock, RUN_FINISHED_KIND, RetryPolicy, RunEvent, RunView,
-    Runtime, RuntimeBuilder, RuntimeError, StepEvent, StepKind, StepState, child_run_id,
+    Runtime, RuntimeBuilder, RuntimeError, StepEvent, StepKind, StepOutput, StepState,
+    child_run_id,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -414,20 +415,20 @@ fn custom(kind: &str, payload: Value) -> RunEvent {
 }
 
 /// The report that the call `id` of the tool `sub` is in the state `status` names: `waiting`, `ok`
-/// (completed) or `error` (failed).
-fn tool_end(id: &str, status: &str) -> RunEvent {
+/// (completed) or `error` (failed). The end of a call says what the call answered (`said`: the
+/// child's text, or why it failed): the step's `output`.
+fn tool_end(id: &str, status: &str, said: Option<&str>) -> RunEvent {
     let state = match status {
         "waiting" => StepState::Waiting,
         "ok" => StepState::Completed,
         "error" => StepState::Failed,
         other => panic!("no such status {other}"),
     };
-    RunEvent::Step(StepEvent::new(
-        format!("tool:{id}"),
-        StepKind::Tool,
-        "sub",
-        state,
-    ))
+    let step = StepEvent::new(format!("tool:{id}"), StepKind::Tool, "sub", state);
+    RunEvent::Step(match said {
+        Some(text) => step.with_output(StepOutput::new(text, state == StepState::Failed)),
+        None => step,
+    })
 }
 
 /// The tool results the parent's history holds, in order.
@@ -511,8 +512,13 @@ mod cases {
             "awaiting_run",
             json!({"call_id": "c1", "run": child.to_string()})
         )));
-        let waiting = events.iter().position(|e| *e == tool_end("c1", "waiting"));
-        let finished = events.iter().position(|e| *e == tool_end("c1", "ok"));
+        let waiting = events
+            .iter()
+            .position(|e| *e == tool_end("c1", "waiting", None));
+        // The child's answer is the output of the call's step.
+        let finished = events
+            .iter()
+            .position(|e| *e == tool_end("c1", "ok", Some("child says 42")));
         assert!(waiting < finished && finished.is_some(), "{events:#?}");
     }
 
@@ -740,7 +746,11 @@ mod cases {
             "{content}"
         );
         assert!(content.contains("bad key"), "{content}");
-        assert!(rig.events(parent).contains(&tool_end("c1", "error")));
+        // The reason is the output of the call's step, as the model reads it.
+        assert!(
+            rig.events(parent)
+                .contains(&tool_end("c1", "error", Some(content)))
+        );
     }
 
     /// A child that is cancelled from outside tells the parent, which reports it to the model.
@@ -935,7 +945,8 @@ mod cases {
             vec![("c1".into(), "child says 42".into(), false)]
         );
         assert!(
-            !rig.events(parent).contains(&tool_end("c1", "waiting")),
+            !rig.events(parent)
+                .contains(&tool_end("c1", "waiting", None)),
             "the parent never had to wait"
         );
     }

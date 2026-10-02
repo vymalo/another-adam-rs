@@ -2,8 +2,8 @@
 //!
 //! PostgreSQL rejects a payload of 8000 bytes or more, and a rejected `NOTIFY`
 //! would fail the statement, so nothing bigger than [`MAX_PAYLOAD_BYTES`] is
-//! ever sent: a `Status` event loses the tail of its detail, and anything else
-//! that does not fit is dropped.
+//! ever sent: a `Status` event loses the tail of its detail, a `Step` loses its
+//! input and output, and anything else that does not fit is dropped.
 
 use adam_core::RunId;
 use adam_runtime::{RunEvent, Signal};
@@ -56,7 +56,8 @@ struct SignalOut<'a> {
 pub(crate) enum Encoded {
     /// As is.
     Fits(String),
-    /// A `Status` whose detail was cut to fit.
+    /// A `Status` whose detail was cut to fit, or a `Step` that was sent without its input and
+    /// output.
     Truncated(String),
     /// Does not fit and cannot be made to.
     Dropped,
@@ -79,6 +80,22 @@ pub(crate) fn encode_event(origin: Uuid, run: RunId, agent: &str, event: &RunEve
     };
     if full.len() <= MAX_PAYLOAD_BYTES {
         return Encoded::Fits(full);
+    }
+    // A step crosses without its input and output (up to 4 KiB and 8 KiB, more than a payload
+    // holds beside the rest of the step): they are a courtesy, and the step, its state and its
+    // label are what a subscriber needs. An end that lost its output is still an end.
+    if let RunEvent::Step(step) = event
+        && (step.input.is_some() || step.output.is_some())
+    {
+        let mut bare = step.clone();
+        bare.input = None;
+        bare.output = None;
+        return match event_json(origin, run, agent, &RunEvent::Step(bare))
+            .filter(|json| json.len() <= MAX_PAYLOAD_BYTES)
+        {
+            Some(json) => Encoded::Truncated(json),
+            None => Encoded::Dropped,
+        };
     }
     // Only a status crosses when too big: it is what wakes a subscriber to
     // re-read the durable record, and the detail is a courtesy (the full
@@ -222,6 +239,54 @@ mod tests {
         };
         assert!(json.len() < MAX_PAYLOAD_BYTES, "{} bytes", json.len());
         assert_eq!(decode(&json).event, RunEvent::Step(step));
+    }
+
+    /// A step with the most input or output its contract allows does not fit a payload beside the rest of the
+    /// step: it crosses without them, and is the same step otherwise. A step whose input and output fit
+    /// crosses whole.
+    #[test]
+    fn a_step_that_is_too_big_crosses_without_its_input_and_output() {
+        use adam_runtime::{STEP_OUTPUT_MAX_BYTES, StepOutput};
+
+        let origin = Uuid::new_v4();
+        let run = RunId::new();
+        let ended = StepEvent::new("tool:c1", StepKind::Tool, "Search", StepState::Completed);
+        let big_output = ended
+            .clone()
+            .with_output(StepOutput::new("m\"n".repeat(STEP_OUTPUT_MAX_BYTES), false));
+        let Encoded::Truncated(json) = encode_event(origin, run, "a", &RunEvent::Step(big_output))
+        else {
+            panic!("an output of 8 KiB of quotes does not fit a payload");
+        };
+        assert!(json.len() <= MAX_PAYLOAD_BYTES);
+        assert_eq!(decode(&json).event, RunEvent::Step(ended.clone()));
+
+        // The most input the contract allows, beside a step that is itself large (a detail of four-byte
+        // characters): over a payload.
+        let started = StepEvent::new("tool:c1", StepKind::Tool, "Search", StepState::Running)
+            .with_detail("🙂".repeat(MAX_STEP_DETAIL_CHARS));
+        let input =
+            serde_json::Map::from_iter((0..8).map(|n| (format!("k{n}"), json!("a".repeat(500)))));
+        let big_input = started.clone().with_input(input);
+        assert!(
+            big_input
+                .input
+                .as_ref()
+                .is_some_and(|i| !i.contains_key("_cut"))
+        );
+        let Encoded::Truncated(json) = encode_event(origin, run, "a", &RunEvent::Step(big_input))
+        else {
+            panic!("a step with 4 KiB of input and a large detail does not fit a payload");
+        };
+        assert_eq!(decode(&json).event, RunEvent::Step(started));
+
+        // Small ones cross whole.
+        let small = ended.with_output(StepOutput::new("1. Example Domain", false));
+        let Encoded::Fits(json) = encode_event(origin, run, "a", &RunEvent::Step(small.clone()))
+        else {
+            panic!("a small output fits");
+        };
+        assert_eq!(decode(&json).event, RunEvent::Step(small));
     }
 
     /// A piece of streamed text is bounded by `MAX_TEXT_DELTA_BYTES` (what `adam-llm-agent` cuts at), so the

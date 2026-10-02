@@ -94,7 +94,16 @@ tree under it:
 | a tool call that never said it ended | ended `canceled` with the turn; `failed` when the turn failed, `canceled` when the run was cancelled |
 
 Every label and detail comes from OpenCode, so it is **scrubbed of the secrets the process holds and cut** before it is
-reported, like every other line. A client that did not activate steps reads the same work as lines of text: the title of
+reported, like every other line.
+
+**A tool call's step also carries what the tool was given and what it answered** ([ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)):
+the arguments of `write_file`, `run_checks`, `prepare_workspace` and the rest as `input` on the report that starts the step
+(strings cut at 512 characters, 4 KiB in all), and the tool's result, or the error it ended with, as `output` on the report
+that ends it (8 KiB, head and tail). The coder's `Redactor` goes over every string of both **before** the cut
+(`Redactor::step_io()`, given to the assembly in `CoderAgent::try_from_def`), so a token the model was told or found, and an
+installation token as soon as it is minted, never reaches the steps; `tests/e2e.rs`
+(`a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_holds`) pins it. The orchestration layer redacts patterns
+on top and has a switch to drop both. A client that did not activate steps reads the same work as lines of text: the title of
 a tool call when it starts, `<title>: done` or `<title>: failed: <output>` when it ends, the lines of OpenCode's reply
 and its plan as they are, and `OpenCode: done` when the call ends (`tests/e2e.rs`, `tests/tools.rs`).
 
@@ -1503,7 +1512,8 @@ and cut to `MAX_FAILURE_TEXT` (2048 bytes, ` [truncated]` appended) *after*
 scrubbing, so a secret on the cut cannot leave its front half. The retry hint
 survives; the `source` does not. It is exact-value replacement, not a detector: a secret that
 was transformed (hashed, split) is not found, and values shorter than 4
-characters are not registered.
+characters are not registered. The same redactor scrubs the input and the output of every tool-call step
+(`Redactor::step_io()`).
 
 SIGTERM stops accepting connections and lets in-flight steps finish and commit
 (see [Roles](#roles) for what stops in which order); a step cut short by a hard kill

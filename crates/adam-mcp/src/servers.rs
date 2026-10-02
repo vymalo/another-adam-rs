@@ -114,6 +114,7 @@ impl McpServers {
                         s.spec,
                         name.clone(),
                         s.remote,
+                        s.title,
                         Arc::clone(&connection),
                         call_timeout,
                     ))
@@ -300,6 +301,8 @@ fn tool_fits(server: &str, tool: &str) -> bool {
 pub(crate) struct Selected {
     pub(crate) remote: String,
     pub(crate) spec: ToolSpec,
+    /// The tool's own human title (MCP's `title`), when the server gave one: what its step is called.
+    pub(crate) title: Option<String>,
 }
 
 /// Choose the tools of `server` from what it `listed`.
@@ -374,6 +377,12 @@ pub(crate) fn select_tools(
 
 fn selected(server: &str, tool: ListedTool) -> Selected {
     let remote = tool.name.to_string();
+    let title = tool
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned);
     let description = tool
         .description
         .as_deref()
@@ -399,6 +408,7 @@ fn selected(server: &str, tool: ListedTool) -> Selected {
             parameters: Value::Object(schema),
         },
         remote,
+        title,
     }
 }
 
@@ -509,6 +519,20 @@ mod tests {
             chosen[0].spec.parameters,
             json!({"type": "object", "properties": {"q": {"type": "string"}}})
         );
+    }
+
+    #[test]
+    fn the_title_is_kept_for_the_step_and_blank_is_none() {
+        let with = |title: &str| {
+            ListedTool::new_with_raw("t".to_owned(), None, Arc::new(serde_json::Map::new()))
+                .with_title(title.to_owned())
+        };
+        let chosen = select_tools("s", vec![with("  Search the web ")], None).unwrap();
+        assert_eq!(chosen[0].title.as_deref(), Some("Search the web"));
+        let chosen = select_tools("s", vec![with("   ")], None).unwrap();
+        assert_eq!(chosen[0].title, None);
+        let chosen = select_tools("s", vec![listed("t")], None).unwrap();
+        assert_eq!(chosen[0].title, None);
     }
 
     #[test]

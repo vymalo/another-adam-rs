@@ -61,7 +61,11 @@ The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/REA
 The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `steps/v1` and
 `text-stream/v1` (`card_of`), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
 whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with the
-tool's name, running, then completed, failed or waiting for the person) to a client that activates `steps/v1` (the
+tool's name or, for an MCP tool whose server gave it a `title`, the title; running, then completed, failed or waiting for the person; with the
+call's arguments as `input` and its result as `output`, cut to 4 KiB and 8 KiB and **scrubbed of this process's secrets first**: the model's
+key, the A2A tokens, the password of `DATABASE_URL` and the value of every environment variable whose name says it is a secret, which is
+where the `${VAR}` values of an `mcp.json` come from; `redact::step_io`, [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md))
+to a client that activates `steps/v1` (the
 orchestration layer's chat does when the card lists it), and a line of text to one that does not
 ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md)): the MCP tools of the folder, `show`,
 `ask_user`, and its subagents, which are `subagent` steps. **The model's answer is streamed** (`stream_text` is on, so every model
@@ -231,7 +235,8 @@ The binary is `main.rs` over a small library, so everything it does is testable 
 | `serve(config, shutdown)` | the process: folder, card, assembly, then `adam_service::serve` |
 | `folder::load(path)`, `folder::log(&folder)` | read the folder (every diagnostic in the error), say which files run |
 | `card_of(&def, &public_url)` | the A2A card the files declare |
-| `assemble(def, model, alias, &policy)` | connect the MCP servers, bind `ask_user`, `show` and `ui_catalog` and the thread-tools source (the `policy` is also the one for the thread-tools URL), give the root and each subagent the model: the `Assembly` |
+| `assemble(def, model, alias, &policy)` | connect the MCP servers, bind `ask_user`, `show` and `ui_catalog` and the thread-tools source (the `policy` is also the one for the thread-tools URL), give the root and each subagent the model: the `Assembly`. `assemble_with(.., step_io)` also says how the tool-call steps report their input and output |
+| `redact::step_io(&config, vars)`, `redact::secret_values` | the `StepIo` that scrubs the secrets of the configuration and of the environment variables `vars` (`redact::process_vars()` in `serve`: the process's, without what is not text) from the input and output of every tool-call step; `WorkerParts::step_io` carries it |
 | `agents(def, card, workers)` | the `Agents` for `adam_service::serve` or a composition of your own: the whole agent with `workers: Some(WorkerParts)`, its starter with `None` |
 | `AgentError`, `exit_code(&err)` | why a step failed, and the exit code of a chain of causes |
 

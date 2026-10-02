@@ -26,6 +26,7 @@ use crate::conversation::{
 use crate::history::fit_history;
 use crate::source::{DynToolSource, SourceCtx, ToolSource, offered};
 use crate::state::Extensions;
+use crate::step_io::StepIo;
 use crate::text_stream;
 use crate::tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use crate::toolset::ToolSet;
@@ -128,6 +129,7 @@ pub struct LlmAgentBuilder {
     extensions: Extensions,
     wait_poll: Duration,
     stream_text: bool,
+    step_io: StepIo,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -244,6 +246,16 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// How the step of a tool call reports what the tool was given and what it answered: the
+    /// arguments on the report that starts the step, the result (or the error) on the one that ends
+    /// it, each scrubbed by [`StepIo::redact`] and then cut to the contract's bounds (4 KiB in, 8 KiB
+    /// out). The default sends both, with no redactor; [`StepIo::off`] sends neither. See "Events"
+    /// on [`LlmAgent`] and ADR 0011.
+    pub fn step_io(mut self, step_io: StepIo) -> Self {
+        self.step_io = step_io;
+        self
+    }
+
     /// Build the agent, or say what is wrong with how it was put together:
     /// a tool whose [`Tool::required_state`] was not registered with
     /// [`state`](Self::state), or two tools with one name.
@@ -333,6 +345,7 @@ impl LlmAgentBuilder {
             extensions: Arc::new(self.extensions),
             wait_poll: self.wait_poll,
             stream_text: self.stream_text,
+            step_io: self.step_io,
         }
     }
 }
@@ -371,7 +384,9 @@ impl LlmAgentBuilder {
 ///   kind, label and icon of [`Tool::step_style`] (the tool's name by default), `running` before
 ///   the tool runs and, after it, `completed` (a result), `failed` (an error result, or a failure
 ///   the run retries), or `waiting` (the tool asked the person a question, or the run parked on a
-///   child run or a remote task: the end comes when the answer does);
+///   child run or a remote task: the end comes when the answer does). The `running` report carries
+///   the call's arguments (`input`) and the report that ends the step the result, or the error it
+///   ended with (`output`), scrubbed and cut by the agent's [`StepIo`](crate::StepIo) (ADR 0011);
 /// * `Step` again from [`ToolCtx::emit_progress`] (an update of the call's own step, the text in its
 ///   detail) and from [`ToolCtx::report_step`] (steps that run under the call's: a command, a tool
 ///   of the agent the call drives);
@@ -455,6 +470,7 @@ pub struct LlmAgent {
     extensions: Arc<Extensions>,
     wait_poll: Duration,
     stream_text: bool,
+    step_io: StepIo,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -508,6 +524,7 @@ impl LlmAgent {
             extensions: Extensions::new(),
             wait_poll: DEFAULT_WAIT_POLL,
             stream_text: true,
+            step_io: StepIo::default(),
         }
     }
 
@@ -823,7 +840,7 @@ impl LlmAgent {
                         return Ok(Flow::Wait);
                     };
                     let outcome = Self::answer_run(state, &wait, child);
-                    ctx.emit(self.step_event(&call.name, &call.id, outcome))
+                    ctx.emit(self.step_end_with_result(state, &call.name, &call.id, outcome))
                         .await;
                     continue;
                 }
@@ -865,7 +882,15 @@ impl LlmAgent {
         call: &ToolCall,
     ) -> Result<ToolResult, AgentError> {
         let end = |state: StepState| self.step_event(&call.name, &call.id, state);
-        ctx.emit(end(StepState::Running)).await;
+        // The report that starts the step says what the call was given (and, with a title the tool
+        // has for itself, what to call it: `Tool::step_style`).
+        let mut start = self
+            .style_of(&call.name)
+            .event(&call.name, &call.id, StepState::Running);
+        if let Some((input, max)) = self.step_io.input(&call.arguments) {
+            start = start.with_input_within(input, max);
+        }
+        ctx.emit(RunEvent::Step(start)).await;
 
         let tool_ctx = self.tool_ctx(ctx, context, &call.id, &call.name);
         let args = call.arguments.clone();
@@ -879,9 +904,16 @@ impl LlmAgent {
             // A name that is none of the agent's own: an agent with no source says so at once,
             // one with sources asks them, inside the step that records the answer.
             None if self.sources.is_empty() => {
-                ctx.emit(end(StepState::Failed)).await;
+                let unknown = self.unknown_tool(&call.name);
+                ctx.emit(self.step_end(
+                    &call.name,
+                    &call.id,
+                    StepState::Failed,
+                    Some((&unknown, true)),
+                ))
+                .await;
                 return Ok(ToolResult::Answered {
-                    message: Message::tool_error(call.id.clone(), self.unknown_tool(&call.name)),
+                    message: Message::tool_error(call.id.clone(), unknown),
                     artifacts: Vec::new(),
                 });
             }
@@ -903,19 +935,38 @@ impl LlmAgent {
 
         match outcome {
             Ok(output) => {
+                let said = (output.content.clone(), output.is_error);
                 let (message, artifacts, outcome) = output_message(ctx, &call.id, output).await;
-                ctx.emit(end(outcome)).await;
+                ctx.emit(self.step_end(
+                    &call.name,
+                    &call.id,
+                    outcome,
+                    Some((said.0.as_str(), said.1)),
+                ))
+                .await;
                 Ok(ToolResult::Answered { message, artifacts })
             }
             Err(ToolError::Permanent(reason)) => {
-                ctx.emit(end(StepState::Failed)).await;
+                ctx.emit(self.step_end(
+                    &call.name,
+                    &call.id,
+                    StepState::Failed,
+                    Some((&reason, true)),
+                ))
+                .await;
                 Ok(ToolResult::Answered {
                     message: Message::tool_error(call.id.clone(), reason),
                     artifacts: Vec::new(),
                 })
             }
             Err(ToolError::Transient(reason)) => {
-                ctx.emit(end(StepState::Failed)).await;
+                ctx.emit(self.step_end(
+                    &call.name,
+                    &call.id,
+                    StepState::Failed,
+                    Some((&reason, true)),
+                ))
+                .await;
                 Err(AgentError::transient(format!(
                     "tool `{}` failed: {reason}",
                     call.name
@@ -966,6 +1017,46 @@ impl LlmAgent {
     /// The report that the call `call_id` of the tool `tool` is in `state`.
     fn step_event(&self, tool: &str, call_id: &str, state: StepState) -> RunEvent {
         RunEvent::Step(self.style_of(tool).event(tool, call_id, state))
+    }
+
+    /// The report that ends the step of the call `call_id` of the tool `tool` in `state`, with what
+    /// the call answered: `result` is the text of the answer and whether it is an error. The
+    /// agent's [`StepIo`] scrubs and cuts it (or leaves it out).
+    fn step_end(
+        &self,
+        tool: &str,
+        call_id: &str,
+        state: StepState,
+        result: Option<(&str, bool)>,
+    ) -> RunEvent {
+        let mut step = self.style_of(tool).event(tool, call_id, state);
+        if let Some((text, error)) = result
+            && let Some(output) = self.step_io.output(text, error)
+        {
+            step = step.with_output(output);
+        }
+        RunEvent::Step(step)
+    }
+
+    /// The report that ends the step of the call `call_id` of the tool `tool` in `state`, with the
+    /// result `state` has recorded for that call, when it has one (the answer of the person, a child
+    /// run's outcome, a remote task's).
+    fn step_end_with_result(
+        &self,
+        conversation: &Conversation,
+        tool: &str,
+        call_id: &str,
+        state: StepState,
+    ) -> RunEvent {
+        let result = conversation.messages.iter().rev().find_map(|m| match m {
+            Message::Tool {
+                call_id: id,
+                content,
+                is_error,
+            } if id == call_id => Some((content.as_str(), *is_error)),
+            _ => None,
+        });
+        self.step_end(tool, call_id, state, result)
     }
 
     /// What the model is told when it calls a tool nobody has.
@@ -1277,7 +1368,7 @@ impl Agent for LlmAgent {
         if let Some((tool, call_id)) = asked
             && state.pending_wait.is_none()
         {
-            ctx.emit(self.step_event(&tool, &call_id, StepState::Completed))
+            ctx.emit(self.step_end_with_result(&state, &tool, &call_id, StepState::Completed))
                 .await;
         }
         // A credential in the context does not outlive its expiry in the store.
@@ -1294,7 +1385,7 @@ impl Agent for LlmAgent {
             match Self::settle(ctx, &wait, &notices).await? {
                 Some(child) => {
                     let outcome = Self::answer_run(&mut state, &wait, &child);
-                    ctx.emit(self.step_event(&wait.tool, &wait.call_id, outcome))
+                    ctx.emit(self.step_end_with_result(&state, &wait.tool, &wait.call_id, outcome))
                         .await;
                 }
                 None => {
@@ -1310,7 +1401,7 @@ impl Agent for LlmAgent {
         if let Some(PendingWait::Remote(wait)) = state.pending_wait.clone() {
             match self.poll_remote(ctx, &mut state, &wait).await? {
                 Some(outcome) => {
-                    ctx.emit(self.step_event(&wait.tool, &wait.call_id, outcome))
+                    ctx.emit(self.step_end_with_result(&state, &wait.tool, &wait.call_id, outcome))
                         .await;
                 }
                 None => {

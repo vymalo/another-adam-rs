@@ -29,7 +29,7 @@ over A2A).
 | `Inbound` | a message delivered to a run |
 | `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`) |
 | `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status`, `Progress`, `Step`, `TextDelta`, `Custom`, `Artifact` |
-| `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `MAX_STEP_ID_BYTES`, `MAX_STEP_LABEL_CHARS`, `MAX_STEP_DETAIL_CHARS` | `RunEvent::Step`: a step of the run's work (a tool call, a sub-agent's work, a command) started, moved or ended, and which step it runs under; see *Steps* |
+| `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput`, `MAX_STEP_ID_BYTES`, `MAX_STEP_LABEL_CHARS`, `MAX_STEP_DETAIL_CHARS`, `STEP_INPUT_MAX_BYTES`, `STEP_INPUT_STRING_MAX_CHARS`, `STEP_OUTPUT_MAX_BYTES` | `RunEvent::Step`: a step of the run's work (a tool call, a sub-agent's work, a command) started, moved or ended, and which step it runs under; a tool call's step can carry what the tool was given (`input`) and answered (`output`), cut to the contract's bounds; see *Steps* |
 | `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
 | `RetryPolicy`, `MAX_RETRY_AFTER` | exponential backoff for transient errors |
 | `Clock`, `SystemClock`, `ManualClock` | injectable time |
@@ -168,6 +168,19 @@ contract's bounds: an id of at most 128 bytes (control characters become `_`), a
 characters, a detail of at most 1000 (`…` marks a cut). Kinds, states and icons are closed enums
 (`#[non_exhaustive]`); `as_str()` is the word on the wire and `parse(..)` reads it. A step is best effort and not
 durable, like every event; `adam-llm-agent` reports every tool call as one.
+
+A tool call's step can also say **what the call was given and what it answered** ([ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)):
+`with_input(map)` on the report that starts it (the arguments, a JSON object) and `with_output(StepOutput::new(text, error))`
+on the one that ends it. Both are cut to the contract's bounds by the constructors, never raised above them:
+
+| | Bound |
+|---|---|
+| `input` | control characters other than `\n` and `\t` dropped; a string over `STEP_INPUT_STRING_MAX_CHARS` (512) characters cut, ending in `…`; an input still over `STEP_INPUT_MAX_BYTES` (4096) serialized replaced by `{"_cut": true, "bytes": <its size>}` |
+| `output.text` | control characters dropped; over `STEP_OUTPUT_MAX_BYTES` (8192) bytes it keeps its head (three quarters) and its tail around a line `… n bytes not kept …`, the whole within 8192, with `truncated: true` and `bytes` the size of the whole; `error: true` when the call failed and `text` is its error |
+
+`truncated`, `bytes` and `error` are absent from the JSON when they are not so. **Redact before you build one**: a cut
+can leave half of a secret that a redactor would no longer recognise (`adam-llm-agent`'s `StepIo` does it in that order).
+The orchestration layer keeps a budget per job on top; the agent keeps none.
 
 ## Streamed text
 
