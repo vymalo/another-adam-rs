@@ -684,36 +684,15 @@ async fn a_card_that_points_the_token_at_another_origin_is_refused_before_anythi
 }
 
 /// The token is in no log line, at any level, from the bind to the end of the run.
+///
+/// The capture is `adam_mcp_testkit::LogCapture`: one global subscriber for the test binary, a
+/// buffer per thread. A scoped subscriber (`tracing::subscriber::set_default`) made this test
+/// flaky: the callsite of "remote task started" caches whether anybody listens, a sibling test
+/// that reaches it first on its own thread (where no subscriber is set yet) caches "nobody", and
+/// that can land after this test's subscriber was registered, so the line was never written.
 #[tokio::test]
 async fn the_token_is_not_logged() {
-    use std::io::Write;
-
-    #[derive(Clone, Default)]
-    struct Logs(Arc<Mutex<Vec<u8>>>);
-    impl Write for Logs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
-        type Writer = Logs;
-        fn make_writer(&'a self) -> Logs {
-            self.clone()
-        }
-    }
-
-    let logs = Logs::default();
-    let _guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(logs.clone())
-            .finish(),
-    );
+    let logs = adam_mcp_testkit::LogCapture::start();
     let memory = InMemoryBackend::new();
     let server = Server::start(memory, TOKEN).await;
     let root = uniq("root");
@@ -728,7 +707,7 @@ async fn the_token_is_not_logged() {
     wait_done(&rt, run).await;
     worker.stop().await;
 
-    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    let text = logs.text();
     assert!(
         text.contains("remote task started"),
         "the logs are being captured"
