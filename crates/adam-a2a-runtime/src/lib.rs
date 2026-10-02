@@ -45,6 +45,6 @@ pub use convert::{
 };
 pub use ids::task_id_for;
 pub use vymalo::{
-    CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF, MAX_ACTION_CONTEXT_CHARS,
-    integral_numbers, vymalo_inbound,
+    CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF,
+    MAX_ACTION_CONTEXT_CHARS, MAX_MENTIONS, integral_numbers, vymalo_inbound,
 };

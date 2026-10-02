@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use a2a::{Message, Part, PartContent, Role, Task, TaskState};
 use adam_a2a::{
-    A2UI_MEDIA_TYPE, Caller, THREAD_TOOLS_EXTENSION, TaskBackend, TaskEvent, UI_CATALOG_EXTENSION,
+    A2UI_MEDIA_TYPE, Caller, MENTIONS_EXTENSION, THREAD_TOOLS_EXTENSION, TaskBackend, TaskEvent,
+    UI_CATALOG_EXTENSION,
 };
 use adam_a2a_runtime::{
-    CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF, RuntimeTaskBackend, vymalo_inbound,
+    CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF, RuntimeTaskBackend,
+    vymalo_inbound,
 };
 use adam_core::{DynStore, MemoryStore, RunId};
 use adam_llm_agent::{Conversation, LlmAgent, Tool, ToolCtx, ToolError, ToolOutput};
@@ -178,6 +180,67 @@ async fn a_messages_extensions_reach_the_run_as_its_context() {
     );
     assert!(context[CONTEXT_UI_CATALOG]["catalog"]["components"]["Text"]["maxLength"].is_i64());
     assert_eq!(context[CONTEXT_THREAD_TOOLS]["token"], "a.b.c");
+}
+
+/// The mentions of a message are the run's context, and the next job of the thread (a task that
+/// continues this one) starts with the mentions of its own message, not these.
+#[tokio::test]
+async fn the_mentions_of_a_message_are_the_runs_context_and_the_next_task_does_not_inherit_them() {
+    let rig = Rig::new();
+    rig.model.push_text("ok").push_text("ok again");
+    let (stop, handle) = rig.worker();
+    let grant = json!({"url": "http://orchestrator/thread-tools/t1/mcp", "token": "a.b.c",
+                       "expiresAt": "2999-01-01T00:00:00Z"});
+
+    let first = with_metadata(
+        Message::new(Role::User, vec![Part::text("first @researcher then @coder")]),
+        json!({
+            THREAD_TOOLS_EXTENSION: grant,
+            MENTIONS_EXTENSION: {
+                "mentions": [
+                    {"agentId": "mock-researcher", "name": "Mock researcher", "label": "@researcher",
+                     "start": 6.0, "end": 17.0,
+                     "cardUrl": "http://mock-researcher:8080/.well-known/agent-card.json"},
+                    {"agentId": "mock-coder", "name": "Mock coder", "label": "@coder",
+                     "start": 23.0, "end": 29.0}],
+                "coordinate": {"tool": "ask_agent"}}}),
+    );
+    let one = rig
+        .backend
+        .submit(alice(), first, None, Some("ctx".into()))
+        .await
+        .unwrap();
+    let context = rig.state(&one).await.context;
+    assert_eq!(context[CONTEXT_MENTIONS]["coordinate"], json!({"tool": "ask_agent"}));
+    let mentioned: Vec<(&str, i64)> = context[CONTEXT_MENTIONS]["mentions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["agentId"].as_str().unwrap(), m["start"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(mentioned, [("mock-researcher", 6), ("mock-coder", 23)]);
+    wait_task(&rig, &one.id, TaskState::Completed).await;
+
+    // The next task of the conversation: its message names nobody.
+    let mut second = with_metadata(
+        Message::new(Role::User, vec![Part::text("thanks, and now?")]),
+        json!({THREAD_TOOLS_EXTENSION: grant}),
+    );
+    second.reference_task_ids = Some(vec![one.id.clone()]);
+    let two = rig
+        .backend
+        .submit(alice(), second, None, Some("ctx".into()))
+        .await
+        .unwrap();
+    let context = rig.state(&two).await.context;
+    assert!(
+        context.get(CONTEXT_MENTIONS).is_none(),
+        "the earlier message's mentions are not this one's: {context:?}"
+    );
+    assert_eq!(context[CONTEXT_THREAD_TOOLS]["token"], "a.b.c", "the rest is carried");
+    wait_task(&rig, &two.id, TaskState::Completed).await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
 }
 
 #[tokio::test]

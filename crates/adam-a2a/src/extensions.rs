@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Five extensions, each optional (a client that does not know one ignores it), detected by the
+//! Six extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -10,10 +10,11 @@
 //! | `thread-tools/v1` | [`THREAD_TOOLS_EXTENSION`] | the agent can use the per-thread tool endpoint a message announces |
 //! | `steps/v1` | [`STEPS_EXTENSION`] | the agent reports its tool calls and its sub-agents' work as nested steps, to a client whose request activated it |
 //! | `text-stream/v1` | [`TEXT_STREAM_EXTENSION`] | the agent sends its reply as the model writes it (chunks, transient) and says the whole text once, to a client whose request activated it |
+//! | `mentions/v1` | [`MENTIONS_EXTENSION`] | the agent reads the agents a person mentioned in a message, and asks them (with the tool `ask_agent` of `thread-tools/v1`) |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`,
-//! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md` and `docs/api/text-stream-v1.md` of
-//! `vymalo/another-agentic-system`); what an agent does with the messages is `adam-a2a-runtime`'s
+//! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md` and
+//! `docs/api/mentions-v1.md` of `vymalo/another-agentic-system`); what an agent does with the messages is `adam-a2a-runtime`'s
 //! `vymalo_inbound` and `adam-ui`, and what it reports is `adam-a2a-runtime`'s subscription.
 
 use serde_json::json;
@@ -46,6 +47,10 @@ pub const STEPS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/step
 /// artifact chunks (transient), and says the whole text once, in the metadata of a status message,
 /// to a client whose request activated the extension.
 pub const TEXT_STREAM_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/text-stream/v1";
+
+/// The URI of the `mentions/v1` extension: a message carries the agents the person mentioned in it
+/// (`agentId`, label, position in the text), in the metadata under this URI.
+pub const MENTIONS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/mentions/v1";
 
 impl ExtensionConfig {
     /// The A2UI v0.9.1 extension, as the card of an agent that takes the screen's catalog inline
@@ -98,6 +103,15 @@ impl ExtensionConfig {
         extension.description = Some("Calls the tools of the thread's endpoint".into());
         extension
     }
+
+    /// The `mentions/v1` extension: the agent reads the agents a person mentioned in a message and
+    /// asks them. Optional, no parameters; the description is the contract's.
+    pub fn mentions() -> Self {
+        let mut extension = Self::new(MENTIONS_EXTENSION);
+        extension.description =
+            Some("Reads the agents a person mentioned in a message, and asks them.".into());
+        extension
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +135,10 @@ mod tests {
         assert_eq!(
             TEXT_STREAM_EXTENSION,
             "https://agents.vymalo.com/a2a/extensions/text-stream/v1"
+        );
+        assert_eq!(
+            MENTIONS_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/mentions/v1"
         );
         assert_eq!(
             A2UI_EXTENSION_V0_9_1,
@@ -150,6 +168,7 @@ mod tests {
             ExtensionConfig::thread_tools(),
             ExtensionConfig::steps(),
             ExtensionConfig::text_stream(),
+            ExtensionConfig::mentions(),
         ] {
             assert!(!e.required, "{}", e.uri);
             assert!(e.params.is_empty(), "{}", e.uri);
@@ -159,5 +178,6 @@ mod tests {
         assert_eq!(ExtensionConfig::thread_tools().uri, THREAD_TOOLS_EXTENSION);
         assert_eq!(ExtensionConfig::steps().uri, STEPS_EXTENSION);
         assert_eq!(ExtensionConfig::text_stream().uri, TEXT_STREAM_EXTENSION);
+        assert_eq!(ExtensionConfig::mentions().uri, MENTIONS_EXTENSION);
     }
 }
