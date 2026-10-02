@@ -118,9 +118,12 @@ impl Ui {
     }
 
     /// The thread tools as a tool source: every tool the endpoint of the run's messages lists, under
-    /// its listed name, read at every model turn. Add it **last** among an agent's sources.
+    /// its listed name, read at every model turn, **except `get_ui_catalog`** (the model has
+    /// `ui_catalog` for that: [`ThreadTools`]). The source also describes `show` with the components
+    /// of the conversation's screen, so register [`tools`](Self::tools) and this source on the same
+    /// agent. Add it **last** among an agent's sources.
     pub fn source(&self) -> ThreadTools {
-        ThreadTools::new(Arc::clone(&self.state.client))
+        ThreadTools::of_ui(Arc::clone(&self.state))
     }
 
     /// The catalogs this process has read.

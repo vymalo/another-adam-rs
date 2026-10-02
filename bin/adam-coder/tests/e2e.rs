@@ -3443,8 +3443,12 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
         .collect();
     assert_eq!(
         offered[offered.len() - 2..],
-        ["get_ui_catalog", "relay__search"],
+        ["ui_catalog", "relay__search"],
         "the endpoint's tools come after the coder's own: {offered:?}"
+    );
+    assert!(
+        !offered.iter().any(|name| name == "get_ui_catalog"),
+        "the model has `ui_catalog`, not the endpoint's twin of it: {offered:?}"
     );
     // The token went to the endpoint and nowhere the model or the client can read it.
     assert!(

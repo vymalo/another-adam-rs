@@ -44,6 +44,13 @@ use crate::cache::CatalogCache;
 use crate::catalog::{Catalog, Claimed};
 use crate::thread_tools::ThreadToolsClient;
 
+/// What this process holds of the screen's catalog, before it asks anyone.
+enum Held {
+    Found(Arc<Catalog>),
+    NoCatalog,
+    Stale,
+}
+
 /// What a run knows of the screen's catalog.
 pub(crate) enum Resolved {
     /// The catalog, read and checked.
@@ -92,6 +99,28 @@ impl UiState {
 
     /// The catalog the screen has now, for a run with inbound context `context`.
     pub(crate) async fn resolve(&self, context: &Map<String, Value>) -> Resolved {
+        match self.held(context) {
+            Held::Found(catalog) => Resolved::Found(catalog),
+            Held::NoCatalog => Resolved::NoCatalog,
+            // Stale: this process does not hold the current catalog. Ask the endpoint for the newest.
+            Held::Stale => self.refetch(context).await,
+        }
+    }
+
+    /// The catalog the screen has now, **when this process holds it already** (in its cache, or in the
+    /// message that carried it) and without asking anyone: the description of `show` is made at every
+    /// model turn, and a turn must not pay a request, or repeat a failing one, for it. `None`: there
+    /// is none, or it is not held yet; a tool that needs it reads it again with
+    /// [`resolve`](Self::resolve), and it is held from then on.
+    pub(crate) fn current_if_held(&self, context: &Map<String, Value>) -> Option<Arc<Catalog>> {
+        match self.held(context) {
+            Held::Found(catalog) => Some(catalog),
+            Held::NoCatalog | Held::Stale => None,
+        }
+    }
+
+    /// What is known of the current catalog without a request.
+    fn held(&self, context: &Map<String, Value>) -> Held {
         let inline = context.get(CONTEXT_UI_CATALOG);
         // What is current: the thread's reference when the message carried one; the inline catalog's
         // own claim otherwise.
@@ -100,10 +129,10 @@ impl UiState {
             .and_then(claimed)
             .or_else(|| inline.and_then(claimed))
         else {
-            return Resolved::NoCatalog;
+            return Held::NoCatalog;
         };
         if let Some(cached) = self.cache.get(&current.digest) {
-            return Resolved::Found(cached);
+            return Held::Found(cached);
         }
         // The message carried exactly this catalog.
         if let Some(entry) = inline
@@ -111,14 +140,17 @@ impl UiState {
             && let Some(document) = entry.get("catalog")
         {
             match Catalog::from_document(document.clone(), &current) {
-                Ok(catalog) => return self.keep(catalog),
+                Ok(catalog) => {
+                    let catalog = Arc::new(catalog);
+                    self.cache.insert(Arc::clone(&catalog));
+                    return Held::Found(catalog);
+                }
                 Err(error) => {
                     tracing::warn!(%error, "the catalog a message carried cannot be used; reading it again");
                 }
             }
         }
-        // Stale: this process does not hold the current catalog. Ask the endpoint for the newest.
-        self.refetch(context).await
+        Held::Stale
     }
 
     fn keep(&self, catalog: Catalog) -> Resolved {

@@ -31,6 +31,17 @@ pub const UI_CATALOG: &str = "ui_catalog";
 /// The most blocks one `show` may draw.
 pub const MAX_BLOCKS: usize = 16;
 
+/// The component that asks the person questions. `show` refuses it: see [`CHOICES`] in the docs of
+/// [`Show`].
+pub(crate) const CHOICES: &str = "Choices";
+
+/// The most bytes of the list of components in `show`'s description: a screen with sixty-four
+/// components would put a page of text in front of the model at every turn.
+const MAX_LIST_BYTES: usize = 2 * 1024;
+
+/// The most characters of what a component is for, in that list: its first sentence, cut.
+const MAX_ABOUT_CHARS: usize = 100;
+
 /// The longest a message about a block may be, for the model.
 const MAX_PROBLEM_BYTES: usize = 2 * 1024;
 
@@ -101,10 +112,17 @@ fn components(
                 "block {n} is not an object {{\"component\": ..., ...}}"
             ));
         };
-        if props.get("component").and_then(Value::as_str).is_none() {
+        let Some(component) = props.get("component").and_then(Value::as_str) else {
             return Err(format!(
                 "block {n} has no `component`; the components are: {}",
                 catalog.names()
+            ));
+        };
+        if component == CHOICES {
+            return Err(format!(
+                "block {n} is a `{CHOICES}` form, which `show` cannot draw: nobody could answer it, so it \
+                 would be a dead form. To ask the person something, call `ask_user` with `question` and \
+                 `choices`; the form is drawn and its answers come back as the result"
             ));
         }
         let mut instance: Map<String, Value> = props.clone();
@@ -133,7 +151,79 @@ fn components(
     Ok(made)
 }
 
+/// What `show` is, before the screen says which components it has.
+fn base_description() -> String {
+    format!(
+        "Show the person something on their screen, beside your text answer: a list of blocks, \
+         each a component of the screen with its properties, drawn one under the other (at most \
+         {MAX_BLOCKS}). Call `ui_catalog` first to learn the components and their properties; \
+         a block that breaks a component's schema is refused with the reason, and you can \
+         correct it. Use it when a card, a list or a diagram says it better than text; the \
+         result is \"Shown to the person.\", and you still answer in text. \
+         Never use it to ask the person something: a `{CHOICES}` form drawn here has nobody to answer \
+         it, so `show` refuses it. Ask with `ask_user`, which takes `choices`."
+    )
+}
+
+/// The description of `show` for a conversation whose screen has `catalog`: what it is, then each
+/// component with the first sentence of what it is for, so that a block names a component that
+/// exists on the first call (`ui_catalog` still gives the properties of each).
+pub(crate) fn describe_show(catalog: &Catalog) -> String {
+    let mut list = String::new();
+    let mut left_out = 0usize;
+    for component in catalog.components() {
+        let about = if component.name() == CHOICES {
+            // The catalog may say what the form is for; here only what `show` does with it.
+            "a form of questions: not for `show`, ask with `ask_user` and `choices`".to_owned()
+        } else {
+            first_sentence(component.description())
+        };
+        let line = if about.is_empty() {
+            format!("\n- {}", component.name())
+        } else {
+            format!("\n- {}: {about}", component.name())
+        };
+        if list.len() + line.len() > MAX_LIST_BYTES {
+            left_out += 1;
+        } else {
+            list.push_str(&line);
+        }
+    }
+    let more = if left_out > 0 {
+        format!("\n- and {left_out} more: see `ui_catalog`")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} The components of this screen:{list}{more}",
+        base_description()
+    )
+}
+
+/// The first sentence of `text` (up to the first full stop followed by a space, or the first line
+/// break), cut to [`MAX_ABOUT_CHARS`] characters.
+fn first_sentence(text: &str) -> String {
+    let line = text.trim().lines().next().unwrap_or_default();
+    let end = line.find(". ").map_or(line.len(), |at| at + 1);
+    let sentence = line[..end].trim();
+    if sentence.chars().count() <= MAX_ABOUT_CHARS {
+        return sentence.to_owned();
+    }
+    let mut cut: String = sentence.chars().take(MAX_ABOUT_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
 /// `show`. Made by [`Ui::tools`](crate::Ui::tools).
+///
+/// It draws what is to be **looked at**. A `Choices` block is refused: a form drawn by `show` is
+/// not a question the conversation waits on, so it accepts no answer (the screen enables a form only
+/// while the conversation is blocked on one), and the person would see a form that is dead. The
+/// refusal tells the model to ask with [`AskUser`](crate::AskUser).
+///
+/// Its description is the one this crate makes ([`ThreadTools`](crate::ThreadTools) rewrites it each
+/// turn, from the conversation's catalog, to list the screen's components); in a composition that
+/// has no such source it tells the model to call `ui_catalog`.
 #[derive(Clone)]
 pub struct Show {
     state: Arc<UiState>,
@@ -156,14 +246,7 @@ impl Tool for Show {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: SHOW.to_owned(),
-            description: format!(
-                "Show the person something on their screen, beside your text answer: a list of blocks, \
-                 each a component of the screen with its properties, drawn one under the other (at most \
-                 {MAX_BLOCKS}). Call `ui_catalog` first to learn the components and their properties; \
-                 a block that breaks a component's schema is refused with the reason, and you can \
-                 correct it. Use it when a card, a list or a diagram says it better than text; the \
-                 result is \"Shown to the person.\", and you still answer in text."
-            ),
+            description: base_description(),
             parameters: json!({
                 "type": "object",
                 "properties": {

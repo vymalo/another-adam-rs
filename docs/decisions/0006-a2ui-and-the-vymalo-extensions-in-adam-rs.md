@@ -163,3 +163,25 @@ stateDiagram-v2
 * *Unverified*: how a real model uses `choices` and `show` (the tests script the model); the web's drawing of the
   surfaces (the orchestration layer's tests); a 401 is told apart from other failures by the text the transport
   reports.
+
+## Status notes
+
+*2026-10-02, from the owner's chats of that day (a model guessed a component name, drew a form that nobody could answer and
+then blamed the screen, and called two tools for one catalog). Three changes, none of them to the contract:*
+
+* **`show` is described with the screen's components.** The description a model reads names each component of the
+  conversation's catalog with the first sentence of what it is for (at most 2 KiB, then "and n more"), so a block names a
+  component that exists on the first call; `ui_catalog` still gives the schemas. A tool's description is made when the agent is
+  built, and the catalog is the conversation's, so the new hook is a defaulted method of `ToolSource`, `refine(&SourceCtx,
+  &mut [ToolSpec])`, called once per model call (inside the journaled step, so a replay reads nothing), and `Ui::source()` uses it
+  to rewrite the description of `show` **from the catalogs this process already holds**: no turn asks the endpoint for the sake of a
+  description. The first turn of a conversation whose catalog is only referenced and not held yet is described as before ("call
+  `ui_catalog` first"); that call, or any tool that reads the catalog, holds it, and the next turn lists it.
+* **`show` refuses a `Choices` block.** The screen enables a form only while the conversation is blocked on one (`ask_user`), so
+  a form drawn by `show` is a dead form. The refusal says so and names `ask_user` with `choices`, and the description says it
+  too. (A later option, the web letting an action on a finished thread start the next job, would change this and not the
+  refusal's reasoning today.)
+* **`get_ui_catalog` is not shown to the model.** `Ui::source()` hides it (`ThreadTools::hiding`) and answers a call to it as a name
+  nobody has: the model has `ui_catalog`, and two tools for one thing made it call whichever it remembered. The refetch of a stale
+  catalog still goes through the endpoint, inside this crate. The other way round (hiding the local tool) was rejected: `ui_catalog`
+  works with no grant, from the message's own catalog, and `get_ui_catalog` does not.

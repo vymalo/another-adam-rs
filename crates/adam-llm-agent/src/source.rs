@@ -97,6 +97,20 @@ pub trait ToolSource: Send + Sync + 'static {
     /// credential in it.
     async fn specs(&self, ctx: &SourceCtx) -> Vec<ToolSpec>;
 
+    /// Change how the tools offered on this model turn are described, once every source has listed
+    /// its own: `specs` holds the agent's own tools, then each source's, as the model is about to be
+    /// shown them. A source that knows something the tool's author could not (what the screen of this
+    /// conversation can draw, for the description of a tool that draws on it) rewrites the
+    /// `description` of that tool here.
+    ///
+    /// Like [`specs`](Self::specs) it runs only when the model is really called, and a replay reads
+    /// nothing: it is for text the model reads, never for what a call does. Leave the names and
+    /// the schemas alone (the model's calls are matched to the tools by name), and fail to
+    /// nothing: a source that cannot tell leaves the descriptions as they are. The default does.
+    async fn refine(&self, ctx: &SourceCtx, specs: &mut [ToolSpec]) {
+        let _ = (ctx, specs);
+    }
+
     /// Run the tool `name` with `args`. `None`: this source does not offer a tool of that name,
     /// and the next one is asked; the agent answers a name nobody owns with an error result.
     ///
@@ -113,6 +127,13 @@ pub trait ToolSource: Send + Sync + 'static {
 
 /// A shared, type-erased [`ToolSource`].
 pub type DynToolSource = Arc<dyn ToolSource>;
+
+/// Let each of `sources` refine the descriptions of `specs`, the tools of this turn, in order.
+pub(crate) async fn refined(sources: &[DynToolSource], ctx: &SourceCtx, specs: &mut [ToolSpec]) {
+    for source in sources {
+        source.refine(ctx, specs).await;
+    }
+}
 
 /// The tools `sources` offer for this turn, in order, without the names in `taken` (the agent's
 /// own tools) or offered by an earlier source, and at most [`MAX_SOURCE_TOOLS`] of them.

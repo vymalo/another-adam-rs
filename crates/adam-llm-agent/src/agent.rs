@@ -24,7 +24,7 @@ use crate::conversation::{
     parse_context, parse_user_text,
 };
 use crate::history::fit_history;
-use crate::source::{DynToolSource, SourceCtx, ToolSource, offered};
+use crate::source::{DynToolSource, SourceCtx, ToolSource, offered, refined};
 use crate::state::Extensions;
 use crate::step_io::StepIo;
 use crate::text_stream;
@@ -690,6 +690,7 @@ impl LlmAgent {
                 if let Some(source_ctx) = &source_ctx {
                     let more = offered(&sources, source_ctx, &request.tools).await;
                     request.tools.extend(more);
+                    refined(&sources, source_ctx, &mut request.tools).await;
                 }
                 if !stream_text {
                     return model

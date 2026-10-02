@@ -750,6 +750,68 @@ async fn an_agent_with_a_source_that_offers_nothing_asks_the_model_exactly_as_be
     assert_eq!(listed.load(SeqCst), 1);
 }
 
+/// A source that offers nothing of its own and rewrites how the tools of this turn are described:
+/// the description of `own` says what the run's context holds, and nothing else changes.
+struct Describes;
+
+#[async_trait]
+impl ToolSource for Describes {
+    async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+        vec![spec("extra")]
+    }
+    async fn refine(&self, ctx: &SourceCtx, specs: &mut [ToolSpec]) {
+        let word = ctx
+            .context("word")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        for spec in specs.iter_mut() {
+            spec.description = format!("{} (the word is {word})", spec.description);
+        }
+    }
+    async fn call(
+        &self,
+        _ctx: &ToolCtx,
+        _name: &str,
+        _args: Value,
+    ) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+/// A source may rewrite the descriptions of the tools the model is shown, the agent's own and the
+/// sources', from what it knows of this run; the names and the schemas are the tools' own. The model
+/// is asked with the result, and a replay, which asks no model, refines nothing.
+#[tokio::test]
+async fn a_source_refines_the_descriptions_of_the_tools_the_model_is_shown() {
+    let h = Harness::new();
+    let agent = h
+        .agent()
+        .tool(ReadsContext::new("own", "word").0)
+        .tool_source(Describes)
+        .build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", message_with("hi", json!({"word": "green"})), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    let request = &h.mock.requests()[0];
+    assert_eq!(names_of(request), ["own", "extra"]);
+    let described: Vec<&str> = request
+        .tools
+        .iter()
+        .map(|t| t.description.as_str())
+        .collect();
+    assert!(
+        described.iter().all(|d| d.ends_with("(the word is green)")),
+        "{described:?}"
+    );
+    assert_eq!(request.tools[1].parameters, spec("extra").parameters);
+}
+
 /// A source with no state: it offers `ping` and answers `pong`, to check the call is journaled.
 struct Ping(Arc<AtomicUsize>);
 

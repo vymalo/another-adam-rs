@@ -51,6 +51,8 @@ use secrecy::SecretString;
 use serde_json::{Map, Value};
 
 use crate::catalog::Claimed;
+use crate::resolve::UiState;
+use crate::show::{SHOW, describe_show};
 
 /// The tool of the endpoint that gives the thread's current catalog.
 pub const GET_UI_CATALOG: &str = "get_ui_catalog";
@@ -261,15 +263,56 @@ fn fits(name: &str) -> bool {
 /// With no usable grant the source offers nothing. A call goes straight to the endpoint (it
 /// answers a name it does not have with a protocol error, which the model reads as an error
 /// result), so the source belongs **last** among the sources of an agent.
-#[derive(Debug, Clone)]
+///
+/// [`Ui::source`](crate::Ui::source) makes one that **hides `get_ui_catalog`** from the model (the
+/// agent has `ui_catalog` for that, and two tools for one thing made models call whichever they
+/// remembered; the catalog is still read through the endpoint, by this crate, when a message does
+/// not carry it) and that **describes `show` with the components of the screen** of the
+/// conversation (see [`refine`](ToolSource::refine)).
+#[derive(Clone)]
 pub struct ThreadTools {
     client: Arc<ThreadToolsClient>,
+    /// The tools of the endpoint the model is not shown, and cannot call through this source.
+    hidden: Vec<&'static str>,
+    /// What describes `show` with the screen's components: the catalogs this process has read.
+    ui: Option<Arc<UiState>>,
+}
+
+impl std::fmt::Debug for ThreadTools {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadTools")
+            .field("hidden", &self.hidden)
+            .field("describes_show", &self.ui.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ThreadTools {
-    /// The source over `client`.
+    /// The source over `client`: every tool the endpoint lists, as it lists it.
     pub fn new(client: Arc<ThreadToolsClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            hidden: Vec::new(),
+            ui: None,
+        }
+    }
+
+    /// The source of a [`Ui`](crate::Ui): `get_ui_catalog` is hidden (`ui_catalog` is the tool for the
+    /// catalog) and `show` is described with the screen's components.
+    pub(crate) fn of_ui(state: Arc<UiState>) -> Self {
+        Self {
+            client: Arc::clone(&state.client),
+            hidden: vec![GET_UI_CATALOG],
+            ui: Some(state),
+        }
+    }
+
+    /// Do not show the model the tool `name` of the endpoint, and refuse a call to it (as a name
+    /// nobody has).
+    #[must_use]
+    pub fn hiding(mut self, name: &'static str) -> Self {
+        self.hidden.push(name);
+        self
     }
 }
 
@@ -295,6 +338,7 @@ impl ToolSource for ThreadTools {
         match listed {
             Ok(tools) => tools
                 .into_iter()
+                .filter(|tool| !self.hidden.contains(&tool.name.as_str()))
                 .filter(|tool| {
                     let fine = fits(&tool.name);
                     if !fine {
@@ -314,12 +358,30 @@ impl ToolSource for ThreadTools {
         }
     }
 
+    async fn refine(&self, ctx: &SourceCtx, specs: &mut [ToolSpec]) {
+        let Some(ui) = &self.ui else {
+            return;
+        };
+        let Some(show) = specs.iter_mut().find(|spec| spec.name == SHOW) else {
+            return;
+        };
+        // Only the conversation's own catalog describes it, and only one this process holds: a model
+        // turn asks nobody for it. With none (or before a tool has read it) the description stays as
+        // the tool made it, which says to call `ui_catalog`, and that call holds it from then on.
+        if let Some(catalog) = ui.current_if_held(ctx.context_map()) {
+            show.description = describe_show(&catalog);
+        }
+    }
+
     async fn call(
         &self,
         ctx: &ToolCtx,
         name: &str,
         args: Value,
     ) -> Option<Result<ToolOutput, ToolError>> {
+        if self.hidden.contains(&name) {
+            return None;
+        }
         let grant = match self.client.grant(ctx.context_map()) {
             Ok(grant) => grant,
             // Nothing was announced: the name is nobody's here.
@@ -498,6 +560,59 @@ mod tests {
             "a name no provider accepts is left out"
         );
         assert_eq!(server.lists(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_source_of_a_ui_hides_the_catalog_tool_the_model_has_its_own_for() {
+        let server = ThreadToolsServer::start(&["tok"]).await;
+        server.add_tool(
+            "relay__search",
+            "Search.",
+            json!({"type": "object"}),
+            "found",
+        );
+        let client =
+            ThreadToolsClient::new(McpPolicy::default()).with_clock(at("2026-10-01T12:00:00Z"));
+        let ui = crate::Ui::with_client(client);
+        let source = ui.source();
+        let ctx = SourceCtx::detached(context(&server.url("t1"), "tok", "2026-10-01T14:00:00Z"));
+        let offered = source.specs(&ctx).await;
+        assert_eq!(
+            offered.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["relay__search"],
+            "get_ui_catalog is not shown: ui_catalog is the tool for it"
+        );
+        // Nor can it be called through the source (a name nobody has), though the endpoint has it.
+        let tool_ctx = ToolCtx::detached("get_ui_catalog", "c1", Arc::new(adam_runtime::NoopSink))
+            .with_context(context(&server.url("t1"), "tok", "2026-10-01T14:00:00Z"));
+        assert!(
+            source
+                .call(&tool_ctx, GET_UI_CATALOG, json!({}))
+                .await
+                .is_none()
+        );
+        // The tools it does list are called as before.
+        assert!(
+            source
+                .call(&tool_ctx, "relay__search", json!({}))
+                .await
+                .is_some()
+        );
+        // The refetch of the catalog, which this crate does itself, still reaches the endpoint
+        // (`tests/tools.rs` pins that): hiding is for the model.
+        // A plain source offers everything, and `hiding` hides what it is told to.
+        let plain = ThreadTools::new(Arc::clone(&ui.state.client));
+        assert_eq!(plain.specs(&ctx).await.len(), 2);
+        let hiding = ThreadTools::new(Arc::clone(&ui.state.client)).hiding("relay__search");
+        assert_eq!(
+            hiding
+                .specs(&ctx)
+                .await
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["get_ui_catalog"]
+        );
     }
 
     #[tokio::test]

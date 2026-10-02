@@ -139,7 +139,7 @@ sequenceDiagram
   S->>C: message: text, ui-catalog/v1 {version, digest}, the catalog inline or only referenced, thread-tools/v1 {url, token}
   C->>E: tools/list (at every model turn, with the grant)
   E-->>C: get_ui_catalog and the tools attached since
-  C->>M: the coder's tools, ask_user, show, ui_catalog, then the listed ones
+  C->>M: the coder's tools, ask_user, show, ui_catalog, then the listed ones except get_ui_catalog
   M->>C: ask_user {question, choices: [db, auth, deploy]}
   C->>C: the catalog: inline, held by digest, or get_ui_catalog once (digest checked)
   C-->>S: input-required: the question and an application/a2ui+json surface (one Choices)
@@ -993,6 +993,12 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
   `Your name is {{display_name}}.`, and the `card.name` the A2A card advertises. "What is your name?" is answered
   with it, never with "I don't have a name". A deployment that mounts its own folder
   ([`ADAM_AGENT_DIR`](#a-folder-at-run-time-adam_agent_dir)) changes the name by changing the var (and `card.name`).
+* **What the person sees** (the section of the same name in the prompt): the words written before a tool call are
+  working notes, shown in the activity panel beside the steps and not as part of the conversation, one line each; the reply
+  that ends the turn is the only text of the coder's in the conversation, so it is complete on its own (never "as I said
+  above") and puts the result first; and replies render as Markdown (headings, bold, lists, tables, links, code
+  blocks), so the coder uses them when they help and not for a one-line answer. `show` and `ui_catalog` are as
+  [`adam-ui`](../../crates/adam-ui/README.md) makes them (`show` refuses a `Choices` form: ask with `ask_user`).
 * **A greeting gets a greeting**: "hi" is answered with a short greeting that says the name and what the agent does
   in one sentence (the second persona line, `In one sentence: <summary>.`) and asks one question, which repository
   and what to change. It is not a task with something missing, so no tool is called and nothing is asked for "the

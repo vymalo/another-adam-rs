@@ -54,9 +54,11 @@ The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/REA
   them lists the tools it does want in `tools:`.
 * **The conversation's tools.** A message from the orchestration layer's chat announces one MCP endpoint for the
   conversation (`thread-tools/v1`); whatever it lists is offered to the model at every turn under its listed name
-  (`get_ui_catalog` today; the relayed tools of attached servers later), through a `ToolSource` that `assemble`
-  gives every agent. The URL is an MCP server's: **`MCP_ALLOW_INSECURE=true`** lets it be plain `http` on another
-  host (a compose stack); https and loopback need nothing. No grant, or an expired one, offers nothing.
+  (the relayed tools of attached servers later; not `get_ui_catalog`, which the model has as `ui_catalog`), through a
+  `ToolSource` that `assemble` gives every agent, and that also describes `show` with the components of the
+  conversation's screen. `show` refuses a `Choices` form (a dead form: ask with `ask_user` and `choices`). The URL
+  is an MCP server's: **`MCP_ALLOW_INSECURE=true`** lets it be plain `http` on another host (a compose stack); https
+  and loopback need nothing. No grant, or an expired one, offers nothing.
 
 The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `steps/v1` and
 `text-stream/v1` (`card_of`), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
@@ -82,8 +84,11 @@ with it is not tested here.
 `dev/agents/researcher/agent/` is a second one: **a researcher** whose `mcp.json` names a web-search MCP server (the
 mock of the orchestration layer's stack) and whose instructions tell the model to search, to cite every source as a
 link, and, when the screen has the components, to show the sources as `Cards` (and how they relate as a `Mermaid`
-graph) with `show` after reading the screen with `ui_catalog`. Its files are the same as the orchestration layer's
-copy of the folder (`another-agentic-system`, `dev/agents/researcher/agent`) and are kept in step by hand. A folder
+graph) with `show` after reading the screen with `ui_catalog`. Both folders end with a section, **What the person
+sees**: the words before a tool call are working notes, shown in the activity panel and not in the conversation;
+the reply that ends the turn is the only text in it, so it is complete on its own and puts the result first; and
+replies render as Markdown. (The orchestration layer's copy of the folders, `another-agentic-system`,
+`dev/agents/*/agent`, is kept in step by hand, and has not taken this section yet.) A folder
 of a few lines is enough:
 
 ```markdown
