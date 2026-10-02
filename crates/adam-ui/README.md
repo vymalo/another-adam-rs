@@ -29,7 +29,7 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 | `AskUser`, `ASK_USER` | `ask_user { question, choices? }`: see *The tools* |
 | `Show`, `SHOW`, `MAX_BLOCKS` | `show { blocks, title? }`, at most 16 blocks; refuses a `Choices` block |
 | `UiCatalogTool`, `UI_CATALOG` | `ui_catalog {}` |
-| `ThreadTools`, `ThreadToolsClient`, `GET_UI_CATALOG` | the source (`ThreadTools::new` lists everything the endpoint lists; `hiding(name)` leaves one out), and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
+| `ThreadTools`, `ThreadToolsClient`, `GET_UI_CATALOG`, `TURN_OUTPUT`, `TURN_OUTPUT_DELIVERED` | the source (`ThreadTools::new` lists everything the endpoint lists; `hiding(name)` leaves one out), and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
 | `Catalog`, `Claimed`, `Component`, `CatalogError`, `canonical_json`, `catalog_digest` | a catalog read and checked against the digest it claims; `validate(instance)` against a component's schema; the canonical form and the digest of [the contract](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/ui-catalog-v1.md#2-digest-version-and-the-lock) |
 | `CatalogCache`, `MAX_CACHED_CATALOGS` | the catalogs this process holds, by digest (8, the oldest dropped) |
 | `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v0.9.1 (`acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1` |
@@ -81,7 +81,14 @@ inbound function reads a screen's action as JSON text.
   provider accepts is left out (with a warning); one that clashes with an own tool loses to it. The source of a
   `Ui` leaves **`get_ui_catalog`** out and refuses a call to it: the model has `ui_catalog` for the same thing, and
   two tools for one thing made it call whichever it remembered (the catalog is still read again through the endpoint,
-  by this crate, when a message does not carry it). The same source rewrites the description of `show` each turn
+  by this crate, when a message does not carry it). **`turn_output { text }`** is the one tool of the endpoint it knows by
+  name: when the endpoint accepts a call, the model is told `TURN_OUTPUT_DELIVERED` (*Delivered to the person as your
+  answer. Finish now with one short line, and do not repeat the answer.*) instead of the endpoint's `{"delivered": true}`,
+  and `text` is **announced as the run's answer** (`ToolOutput::announcing`): the run's output, and so the A2A `completed`
+  status message, carries it and not the model's closing line, and a plain A2A client reads what the orchestrator shows.
+  A later accepted call replaces it; a refused call (the turn is over, blank or oversize text, a grant the endpoint no
+  longer accepts) announces nothing and the model reads the error. With an endpoint that does not list `turn_output`
+  nothing changes ([ADR 0014](../../docs/decisions/0014-a-turn-output-answer-is-the-runs-answer.md)). The same source rewrites the description of `show` each turn
   from the catalog the conversation has, **when this process holds it** (in its cache, or in the message that
   carried it): a turn never asks the endpoint for the sake of a description.
 
@@ -155,7 +162,12 @@ stateDiagram-v2
   expired, refused, missing or malformed grant and a dead endpoint; a catalog that does not hash to its claim; `show`
   (a golden, `tests/golden/show_blocks.json`; a replay emits the same surface; every refusal) and `ui_catalog`; the
   description of `show` is made from the catalog once it is held and no turn fetches it.
-  `src/thread_tools.rs` also pins that the source of a `Ui` hides `get_ui_catalog` and refuses a call to it.
+  `src/thread_tools.rs` also pins that the source of a `Ui` hides `get_ui_catalog` and refuses a call to it, and what a
+  `turn_output` call gives the model and the run (the result text, the announced text, every refusal).
+* `tests/turn_output.rs`: a whole agent behind A2A against the fake endpoint with `turn_output` enabled: the announced
+  text is the `completed` status message and the run's output (no stream), the model was told what to do next, the last of
+  two announcements wins, a refused call (the turn is over, oversize) leaves the closing words as the answer and the model
+  reads the error, and an endpoint without the tool changes nothing.
 * `tests/cards.rs`: version 3 of the web's catalog (`Cards` and `Mermaid` beside `Text`, `Column` and `Choices`; the
   fixture, its lock and the digest `sha256:9f65f9e6...` pinned, and the three components of version 2 unchanged in it):
   what a researcher draws (a Text, three source cards and a graph) is one surface, a golden file

@@ -194,6 +194,12 @@ pub struct Conversation {
     /// Artifacts produced so far, summarised in the final output.
     #[serde(default)]
     pub artifacts: Vec<ArtifactRef>,
+    /// The words a tool announced as the run's answer ([`ToolOutput::announcing`](crate::ToolOutput::announcing)):
+    /// the last announcement of the turn in progress, which is the `text` of the run's output when it
+    /// finishes. A new message that reaches the run ends the turn and clears it. Absent from state
+    /// written before it existed, and not written while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub announced: Option<String>,
     /// The run whose conversation this one carries on, for a run started with
     /// `Runtime::start_with_id_continuing` (see [`Conversation::continued`]); `None` for a run that
     /// began from nothing. Only for whoever reads the durable state: the loop never looks at it.

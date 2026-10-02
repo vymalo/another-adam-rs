@@ -22,7 +22,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so `adam-assembly` keeps it out of subagents; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "OpenCode", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) |
-| `ToolOutput` | `text`, `error`, `with_artifact`. A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed |
+| `ToolOutput` | `text`, `error`, `with_artifact`. A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
 | `StepIo` | how a call's step reports its input and output: `StepIo::default().redact(\|text\| ..).input_max(n).output_max(n)`, or `StepIo::off()`; given to the builder with `step_io(..)` (see *Steps*) |
 | `ToolCtx` | run id, conversation id, attempt, call id, `child_run_id()` (the id of the child this call starts), `start_child(agent, message)` (starts it on the runtime that steps the run), `step_id()` (`tool:<call id>`), `report_step(StepEvent)` (a step that runs under this call's), `emit_progress` (an update of the call's own step, the text in its detail), `cancelled` / `cancel_token`, `state::<T>()` / `require_state::<T>()`, `context(key)` / `context_map()` (the run's inbound context, see *Context and tool sources*), and for tests `detached(..).with_state(..).with_context(..)` |
@@ -258,6 +258,26 @@ asks for `complete` as before (for a model client that cannot stream, or a provi
   delivers nothing) puts the stream in `PendingQuestion::stream`, so the `input-required` status that carries the question
   says which stream its text was.
 
+## Announced answers
+
+A tool can say "this is my answer" before the model is done: `ToolOutput::announcing(text)` (the member `answer: Option<String>`,
+absent from a journal written before it and not written while `None`). It is for a tool that hands the final answer over by
+another route, so that a client that reads only the run's output reads what the person was shown. `adam-ui` uses it for the
+thread tool `turn_output` ([ADR 0014](../../docs/decisions/0014-a-turn-output-answer-is-the-runs-answer.md)).
+
+* The loop keeps the words in `Conversation::announced` (journaled with the call's result, so a replay announces the same
+  words and the tool is not called again). **The last announcement wins.** A result that is an error announces nothing, whatever
+  its `answer` says (a call the endpoint refused changes nothing), and the same goes for a result marked as an error because a
+  file was refused.
+* When the run ends (a model turn with no tool call), the output is `{"text": <the announcement>, "artifacts": ..}` and so is
+  the text of the A2A `completed` status. It names **no `stream`** and is never `truncated`: it is not the words the model
+  streamed. The closing words are still said, as `agent_text` with the `stream` they were sent as, so the orchestration layer
+  files them as working text.
+* **A message that reaches the run ends the turn** and clears the announcement (the person's answer to a question, a message
+  that arrives while the run is going): what was announced is the answer of the turn before. A run that continues another
+  starts with none.
+* With no tool announcing anything, nothing changes: the closing words are the answer, with their `stream`.
+
 ## Child runs
 
 A tool that delegates returns `Err(ToolError::AwaitRun { run })` after starting the child:
@@ -360,6 +380,12 @@ No environment variables.
 The old `Conversation` JSON with `pending_question` is a literal in `src/conversation.rs`
 (`a_state_stored_as_pending_question_still_loads`) and the old `ToolError` shapes are literals in `src/tool.rs`
 (`journals_written_before_await_run_still_decode`).
+
+`tests/announced_answer.rs` is the suite of *Announced answers* (real `Runtime`, scripted `MockModel`, `MemoryStore`): an
+announced answer is the run's output and the closing line is not, the last of several wins (in one message and across
+turns), a refused call changes nothing (and one after an announcement keeps it), no announcement leaves the closing words as
+the answer with their stream, a replay after a crash inside the next tool keeps the announced answer and does not call the
+tool again, a message that reaches the run clears it, and the serde shapes of older journals.
 
 `tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
 the context of the start message reaching a tool, replace/delete/keep across messages, a continued run carrying the

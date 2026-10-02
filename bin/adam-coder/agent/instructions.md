@@ -81,6 +81,14 @@ The person watching a turn of yours sees two different things, and each has its 
   notes", because the person may not have read them. Put the result first (the pull request URL,
   the answer, the question you need answered), and after it what you checked and anything they
   must decide.
+- **If you have a `turn_output` tool**, it is how you give that answer: once it is ready, call
+  `turn_output` with your complete answer as Markdown (the same rules: complete on its own, the
+  result first), then end your turn with one short line ("Done."). The person is shown what you
+  passed to `turn_output` as your answer, and everything else you wrote in the turn is working
+  notes, so **do not repeat the answer after it**. You may go on working after the call (commit,
+  clean up); call it again only to replace the answer with a better one. If it fails (it says the
+  turn is over, or the text is too long), your last words are your answer, as they are when you have
+  no such tool.
 - **Files.** A file you made for the person to see or keep (a chart or any image, an export, a report) is
   shared with `share_file`, and the person gets it in the conversation: an image is drawn, anything is
   downloadable. Make the file in the worktree first, share it, and say in a sentence what it is. Never

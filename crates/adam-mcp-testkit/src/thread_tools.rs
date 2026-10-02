@@ -13,6 +13,7 @@
 //! | Tool | Arguments | Answers |
 //! |---|---|---|
 //! | `get_ui_catalog` | `knownDigest?` | the catalog set with [`set_catalog`](ThreadToolsServer::set_catalog) as `structuredContent` and as the same JSON text: `{catalogId, version, digest, unchanged, catalog?}`; `isError` ("this thread has no UI catalog; answer in text") without one |
+//! | `turn_output` (only after [`enable_turn_output`](ThreadToolsServer::enable_turn_output)) | `text` | `{"delivered": true}` as `structuredContent` and as the same JSON text, and the text is kept ([`announcements`](ThreadToolsServer::announcements)); `isError` for blank text (`text must not be empty`), more than 65536 bytes (`text must be at most 65536 bytes`) and, after [`end_turn`](ThreadToolsServer::end_turn), every call (`this turn is over`) |
 //! | each tool of [`add_tool`](ThreadToolsServer::add_tool) | an object | the text it was given, with the arguments it was called with echoed after it |
 //!
 //! Test code, not a product: it panics when the machine cannot give it a port.
@@ -44,6 +45,23 @@ use tokio::task::JoinHandle;
 /// The tool every endpoint has.
 pub const GET_UI_CATALOG: &str = "get_ui_catalog";
 
+/// The tool with which an agent announces its answer for the turn.
+pub const TURN_OUTPUT: &str = "turn_output";
+
+/// The longest answer `turn_output` takes, in bytes.
+const MAX_TURN_OUTPUT_BYTES: usize = 65_536;
+
+/// The state of the fake's `turn_output`.
+#[derive(Default)]
+struct TurnOutput {
+    /// Whether the tool is listed.
+    enabled: bool,
+    /// Whether the turn is over: every call is refused.
+    over: bool,
+    /// The texts accepted, in order.
+    announced: Vec<String>,
+}
+
 /// What the endpoint saw, and what it answers. Shared by every request.
 #[derive(Default)]
 struct Shared {
@@ -51,6 +69,8 @@ struct Shared {
     tokens: Mutex<Vec<String>>,
     /// The catalog `get_ui_catalog` answers: `(catalogId, version, digest, catalog)`.
     catalog: Mutex<Option<(String, u64, String, Value)>>,
+    /// The built-in `turn_output`, when the test asked for it.
+    turn_output: Mutex<TurnOutput>,
     /// The extra tools: `(tool, text it answers)`.
     extra: Mutex<Vec<(Tool, String)>>,
     initializations: AtomicUsize,
@@ -91,6 +111,21 @@ fn get_ui_catalog_tool() -> Tool {
     )
 }
 
+fn turn_output_tool() -> Tool {
+    Tool::new(
+        TURN_OUTPUT,
+        "Say that this is your answer for this turn, as Markdown: 1 to 65536 bytes. Call it once \
+         the answer is ready, then finish with one short line.",
+        object(json!({
+            "type": "object",
+            "properties": {"text": {"type": "string", "minLength": 1,
+                "description": "Your answer for this turn, as Markdown: 1 to 65536 bytes."}},
+            "required": ["text"],
+            "additionalProperties": false
+        })),
+    )
+}
+
 impl ServerHandler for Endpoint {
     fn get_info(&self) -> ServerConfig {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
@@ -113,6 +148,9 @@ impl ServerHandler for Endpoint {
     ) -> Result<ListToolsResult, McpError> {
         self.shared.lists.fetch_add(1, Ordering::SeqCst);
         let mut tools = vec![get_ui_catalog_tool()];
+        if lock(&self.shared.turn_output).enabled {
+            tools.push(turn_output_tool());
+        }
         tools.extend(
             lock(&self.shared.extra)
                 .iter()
@@ -132,6 +170,9 @@ impl ServerHandler for Endpoint {
         if name == GET_UI_CATALOG {
             return Ok(CallToolResponse::Complete(self.catalog_answer(&arguments)));
         }
+        if name == TURN_OUTPUT && lock(&self.shared.turn_output).enabled {
+            return self.turn_output_answer(&arguments);
+        }
         let extra = lock(&self.shared.extra);
         match extra.iter().find(|(tool, _)| tool.name == name) {
             Some((_, text)) => Ok(CallToolResponse::Complete(CallToolResult::success(vec![
@@ -147,6 +188,35 @@ impl ServerHandler for Endpoint {
 }
 
 impl Endpoint {
+    fn turn_output_answer(&self, arguments: &Value) -> Result<CallToolResponse, McpError> {
+        let refuse = |why: &str| {
+            Ok(CallToolResponse::Complete(CallToolResult::error(vec![
+                ContentBlock::text(why),
+            ])))
+        };
+        let Some(text) = arguments.get("text").and_then(Value::as_str) else {
+            return Err(McpError::invalid_params(
+                "`text` is required and must be a string",
+                None,
+            ));
+        };
+        let mut state = lock(&self.shared.turn_output);
+        if state.over {
+            return refuse("this turn is over");
+        }
+        if text.trim().is_empty() {
+            return refuse("text must not be empty");
+        }
+        if text.len() > MAX_TURN_OUTPUT_BYTES {
+            return refuse("text must be at most 65536 bytes");
+        }
+        state.announced.push(text.to_owned());
+        let body = json!({"delivered": true});
+        let mut result = CallToolResult::success(vec![ContentBlock::text(body.to_string())]);
+        result.structured_content = Some(body);
+        Ok(CallToolResponse::Complete(result))
+    }
+
     fn catalog_answer(&self, arguments: &Value) -> CallToolResult {
         let Some((catalog_id, version, digest, catalog)) = lock(&self.shared.catalog).clone()
         else {
@@ -260,6 +330,23 @@ impl ThreadToolsServer {
         let mut extra = lock(&self.shared.extra);
         extra.retain(|(t, _)| t.name != name);
         extra.push((tool, text.to_owned()));
+    }
+
+    /// List the built-in `turn_output` from now on, as the orchestrator does: it takes
+    /// `{text}`, keeps what it accepted ([`announcements`](Self::announcements)) and answers
+    /// `{"delivered": true}`.
+    pub fn enable_turn_output(&self) {
+        lock(&self.shared.turn_output).enabled = true;
+    }
+
+    /// The turn is over: from now on `turn_output` answers an error, `this turn is over`.
+    pub fn end_turn(&self) {
+        lock(&self.shared.turn_output).over = true;
+    }
+
+    /// The texts `turn_output` accepted, in order.
+    pub fn announcements(&self) -> Vec<String> {
+        lock(&self.shared.turn_output).announced.clone()
     }
 
     /// Stop listing the tool `name`.

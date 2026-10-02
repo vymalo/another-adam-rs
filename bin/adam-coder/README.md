@@ -1130,7 +1130,11 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
   working notes, shown in the activity panel beside the steps and not as part of the conversation, one line each; the reply
   that ends the turn is the only text of the coder's in the conversation, so it is complete on its own (never "as I said
   above") and puts the result first; and replies render as Markdown (headings, bold, lists, tables, links, code
-  blocks), so the coder uses them when they help and not for a one-line answer. `show` and `ui_catalog` are as
+  blocks), so the coder uses them when they help and not for a one-line answer. **When it has a `turn_output` tool** (the
+  thread tool of an orchestration layer that lists it, [ADR 0014](../../docs/decisions/0014-a-turn-output-answer-is-the-runs-answer.md))
+  it gives that answer by calling the tool with the whole answer, ends with one short line and does not repeat the answer;
+  the instructions read the same without the tool (the reply that ends the turn is the answer) and when the call fails.
+  `show` and `ui_catalog` are as
   [`adam-ui`](../../crates/adam-ui/README.md) makes them (`show` refuses a `Choices` form: ask with `ask_user`).
 * **A greeting gets a greeting**: "hi" is answered with a short greeting that says the name and what the agent does
   in one sentence (the second persona line, `In one sentence: <summary>.`) and asks one question, which repository

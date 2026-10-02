@@ -65,13 +65,18 @@ let url = server.url("thread-1");                         // http://127.0.0.1:<p
 server.set_catalog(Some((id, 2, digest, document)));      // what `get_ui_catalog` answers (none: isError)
 server.add_tool("relay__search", "Search.", schema, "found");   // listed from the next request; a call answers "found {args}"
 server.remove_tool("relay__search");
+server.enable_turn_output();                              // list the built-in `turn_output { text }` (answers {"delivered": true})
+server.announcements(); server.end_turn();                // the texts it accepted; from then on it answers "this turn is over"
 server.set_tokens(&["another"]);                          // rotate what is accepted
 server.lists(); server.calls(); server.catalog_requests();   // what it was asked
 server.authorizations(); server.refused();                 // the headers it saw, and the 401s
 ```
 
 `get_ui_catalog` has the contract's input (`knownDigest?`) and output (`structuredContent` and the same JSON as text:
-`{catalogId, version, digest, unchanged, catalog?}`); a name nobody owns is the protocol error `-32602`.
+`{catalogId, version, digest, unchanged, catalog?}`); a name nobody owns is the protocol error `-32602`. `turn_output` is
+listed only after `enable_turn_output` (so the tests written before it are unchanged): it keeps the texts it accepts,
+refuses blank text (`text must not be empty`), more than 65536 bytes (`text must be at most 65536 bytes`) and, after
+`end_turn`, everything (`this turn is over`), as the real tool does.
 
 ## Test helpers
 
