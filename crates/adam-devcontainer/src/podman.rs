@@ -19,6 +19,69 @@ pub(crate) const RUN_LABEL: &str = "adam.vymalo.com/run";
 /// The label that names the deployment that made it.
 pub(crate) const DEPLOYMENT_LABEL: &str = "adam.vymalo.com/deployment";
 
+/// One line of an id map: `size` ids from `host_id` on are `container_id` on in the namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdRange {
+    pub container_id: u32,
+    pub host_id: u32,
+    pub size: u32,
+}
+
+/// The uid and gid maps of the Podman service (empty when it is not rootless).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct IdMaps {
+    pub uids: Vec<IdRange>,
+    pub gids: Vec<IdRange>,
+}
+
+impl IdMaps {
+    /// From `podman info --format json`: `host.idMappings.{uidmap,gidmap}` when
+    /// `host.security.rootless` is true; nothing otherwise.
+    pub(crate) fn from_info(info: &Value) -> Self {
+        let host = &info["host"];
+        if host["security"]["rootless"].as_bool() != Some(true) {
+            return Self::default();
+        }
+        let ranges = |key: &str| {
+            host["idMappings"][key]
+                .as_array()
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .filter_map(|l| {
+                            let n = |k: &str| l[k].as_u64().and_then(|v| u32::try_from(v).ok());
+                            Some(IdRange {
+                                container_id: n("container_id")?,
+                                host_id: n("host_id")?,
+                                size: n("size")?,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            uids: ranges("uidmap"),
+            gids: ranges("gidmap"),
+        }
+    }
+
+    /// The ids of the host as the service numbers them; unchanged when there is no map (rootful),
+    /// `None` when a rootless service has no number for one of them.
+    pub(crate) fn to_service(&self, uid: u32, gid: u32) -> Option<(u32, u32)> {
+        fn map(ranges: &[IdRange], id: u32) -> Option<u32> {
+            if ranges.is_empty() {
+                return Some(id);
+            }
+            ranges.iter().find_map(|r| {
+                (id >= r.host_id && id - r.host_id < r.size)
+                    .then(|| r.container_id + (id - r.host_id))
+            })
+        }
+        Some((map(&self.uids, uid)?, map(&self.gids, gid)?))
+    }
+}
+
 /// A container as `podman ps` lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Row {
@@ -83,6 +146,16 @@ impl Podman {
         self.call(&["info", "--format", "json"], timeout)
             .await
             .map(|_| ())
+    }
+
+    /// The service's own id maps (`host.idMappings` of `podman info`): how the ids of the host are
+    /// numbered in the user namespace of a rootless service, which is the namespace a container's
+    /// `/proc/self/uid_map` is relative to. Empty for a rootful service.
+    pub(crate) async fn id_maps(&self, timeout: Duration) -> Result<IdMaps, PodmanError> {
+        let out = self.call(&["info", "--format", "json"], timeout).await?;
+        let info: Value = serde_json::from_str(&out)
+            .map_err(|e| PodmanError(format!("`podman info` is not JSON: {e}")))?;
+        Ok(IdMaps::from_info(&info))
     }
 
     /// Pull `image`.
@@ -174,9 +247,10 @@ impl Podman {
         .map(|_| ())
     }
 
-    /// Give `dir` to `uid:gid` (as the host sees them: the coder's own) through `adam-exec`, as root,
-    /// so that the coder can delete what a process created there as another user. The script maps
-    /// the ids through the container's own id map.
+    /// Give `dir` to `uid:gid` through `adam-exec`, as root, so that the coder can delete what a
+    /// process created there as another user. The ids are the service's ([`IdMaps::to_service`]):
+    /// the script maps them through the container's own id map, which is relative to the service's
+    /// user namespace.
     pub(crate) async fn exec_chown(
         &self,
         id: &str,
@@ -329,6 +403,37 @@ mod tests {
       {"Id":"bbb222","State":"exited","Names":["other"],"Labels":{"adam.vymalo.com/run":"run-2"}},
       {"Id":"ccc333","State":"Running","Labels":null}
     ]"#;
+
+    #[test]
+    fn a_rootless_service_numbers_its_own_user_0_and_the_rest_by_its_subuids() {
+        let info = serde_json::json!({"host": {
+            "security": {"rootless": true},
+            "idMappings": {
+                "uidmap": [{"container_id": 0, "host_id": 10001, "size": 1},
+                           {"container_id": 1, "host_id": 100000, "size": 65536}],
+                "gidmap": [{"container_id": 0, "host_id": 10001, "size": 1},
+                           {"container_id": 1, "host_id": 100000, "size": 65536}]
+            }
+        }});
+        let maps = IdMaps::from_info(&info);
+        // The coder and the service share uid 10001: the service calls it 0.
+        assert_eq!(maps.to_service(10001, 10001), Some((0, 0)));
+        assert_eq!(maps.to_service(110000, 100000), Some((10001, 1)));
+        // An id the service has no number for is not guessed.
+        assert_eq!(maps.to_service(1000, 10001), None);
+    }
+
+    #[test]
+    fn a_rootful_service_or_an_older_answer_leaves_the_ids_as_they_are() {
+        let rootful = serde_json::json!({"host": {"security": {"rootless": false},
+            "idMappings": {"uidmap": [{"container_id": 0, "host_id": 10001, "size": 1}]}}});
+        assert_eq!(IdMaps::from_info(&rootful), IdMaps::default());
+        assert_eq!(IdMaps::from_info(&serde_json::json!({})), IdMaps::default());
+        assert_eq!(
+            IdMaps::default().to_service(10001, 10001),
+            Some((10001, 10001))
+        );
+    }
 
     #[test]
     fn ps_rows_say_which_run_a_container_is_and_whether_it_runs() {

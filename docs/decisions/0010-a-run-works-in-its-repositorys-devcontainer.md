@@ -85,6 +85,11 @@ bind-mounted directory stay 10001's outside), `--network=none` and the shared ne
   the timeout. The client is the static `podman-remote` of the same release as the service (containers/podman v5.8.7,
   `podman-remote-static-linux_amd64.tar.gz`, sha256 `01b5ac59…5e7e` from the release's `shasums`, *verified 2026-10-01*),
   in CI and in the coder's image.
+* *Settled 2026-10-02 by the CI job:* a container's `/proc/self/uid_map` is relative to the rootless service's own
+  user namespace, not to the host's. Handing the coder's host uid (10001) to `adam-exec chown` gave the workspace to
+  110000 (a subuid) and the coder could not delete it. `release` now first numbers the ids as the service does
+  (`host.idMappings` of `podman info`: the service's own user, which is the coder's, is 0), and leaves the files
+  alone, with a warning, when the service has no number for them.
 * That Compose resolves the relative path `seccomp=./dev/podman/seccomp.json` (`PODMAN_SECCOMP` overrides it).
 * DNS to a compose service name from a devcontainer in the service's network namespace; egress from nested containers.
 * That the inspect check does not refuse a container for a `SecurityOpt` the service's `containers.conf` adds (the check

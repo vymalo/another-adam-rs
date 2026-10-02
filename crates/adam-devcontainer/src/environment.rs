@@ -936,16 +936,33 @@ impl DevContainer {
         let list = |e: crate::podman::PodmanError| EnvError::Unavailable(e.to_string());
         let rows = podman.containers(RUN_LABEL, run).await.map_err(list)?;
         // What a process in the container made as another user must be the coder's to delete: give
-        // the tree to the coder's own user and group, which the script maps through the container's
-        // id map (the user's own number under keep-id, root's without it).
+        // the tree to the coder's own user and group. The container's id map is relative to the
+        // service's user namespace, so the ids go there first (a rootless service calls its own
+        // user, which is the coder's, 0); the script then maps them into the container.
         let work = self.inner.settings.root.join("workspaces").join(run);
-        if let Ok(meta) = std::fs::metadata(&work) {
-            for row in rows.iter().filter(|r| r.running) {
-                if let Err(e) = podman
-                    .exec_chown(&row.id, meta.uid(), meta.gid(), &work.display().to_string())
-                    .await
-                {
-                    tracing::warn!(error = %e, run, "could not give the files back before removing the container");
+        let running: Vec<_> = rows.iter().filter(|r| r.running).collect();
+        if let (Ok(meta), false) = (std::fs::metadata(&work), running.is_empty()) {
+            match podman.id_maps(self.inner.settings.probe_timeout).await {
+                Ok(maps) => match maps.to_service(meta.uid(), meta.gid()) {
+                    Some((uid, gid)) => {
+                        for row in running {
+                            if let Err(e) = podman
+                                .exec_chown(&row.id, uid, gid, &work.display().to_string())
+                                .await
+                            {
+                                tracing::warn!(error = %e, run, "could not give the files back before removing the container");
+                            }
+                        }
+                    }
+                    None => tracing::warn!(
+                        run,
+                        uid = meta.uid(),
+                        gid = meta.gid(),
+                        "the Podman service has no number for the coder's ids: the files are not given back"
+                    ),
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, run, "could not read the Podman service's id maps")
                 }
             }
         }
