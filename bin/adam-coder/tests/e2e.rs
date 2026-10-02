@@ -574,15 +574,9 @@ async fn the_coder_fixes_a_line_with_apply_patch_and_opens_the_pull_request(stor
         "{:?}",
         seen.labels
     );
-    // The progress of a tool is a line of its own for a client that did not ask for steps, which is
-    // what `dev/coder-e2e.sh` (SCENARIO=files) reads.
-    for line in ["read greet.sh (remote)", "patched greet.sh (remote)"] {
-        assert!(
-            seen.messages.iter().any(|m| m == line),
-            "{line}: {:#?}",
-            seen.messages
-        );
-    }
+    // Not asserted: the progress lines of the read and the patch ("read greet.sh (remote)"). Progress
+    // is not kept, and a stream that attaches after the task is made can miss a quick step's line; what
+    // the model was told (below) is the durable proof.
     assert!(
         !seen.saw_message("starting OpenCode"),
         "OpenCode was not needed: {:#?}",
