@@ -1,7 +1,7 @@
-//! `read_file`, `write_file` and `apply_patch`: the coder edits small, well-located things itself.
+//! `read_file`, `write_file`, `edit_file` and `apply_patch`: the coder edits small, well-located things itself.
 //!
 //! The model used to change a worktree only by delegating to OpenCode, which costs a process, a
-//! model and a conversation for a one-line fix. These three tools read and change files of the
+//! model and a conversation for a one-line fix. These tools read and change files of the
 //! worktree directly, in the coder's own process, and are **confined to it**: the model chooses
 //! the path, so a path is checked by [`confine`] before anything is opened, and a patch is checked
 //! by the paths `git` itself says it would touch.
@@ -661,7 +661,7 @@ fn listed(paths: &[String]) -> String {
 
 /// What a change to a scratch project that was already published adds to the tool's result: the
 /// change does not reach the repository ([`published_note`](super::scratch::published_note)).
-fn push_published_note(text: &mut String, slot: &adam_workspace::Slot) {
+pub(super) fn push_published_note(text: &mut String, slot: &adam_workspace::Slot) {
     if let Some(note) = super::scratch::published_note(slot) {
         text.push('\n');
         text.push_str(&note);
@@ -706,8 +706,8 @@ pub async fn read_file(
 
 /// Create a file, or replace one, with exactly `content`. Parent directories are created. The
 /// path is relative to the root of the worktree; nothing inside `.git` and nothing through a
-/// symlink can be written. For a change to part of a file use apply_patch (or read it first with
-/// read_file and write it whole); for a broad, multi-file change use delegate_to_opencode.
+/// symlink can be written. For a change to part of a file use edit_file (exact text replaced) or
+/// apply_patch (a diff); for a broad, multi-file change use delegate_to_opencode.
 #[tool]
 pub async fn write_file(
     env: State<ToolEnv>,
@@ -751,7 +751,8 @@ pub async fn write_file(
 /// checked first (inside the worktree, not `.git`, not a symlink); a patch that creates a symlink
 /// is refused; and it is all or nothing: if a hunk does not match the file, nothing is changed
 /// and you are told why. Read the file first, so the context lines match it exactly. Use it for
-/// small, well-located changes; delegate broad, multi-file changes to OpenCode.
+/// several changes at once, in one file or several; for one exact replacement edit_file is simpler.
+/// Delegate broad, multi-file changes to OpenCode.
 #[tool]
 pub async fn apply_patch(
     env: State<ToolEnv>,
@@ -784,6 +785,352 @@ pub async fn apply_patch(
             Ok(ToolOutput::error(reason))
         }
         Err(PatchError::Git(e)) => Err(ToolError::Transient(format!("cannot run git apply: {e}"))),
+    }
+}
+
+/// What an edit did.
+#[derive(Debug, PartialEq, Eq)]
+struct Edited {
+    /// How many places were replaced.
+    replaced: usize,
+    /// The 1-based line each replaced place started on, in the file as it was.
+    lines: Vec<usize>,
+    bytes: usize,
+}
+
+/// Most places `edit_file` lists by line number.
+const MAX_PLACES: usize = 10;
+
+/// Most lines of the closest region an error shows (and of context around it, each side).
+const MAX_REGION_LINES: usize = 30;
+const REGION_CONTEXT: usize = 2;
+
+/// Longest line an error quotes, in characters.
+const MAX_QUOTED_CHARS: usize = 200;
+
+/// Replace `old` with `new` in `rel` under `root`: exactly, once or everywhere.
+///
+/// The file must exist, be a regular file of at most [`WRITE_CAP`] bytes, and be UTF-8 text without
+/// NUL. The path is confined as a write is ([`confine`] with [`Access::Write`]), so nothing inside
+/// `.git`, nothing outside the worktree and nothing through a symlink is edited. The write is
+/// [`write_in`]'s (a new file renamed over the old, the mode kept).
+fn edit_in(
+    root: &Path,
+    rel: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<Edited, String> {
+    let shown = rel.trim();
+    if old.is_empty() {
+        return Err(
+            "old is empty: give the exact text to replace (to create a file use write_file)".into(),
+        );
+    }
+    if old == new {
+        return Err("old and new are the same text: there is nothing to change".into());
+    }
+    let path = confine(root, rel, Access::Write)?;
+    let meta = match fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(format!(
+                "`{shown}` does not exist: edit_file changes a file that is there (write_file \
+                 creates one)"
+            ));
+        }
+        Err(e) => return Err(format!("cannot read `{shown}`: {e}")),
+    };
+    if !meta.is_file() {
+        return Err(format!("`{shown}` is not a regular file"));
+    }
+    if meta.len() > WRITE_CAP as u64 {
+        return Err(format!(
+            "`{shown}` is {} bytes, over the {WRITE_CAP} bytes edit_file works on: use apply_patch, \
+             or have OpenCode make the change",
+            meta.len()
+        ));
+    }
+    let bytes = fs::read(&path).map_err(|e| format!("cannot read `{shown}`: {e}"))?;
+    let Ok(content) = String::from_utf8(bytes) else {
+        return Err(format!(
+            "`{shown}` is not UTF-8 text: edit_file changes text files"
+        ));
+    };
+    if content.contains('\0') {
+        return Err(binary_notice(shown, meta.len()));
+    }
+
+    let places: Vec<usize> = content.match_indices(old).map(|(at, _)| at).collect();
+    let lines: Vec<usize> = places.iter().map(|at| line_of(&content, *at)).collect();
+    match places.len() {
+        0 => return Err(not_found(shown, &content, old)),
+        1 => {}
+        n if !replace_all => {
+            return Err(format!(
+                "`old` is in `{shown}` {n} times (starting at {}): nothing was changed. Add the \
+                 lines around the one you mean to `old` so that it matches once, or set \
+                 replace_all to replace every one",
+                places_listed(&lines)
+            ));
+        }
+        _ => {}
+    }
+    let edited = if replace_all {
+        content.replace(old, new)
+    } else {
+        content.replacen(old, new, 1)
+    };
+    let written = write_in(root, rel, &edited)?;
+    Ok(Edited {
+        replaced: places.len(),
+        lines,
+        bytes: written.bytes,
+    })
+}
+
+/// The 1-based line of the byte offset `at` of `text`.
+fn line_of(text: &str, at: usize) -> usize {
+    text[..at].bytes().filter(|b| *b == b'\n').count() + 1
+}
+
+/// `lines 3, 9, 14` (the first [`MAX_PLACES`], then how many more).
+fn places_listed(lines: &[usize]) -> String {
+    let mut text = format!(
+        "line{} {}",
+        if lines.len() == 1 { "" } else { "s" },
+        lines
+            .iter()
+            .take(MAX_PLACES)
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if lines.len() > MAX_PLACES {
+        text.push_str(&format!(" and {} more", lines.len() - MAX_PLACES));
+    }
+    text
+}
+
+/// `line` cut to [`MAX_QUOTED_CHARS`] characters.
+fn quoted(line: &str) -> String {
+    let mut text: String = line.chars().take(MAX_QUOTED_CHARS).collect();
+    if line.chars().count() > MAX_QUOTED_CHARS {
+        text.push_str("...");
+    }
+    text
+}
+
+/// How alike two lines are, from 0 to 1000: the Sorensen-Dice coefficient of their character pairs
+/// (whitespace at the ends does not count). Two empty lines are alike; an empty line and one with
+/// text are not.
+fn similarity(a: &str, b: &str) -> usize {
+    let (a, b) = (a.trim(), b.trim());
+    if a == b {
+        return 1000;
+    }
+    let pairs = |s: &str| -> Vec<(char, char)> {
+        let chars: Vec<char> = s.chars().collect();
+        chars.windows(2).map(|w| (w[0], w[1])).collect()
+    };
+    let (mut left, right) = (pairs(a), pairs(b));
+    if left.is_empty() || right.is_empty() {
+        // A single character each: alike only if equal, which `a == b` above already took.
+        return 0;
+    }
+    let total = left.len() + right.len();
+    let mut common = 0;
+    for pair in right {
+        if let Some(at) = left.iter().position(|p| *p == pair) {
+            left.swap_remove(at);
+            common += 1;
+        }
+    }
+    2 * common * 1000 / total
+}
+
+/// Where the lines of `old` are most nearly in the lines of `content`: the 0-based index of the
+/// first line of the window of the same length that matches best, or `None` when nothing in the file
+/// is anything like it.
+///
+/// A line of `old` that is in the file (ignoring the whitespace at its ends) votes for the window
+/// it would sit in if `old` were there; the window with the most votes is the closest. When no line
+/// matches at all (every line was written a little differently), the most alike pair of one of the
+/// longest lines of `old` and a line of the file places the window.
+fn closest_window(content_lines: &[&str], old_lines: &[&str]) -> Option<usize> {
+    use std::collections::HashMap;
+    let mut by_text: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (at, line) in content_lines.iter().enumerate() {
+        by_text.entry(line.trim()).or_default().push(at);
+    }
+    let mut votes: HashMap<usize, usize> = HashMap::new();
+    for (i, line) in old_lines.iter().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        for &at in by_text.get(line).into_iter().flatten() {
+            if let Some(start) = at.checked_sub(i) {
+                *votes.entry(start).or_default() += 1;
+            }
+        }
+    }
+    // The most votes; the earliest window among equals.
+    if let Some((start, _)) = votes.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))) {
+        return Some(*start);
+    }
+    // No line is the same: the best pair of one of the longest lines of `old` and a line of the
+    // file, when it is alike enough to be worth showing.
+    let mut longest: Vec<(usize, &str)> = old_lines
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .collect();
+    longest.sort_by_key(|(_, l)| std::cmp::Reverse(l.trim().len()));
+    let mut best: Option<(usize, usize)> = None;
+    for (i, line) in longest.into_iter().take(3) {
+        for (at, candidate) in content_lines.iter().enumerate() {
+            let score = similarity(line, candidate);
+            if score >= 500 && best.is_none_or(|(s, _)| score > s) {
+                best = Some((score, at.saturating_sub(i)));
+            }
+        }
+    }
+    best.map(|(_, start)| start)
+}
+
+/// A line made readable when it differs from another only in blanks: tabs, spaces at the ends and
+/// carriage returns are spelled out.
+fn visible(line: &str) -> String {
+    quoted(&line.replace('\t', "\\t").replace('\r', "\\r"))
+}
+
+/// What the model is told when `old` is nowhere in the file: the region that is closest to it with
+/// line numbers and a few lines around it, and the first line where the two differ.
+fn not_found(shown: &str, content: &str, old: &str) -> String {
+    let content_lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old.lines().collect();
+    let mut message = format!("`old` was not found in `{shown}`, and nothing was changed.");
+    if content.contains("\r\n") && !old.contains('\r') {
+        message.push_str(
+            " The file uses CRLF line endings, which a multi-line `old` must have as well.",
+        );
+    }
+    let Some(start) =
+        closest_window(&content_lines, &old_lines).filter(|s| *s < content_lines.len())
+    else {
+        message.push_str(
+            " Nothing in the file is like it: read the file again with read_file and copy the \
+             text from it.",
+        );
+        return message;
+    };
+    let len = old_lines.len().max(1);
+    let end = (start + len).min(content_lines.len());
+    let shown_end = end.min(start + MAX_REGION_LINES);
+    let from = start.saturating_sub(REGION_CONTEXT);
+    let to = (shown_end + REGION_CONTEXT).min(content_lines.len());
+    message.push_str(&format!(
+        " The closest region is lines {}-{} (shown with its surroundings):\n",
+        start + 1,
+        end
+    ));
+    for (at, line) in content_lines.iter().enumerate().take(to).skip(from) {
+        let mark = if (start..shown_end).contains(&at) {
+            ">"
+        } else {
+            " "
+        };
+        message.push_str(&format!("{mark}{:>6}\t{}\n", at + 1, quoted(line)));
+    }
+    if end > shown_end {
+        message.push_str(&format!(
+            "       \t[... {} more lines of the region]\n",
+            end - shown_end
+        ));
+    }
+    // The first line where the region and `old` part.
+    let differs = (0..len).find(|i| content_lines.get(start + i) != old_lines.get(*i));
+    if let Some(i) = differs {
+        let mine = old_lines.get(i).copied().unwrap_or("");
+        match content_lines.get(start + i) {
+            Some(theirs) if theirs.trim() == mine.trim() => message.push_str(&format!(
+                "First difference, at line {}: only the blanks differ (tabs or spaces, spaces at \
+                 the end, or the line ending). The file has `{}`, your `old` has `{}`.\n",
+                start + i + 1,
+                visible(theirs),
+                visible(mine)
+            )),
+            Some(theirs) => message.push_str(&format!(
+                "First difference, at line {}: the file has `{}`, your `old` has `{}`.\n",
+                start + i + 1,
+                quoted(theirs),
+                quoted(mine)
+            )),
+            None => message.push_str(&format!(
+                "Your `old` goes on past the end of the file, at its line {}: `{}`.\n",
+                i + 1,
+                quoted(mine)
+            )),
+        }
+    }
+    message.push_str("Copy `old` from the file exactly, or use apply_patch.");
+    message
+}
+
+/// Replace exact text in a file of your worktree: every character of `old`, blanks and line breaks
+/// included, is replaced by `new`. It is the way to make a small change without writing a diff:
+/// read the file, copy the lines you mean to change as `old`, write what they become as `new`. It
+/// refuses, and changes nothing, when `old` is not in the file (the error shows the closest region
+/// with line numbers, so you can copy it right) or when `old` is in the file more than once and
+/// `replace_all` is not set (the error lists the lines: add more of the text around it to make it
+/// unique). The path is relative to the root of the worktree; nothing inside `.git` and nothing
+/// through a symlink can be edited. The file must be text of at most 1 MiB. To create a file or
+/// replace it whole use write_file, for several files at once apply_patch.
+#[tool]
+pub async fn edit_file(
+    env: State<ToolEnv>,
+    ctx: &ToolCtx,
+    /// Path of the file, relative to the root of the worktree
+    path: String,
+    /// The exact text to replace, copied from the file (blanks and line breaks too). Must be in the file; and once, unless replace_all is set.
+    old: String,
+    /// What it becomes. May be empty, to delete the text.
+    new: String,
+    /// Replace every place `old` is in. Leave out to replace the one place that has it.
+    replace_all: Option<bool>,
+    /// The slot to edit in: its name, or the repository's address. Leave out when the workspace has one.
+    repo: Option<String>,
+) -> Outcome {
+    let Some(path) = non_empty(&path) else {
+        return Ok(ToolOutput::error("path is required"));
+    };
+    let slot = match env.slot(ctx, repo.as_deref()).await {
+        Ok(slot) => slot,
+        Err(outcome) => return outcome,
+    };
+    let (root, rel) = (slot.path().to_path_buf(), path.to_owned());
+    let all = replace_all.unwrap_or(false);
+    let edited = tokio::task::spawn_blocking(move || edit_in(&root, &rel, &old, &new, all))
+        .await
+        .map_err(|e| ToolError::Transient(format!("the edit was interrupted: {e}")))?;
+    match edited {
+        Ok(done) => {
+            ctx.emit_progress(format!("edited {path} ({})", slot.dir()))
+                .await;
+            let mut text = format!(
+                "Edited {path}: replaced {} place{} ({}), {} bytes now. Run the checks again \
+                 before you commit.",
+                done.replaced,
+                if done.replaced == 1 { "" } else { "s" },
+                places_listed(&done.lines),
+                done.bytes
+            );
+            push_published_note(&mut text, &slot);
+            Ok(ToolOutput::text(text))
+        }
+        Err(reason) => Ok(ToolOutput::error(reason)),
     }
 }
 
@@ -1162,5 +1509,221 @@ mod tests {
         assert_eq!(listed(&few), "f0, f1, f2");
         let many: Vec<String> = (0..MAX_LISTED + 5).map(|i| format!("f{i}")).collect();
         assert!(listed(&many).ends_with("and 5 more"));
+    }
+
+    const MAIN_RS: &str = "use std::io;\n\nfn main() {\n    let name = \"world\";\n    println!(\"hello, {name}\");\n}\n\nfn helper() {\n    let name = \"world\";\n    drop(name);\n}\n";
+
+    fn edit(root: &Path, old: &str, new: &str, all: bool) -> Result<Edited, String> {
+        edit_in(root, "src/main.rs", old, new, all)
+    }
+
+    fn with_main() -> tempfile::TempDir {
+        let dir = root();
+        fs::write(dir.path().join("src/main.rs"), MAIN_RS).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_edit_replaces_the_one_place_and_says_where() {
+        let dir = with_main();
+        let done = edit(
+            dir.path(),
+            "println!(\"hello, {name}\");",
+            "println!(\"bye, {name}\");",
+            false,
+        )
+        .unwrap();
+        assert_eq!((done.replaced, done.lines.clone()), (1, vec![5]));
+        let now = fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
+        assert_eq!(now, MAIN_RS.replace("hello", "bye"));
+        assert_eq!(done.bytes, now.len());
+        // A multi-line replacement, and a deletion (an empty `new`).
+        edit(
+            dir.path(),
+            "fn helper() {\n    let name = \"world\";\n    drop(name);\n}\n",
+            "",
+            false,
+        )
+        .unwrap();
+        assert!(
+            !fs::read_to_string(dir.path().join("src/main.rs"))
+                .unwrap()
+                .contains("helper")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_keeps_the_mode_of_the_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = with_main();
+        let path = dir.path().join("src/main.rs");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        edit(dir.path(), "hello", "bye", false).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn a_text_in_two_places_is_refused_with_their_lines_unless_replace_all_is_set() {
+        let dir = with_main();
+        let why = edit(
+            dir.path(),
+            "let name = \"world\";",
+            "let name = \"you\";",
+            false,
+        )
+        .unwrap_err();
+        assert!(why.contains("2 times (starting at lines 4, 9)"), "{why}");
+        assert!(why.contains("replace_all"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            MAIN_RS,
+            "nothing changed"
+        );
+        let done = edit(
+            dir.path(),
+            "let name = \"world\";",
+            "let name = \"you\";",
+            true,
+        )
+        .unwrap();
+        assert_eq!((done.replaced, done.lines), (2, vec![4, 9]));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/main.rs"))
+                .unwrap()
+                .matches("\"you\"")
+                .count(),
+            2
+        );
+        // replace_all with one place is that place.
+        let one = edit(dir.path(), "use std::io;", "use std::fmt;", true).unwrap();
+        assert_eq!(one.replaced, 1);
+    }
+
+    #[test]
+    fn a_text_that_is_not_there_shows_the_closest_region_with_numbers_and_the_first_difference() {
+        let dir = with_main();
+        // Indentation is wrong (two spaces for four): every line of it is nearly there.
+        let why = edit(
+            dir.path(),
+            "fn main() {\n  let name = \"world\";\n  println!(\"hello, {name}\");\n}",
+            "x",
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("was not found") && why.contains("nothing was changed"),
+            "{why}"
+        );
+        assert!(why.contains("closest region is lines 3-6"), "{why}");
+        // The region with line numbers, marked, and the line before it for context.
+        assert!(why.contains(">     3\tfn main() {"), "{why}");
+        assert!(why.contains(">     4\t    let name = \"world\";"), "{why}");
+        assert!(why.contains("      2\t"), "context above: {why}");
+        assert!(
+            why.contains("First difference, at line 4: only the blanks differ"),
+            "{why}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            MAIN_RS
+        );
+
+        // A word that is different: the lines are said, not a blanks hint.
+        let why = edit(dir.path(), "println!(\"goodbye, {name}\");", "x", false).unwrap_err();
+        assert!(why.contains("closest region is lines 5-5"), "{why}");
+        assert!(
+            why.contains(
+                "First difference, at line 5: the file has `    println!(\"hello, {name}\");`"
+            ),
+            "{why}"
+        );
+        assert!(!why.contains("only the blanks"), "{why}");
+    }
+
+    #[test]
+    fn a_text_nothing_is_like_says_so_and_a_crlf_file_is_noticed() {
+        let dir = with_main();
+        let why = edit(dir.path(), "zzzzzzzz qqqqqqqq", "x", false).unwrap_err();
+        assert!(why.contains("Nothing in the file is like it"), "{why}");
+        fs::write(dir.path().join("src/crlf.txt"), "one\r\ntwo\r\nthree\r\n").unwrap();
+        let why = edit_in(dir.path(), "src/crlf.txt", "one\ntwo", "x", false).unwrap_err();
+        assert!(why.contains("CRLF"), "{why}");
+        assert!(why.contains("closest region is lines 1-2"), "{why}");
+    }
+
+    #[test]
+    fn a_very_long_region_is_cut() {
+        let dir = root();
+        let body: String = (0..100).map(|i| format!("line number {i}\n")).collect();
+        fs::write(dir.path().join("long.txt"), &body).unwrap();
+        let asked: String = (0..100)
+            .map(|i| format!("line number {i}\n"))
+            .collect::<String>()
+            + "extra\n";
+        let why = edit_in(dir.path(), "long.txt", &asked, "x", false).unwrap_err();
+        assert!(why.contains("more lines of the region"), "{why}");
+        assert!(why.len() < 4000, "{}", why.len());
+    }
+
+    #[test]
+    fn what_edit_file_cannot_do_is_said_and_nothing_is_touched() {
+        let dir = with_main();
+        for (rel, old, new, expected) in [
+            ("src/main.rs", "", "x", "old is empty"),
+            ("src/main.rs", "fn", "fn", "nothing to change"),
+            ("src/none.rs", "a", "b", "does not exist"),
+            ("src", "a", "b", "is a directory"),
+            ("../x", "a", "b", "`..`"),
+            ("/etc/passwd", "a", "b", "absolute"),
+            (".git", "a", "b", ".git"),
+            ("sub/.GIT/config", "a", "b", ".git"),
+            ("  ", "a", "b", "path is required"),
+        ] {
+            let why = edit_in(dir.path(), rel, old, new, false).unwrap_err();
+            assert!(why.contains(expected), "{rel}: {why}");
+        }
+        fs::write(dir.path().join("bin.dat"), b"a\0b").unwrap();
+        let why = edit_in(dir.path(), "bin.dat", "a", "b", false).unwrap_err();
+        assert!(why.contains("binary"), "{why}");
+        fs::write(dir.path().join("latin1.txt"), [0xe9, b'a']).unwrap();
+        let why = edit_in(dir.path(), "latin1.txt", "a", "b", false).unwrap_err();
+        assert!(why.contains("not UTF-8"), "{why}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            MAIN_RS
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_not_edited_through() {
+        let dir = with_main();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("secret"), "s3cr3t").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("src/main.rs"), dir.path().join("inside"))
+            .unwrap();
+        for rel in ["link", "inside"] {
+            let why = edit_in(dir.path(), rel, "s3cr3t", "x", false).unwrap_err();
+            assert!(why.contains("symlink"), "{rel}: {why}");
+        }
+        assert_eq!(
+            fs::read_to_string(outside.path().join("secret")).unwrap(),
+            "s3cr3t"
+        );
+    }
+
+    #[test]
+    fn the_similarity_of_lines_ignores_the_blanks_at_the_ends() {
+        assert_eq!(similarity("  a b ", "a b"), 1000);
+        assert_eq!(similarity("", "  "), 1000);
+        assert_eq!(similarity("abc", ""), 0);
+        assert!(similarity("println!(\"hello\")", "println!(\"hallo\")") > 700);
+        assert!(similarity("println!(\"hello\")", "fn main() {") < 400);
+        assert_eq!(line_of("a\nb\nc", 4), 3);
     }
 }

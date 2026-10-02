@@ -495,10 +495,11 @@ classDiagram
     PermissionPrompt <|.. StaticPrompt
 ```
 
-Each box is a crate (underscores stand for hyphens). The twelve coder tools are
-`prepare_workspace`, `start_scratch`, `publish_scratch`, `run_command`, `read_file`, `write_file`, `apply_patch`, `delegate_to_opencode`, `run_checks`,
-`commit_and_push`, `open_pull_request` and `ask_user` (the tool of `adam-ui`, under the coder's own words about when to ask), and
-`adam-ui` adds `show` and `ui_catalog` and a source of the tools of the conversation's endpoint. A thirteenth type,
+Each box is a crate (underscores stand for hyphens). The seventeen coder tools are
+`prepare_workspace`, `start_scratch`, `publish_scratch`, `request_repository`, `create_repository`, `run_command`, `run`, `read_file`, `write_file`,
+`edit_file`, `apply_patch`, `share_file`, `delegate_to_opencode`, `run_checks`, `rebuild_environment`, `commit_and_push` and
+`open_pull_request`; `ask_user` (the tool of `adam-ui`, under the coder's own words about when to ask) is the eighteenth, and
+`adam-ui` adds `show` and `ui_catalog` and a source of the tools of the conversation's endpoint. One more type,
 `Redacting`, wraps each of them to scrub secrets (`bin/adam-coder/src/tools/mod.rs`). `CoderAgent`
 wraps the `LlmAgent` that `adam-assembly` builds from `bin/adam-coder/agent/instructions.md` (the prompt, the
 limits and the A2A card are that file) and adds its completion rule. `FnTool` is a tool made from a closure. A tool
@@ -1952,8 +1953,10 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
 * **The tools** (`tools/`): `prepare_workspace`, `start_scratch` and `publish_scratch` (a scratch project to start in
   before a repository is named, and its copy into the repository the person names later: see
   [the coder README](../bin/adam-coder/README.md#scratch-projects)), `run_command` (looking around: no check, no cycle,
-  changes to HEAD, the branch, the working tree, refs and git configuration are undone), `read_file`, `write_file` and
-  `apply_patch` (small changes made in the coder's own process, confined to the worktree: see
+  changes to HEAD, the branch, the working tree, refs and git configuration are undone), `run` (making something with a
+  command: the file changes are kept, git is not touched and a command that does is undone entirely, and it is never a
+  check, [ADR 0013](decisions/0013-run-keeps-changes-edit-file-and-scratch-completion.md)), `read_file`, `write_file`,
+  `edit_file` and `apply_patch` (small changes made in the coder's own process, confined to the worktree: see
   [the coder README](../bin/adam-coder/README.md#reading-and-changing-files-itself)), `delegate_to_opencode`, `run_checks` (the project's own checks only),
   `commit_and_push`, `open_pull_request` and `ask_user`, then the screen's `show` and `ui_catalog` (all three
   of `adam-ui`: `Ui::tools()`).
@@ -1979,8 +1982,9 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     names, only after the person says yes to a question the tool writes, once per owner, name and visibility; the
     repository it makes is granted. A GitHub App creates for organisations only. See
     [`bin/adam-coder`](../bin/adam-coder/README.md#a-repository-of-its-own-on-request).
-  * After `MAX_CHECK_CYCLES` (default 3) failed check runs, `run_checks`
-    refuses to run. `commit_and_push` and `open_pull_request` refuse too.
+  * After `MAX_CHECK_CYCLES` (default 3) failed check runs in a repository, `run_checks`
+    refuses to run there. `commit_and_push` and `open_pull_request` refuse too. A scratch project has a budget of its own,
+    `SCRATCH_CHECK_CYCLES` (default 5), counted apart (ADR 0013).
   * `open_pull_request` refuses unless the pushed `HEAD` is the current commit
     and the last check run passed **on exactly the tree it contains**. A run that
     continues a pushed branch pushes to a branch of its own, and only after this
@@ -1988,7 +1992,7 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     request that is open for it never carries unverified commits.
   * **A workspace of several slots** ([the coder README](../bin/adam-coder/README.md#the-workspace-of-a-run)):
     `prepare_workspace` on a second repository the person named adds a slot (a repository has at most one
-    slot per run); `run_command`, the file tools, `delegate_to_opencode`, `run_checks`, `commit_and_push` and
+    slot per run); `run_command`, `run`, the file tools, `delegate_to_opencode`, `run_checks`, `commit_and_push` and
     `open_pull_request` take an optional `repo` (the slot's directory or the repository's address), which
     may be left out while there is one slot and is refused with the list of slots when there are several.
     A check and a push are of one slot; the gate does not change: `open_pull_request` wants the most recent
@@ -1998,17 +2002,22 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     named (the rule of `prepare_workspace`), gives an empty repository an empty first commit (the only push outside
     `agent/*`), asks for a `path` or `overwrite` for one that has files, and copies all or nothing. The gate does not
     change: the checks that ran on the project bind the pushed commit only when its tree is the same.
-  * The file tools (`read_file`, `write_file`, `apply_patch`) refuse a path that is empty, absolute, goes up with `..`,
+  * The file tools (`read_file`, `write_file`, `edit_file`, `apply_patch`) refuse a path that is empty, absolute, goes up with `..`,
     names `.git` (any case), leaves the worktree through a symlink (read) or goes through a symlink (write); a patch is
     checked by the paths `git apply --numstat -z` reports and refused if it creates a symlink or a submodule; a hunk that
-    does not match changes nothing. They change files and not git: the commit that follows is bound to a check only
-    after a new `run_checks`.
+    does not match changes nothing; `edit_file` replaces exact text and, when the text is not there or is in several
+    places, changes nothing and says where the closest region (or the places) is. They change files and not git: the
+    commit that follows is bound to a check only after a new `run_checks`, and so after a `run` that changed files.
   * A command the shell cannot find (exit 127, `not found`) is a missing toolchain: reported to the model,
     no check cycle used, no `checks` artifact, and the model asks the person and waits.
   * A run that stops with no pull request fails if the check-cycle budget is
     used up with the last check red, or the credentials were rejected
     (`CoderAgent::verdict`). "The model said it
     is done" is not the same as "delivered".
+  * A run that stops with no pull request **completes** when it is scratch work that shared a file and no repository is in
+    play: only scratch projects in the workspace, a file shared (`share_file`), no repository named, created, pushed or
+    continued (`delivered_a_result`; the owner's decision of 2026-10-02, ADR 0013). A scratch project is deleted with
+    its run, so an offer to publish it is taken up by a follow-up task, which makes the project again.
   * Any other stop without a pull request is a question, not a completion: the
     run parks as `ask_user` would (`input-required`, the model's text as the
     question) and the person's answer resumes it.

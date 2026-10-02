@@ -1,6 +1,6 @@
 {
   "name": "write_file",
-  "description": "Create a file, or replace one, with exactly `content`. Parent directories are created. The path is relative to the root of the worktree; nothing inside `.git` and nothing through a symlink can be written. For a change to part of a file use apply_patch (or read it first with read_file and write it whole); for a broad, multi-file change use delegate_to_opencode.",
+  "description": "Create a file, or replace one, with exactly `content`. Parent directories are created. The path is relative to the root of the worktree; nothing inside `.git` and nothing through a symlink can be written. For a change to part of a file use edit_file (exact text replaced) or apply_patch (a diff); for a broad, multi-file change use delegate_to_opencode.",
   "parameters": {
     "type": "object",
     "properties": {

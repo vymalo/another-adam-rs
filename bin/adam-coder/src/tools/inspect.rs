@@ -1,4 +1,5 @@
-//! `run_command { command, cwd?, repo? }`: look around in the worktree.
+//! `run_command { command, cwd?, repo? }`: look around in the worktree. (`run`, in [`make`](super::make),
+//! is its sibling for making things: it keeps what the command changes.)
 //!
 //! The model explores a repository with commands (`git branch -r`, `ls`, `cat README.md`,
 //! `git log`). Doing that through `run_checks` made every look around a check run: it reported a
@@ -12,8 +13,10 @@
 //! * it is **not an editing path**: the worktree is snapshotted before the command (`HEAD`, the
 //!   branch, the tree of the files as `commit_and_push` would commit them, and the refs and local
 //!   git configuration a command could change without touching a file), and a command after
-//!   which any of them differs is undone and refused. Changes are made by `delegate_to_opencode`, so
-//!   that they are the work of the tool that commits, checks and reports them.
+//!   which any of them differs is undone and refused. Changes are made by the file tools, by
+//!   `delegate_to_opencode` and, for a command that makes something (a build, an export, a
+//!   generated file), by `run` ([`run`](super::make)), which keeps the files it changes and is held
+//!   to the same guard for everything else.
 //!
 //! A command the shell cannot find is reported as a missing toolchain, as for `run_checks` (see
 //! [`missing_tool`]).
@@ -33,8 +36,9 @@ use super::{Outcome, ToolEnv, non_empty, run_error};
 /// repository's own devcontainer when it has one, so its tools are there). You get the exit code and
 /// the tail of the output.
 /// It costs no check cycle and reports no checks, and it is for looking: changes it makes to
-/// HEAD, the branch and the working tree are undone and refused (make changes with
-/// delegate_to_opencode). Use it to explore; use run_checks only for the project's real checks.
+/// HEAD, the branch and the working tree are undone and refused (to make a file or change the
+/// worktree with a command, use run; to change code, write_file, edit_file, apply_patch or
+/// delegate_to_opencode). Use it to look; use run_checks only for the project's real checks.
 #[tool]
 pub async fn run_command(
     env: State<ToolEnv>,
@@ -120,7 +124,7 @@ pub async fn run_command(
 /// restore then only puts `HEAD` and the branch back and leaves the files alone, since nothing it
 /// could write back would be exact.
 #[derive(Debug, PartialEq, Eq)]
-struct Snapshot {
+pub(super) struct Snapshot {
     /// The git directory of this worktree: a command that replaced the `.git` file would point
     /// every later git call somewhere else, and nothing may be restored through it.
     git_dir: String,
@@ -136,7 +140,7 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    async fn take(dir: &std::path::Path) -> Option<Self> {
+    pub(super) async fn take(dir: &std::path::Path) -> Option<Self> {
         let git_dir = git_stdout(dir, &["rev-parse", "--absolute-git-dir"]).await?;
         let dot_git = tokio::fs::read_to_string(dir.join(".git")).await.ok();
         let head = head_sha(dir).await?;
@@ -156,8 +160,28 @@ impl Snapshot {
         })
     }
 
+    /// Whether everything but the files is as `other` has it: the git directory, the `.git` file,
+    /// `HEAD`, the branch, and the refs, configuration and ignore rules of the repository. What
+    /// `run` holds a command to: it may change files, and nothing of git.
+    pub(super) fn same_git_as(&self, other: &Self) -> bool {
+        self.git_dir == other.git_dir
+            && self.dot_git == other.dot_git
+            && self.head == other.head
+            && self.branch == other.branch
+            && self.repo == other.repo
+    }
+
+    /// Whether the files differ from `other`'s (a worktree whose tree id cannot be computed has
+    /// only `git status`, which is compared as it is).
+    pub(super) fn files_differ_from(&self, other: &Self) -> bool {
+        match (&self.tree, &other.tree) {
+            (Some(a), Some(b)) => a != b,
+            _ => self.status != other.status,
+        }
+    }
+
     /// Put it all back; `true` when the worktree is exactly as it was.
-    async fn restore(&self, slot: &adam_workspace::Slot) -> bool {
+    pub(super) async fn restore(&self, slot: &adam_workspace::Slot) -> bool {
         let dir = slot.path();
         if let Some(text) = &self.dot_git
             && tokio::fs::read_to_string(dir.join(".git"))
@@ -212,7 +236,7 @@ fn changed_the_worktree(command: &str, outcome: &ShellOutcome, restored: bool) -
     };
     format!(
         "`{command}` changed the worktree (files, HEAD, the branch, a ref or the git \
-         configuration), and run_command is for looking around only. {what} Changes go through delegate_to_opencode. Output of the \
+         configuration), and run_command is for looking around only. {what} To make something with a command use `run`; to change code use write_file, edit_file, apply_patch or delegate_to_opencode. Output of the \
          command, for what it is worth:\n{}",
         outcome.tail
     )
@@ -220,7 +244,7 @@ fn changed_the_worktree(command: &str, outcome: &ShellOutcome, restored: bool) -
 
 /// The command, how it ended, and the tail of its output. A non-zero exit is said plainly: for a
 /// command that only looks, it is an answer ("no such file"), not a failure.
-fn render(command: &str, outcome: &ShellOutcome) -> String {
+pub(super) fn render(command: &str, outcome: &ShellOutcome) -> String {
     let how = if outcome.timed_out {
         "timed out (the command was killed)".to_owned()
     } else {

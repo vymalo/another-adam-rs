@@ -82,6 +82,7 @@ async fn build_agent(
         &worker.opencode_model,
     ));
     settings.max_check_cycles = worker.max_check_cycles;
+    settings.scratch_check_cycles = worker.scratch_check_cycles;
     if let Some(host) = worker.allowed_repo_hosts.first() {
         settings.default_repo_host.clone_from(host);
     }

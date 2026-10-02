@@ -28,7 +28,8 @@
 //! | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` ([`adam_host::Placement`]); `a2a-only` is refused | `shared` |
 //! | `WORKER_ID` | stable identity of this worker: the lease identity and, with `affinity` or `isolated`, the run owner; letters, digits, `.`, `_`, `-` | random per process; required for `affinity` and `isolated` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
-//! | `MAX_CHECK_CYCLES` | failed `run_checks` before the agent must stop | `3` |
+//! | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
+//! | `SCRATCH_CHECK_CYCLES` | the same for a scratch project, counted apart | `5` |
 //! | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs; `0` turns it off | `300` |
 //! | `CHECK_TIMEOUT_SECS` | time limit of one `run_checks` command | `900` |
 //! | `CHECK_OUTPUT_TAIL_BYTES` | output tail `run_checks` returns | `16384` |
@@ -156,6 +157,8 @@ pub struct WorkerConfig {
     pub workers: usize,
     /// `MAX_CHECK_CYCLES`.
     pub max_check_cycles: u32,
+    /// `SCRATCH_CHECK_CYCLES`.
+    pub scratch_check_cycles: u32,
     /// `WORKSPACE_SWEEP_SECS`: how often the janitor sweeps the workspaces of finished runs;
     /// `None` (the variable is `0`) turns it off.
     pub workspace_sweep: Option<Duration>,
@@ -617,6 +620,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("worker_id", &self.worker_id)
             .field("workers", &self.workers)
             .field("max_check_cycles", &self.max_check_cycles)
+            .field("scratch_check_cycles", &self.scratch_check_cycles)
             .field("workspace_sweep", &self.workspace_sweep)
             .field("check_timeout", &self.check_timeout)
             .field("check_output_tail", &self.check_output_tail)
@@ -743,6 +747,10 @@ impl WorkerConfig {
         if max_check_cycles == 0 {
             problems.push("MAX_CHECK_CYCLES must be at least 1".into());
         }
+        let scratch_check_cycles = parse_or(get, "SCRATCH_CHECK_CYCLES", 5u32, problems);
+        if scratch_check_cycles == 0 {
+            problems.push("SCRATCH_CHECK_CYCLES must be at least 1".into());
+        }
         // The janitor of the workspaces of finished runs: every five minutes, `0` is off.
         let workspace_sweep =
             Some(parse_or(get, "WORKSPACE_SWEEP_SECS", 300u64, problems)).filter(|secs| *secs > 0);
@@ -823,6 +831,7 @@ impl WorkerConfig {
             worker_id: settings.worker_id.clone(),
             workers: settings.workers,
             max_check_cycles,
+            scratch_check_cycles,
             workspace_sweep: workspace_sweep.map(Duration::from_secs),
             check_timeout,
             check_output_tail,
@@ -914,6 +923,7 @@ mod tests {
         assert_eq!(c.workspace_root, PathBuf::from("/work"));
         assert_eq!(c.workers, 4);
         assert_eq!(c.max_check_cycles, 3);
+        assert_eq!(c.scratch_check_cycles, 5, "scratch work gets more tries");
         assert_eq!(c.opencode_model, "coder-large");
         assert_eq!(c.opencode_command, ["opencode", "acp"]);
         assert_eq!(c.allowed_repo_hosts, ["github.com"]);
@@ -971,6 +981,25 @@ mod tests {
                 err.problems
             );
         }
+    }
+
+    #[test]
+    fn the_check_budgets_are_set_apart_and_must_be_at_least_one() {
+        let mut vars = full();
+        vars.insert("MAX_CHECK_CYCLES", "2");
+        vars.insert("SCRATCH_CHECK_CYCLES", "7");
+        let c = parse(&vars).expect("valid").worker.expect("a worker");
+        assert_eq!((c.max_check_cycles, c.scratch_check_cycles), (2, 7));
+        let mut vars = full();
+        vars.insert("SCRATCH_CHECK_CYCLES", "0");
+        let err = parse(&vars).unwrap_err();
+        assert!(
+            err.problems
+                .iter()
+                .any(|p| p.contains("SCRATCH_CHECK_CYCLES must be at least 1")),
+            "{:?}",
+            err.problems
+        );
     }
 
     #[test]
