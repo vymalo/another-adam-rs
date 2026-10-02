@@ -106,13 +106,20 @@ pub async fn run(
 
     // Did it touch git? The files are its to change; HEAD, the branch, the refs, the
     // configuration and `.git` are not.
-    let after = Snapshot::take(slot.path()).await;
-    let Some(after) = after.filter(|after| before.same_git_as(after)) else {
+    // A worktree whose git cannot be read after the command is not known to be untouched, so
+    // it is undone as one that changed git would be; the model is told which of the two it was.
+    let Some(after) = Snapshot::take(slot.path()).await else {
+        let restored = before.restore(&slot).await;
+        ctx.emit_progress(format!("could not check git after: {shown}; undid it"))
+            .await;
+        return Ok(ToolOutput::error(unverified(&shown, &outcome, restored)));
+    };
+    if !before.same_git_as(&after) {
         let restored = before.restore(&slot).await;
         ctx.emit_progress(format!("undid a change to git made by: {shown}"))
             .await;
         return Ok(ToolOutput::error(touched_git(&shown, &outcome, restored)));
-    };
+    }
 
     if let Some(missing) = missing_tool(&outcome, command) {
         ctx.emit_progress("the workspace lacks a tool".to_owned())
@@ -148,14 +155,34 @@ pub async fn run(
     Ok(ToolOutput::text(text))
 }
 
-/// What the model is told when its command changed git (and everything was put back).
-fn touched_git(command: &str, outcome: &ShellOutcome, restored: bool) -> String {
-    let what = if restored {
+/// What the model is told of the undoing: whether the worktree is as it was.
+fn undone(restored: bool) -> &'static str {
+    if restored {
         "Everything it did was undone, its files included: the worktree is exactly as it was."
     } else {
         "It could not be fully undone (HEAD and the branch are back, but the files may differ): \
          run `git status` with run_command to see the worktree before you go on."
-    };
+    }
+}
+
+/// What the model is told when the state of git could not be read after its command, so that
+/// nobody can say whether it changed git (and everything was put back, to be safe).
+fn unverified(command: &str, outcome: &ShellOutcome, restored: bool) -> String {
+    format!(
+        "After `{command}` the state of the worktree's git could not be read, so it is not known \
+         whether the command changed git; to be safe it was treated as if it had, since `run` \
+         may change files and nothing of git. {} If the command touches git (HEAD, the branch, \
+         a ref, `.git` or the git configuration), commit with commit_and_push and run it again \
+         without the git part; if it does not, try it again, and if this persists, tell the \
+         person. Output of the command, for what it is worth:\n{}",
+        undone(restored),
+        outcome.tail
+    )
+}
+
+/// What the model is told when its command changed git (and everything was put back).
+fn touched_git(command: &str, outcome: &ShellOutcome, restored: bool) -> String {
+    let what = undone(restored);
     format!(
         "`{command}` changed git (HEAD, the branch, a ref, `.git` or the git configuration), and \
          `run` may change files and nothing of git. {what} Commit with commit_and_push, and \
@@ -245,6 +272,26 @@ mod tests {
             "{said}"
         );
         let unsure = touched_git("git commit -am x", &outcome, false);
+        assert!(unsure.contains("could not be fully undone"), "{unsure}");
+    }
+
+    #[test]
+    fn a_worktree_that_cannot_be_read_after_is_not_said_to_have_changed_git() {
+        let outcome = ShellOutcome {
+            exit_code: Some(0),
+            timed_out: false,
+            tail: "out".into(),
+            truncated: false,
+        };
+        let said = unverified("npm run render", &outcome, true);
+        assert!(
+            said.contains("could not be read")
+                && said.contains("not known")
+                && said.contains("files included")
+                && !said.contains("changed git ("),
+            "{said}"
+        );
+        let unsure = unverified("npm run render", &outcome, false);
         assert!(unsure.contains("could not be fully undone"), "{unsure}");
     }
 }
