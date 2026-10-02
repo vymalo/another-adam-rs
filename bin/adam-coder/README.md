@@ -832,7 +832,9 @@ stateDiagram-v2
   that is down or too slow. Nothing ran, no check cycle was used, no `checks` artifact was emitted. A cancel of the run ends
   the wait for `ensure`.
 * **A timeout or a cancel** kills the process group here and then calls `EnvSession::kill` with the id of the command, for what
-  lives where this process cannot reach. For OpenCode the same call follows the stop (`session/cancel`, then the kill).
+  lives where this process cannot reach. `run_in` takes the run's `CancelToken`: a cancel ends `run_command`, `run` and
+  `run_checks` at once with the `cancelled` tool error (`RunError::Cancelled`), whatever the command was doing (a `sleep 60`
+  included), and a command of a run that is cancelled already is not started. For OpenCode the same call follows the stop (`session/cancel`, then the kill).
 * **An environment may start OpenCode from nothing.** A session whose `PreparedCommand` has `env_clear` (the devcontainer's: its
   command is the devcontainer CLI, which must not see this process's environment) is started by the ACP client with
   `AcpCommand::clear_env()`: only what the environment set. `Local` never asks for it. OpenCode is where the environment says
@@ -1310,7 +1312,10 @@ crash after it was posted and before the call was journaled posts it again when 
   its process group** (the commands it started) and waits until it is reaped
   before returning, so nothing outlives the tool. `commit_and_push` and
   `open_pull_request` refuse to act once the token has fired, so a later call of
-  the same model turn cannot publish a cancelled run. The child is started in
+  the same model turn cannot publish a cancelled run. The model call in flight is dropped too (`adam-llm-agent`'s
+  *Cancel*), and the commands of `run_command`, `run` and `run_checks` are killed (process group and the
+  session's kill): the task ends `canceled` and the worker is free within milliseconds, not after the model's 30 s or the
+  command's `sleep 60` (`a_cancel_ends_the_task_canceled_while_*` in `tests/e2e.rs`). The child is started in
   its own process group, so a terminal Ctrl-C does not reach it; the coder's
   own shutdown and cancel paths do.
 * **429 with `Retry-After`** from the model gateway is carried to the runtime

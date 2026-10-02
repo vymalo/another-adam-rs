@@ -48,6 +48,15 @@ that no pull request had been opened. Now `commit_and_push` pushes to the run's 
 per run" and the diagrams there). The pushed-branch evidence is structured state written by the tool
 (run notes), not text read back from the history.
 
+*Amended 2026-10-02 (a cancel stops the model call; owed calls are answered):* decision 2's *dropped* bullet
+is replaced. A last assistant message whose tool calls did not all get a result is no longer dropped with the results
+that did arrive. It is kept, and each owed call is answered with an error result, "Stopped by the person"
+(`STOPPED_BY_THE_PERSON`), after the results that did arrive, so the model keeps what it asked for and a provider
+still never sees a call without a result. `pending_calls` and `pending_wait` stay empty. The conversation cannot tell
+a cancel from another ending (the agent state is not touched by a cancel), so a run that ended in a limit or a failure
+gets the same text. This goes with the cancel work: the model call is dropped when the run is cancelled
+(`adam-llm-agent`, `Cancel`), so a cancelled run is the common predecessor of a continuation.
+
 ## Context
 
 A host such as the `another-agentic-system` orchestrator drives the coder over A2A. Every rework,
@@ -104,9 +113,10 @@ out: this is not one of ADR 0001's host extensions and needs no capability detec
    shared by both, so a front and a worker cannot disagree):
    * *carried:* the history, and the user messages that were waiting behind an owed tool result
      (`deferred`), in the order they arrived, then the new user message;
-   * *dropped:* a last assistant message whose tool calls did not all get a result, with the results
+   * *answered* (amended 2026-10-02, see the note at the top; it was *dropped*): the tool calls of a last assistant
+     message that did not all get a result each get an error result, "Stopped by the person", after the results
      that did arrive. A run that ended mid-turn (a limit, a cancel, a question nobody answered)
-     leaves one, and a provider rejects a call without a result. `pending_calls` and `pending_wait`
+     leaves such a message, and a provider rejects a call without a result. `pending_calls` and `pending_wait`
      are therefore always empty in a continued conversation, so it never answers a question or a child
      run of the run before. The side effects of the dropped calls are not undone: the model can look
      at the world again with its tools;

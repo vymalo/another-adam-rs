@@ -18,6 +18,7 @@ instructions + a model + a toolset. It is served over A2A by
 
 | Item | What |
 |---|---|
+| `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
 | `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.build()` |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*) |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens`; a tripped limit fails the run with a message naming it (except history, which shortens old tool output) |
@@ -102,7 +103,7 @@ the conversation of the run before:
 | | |
 |---|---|
 | **Carried** | the history, oldest first, and the user messages that were waiting behind an owed tool result (`deferred`), in arrival order; then the new user message |
-| **Dropped** | a last assistant message whose tool calls did not all get a result, with the results that did arrive: a run that ended mid-turn (a limit, a cancel, a question nobody answered) leaves one, and a provider rejects a call without a result. So `pending_calls` and `pending_wait` are always empty: a continued run never answers a question or a child run of the run before. The side effects of the dropped calls are not undone |
+| **Answered** | the tool calls of a last assistant message that did not all get a result: a run that ended mid-turn (a cancel, a limit, a question nobody answered) leaves them, and a provider rejects a call without a result. Each owed call gets an error result, `STOPPED_BY_THE_PERSON`, after the results that did arrive: the model keeps what it asked for and is told which calls did not finish. The run state cannot tell a cancel from another ending, so a run that failed gets the same text. So `pending_calls` and `pending_wait` are always empty: a continued run never answers a question or a child run of the run before, and never runs a stopped call. The side effects of the calls are not undone |
 | **Reset** | `turns`, `tool_calls`, `usage` (`Limits` are per run) and `artifacts` (the final output lists what this run produced) |
 | **Recorded** | `continued_from: Option<RunId>`, not written while `None`; `omitted_turns: u32`, not written while zero |
 | **Bounded** | over `MAX_CARRIED_BYTES` (256 KiB of JSON), in this order and only as far as needed: **(1) the tool outputs of the turns older than the newest are shortened**, oldest first, each keeping its head and ending in the `TRUNCATION_MARKER_PREFIX` marker (the same truncation `max_history_tokens` does when a history is sent); **(2) whole old turns are dropped** (a turn is a user message and what follows it up to the next), one marker standing in for them; **(3) the newest prior turn's tool outputs are shortened, last**. Never dropped: **the first user message of the chain** (the task; kept verbatim as the first text part of the first message) and the **newest prior turn**. A newest turn whose own text is over the cap is carried over it. The waiting messages and the new one are counted, never cut |
@@ -257,6 +258,16 @@ asks for `complete` as before (for a model client that cannot stream, or a provi
   not stream has neither. An agent that turns the answer into a question to the person (the coder does, for a reply that
   delivers nothing) puts the stream in `PendingQuestion::stream`, so the `input-required` status that carries the question
   says which stream its text was.
+
+## Cancel
+
+`Runtime::cancel` fails the run and fires the step's `CancelToken`. The model call listens to it: the journaled step
+`model:<turn>` races the token against `complete` (or against `ModelClient::stream` and every item of its answer, a model that
+goes quiet in the middle included) and **drops the request** when it fires, so a cancel does not wait for the provider. A
+stream that was open ends with `abandoned: true` and what had been written. The turn is then over: nothing the model said is
+acted on, said whole or kept, and the calls of the turn that are still owed do not start (a tool that does not listen to the
+token still ends by itself; the next call is not made). The run is already `Failed` (`cancelled: <reason>`) in the store, so the
+worker drops the result of the step. A run that continues a cancelled one reads its history as *Answered* above.
 
 ## Announced answers
 
@@ -419,12 +430,12 @@ message that starts like one; the newest prior turn protected with waiting messa
 alternating in each shape a continuation can take; state stored before `continued_from` and `omitted_turns`
 existed still loads), in `src/history.rs` (`shorten_output`) and in `tests/llm_agent.rs`
 (`a_starter_continues_exactly_like_the_agent`, a new run whose model is shown the earlier messages, a front that
-holds only the starter, a run cancelled on a question that is continued without the stale wait, the 256 KiB cap
+holds only the starter, a run cancelled on a question that is continued with its owed call answered as stopped, the 256 KiB cap
 through the starter).
 
 `tests/llm_agent.rs` is a behavioural suite over a scripted `MockModel` and
 `MemoryStore` (`a_starter_inits_exactly_like_the_agent`, tool loop, retries and rate limits, limits, replay after a
-crash, `NeedsInput` parking, cancellation, history truncation, and **steps**: a tool is a step in its own style and the steps it reports run under it, a plain tool is labelled with its name and an unknown one fails, a question keeps the step `waiting` until the answer ends it, a detached context reports to its sink). Property tests
+crash, `NeedsInput` parking, cancellation (a tool, and the model call in flight: a model that takes 30 s, before the answer and in the middle of a stream, is dropped and the step ends in milliseconds; the owed calls of a turn do not start; a continuation answers the calls that were owed), history truncation, and **steps**: a tool is a step in its own style and the steps it reports run under it, a plain tool is labelled with its name and an unknown one fails, a question keeps the step `waiting` until the answer ends it, a detached context reports to its sink). Property tests
 of the truncation are in `src/history.rs`; the journal record of a model
 failure is tested in `src/agent.rs`
 (`a_journaled_failure_keeps_the_class_the_hint_and_the_whole_chain`,
