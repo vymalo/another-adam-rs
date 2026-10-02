@@ -46,6 +46,12 @@ impl EnvProgress for Steps {
     }
 }
 
+/// This process's uid, from `id -u` (the test has no libc binding of its own).
+fn nix_uid() -> u32 {
+    let out = StdCommand::new("id").arg("-u").output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let out = StdCommand::new("git")
         .current_dir(dir)
@@ -408,8 +414,28 @@ async fn the_devbox_fixture_runs_in_its_devcontainer_on_rootless_podman() {
     );
     assert!(!workspaces_root.join("environments").join(&run).exists());
     assert!(environment.held_runs().await.unwrap().is_empty());
-    ws.remove().await.expect(
-        "the workspace, and every file a process in the container made, is the coder's to delete",
-    );
+    let workspace_dir = slot_path.parent().unwrap().to_owned();
+    if let Err(e) = ws.remove().await {
+        // Say which files are not the coder's, and how they are kept.
+        let left = StdCommand::new("find")
+            .arg(&workspace_dir)
+            .args(["(", "!", "-uid"])
+            .arg(nix_uid().to_string())
+            .args([
+                "-o",
+                "!",
+                "-perm",
+                "-u+w",
+                ")",
+                "-printf",
+                "%U:%G %m %y %p\\n",
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        panic!(
+            "the workspace, and every file a process in the container made, is the coder's to delete: {e:?}\nnot the coder's, or not writable:\n{left}"
+        );
+    }
     assert!(!slot_path.exists());
 }
