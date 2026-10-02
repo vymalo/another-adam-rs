@@ -52,6 +52,7 @@ docker run -d --name "$name" --network host \
   -e MODEL=fake-model \
   -e GITHUB_TOKEN=smoke-github-token \
   -e A2A_BEARER_TOKENS="$token" \
+  -e MCP_ALLOW_STDIO=true \
   -e PUBLIC_URL="http://127.0.0.1:$coder_port/" \
   -e LISTEN_ADDR="127.0.0.1:$coder_port" \
   "$image" >/dev/null
@@ -84,8 +85,16 @@ if echo "$out" | grep -q "invalid configuration" && ! echo "$out" | grep -qi "op
 else
   bad "DEVCONTAINER_RUNTIME=podman does not accept the image's OpenCode: $out"
 fi
-# The GitHub MCP server of the shipped `mcp.json`: the coder (embedded agent files, the image's
-# MCP_ALLOW_STDIO) started it as a child process and connected it (the check above already needed it
+# Local-process MCP servers are the coder's alone: the image sets no MCP_ALLOW_STDIO (an `adam-agent`
+# run from it refuses such servers unless its own deployment opts in), and the coder's deployment sets it,
+# which this script does for the container above.
+if [ -z "$(docker run --rm --entrypoint sh "$image" -c 'printf %s "${MCP_ALLOW_STDIO:-}"' 2>/dev/null)" ]; then
+  ok "the image does not allow local-process MCP servers: only the coder's deployment does"
+else
+  bad "the image sets MCP_ALLOW_STDIO: every agent of the image would allow local-process MCP servers"
+fi
+# The GitHub MCP server of the shipped `mcp.json`: the coder (embedded agent files, MCP_ALLOW_STDIO=true as
+# its deployment sets it) started it as a child process and connected it (the check above already needed it
 # to start), and it lists the twelve read tools and no write tool.
 if docker logs "$name" 2>&1 | grep -q 'connected to the MCP server.*github'; then
   ok "the coder connected the GitHub MCP server"

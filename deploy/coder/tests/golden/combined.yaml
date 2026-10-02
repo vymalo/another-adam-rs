@@ -123,6 +123,8 @@ spec:
               value: "900"
             - name: WORKSPACE_SWEEP_SECS
               value: "300"
+            - name: MCP_ALLOW_STDIO
+              value: "true"
             - name: ALLOWED_REPO_HOSTS
               value: "github.com"
             - name: GITHUB_API_URL

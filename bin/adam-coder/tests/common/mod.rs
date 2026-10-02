@@ -1055,7 +1055,8 @@ pub fn folder() -> TempDir {
 
 /// [`folder`] without its `agent/mcp.json`: the shipped agent as a deployment that connects no MCP
 /// server mounts it. The shipped file names the GitHub server, a local process that only starts
-/// with `MCP_ALLOW_STDIO` and the `github-mcp-server` binary (the coder image has both), so a test
+/// with `MCP_ALLOW_STDIO` and the `github-mcp-server` binary (the coder image has the binary, the coder's
+/// deployment sets the variable), so a test
 /// that starts a worker on a folder, or assembles one, takes this and says itself which servers it
 /// connects (`tests/binary.rs`, `tests/agent_files.rs`); the shipped file is tested as it is.
 pub fn plain_folder() -> TempDir {

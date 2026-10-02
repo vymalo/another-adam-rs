@@ -54,6 +54,10 @@ golden="$chart/tests/golden/combined.yaml"
 # command above, at the same --namespace and --set, only for a deliberate change).
 check "the default render equals tests/golden/combined.yaml" cmp -s "$out" "$golden"
 
+# Local-process MCP servers are the coder's alone to allow (ADR 0009, decision 8): the image sets nothing,
+# and the worker's deployment says so, because its shipped mcp.json starts the pinned github-mcp-server.
+check "the worker allows local-process MCP servers (the shipped mcp.json starts github-mcp-server)" count 'name: MCP_ALLOW_STDIO' 1
+
 check "never exposed: no Ingress, Route or Gateway" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$'
 check "never exposed: no LoadBalancer or NodePort" lacks 'type: (LoadBalancer|NodePort)'
 check "exactly one Service, and it is ClusterIP" count '^kind: Service$' 1
@@ -127,6 +131,7 @@ helm template coder "$chart" --namespace coder-ns --set config.role=control-plan
 check "a control plane renders ROLE=control-plane" has 'value: "control-plane"'
 check "a control plane gets no model, GitHub or OpenCode settings" lacks "$model_and_github"
 check "a control plane gets no workspace or check settings" lacks "$workspace_and_checks"
+check "a control plane connects no MCP server, so it allows none: no MCP_ALLOW_STDIO" lacks 'name: MCP_ALLOW_STDIO'
 check "a control plane's ExternalSecret carries neither worker secret" lacks "$secrets_of_workers"
 check "a control plane keeps the A2A tokens, the database and the public URL" count "$front" 3
 check "a control plane's ExternalSecret still has the A2A tokens" has 'secretKey: A2A_BEARER_TOKENS'
@@ -171,6 +176,8 @@ check "split: the Deployment is a control plane" dhas Deployment 'value: "contro
 check "split: the Deployment has no volume" dlacks Deployment 'volumeMounts:|volumeClaimTemplates:|mountPath:'
 check "split: the Deployment has no model, GitHub or OpenCode settings" dlacks Deployment "$model_and_github"
 check "split: the Deployment has no workspace or check settings" dlacks Deployment "$workspace_and_checks"
+check "split: the Deployment allows no local-process MCP server" dlacks Deployment 'name: MCP_ALLOW_STDIO'
+check "split: the worker StatefulSet allows them" dhas StatefulSet 'name: MCP_ALLOW_STDIO'
 check "split: the Deployment keeps the A2A tokens, the database and the public URL" dcount Deployment "$front" 3
 check "split: the Deployment uses /healthz for all three probes" dcount Deployment 'path: /healthz' 3
 check "split: the Deployment runs as uid 10001, non-root" dhas Deployment 'runAsUser: 10001'

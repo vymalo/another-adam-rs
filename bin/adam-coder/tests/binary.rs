@@ -886,7 +886,7 @@ async fn an_mcp_server_that_cannot_be_connected_stops_the_worker_with_the_code_o
 
 /// The shipped agent names the GitHub MCP server, a local process, so a worker on the embedded
 /// copy stops at startup unless the deployment allows local processes (`MCP_ALLOW_STDIO`, which
-/// the coder image sets) and the binary is there: 78 when it is not allowed, 69 when it is allowed
+/// the coder's deployment sets, not the image) and the binary is there: 78 when it is not allowed, 69 when it is allowed
 /// and is not on `PATH` (a supervisor may retry: the image may be mid-roll). Never in the middle of
 /// a run, and never with a value of a variable in the message.
 #[tokio::test]
@@ -1002,8 +1002,8 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
         } else {
             valid_env(&db.url(), &work)
         };
-        // The embedded copy, with the deployment's two settings: the image's `MCP_ALLOW_STDIO`, and
-        // (not the image's) the mock as the GitHub host, which is plain http to this machine.
+        // The embedded copy, with the deployment's two settings: the coder's `MCP_ALLOW_STDIO`, and
+        // the mock as the GitHub host, which is plain http to this machine.
         env.retain(|(k, _)| k != "ADAM_AGENT_DIR");
         env.extend([
             ("MODEL_BASE_URL".to_owned(), model.uri()),

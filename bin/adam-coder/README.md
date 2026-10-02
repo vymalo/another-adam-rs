@@ -1135,7 +1135,7 @@ rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
   is up; a mistake in the files or the policy is 78. A tool call that fails is an error result the model reads.
 * A folder without an `mcp.json` connects nothing. **The embedded copy has one**: it names the GitHub MCP server, a
   local process (see [GitHub over MCP](#github-over-mcp-read-only)), so a coder on the embedded files needs
-  `MCP_ALLOW_STDIO=true` and `github-mcp-server` on its `PATH`, which the image has. A **control plane** serves the
+  `MCP_ALLOW_STDIO=true` (the coder's deployment sets it, not the image) and `github-mcp-server` on its `PATH` (which the image has). A **control plane** serves the
   card and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
 
 ### Retry safety
@@ -1199,7 +1199,7 @@ way; every problem is reported at once at startup):
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
-| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. **The coder image sets it** (it ships `github-mcp-server`, which the shipped `mcp.json` starts), so an `adam-agent` run from that image allows it too: set `MCP_ALLOW_STDIO=false` there to refuse local processes | `false` (the image: `true`) |
+| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. **The coder's deployment sets it, the image does not** (the image carries `github-mcp-server`, which the shipped `mcp.json` starts, but also `adam-agent`, which must refuse local processes unless its own deployment opts in): the chart sets it on the roles that run workers, `compose.yaml` on the `coder` service, and the container smoke test passes it | `false` |
 | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
 | `DEVCONTAINER_RUNTIME` | where a run's commands and OpenCode run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service; see [The work environment](#the-work-environment-the-repositorys-devcontainer)). Anything else: exit 78 | `off` |
@@ -1454,7 +1454,8 @@ decision 8):
   the chart mounts the key as a file (`GITHUB_APP_PRIVATE_KEY_PATH`) and needs nothing. A deployment that keeps the key in a
   variable has no GitHub MCP server: mount a copy of the folder without that server (`ADAM_AGENT_DIR`).
 * **A deployment must allow it.** The server is a local process: `MCP_ALLOW_STDIO=true` and the binary on `PATH`
-  (the image has both; a control plane connects nothing). Without the variable the process stops at startup with
+  (the image has the binary; **the coder's deployment sets the variable**, since the image also carries `adam-agent`, which
+  must refuse local processes unless its own deployment opts in; a control plane connects nothing). Without the variable the process stops at startup with
   exit 78 naming it, and with it and no binary with exit 69, never in the middle of a run, and no message holds a
   credential. The image pins the binary by tag and digest (v1.12.2) and its build and the container smoke test list
   its tools over stdio, with no credential at all (the server lists tools without calling GitHub, *verified*; a

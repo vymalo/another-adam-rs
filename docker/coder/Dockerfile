@@ -93,11 +93,14 @@ RUN tar -xzf /tmp/podman-remote.tar.gz -C /tmp \
  && rm -rf /tmp/podman-remote.tar.gz /tmp/bin \
  && npm install -g --no-fund --no-audit "@devcontainers/cli@${DEVCONTAINERS_CLI_VERSION}"
 
+# MCP_ALLOW_STDIO is **not** set here: the image carries two binaries, and only the coder (whose shipped
+# mcp.json starts the pinned github-mcp-server) may start local-process MCP servers. The coder's deployment
+# sets it (the chart, compose.yaml, the container smoke test); `adam-agent` from this image refuses such
+# servers unless its own deployment opts in (ADR 0009, decision 8).
 ENV WORKSPACE_ROOT=/work \
     LISTEN_ADDR=0.0.0.0:8080 \
     RUST_LOG=info \
     OPENCODE_DISABLE_AUTOUPDATE=1 \
-    MCP_ALLOW_STDIO=true \
     DEVCONTAINER_CLI=devcontainer \
     DEVCONTAINER_PODMAN=podman-remote
 

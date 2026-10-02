@@ -253,7 +253,8 @@ docker run --rm --entrypoint tini \
 There is no second package: a new GHCR package is private until its owner makes it public, and a lean image of its
 own (the coder's image carries the workspace toolchains, which a chat agent does not use) can come later. Stdio MCP
 servers that need `node` or `python` need an image that has them (`MCP_ALLOW_STDIO=true` allows the kind; the image
-brings the program).
+brings the program). The coder image sets **no** `MCP_ALLOW_STDIO`: it belongs to the coder's own deployment, so an
+`adam-agent` run from the image refuses local-process servers unless its deployment sets it.
 
 `compose.yaml` has the service `agent` (profile `app`): the example folder `dev/agents/assistant/agent` mounted
 at `/etc/adam/agent`, the model `mock-assistant` of the WireMock mock, the coder's database (runs are scoped by the

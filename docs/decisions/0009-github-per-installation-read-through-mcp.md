@@ -123,8 +123,9 @@ image `ghcr.io/github/github-mcp-server:v1.12.2`, index digest
    Production runs the binary inside the coder image; development and the e2e point the coder at a
    mock over http. In App mode the server gets the same `GITHUB_APP_*` variables, the key as a *file*
    (the key in a variable is not passed to a child, and a server that has an App and no key does not
-   start: the coder then stops at startup, exit 69; the chart mounts the key as a file). The image sets
-   `MCP_ALLOW_STDIO=true`, which the coder's deployment policy needs to start a local process. The
+   start: the coder then stops at startup, exit 69; the chart mounts the key as a file). The coder's
+   deployment sets `MCP_ALLOW_STDIO=true`, which its policy needs to start a local process (the image
+   does not: see the status note of 2026-10-01, coder-only). The
    allow-list is checked at startup (a name the server does not list stops the coder), and the image
    build runs the same check over stdio with no credential.
 9. **Creating a repository is off unless the deployment says who it may be created for (D7.7).**
@@ -221,14 +222,14 @@ of the code.*
 
 *2026-10-01 (slice 7, A6): decision 8 is built. `bin/adam-coder/agent/mcp.json` names `github-mcp-server`
 (stdio, `--read-only`, four toolsets, twelve tools); the coder image carries v1.12.2 by tag and digest,
-sets `MCP_ALLOW_STDIO=true` and tests the tool list at build and in the container smoke test; the dev stack
+(the coder's deployment sets `MCP_ALLOW_STDIO=true`, see the next note) and tests the tool list at build and in the container smoke test; the dev stack
 and the e2e read GitHub through `mock-github-mcp` over http (`dev/coder-agent/mcp.json`); a test runs the
 coder's binary against the real server in both modes (`ADAM_TEST_GITHUB_MCP_SERVER`; CI takes the binary
 out of the pinned image). The facts of the context are verified against that tag (see above); what is not:
 a live GitHub (the server was only run against a mock of its REST API), GitHub Enterprise Server, and
 v1.13.0. Because the shipped `mcp.json` names a local process, **a coder on the embedded files needs
 `MCP_ALLOW_STDIO=true` and the binary on `PATH`**, or it stops at startup (exit 78, or 69 when the binary
-is missing); the image has both.*
+is missing); the image has the binary (and, at first, the variable: see the next note).*
 
 *2026-10-01 (slice 7, A8): decision 9 is built (`bin/adam-coder/README.md`, "A repository of its own, on
 request"). `create_repository { owner, name, private?, description? }` is off unless `CREATE_REPO_OWNERS` (the
@@ -259,3 +260,12 @@ refusing it as a name the run did not create. A name that exists without an inte
 intent is removed when the creation is recorded or the host definitely refused it (it stays after a failure that
 may have happened after the host made the repository, a timeout). The consent rule is the one of ADR 0008: only
 an explicit yes or no is recorded, so a "wait" no longer ends the question for the task.*
+
+*2026-10-01: the owner chose coder-only for local-process MCP servers. The coder image no longer sets `MCP_ALLOW_STDIO=true`
+(decision 8, as built in A6, had it in the image's `ENV`). The image carries two binaries, `adam-coder` and `adam-agent`
+(ADR 0005), and an image-wide variable made every agent run from it allow a folder's `command` servers; only the coder, whose
+shipped `mcp.json` starts the pinned `github-mcp-server`, needs that. The coder's own deployment sets it instead: the chart on
+the roles that run workers (`MCP_ALLOW_STDIO: "true"` in the StatefulSet, none in the control plane's Deployment, which connects
+no MCP server; its render check and golden follow), `compose.yaml` on the `coder` service, and the container smoke test, which
+also checks that the image itself sets nothing. An `adam-agent` run from the image refuses local-process servers (the default,
+`false`) unless its own deployment opts in. Nothing else in decision 8 changes.*

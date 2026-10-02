@@ -917,7 +917,7 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
 }
 
 /// A deployment that does not allow local processes does not get the GitHub server, and says so
-/// at startup, naming the variable that decides (78); the image allows them (`MCP_ALLOW_STDIO`).
+/// at startup, naming the variable that decides (78); the coder's deployment allows them (`MCP_ALLOW_STDIO`).
 #[tokio::test]
 async fn the_shipped_mcp_json_starts_no_local_process_unless_the_deployment_allows_it() {
     let error = AgentFiles::Embedded

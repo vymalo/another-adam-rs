@@ -2046,7 +2046,7 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
   * **GitHub is read through the official GitHub MCP server, read-only**
     ([ADR 0009](decisions/0009-github-per-installation-read-through-mcp.md), decision 8). The coder's shipped
     `agent/mcp.json` starts `github-mcp-server stdio --read-only` as a child process (the image carries it, pinned
-    by tag and digest, and sets `MCP_ALLOW_STDIO=true`), hands it the coder's own credentials by the names it reads
+    by tag and digest; the coder's deployment, not the image, sets `MCP_ALLOW_STDIO=true`), hands it the coder's own credentials by the names it reads
     (`GITHUB_TOKEN` as `GITHUB_PERSONAL_ACCESS_TOKEN`, or the App's id, installation and key *file*; the other mode
     is an empty variable, which the server counts as unset) and offers the model twelve of its tools as
     `github__<name>`. Everything that writes stays the coder's own, behind the gate. The dev stack points the coder at
