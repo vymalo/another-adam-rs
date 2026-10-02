@@ -295,14 +295,20 @@ fn json_len(message: &Message) -> usize {
     serde_json::to_vec(message).map_or(0, |bytes| bytes.len())
 }
 
-/// Removes a last assistant message whose tool calls did not all get a result, with anything
-/// after it (results that did arrive, for a turn that never finished).
+/// What a tool call that was still owed when its run ended is told, in a continued conversation:
+/// the result the model reads in place of the one it never got.
+pub const STOPPED_BY_THE_PERSON: &str = "Stopped by the person: the run ended before this call finished, so it gave no result. \
+     Whatever it had already done was not undone; look at the world again before relying on it.";
+
+/// Answers the tool calls of the last assistant message that never got a result, each with
+/// [`STOPPED_BY_THE_PERSON`] as an error result, after the results that did arrive.
 ///
-/// A run that ended mid-turn (failed on a limit, was cancelled, or died while parked on a
+/// A run that ended mid-turn (was cancelled, failed on a limit, or died while parked on a
 /// question) leaves such a message, and a provider rejects a history in which a call has no
-/// result. The loop answers every call of a message before it asks the model again, so only the
+/// result. The model keeps what it asked for and what came back, and is told which calls were
+/// stopped. The loop answers every call of a message before it asks the model again, so only the
 /// last message with calls can be in this state.
-fn drop_unanswered_calls(messages: &mut Vec<Message>) {
+fn answer_owed_calls(messages: &mut Vec<Message>) {
     let Some(at) = messages.iter().rposition(
         |m| matches!(m, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()),
     ) else {
@@ -311,14 +317,19 @@ fn drop_unanswered_calls(messages: &mut Vec<Message>) {
     let Message::Assistant { tool_calls, .. } = &messages[at] else {
         return;
     };
-    let answered = |id: &str| {
-        messages[at + 1..]
-            .iter()
-            .any(|m| matches!(m, Message::Tool { call_id, .. } if call_id == id))
-    };
-    if !tool_calls.iter().all(|call| answered(&call.id)) {
-        messages.truncate(at);
-    }
+    let owed: Vec<String> = tool_calls
+        .iter()
+        .filter(|call| {
+            !messages[at + 1..]
+                .iter()
+                .any(|m| matches!(m, Message::Tool { call_id, .. } if *call_id == call.id))
+        })
+        .map(|call| call.id.clone())
+        .collect();
+    messages.extend(
+        owed.into_iter()
+            .map(|id| Message::tool_error(id, STOPPED_BY_THE_PERSON)),
+    );
 }
 
 /// Brings the first message into the one shape the rest of [`carry`] relies on: **exactly one text
@@ -562,9 +573,11 @@ impl Conversation {
     /// * **Carried:** the history, oldest first, and the user messages that were still waiting
     ///   behind an owed tool result ([`deferred`](Self::deferred)), in the order they arrived,
     ///   then `text` as the newest user message.
-    /// * **Dropped:** a last assistant message whose tool calls never got their results, with the
-    ///   results that did arrive (the run that made them ended mid-turn, and a model provider
-    ///   rejects a call without a result). The wait that message was parked on goes with it:
+    /// * **Answered:** the tool calls of a last assistant message that never got their results
+    ///   (the run that made them ended mid-turn: it was cancelled, or failed, or was parked on a
+    ///   question, and a model provider rejects a call without a result) each get an error result,
+    ///   [`STOPPED_BY_THE_PERSON`], after the results that did arrive. The model keeps what it
+    ///   asked for and is told which calls did not finish. The wait the run was parked on goes:
     ///   `pending_wait` and `pending_calls` are always empty here, so a continued run never
     ///   answers a question or a child run of the run before.
     /// * **Reset, per task:** `turns`, `tool_calls` and `usage` (the [`Limits`](crate::Limits) are
@@ -587,7 +600,7 @@ impl Conversation {
 
     fn continued_within(&self, text: impl Into<String>, from: RunId, cap: usize) -> Self {
         let mut prior = self.messages.clone();
-        drop_unanswered_calls(&mut prior);
+        answer_owed_calls(&mut prior);
         // The deferred messages and the new one are the tail: counted, never cut, and not turns of
         // the prior, so the newest turn that is protected is the prior's own.
         let mut tail = self.deferred.clone();
@@ -887,28 +900,60 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_without_its_result_is_dropped_with_the_turn_it_belonged_to() {
+    fn a_tool_call_without_its_result_is_answered_as_stopped() {
         let run = RunId::new();
         let user = |t: &str| Message::user_text(t);
+        let stopped = |id: &str| Message::tool_error(id, STOPPED_BY_THE_PERSON);
 
-        // Nothing came back at all (a limit failed the run right after the model's turn): what is
-        // left ends with the task, so the new message joins it instead of following it.
+        // Nothing came back at all (the run was cancelled right after the model's turn): the model
+        // keeps its calls and is told each was stopped, and the new message follows them.
         let mut c = Conversation::new("task");
         c.messages.push(calls(&["c1", "c2"]));
         let next = c.continued("more", run);
-        assert_eq!(next.messages, [user_of(&["task", "more"])]);
+        assert_eq!(
+            next.messages,
+            [
+                user("task"),
+                calls(&["c1", "c2"]),
+                stopped("c1"),
+                stopped("c2"),
+                user("more"),
+            ]
+        );
         assert_alternating(&next.messages);
 
-        // Some results came back, not all.
+        // Some results came back, not all: they stay, and only the owed one is stopped.
         let mut c = Conversation::new("task");
         c.messages.push(calls(&["c1", "c2"]));
         c.messages.push(Message::tool_result("c1", "partial"));
         assert_eq!(
             c.continued("more", run).messages,
-            [user_of(&["task", "more"])]
+            [
+                user("task"),
+                calls(&["c1", "c2"]),
+                Message::tool_result("c1", "partial"),
+                stopped("c2"),
+                user("more"),
+            ]
         );
 
-        // Parked on a question the run never got an answer to: the wait goes with the call.
+        // A result that arrived for the second call only: the first is the one owed.
+        let mut c = Conversation::new("task");
+        c.messages.push(calls(&["c1", "c2"]));
+        c.messages.push(Message::tool_result("c2", "late"));
+        assert_eq!(
+            c.continued("more", run).messages,
+            [
+                user("task"),
+                calls(&["c1", "c2"]),
+                Message::tool_result("c2", "late"),
+                stopped("c1"),
+                user("more"),
+            ]
+        );
+
+        // Parked on a question the run never got an answer to: the call is stopped, and the wait
+        // goes.
         let mut c = Conversation::new("task");
         c.messages.push(calls(&["c1"]));
         c.pending_calls = vec![call("c1")];
@@ -920,10 +965,13 @@ mod tests {
             stream: None,
         }));
         let next = c.continued("more", run);
-        assert_eq!(next.messages, [user_of(&["task", "more"])]);
+        assert_eq!(
+            next.messages,
+            [user("task"), calls(&["c1"]), stopped("c1"), user("more")]
+        );
         assert!(next.pending_calls.is_empty() && next.pending_wait.is_none());
 
-        // Earlier, finished exchanges stay; only the last, unfinished one goes.
+        // Earlier, finished exchanges stay as they are; only the last, unfinished one is stopped.
         let mut c = Conversation::new("task");
         c.messages.push(calls(&["c1"]));
         c.messages.push(Message::tool_result("c1", "out"));
@@ -935,12 +983,14 @@ mod tests {
                 user("task"),
                 calls(&["c1"]),
                 Message::tool_result("c1", "out"),
+                calls(&["c2"]),
+                stopped("c2"),
                 user("more"),
             ]
         );
         assert_alternating(&next.messages);
 
-        // Answered calls are history, whatever came after them.
+        // Answered calls are history, whatever came after them: nothing is added.
         let mut c = Conversation::new("task");
         c.messages.push(calls(&["c1", "c2"]));
         c.messages.push(Message::tool_result("c1", "one"));
@@ -948,6 +998,7 @@ mod tests {
         c.messages.push(Message::assistant_text("done"));
         let next = c.continued("more", run);
         assert_eq!(next.messages.len(), 6);
+        assert!(!next.messages.contains(&stopped("c1")) && !next.messages.contains(&stopped("c2")));
         assert_alternating(&next.messages);
     }
 

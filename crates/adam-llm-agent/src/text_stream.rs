@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use adam_model::{DynModel, ModelDelta, ModelError, ModelRequest, ModelResponse};
-use adam_runtime::{Emitter, MAX_TEXT_DELTA_BYTES, RunEvent, floor_boundary};
+use adam_runtime::{CancelToken, Emitter, MAX_TEXT_DELTA_BYTES, RunEvent, floor_boundary};
 use futures::StreamExt;
 use tokio::time::{Instant, sleep_until};
 
@@ -145,6 +145,22 @@ pub(crate) struct Streamed {
     pub(crate) stream: Option<String>,
 }
 
+/// Why [`stream_response`] gave no response.
+#[derive(Debug)]
+pub(crate) enum StreamStop {
+    /// The model's client failed, before the first byte or in the middle of the answer.
+    Failed(ModelError),
+    /// The run was cancelled: the request was dropped, and with it the connection, wherever the
+    /// answer had got to.
+    Cancelled,
+}
+
+impl From<ModelError> for StreamStop {
+    fn from(error: ModelError) -> Self {
+        Self::Failed(error)
+    }
+}
+
 /// Calls `model` with [`ModelClient::stream`](adam_model::ModelClient::stream) and sends the words
 /// as [`RunEvent::TextDelta`] events through `emitter` while they arrive. Returns the assembled
 /// response (the stream's last item) and the id of the stream the words were sent as, if any were.
@@ -154,14 +170,23 @@ pub(crate) struct Streamed {
 /// [`ModelClient::complete`](adam_model::ModelClient::complete); a stream that was open says it is
 /// abandoned first.
 ///
+/// `cancel` is the run's: when it fires, at any point (the request still being made, the answer
+/// still coming, the model silent in the middle of it) the request and the stream are dropped at
+/// once, an open stream says it is abandoned, and the call is [`StreamStop::Cancelled`].
+///
 /// `new_stream` makes the id of the stream, called when the first word that is not blank arrives.
 pub(crate) async fn stream_response(
     model: &DynModel,
     request: ModelRequest,
     emitter: &Emitter,
+    cancel: &CancelToken,
     new_stream: impl FnOnce() -> String,
-) -> Result<Streamed, ModelError> {
-    let mut deltas = model.stream(request).await?;
+) -> Result<Streamed, StreamStop> {
+    let mut deltas = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(StreamStop::Cancelled),
+        started = model.stream(request) => started?,
+    };
     let mut sender = Sender {
         emitter,
         coalescer: Coalescer::new(FLUSH_INTERVAL, FLUSH_BYTES),
@@ -169,15 +194,17 @@ pub(crate) async fn stream_response(
         stream: None,
     };
     loop {
-        let next = match sender.coalescer.deadline() {
-            Some(at) => tokio::select! {
-                item = deltas.next() => item,
-                () = sleep_until(at) => {
-                    sender.tick().await;
-                    continue;
-                }
-            },
-            None => deltas.next().await,
+        let next = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                sender.abandon().await;
+                return Err(StreamStop::Cancelled);
+            }
+            () = sleep_until_due(sender.coalescer.deadline()) => {
+                sender.tick().await;
+                continue;
+            }
+            item = deltas.next() => item,
         };
         match next {
             Some(Ok(ModelDelta::Text(text))) => sender.push(&text).await,
@@ -191,15 +218,23 @@ pub(crate) async fn stream_response(
             }
             Some(Err(error)) => {
                 sender.abandon().await;
-                return Err(error);
+                return Err(StreamStop::Failed(error));
             }
             None => {
                 sender.abandon().await;
-                return Err(ModelError::protocol(
+                return Err(StreamStop::Failed(ModelError::protocol(
                     "the model's stream ended without a final message",
-                ));
+                )));
             }
         }
+    }
+}
+
+/// Resolves at `at`; never, when there is nothing waiting to be sent.
+async fn sleep_until_due(at: Option<Instant>) {
+    match at {
+        Some(at) => sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -407,16 +442,29 @@ mod tests {
         assert_eq!(c.text(), "Fib");
     }
 
+    /// The failure of a call that nobody cancelled.
+    fn failed(stop: StreamStop) -> ModelError {
+        match stop {
+            StreamStop::Failed(error) => error,
+            StreamStop::Cancelled => panic!("nobody cancelled this call"),
+        }
+    }
+
     /// What the events of a model call say, for a model that answers with `script`.
     async fn run(model: Arc<MockModel>) -> (Result<Streamed, ModelError>, Vec<RunEvent>) {
         let sink = CollectingSink::new();
         let run = RunId::new();
         let emitter = Emitter::new(run, "test", Arc::new(sink.clone()));
         let dynamic: DynModel = model;
-        let result = stream_response(&dynamic, ModelRequest::new("m"), &emitter, || {
-            "s1".to_owned()
-        })
-        .await;
+        let result = stream_response(
+            &dynamic,
+            ModelRequest::new("m"),
+            &emitter,
+            &CancelToken::new(),
+            || "s1".to_owned(),
+        )
+        .await
+        .map_err(failed);
         (result, sink.events_for(run))
     }
 
@@ -509,10 +557,15 @@ mod tests {
         let sink = CollectingSink::new();
         let run = RunId::new();
         let emitter = Emitter::new(run, "test", Arc::new(sink.clone()));
-        let result = stream_response(&scripted(items), ModelRequest::new("m"), &emitter, || {
-            "s1".to_owned()
-        })
-        .await;
+        let result = stream_response(
+            &scripted(items),
+            ModelRequest::new("m"),
+            &emitter,
+            &CancelToken::new(),
+            || "s1".to_owned(),
+        )
+        .await
+        .map_err(failed);
         (result, sink.events_for(run))
     }
 
@@ -650,7 +703,15 @@ mod tests {
         let call = tokio::spawn({
             let emitter = emitter.clone();
             async move {
-                stream_response(&model, ModelRequest::new("m"), &emitter, || "s1".to_owned()).await
+                stream_response(
+                    &model,
+                    ModelRequest::new("m"),
+                    &emitter,
+                    &CancelToken::new(),
+                    || "s1".to_owned(),
+                )
+                .await
+                .map_err(failed)
             }
         });
         // Over half a second in, the words have all been written and the model is silent for
@@ -672,5 +733,81 @@ mod tests {
             assert_eq!(*offset, next);
             next += text.len() as u64;
         }
+    }
+
+    /// A cancel is heard whatever the model is doing: it drops the request, and a stream that is
+    /// open says that it is abandoned and what had been written.
+    #[tokio::test]
+    async fn a_cancel_drops_the_stream_and_ends_an_open_one_abandoned() {
+        let sink = CollectingSink::new();
+        let run = RunId::new();
+        let emitter = Emitter::new(run, "test", Arc::new(sink.clone()));
+        let model: DynModel = Arc::new(Slow);
+        let cancel = CancelToken::new();
+        let call = tokio::spawn({
+            let (emitter, cancel) = (emitter.clone(), cancel.clone());
+            async move {
+                stream_response(&model, ModelRequest::new("m"), &emitter, &cancel, || {
+                    "s1".to_owned()
+                })
+                .await
+            }
+        });
+        // The words are written in 120 ms; the model is then silent for a second.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let cancelled_at = Instant::now();
+        cancel.cancel();
+        let stop = call.await.expect("joined").expect_err("no answer");
+        assert!(matches!(stop, StreamStop::Cancelled), "{stop:?}");
+        assert!(
+            cancelled_at.elapsed() < Duration::from_millis(500),
+            "the silent model is not waited for: {:?}",
+            cancelled_at.elapsed()
+        );
+        let all = pieces(&sink.events_for(run));
+        let joined: String = all.iter().map(|p| p.1.as_str()).collect();
+        assert_eq!(joined, "one two three four ");
+        assert_eq!(all.last().map(|p| (p.2, p.3)), Some((true, true)));
+    }
+
+    /// A model that has not begun to answer is not waited for either, and a run that is cancelled
+    /// already does not get as far as asking.
+    #[tokio::test]
+    async fn a_cancel_before_the_first_byte_drops_the_request() {
+        struct Never;
+        #[async_trait::async_trait]
+        impl adam_model::ModelClient for Never {
+            async fn complete(&self, _: ModelRequest) -> Result<ModelResponse, ModelError> {
+                std::future::pending().await
+            }
+            async fn stream(
+                &self,
+                _: ModelRequest,
+            ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError>
+            {
+                std::future::pending().await
+            }
+        }
+        let sink = CollectingSink::new();
+        let run = RunId::new();
+        let emitter = Emitter::new(run, "test", Arc::new(sink.clone()));
+        let model: DynModel = Arc::new(Never);
+        let cancel = CancelToken::new();
+        let fire = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            fire.cancel();
+        });
+        let stop = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream_response(&model, ModelRequest::new("m"), &emitter, &cancel, || {
+                "s1".to_owned()
+            }),
+        )
+        .await
+        .expect("a cancel ends the call")
+        .expect_err("no answer");
+        assert!(matches!(stop, StreamStop::Cancelled), "{stop:?}");
+        assert!(sink.events_for(run).is_empty(), "no stream was opened");
     }
 }

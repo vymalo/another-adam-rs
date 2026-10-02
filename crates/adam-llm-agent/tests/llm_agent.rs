@@ -1154,6 +1154,324 @@ async fn cancelling_the_run_stops_a_running_tool() {
     assert_eq!(h.mock.requests().len(), 1, "no model call after the cancel");
 }
 
+// ---------------------------------------------------------------------------
+// Cancellation reaches the model call in flight
+// ---------------------------------------------------------------------------
+
+/// Where a [`StalledModel`] goes quiet.
+#[derive(Clone, Copy, Debug)]
+enum Stall {
+    /// Before it has said anything: the request is made and nothing comes back.
+    BeforeTheAnswer,
+    /// In the middle of a streamed answer: the first words arrive, then nothing.
+    AfterTheFirstWords,
+}
+
+/// Counts a model call for as long as its request (or the stream of its answer) is alive: dropping
+/// either ends it.
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn begin(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, SeqCst);
+        Self(count.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, SeqCst);
+    }
+}
+
+/// A model that takes `delay` to answer (the provider is slow, or the connection hangs), and says
+/// how many of its calls are still alive: a call that was dropped is not.
+struct StalledModel {
+    inner: Arc<MockModel>,
+    delay: Duration,
+    stall: Stall,
+    /// Signalled once the model is silent, with the call alive.
+    quiet: Arc<Notify>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl StalledModel {
+    fn new(inner: &Arc<MockModel>, stall: Stall) -> Arc<Self> {
+        Arc::new(Self {
+            inner: inner.clone(),
+            delay: Duration::from_secs(30),
+            stall,
+            quiet: Arc::new(Notify::new()),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+}
+
+#[async_trait]
+impl ModelClient for StalledModel {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        let _alive = InFlight::begin(&self.in_flight);
+        self.quiet.notify_one();
+        tokio::time::sleep(self.delay).await;
+        self.inner.complete(req).await
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        let alive = InFlight::begin(&self.in_flight);
+        match self.stall {
+            Stall::BeforeTheAnswer => {
+                self.quiet.notify_one();
+                tokio::time::sleep(self.delay).await;
+                let answer = self.inner.stream(req).await?;
+                Ok(Box::pin(futures::StreamExt::map(answer, move |item| {
+                    let _alive = &alive;
+                    item
+                })))
+            }
+            Stall::AfterTheFirstWords => {
+                // Its first words now, the rest of the answer after the delay.
+                let answer = self.inner.stream(req).await?;
+                let (quiet, delay) = (self.quiet.clone(), self.delay);
+                Ok(Box::pin(futures::StreamExt::then(answer, move |item| {
+                    let (quiet, alive) = (quiet.clone(), &alive);
+                    let _ = alive;
+                    async move {
+                        if matches!(item, Ok(ModelDelta::Finished(_))) {
+                            quiet.notify_one();
+                            tokio::time::sleep(delay).await;
+                        }
+                        item
+                    }
+                })))
+            }
+        }
+    }
+}
+
+/// A cancel while the model is being waited for ends the run at once: the request is dropped, no
+/// time is spent on the 30 s the provider would have taken, and nothing the model might have said
+/// is acted on or sent.
+async fn a_cancel_stops_the_model_call_in_flight(stream_text: bool, stall: Stall) {
+    let h = Harness::new();
+    h.mock.push_text("Hello there, a long answer");
+    let model = StalledModel::new(&h.mock, stall);
+    let dynamic: DynModel = model.clone();
+    let agent = LlmAgent::builder("llm", dynamic, "test-model")
+        .stream_text(stream_text)
+        .build();
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    notified(&model.quiet, "the model to go quiet").await;
+    assert_eq!(model.in_flight.load(SeqCst), 1, "the call is in flight");
+
+    let cancelled_at = Instant::now();
+    rt.cancel(run, "user pressed stop").await.expect("cancel");
+    // The worker stops when its steps have: a model call that was not dropped holds it for 30 s.
+    worker.stop().await;
+    let took = cancelled_at.elapsed();
+    eprintln!("cancel to the end of the step ({stream_text}, {stall:?}): {took:?}");
+    assert!(
+        took < Duration::from_secs(2),
+        "a cancel does not wait for the model: {took:?}"
+    );
+
+    assert_eq!(model.in_flight.load(SeqCst), 0, "the request was dropped");
+    let view = rt.view(run).await.expect("view").expect("run");
+    assert_eq!(view.status, RunStatus::Failed);
+    assert_eq!(view.error.as_deref(), Some("cancelled: user pressed stop"));
+    assert_eq!(
+        h.mock.requests().len(),
+        usize::from(matches!(stall, Stall::AfterTheFirstWords))
+    );
+    // The turn was not carried on: no words said whole, no tool step, no extra status.
+    assert!(h.events(run).is_empty(), "{:?}", h.events(run));
+    // What had been streamed ends abandoned: nobody is left waiting for more.
+    let pieces: Vec<(String, bool, bool)> = h
+        .sink
+        .events_for(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::TextDelta {
+                text,
+                last,
+                abandoned,
+                ..
+            } => Some((text, last, abandoned)),
+            _ => None,
+        })
+        .collect();
+    match stall {
+        Stall::AfterTheFirstWords if stream_text => {
+            let said: String = pieces.iter().map(|p| p.0.as_str()).collect();
+            assert_eq!(said, "Hello there, a long answer");
+            let last = pieces.last().expect("a piece");
+            assert!(last.1 && last.2, "the stream ends abandoned: {pieces:?}");
+        }
+        _ => assert!(pieces.is_empty(), "{pieces:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_stops_a_model_call_that_has_not_answered() {
+    a_cancel_stops_the_model_call_in_flight(false, Stall::BeforeTheAnswer).await;
+}
+
+#[tokio::test]
+async fn a_cancel_stops_a_streamed_model_call_that_has_not_answered() {
+    a_cancel_stops_the_model_call_in_flight(true, Stall::BeforeTheAnswer).await;
+}
+
+#[tokio::test]
+async fn a_cancel_stops_a_streamed_answer_that_went_quiet_in_the_middle() {
+    a_cancel_stops_the_model_call_in_flight(true, Stall::AfterTheFirstWords).await;
+}
+
+/// The calls of a turn that are still owed when the run is cancelled do not start: the tool that
+/// was running ends, and the next call is not made.
+#[tokio::test]
+async fn a_cancel_ends_the_turn_between_its_calls() {
+    let h = Harness::new();
+    let started = Arc::new(Notify::new());
+    let (second, second_calls) = CountingTool::new("second");
+    let agent = h
+        .agent()
+        .tool(AsyncTool({
+            let started = started.clone();
+            move |ctx: ToolCtx| {
+                let started = started.clone();
+                async move {
+                    started.notify_one();
+                    // A tool that does not look at the cancel: it ends on its own a little later.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    assert!(ctx.is_cancelled());
+                    Ok(ToolOutput::text("finished anyway"))
+                }
+            }
+        }))
+        .tool(second)
+        .build();
+    h.mock
+        .push_tool_calls(vec![
+            call("c1", "async_tool", json!({})),
+            call("c2", "second", json!({})),
+        ])
+        .push_text("never reached");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    notified(&started, "the first tool to start").await;
+
+    rt.cancel(run, "stop").await.expect("cancel");
+    worker.stop().await;
+
+    assert_eq!(
+        second_calls.load(SeqCst),
+        0,
+        "the second call never started"
+    );
+    assert_eq!(h.mock.requests().len(), 1, "no model call after the cancel");
+    let view = rt.view(run).await.expect("view").expect("run");
+    assert_eq!(view.error.as_deref(), Some("cancelled: stop"));
+}
+
+/// A run parked on a question is cancelled; the run that continues it starts from a history in
+/// which the call that was never answered has a result, and the model's provider never sees a call
+/// without one.
+#[tokio::test]
+async fn a_run_that_continues_a_cancelled_one_answers_the_calls_that_were_owed() {
+    let h = Harness::new();
+    let (second, second_calls) = CountingTool::new("second");
+    let agent = h
+        .agent()
+        .tool(fn_tool("ask", |_, _| {
+            Err(ToolError::NeedsInput {
+                question: "which one?".into(),
+                ui: None,
+            })
+        }))
+        .tool(second)
+        .build();
+    h.mock
+        .push_tool_calls(vec![
+            call("c1", "ask", json!({})),
+            call("c2", "second", json!({})),
+        ])
+        .push_text("fine, starting again");
+    let rt = h.runtime(&agent);
+    let first = rt
+        .start("llm", user_message("do the thing"), Some("ctx"))
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_waiting(&rt, first).await;
+    rt.cancel(first, "changed my mind").await.expect("cancel");
+    assert_eq!(second_calls.load(SeqCst), 0);
+
+    let next = rt
+        .start_continuing(
+            "llm",
+            user_message("never mind, do it differently"),
+            Some("ctx"),
+            first,
+        )
+        .await
+        .expect("continue");
+    wait_done(&rt, next).await;
+    worker.stop().await;
+
+    let history = h.mock.requests()[1].messages.clone();
+    assert_calls_are_answered(&history);
+    assert_eq!(
+        history,
+        [
+            Message::user_text("do the thing"),
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![
+                    call("c1", "ask", json!({})),
+                    call("c2", "second", json!({})),
+                ],
+            },
+            Message::tool_error("c1", adam_llm_agent::STOPPED_BY_THE_PERSON),
+            Message::tool_error("c2", adam_llm_agent::STOPPED_BY_THE_PERSON),
+            Message::user_text("never mind, do it differently"),
+        ]
+    );
+    assert_eq!(second_calls.load(SeqCst), 0, "a stopped call is not run");
+}
+
+/// What a provider checks: every call of an assistant message is answered by a tool message before
+/// anything else comes, and no tool message answers a call nobody made.
+fn assert_calls_are_answered(history: &[Message]) {
+    let mut owed: Vec<String> = Vec::new();
+    for message in history {
+        match message {
+            Message::Tool { call_id, .. } => {
+                let at = owed
+                    .iter()
+                    .position(|id| id == call_id)
+                    .unwrap_or_else(|| panic!("a result for {call_id}, which nobody asked for"));
+                owed.remove(at);
+            }
+            other => {
+                assert!(owed.is_empty(), "calls without a result: {owed:?}");
+                owed = other.tool_calls().iter().map(|c| c.id.clone()).collect();
+            }
+        }
+    }
+    assert!(owed.is_empty(), "calls without a result: {owed:?}");
+}
+
 #[tokio::test]
 async fn a_detached_tool_ctx_is_never_cancelled_unless_given_a_token() {
     let sink: adam_runtime::DynEventSink = Arc::new(CollectingSink::new());
@@ -1935,7 +2253,8 @@ async fn a_start_only_front_continues_and_a_worker_steps() {
 
 /// A run that stopped mid-turn, parked on a question and then cancelled, leaves an assistant
 /// message whose call never got its result. The run that continues it must not ask the model
-/// to answer a question nobody is waiting for, and must not send a call without a result.
+/// to answer a question nobody is waiting for, and must not send a call without a result: the
+/// call is answered as stopped.
 #[tokio::test]
 async fn a_run_cancelled_on_a_question_continues_without_the_stale_wait() {
     let h = Harness::new();
@@ -1968,28 +2287,25 @@ async fn a_run_cancelled_on_a_question_continues_without_the_stale_wait() {
     );
     let started = conversation(&rt.view(second).await.unwrap().unwrap());
     assert!(started.pending_wait.is_none() && started.pending_calls.is_empty());
-    // The run ended with nothing after the task, so the new message joins it: a chat template
-    // that wants the roles to alternate gets one user message with two parts.
+    // The model keeps its call, is told it was stopped, and the new message follows.
     assert_eq!(
         started.messages,
-        [Message::User {
-            content: vec![
-                ContentPart::text("deploy"),
-                ContentPart::text("just deploy to staging")
-            ]
-        }]
+        [
+            Message::user_text("deploy"),
+            Message::Assistant {
+                content: vec![],
+                tool_calls: vec![call("c1", "ask", json!({}))],
+            },
+            Message::tool_error("c1", adam_llm_agent::STOPPED_BY_THE_PERSON),
+            Message::user_text("just deploy to staging"),
+        ]
     );
     let done = wait_done(&rt, second).await;
     worker.stop().await;
     assert_eq!(done.output.unwrap()["text"], "deploying to staging");
-    // The model was never shown the call without its result.
+    // The model was never shown a call without its result.
     let requests = h.mock.requests();
-    let shown = &requests.last().unwrap().messages;
-    assert!(
-        !shown
-            .iter()
-            .any(|m| matches!(m, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()))
-    );
+    assert_calls_are_answered(&requests.last().unwrap().messages);
 }
 
 /// The bound on what is carried, seen through the starter the A2A front uses: over 256 KiB old

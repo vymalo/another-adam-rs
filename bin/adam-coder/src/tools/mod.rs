@@ -625,6 +625,7 @@ pub(crate) fn run_error(redactor: &Redactor, e: &shell::RunError) -> ToolError {
     match e {
         shell::RunError::Prepare(e) => environment_error(redactor, e),
         shell::RunError::Spawn(e) => ToolError::Transient(format!("cannot start the shell: {e}")),
+        shell::RunError::Cancelled => cancelled("the command was stopped"),
     }
 }
 

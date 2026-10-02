@@ -932,7 +932,7 @@ sequenceDiagram
         R->>DB: load_run(run id): a repeat answers false here
         R->>DB: load_run(t1), and the envelope's agent state
         R->>A: init_continuing(inbound, prior state, t1)
-        Note over A: LlmAgent: carry the history, drop a tool call<br/>that never got its result, reset the counters,<br/>cap the history at 256 KiB (tool output first),<br/>keep the roles alternating
+        Note over A: LlmAgent: carry the history, answer a tool call<br/>that never got its result as stopped, reset the counters,<br/>cap the history at 256 KiB (tool output first),<br/>keep the roles alternating
         A-->>R: the new run's state
         R->>DB: create_run (Runnable, version 1)
     else none, or the conversation has an open task
@@ -1351,7 +1351,9 @@ How the two fit:
   `cancelled: <reason>`. A step running at that moment is told through its
   `CancelToken` (at once in the same process, within one poll interval from
   another one). Its later commit is rejected by the compare-and-swap. A run that
-  already finished is left as it is.
+  already finished is left as it is. The model call of `LlmAgent` and the commands of
+  the coder's tools listen to the token and are dropped or killed at once, so a
+  cancel ends the step in milliseconds, not when the provider or the command is done.
 * **Deliver.** `Runtime::deliver` appends to the inbox. A `Parked` run becomes
   `Runnable` at once, even if it was waiting on a timer. A run that is `Done`
   or `Failed` answers `Finished`.

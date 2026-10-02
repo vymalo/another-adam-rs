@@ -887,8 +887,10 @@ impl Runtime {
     /// this runtime holds the run, and if another process does, at once too
     /// when both runtimes share a [`Notifier`] (a
     /// [`Signal::Finished`]), otherwise within one poll interval. The step is
-    /// not aborted; it may stop early or run to its end (its result is
-    /// dropped either way).
+    /// not aborted by the runtime: a step that listens to the token stops
+    /// early (`LlmAgent` drops its model request, the coder kills its
+    /// commands), one that does not runs to its end (its result is dropped
+    /// either way).
     #[tracing::instrument(skip(self))]
     pub async fn cancel(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
         for _ in 0..MAX_COMMIT_RETRIES {

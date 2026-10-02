@@ -63,6 +63,11 @@ impl Default for Limits {
     }
 }
 
+/// What a turn that a cancel ended says. The run is `Failed` with the reason the canceller gave
+/// (`cancelled: <reason>`, written by `Runtime::cancel`); this text is only ever dropped with the
+/// commit that carries it, and shows up in logs.
+const CANCELLED: &str = "cancelled: the run was cancelled while it worked";
+
 /// A model failure in journal form: [`ModelError`] is not serializable, but
 /// whether it is worth retrying must survive being recorded. The journal is a
 /// persistence boundary, so the error chain is flattened here, once, with
@@ -79,6 +84,27 @@ struct ModelFailure {
     /// journals written before classes existed, which decode as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     class: Option<String>,
+}
+
+impl ModelFailure {
+    /// The call was dropped because the run was cancelled. Not retryable: nobody is waiting for it.
+    fn cancelled() -> Self {
+        Self {
+            retryable: false,
+            message: CANCELLED.to_owned(),
+            retry_after_ms: None,
+            class: None,
+        }
+    }
+}
+
+impl From<text_stream::StreamStop> for ModelFailure {
+    fn from(stop: text_stream::StreamStop) -> Self {
+        match stop {
+            text_stream::StreamStop::Failed(e) => e.into(),
+            text_stream::StreamStop::Cancelled => Self::cancelled(),
+        }
+    }
 }
 
 impl From<ModelError> for ModelFailure {
@@ -672,6 +698,9 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
     ) -> Result<Flow, AgentError> {
+        if ctx.is_cancelled() {
+            return Ok(Flow::Fail(CANCELLED.into()));
+        }
         if state.turns >= self.limits.max_turns {
             return Ok(Flow::Fail(format!(
                 "turn limit exceeded: the model was called {} times (max_turns = {})",
@@ -698,6 +727,7 @@ impl LlmAgent {
         let run = ctx.run_id();
         let emitter = ctx.emitter();
         let stream_text = self.stream_text;
+        let cancel = ctx.cancel_token();
         let recorded: Result<Recorded, ModelFailure> = ctx
             .step(&format!("model:{turn}"), move || async move {
                 // The sources are read here, inside the step, so that a replay of a turn whose model
@@ -709,27 +739,39 @@ impl LlmAgent {
                     refined(&sources, source_ctx, &mut request.tools).await;
                 }
                 if !stream_text {
-                    return model
-                        .complete(request)
-                        .await
-                        .map(|response| Recorded {
-                            response,
-                            stream: None,
-                        })
-                        .map_err(ModelFailure::from);
+                    // The request races the run's cancellation: a cancel drops it, and with it the
+                    // connection, instead of letting the provider finish an answer nobody will read.
+                    return tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => Err(ModelFailure::cancelled()),
+                        answer = model.complete(request) => answer
+                            .map(|response| Recorded {
+                                response,
+                                stream: None,
+                            })
+                            .map_err(ModelFailure::from),
+                    };
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
                 // recorded with the answer: a replay calls no model and sends no pieces, but it knows
                 // which stream the words were, so it says them whole under the same id.
-                text_stream::stream_response(&model, request, &emitter, || stream_id(run, turn))
-                    .await
-                    .map(|streamed| Recorded {
-                        response: streamed.response,
-                        stream: streamed.stream,
-                    })
-                    .map_err(ModelFailure::from)
+                text_stream::stream_response(&model, request, &emitter, &cancel, || {
+                    stream_id(run, turn)
+                })
+                .await
+                .map(|streamed| Recorded {
+                    response: streamed.response,
+                    stream: streamed.stream,
+                })
+                .map_err(ModelFailure::from)
             })
             .await?;
+        // A cancel ends the turn here: nothing the model said is acted on, said or kept. The run is
+        // already `Failed` in the store (that is what told the token), so this result is dropped
+        // by the worker's commit.
+        if ctx.is_cancelled() {
+            return Ok(Flow::Fail(CANCELLED.into()));
+        }
         let (response, stream) = match recorded {
             Ok(Recorded { response, stream }) => (response, stream),
             // A recorded error is replayed forever on crash-replay, but a
@@ -832,6 +874,10 @@ impl LlmAgent {
         notices: &[(RunId, ChildStatus)],
     ) -> Result<Flow, AgentError> {
         while let Some(call) = state.pending_calls.first().cloned() {
+            // A cancel stops the turn between its calls too: the ones still owed do not start.
+            if ctx.is_cancelled() {
+                return Ok(Flow::Fail(CANCELLED.into()));
+            }
             let used = files_kept(&state.artifacts);
             let (message, artifacts) = match self.run_tool(ctx, &state.context, &call, used).await?
             {

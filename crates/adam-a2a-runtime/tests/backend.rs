@@ -1684,6 +1684,184 @@ async fn the_model_of_a_continued_task_sees_the_earlier_messages_in_postgres() {
     llm_continuation_scenario(Arc::new(store)).await;
 }
 
+/// A tool of the model's that asks the person something: the run parks on it.
+struct Ask;
+
+#[async_trait]
+impl adam_llm_agent::Tool for Ask {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: "ask".into(),
+            description: "ask the person".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(
+        &self,
+        _ctx: &adam_llm_agent::ToolCtx,
+        _args: Value,
+    ) -> Result<adam_llm_agent::ToolOutput, adam_llm_agent::ToolError> {
+        Err(adam_llm_agent::ToolError::NeedsInput {
+            question: "which environment?".into(),
+            ui: None,
+        })
+    }
+}
+
+/// A tool that must never run in this test: the call that is owed is stopped, not made.
+struct Look(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl adam_llm_agent::Tool for Look {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: "look".into(),
+            description: "look around".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+    async fn call(
+        &self,
+        _ctx: &adam_llm_agent::ToolCtx,
+        _args: Value,
+    ) -> Result<adam_llm_agent::ToolOutput, adam_llm_agent::ToolError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(adam_llm_agent::ToolOutput::text("looked"))
+    }
+}
+
+/// What a model provider checks of a history: every call of an assistant message is answered by a
+/// tool message before anything else follows, and no result answers a call nobody made.
+fn assert_every_call_is_answered(history: &[ModelMessage]) {
+    let mut owed: Vec<String> = Vec::new();
+    for message in history {
+        match message {
+            ModelMessage::Tool { call_id, .. } => {
+                let at = owed
+                    .iter()
+                    .position(|id| id == call_id)
+                    .unwrap_or_else(|| panic!("a result for {call_id}, which nobody asked for"));
+                owed.remove(at);
+            }
+            other => {
+                assert!(owed.is_empty(), "calls without a result: {owed:?}");
+                owed = other.tool_calls().iter().map(|c| c.id.clone()).collect();
+            }
+        }
+    }
+    assert!(owed.is_empty(), "calls without a result: {owed:?}");
+}
+
+/// A task canceled while it waits for the person's answer still owes the model the results of its
+/// calls. The task that references it continues with a history the provider accepts: the calls
+/// that were owed are answered as stopped by the person, and none of them is run.
+async fn canceled_continuation_scenario(store: DynStore) {
+    let unique = uuid_like();
+    let agent = format!("llm-canceled-{unique}");
+    let context = format!("ctx-canceled-{unique}");
+    let who = Caller::new(format!("token-{unique}"));
+
+    let looked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let model = Arc::new(MockModel::new());
+    model
+        .push_tool_calls(vec![
+            adam_model::ToolCall {
+                id: "c1".into(),
+                name: "ask".into(),
+                arguments: json!({}),
+            },
+            adam_model::ToolCall {
+                id: "c2".into(),
+                name: "look".into(),
+                arguments: json!({}),
+            },
+        ])
+        .push_text("starting over");
+    let events = BroadcastSink::default();
+    let runtime = Runtime::builder(store)
+        .agent(
+            LlmAgent::builder(&agent, model.clone(), "m")
+                .tool(Ask)
+                .tool(Look(looked.clone()))
+                .build(),
+        )
+        .event_sink(events.clone())
+        .poll_interval(Duration::from_millis(10))
+        .build();
+    let backend = RuntimeTaskBackend::new(runtime.clone(), events, agent.clone())
+        .with_poll_interval(Duration::from_millis(10));
+    let worker = spawn_worker(runtime.clone());
+
+    let first = backend
+        .submit(who.clone(), user("deploy"), None, Some(context.clone()))
+        .await
+        .unwrap();
+    wait_task(&backend, &who, &first.id, TaskState::InputRequired).await;
+    let canceled = backend.cancel(&who, &first.id).await.unwrap();
+    assert_eq!(canceled.status.state, TaskState::Canceled);
+
+    let second = backend
+        .submit(
+            who.clone(),
+            user_refs("do it another way", &[first.id.as_str()]),
+            None,
+            Some(context.clone()),
+        )
+        .await
+        .unwrap();
+    assert_ne!(second.id, first.id);
+    let done = wait_task(&backend, &who, &second.id, TaskState::Completed).await;
+    worker.stop().await;
+    assert_eq!(
+        done.status.message.as_ref().and_then(|m| m.text()),
+        Some("starting over")
+    );
+
+    // What the model was asked the second time: its own calls, each answered as stopped (the
+    // history a provider accepts), then the new message.
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    let history = &requests[1].messages;
+    assert_every_call_is_answered(history);
+    let stopped = |id: &str| ModelMessage::tool_error(id, adam_llm_agent::STOPPED_BY_THE_PERSON);
+    assert_eq!(history.len(), 5, "{history:#?}");
+    assert_eq!(history[0], ModelMessage::user_text("deploy"));
+    assert_eq!(history[1].tool_calls().len(), 2);
+    assert_eq!(history[2], stopped("c1"));
+    assert_eq!(history[3], stopped("c2"));
+    assert_eq!(history[4], ModelMessage::user_text("do it another way"));
+    assert_eq!(
+        looked.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a call that was stopped is not made"
+    );
+    let view = runtime
+        .view(RunId(second.id.parse().unwrap()))
+        .await
+        .unwrap()
+        .unwrap();
+    let state: Conversation = serde_json::from_value(view.state).unwrap();
+    assert_eq!(state.continued_from, Some(RunId(first.id.parse().unwrap())));
+    assert!(state.pending_calls.is_empty() && state.pending_wait.is_none());
+}
+
+#[tokio::test]
+async fn a_task_that_references_a_canceled_one_continues_with_a_valid_history() {
+    canceled_continuation_scenario(Arc::new(MemoryStore::new())).await;
+}
+
+#[tokio::test]
+async fn a_task_that_references_a_canceled_one_continues_with_a_valid_history_in_postgres() {
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let store = adam_store_postgres::PgStore::connect(&url)
+        .await
+        .expect("connect to postgres");
+    adam_core::Store::migrate(&store).await.expect("migrate");
+    canceled_continuation_scenario(Arc::new(store)).await;
+}
+
 // --------------------------------------------- what a reference can and cannot do to a request
 
 /// A terminal record of `AGENT` in `subject`'s conversation `context` whose state is not a valid

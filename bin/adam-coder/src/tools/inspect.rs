@@ -82,6 +82,7 @@ pub async fn run_command(
         shell_spec(&dir, command),
         env.settings.check_timeout,
         env.settings.check_output_tail,
+        &ctx.cancel_token(),
     )
     .await
     .map_err(|e| run_error(redactor, &e))?;

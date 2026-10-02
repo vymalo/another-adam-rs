@@ -11,6 +11,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use adam_runtime::CancelToken;
 use adam_workspace::{EnvError, EnvSession, ExecSpec};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
@@ -285,6 +286,9 @@ pub enum RunError {
     /// The process could not be started.
     #[error("cannot start the process")]
     Spawn(#[source] io::Error),
+    /// The run was cancelled: the process group was killed, or never started.
+    #[error("the run was cancelled")]
+    Cancelled,
 }
 
 /// Run `spec` in the environment of `session` (a login shell for a [`Program::Shell`](adam_workspace::Program),
@@ -295,17 +299,25 @@ pub enum RunError {
 /// [`EnvSession::kill`] is told, which is for what runs where this process cannot reach. The
 /// returned tail holds at most `tail_cap` bytes.
 ///
+/// `cancel` is the run's: when it fires the command is stopped the way a timeout stops it (the
+/// whole process group, and the session is told) and nothing is waited for, so a cancel does not
+/// sit through a `sleep 60`. A command whose run is already cancelled is not started.
+///
 /// # Errors
 ///
 /// [`RunError::Prepare`] when the environment refuses the spec, [`RunError::Spawn`] when the process
-/// cannot be started.
+/// cannot be started, [`RunError::Cancelled`] when `cancel` fired.
 #[tracing::instrument(skip(session, spec), fields(dir = %spec.cwd.display()))]
 pub async fn run_in(
     session: &dyn EnvSession,
     spec: ExecSpec,
     timeout: Duration,
     tail_cap: usize,
+    cancel: &CancelToken,
 ) -> Result<ShellOutcome, RunError> {
+    if cancel.is_cancelled() {
+        return Err(RunError::Cancelled);
+    }
     let prepared = session.prepare(&spec).map_err(RunError::Prepare)?;
     let mut cmd = prepared.command();
     cmd.stdin(Stdio::null())
@@ -330,13 +342,27 @@ pub async fn run_in(
         readers.push(tokio::spawn(pump(err, tail.clone())));
     }
 
-    let (exit_code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(status) => (status.map_err(RunError::Spawn)?.code(), false),
-        Err(_) => {
+    let waited = tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        waited = tokio::time::timeout(timeout, child.wait()) => Some(waited),
+    };
+    let (exit_code, timed_out) = match waited {
+        Some(Ok(status)) => (status.map_err(RunError::Spawn)?.code(), false),
+        Some(Err(_)) => {
             kill_group(pid).await;
             let _ = child.kill().await;
             session.kill(&prepared.exec).await;
             (None, true)
+        }
+        None => {
+            kill_group(pid).await;
+            let _ = child.kill().await;
+            session.kill(&prepared.exec).await;
+            for reader in &readers {
+                reader.abort();
+            }
+            return Err(RunError::Cancelled);
         }
     };
 
@@ -401,7 +427,14 @@ mod tests {
         timeout: Duration,
         tail_cap: usize,
     ) -> Result<ShellOutcome, RunError> {
-        run_in(&LocalSession, shell_spec(dir, command), timeout, tail_cap).await
+        run_in(
+            &LocalSession,
+            shell_spec(dir, command),
+            timeout,
+            tail_cap,
+            &CancelToken::new(),
+        )
+        .await
     }
 
     /// An environment that is this container and keeps a record of what it was asked.
@@ -526,7 +559,9 @@ mod tests {
         .env("A2A_BEARER_TOKENS", "c")
         .env("MODEL_API_KEY", "d")
         .env("KEPT", "yes");
-        let out = run_in(&LocalSession, spec, LONG, 1024).await.unwrap();
+        let out = run_in(&LocalSession, spec, LONG, 1024, &CancelToken::new())
+            .await
+            .unwrap();
         // (a login shell may print profile noise before the count)
         assert!(out.tail.lines().any(|l| l.trim() == "0"), "{:?}", out.tail);
         assert!(
@@ -540,9 +575,15 @@ mod tests {
     async fn the_command_that_runs_is_the_one_the_session_prepared() {
         let dir = tempfile::tempdir().unwrap();
         let session = Recording::default();
-        let out = run_in(&session, shell_spec(dir.path(), "echo hi"), LONG, 1024)
-            .await
-            .unwrap();
+        let out = run_in(
+            &session,
+            shell_spec(dir.path(), "echo hi"),
+            LONG,
+            1024,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
         assert!(out.passed() && out.tail.contains("hi"), "{out:?}");
         assert_eq!(session.prepared.lock().unwrap().len(), 1);
         assert!(
@@ -560,6 +601,7 @@ mod tests {
             shell_spec(dir.path(), "sleep 60"),
             Duration::from_secs(1),
             1024,
+            &CancelToken::new(),
         )
         .await
         .unwrap();
@@ -571,6 +613,60 @@ mod tests {
             killed, prepared,
             "the session is told which command timed out"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_stops_the_command_at_once_and_tells_the_session_which() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Recording::default();
+        let cancel = CancelToken::new();
+        let fire = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            fire.cancel();
+        });
+        let started = std::time::Instant::now();
+        let err = run_in(
+            &session,
+            shell_spec(dir.path(), "sleep 60"),
+            LONG,
+            1024,
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RunError::Cancelled), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a cancel does not wait for the command: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            session.killed.lock().unwrap().clone(),
+            session.prepared.lock().unwrap().clone(),
+            "the session is told which command was stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_is_already_cancelled_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let session = Recording::default();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let err = run_in(
+            &session,
+            shell_spec(dir.path(), &format!("touch {}", marker.display())),
+            LONG,
+            1024,
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RunError::Cancelled), "{err:?}");
+        assert!(session.prepared.lock().unwrap().is_empty());
+        assert!(!marker.exists());
     }
 
     #[tokio::test]
@@ -586,6 +682,7 @@ mod tests {
             shell_spec(dir.path(), &format!("touch {}", marker.display())),
             LONG,
             1024,
+            &CancelToken::new(),
         )
         .await
         .unwrap_err();
@@ -600,7 +697,9 @@ mod tests {
     async fn a_program_that_cannot_start_is_a_spawn_error() {
         let dir = tempfile::tempdir().unwrap();
         let spec = ExecSpec::argv(["/nonexistent/program"], dir.path());
-        let err = run_in(&LocalSession, spec, LONG, 1024).await.unwrap_err();
+        let err = run_in(&LocalSession, spec, LONG, 1024, &CancelToken::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, RunError::Spawn(_)), "{err:?}");
     }
 
