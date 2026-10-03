@@ -13,10 +13,10 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (27
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (28
   cases: create/load, state round trip, CAS conflicts, concurrent commits,
   journal ordering and first-writer-wins, claim rules and exclusivity, busy runs
-  that a claim leaves alone, lease expiry/renew/release, pinned claims and the
+  that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
   run owner, one open run per conversation, purge).
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
@@ -52,6 +52,7 @@ failure (see `adam_core::testing`).
 * `tests/memory.rs`: runs the suite against `MemoryStore` (always on).
 * `claim_skips_busy_runs` (both scopes): runs named as `busy` are not claimed, with a live lease or an expired one,
   take no slot of the limit, and are not leased by the call that skipped them.
+* `lease_until_reports_the_lease`: nothing before a claim or for an unknown run, the end of the claim, of a renewal, still the same after a commit and after a stranger's release, nothing after the holder's release, and an expired lease reported as it was.
 * Pinned-claim cases (`ClaimScope::Pinned`): an owned run is never given to another worker, not
   after a release, a commit or an expired lease; the first pinned claim sets the owner and an
   `Any` claim neither reads nor sets it; 4 workers racing on 48 runs split them exactly once and

@@ -270,6 +270,15 @@ impl Store for MemoryStore {
         Ok(())
     }
 
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .runs
+            .get(&id)
+            .and_then(|slot| slot.lease.as_ref())
+            .map(|(_, until)| *until))
+    }
+
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
         let mut inner = self.inner.lock().await;
         let doomed: Vec<RunId> = inner

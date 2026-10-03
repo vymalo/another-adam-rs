@@ -60,6 +60,8 @@ pub enum Method {
     RenewLease,
     /// [`Store::release_lease`].
     ReleaseLease,
+    /// [`Store::lease_until`].
+    LeaseUntil,
     /// [`Store::purge_finished`].
     PurgeFinished,
 }
@@ -377,6 +379,11 @@ impl Store for FaultyStore {
             self.inner.release_lease(id, worker),
         )
         .await
+    }
+
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+        self.run(Method::LeaseUntil, Some(id), self.inner.lease_until(id))
+            .await
     }
 
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {

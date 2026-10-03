@@ -486,6 +486,15 @@ pub trait Store: Send + Sync + 'static {
     /// Drop the lease if `worker` holds it, so the run is claimable at once.
     async fn release_lease(&self, id: RunId, worker: &str) -> StoreResult<()>;
 
+    /// When the lease on a run ends, or `None` if the run has no lease (never claimed, or released)
+    /// or does not exist.
+    ///
+    /// A lease that has run out and was not released is still reported: whether it still counts is
+    /// for the caller to say against its own clock (a claim treats `until <= now` as free). This is
+    /// how a reader that is not a worker (the A2A server, which may run in another process) learns
+    /// that a worker is stepping a run: see `RunView::claimed` in `adam-runtime`.
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>>;
+
     /// Delete finished (done or failed) runs of `agent` last updated before
     /// `before`, with their journals. Returns the number of runs deleted.
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64>;
