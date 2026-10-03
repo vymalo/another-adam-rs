@@ -6,6 +6,17 @@ GitHub, which `adam-workspace` and the coder build, and the two decisions around
 of the slice build: the coder's own tools stay in process, and GitHub is *read* through the official
 GitHub MCP server. The status notes at the end say which are built.
 
+*Amended 2026-10-03 ([ADR 0017](0017-a-github-app-works-on-every-account-it-is-installed-on.md)):* decision 1's "exactly one"
+stays, but the installation need not be named: an App without `GITHUB_APP_INSTALLATION_ID` finds the installation of each
+repository's owner, for the accounts a required owner list allows (0017's D1 and D2, **built in `adam-workspace`**:
+`GitHubApp::discovering`; the coder's configuration follows), and a pinned App is as this record says. Decision 5's message
+names `GITHUB_APP_INSTALLATION_ID` only for a pinned App (built), and a not-installed account, a suspended installation and an
+owner outside the list are `Auth` or `Invalid` errors of their own. Decision 6's 16 remembered tokens are a bound for one
+installation; 0017's D5 raises it to follow the cache (not built). Decision 8's "GitHub is read through the official server
+over stdio, which holds the App" and the alternative "Let github-mcp-server hold the App" are revisited by 0017's D4: the
+server runs in `http` mode with no credentials and the coder supplies a token per call (not built; until then decision 8
+stands as written, for a pinned App or a token).
+
 ## Context
 
 The coder has one static `GITHUB_TOKEN` (`bin/adam-coder/src/config.rs`), scoped to
