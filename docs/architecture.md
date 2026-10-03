@@ -1389,7 +1389,9 @@ How a run looks to an A2A client (`task_state` in
 
 A turn commits once, so the first model call of a task can last a long time with nothing committed. The
 lease is what says a worker is on the run: `Runtime::view` reads it (`Store::lease_until`, compared with
-the runtime's clock) for a runnable run and sets `RunView::claimed`, and the worker emits
+the runtime's clock) **before** the record, so a step that commits and releases between the two reads is
+read with the version it committed and never as `submitted` again, and sets `RunView::claimed` for a
+runnable run; the worker emits
 `Status(Runnable, claimed)` when it first takes a run, which makes a subscriber read the run again. The
 task is `working` from the claim, in a `tasks/get` read and as a status update to a subscriber, and a
 `steer/v1` message sent during that first call is delivered to the running task. A lease that ran out

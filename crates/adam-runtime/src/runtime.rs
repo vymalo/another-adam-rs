@@ -943,21 +943,20 @@ impl Runtime {
     /// Snapshot of a run from its durable record (`None` if it does not exist).
     #[tracing::instrument(skip(self))]
     pub async fn view(&self, run: RunId) -> Result<Option<RunView>, RuntimeError> {
+        // The lease is read **before** the record. The two reads are not one snapshot, and this
+        // order makes every interleaving harmless: a claim that lands between them reads as not
+        // yet (the next view has it, and a worker emits a status event at once to prompt that
+        // read), and a step that commits and releases between them is read with the version it
+        // committed, so it is `working` from its version. Read the other way round, that step
+        // read as version 1 with no lease, `submitted`, and a subscriber saw `working` go back.
+        // It costs one primary-key read for a view of a parked or finished run.
+        let until = self.inner.store.lease_until(run).await?;
         let Some(rec) = self.inner.store.load_run(run).await? else {
             return Ok(None);
         };
         let env = Envelope::decode(run, &rec.state)?;
-        // Read after the record, and only for a run a worker could be holding: a second read for
-        // every view of a parked or finished run would buy nothing. The two reads are not one
-        // snapshot. A claim that lands between them reads as not yet (the next view has it, and
-        // a worker emits a status event at once to prompt that read); a step that commits and
-        // releases between them reads as `submitted` for one view at most.
-        let claimed = if rec.status == RunStatus::Runnable {
-            let until = self.inner.store.lease_until(run).await?;
-            until.is_some_and(|until| until > self.inner.clock.now())
-        } else {
-            false
-        };
+        let claimed = rec.status == RunStatus::Runnable
+            && until.is_some_and(|until| until > self.inner.clock.now());
         Ok(Some(RunView::new(rec, env, claimed)))
     }
 }
