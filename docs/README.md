@@ -15,6 +15,12 @@ Other places to look:
   [Where to go next](architecture.md#where-to-go-next).
 * [`deploy/coder/README.md`](../deploy/coder/README.md): the Helm chart of the
   coder agent.
+* [`CLAUDE.md`](../CLAUDE.md) and the skills in `.agents/skills/`: the guide for an
+  agent working here, and six skills for the repositories that integrate adam-rs
+  (`adam-agent-folder`, `adam-embed`, `adam-store-adapter`, `adam-a2a-extensions`,
+  `adam-coder-deploy`, `adam-upgrade`). Install them with
+  `npx skills add vymalo/another-adam-rs --skill <name>`; see
+  [Agent context and skills](../README.md#agent-context-and-skills).
 
 ## Writing docs
 
@@ -25,5 +31,5 @@ Other places to look:
 * Mark third-party claims *verified* (with date and source) or *unverified*.
 * Do not copy a crate README. Link to it.
 * `node tools/docs-check/check-docs.mjs` parses every diagram and resolves every
-  relative link and `#heading`. CI runs it in the `docs` job. Install once with
-  `npm --prefix tools/docs-check ci`.
+  relative link and `#heading`, and checks the first-party skills. CI runs it in
+  the `docs` job. Install once with `npm --prefix tools/docs-check ci`.
