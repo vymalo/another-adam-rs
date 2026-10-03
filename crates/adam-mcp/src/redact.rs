@@ -17,7 +17,7 @@ pub(crate) const REDACTED: &str = "[REDACTED]";
 
 /// The values one server's messages must not contain, longest first (so `Bearer abc` goes before
 /// `abc`).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Redactor {
     secrets: Vec<String>,
 }

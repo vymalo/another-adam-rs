@@ -34,7 +34,7 @@ use crate::error::Error;
 use crate::redact::Redactor;
 use crate::text::{MAX_MESSAGE_BYTES, cap_text};
 
-type Service = RunningService<RoleClient, ClientConfig>;
+pub(crate) type Service = RunningService<RoleClient, ClientConfig>;
 
 /// The variables a child process gets when it does not inherit the environment.
 const SAFE_VARS: &[&str] = &[
@@ -273,6 +273,24 @@ async fn next_line<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// Ask `service` (just dialled from `recipe`) for its tools, every page, within the connect timeout.
+pub(crate) async fn list_with(
+    recipe: &Recipe,
+    service: &Service,
+) -> Result<Vec<ListedTool>, Error> {
+    match tokio::time::timeout(recipe.connect_timeout, service.peer().list_all_tools()).await {
+        Ok(Ok(tools)) => Ok(tools),
+        Ok(Err(e)) => Err(Error::ListTools {
+            server: recipe.server.clone(),
+            message: recipe.scrub(&adam_error::report(&e)),
+        }),
+        Err(_) => Err(Error::ListTools {
+            server: recipe.server.clone(),
+            message: format!("no answer within {} ms", recipe.connect_timeout.as_millis()),
+        }),
+    }
+}
+
 /// The state of one connection.
 struct Live {
     service: Option<Service>,
@@ -292,23 +310,7 @@ impl Connection {
     /// Connect for the first time and list the tools. A failure is a startup error.
     pub(crate) async fn open(recipe: Recipe) -> Result<(Arc<Self>, Vec<ListedTool>), Error> {
         let service = recipe.dial().await?;
-        let listed =
-            tokio::time::timeout(recipe.connect_timeout, service.peer().list_all_tools()).await;
-        let tools = match listed {
-            Ok(Ok(tools)) => tools,
-            Ok(Err(e)) => {
-                return Err(Error::ListTools {
-                    server: recipe.server.clone(),
-                    message: recipe.scrub(&adam_error::report(&e)),
-                });
-            }
-            Err(_) => {
-                return Err(Error::ListTools {
-                    server: recipe.server.clone(),
-                    message: format!("no answer within {} ms", recipe.connect_timeout.as_millis()),
-                });
-            }
-        };
+        let tools = list_with(&recipe, &service).await?;
         let connection = Arc::new(Self {
             recipe,
             live: tokio::sync::Mutex::new(Live {
@@ -318,10 +320,6 @@ impl Connection {
             }),
         });
         Ok((connection, tools))
-    }
-
-    pub(crate) fn scrub(&self, text: &str) -> String {
-        self.recipe.scrub(text)
     }
 
     /// The values this server's messages may not repeat.

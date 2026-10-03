@@ -33,15 +33,121 @@ own.
 | Item | What |
 |---|---|
 | `McpServers` | `connect(&McpConfig, &Env, &McpPolicy)`, `tools()` (a `ToolSet`), `names()`, `shutdown()`; `Debug` shows server and tool names only |
-| `McpPolicy` | what the deployment decides: `allow_stdio` (default off), `allow_insecure` (off), `allow_url_secrets` (off: no `${VAR}` in a `url`; if on, filter the `rmcp` log target), `inherit_env` (off), `connect_timeout` (30 s), `call_timeout` (60 s), `thread_tools_max_call` (3600 s: the cap a caller puts on a call to the thread-tools endpoint) |
+| `McpPolicy` | what the deployment decides: `allow_stdio` (default off), `allow_insecure` (off), `allow_url_secrets` (off: no `${VAR}` in a `url`; if on, filter the `rmcp` log target), `inherit_env` (off), `connect_timeout` (30 s), `call_timeout` (60 s), `thread_tools_max_call` (3600 s: the cap a caller puts on a call to the thread-tools endpoint), `bearer_per_call(server, origin, Arc<dyn CallBearer>)` (a server name plus an origin bound to a bearer per call: see *A bearer per call*); `Debug` names the bindings (server and origin) and never a token |
+| `CallBearer` | the deployment's trait: `for_listing()` and `for_call(tool, &arguments)`, each a `SecretString` or a `ToolError` |
 | `Env` | values for `${VAR}`, taken before the process environment; held as secrets, `Debug` shows names only |
-| `Error` | closed enum, every variant names the server and none carries a value from a variable: `Var`, `StdioNotAllowed`, `SseUnsupported`, `Url`, `UrlSecret` (names the variable), `Header`, `Name`, `Spawn`, `Connect`, `ListTools`, `UnknownTool` |
+| `Error` | closed enum, every variant names the server and none carries a value from a variable: `Var`, `StdioNotAllowed`, `SseUnsupported`, `Url`, `UrlSecret` (names the variable), `Header`, `Name`, `Spawn`, `Connect`, `ListTools`, `UnknownTool`, `BearerBinding` (a bearer-per-call binding the file or the bearer does not fit) |
 | `VarProblem`, `UrlProblem` | closed enums inside `Error::Var` and `Error::Url` |
 | `MAX_RESULT_BYTES` | 64 KiB: the most of an answer that reaches the model |
 | `Endpoint::new(url, &SecretString, &McpPolicy)`, `list_tools()`, `call_tool(name, args)`, `call_tool_with(name, args, CallOptions)`, `CallOptions`, `EndpointError`, `RemoteTool` (with the tool's own `meta`), `RemoteResult` | one MCP endpoint a **message** announced, with a bearer token known only at run time, one connection per request: see *An endpoint a message announces* |
 
 `Connect`, `Spawn` and `ListTools` are `ErrorClass::Transient` (the server may be up later); every other variant is
 `Invalid` (the same files and policy never succeed).
+
+**Breaking change: `Error::BearerBinding { server, why }` is a new variant of the closed enum `Error`** (it is not
+`#[non_exhaustive]`, on purpose: a new refusal must fail to compile where it is not handled). A `match` on `Error` with no
+wildcard arm stops compiling and needs one more arm (class `Invalid`, like every refusal of the files and the policy);
+`Classify` and `Display` need no change. The rest of the change is additive: `CallBearer`, `McpPolicy::bearer_per_call`,
+and a hand-written `Debug` for `McpPolicy` (the derived one printed the same settings; the new one adds the bindings).
+`adam-assembly` is unchanged: the policy passes through `connect_mcp`, and its `Error::Mcp` already carries any
+`adam_mcp::Error` as a source.
+
+## A bearer per call
+
+Some servers serve many accounts with one process, and the credential that fits a call depends on what the call is
+about (the GitHub MCP server in `http` mode reads its token from each request's `Authorization`). A token fixed in
+`mcp.json`, or read from the environment at startup, is the wrong shape for that. The **deployment** gives such a
+server its bearer, one call at a time:
+
+```rust
+use std::sync::Arc;
+use adam_mcp::{CallBearer, McpPolicy};
+
+struct Router { /* the deployment's credentials */ }
+
+#[async_trait::async_trait]
+impl CallBearer for Router {
+    async fn for_listing(&self) -> Result<SecretString, ToolError> { /* a placeholder of the right shape */ }
+    async fn for_call(&self, tool: &str, arguments: &Map<String, Value>) -> Result<SecretString, ToolError> {
+        /* choose by what the call is about (`tool` is the name on the server, `arguments` the model's) */
+    }
+}
+
+let policy = McpPolicy::default()
+    .bearer_per_call("github", "http://127.0.0.1:8082", Arc::new(Router { /* .. */ }));
+```
+
+The deployment binds a **name and an origin** (of the URL you give, only scheme, host and port count): the files say
+which servers exist, the deployment says whose credential each one gets. For the server of that name,
+`McpServers::connect`:
+
+* **refuses a file that points it at another origin**, or that gives it an `Authorization` header of its own (any
+  spelling of the name, even one whose `${VAR}` is not set): `Error::BearerBinding { server, why }`, class `Invalid`,
+  before any request and before the bearer is asked. A credential the deployment did not choose is never sent beside, or
+  instead of, the one it did. Other headers are kept and sent with the bearer.
+* **lists the tools with `for_listing`**, on a connection that is closed again. A server that checks the *form* of a token
+  and not its owner accepts a placeholder of the right shape; if the listing needs a real one, the bearer gives it. A
+  permanent error of `for_listing` is `BearerBinding`, a transient one is `ListTools` (class `Transient`, like any
+  server that cannot be listed yet).
+* **dials again for every call**, as `Endpoint` does: `for_call(tool, arguments)` first, then `initialize`
+  (`Authorization: Bearer <token>`), the `tools/call`, close. Nothing is kept between calls, so no session outlives the
+  token it was made with; the price is an `initialize` and a close per call (a loopback round trip each, for a sidecar).
+* **leaves a `stdio` server of that name alone**, with a `warn!` saying it gets no bearer: a process has no origin to send
+  one to, and a folder written before the binding existed keeps working (what it had in `env` it still has).
+
+```mermaid
+sequenceDiagram
+    participant L as LlmAgent (journaled step tool:CALL_ID)
+    participant T as McpTool
+    participant B as CallBearer (the deployment)
+    participant S as MCP server (http, at the bound origin)
+    L->>T: call(ctx, args)
+    T->>B: for_call(tool on the server, arguments)
+    alt Permanent
+        B-->>T: ToolError::Permanent(why)
+        T-->>L: error result "the call to `x` was not sent: why" (nothing was sent)
+    else Transient
+        B-->>T: ToolError::Transient(why)
+        T-->>L: Err(Transient): the runtime retries the step (nothing was sent)
+    else a token
+        B-->>T: token
+        T->>S: initialize (Authorization: Bearer token), within connect_timeout
+        S-->>T: initialized
+        T->>S: tools/call, within call_timeout and ctx.cancelled()
+        S-->>T: result
+        T->>S: close
+        T-->>L: ToolOutput scrubbed of the token, Bearer token and every expanded value
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Checked: connect (URL at the bound origin, no Authorization header in the file)
+    Checked --> Refused: another origin, or an Authorization header
+    Checked --> Listed: for_listing, one connection, tools/list, closed
+    Listed --> Calling: a call
+    Calling --> Listed: the result, or an error result (the connection is closed either way)
+    Listed --> Closed: shutdown
+    Closed --> [*]: later calls are error results
+```
+
+* **What `for_call` decides.** `ToolError::Permanent(why)` is an **error result** for the model, `the call to
+  `<server>__<tool>` was not sent: <why>`, and **nothing is sent** (say what the model can do about it).
+  `ToolError::Transient(why)` is **returned as it is**: the run's step fails transiently and the runtime retries it, which
+  cannot repeat a call because nothing reached the server. This is the one `Transient` this crate produces; a failure of
+  the server's own is still never one (see *A call*). Any other `ToolError` is returned as it is, nothing sent. A token
+  that is empty or cannot be a header value is an error result, without being shown.
+* **The token is a secret of that call**: registered with the redactor of its connection, alone and as `Bearer <token>`,
+  so no tool result, no error (a failed dial included) and no log line of this crate carries it (the tests read the logs at
+  `TRACE`). `Debug` of the policy names a binding by server and origin and never a bearer.
+* **A failed dial** (the server refused the token, was down) is an error result `the call to `x` was not made: <the
+  connection error, scrubbed>`; nothing of the call was sent.
+* **At-least-once still holds** for what was sent: a replay of a committed step returns the recorded result and asks the
+  bearer for nothing; a step that failed before it committed asks again and may call the server again.
+* **`shutdown()`** makes later calls of a bound server error results, as for a kept one; a call in flight finishes on its
+  own connection.
+* **Many calls at once** each get their own connection and ask the bearer concurrently: the bearer is shared and must
+  serialise what needs it (a cache of minted tokens, say).
 
 ## An endpoint a message announces
 
@@ -120,7 +226,8 @@ by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A 
   without userinfo, query and fragment, and with every value a variable put into it replaced by `[REDACTED]`
   (so, with the opt-in, a secret in the path or the host is not shown either). The rules are those of remote subagents (`a2a:`), whose helpers were copied (with a
   comment saying where from) rather than shared, because the two crates do not depend on each other.
-* **Headers** are sent on every request, values marked sensitive. A header the transport owns
+* **Headers** are sent on every request, values marked sensitive (on a server the deployment bound to a bearer per call,
+  never an `Authorization` header: see *A bearer per call*). A header the transport owns
   (`Accept`, `Mcp-Session-Id`, `Last-Event-ID`: *verified 2026-09-29*, `RESERVED_HEADERS` in the `rmcp` source) is
   refused by `rmcp` when the first request is made, which is a startup error (`Error::Connect`).
 * **`tools:`** (an adam extension) is an allow-list: exactly the listed tools, in the list's order; a listed tool the
@@ -197,7 +304,8 @@ stateDiagram-v2
   returned no content)`. It is **scrubbed of every value a `${VAR}` put into the server's text** (`[REDACTED]`;
   success text and `isError` text alike) and then cut at 64 KiB on a character boundary with a note. `isError: true` is an error
   *result* (the model reads it and the run goes on).
-* **Every failure of a call is an error result, never a `ToolError`.** In particular never
+* **Every failure of a call is an error result, never a `ToolError`** (the one exception is the deployment's own
+  bearer saying `Transient` before anything is sent: see *A bearer per call*). In particular a server's failure is never
   `ToolError::Transient`: an MCP call has no idempotency key, so a call that failed on the way may or may not have
   run, and retrying it is not this crate's decision. The result says "it may or may not have run on the MCP
   server; check before you repeat it". That covers a server that answered with a protocol error (its message,
@@ -321,6 +429,23 @@ per test): none relies on another test's runtime to reap a process or to install
   restarted between two calls (four POSTs exactly, counted by the testkit: no request is sent again after a `404`,
   which `reinit_on_expired_session(true)` would do and the test then fails); a slow
   call as an error result while the session stays usable; cancellation returning at once; shutdown.
+* `tests/http.rs`, a bearer per call (`McpPolicy::bearer_per_call`; the testkit's `authorizations()` records the header of
+  every request, so each phase is read off it): `listing_uses_the_listing_bearer` (every request of the listing carries it,
+  one listing, the per-call bearer not asked), `a_per_call_bearer_is_sent_with_each_call` (each call's requests carry
+  that call's token, the bearer is asked with the tool's name on the server and the model's arguments, one `initialize` per
+  call, no token in any log at `TRACE` or `Debug`), `a_refused_bearer_is_the_tools_error_result_and_nothing_is_sent`
+  (a permanent refusal, and an empty token: the server saw no request), `a_transient_bearer_failure_is_a_transient_tool_error`,
+  `a_binding_to_another_origin_is_refused_at_connect` (another server, a binding that is no origin, and the same origin
+  spelled with another path), `a_static_authorization_header_with_a_binding_is_refused` (three spellings, a variable that is
+  not set, and the file's secret never shown; other headers kept), `the_per_call_bearer_is_scrubbed_from_results` (the token
+  and `Bearer <token>` a server hands back; each call scrubbed of its own), a listing the server or the bearer refuses
+  (`a_server_that_refuses_the_listing_bearer_fails_connect_without_showing_it`,
+  `a_bearer_refused_for_listing_fails_connect_by_its_class`), and a server of another name left unbound, with `shutdown`
+  closing a bound one. Every port in these tests is a started `TestHttpServer`, a listener; none holds a socket that is only
+  bound, which a parallel test's server could share on CI (see vymalo/another-adam-rs#80). Unit tests
+  in `src/policy.rs`: `Debug` without a token, and what an origin is (scheme, host, port; a default port is none).
+* `tests/stdio.rs` (testkit), `a_stdio_server_of_the_bound_name_is_left_alone`: the bound name on a local process
+  connects and works as before, the bearer is never asked, and the log says why.
 * `tests/endpoint.rs`: against the testkit's fake thread-tools endpoint: listing and listing again after the tools
   change (one `initialize` per request), a call with its structured content and its text, a tool that failed (`isError`)
   and an unknown tool (`Rejected`), arguments reaching the tool, the token on every request and never shown, a token

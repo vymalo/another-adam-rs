@@ -7,10 +7,13 @@ use std::time::Duration;
 
 use adam_agent_fs::McpConfig;
 use adam_error::{Classify, ErrorClass};
+use adam_llm_agent::ToolError;
 use adam_llm_agent::{ToolCtx, ToolOutput, ToolSet};
-use adam_mcp::{Env, Error, McpPolicy, McpServers};
+use adam_mcp::{CallBearer, Env, Error, McpPolicy, McpServers};
 use adam_mcp_testkit::{LogCapture, wait_until};
 use adam_runtime::NoopSink;
+use async_trait::async_trait;
+use secrecy::SecretString;
 use serde_json::{Value, json};
 
 const SERVER: &str = env!("CARGO_BIN_EXE_adam-mcp-test-server");
@@ -324,5 +327,50 @@ async fn stderr_is_logged_without_expanded_values() {
     let text = logs.text();
     assert!(text.contains("echoing the variable: [REDACTED]"), "{text}");
     assert!(!text.contains(secret), "the secret is in the logs");
+    servers.shutdown().await;
+}
+
+/// A bearer that must never be asked for: the server it is bound to is not an `http` one.
+struct Never;
+
+#[async_trait]
+impl CallBearer for Never {
+    async fn for_listing(&self) -> Result<SecretString, ToolError> {
+        panic!("a stdio server has no bearer to list with");
+    }
+
+    async fn for_call(
+        &self,
+        _tool: &str,
+        _arguments: &serde_json::Map<String, Value>,
+    ) -> Result<SecretString, ToolError> {
+        panic!("a stdio server has no bearer to call with");
+    }
+}
+
+#[tokio::test]
+async fn a_stdio_server_of_the_bound_name_is_left_alone() {
+    // A folder written before the binding existed: its `github` is a local process. The deployment
+    // binds the name to an origin, which a process has not: the server connects and works as it
+    // did, the bearer is never asked for, and the log says why.
+    let logs = LogCapture::start();
+    let policy =
+        allowed().bearer_per_call("t", "http://127.0.0.1:8082", std::sync::Arc::new(Never));
+    let servers = McpServers::connect(&one(json!({})), &Env::new(), &policy)
+        .await
+        .unwrap();
+    let tools = servers.tools();
+    assert_eq!(
+        call(&tools, "t__echo", json!({"text": "as before"}))
+            .await
+            .content,
+        "as before"
+    );
+    let text = logs.text();
+    assert!(
+        text.contains("gives a bearer per call to an MCP server of this name")
+            && text.contains("local process"),
+        "{text}"
+    );
     servers.shutdown().await;
 }

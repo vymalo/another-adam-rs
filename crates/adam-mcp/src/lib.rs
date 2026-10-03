@@ -11,10 +11,15 @@
 //! `ToolError::Transient`: MCP has no idempotency key, so the call may or may not have run and retrying
 //! it is not this crate's decision. Inside an `LlmAgent` the call is a journaled step, so a replay of a
 //! committed call does not repeat it, and a transition that fails before it commits does (at-least-once).
+//! A deployment can give a server a bearer token **per call** ([`McpPolicy::bearer_per_call`],
+//! [`CallBearer`]), for a server that serves many accounts with one process; its calls then each
+//! get a connection of their own, and the one `ToolError::Transient` there is comes from the
+//! deployment's bearer, before anything is sent.
 //! `adam-assembly` (feature `mcp`) wires this into each agent; the README has the diagrams, the
 //! security notes and the facts about the SDK.
 #![warn(missing_docs)]
 
+mod bearer;
 mod connection;
 mod error;
 mod expand;
@@ -30,7 +35,8 @@ pub use error::{Error, UrlProblem, VarProblem};
 pub use expand::Env;
 pub use once::{CallOptions, Endpoint, EndpointError, RemoteResult, RemoteTool};
 pub use policy::{
-    DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_THREAD_TOOLS_MAX_CALL, McpPolicy,
+    CallBearer, DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_THREAD_TOOLS_MAX_CALL,
+    McpPolicy,
 };
 pub use servers::McpServers;
 pub use text::MAX_RESULT_BYTES;
