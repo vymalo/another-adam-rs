@@ -14,8 +14,10 @@ names `GITHUB_APP_INSTALLATION_ID` only for a pinned App (built), and a not-inst
 owner outside the list are `Auth` or `Invalid` errors of their own. Decision 6's 16 remembered tokens are a bound for one
 installation; 0017's D5 raises it to follow the cache (not built). Decision 8's "GitHub is read through the official server
 over stdio, which holds the App" and the alternative "Let github-mcp-server hold the App" are revisited by 0017's D4: the
-server runs in `http` mode with no credentials and the coder supplies a token per call (not built; until then decision 8
-stands as written, for a pinned App or a token).
+server runs in `http` mode, as a sidecar, with no credentials, and the coder supplies the token of each call (**built for
+a token and a pinned App**: the shipped `mcp.json` is the `http` form, `GITHUB_MCP_URL` says where the sidecar is, the chart
+runs it). So decision 8's `MCP_ALLOW_STDIO`, the `GITHUB_APP_*` variables handed to a child process and the App's key as
+a file for that child no longer describe the shipped file, and the key is nowhere but in the coder.
 
 ## Context
 

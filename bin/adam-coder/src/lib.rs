@@ -24,6 +24,7 @@
 //! | [`tools`] | the nine tools of the coder (`#[tool]` functions reading [`ToolEnv`] from the agent's state; the screen's three, `ask_user`, `show` and `ui_catalog`, are `adam-ui`'s) and [`CoderSettings`] |
 //! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`, or read at startup from the folder `ADAM_AGENT_DIR` names) |
 //! | [`files`] | [`AgentFiles`]: where those files come from, the embedded copy or a folder read once at startup, and why a folder is refused ([`AgentFilesError`]) |
+//! | [`github_mcp`] | [`GitHubReadBearer`]: the coder's credentials as the bearer of each call to the GitHub MCP server (`http` mode, a sidecar), chosen by the owner and repository the call is about |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
 //! | [`janitor`] | [`Janitor`]: the sweep that removes the workspaces of finished runs, a worker component of the process |
@@ -85,6 +86,7 @@ pub mod app;
 pub mod config;
 pub mod exit;
 pub mod files;
+pub mod github_mcp;
 pub mod janitor;
 pub mod opencode;
 pub mod redact;
@@ -97,6 +99,7 @@ pub use app::{Coder, LiveSignals, RuntimeOptions, agent_card, agent_card_from};
 pub use config::{Config, ConfigError, GitHubAppConfig, GitHubAuth, McpSettings, WorkerConfig};
 pub use exit::exit_code;
 pub use files::{AgentFiles, AgentFilesError};
+pub use github_mcp::GitHubReadBearer;
 pub use janitor::Janitor;
 pub use redact::{RedactingCredentials, Redactor};
 pub use repos::workspaces_for;

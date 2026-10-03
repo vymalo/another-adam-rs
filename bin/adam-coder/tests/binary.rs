@@ -15,7 +15,8 @@ use a2a::{Message, Part, Role, SendMessageRequest, StreamResponse, TaskState};
 use adam_core::{RunId, RunStatus};
 use common::pg::TestDb;
 // A folder here is the shipped agent without its `mcp.json` (the shipped one names the GitHub
-// server, a local process: see `common::plain_folder`); the tests of `mcp.json` write their own.
+// server's sidecar, which a test would have to run: see `common::plain_folder`); the tests of
+// `mcp.json` write their own.
 use common::{chat_response, edit_instructions, plain_folder as folder, text_reply, tool_reply};
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -51,9 +52,10 @@ fn plain_agent_dir() -> &'static Path {
 /// tests never collide) and logs the address it got; [`Proc::ready`] reads it.
 ///
 /// The agent files are a folder: the shipped `agent/` without its `mcp.json` ([`plain_agent_dir`]),
-/// because the shipped file starts the GitHub MCP server, a local process that needs
-/// `MCP_ALLOW_STDIO` and the `github-mcp-server` binary. A test of the embedded copy removes
-/// `ADAM_AGENT_DIR`; [`the_embedded_agent_connects_the_real_github_mcp_server`] does, with both.
+/// because the shipped file names the GitHub MCP server's sidecar (127.0.0.1:8082), which has to be
+/// running. A test of the embedded copy removes `ADAM_AGENT_DIR`;
+/// [`the_embedded_agent_connects_the_real_github_mcp_server`] runs the real server and a folder
+/// with the shipped file and its port.
 fn valid_env(database_url: &str, workspace: &Path) -> Vec<(String, String)> {
     let env = |k: &str, v: String| (k.to_owned(), v);
     vec![
@@ -884,53 +886,115 @@ async fn an_mcp_server_that_cannot_be_connected_stops_the_worker_with_the_code_o
     db.finish().await;
 }
 
-/// The shipped agent names the GitHub MCP server, a local process, so a worker on the embedded
-/// copy stops at startup unless the deployment allows local processes (`MCP_ALLOW_STDIO`, which
-/// the coder's deployment sets, not the image) and the binary is there: 78 when it is not allowed, 69 when it is allowed
-/// and is not on `PATH` (a supervisor may retry: the image may be mid-roll). Never in the middle of
-/// a run, and never with a value of a variable in the message.
+/// The shipped agent names the GitHub MCP server's sidecar over http (127.0.0.1:8082) and the
+/// deployment binds that server to the coder's credentials at `GITHUB_MCP_URL`, so a worker on the
+/// embedded copy stops at startup unless the sidecar is there: 69 when nothing answers (a supervisor
+/// retries: the pod's sidecar may be starting), and 78 when `GITHUB_MCP_URL` names another origin
+/// than the file does (the files and the deployment disagree: a bearer the deployment gave for one
+/// place is never sent to another). Never in the middle of a run, and never with a credential in the
+/// message. The local-process flag has nothing to do with it any more.
 #[tokio::test]
-async fn the_embedded_agent_needs_mcp_allow_stdio_and_the_github_server_on_path() {
+async fn the_embedded_agent_needs_the_github_server_at_github_mcp_url() {
     let tmp = tempfile::tempdir().unwrap();
     // Failing before anything connects: Postgres need not exist.
     let mut env = role_env("worker", "postgres://u:p@127.0.0.1:1/x", tmp.path());
     env.retain(|(k, _)| k != "ADAM_AGENT_DIR");
-    let empty_path = tmp.path().join("no-binaries");
-    std::fs::create_dir_all(&empty_path).unwrap();
-    env.push(("PATH".into(), empty_path.to_string_lossy().into_owned()));
 
-    let mut p = Proc::spawn(&env);
+    // Another origin than the file's: refused at once, naming the server and the variable.
+    let mut other = env.clone();
+    other.push(("GITHUB_MCP_URL".into(), "http://127.0.0.1:9".into()));
+    let mut p = Proc::spawn(&other);
     let status = p.exit_within(Duration::from_secs(30)).await;
     assert_eq!(status.code(), Some(78), "{}", p.logs());
     let err = failure(&p)["error"].as_str().unwrap().to_owned();
     assert!(err.contains("connecting the MCP servers"), "{err}");
-    assert!(err.contains("MCP_ALLOW_STDIO"), "{err}");
     assert!(err.contains("github"), "the server is named:\n{err}");
+    assert!(
+        err.contains("GITHUB_MCP_URL"),
+        "the variable is named:\n{err}"
+    );
     assert!(!err.contains(GITHUB_TOKEN), "{err}");
 
-    env.push(("MCP_ALLOW_STDIO".into(), "true".into()));
+    // The file's own origin, with nothing listening on it: the sidecar may be up later.
+    if std::net::TcpStream::connect("127.0.0.1:8082").is_ok() {
+        eprintln!("not asserting 69: something listens on 127.0.0.1:8082 here");
+        return;
+    }
     let mut p = Proc::spawn(&env);
     let status = p.exit_within(Duration::from_secs(30)).await;
     assert_eq!(status.code(), Some(69), "{}", p.logs());
     let err = failure(&p)["error"].as_str().unwrap().to_owned();
     assert!(err.contains("github"), "{err}");
-    assert!(
-        err.contains("github-mcp-server"),
-        "the binary is named:\n{err}"
-    );
     assert!(!err.contains(GITHUB_TOKEN), "{err}");
 }
 
-/// The shipped agent against the **real** `github-mcp-server` (the one the coder image carries,
-/// `ADAM_TEST_GITHUB_MCP_SERVER` = the path of that binary, for example copied out of the image
-/// with `docker cp`; skipped without it): a worker on the embedded copy connects it as a child
-/// process, the model is offered the twelve read tools and no write tool, a call reaches GitHub
-/// (a mock, through `GITHUB_MCP_HOST`) with the credentials of the mode the coder runs in, and no
-/// credential is in the logs. Two modes, in one test because they share the binary: a token (the
-/// server reads it as `GITHUB_PERSONAL_ACCESS_TOKEN`, and the `GITHUB_APP_*` variables the file
-/// passes are empty) and a GitHub App (the file passes an **empty** `GITHUB_PERSONAL_ACCESS_TOKEN`:
-/// the server counts it as unset, signs a JWT with the key file, trades it at the installation's
-/// token endpoint and calls with the token it gets).
+/// A free local port (bound and released: another process could take it, which a test of one
+/// machine accepts).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A running `github-mcp-server http`, killed when dropped.
+struct GitHubMcpSidecar {
+    _child: Child,
+}
+
+impl GitHubMcpSidecar {
+    /// Start `binary` as the chart's sidecar does (`--read-only`, the four toolsets, loopback), on
+    /// `port`, with `github` as the GitHub host. It gets **no** credential and no environment: the
+    /// token of each request is all it ever has.
+    async fn start(binary: &Path, port: u16, github: &str) -> Self {
+        let child = Command::new(binary)
+            .args([
+                "http",
+                "--read-only",
+                "--toolsets",
+                "context,repos,issues,pull_requests",
+            ])
+            .args(["--listen-host", "127.0.0.1", "--port", &port.to_string()])
+            .args(["--gh-host", github])
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("github-mcp-server starts");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "github-mcp-server http does not listen on {port}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Self { _child: child }
+    }
+}
+
+/// The shipped agent against the **real** `github-mcp-server` in `http` mode, the way the chart runs
+/// it (`ADAM_TEST_GITHUB_MCP_SERVER` = the path of that binary, for example copied out of the image
+/// with `docker cp`; skipped without it, and without Postgres): the server is a sidecar with no
+/// credential, the worker on the shipped `mcp.json` (its URL moved to a free port: the only change)
+/// lists its tools at startup and the model is offered the twelve read tools and no write tool.
+///
+/// * **F10 of ADR 0017**: after startup, before any run, the mock GitHub has received **zero**
+///   requests. The listing carries the placeholder bearer and the server does not call GitHub for it.
+/// * A call reaches GitHub (a mock, the server's `--gh-host`) carrying **the coder's credentials of
+///   that call**: the personal access token, or the pinned installation's token the coder minted
+///   (once: the second call is the cached token). Never the placeholder.
+/// * No credential is in the logs.
+///
+/// Two modes, in one test because they share the binary: a token, and a GitHub App pinned to its
+/// installation (`GITHUB_APP_INSTALLATION_ID`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_embedded_agent_connects_the_real_github_mcp_server() {
     let Some(binary) = std::env::var_os("ADAM_TEST_GITHUB_MCP_SERVER")
@@ -944,21 +1008,12 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    // The binary, named as the shipped `mcp.json` names it, on the `PATH` of the coder only.
-    let bin = tmp.path().join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::os::unix::fs::symlink(&binary, bin.join("github-mcp-server")).unwrap();
-    let search_path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
     let key = Arc::new(adam_workspace::testing::TestAppKey::generate());
 
     for app in [false, true] {
-        let mode = if app { "App" } else { "token" };
+        let mode = if app { "pinned App" } else { "token" };
         let github = MockServer::start().await;
-        // What the server asks a classic token's scopes of at startup (`ghp_`), and the call below.
+        // What the server asks of a classic token's scopes (`ghp_`), and the two calls below.
         Mock::given(method("HEAD"))
             .and(path("/api/v3/"))
             .respond_with(ResponseTemplate::new(200).insert_header("X-OAuth-Scopes", "repo"))
@@ -972,9 +1027,18 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
             )
             .mount(&github)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/repos/acme/widgets/branches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"name": "trunk-of-widgets", "protected": false,
+                 "commit": {"sha": "0123456789abcdef0123456789abcdef01234567", "url": "https://example.invalid/c"}}
+            ])))
+            .mount(&github)
+            .await;
+        // The coder's own REST root: the trade of a JWT for the installation token.
         let minted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Mock::given(method("POST"))
-            .and(path("/api/v3/app/installations/67890/access_tokens"))
+            .and(path("/app/installations/67890/access_tokens"))
             .respond_with(MintToken {
                 key: key.clone(),
                 minted: minted.clone(),
@@ -989,30 +1053,65 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
             .respond_with(Script {
                 replies: vec![
                     tool_reply("g1", "github__get_me", json!({})),
-                    text_reply("You are octocat."),
+                    tool_reply(
+                        "g2",
+                        "github__list_branches",
+                        json!({"owner": "acme", "repo": "widgets"}),
+                    ),
+                    text_reply("You are octocat, and acme/widgets has trunk-of-widgets."),
                 ],
                 asked,
             })
             .mount(&model)
             .await;
 
-        let work = tmp.path().join(format!("work-{mode}"));
+        // The sidecar, with no credential, and the shipped folder with only its port changed.
+        let port = free_port();
+        let _sidecar = GitHubMcpSidecar::start(&binary, port, &github.uri()).await;
+        let agent = common::folder();
+        let file = agent.path().join("agent/mcp.json");
+        let shipped = std::fs::read_to_string(&file).unwrap();
+        assert!(shipped.contains("127.0.0.1:8082"), "{shipped}");
+        std::fs::write(
+            &file,
+            shipped.replace("127.0.0.1:8082", &format!("127.0.0.1:{port}")),
+        )
+        .unwrap();
+
+        let work = tmp.path().join(format!("work-{}", mode.replace(' ', "-")));
         let mut env = if app {
             app_env(&db.url(), &work, &key, tmp.path())
         } else {
             valid_env(&db.url(), &work)
         };
-        // The embedded copy, with the deployment's two settings: the coder's `MCP_ALLOW_STDIO`, and
-        // the mock as the GitHub host, which is plain http to this machine.
         env.retain(|(k, _)| k != "ADAM_AGENT_DIR");
         env.extend([
+            (
+                "ADAM_AGENT_DIR".to_owned(),
+                agent.path().to_string_lossy().into_owned(),
+            ),
             ("MODEL_BASE_URL".to_owned(), model.uri()),
-            ("PATH".to_owned(), search_path.clone()),
-            ("MCP_ALLOW_STDIO".to_owned(), "true".to_owned()),
-            ("GITHUB_MCP_HOST".to_owned(), github.uri()),
+            ("GITHUB_API_URL".to_owned(), github.uri()),
+            (
+                "GITHUB_MCP_URL".to_owned(),
+                format!("http://127.0.0.1:{port}"),
+            ),
         ]);
         let mut coder = Proc::spawn(&env);
         let addr = coder.ready().await;
+        // F10: the coder connected the server and listed its tools with the placeholder bearer,
+        // and GitHub was not asked a thing.
+        assert!(
+            coder.logs().contains("connected to the MCP server"),
+            "{mode}: {}",
+            coder.logs()
+        );
+        let at_startup = github.received_requests().await.unwrap();
+        assert!(
+            at_startup.is_empty(),
+            "{mode}: GitHub received requests at startup: {at_startup:?}"
+        );
+
         let client = common::a2a_client(addr, A2A_TOKEN).await;
         let mut stream = client
             .send_streaming_message(&SendMessageRequest {
@@ -1074,48 +1173,73 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
             offered[0], "prepare_workspace",
             "the coder's own come first: {offered:?}"
         );
-        // The call reached the real server, and the answer is what GitHub (the mock) said.
-        let second: Value = serde_json::from_slice(&requests[1].body).unwrap();
-        let answer = second["messages"].as_array().unwrap().last().unwrap()["content"]
-            .as_str()
+        // The calls reached the real server, and the answers are what GitHub (the mock) said.
+        let last_request: Value =
+            serde_json::from_slice(&requests[requests.len() - 1].body).unwrap();
+        let tool_results: Vec<String> = last_request["messages"]
+            .as_array()
             .unwrap()
-            .to_owned();
-        assert!(answer.contains("octocat"), "{mode}: {answer}");
-
-        // The credentials the server called GitHub with are the coder's own, in the mode it runs in.
-        let seen = github.received_requests().await.unwrap();
-        let user: Vec<_> = seen
             .iter()
-            .filter(|r| r.url.path() == "/api/v3/user")
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap_or_default().to_owned())
             .collect();
-        assert_eq!(user.len(), 1, "{mode}: {seen:?}");
-        let bearer = user[0]
-            .headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_else(|| panic!("{mode}: no bearer: {seen:?}\n{}", coder.logs()));
-        if app {
-            assert_eq!(
-                bearer,
-                format!("Bearer {APP_TOKEN}"),
-                "the token it traded for"
-            );
-            assert_eq!(minted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(tool_results.len(), 2, "{mode}: {tool_results:?}");
+        assert!(
+            tool_results[0].contains("octocat"),
+            "{mode}: {}",
+            tool_results[0]
+        );
+        assert!(
+            tool_results[1].contains("trunk-of-widgets"),
+            "{mode}: {}",
+            tool_results[1]
+        );
+
+        // The credentials the server called GitHub with are the coder's own, one per call, in the
+        // mode it runs in: never the listing's placeholder.
+        let seen = github.received_requests().await.unwrap();
+        let want = if app {
+            format!("Bearer {APP_TOKEN}")
         } else {
-            assert_eq!(bearer, format!("Bearer {GITHUB_TOKEN}"));
+            format!("Bearer {GITHUB_TOKEN}")
+        };
+        for api_path in ["/api/v3/user", "/api/v3/repos/acme/widgets/branches"] {
+            let calls: Vec<_> = seen.iter().filter(|r| r.url.path() == api_path).collect();
+            assert_eq!(calls.len(), 1, "{mode} {api_path}: {seen:?}");
+            let bearer = calls[0]
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_else(|| {
+                    panic!("{mode} {api_path}: no bearer: {seen:?}\n{}", coder.logs())
+                });
+            assert_eq!(bearer, want, "{mode} {api_path}");
+        }
+        assert!(
+            seen.iter().all(|r| !format!("{:?}", r.headers)
+                .contains(adam_coder::github_mcp::LISTING_ONLY_BEARER)),
+            "{mode}: the placeholder reached GitHub: {seen:?}"
+        );
+        if app {
+            // One mint serves both calls (the second is the cached token), by the coder and not by
+            // the server, which holds no key.
+            assert_eq!(
+                minted.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{mode}"
+            );
+        } else {
             assert_eq!(
                 minted.load(std::sync::atomic::Ordering::SeqCst),
                 0,
-                "no App, no trade"
+                "{mode}: no App, no trade"
             );
-            // A classic token's scopes are asked of GitHub once, at startup, as the server does.
-            assert!(seen.iter().any(|r| r.method.as_str() == "HEAD"), "{seen:?}");
         }
 
         coder.sigterm().await;
         let status = coder.exit_within(Duration::from_secs(30)).await;
         assert_eq!(status.code(), Some(0), "{mode}: {}", coder.logs());
-        let visible = format!("{}{answer}", coder.logs());
+        let visible = format!("{}{}", coder.logs(), tool_results.concat());
         for secret in [GITHUB_TOKEN, APP_TOKEN] {
             assert!(!visible.contains(secret), "{mode}: {secret} is visible");
         }

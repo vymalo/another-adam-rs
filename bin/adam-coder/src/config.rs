@@ -24,6 +24,7 @@
 //! | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees; empty turns the tool off | empty (off) |
 //! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
 //! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
+//! | `GITHUB_MCP_URL` | where the GitHub MCP server (`github-mcp-server http`, a sidecar of the pod) listens, for the agent folder's `mcp.json`: only the origin counts, and the folder's `github` server must be at it. The coder gives that server the credentials of each call ([`GitHubReadBearer`](crate::GitHubReadBearer)); the server holds none | `http://127.0.0.1:8082` |
 //! | `WORKSPACE_ROOT` | mirrors and worktrees (persistent storage) | `/work` |
 //! | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` ([`adam_host::Placement`]); `a2a-only` is refused | `shared` |
 //! | `WORKER_ID` | stable identity of this worker: the lease identity and, with `affinity` or `isolated`, the run owner; letters, digits, `.`, `_`, `-` | random per process; required for `affinity` and `isolated` |
@@ -148,6 +149,10 @@ pub struct WorkerConfig {
     pub allow_local_repos: bool,
     /// `GITHUB_API_URL`.
     pub github_api_url: Url,
+    /// `GITHUB_MCP_URL`: where the GitHub MCP server is, which the `github` server of the agent
+    /// folder's `mcp.json` has to be at (only the origin counts). The coder binds the credentials
+    /// of each call to it ([`GitHubReadBearer`](crate::GitHubReadBearer)).
+    pub github_mcp_url: Url,
     /// `WORKSPACE_ROOT`. Use [`WorkerConfig::placed_root`] for the folder the worker works in.
     pub workspace_root: PathBuf,
     /// `WORKSPACE_PLACEMENT`. Never [`Placement::A2aOnly`]: the parser refuses it.
@@ -616,6 +621,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("create_repo_owners", &self.create_repo_owners)
             .field("allow_local_repos", &self.allow_local_repos)
             .field("github_api_url", &self.github_api_url.as_str())
+            .field("github_mcp_url", &self.github_mcp_url.as_str())
             .field("workspace_root", &self.workspace_root)
             .field("placement", &self.placement)
             .field("worker_id", &self.worker_id)
@@ -810,15 +816,42 @@ impl WorkerConfig {
                 }
             },
         };
+        let github_mcp_url = match get("GITHUB_MCP_URL") {
+            None => Url::parse(DEFAULT_GITHUB_MCP_URL).ok(),
+            Some(raw) => match Url::parse(raw.trim()) {
+                Ok(u) if u.username().is_empty() && u.password().is_none() => {
+                    if matches!(u.scheme(), "http" | "https") && u.host().is_some() {
+                        Some(u)
+                    } else {
+                        problems.push("GITHUB_MCP_URL must be an http(s) URL".into());
+                        None
+                    }
+                }
+                Ok(_) => {
+                    problems.push(
+                        "GITHUB_MCP_URL must not carry credentials: the coder sends the \
+                         credentials of each call itself"
+                            .into(),
+                    );
+                    None
+                }
+                Err(e) => {
+                    problems.push(format!("GITHUB_MCP_URL is not a URL: {e}"));
+                    None
+                }
+            },
+        };
         let opencode_command: Vec<String> = get("OPENCODE_COMMAND")
             .unwrap_or_else(|| "opencode acp".to_owned())
             .split_whitespace()
             .map(str::to_owned)
             .collect();
 
-        // `github` and `github_api_url` are `None` only after a problem was recorded above.
+        // `github`, `github_api_url` and `github_mcp_url` are `None` only after a problem was
+        // recorded above.
         let github = github?;
         let github_api_url = github_api_url?;
+        let github_mcp_url = github_mcp_url?;
         Some(Self {
             model,
             opencode_model,
@@ -827,6 +860,7 @@ impl WorkerConfig {
             create_repo_owners,
             allow_local_repos,
             github_api_url,
+            github_mcp_url,
             workspace_root,
             placement,
             worker_id: settings.worker_id.clone(),
@@ -867,6 +901,9 @@ fn is_account_name(owner: &str) -> bool {
 const DEFAULT_REPO_HOST: &str = "github.com";
 /// API root used when `GITHUB_API_URL` is unset.
 const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
+/// Where the GitHub MCP server is when `GITHUB_MCP_URL` is unset: the sidecar of the pod, on the
+/// port of `github-mcp-server http`.
+const DEFAULT_GITHUB_MCP_URL: &str = "http://127.0.0.1:8082";
 
 /// `name` or `name:port`: letters, digits, dots and dashes, nothing that could
 /// smuggle a scheme, path, userinfo or wildcard into an allowlist.
@@ -1122,6 +1159,43 @@ mod tests {
         let mut vars = full();
         vars.insert("GITHUB_API_URL", "not a url");
         assert!(parse(&vars).is_err());
+    }
+
+    /// `GITHUB_MCP_URL` is the GitHub MCP server's sidecar by default, any http(s) URL without
+    /// credentials otherwise, and a worker's variable only: a control plane connects no server.
+    #[test]
+    fn the_github_mcp_server_is_the_sidecar_unless_told_otherwise() {
+        let c = worker(&full());
+        assert_eq!(c.github_mcp_url.as_str(), "http://127.0.0.1:8082/");
+        let mut vars = full();
+        vars.insert("GITHUB_MCP_URL", "http://mock-github-mcp:8080");
+        assert_eq!(
+            worker(&vars).github_mcp_url.origin().ascii_serialization(),
+            "http://mock-github-mcp:8080"
+        );
+        for bad in [
+            "not a url",
+            "ftp://mcp.example",
+            "unix:///run/mcp.sock",
+            "http://user:pass@mcp.example",
+        ] {
+            let mut vars = full();
+            vars.insert("GITHUB_MCP_URL", bad);
+            let err = parse(&vars).unwrap_err();
+            assert!(
+                err.problems.iter().any(|p| p.starts_with("GITHUB_MCP_URL")),
+                "{bad}: {:?}",
+                err.problems
+            );
+            assert!(
+                !err.to_string().contains("pass"),
+                "no credential in the error: {err}"
+            );
+        }
+        let mut vars = full();
+        vars.insert("ROLE", "control-plane");
+        vars.insert("GITHUB_MCP_URL", "garbage");
+        assert!(parse(&vars).is_ok(), "a control plane does not read it");
     }
 
     #[test]
