@@ -172,6 +172,18 @@ pub enum Error {
         /// Why, without any expanded value.
         message: String,
     },
+    /// The deployment bound this server to a bearer per call
+    /// ([`McpPolicy::bearer_per_call`](crate::McpPolicy::bearer_per_call)) and the file or the
+    /// bearer does not fit the binding: the server is at another origin, it sets its own
+    /// `Authorization` header, or the listing bearer was refused. Nothing was requested for the
+    /// first two. `why` never carries a token.
+    #[error("MCP server `{server}`: bearer per call refused: {why}")]
+    BearerBinding {
+        /// The server.
+        server: String,
+        /// Why, without any token.
+        why: String,
+    },
     /// The allow-list (`tools:`) names a tool the server does not have.
     #[error(
         "MCP server `{server}`: `tools` names `{tool}`, which the server does not offer; it \
@@ -213,6 +225,7 @@ impl Classify for Error {
             | Self::UrlSecret { .. }
             | Self::Header { .. }
             | Self::Name { .. }
+            | Self::BearerBinding { .. }
             | Self::UnknownTool { .. } => ErrorClass::Invalid,
         }
     }

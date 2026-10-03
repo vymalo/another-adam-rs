@@ -29,15 +29,19 @@ use rmcp::model::{
 };
 use serde_json::{Map, Value};
 
+use crate::bearer::{CLOSE_GRACE, PerCall, UnusableBearer};
 use crate::connection::Connection;
 use crate::redact::Redactor;
-use crate::text::{MAX_RESULT_BYTES, cap_text};
+use crate::text::{MAX_MESSAGE_BYTES, MAX_RESULT_BYTES, cap_text};
 
 /// A tool of an MCP server. The model sees it as `<server>__<tool>`.
 ///
-/// A call is **not** retried by this crate and never becomes a [`ToolError::Transient`]: an MCP
-/// call has no idempotency key, so a call that failed on the way may or may not have run, and the
-/// model is told so in an error result. `adam-llm-agent` journals the result under the step
+/// A call is **not** retried by this crate and never becomes a [`ToolError::Transient`] because of
+/// what the server did: an MCP call has no idempotency key, so a call that failed on the way may or
+/// may not have run, and the model is told so in an error result. (The one `Transient` there is
+/// comes from the deployment's [`CallBearer`](crate::CallBearer) of a server bound with
+/// [`McpPolicy::bearer_per_call`](crate::McpPolicy::bearer_per_call): it is returned before
+/// anything is sent, so a retry cannot repeat a call.) `adam-llm-agent` journals the result under the step
 /// `tool:CALL_ID`, so a replay of a committed call returns the recorded result and does not call
 /// the server again; a transition that fails *before* its commit (a crash, a lost lease, a later
 /// tool of the same turn returning `Transient`) runs the call again, so an MCP tool is
@@ -49,8 +53,27 @@ pub(crate) struct McpTool {
     remote: String,
     /// The tool's title, when the server gave one: the label of its step.
     title: Option<String>,
-    connection: Arc<Connection>,
+    target: Target,
     call_timeout: Duration,
+}
+
+/// How a tool reaches its server.
+#[derive(Clone)]
+pub(crate) enum Target {
+    /// One connection, kept and redialled when it breaks.
+    Kept(Arc<Connection>),
+    /// A connection of its own for every call, with the bearer the deployment gives that call.
+    PerCall(Arc<PerCall>),
+}
+
+impl Target {
+    /// Close what is open, and make every later call an error result.
+    pub(crate) async fn close(&self) {
+        match self {
+            Self::Kept(connection) => connection.close().await,
+            Self::PerCall(per_call) => per_call.close(),
+        }
+    }
 }
 
 impl std::fmt::Debug for McpTool {
@@ -67,7 +90,7 @@ impl McpTool {
         server: String,
         remote: String,
         title: Option<String>,
-        connection: Arc<Connection>,
+        target: Target,
         call_timeout: Duration,
     ) -> Self {
         Self {
@@ -75,7 +98,7 @@ impl McpTool {
             server,
             remote,
             title,
-            connection,
+            target,
             call_timeout,
         }
     }
@@ -93,17 +116,17 @@ impl McpTool {
         ))
     }
 
-    /// What the server answered (or did not), as the result of the call. A broken session is
-    /// dropped, so the next call reconnects.
-    async fn finish(
+    /// What the server answered (or did not), as the result of the call, scrubbed of what
+    /// `redactor` knows; and whether the transport failed, so that a kept session is dropped and
+    /// the next call reconnects.
+    fn describe(
         &self,
-        generation: u64,
+        redactor: &Redactor,
         outcome: Result<CallToolResponse, ServiceError>,
-    ) -> ToolOutput {
-        match outcome {
-            Ok(CallToolResponse::Complete(result)) => {
-                map_result(&result, self.connection.redactor())
-            }
+    ) -> (ToolOutput, bool) {
+        let scrub = |text: &str| cap_text(redactor.scrub(text), MAX_MESSAGE_BYTES);
+        let output = match outcome {
+            Ok(CallToolResponse::Complete(result)) => map_result(&result, redactor),
             Ok(CallToolResponse::InputRequired(_)) => ToolOutput::error(format!(
                 "the MCP server `{}` needs more input for `{}` (input_required), which this \
                  client cannot give: nobody is there to answer",
@@ -125,20 +148,136 @@ impl McpTool {
                 "the MCP server `{}` refused the call to `{}`: {}",
                 self.server,
                 self.name(),
-                self.connection.scrub(&error.message)
+                scrub(&error.message)
             )),
             Err(ServiceError::Timeout { .. }) => self.lost(
                 "the connection gave up waiting for the answer (the call may still be running \
                  on the server)",
             ),
             Err(error) => {
-                self.connection.mark_broken(generation).await;
-                self.lost(&format!(
-                    "the connection to the server failed ({})",
-                    self.connection.scrub(&adam_error::report(&error))
-                ))
+                return (
+                    self.lost(&format!(
+                        "the connection to the server failed ({})",
+                        scrub(&adam_error::report(&error))
+                    )),
+                    true,
+                );
             }
+        };
+        (output, false)
+    }
+
+    fn cancelled(&self) -> ToolOutput {
+        ToolOutput::error(format!(
+            "the run was cancelled while `{}` was called; it may or may not have run",
+            self.name()
+        ))
+    }
+
+    fn no_answer(&self) -> ToolOutput {
+        self.lost(&format!(
+            "no answer within {} ms (the call may still be running on the server)",
+            self.call_timeout.as_millis()
+        ))
+    }
+
+    /// A call on the kept connection.
+    async fn call_kept(
+        &self,
+        ctx: &ToolCtx,
+        connection: &Connection,
+        params: CallToolRequestParams,
+    ) -> ToolOutput {
+        let (peer, generation) = tokio::select! {
+            () = ctx.cancelled() => return self.cancelled(),
+            got = connection.peer() => match got {
+                Ok(pair) => pair,
+                Err(text) => return ToolOutput::error(text),
+            },
+        };
+        let outcome = tokio::select! {
+            () = ctx.cancelled() => return self.cancelled(),
+            waited = tokio::time::timeout(self.call_timeout, peer.call_tool_once(params)) => waited,
+        };
+        match outcome {
+            Ok(outcome) => {
+                let (output, broken) = self.describe(connection.redactor(), outcome);
+                if broken {
+                    // A broken session is dropped, so the next call reconnects.
+                    connection.mark_broken(generation).await;
+                }
+                output
+            }
+            Err(_) => self.no_answer(),
         }
+    }
+
+    /// A call on a connection of its own, with the bearer the deployment gives it. What the
+    /// deployment refuses is answered before anything is sent.
+    async fn call_per_call(
+        &self,
+        ctx: &ToolCtx,
+        per_call: &PerCall,
+        arguments: Map<String, Value>,
+    ) -> Result<ToolOutput, ToolError> {
+        if per_call.is_closed() {
+            return Ok(ToolOutput::error(format!(
+                "the connection to the MCP server `{}` was shut down",
+                self.server
+            )));
+        }
+        let token = tokio::select! {
+            () = ctx.cancelled() => return Ok(self.cancelled()),
+            got = per_call.bearer.for_call(&self.remote, &arguments) => got,
+        };
+        let token = match token {
+            Ok(token) => token,
+            Err(ToolError::Permanent(why)) => {
+                return Ok(ToolOutput::error(format!(
+                    "the call to `{}` was not sent: {}",
+                    self.name(),
+                    per_call.scrub(&why)
+                )));
+            }
+            Err(ToolError::Transient(why)) => {
+                return Err(ToolError::Transient(per_call.scrub(&why)));
+            }
+            Err(other) => return Err(other),
+        };
+        let recipe = match per_call.recipe(&token) {
+            Ok(recipe) => recipe,
+            Err(UnusableBearer) => {
+                return Ok(ToolOutput::error(format!(
+                    "the call to `{}` was not sent: the bearer for it is empty or not a valid \
+                     header value",
+                    self.name()
+                )));
+            }
+        };
+        let params = CallToolRequestParams::new(self.remote.clone()).with_arguments(arguments);
+        let mut service = tokio::select! {
+            () = ctx.cancelled() => return Ok(self.cancelled()),
+            dialled = recipe.dial() => match dialled {
+                Ok(service) => service,
+                // Failed before the call was made: the error is scrubbed of the token.
+                Err(error) => {
+                    return Ok(ToolOutput::error(format!(
+                        "the call to `{}` was not made: {error}",
+                        self.name()
+                    )));
+                }
+            },
+        };
+        let outcome = tokio::select! {
+            () = ctx.cancelled() => return Ok(self.cancelled()),
+            waited = tokio::time::timeout(self.call_timeout, service.peer().call_tool_once(params)) => waited,
+        };
+        let output = match outcome {
+            Ok(outcome) => self.describe(&recipe.redactor, outcome).0,
+            Err(_) => self.no_answer(),
+        };
+        let _ = service.close_with_timeout(CLOSE_GRACE).await;
+        Ok(output)
     }
 }
 
@@ -169,32 +308,14 @@ impl Tool for McpTool {
                 )));
             }
         };
-        let params = CallToolRequestParams::new(self.remote.clone()).with_arguments(arguments);
-        let cancelled = || {
-            ToolOutput::error(format!(
-                "the run was cancelled while `{}` was called; it may or may not have run",
-                self.name()
-            ))
-        };
-
-        let (peer, generation) = tokio::select! {
-            () = ctx.cancelled() => return Ok(cancelled()),
-            got = self.connection.peer() => match got {
-                Ok(pair) => pair,
-                Err(text) => return Ok(ToolOutput::error(text)),
-            },
-        };
-        let outcome = tokio::select! {
-            () = ctx.cancelled() => return Ok(cancelled()),
-            waited = tokio::time::timeout(self.call_timeout, peer.call_tool_once(params)) => waited,
-        };
-        Ok(match outcome {
-            Ok(outcome) => self.finish(generation, outcome).await,
-            Err(_) => self.lost(&format!(
-                "no answer within {} ms (the call may still be running on the server)",
-                self.call_timeout.as_millis()
-            )),
-        })
+        match &self.target {
+            Target::Kept(connection) => {
+                let params =
+                    CallToolRequestParams::new(self.remote.clone()).with_arguments(arguments);
+                Ok(self.call_kept(ctx, connection, params).await)
+            }
+            Target::PerCall(per_call) => self.call_per_call(ctx, per_call, arguments).await,
+        }
     }
 }
 

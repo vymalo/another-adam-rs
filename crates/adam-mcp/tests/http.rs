@@ -3,13 +3,18 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adam_error::{Classify, ErrorClass};
-use adam_mcp::{Env, Error, MAX_RESULT_BYTES, McpPolicy, McpServers, VarProblem};
+use adam_llm_agent::ToolError;
+use adam_mcp::{CallBearer, Env, Error, MAX_RESULT_BYTES, McpPolicy, McpServers, VarProblem};
 use adam_mcp_testkit::{LogCapture, TestHttpServer, TestServer, wait_until};
 use adam_runtime::CancelToken;
+use async_trait::async_trait;
 use common::{call, cancellable, http_config};
+use secrecy::SecretString;
 use serde_json::json;
 
 const TOKEN: &str = "tok-7f3c9a1e-secret";
@@ -655,5 +660,498 @@ async fn shutdown_closes_and_later_calls_are_error_results() {
         server.initializations(),
         1,
         "a shut-down connection does not redial"
+    );
+}
+
+// ---- a bearer per call (`McpPolicy::bearer_per_call`) ----
+
+const LISTING_TOKEN: &str = "listing-token-5b81e0";
+
+/// What the deployment's [`CallBearer`] answers, and what it was asked.
+struct Scripted {
+    /// How `for_call` answers: a new token each call (`call-token-<n>-<hex>`), or an error.
+    answer: Mutex<Answer>,
+    issued: AtomicUsize,
+    listings: AtomicUsize,
+    asked: Mutex<Vec<(String, serde_json::Map<String, serde_json::Value>)>>,
+}
+
+#[derive(Clone)]
+enum Answer {
+    Token,
+    Permanent(&'static str),
+    Transient(&'static str),
+    Empty,
+}
+
+impl Scripted {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            answer: Mutex::new(Answer::Token),
+            issued: AtomicUsize::new(0),
+            listings: AtomicUsize::new(0),
+            asked: Mutex::default(),
+        })
+    }
+
+    fn answer(&self, answer: Answer) {
+        *self.answer.lock().unwrap() = answer;
+    }
+
+    /// The token `for_call` gives the `n`th time it answers with one (from 1).
+    fn token(n: usize) -> String {
+        format!("call-token-{n}-3fa9c1")
+    }
+
+    fn asked(&self) -> Vec<(String, serde_json::Map<String, serde_json::Value>)> {
+        self.asked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl CallBearer for Scripted {
+    async fn for_listing(&self) -> Result<SecretString, ToolError> {
+        self.listings.fetch_add(1, Ordering::SeqCst);
+        Ok(SecretString::from(LISTING_TOKEN.to_owned()))
+    }
+
+    async fn for_call(
+        &self,
+        tool: &str,
+        arguments: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<SecretString, ToolError> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((tool.to_owned(), arguments.clone()));
+        let answer = self.answer.lock().unwrap().clone();
+        match answer {
+            Answer::Token => {
+                let n = self.issued.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(SecretString::from(Self::token(n)))
+            }
+            Answer::Permanent(why) => Err(ToolError::Permanent(why.to_owned())),
+            Answer::Transient(why) => Err(ToolError::Transient(why.to_owned())),
+            Answer::Empty => Ok(SecretString::from(String::new())),
+        }
+    }
+}
+
+fn bound(server: &TestHttpServer, bearer: &Arc<Scripted>) -> McpPolicy {
+    // The whole URL is given and only its origin counts.
+    McpPolicy::default().bearer_per_call("t", &server.url(), bearer.clone())
+}
+
+async fn connect_bound(server: &TestHttpServer, bearer: &Arc<Scripted>) -> McpServers {
+    McpServers::connect(
+        &http_config("t", &server.url(), ""),
+        &Env::new(),
+        &bound(server, bearer),
+    )
+    .await
+    .unwrap()
+}
+
+/// The `Authorization` headers that came in after the first `seen`, each as it was sent.
+fn since(server: &TestHttpServer, seen: usize) -> Vec<String> {
+    server.authorizations().split_off(seen)
+}
+
+#[tokio::test]
+async fn listing_uses_the_listing_bearer() {
+    let server = TestHttpServer::start(None).await;
+    let bearer = Scripted::new();
+    let servers = connect_bound(&server, &bearer).await;
+
+    // The tools are those of the server, as without a binding...
+    assert_eq!(servers.names(), expected_names("t"));
+    // ...listed once, with the listing bearer on every request of that connection, and the
+    // per-call bearer not asked for.
+    assert_eq!(bearer.listings.load(Ordering::SeqCst), 1);
+    assert!(bearer.asked().is_empty());
+    let sent = server.authorizations();
+    assert!(!sent.is_empty());
+    assert!(
+        sent.iter().all(|h| h == &format!("Bearer {LISTING_TOKEN}")),
+        "{sent:?}"
+    );
+    assert_eq!(server.initializations(), 1);
+    servers.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_per_call_bearer_is_sent_with_each_call() {
+    let logs = LogCapture::start();
+    let server = TestHttpServer::start(None).await;
+    let bearer = Scripted::new();
+    let servers = connect_bound(&server, &bearer).await;
+    let tools = servers.tools();
+    let listed = server.authorizations().len();
+
+    let first = call(&tools, "t__echo", json!({"text": "one"})).await;
+    assert!(!first.is_error, "{}", first.content);
+    assert_eq!(first.content, "one");
+    let first_sent = since(&server, listed);
+    assert!(!first_sent.is_empty());
+    assert!(
+        first_sent
+            .iter()
+            .all(|h| h == &format!("Bearer {}", Scripted::token(1))),
+        "{first_sent:?}"
+    );
+
+    let seen = server.authorizations().len();
+    let second = call(&tools, "t__echo", json!({"text": "two"})).await;
+    assert_eq!(second.content, "two");
+    let second_sent = since(&server, seen);
+    assert!(
+        second_sent
+            .iter()
+            .all(|h| h == &format!("Bearer {}", Scripted::token(2))),
+        "{second_sent:?}"
+    );
+
+    // The bearer was asked for each call, with the tool's name on the server and the model's
+    // arguments as they were.
+    assert_eq!(
+        bearer.asked(),
+        vec![
+            (
+                "echo".to_owned(),
+                json!({"text": "one"}).as_object().unwrap().clone()
+            ),
+            (
+                "echo".to_owned(),
+                json!({"text": "two"}).as_object().unwrap().clone()
+            ),
+        ]
+    );
+    // One connection per call, on top of the listing's: three `initialize`s, none kept.
+    assert_eq!(server.initializations(), 3);
+    assert_eq!(bearer.listings.load(Ordering::SeqCst), 1);
+
+    // Neither token is in the logs (at `TRACE`, from `rmcp`, `hyper` and `reqwest`) or in `Debug`.
+    let text = logs.text();
+    assert!(
+        text.contains("connected to the MCP server"),
+        "the logs are being captured: {text}"
+    );
+    for token in [
+        LISTING_TOKEN.to_owned(),
+        Scripted::token(1),
+        Scripted::token(2),
+    ] {
+        assert!(!text.contains(&token), "{token} is in the logs");
+        for shown in [format!("{servers:?}"), format!("{tools:?}")] {
+            assert!(!shown.contains(&token), "{shown}");
+        }
+    }
+    servers.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_refused_bearer_is_the_tools_error_result_and_nothing_is_sent() {
+    let server = TestHttpServer::start(None).await;
+    let bearer = Scripted::new();
+    let servers = connect_bound(&server, &bearer).await;
+    let tools = servers.tools();
+    let (requests, calls) = (server.requests(), server.calls());
+
+    bearer.answer(Answer::Permanent(
+        "this account is not installed: ask the person",
+    ));
+    let out = call(&tools, "t__echo", json!({"text": "x"})).await;
+    assert!(out.is_error);
+    assert!(
+        out.content.contains("was not sent")
+            && out
+                .content
+                .contains("this account is not installed: ask the person"),
+        "{}",
+        out.content
+    );
+    assert_eq!(server.requests(), requests, "nothing was sent");
+    assert_eq!(server.calls(), calls);
+
+    // A token that cannot be sent as a header is refused the same way, without being shown.
+    bearer.answer(Answer::Empty);
+    let out = call(&tools, "t__echo", json!({"text": "x"})).await;
+    assert!(
+        out.is_error && out.content.contains("was not sent"),
+        "{}",
+        out.content
+    );
+    assert_eq!(server.requests(), requests, "nothing was sent");
+
+    // The next call, with a token again, works.
+    bearer.answer(Answer::Token);
+    assert_eq!(
+        call(&tools, "t__echo", json!({"text": "back"}))
+            .await
+            .content,
+        "back"
+    );
+    servers.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_transient_bearer_failure_is_a_transient_tool_error() {
+    let server = TestHttpServer::start(None).await;
+    let bearer = Scripted::new();
+    let servers = connect_bound(&server, &bearer).await;
+    let tools = servers.tools();
+    let requests = server.requests();
+
+    bearer.answer(Answer::Transient("the token service is busy"));
+    let tool = tools.get("t__echo").unwrap();
+    let error = tool
+        .call(&common::ctx("t__echo"), json!({"text": "x"}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, ToolError::Transient(why) if why == "the token service is busy"),
+        "{error}"
+    );
+    // Safe to retry: nothing reached the server.
+    assert_eq!(server.requests(), requests, "nothing was sent");
+    servers.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_binding_to_another_origin_is_refused_at_connect() {
+    let server = TestHttpServer::start(None).await;
+    let elsewhere = TestHttpServer::start(None).await;
+    let bearer = Scripted::new();
+    // The deployment bound `t` at `elsewhere`; the folder points it at `server`.
+    let policy = McpPolicy::default().bearer_per_call("t", &elsewhere.url(), bearer.clone());
+    let error = McpServers::connect(&http_config("t", &server.url(), ""), &Env::new(), &policy)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::BearerBinding { server, why }
+            if server == "t" && why.contains("bearer only at")),
+        "{error}"
+    );
+    assert_eq!(error.class(), ErrorClass::Invalid);
+    let origin_of = |s: &TestHttpServer| s.url().trim_end_matches("/mcp").to_owned();
+    let text = error.to_string();
+    assert!(
+        text.contains(&origin_of(&elsewhere)) && text.contains(&origin_of(&server)),
+        "{text}"
+    );
+    // Nothing was asked for and nothing was sent, to either.
+    assert_eq!(server.requests() + elsewhere.requests(), 0);
+    assert_eq!(bearer.listings.load(Ordering::SeqCst), 0);
+    assert!(bearer.asked().is_empty());
+
+    // A binding that is not an origin at all matches nothing.
+    let policy = McpPolicy::default().bearer_per_call("t", "not a url", bearer.clone());
+    let error = McpServers::connect(&http_config("t", &server.url(), ""), &Env::new(), &policy)
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, Error::BearerBinding { .. }), "{error}");
+    assert_eq!(server.requests(), 0);
+
+    // The same origin by another spelling (another path, a query) is the same origin.
+    let policy = McpPolicy::default().bearer_per_call(
+        "t",
+        &format!("{}/elsewhere?x=1", server.url().trim_end_matches("/mcp")),
+        bearer,
+    );
+    let servers = McpServers::connect(&http_config("t", &server.url(), ""), &Env::new(), &policy)
+        .await
+        .unwrap();
+    servers.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_static_authorization_header_with_a_binding_is_refused() {
+    let server = TestHttpServer::start(None).await;
+    let bearer = Scripted::new();
+    let file_secret = "file-secret-71d4";
+    for header in ["Authorization", "authorization", "AUTHORIZATION"] {
+        let config = http_config(
+            "t",
+            &server.url(),
+            &format!(r#""headers": {{"{header}": "Bearer ${{MCP_TEST_TOKEN}}"}}"#),
+        );
+        let env = Env::new().var("MCP_TEST_TOKEN", file_secret);
+        let error = McpServers::connect(&config, &env, &bound(&server, &bearer))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::BearerBinding { server, why }
+                if server == "t" && why.contains("Authorization")),
+            "{header}: {error}"
+        );
+        assert_eq!(error.class(), ErrorClass::Invalid);
+        let text = format!("{error} / {error:?}");
+        assert!(!text.contains(file_secret), "{text}");
+    }
+    // Even one whose variable is not set is refused as such, not as a missing variable.
+    let config = http_config(
+        "t",
+        &server.url(),
+        r#""headers": {"Authorization": "Bearer ${MCP_TEST_SURELY_UNSET_9C2E}"}"#,
+    );
+    let error = McpServers::connect(&config, &Env::new(), &bound(&server, &bearer))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, Error::BearerBinding { .. }), "{error}");
+    assert_eq!(server.requests(), 0, "nothing was sent");
+
+    // Other headers are kept, and sent beside the bearer.
+    let config = http_config("t", &server.url(), r#""headers": {"X-Team": "blue"}"#);
+    let servers = McpServers::connect(&config, &Env::new(), &bound(&server, &bearer))
+        .await
+        .unwrap();
+    servers.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_per_call_bearer_is_scrubbed_from_results() {
+    let server = TestHttpServer::start(None).await;
+    let bearer = Scripted::new();
+    let servers = connect_bound(&server, &bearer).await;
+    let tools = servers.tools();
+
+    // A server that says the credential it was given: here the model's own argument carries it
+    // back (the first call is given the first token).
+    let token = Scripted::token(1);
+    let out = call(
+        &tools,
+        "t__echo",
+        json!({"text": format!("you sent Bearer {token}, and {token} alone")}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(out.content, "you sent [REDACTED], and [REDACTED] alone");
+    assert!(!out.content.contains(&token));
+
+    // The token of the call is not the redactor's forever: a later call, with another token,
+    // is scrubbed of its own (and says the earlier one, which nobody holds any more, as it is).
+    let second = Scripted::token(2);
+    let out = call(&tools, "t__echo", json!({"text": second.clone()})).await;
+    assert_eq!(out.content, "[REDACTED]");
+    servers.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_that_refuses_the_listing_bearer_fails_connect_without_showing_it() {
+    let server = TestHttpServer::start(Some("the-token-the-server-wants")).await;
+    let bearer = Scripted::new();
+    // The listing bearer is not accepted either, so this fails at startup, and says no token.
+    let error = McpServers::connect(
+        &http_config("t", &server.url(), ""),
+        &Env::new(),
+        &bound(&server, &bearer),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(&error, Error::Connect { .. }), "{error}");
+    let text = format!("{error} / {error:?}");
+    assert!(!text.contains(LISTING_TOKEN), "{text}");
+}
+
+#[tokio::test]
+async fn a_bearer_refused_for_listing_fails_connect_by_its_class() {
+    struct Refusing(ToolError);
+    #[async_trait]
+    impl CallBearer for Refusing {
+        async fn for_listing(&self) -> Result<SecretString, ToolError> {
+            Err(self.0.clone())
+        }
+        async fn for_call(
+            &self,
+            _tool: &str,
+            _arguments: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<SecretString, ToolError> {
+            unreachable!("never listed, never called")
+        }
+    }
+    let server = TestHttpServer::start(None).await;
+    let policy =
+        |error| McpPolicy::default().bearer_per_call("t", &server.url(), Arc::new(Refusing(error)));
+    let config = http_config("t", &server.url(), "");
+
+    let error = McpServers::connect(
+        &config,
+        &Env::new(),
+        &policy(ToolError::Permanent("no key".to_owned())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, Error::BearerBinding { why, .. } if why.contains("no key")),
+        "{error}"
+    );
+    assert_eq!(error.class(), ErrorClass::Invalid);
+
+    let error = McpServers::connect(
+        &config,
+        &Env::new(),
+        &policy(ToolError::Transient("busy".to_owned())),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, Error::ListTools { message, .. } if message.contains("busy")),
+        "{error}"
+    );
+    assert_eq!(error.class(), ErrorClass::Transient);
+    assert_eq!(server.requests(), 0, "nothing was sent");
+}
+
+#[tokio::test]
+async fn a_server_of_another_name_is_not_bound_and_shutdown_closes_a_bound_one() {
+    let server = TestHttpServer::start(None).await;
+    let bearer = Scripted::new();
+    // `t` is bound (by `bound`), `u` is the same server under another name: it is kept, with no
+    // bearer, as without a binding.
+    let url = server.url();
+    let config = common::config(&format!(
+        r#"{{"mcpServers": {{
+            "t": {{"type": "http", "url": "{url}", "tools": ["echo"]}},
+            "u": {{"type": "http", "url": "{url}", "tools": ["echo"]}}
+        }}}}"#
+    ));
+    let servers = McpServers::connect(&config, &Env::new(), &bound(&server, &bearer))
+        .await
+        .unwrap();
+    let tools = servers.tools();
+    let seen = server.authorizations().len();
+    assert_eq!(
+        call(&tools, "u__echo", json!({"text": "plain"}))
+            .await
+            .content,
+        "plain"
+    );
+    assert!(bearer.asked().is_empty(), "`u` is not bound");
+    assert_eq!(
+        since(&server, seen),
+        Vec::<String>::new(),
+        "`u` sends no bearer"
+    );
+
+    // A bound server's calls end with `shutdown`, as a kept one's do.
+    assert_eq!(
+        call(&tools, "t__echo", json!({"text": "bound"}))
+            .await
+            .content,
+        "bound"
+    );
+    servers.shutdown().await;
+    let requests = server.requests();
+    let out = call(&tools, "t__echo", json!({"text": "late"})).await;
+    assert!(
+        out.is_error && out.content.contains("shut down"),
+        "{}",
+        out.content
+    );
+    assert_eq!(server.requests(), requests);
+    assert_eq!(
+        bearer.asked().len(),
+        1,
+        "no bearer was asked for after shutdown"
     );
 }

@@ -30,6 +30,8 @@ adam-agent-fs.workspace = true
 adam-error.workspace = true
 adam-llm-agent.workspace = true
 adam-runtime.workspace = true
+async-trait.workspace = true
+secrecy.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "process"] }
 

@@ -10,6 +10,11 @@ the chart), **D4** (GitHub read through `github-mcp-server http` with a token pe
 **D6** (read-only tokens). Until then the coder is exactly as ADR 0009 says: its `GitHubApp` is pinned. The sequence
 diagram of an MCP call comes with the change that builds D4.*
 
+*Status note, 2026-10-03: **D4's adam-mcp part is built** (`crates/adam-mcp`): `CallBearer`, `McpPolicy::bearer_per_call`
+(a server name plus an origin), and the refusals at connect (`Error::BearerBinding`: another origin, or an `Authorization`
+header of the file's own; a `stdio` server of the bound name gets no binding and a warning). Still not built: the coder's
+use of it (the router that picks a token per call, `GITHUB_MCP_URL`, the embedded `mcp.json`, the sidecar).*
+
 ## Context
 
 ADR 0009 authenticates the coder as **one installation** of a GitHub App: `GITHUB_APP_INSTALLATION_ID` names it, and the token

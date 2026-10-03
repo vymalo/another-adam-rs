@@ -16,6 +16,10 @@
 //!     end
 //!     X-->>A: McpServers (tools() = <server>__<tool>)
 //! ```
+//!
+//! A server the deployment bound to a bearer per call ([`McpPolicy::bearer_per_call`]) is checked
+//! in the first pass too (its URL at the bound origin, no `Authorization` header in the file), and
+//! listed with the listing bearer on a connection that is closed again; its calls are `bearer.rs`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,13 +32,14 @@ use rmcp::model::Tool as ListedTool;
 use secrecy::SecretString;
 use serde_json::Value;
 
+use crate::bearer::PerCall;
 use crate::connection::{Connection, Recipe, Transport};
 use crate::error::Error;
 use crate::expand::{Env, Expander};
 use crate::policy::McpPolicy;
 use crate::redact::Redactor;
 use crate::text::{MAX_DESCRIPTION_BYTES, cap_text};
-use crate::tool::McpTool;
+use crate::tool::{McpTool, Target};
 use crate::url;
 
 /// The servers of an `mcp.json`, connected and listed.
@@ -54,7 +59,7 @@ pub struct McpServers {
 
 struct Server {
     name: String,
-    connection: Arc<Connection>,
+    target: Target,
     tools: Vec<Arc<McpTool>>,
 }
 
@@ -97,13 +102,25 @@ impl McpServers {
                 recipe,
                 allow,
                 call_timeout,
+                per_call,
             } = plan;
             let name = recipe.server.clone();
-            let (connection, listed) = Connection::open(recipe).await?;
+            let (target, listed) = match per_call {
+                // A bound server is listed with the listing bearer, and dialled again per call.
+                Some(per_call) => {
+                    let per_call = Arc::new(per_call);
+                    let listed = per_call.list().await?;
+                    (Target::PerCall(per_call), listed)
+                }
+                None => {
+                    let (connection, listed) = Connection::open(recipe).await?;
+                    (Target::Kept(connection), listed)
+                }
+            };
             let selected = match select_tools(&name, listed, allow.as_deref()) {
                 Ok(selected) => selected,
                 Err(error) => {
-                    connection.close().await;
+                    target.close().await;
                     return Err(error);
                 }
             };
@@ -115,7 +132,7 @@ impl McpServers {
                         name.clone(),
                         s.remote,
                         s.title,
-                        Arc::clone(&connection),
+                        target.clone(),
                         call_timeout,
                     ))
                 })
@@ -123,7 +140,7 @@ impl McpServers {
             tracing::info!(server = %name, "connected to the MCP server");
             servers.push(Server {
                 name,
-                connection,
+                target,
                 tools,
             });
         }
@@ -148,7 +165,7 @@ impl McpServers {
     /// process is asked to end and killed if it has not within a few seconds.
     pub async fn shutdown(self) {
         for server in &self.servers {
-            server.connection.close().await;
+            server.target.close().await;
         }
     }
 }
@@ -165,6 +182,8 @@ struct Plan {
     recipe: Recipe,
     allow: Option<Vec<String>>,
     call_timeout: std::time::Duration,
+    /// Set for a remote server the deployment bound to a bearer per call.
+    per_call: Option<PerCall>,
 }
 
 impl Plan {
@@ -181,7 +200,7 @@ impl Plan {
         }
         let mut redactor = Redactor::default();
         let mut expander = Expander::new(name, env, &mut redactor);
-        let (command_as_written, transport, allow) = match server {
+        let (command_as_written, transport, allow, per_call) = match server {
             McpServer::Stdio {
                 command,
                 args,
@@ -192,6 +211,14 @@ impl Plan {
                     return Err(Error::StdioNotAllowed {
                         server: name.to_owned(),
                     });
+                }
+                if policy.binding(name).is_some() {
+                    tracing::warn!(
+                        server = name,
+                        "the deployment gives a bearer per call to an MCP server of this name, but \
+                         this one is a local process (`command`): it gets none, and its own `env` \
+                         is what it has"
+                    );
                 }
                 let command_text = expander.expand(command)?;
                 let mut expanded_args = Vec::with_capacity(args.len());
@@ -211,6 +238,7 @@ impl Plan {
                         inherit_env: policy.inherits_env(),
                     },
                     tools.clone(),
+                    None,
                 )
             }
             McpServer::Remote {
@@ -245,6 +273,35 @@ impl Plan {
                     policy.insecure_allowed(),
                     expander.redactor(),
                 )?;
+                let binding = policy.binding(name);
+                if let Some(binding) = binding {
+                    // Before any header is expanded: a credential of the file's own, even one that
+                    // is not set, would be sent beside or instead of the deployment's.
+                    if !binding.matches(&parsed) {
+                        let at = parsed.origin().ascii_serialization();
+                        return Err(Error::BearerBinding {
+                            server: name.to_owned(),
+                            why: format!(
+                                "the deployment gives this server a bearer only at {}, and the \
+                                 file points it at {}",
+                                binding.origin,
+                                expander.redactor().scrub(&at)
+                            ),
+                        });
+                    }
+                    if headers
+                        .keys()
+                        .any(|k| k.eq_ignore_ascii_case("authorization"))
+                    {
+                        return Err(Error::BearerBinding {
+                            server: name.to_owned(),
+                            why: "the file sets an `Authorization` header, and the deployment \
+                                  gives this server its own bearer for every call: remove the \
+                                  header from the file"
+                                .to_owned(),
+                        });
+                    }
+                }
                 let mut expanded_headers = Vec::with_capacity(headers.len());
                 for (key, value) in headers {
                     let bad = || Error::Header {
@@ -256,6 +313,16 @@ impl Plan {
                         HeaderValue::from_str(&expander.expand(value)?).map_err(|_| bad())?;
                     expanded_headers.push((header_name, header_value));
                 }
+                let per_call = binding.map(|binding| {
+                    PerCall::new(
+                        name,
+                        Arc::clone(&binding.bearer),
+                        parsed.clone(),
+                        expanded_headers.clone(),
+                        expander.redactor().clone(),
+                        policy.connect_timeout_value(),
+                    )
+                });
                 (
                     String::new(),
                     Transport::Http {
@@ -263,6 +330,7 @@ impl Plan {
                         headers: expanded_headers,
                     },
                     tools.clone(),
+                    per_call,
                 )
             }
         };
@@ -276,6 +344,7 @@ impl Plan {
             },
             allow,
             call_timeout: policy.call_timeout_value(),
+            per_call,
         })
     }
 }
