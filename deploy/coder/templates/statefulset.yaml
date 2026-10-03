@@ -147,8 +147,15 @@ spec:
             {{- /* github.auth=app: no GITHUB_TOKEN; the key is a file from the Secret mounted below. */}}
             - name: GITHUB_APP_ID
               value: {{ include "coder.githubAppId" . | quote }}
+            {{- if include "coder.githubAppPinned" . }}
+            {{- /* A pin: this installation serves every repository. */}}
             - name: GITHUB_APP_INSTALLATION_ID
               value: {{ include "coder.githubAppInstallationId" . | quote }}
+            {{- else }}
+            {{- /* No pin: the installation of each repository's owner is found, for these accounts only. */}}
+            - name: GITHUB_APP_OWNERS
+              value: {{ include "coder.githubAppOwners" . | quote }}
+            {{- end }}
             - name: GITHUB_APP_PRIVATE_KEY_PATH
               value: /var/run/secrets/github-app/private-key.pem
             {{- end }}

@@ -49,9 +49,11 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      `ROLE=control-plane` plus the worker StatefulSet).
    * `workspace.placement`: empty, `isolated`, `affinity` or `shared` (ADR 0002,
      `docs/decisions/0002-workspace-placement.md`); `replicaCount` above 1 needs one.
-   * `github.auth: token` (default) or `app`
-     (`github.app.id`, `.installationId`, `.privateKeySecret`); `createRepoOwners` turns the
-     repository-creation tool on.
+   * `github.auth: token` (default) or `app` (`github.app.id`, `.privateKeySecret`, and exactly
+     one of `.installationId`, a pin to one installation, or `.owners`, the accounts the App may
+     act for, the installation of each found with the App's key: `GITHUB_APP_OWNERS`, ADR 0017;
+     there is no default list, because a public App can be installed by anyone);
+     `createRepoOwners` turns the repository-creation tool on.
    * `githubMcp` (default on): the official GitHub MCP server as a **native sidecar** (an init
      container with `restartPolicy: Always`, Kubernetes 1.29+) of every pod that runs workers,
      `github-mcp-server http --read-only` on 127.0.0.1:8082 from the coder's own image. It holds no

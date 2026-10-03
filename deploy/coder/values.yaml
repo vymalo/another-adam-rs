@@ -94,7 +94,8 @@ github:
   #        token someone refreshes.
   # app    a GitHub App installation: the coder signs a short-lived JWT with the App's private
   #        key and trades it for an installation access token (valid for 1 hour, renewed
-  #        before it runs out), per installation and scoped to what the App was granted.
+  #        before it runs out), per installation and scoped to what the App was granted. One
+  #        installation (app.installationId) or the installation of each owner (app.owners).
   #        GITHUB_TOKEN is then neither rendered nor required, and the ExternalSecret has no
   #        githubToken entry. The key is read at startup: a rotated key needs a restart.
   auth: token
@@ -106,9 +107,21 @@ github:
   app:
     # The App's application ID (a number) or its client ID (`Iv1.…`): the JWT's `iss`.
     id: ""
-    # The installation's ID, a positive integer (the last part of the URL of the installation's
-    # settings page).
+    # Exactly one of installationId and owners.
+    #
+    # installationId: pin the App to ONE installation, a positive integer (the last part of the URL of
+    # the installation's settings page). It serves every repository the coder works on, so it fits a
+    # deployment that works on one account. GITHUB_APP_INSTALLATION_ID.
     installationId: ""
+    # owners: the accounts (users and organisations) the coder may act for, and no pin. The
+    # installation of each repository's owner is found with the App's key, and a token is minted for
+    # each, so one deployment works on several accounts. Required without a pin, and there is no
+    # default, because a PUBLIC App can be installed by anyone: an account that installed it is no
+    # proof that you want it acted for. Names are compared without case; `*` is every account the App
+    # is installed on (the coder logs a warning; it is refused beside other names). A list, or a
+    # string of names separated by commas or spaces. GITHUB_APP_OWNERS.
+    #   owners: [acme, octocat]
+    owners: []
     # Name of a Secret in this namespace that you (or another ExternalSecret) manage, with one
     # key, `private-key.pem`: the App's private key as GitHub gives it (PKCS#1) or PKCS#8. The
     # chart mounts it read-only at /var/run/secrets/github-app and sets

@@ -505,4 +505,80 @@ helm template coder "$chart" --namespace coder-ns --set workspace.placement=shar
   --set workspace.sharedVolume.storageClass=$rwx_class --set replicaCount=3 > "$out"
 check "shared: every worker has the sidecar (it is part of the pod)" count '^        - name: github-mcp$' 1
 
+# github.app.owners: no pin, the installation of each owner is found (ADR 0017). Exactly one of the pin and the
+# owners; the owners are what the coder may act for, and there is no default.
+owners_env='name: (GITHUB_APP_ID|GITHUB_APP_OWNERS|GITHUB_APP_PRIVATE_KEY_PATH)$'
+helm_owners() { # the values an App with owners needs, then any more
+  helm template coder "$chart" --namespace coder-ns --set github.auth=app --set github.app.id=1234567 \
+    --set 'github.app.owners={acme,Other-Org}' --set github.app.privateKeySecret=coder-github-app "$@"
+}
+helm_owners > "$out"
+check "owners: the pod gets the App's ID, the owners and the key path" count "$owners_env" 3
+check "owners: no GITHUB_APP_INSTALLATION_ID, there is no pin" lacks 'GITHUB_APP_INSTALLATION_ID'
+check "owners: GITHUB_APP_OWNERS is the list, comma-joined, as written" dhas StatefulSet '^              value: "acme,Other-Org"$'
+check "owners: exactly one GITHUB_APP_OWNERS" count 'name: GITHUB_APP_OWNERS$' 1
+check "owners: no GITHUB_TOKEN, the key is a file from the named Secret, read-only" \
+  dhas StatefulSet '^            secretName: coder-github-app$'
+check "owners: the key is mounted into the coder's container only (not the sidecar)" chas 'mountPath: /var/run/secrets/github-app'
+check "owners: the GitHub MCP sidecar still holds nothing" slacks 'github-app|secretName|GITHUB_APP|volumeMounts'
+check "owners: no Secret object and no key in the render" lacks '^kind: Secret$|PRIVATE KEY'
+check "owners: the model, workspace and check settings are unchanged" dcount StatefulSet "$workspace_and_checks" 10
+check "owners: still never exposed" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$|type: (LoadBalancer|NodePort)'
+# A pin renders as before, and the owners value is empty by default.
+helm_app > "$out"
+check "a pin: GITHUB_APP_INSTALLATION_ID and no GITHUB_APP_OWNERS" lacks 'GITHUB_APP_OWNERS'
+check "a pin: it is rendered once" count 'name: GITHUB_APP_INSTALLATION_ID$' 1
+# The forms the owners come in.
+cat > "$vals" <<'YAML'
+github:
+  auth: app
+  app:
+    id: 1234567
+    privateKeySecret: coder-github-app
+    owners: "acme, Other-Org  third,"
+YAML
+helm template coder "$chart" --namespace coder-ns -f "$vals" > "$out"
+check "owners: a string of names separated by commas or spaces is accepted" dhas StatefulSet '^              value: "acme,Other-Org,third"$'
+cat > "$vals" <<'YAML'
+github:
+  auth: app
+  app:
+    id: 1234567
+    privateKeySecret: coder-github-app
+    owners: ["  acme ", "", 42]
+YAML
+helm template coder "$chart" --namespace coder-ns -f "$vals" > "$out"
+check "owners: entries are trimmed, blanks dropped, a number is its digits" dhas StatefulSet '^              value: "acme,42"$'
+helm_owners --set 'github.app.owners={*}' > "$out"
+check "owners: * is passed through (the binary warns, and refuses it beside names)" dhas StatefulSet '^              value: "\*"$'
+# Roles: a control plane renders none of it, the split worker has it, the front has not.
+helm_owners --set config.role=control-plane > "$out"
+check "owners: a control plane gets no App variable and no key volume" lacks "$owners_env|github-app"
+helm_owners --set topology=split > "$out"
+check "split + owners: the worker gets the owners" dhas StatefulSet 'name: GITHUB_APP_OWNERS$'
+check "split + owners: the front has no App variable, volume or mount" dlacks Deployment "$owners_env|github-app|volumes:|volumeMounts:"
+# Guards.
+message=$(helm_owners --set github.app.installationId=98765432 2>&1 || true)
+check "a pin and owners together fail" fails helm_owners --set github.app.installationId=98765432
+check "the error says both are set and names both values" says "$message" 'github.app.installationId and github.app.owners are both set'
+message=$(helm_app --set 'github.app.installationId=' 2>&1 || true)
+check "neither the pin nor owners fails" fails helm_app --set github.app.installationId=
+check "the error names both ways" says "$message" 'github.app.installationId.*github.app.owners'
+check "an empty owners list with no pin fails" fails helm_owners --set 'github.app.owners=null'
+cat > "$vals" <<'YAML'
+github:
+  auth: app
+  app:
+    id: 1234567
+    privateKeySecret: coder-github-app
+    owners: [" ", ""]
+YAML
+check "a blank-only owners list with no pin fails" fails helm template coder "$chart" --namespace coder-ns -f "$vals"
+check "a bad pin is not mistaken for no pin: installationId=abc with owners fails" \
+  fails helm_owners --set-string github.app.installationId=abc
+check "token mode ignores github.app.owners" \
+  helm template coder "$chart" --namespace coder-ns --set 'github.app.owners={acme}'
+helm template coder "$chart" --namespace coder-ns --set 'github.app.owners={acme}' > "$out"
+check "token mode renders no GITHUB_APP_OWNERS" lacks 'GITHUB_APP_OWNERS'
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

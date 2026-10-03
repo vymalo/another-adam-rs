@@ -23,8 +23,16 @@ from service.yaml, which every render contains, so they always run.
 {{- if not (include "coder.githubAppId" .) -}}
 {{- fail "github.auth=app needs github.app.id (the App's application ID or client ID)" -}}
 {{- end -}}
-{{- if le (int64 (include "coder.githubAppInstallationId" .)) 0 -}}
-{{- fail "github.auth=app needs github.app.installationId, a positive integer" -}}
+{{- $pinned := include "coder.githubAppPinned" . -}}
+{{- $owners := include "coder.githubAppOwners" . -}}
+{{- if and $pinned $owners -}}
+{{- fail "github.app.installationId and github.app.owners are both set: pin one installation, or list the accounts the App may act for (an installation is found for each), not both" -}}
+{{- end -}}
+{{- if not (or $pinned $owners) -}}
+{{- fail "github.auth=app needs github.app.installationId (one installation, a positive integer) or github.app.owners (the accounts the App may act for: the installation of each is found)" -}}
+{{- end -}}
+{{- if and $pinned (le (int64 (include "coder.githubAppInstallationId" .)) 0) -}}
+{{- fail "github.app.installationId must be a positive integer" -}}
 {{- end -}}
 {{- if not .Values.github.app.privateKeySecret -}}
 {{- fail "github.auth=app needs github.app.privateKeySecret: the name of a Secret with the App's private key under the key private-key.pem" -}}
