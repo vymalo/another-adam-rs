@@ -3,7 +3,13 @@
 //   2. every relative Markdown link points at a file or directory that exists, and
 //   3. every `#fragment` of a link to a Markdown file names a heading that exists, and
 //   4. every Rust crate (a directory with a Cargo.toml under crates/ or bin/) has a README.md
-//      next to it.
+//      next to it, and
+//   5. every first-party skill (a directory of .agents/skills that skills-lock.json does not list)
+//      has a SKILL.md whose frontmatter `name` is its directory and which has a `description`, is
+//      mirrored by a symlink that resolves in .claude/, .goose/ and .kiro/, has no relative Markdown
+//      link (a skill is installed into other repositories, where it would break), and cites only
+//      repository paths that exist (code spans that start with crates/, bin/, docs/, deploy/,
+//      docker/, dev/, tools/ or .github/; spans with a placeholder or a glob are not paths).
 // Usage (from the repo root):  npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs
 // Exits 1 on any failure, listing file:line for each.
 import fs from 'node:fs';
@@ -124,7 +130,71 @@ for (const crateRoot of crateRoots) {
   }
 }
 
-console.log(`${diagrams} diagrams, ${links} relative links, ${crates} crate READMEs checked`);
+// First-party skills: the skills the skills CLI can install from this repository into others.
+// The vendored ones are pinned in skills-lock.json and belong to their authors, so they are not checked.
+const skillsDir = path.join(root, '.agents', 'skills');
+const mirrors = ['.claude', '.goose', '.kiro'];
+const pathPrefixes = ['crates/', 'bin/', 'docs/', 'deploy/', 'docker/', 'dev/', 'tools/', '.github/'];
+let skills = 0, skillPaths = 0;
+if (fs.existsSync(skillsDir)) {
+  let locked = new Set();
+  let sources = new Set();
+  const lockFile = path.join(root, 'skills-lock.json');
+  if (fs.existsSync(lockFile)) {
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8')).skills ?? {};
+    locked = new Set(Object.keys(lock));
+    sources = new Set(Object.values(lock).map((entry) => entry.source));
+  }
+  for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || locked.has(entry.name)) continue;
+    skills++;
+    const name = entry.name;
+    const dir = path.join(skillsDir, name);
+    const rel = path.relative(root, path.join(dir, 'SKILL.md'));
+    const skillFile = path.join(dir, 'SKILL.md');
+    if (!fs.existsSync(skillFile)) { failures.push(`${rel}: first-party skill has no SKILL.md`); continue; }
+    const src = fs.readFileSync(skillFile, 'utf8');
+
+    // Frontmatter: the top-level `name` and `description` keys between the first two `---` lines.
+    const fm = /^---\n([\s\S]*?)\n---\n/.exec(src);
+    if (!fm) failures.push(`${rel}:1 no YAML frontmatter`);
+    else {
+      const key = (k) => {
+        const m = new RegExp(`^${k}:[ \\t]*(.*)$`, 'm').exec(fm[1]);
+        return m ? m[1].trim().replace(/^(["'])(.*)\1$/, '$2') : null;
+      };
+      if (key('name') !== name) failures.push(`${rel}:1 frontmatter name "${key('name')}" is not the directory "${name}"`);
+      if (!key('description')) failures.push(`${rel}:1 frontmatter has no description`);
+    }
+
+    // Mirrors: a symlink that resolves to this skill, in every agent directory.
+    for (const mirror of mirrors) {
+      const link = path.join(root, mirror, 'skills', name);
+      let ok = false;
+      try { ok = fs.lstatSync(link).isSymbolicLink() && fs.realpathSync(link) === fs.realpathSync(dir); } catch { /* missing or dangling */ }
+      if (!ok) failures.push(`${path.join(mirror, 'skills', name)}: not a symlink that resolves to .agents/skills/${name}`);
+    }
+
+    // A skill is read in other repositories: no relative link, and every repository path it cites exists.
+    const body = src.replace(/```[\s\S]*?```/g, (code) => code.replace(/[^\n]/g, ' '));
+    for (const m of body.matchAll(/\]\(([^)\s]+)\)/g)) {
+      if (!/^(https?:|mailto:|#)/i.test(m[1])) failures.push(`${rel}:${lineOf(src, m.index)} relative link in a skill: ${m[1]}`);
+    }
+    for (const m of body.matchAll(/`([^`\n]+)`/g)) {
+      for (const raw of m[1].split(/\s+/)) {
+        // Strip quotes, trailing punctuation, a `:line` and a `#fragment`.
+        const token = raw.replace(/^[("']+/, '').replace(/[)"',;.]+$/, '').replace(/[:#].*$/, '');
+        if (sources.has(token)) continue; // `docker/skills` is a repository name, not a path
+        if (!pathPrefixes.some((prefix) => token.startsWith(prefix))) continue;
+        if (/[<>*{}$|]|\.\.\./.test(token)) continue; // a placeholder, a glob or a brace list is not a path
+        skillPaths++;
+        if (!fs.existsSync(path.join(root, token))) failures.push(`${rel}:${lineOf(src, m.index)} cited path does not exist: ${token}`);
+      }
+    }
+  }
+}
+
+console.log(`${diagrams} diagrams, ${links} relative links, ${crates} crate READMEs, ${skills} first-party skills (${skillPaths} cited paths) checked`);
 if (failures.length) {
   console.error(failures.join('\n'));
   console.error(`${failures.length} problem(s)`);
