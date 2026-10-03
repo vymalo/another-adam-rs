@@ -198,6 +198,7 @@ struct Sql {
     claim_due_pinned: Arc<str>,
     renew_lease: Arc<str>,
     release_lease: Arc<str>,
+    lease_until: Arc<str>,
     purge: Arc<str>,
 }
 
@@ -319,6 +320,7 @@ impl Sql {
                 "UPDATE {runs} SET lease_owner = NULL, lease_until = NULL
                   WHERE id = $1 AND lease_owner = $2"
             )),
+            lease_until: Arc::from(format!("SELECT lease_until FROM {runs} WHERE id = $1")),
             // Batched so a large backlog never becomes one huge transaction.
             // SKIP LOCKED lets concurrent sweepers share the work.
             purge: Arc::from(format!(
@@ -656,6 +658,19 @@ impl Store for PgStore {
             .await
             .map_err(classify)?;
         Ok(())
+    }
+
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+        let row = sqlx::query(safe(&self.sql.lease_until))
+            .bind(id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(classify)?;
+        let until = row
+            .map(|r| r.try_get::<Option<DateTime<Utc>>, _>("lease_until"))
+            .transpose()
+            .map_err(classify)?;
+        Ok(until.flatten())
     }
 
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {

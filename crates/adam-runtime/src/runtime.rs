@@ -128,6 +128,17 @@ pub struct RunView {
     /// Parked with no timer: only an inbound message (or cancel) resumes it.
     /// This is the "input required" state.
     pub waiting: bool,
+    /// A worker holds an unexpired lease on the run: it is being stepped right now, though
+    /// nothing has been committed yet. Only ever `true` for a runnable run (a parked, finished or
+    /// failed run is not being stepped, whatever lease it still carries). The lease is the store's
+    /// scheduling data, read beside the record in [`Runtime::view`], so a reader in another process
+    /// than the worker sees it too. A lease that ran out (the worker died) reads `false` until
+    /// another worker claims the run.
+    ///
+    /// This is what lets an A2A task that has not had its first commit report `working` instead
+    /// of `submitted`: a whole turn commits once, and its first model call can take a long time.
+    #[serde(default)]
+    pub claimed: bool,
     /// The result, once `Done`.
     pub output: Option<Value>,
     /// The reason, once `Failed` (a cancel reads `cancelled: <reason>`).
@@ -151,7 +162,7 @@ pub struct RunView {
 }
 
 impl RunView {
-    fn new(rec: RunRecord, env: Envelope) -> Self {
+    fn new(rec: RunRecord, env: Envelope, claimed: bool) -> Self {
         Self {
             id: rec.id,
             agent: rec.agent,
@@ -159,6 +170,7 @@ impl RunView {
             status: rec.status,
             wake_at: rec.wake_at,
             waiting: rec.status == RunStatus::Parked && rec.wake_at.is_none(),
+            claimed,
             output: (rec.status == RunStatus::Done).then_some(env.output),
             error: env.error,
             attempt: env.attempt,
@@ -935,7 +947,18 @@ impl Runtime {
             return Ok(None);
         };
         let env = Envelope::decode(run, &rec.state)?;
-        Ok(Some(RunView::new(rec, env)))
+        // Read after the record, and only for a run a worker could be holding: a second read for
+        // every view of a parked or finished run would buy nothing. The two reads are not one
+        // snapshot. A claim that lands between them reads as not yet (the next view has it, and
+        // a worker emits a status event at once to prompt that read); a step that commits and
+        // releases between them reads as `submitted` for one view at most.
+        let claimed = if rec.status == RunStatus::Runnable {
+            let until = self.inner.store.lease_until(run).await?;
+            until.is_some_and(|until| until > self.inner.clock.now())
+        } else {
+            false
+        };
+        Ok(Some(RunView::new(rec, env, claimed)))
     }
 }
 

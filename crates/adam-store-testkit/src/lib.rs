@@ -52,7 +52,7 @@ macro_rules! store_conformance {
             journal_detects_nondeterminism, journal_requires_run,
             claim_respects_due_rules, claim_filters_agents_and_limit, claim_skips_busy_runs,
             claim_is_exclusive_under_concurrency, lease_expiry_allows_takeover,
-            renew_and_release_lease,
+            renew_and_release_lease, lease_until_reports_the_lease,
             pinned_claim_never_gives_a_run_to_another_worker,
             pinned_claim_sets_the_owner_on_first_claim,
             any_claim_ignores_and_never_sets_the_owner,
@@ -794,6 +794,62 @@ pub mod cases {
                 .unwrap()
         );
         store.release_lease(RunId::new(), "w1").await.unwrap();
+    }
+
+    /// `lease_until` says when the lease on a run ends: nothing before a claim, the claim's end
+    /// after it, the renewed end after a renewal, nothing after a release, and nothing for a run
+    /// that does not exist. A commit does not touch the lease. An expired lease is still reported:
+    /// the caller compares with its own clock.
+    pub async fn lease_until_reports_the_lease(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(store.lease_until(run.id).await.unwrap(), None, "unclaimed");
+        assert_eq!(store.lease_until(RunId::new()).await.unwrap(), None);
+
+        let t = truncate_ms(now() + chrono::Duration::seconds(1));
+        let ttl = Duration::from_secs(10);
+        assert_eq!(
+            claim_ids(&store, &agent, "w1", t, ttl, 1).await,
+            vec![run.id]
+        );
+        let first_end = t + chrono::Duration::seconds(10);
+        assert_eq!(store.lease_until(run.id).await.unwrap(), Some(first_end));
+
+        let t_renew = t + chrono::Duration::seconds(8);
+        assert!(store.renew_lease(run.id, "w1", t_renew, ttl).await.unwrap());
+        let renewed_end = t_renew + chrono::Duration::seconds(10);
+        assert_eq!(store.lease_until(run.id).await.unwrap(), Some(renewed_end));
+
+        // Not the lease's business: a commit leaves it as it is.
+        store
+            .commit_run(
+                run.id,
+                run.version,
+                RunUpdate::new(RunStatus::Runnable, json!({"turn": 1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.lease_until(run.id).await.unwrap(), Some(renewed_end));
+
+        // Only the holder's release clears it.
+        store.release_lease(run.id, "intruder").await.unwrap();
+        assert_eq!(store.lease_until(run.id).await.unwrap(), Some(renewed_end));
+        store.release_lease(run.id, "w1").await.unwrap();
+        assert_eq!(store.lease_until(run.id).await.unwrap(), None, "released");
+
+        // A lease that ran out is reported as it was; whether it still counts is the caller's call.
+        let t2 = renewed_end + chrono::Duration::seconds(1);
+        assert_eq!(
+            claim_ids(&store, &agent, "w2", t2, ttl, 1).await,
+            vec![run.id]
+        );
+        assert_eq!(
+            store.lease_until(run.id).await.unwrap(),
+            Some(t2 + chrono::Duration::seconds(10))
+        );
     }
 
     /// Once a run has an owner, a pinned claim by another worker never gets it: not while it

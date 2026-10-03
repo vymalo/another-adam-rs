@@ -258,6 +258,7 @@ mod tests {
             status,
             wake_at: None,
             waiting: status == adam_core::RunStatus::Parked,
+            claimed: false,
             output,
             error: None,
             attempt: 0,

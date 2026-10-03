@@ -186,7 +186,10 @@ impl Artifact {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunEvent {
-    /// The run's status changed (emitted by the runtime after the commit).
+    /// The run's status changed (emitted by the runtime after the commit), or a worker took the
+    /// run for the first time: then `status` is the run's own (`runnable`, nothing was committed)
+    /// and `detail` is `claimed`, to say that the run is being stepped now. A status event is a
+    /// prompt to read the durable run (`Runtime::view`), which is the truth.
     Status {
         /// The new status.
         status: RunStatus,

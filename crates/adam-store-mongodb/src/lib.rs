@@ -694,6 +694,15 @@ impl Store for MongoStore {
         Ok(())
     }
 
+    async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
+        let found = self
+            .runs
+            .find_one(doc! { "_id": uuid(id) })
+            .await
+            .map_err(classify)?;
+        found.map_or(Ok(None), |d| get_date(&d, "lease_until"))
+    }
+
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
         // `updated_at < before` at millisecond precision, rounding `before` up so
         // a sub-millisecond cutoff selects the same runs as in the other stores.

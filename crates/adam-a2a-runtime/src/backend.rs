@@ -44,6 +44,8 @@ pub const MAX_REFERENCES: usize = 8;
 /// | `SendMessage` (new) | `Runtime::start_with_id` with [`task_id_for`], conversation `<subject>:<context id>` |
 /// | `SendMessage` (new) with `referenceTaskIds` | `Runtime::start_with_id_continuing` from the first reference that qualifies (see below) |
 /// | `SendMessage` with `taskId` | `Runtime::deliver` while `input-required`; and, with `steer/v1` activated, while `submitted` or `working` (see "A message for a running task") |
+/// | `submitted` | runnable, nothing committed, no worker holds it |
+/// | `working` | runnable and a worker holds the run's lease (`RunView::claimed`, from the first claim, before the first commit), or committed at least once, or parked on a timer |
 /// | `input-required` | run parked with no timer (`RunView::waiting`); the question comes from [`PromptFn`] |
 /// | `completed` | `Done`; `output.text` is the status message, `RunView::artifacts` are the task artifacts |
 /// | `failed` | `Failed`; the error is the status message |

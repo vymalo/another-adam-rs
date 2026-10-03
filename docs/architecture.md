@@ -853,6 +853,7 @@ sequenceDiagram
     B->>R: view(run), the snapshot, read after attaching
     B-->>C: SSE: snapshot (state submitted or working)
     Note over R,DB: Workers advance the run. See the next diagram.
+    Note over K,B: a worker's first claim emits Status(Runnable, claimed): a re-read, and working
     loop until a terminal state or input-required
         par live events
             K-->>B: Progress, Custom or Artifact event
@@ -1378,12 +1379,22 @@ How a run looks to an A2A client (`task_state` in
 
 | Run | A2A task state |
 |---|---|
-| `Runnable`, version 1 (no worker has committed yet) | `submitted` |
+| `Runnable`, version 1 (no worker has committed yet), no worker holds a lease | `submitted` |
+| `Runnable`, version 1, a worker holds an unexpired lease (`RunView::claimed`) | `working` |
 | `Runnable`, or `Parked` with a timer | `working` |
 | `Parked` with no timer | `input-required` |
 | `Done` | `completed` |
 | `Failed` with an error that starts `cancelled: ` | `canceled` |
 | `Failed` otherwise | `failed` |
+
+A turn commits once, so the first model call of a task can last a long time with nothing committed. The
+lease is what says a worker is on the run: `Runtime::view` reads it (`Store::lease_until`, compared with
+the runtime's clock) for a runnable run and sets `RunView::claimed`, and the worker emits
+`Status(Runnable, claimed)` when it first takes a run, which makes a subscriber read the run again. The
+task is `working` from the claim, in a `tasks/get` read and as a status update to a subscriber, and a
+`steer/v1` message sent during that first call is delivered to the running task. A lease that ran out
+(the worker died) is not a worker at work, so the task reads `submitted` again until another worker takes
+it. A front that only registers the starter claims nothing, and its tasks stay `submitted`.
 
 The ids an A2A client sees are derived, not random. The `message_id` of a
 status message is a hash of the task id, the state and the text, so every

@@ -4,6 +4,12 @@
 //! refuses with A2A's error; and a message sent while the model writes the final answer is answered.
 //! The last case goes through the real A2A server over HTTP, as the orchestration layer does.
 //!
+//! The first model call of a task is held at a gate by several cases, and that is the case that
+//! matters most: a whole turn commits once, so until it ends nothing is committed, and the task
+//! has to read `working` from the moment a worker takes it (`a_task_a_worker_has_taken_is_working_...`),
+//! in a read and as an event to a subscriber, or a message sent meanwhile would be refused or
+//! wait for the next turn.
+//!
 //! Run against `MemoryStore` always and against PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set.
 //! Nothing sleeps for a fixed time: the model and the tool are held at gates, so a message is
 //! always delivered *during* the step.
@@ -16,7 +22,7 @@ use std::time::Duration;
 use a2a::{Message, Part, Role, Task, TaskState};
 use adam_a2a::{
     A2aServer, AgentCardConfig, AuthConfig, BackendError, Caller, ExtensionConfig, STEER_EXTENSION,
-    TaskBackend,
+    TaskBackend, TaskEvent,
 };
 use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::{DynStore, MemoryStore, RunId};
@@ -142,6 +148,17 @@ struct Rig {
 impl Rig {
     /// `hold_model_on`: the model call that waits at the gate. `with_tool`: the agent has the gate tool.
     fn new(store: &DynStore, hold_model_on: Option<usize>, with_tool: bool) -> Self {
+        Self::polling(store, hold_model_on, with_tool, Duration::from_millis(10))
+    }
+
+    /// As [`Rig::new`], with the backend re-reading the run every `poll` (its subscriptions go by
+    /// the live events in between).
+    fn polling(
+        store: &DynStore,
+        hold_model_on: Option<usize>,
+        with_tool: bool,
+        poll: Duration,
+    ) -> Self {
         let name = uniq("steer");
         let mock = Arc::new(MockModel::new());
         let gate = Arc::new(Gate::default());
@@ -161,8 +178,8 @@ impl Rig {
             .event_sink(events.clone())
             .poll_interval(Duration::from_millis(10))
             .build();
-        let backend = RuntimeTaskBackend::new(runtime.clone(), events, name)
-            .with_poll_interval(Duration::from_millis(10));
+        let backend =
+            RuntimeTaskBackend::new(runtime.clone(), events, name).with_poll_interval(poll);
         Self {
             mock,
             gate,
@@ -235,6 +252,15 @@ async fn wait_state(rig: &Rig, who: &Caller, id: &str, state: TaskState) -> Task
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("task {id} never reached {state:?}");
+}
+
+/// The next event of a subscription, within a bound that is for a bug and never relied on.
+async fn next(events: &mut BoxStream<'static, Result<TaskEvent, BackendError>>) -> TaskEvent {
+    tokio::time::timeout(Duration::from_secs(20), events.next())
+        .await
+        .expect("timed out waiting for an event")
+        .expect("the stream ended early")
+        .expect("the stream item was an error")
 }
 
 fn answer(task: &Task) -> String {
@@ -562,6 +588,134 @@ async fn a_message_sent_during_the_final_model_call_is_answered() {
             "{backend}"
         );
         assert_eq!(rig.pending(&done).await, 0, "{backend}");
+    }
+}
+
+/// A worker that has taken a task makes it `working`, though nothing is committed until the turn
+/// ends and the model is still at its first call. A message sent now is steered into the task and
+/// read by the next model turn, exactly as it was when the task read `submitted`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_a_worker_has_taken_is_working_before_its_first_commit_and_takes_a_steer() {
+    for (backend, store) in stores().await {
+        let rig = Rig::new(&store, Some(0), false);
+        rig.mock.push_text("red").push_text("blue");
+        let who = uniq("alice");
+        let task = rig
+            .backend
+            .submit(caller(&who), user("which colour?", "m-0"), None, None)
+            .await
+            .unwrap();
+        // Nobody has taken it yet: no worker is running.
+        let before = rig
+            .backend
+            .get(&caller(&who), &task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.status.state, TaskState::Submitted, "{backend}");
+
+        let worker = rig.worker();
+        rig.gate.wait_reached().await;
+        let during = rig
+            .backend
+            .get(&caller(&who), &task.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(during.status.state, TaskState::Working, "{backend}");
+        let view = rig
+            .runtime
+            .view(RunId(task.id.parse().unwrap()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (view.version, view.claimed),
+            (1, true),
+            "{backend}: nothing is committed, and a worker holds the run"
+        );
+
+        let answered = rig
+            .backend
+            .submit(
+                steering(&who),
+                user("I meant the sea", "m-1"),
+                Some(task.id.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(answered.status.state, TaskState::Working, "{backend}");
+        rig.gate.release.notify_one();
+        let done = wait_state(&rig, &caller(&who), &task.id, TaskState::Completed).await;
+        worker.stop().await;
+        assert_eq!(answer(&done), "blue", "{backend}");
+        assert_eq!(
+            rig.mock.requests()[1].messages.last(),
+            Some(&ModelMessage::user_text("I meant the sea")),
+            "{backend}"
+        );
+    }
+}
+
+/// A subscriber hears `working` when the worker takes the task, before the first commit, from the
+/// live event and not from a poll: the backend here re-reads only once a minute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscriber_is_told_working_when_a_worker_takes_the_task() {
+    for (backend, store) in stores().await {
+        let rig = Rig::polling(&store, Some(0), false, Duration::from_secs(60));
+        rig.mock.push_text("done");
+        let who = uniq("alice");
+        let task = rig
+            .backend
+            .submit(caller(&who), user("go", "m-0"), None, None)
+            .await
+            .unwrap();
+        let mut events = rig.backend.subscribe(&caller(&who), &task.id);
+        let first = next(&mut events).await;
+        assert!(
+            matches!(&first, TaskEvent::Snapshot(t) if t.status.state == TaskState::Submitted),
+            "{backend}: {first:?}"
+        );
+
+        // The model is held at its first call, so this is before anything is committed.
+        let worker = rig.worker();
+        let second = next(&mut events).await;
+        assert!(
+            matches!(&second, TaskEvent::Status(u) if u.status.state == TaskState::Working),
+            "{backend}: {second:?}"
+        );
+        let view = rig
+            .runtime
+            .view(RunId(task.id.parse().unwrap()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.version, 1, "{backend}: still nothing committed");
+
+        rig.gate.release.notify_one();
+        let rest = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut labels = Vec::new();
+            while let Some(event) = events.next().await {
+                labels.push(match event.expect("an event") {
+                    TaskEvent::Status(u) => u.status.state,
+                    other => panic!("{backend}: unexpected {other:?}"),
+                });
+            }
+            labels
+        })
+        .await;
+        worker.stop().await;
+        // The agent's own progress events are `working` too; what matters is that the task never
+        // falls back, and that it ends. The poll is a minute away, so the end is the live status.
+        let rest = rest.expect("the stream ends");
+        assert_eq!(rest.last(), Some(&TaskState::Completed), "{backend}");
+        assert!(
+            rest[..rest.len() - 1]
+                .iter()
+                .all(|s| *s == TaskState::Working),
+            "{backend}: {rest:?}"
+        );
     }
 }
 

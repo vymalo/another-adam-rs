@@ -2167,6 +2167,116 @@ mod cases {
     }
 
     /// Events, durable artifacts, and reconstruction after a restart.
+    /// A worker that takes a run says so before it steps it, and `RunView::claimed` is true from
+    /// then until the lease ends: nothing is committed while the first step is in the air, so the
+    /// record alone cannot tell a run being stepped from one nobody has taken. Only the first claim
+    /// is announced: after a commit the run is known to be in progress.
+    pub async fn a_claimed_run_says_so_before_its_first_commit(store: DynStore) {
+        let name = uniq("claimed");
+        let (started, gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (started, gate) = (started.clone(), gate.clone());
+                move |_ctx, state| {
+                    let (started, gate) = (started.clone(), gate.clone());
+                    async move {
+                        if phase(&state) == 0 {
+                            started.notify_one();
+                            notified(&gate, "the test to look at the run").await;
+                            return Ok(Transition::Continue(json!({"phase": 1})));
+                        }
+                        Ok(Transition::Done {
+                            state,
+                            output: json!("finished"),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let sink = CollectingSink::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .event_sink(sink.clone())
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let before = rt.view(run).await.expect("view").expect("run");
+        assert_eq!(
+            (before.status, before.version, before.claimed),
+            (RunStatus::Runnable, 1, false),
+            "created, and nobody has taken it"
+        );
+
+        let worker = spawn_worker(&rt);
+        notified(&started, "the first step").await;
+        let during = rt.view(run).await.expect("view").expect("run");
+        assert_eq!(
+            (during.status, during.version, during.claimed),
+            (RunStatus::Runnable, 1, true),
+            "a worker holds it, and nothing is committed yet"
+        );
+        gate.notify_one();
+        let done = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert!(!done.claimed, "a finished run is nobody's");
+
+        let claimed = |e: &RunEvent| matches!(e, RunEvent::Status { status: RunStatus::Runnable, detail: Some(d) } if d == "claimed");
+        let events = sink.events_for(run);
+        assert_eq!(
+            events.iter().filter(|e| claimed(e)).count(),
+            1,
+            "the first claim is announced once, not the claim of the second step: {events:?}"
+        );
+        assert!(
+            events.get(1).is_some_and(claimed),
+            "announced right after the start, before anything the step did: {events:?}"
+        );
+    }
+
+    /// A lease that ran out (the worker died, or the step outlived it) is no claim: the run reads
+    /// as unclaimed again until a worker takes it.
+    pub async fn a_lease_that_ran_out_is_not_a_claim(store: DynStore) {
+        let name = uniq("claim-lapse");
+        let (started, gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let agent = fn_agent(
+            &name,
+            step_fn({
+                let (started, gate) = (started.clone(), gate.clone());
+                move |_ctx, state| {
+                    let (started, gate) = (started.clone(), gate.clone());
+                    async move {
+                        started.notify_one();
+                        notified(&gate, "the clock to move past the lease").await;
+                        Ok(Transition::Done {
+                            state,
+                            output: json!("late"),
+                        })
+                    }
+                    .boxed()
+                }
+            }),
+        );
+        let clock = ManualClock::new();
+        let rt = builder(&store, &uniq("w"), &agent)
+            .lease_renewal(false)
+            .clock(clock.clone())
+            .build();
+        let run = rt.start(&name, inbound(), None).await.expect("start");
+        let worker = spawn_worker(&rt);
+        notified(&started, "the step").await;
+        assert!(rt.view(run).await.unwrap().unwrap().claimed);
+
+        clock.advance(Duration::from_secs(11)); // the 10 s lease lapses under the step
+        let lapsed = rt.view(run).await.unwrap().unwrap();
+        assert_eq!(
+            (lapsed.status, lapsed.version, lapsed.claimed),
+            (RunStatus::Runnable, 1, false)
+        );
+        gate.notify_one();
+        wait_done(&rt, run).await;
+        worker.stop().await;
+    }
+
     pub async fn events_and_durable_artifacts(store: DynStore) {
         let name = uniq("events");
         let agent = fn_agent(
@@ -2221,6 +2331,10 @@ mod cases {
                 RunEvent::Status {
                     status: RunStatus::Runnable,
                     detail: Some("started".into())
+                },
+                RunEvent::Status {
+                    status: RunStatus::Runnable,
+                    detail: Some("claimed".into())
                 },
                 RunEvent::Progress {
                     message: "working".into()
@@ -4603,6 +4717,8 @@ macro_rules! runtime_suite {
                 start_with_id_is_idempotent,
                 api_errors,
                 a_starter_only_runtime_starts_and_a_full_runtime_steps,
+                a_claimed_run_says_so_before_its_first_commit,
+                a_lease_that_ran_out_is_not_a_claim,
                 events_and_durable_artifacts,
                 broadcast_sink_streams_a_run,
                 panic_is_a_transient_failure,
