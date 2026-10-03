@@ -595,6 +595,127 @@ mod tests {
         }
     }
 
+    /// An App that finds the installation of each owner needs a call to name one account: a search
+    /// that names none, or several, is an error result that says how to name one, and **nothing is
+    /// asked of the credentials**, so no installation is looked up for a guess; one account is
+    /// served like any call.
+    #[tokio::test]
+    async fn a_search_with_no_or_several_accounts_is_refused_without_a_pin() {
+        let creds = Arc::new(Recording::default());
+        let bearer = bearer(&creds, true);
+        for (tool, arguments) in [
+            ("search_code", json!({"query": "fn main"})),
+            (
+                "search_repositories",
+                json!({"query": "language:rust stars:>100"}),
+            ),
+            ("search_issues", json!({"query": "bug -org:other"})),
+            ("search_issues", json!({})),
+            ("search_code", json!({"query": "org:acme org:other"})),
+            (
+                "search_code",
+                json!({"query": "(user:octocat OR org:acme) fn"}),
+            ),
+            ("get_file_contents", json!({"path": "README.md"})),
+            // An owner that is no login is no account either (the model's text is never put in a URL).
+            ("get_file_contents", json!({"owner": "a b", "repo": "r"})),
+            ("list_branches", json!({"owner": "../x", "repo": "r"})),
+        ] {
+            let err = bearer
+                .for_call(tool, &args(arguments.clone()))
+                .await
+                .unwrap_err();
+            let ToolError::Permanent(why) = &err else {
+                panic!("{tool} {arguments}: {err:?}")
+            };
+            assert!(
+                why.contains("`org:`, `user:` or `repo:`") && why.contains("one account"),
+                "{tool} {arguments}: {why}"
+            );
+        }
+        assert!(
+            creds.asked.lock().unwrap().is_empty(),
+            "the credentials were not asked: {:?}",
+            creds.asked.lock().unwrap()
+        );
+        // One account, however it is named, is served from that account's installation.
+        for (tool, arguments, url) in [
+            (
+                "search_code",
+                json!({"query": "fn main org:acme"}),
+                "https://github.com/acme/-",
+            ),
+            (
+                "search_issues",
+                json!({"query": "bug user:Octocat"}),
+                "https://github.com/Octocat/-",
+            ),
+            (
+                "search_code",
+                json!({"query": "repo:acme/widgets fn"}),
+                "https://github.com/acme/widgets",
+            ),
+            (
+                "search_issues",
+                json!({"owner": "acme", "query": "bug"}),
+                "https://github.com/acme/-",
+            ),
+            (
+                "list_branches",
+                json!({"owner": "acme", "repo": "widgets"}),
+                "https://github.com/acme/widgets",
+            ),
+        ] {
+            assert_eq!(
+                token(&bearer, tool, arguments.clone()).await,
+                format!("ghs_token_for_{url}"),
+                "{tool} {arguments}"
+            );
+        }
+        // A refusal of the credentials (not installed, not on the list) is the model's to read.
+        *creds.fail.lock().unwrap() = Some(WorkspaceError::Auth(
+            "the GitHub App `x` is not installed on `acme`".to_owned(),
+        ));
+        let err = bearer
+            .for_call(
+                "list_branches",
+                &args(json!({"owner": "acme", "repo": "widgets"})),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Permanent(why) if why.contains("not installed")),
+            "{err:?}"
+        );
+    }
+
+    /// `get_me` is the authenticated user, which an App is not (the server asks `GET /user`, which an
+    /// installation token gets a `403` for): refused without a pin, with the reason, and the
+    /// credentials are not asked.
+    #[tokio::test]
+    async fn get_me_is_refused_for_an_app_without_a_pin() {
+        let creds = Arc::new(Recording::default());
+        let discovering = bearer(&creds, true);
+        let err = discovering
+            .for_call("get_me", &Map::new())
+            .await
+            .unwrap_err();
+        let ToolError::Permanent(why) = &err else {
+            panic!("{err:?}")
+        };
+        assert!(
+            why.contains("not a user") && why.contains("GitHub App"),
+            "{why}"
+        );
+        assert!(creds.asked.lock().unwrap().is_empty());
+        // With a token or a pinned installation it is asked for like the rest.
+        let one = bearer(&creds, false);
+        assert_eq!(
+            token(&one, "get_me", json!({})).await,
+            "ghs_token_for_https://github.com/-/-"
+        );
+    }
+
     #[test]
     fn debug_shows_the_host_and_no_credentials() {
         let creds: DynGitCredentials = Arc::new(StaticToken::new("ghp_secret_token"));

@@ -118,7 +118,8 @@ async fn build_agent(
             .allowed_repo_hosts
             .first()
             .map_or("github.com", String::as_str),
-        false,
+        // An App that finds the installation of each owner needs each call to name its account.
+        worker.github.finds_installations(),
     ));
     let policy =
         worker

@@ -212,28 +212,35 @@ impl Respond for CreatePull {
 /// A mock GitHub for `octo/widgets`: lists and creates pull requests.
 pub async fn mock_github() -> MockServer {
     let github = MockServer::start().await;
+    mount_repository(&github, "octo/widgets").await;
+    github
+}
+
+/// Make `github` list and create pull requests, and take comments on them, for the repository
+/// `slug` (`owner/name`), with its own pull requests.
+pub async fn mount_repository(github: &MockServer, slug: &str) {
     let pulls = Arc::new(Pulls::default());
     Mock::given(method("GET"))
-        .and(path("/repos/octo/widgets/pulls"))
+        .and(path(format!("/repos/{slug}/pulls")))
         .respond_with(ListPulls {
             pulls: pulls.clone(),
         })
-        .mount(&github)
+        .mount(github)
         .await;
     Mock::given(method("POST"))
-        .and(path("/repos/octo/widgets/pulls"))
+        .and(path(format!("/repos/{slug}/pulls")))
         .respond_with(CreatePull { pulls })
-        .mount(&github)
+        .mount(github)
         .await;
     // Comments on a pull request (the issue's comments).
     Mock::given(method("POST"))
-        .and(wiremock::matchers::path_regex(
-            r"^/repos/octo/widgets/issues/\d+/comments$",
-        ))
+        .and(wiremock::matchers::path_regex(format!(
+            r"^/repos/{}/issues/\d+/comments$",
+            slug.replace('.', r"\.")
+        )))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
-        .mount(&github)
+        .mount(github)
         .await;
-    github
 }
 
 /// Make the mock GitHub answer every API call with `status` from now on.

@@ -8,7 +8,7 @@ and 8, and its alternative "Let github-mcp-server hold the App").
 changes: the coder's configuration (`GITHUB_APP_OWNERS`, an optional `GITHUB_APP_INSTALLATION_ID`, its startup checks and
 the chart), **D4** (GitHub read through `github-mcp-server http` with a token per call), **D5** (the redactor's bound) and
 **D6** (read-only tokens). Until then the coder is exactly as ADR 0009 says: its `GitHubApp` is pinned. The sequence
-diagram of an MCP call comes with the change that builds D4.*
+diagram of an MCP call comes with the change that builds D4. (The notes below say what was built since.)*
 
 *Status note, 2026-10-03: **D4's adam-mcp part is built** (`crates/adam-mcp`): `CallBearer`, `McpPolicy::bearer_per_call`
 (a server name plus an origin), and the refusals at connect (`Error::BearerBinding`: another origin, or an `Authorization`
@@ -23,6 +23,18 @@ for an App that finds the installation of each owner (a search that names no acc
 error results), but nothing builds such an App yet, so they are not exercised: the coder's `GITHUB_APP_OWNERS`, D5 and
 D6 follow. `MCP_ALLOW_STDIO` stays in the chart for one release, for an agent folder that still starts the server as a
 child process.*
+
+*Status note, 2026-10-03: **D1 to D5 are built.** The coder's `GITHUB_APP_INSTALLATION_ID` is an optional pin and
+`GITHUB_APP_OWNERS` (comma- or space-separated, without case, `*` for any with a startup warning) is required without one
+(`GitHubAppConfig { installations: AppInstallations::{Pinned, Owners} }`; a pin with owners, owners with a token, neither
+variable, `*` beside names, and an entry that is no account name are exit 78 naming the variables); `repos.rs` builds
+`GitHubApp::new` or `GitHubApp::discovering`; the discovery rules of `GitHubReadBearer` are exercised (a search with no
+account or several, an owner that is no login, and `get_me` are error results, and nothing is asked of the credentials for
+them); D5's `MAX_ADDED` is `2 * MAX_CACHED_INSTALLATIONS` (128); the chart has `github.app.owners` and refuses a pin with
+owners and neither; the compose override runs the App by owner with `GITHUB_APP_OWNERS: local,scratch,other-org` against the
+mock's lookups. `bin/adam-coder/tests/binary.rs` runs the real server in `http` mode with owners and shows, for two owners,
+two lookups, two mints and two calls each with its own token. **Not built: D6** (read-only tokens for MCP calls). **Not run:**
+a live GitHub App, GitHub Enterprise Server, and F2, F3, F7 and F8 above against GitHub.*
 
 ## Context
 
@@ -63,7 +75,8 @@ tried.**
 ## Decision
 
 1. **D1. The installation is found per owner; `GITHUB_APP_INSTALLATION_ID` becomes an optional pin.** *Built in the library
-   (`GitHubApp::discovering`; `GitHubApp::new` is the pinned constructor, unchanged); the coder's variable follows.*
+   (`GitHubApp::discovering`; `GitHubApp::new` is the pinned constructor, unchanged) and in the coder
+   (`GITHUB_APP_INSTALLATION_ID` is the optional pin).*
    * With a pin, behaviour is exactly ADR 0009: no lookup, one token for every repository.
    * Without a pin, the installation is resolved from the owner of the repository's URL, with the App's JWT:
      1. `GET /orgs/{owner}/installation`;
@@ -71,9 +84,9 @@ tried.**
      3. on `404` again, "not installed".
    * By owner and not by repository, because creating a repository (`create_repository` asks for credentials for an address
      that does not exist yet) needs the installation too.
-   * A pin and an owner list together are a configuration error (the coder's exit 78; follows with its configuration).
-2. **D2. An owner allow-list is required when there is no pin: fail closed.** *Built in the library (`AppOwners`); the coder's
-   `GITHUB_APP_OWNERS` follows.* Logins are compared without case; `AppOwners::Any` (the coder's `*`) is every account the App
+   * A pin and an owner list together are a configuration error (the coder's exit 78, naming both variables).
+2. **D2. An owner allow-list is required when there is no pin: fail closed.** *Built in the library (`AppOwners`) and in the coder
+   (`GITHUB_APP_OWNERS`).* Logins are compared without case; `AppOwners::Any` (the coder's `*`) is every account the App
    is installed on, and the coder logs a warning for it. There is no default, because of F6.
    * The check runs **before anything is looked up or signed** and applies on every path (git, REST, `create_repository`, and
      later MCP reads). `CREATE_REPO_OWNERS` still applies on top, and `ALLOWED_REPO_HOSTS` (`HostScoped`) stays outermost.
@@ -105,8 +118,8 @@ tried.**
    * **A missing permission**: an installation with "selected repositories" that lacks the repository fails at `git` or at
      the REST call, as today.
 4. **D4. The GitHub MCP server runs in `http` mode, holds no credentials, and the coder supplies a token per call.**
-   *Built for a token and a pinned installation (the coder's part) on top of adam-mcp's `CallBearer`; the discovery
-   rules are written and follow with `GITHUB_APP_OWNERS`.*
+   *Built, in the coder, for a token, a pinned installation and an App that finds the installation of each owner, on
+   top of adam-mcp's `CallBearer`.*
    * **Process**: `github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests --listen-host 127.0.0.1
      --port 8082` as a native sidecar in the chart (F12), or a service sharing the coder's network in compose.
    * **Agent folder**: the embedded `mcp.json` becomes `{"type":"http","url":"http://127.0.0.1:8082/","tools":[the twelve]}`
@@ -127,7 +140,7 @@ tried.**
      feeding the `stdio` server a minted token: it is static for the process and expires within the hour; (d) coder-only
      wrappers over `adam_mcp::Endpoint`, with no adam-mcp change: smaller, but it moves the allow-list out of the agent
      folder (second choice).
-5. **D5. The redactor scales with the cache.** *Not built.* `bin/adam-coder/src/redact.rs` `MAX_ADDED` becomes
+5. **D5. The redactor scales with the cache.** *Built.* `bin/adam-coder/src/redact.rs` `MAX_ADDED` becomes
    `2 * adam_workspace::MAX_CACHED_INSTALLATIONS`. ADR 0009 decision 6's 16 assumes one live token; with 64 installations
    there can be 64, and one more while a refresh overlaps. The constant is public for that reason.
 6. **D6. Down-scoping.** *Not built.*

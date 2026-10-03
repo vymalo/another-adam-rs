@@ -523,7 +523,7 @@ The boundaries, by what they swap:
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` | `InMemoryBackend` (feature `test-util`) |
 | `CodeHost` | `adam-workspace` | `GitHub` (feature `github`, on by default) | `MemoryCodeHost` (feature `test-util`) |
 | `Environment` | `adam-workspace` | `Local` (the caller's own container), `DevContainer` (`adam-devcontainer`: the first repository's devcontainer, on a rootless Podman service) | the stub Podman and stub CLI of `adam-devcontainer`'s tests |
-| `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `GitHubApp` (installation access tokens minted from a GitHub App's key, feature `github`; wrapped in `HostScoped`, which limits any credentials to named hosts), `StaticToken` (one token, any host) | none needed |
+| `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `GitHubApp` (installation access tokens minted from a GitHub App's key, feature `github`, for one pinned installation or for the installation of each owner, found and cached; wrapped in `HostScoped`, which limits any credentials to named hosts), `StaticToken` (one token, any host) | none needed |
 | `Agent` | `adam-runtime` | `LlmAgent`, `CoderAgent` | test agents |
 | `AgentStarter` | `adam-runtime` | `LlmStarter`, `CoderStarter` | test starters |
 | `Tool` | `adam-llm-agent` | the coder tools, `FnTool` | test tools |
@@ -2080,10 +2080,14 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     the allow-list (`ScopedToken`, or `HostScoped` over `GitHubApp`, plus `Workspaces::allow_hosts`).
   * **A token or a GitHub App installation, never both**
     ([ADR 0009](decisions/0009-github-per-installation-read-through-mcp.md)): `GITHUB_TOKEN`, or
-    `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and a private key (a file, or the PEM in a variable). The
+    `GITHUB_APP_ID`, a private key (a file, or the PEM in a variable) and **one of** `GITHUB_APP_INSTALLATION_ID` (a pin: that
+    one installation serves every repository) **or** `GITHUB_APP_OWNERS` (no pin: the accounts the App may act for, and
+    the installation of each repository's owner is found with the App's JWT,
+    [ADR 0017](decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md); required, never defaulted, because a
+    public App can be installed by anyone, and checked before anything is looked up or signed). The
     key is parsed at startup. `GitHubApp` signs a short JWT with it and trades it, at
     `{GITHUB_API_URL}/app/installations/{id}/access_tokens`, for an installation token, kept until five minutes
-    before it expires and minted again by one caller at a time. `RedactingCredentials` hands every token it
+    before it expires and minted again by one caller at a time, one cache for each installation. `RedactingCredentials` hands every token it
     gets to the shared `Redactor`, so a minted token is a secret from the moment it exists. The sequence and the
     states of the cached token are in the ADR and in the
     [`adam-workspace` README](../crates/adam-workspace/README.md#github-app-credentials).
@@ -2096,7 +2100,8 @@ What the diagrams cannot say (`bin/adam-coder/src/`):
     `GitHubReadBearer` (`bin/adam-coder/src/github_mcp.rs`, an `adam_mcp::CallBearer`), which gives each call the token
     of the repository it is about, through the coder's own `GitCredentials` (host check, redactor), and a placeholder
     bearer to list the tools at startup (no request reaches GitHub for it). With a token or a pinned installation that
-    is the one token. The model is offered twelve of the server's tools as `github__<name>`. Everything that writes
+    is the one token; for an App by owner a call has to be about one account (a search that names none or several, and
+    `get_me`, are error results) and gets the token of that owner's installation. The model is offered twelve of the server's tools as `github__<name>`. Everything that writes
     stays the coder's own, behind the gate. The dev stack points the coder at a WireMock of the server's HTTP endpoint
     instead (`dev/coder-agent/mcp.json`, `mock-github-mcp`). See
     [`bin/adam-coder`](../bin/adam-coder/README.md#github-over-mcp-read-only).
@@ -2228,6 +2233,8 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_PATH`, and the App's private key
   is a Secret you manage (`github.app.privateKeySecret`, key `private-key.pem`) mounted read-only at
   `/var/run/secrets/github-app`. The chart carries no key, and a control plane has no GitHub setting or key volume.
+  An App is pinned (`github.app.installationId`) or by owner (`github.app.owners`, rendered as `GITHUB_APP_OWNERS`):
+  exactly one, and the render fails for both or neither.
 * **The GitHub MCP server** is a native sidecar of every pod that runs workers (`githubMcp`: an init container with
   `restartPolicy: Always`, the coder's own image, `github-mcp-server http --read-only --toolsets
   context,repos,issues,pull_requests` on 127.0.0.1:8082, a TCP startup probe, no Secret, no environment but
@@ -2319,9 +2326,10 @@ flowchart LR
   idle here.
 * The coder is a token (`GITHUB_TOKEN`, a dummy) unless `-f dev/compose.github-app.yaml` is added: that override
   turns the token off, makes a throwaway RSA key into a volume with an init service (no key is committed) and gives
-  the coder `GITHUB_APP_*`, so it trades a JWT at `mock-github` for an installation token that lasts four minutes
+  the coder `GITHUB_APP_*` with `GITHUB_APP_OWNERS` and no pin, so it finds the installation of each owner at
+  `mock-github` with its JWT and trades the JWT for an installation token that lasts four minutes
   (inside the coder's refresh margin, so the refresh runs all the time). `dev/coder-e2e.sh` with `GITHUB_AUTH=app`
-  asserts that the trade happened and that every call to the repositories' API, and every `tools/call` to
+  asserts that the installation was looked up (the first run after the coder started), that the trade happened and that every call to the repositories' API, and every `tools/call` to
   `mock-github-mcp`, carried the installation token and never the JWT; CI runs the four scenarios of that script in both modes.
 * The service `agent` is [`adam-agent`](../bin/adam-agent/README.md) from the **coder's image** with the entrypoint
   overridden (`tini -- adam-agent`; there is no second image): a chat persona in the folder

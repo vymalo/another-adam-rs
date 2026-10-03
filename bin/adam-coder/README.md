@@ -1351,7 +1351,9 @@ way; every problem is reported at once at startup):
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
 | `GITHUB_TOKEN` | push and pull request token (a personal access token); only ever sent to the `ALLOWED_REPO_HOSTS`. Must be unset or empty in App mode | one of this or the App's variables, for `all` and `worker` |
-| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` | GitHub App mode: the App's application ID or client ID (the JWT's `iss`), and the installation's ID (a positive integer). See [GitHub credentials](#github-credentials-a-token-or-an-app-installation) | both required in App mode, unset in token mode |
+| `GITHUB_APP_ID` | GitHub App mode: the App's application ID or client ID (the JWT's `iss`). See [GitHub credentials](#github-credentials-a-token-or-an-app-installation) | required in App mode |
+| `GITHUB_APP_INSTALLATION_ID` | App mode: **pins** the App to one installation (a positive integer), which serves every repository, with no lookup | App mode: this or `GITHUB_APP_OWNERS`, exactly one |
+| `GITHUB_APP_OWNERS` | App mode **without a pin**: the accounts (users and organisations) the App may act for, separated by commas or spaces, compared without case, or `*` for every account the App is installed on (a startup warning; refused beside other names). The installation of each repository's owner is found with the App's JWT. The chart's `github.app.owners` | App mode: this or `GITHUB_APP_INSTALLATION_ID`, exactly one |
 | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 as GitHub gives it, or PKCS#8): a file, or inline (`\n` escapes accepted). Exactly one. Parsed at startup | one required in App mode |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
@@ -1523,21 +1525,40 @@ remotes never receive the token.
 ### GitHub credentials: a token or an App installation
 
 A worker authenticates to GitHub one of two ways, **exactly one**
-([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md)):
+([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md)), and an App one of two ways, **exactly one**
+([ADR 0017](../../docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md)):
 
-| | token | GitHub App installation |
-|---|---|---|
-| Variables | `GITHUB_TOKEN` | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and one of `GITHUB_APP_PRIVATE_KEY_PATH` (a file) or `GITHUB_APP_PRIVATE_KEY` (the PEM; `\n` escapes accepted) |
-| `GITHUB_TOKEN` | required | must be unset or empty |
-| Whose | a person's, until it is revoked | the App's, scoped to what the App was granted on the installation; its tokens last an hour |
-| Credentials | `ScopedToken` for `ALLOWED_REPO_HOSTS` | `HostScoped<GitHubApp>` for the same hosts |
+| | token | GitHub App, pinned | GitHub App, by owner |
+|---|---|---|---|
+| Variables | `GITHUB_TOKEN` | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and one of `GITHUB_APP_PRIVATE_KEY_PATH` (a file) or `GITHUB_APP_PRIVATE_KEY` (the PEM; `\n` escapes accepted) | `GITHUB_APP_ID`, **`GITHUB_APP_OWNERS`**, and the key |
+| `GITHUB_TOKEN` | required | must be unset or empty | must be unset or empty |
+| Whose | a person's, until it is revoked | the App's, scoped to what the App was granted on the one installation; its tokens last an hour | the App's, on the installation of each owner; one token for each |
+| Which repositories | every one the token reaches | every one of that installation, no lookup | those of an owner on the list, whose installation is found with the App's JWT (`GET /orgs/{owner}/installation`, then `GET /users/{owner}/installation`) |
+| Credentials | `ScopedToken` for `ALLOWED_REPO_HOSTS` | `HostScoped<GitHubApp::new>` for the same hosts | `HostScoped<GitHubApp::discovering>` for the same hosts |
 
-Both set, an App set that is partial (`GITHUB_APP_ID` without the installation or the key, a key with both its
-file and its variable), an installation ID that is not a positive integer, a key file that cannot be read, and a
+**`GITHUB_APP_OWNERS` is required without a pin and has no default: fail closed.** A public App can be installed by
+anyone (*verified 2026-10-03*, docs.github.com "Making a GitHub App public or private"), so "the App is installed on this
+account" says nothing about whether the deployment wants it to act there: a prompt-injected "push this to
+`attacker/repo`" would otherwise get a working token for any account that installed the App. The list is checked
+**before anything is looked up or signed**, for every path (git, REST, `create_repository`, and the GitHub MCP reads), and
+`CREATE_REPO_OWNERS` and `ALLOWED_REPO_HOSTS` still apply on top. `*` says every account the App is installed on, on
+purpose, and logs a warning at startup. A private App can only be installed on its own account (*verified 2026-10-03*,
+same page), so working across accounts needs a public (or an enterprise-owned: *unverified*) App.
+
+Both set, an App set that is partial (`GITHUB_APP_ID` without the key, a key with both its file and its variable),
+**neither the pin nor the owners**, **a pin together with owners**, **owners with a token**, `*` beside other names, an
+owner that is no account name, an installation ID that is not a positive integer, a key file that cannot be read, and a
 key that is not an unencrypted RSA key in PEM form (PKCS#1, as GitHub lets the owner download it, or PKCS#8) are
 configuration errors: exit 78, every problem listed, the name of the variable and never a value. The key is
 **parsed at startup**, so a deployment learns of a bad one when it rolls out, not at the first push. A rotated
 key needs a restart. `GITHUB_APP_ID` is the App's application ID or its client ID (the JWT's `iss`).
+**Breaking change of the library's API:** `GitHubAppConfig::installation_id: u64` is now `installations: AppInstallations`
+(`Pinned(u64)` or `Owners(AppOwners)`), so code that builds or reads a `GitHubAppConfig` has to say which;
+`GitHubAuth::finds_installations()` says whether the installation is found by owner, and `WorkerConfig` has a new field,
+`github_mcp_url`. What an App by owner
+does with an account (the account cache, the 60 seconds a "not installed" is believed, the token slot of each
+installation, the errors) is [`adam-workspace`'s](../../crates/adam-workspace/README.md#github-app-credentials) and
+ADR 0017's D3.
 
 ```mermaid
 sequenceDiagram
@@ -1569,16 +1590,19 @@ stateDiagram-v2
 ```
 
 A token the App minted is a secret from the moment it exists: the redactor is shared, and the credentials add
-each token they hand out (at most 16 are remembered, oldest forgotten first), so a tool result, an error or a
+each token they hand out (up to `2 * MAX_CACHED_INSTALLATIONS`, 128, are remembered, oldest forgotten first: two for each
+installation an App by owner can hold a token for), so a tool result, an error or a
 log line that quotes one is scrubbed (the App's PEM and its Base64 body are registered at startup). The key is
 hidden from OpenCode and from the project's commands as `GITHUB_TOKEN` is; a key file is a path, and sits
 wherever the deployment mounted it (the chart: `/var/run/secrets/github-app/private-key.pem`, read-only, mode
 0440, group `fsGroup`).
 
 A refused mint is told to the person as it is for a bad token: `401`, `403` and `404` from GitHub are an
-authentication error that names `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and the key, and a run that ends at
-one fails naming them (and that the App must be installed on the repository, with write access to its contents
-and pull requests). A rate limit is a rate limit (with the wait GitHub asked for), and a `5xx` or a transport
+authentication error that names `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` (for an App by owner, `GITHUB_APP_OWNERS`
+in its place: the hint says the owner has to be on the list) and the key, and a run that ends at one fails naming them (and
+that the App must be installed on the repository, with write access to its contents and pull requests). An owner the
+App is not installed on, one that is not on the list, and a suspended installation are errors of their own that name
+the App and the owner. A rate limit is a rate limit (with the wait GitHub asked for), and a `5xx` or a transport
 failure is transient. The token endpoint is `{GITHUB_API_URL}/app/installations/{id}/access_tokens`, so GitHub
 Enterprise Server and a mock need no other variable. The deployment's own example is
 `dev/compose.github-app.yaml` (an init service makes a throwaway key; the mock gives an installation token that
@@ -1624,7 +1648,12 @@ decision 8 of [ADR 0009](../../docs/decisions/0009-github-per-installation-read-
   call) the call's subject only chooses what the credentials look at: one token serves any call, a search that names
   no account and `get_me` included. A refusal of the credentials (`Auth`, `Invalid`, `NotFound`) is an error result the
   model reads, and nothing is sent to the server; `RateLimited` and `Transient` fail the step transiently and it is
-  retried (nothing was sent). The model's arguments are untrusted: an `owner` or `repo` with a character outside
+  retried (nothing was sent). **An App by owner** (`GITHUB_APP_OWNERS`, no pin) needs a call to be about **one account**:
+  a search that names none or several (`org:a org:b`) is an error result that says to give `owner` (and `repo`) or one
+  `org:`, `user:` or `repo:`, and `github__get_me` (the authenticated *user*, which an App is not: the server's `GET /user`
+  is a `403` for an installation token) is an error result; neither is sent, and no installation is looked up for a
+  guess. The call's owner then decides the installation, through `GitCredentials::token_for`, so the owner list, the
+  account cache and the token cache apply. The model's arguments are untrusted: an `owner` or `repo` with a character outside
   `A-Z a-z 0-9 . - _` is never put in a URL.
 * **No credential in the file, none in the server.** A file that gives `github` an `Authorization` header, or points it
   at another origin than `GITHUB_MCP_URL`, is refused at startup (exit 78, naming the server and `GITHUB_MCP_URL`):
@@ -1851,7 +1880,10 @@ database of its own, so the role needs `CREATEDB`):
   a URL component never reaches a URL; a search names its account with `repo:`, `org:` or `user:` (negated qualifiers
   and quoted phrases are not read, two owners are two accounts); a token and a pinned installation serve every call
   (a search with no account, two accounts, `get_me`), a bearer for another host than its credentials refuses; what the
-  credentials say reaches the call typed (a refusal for the model, a transient failure retried, no token in either).
+  credentials say reaches the call typed (a refusal for the model, a transient failure retried, no token in either); for
+  an App by owner (`a_search_with_no_or_several_accounts_is_refused_without_a_pin`, `get_me_is_refused_for_an_app_without_a_pin`)
+  a search with no account or several, a call with an owner that is no login, and `get_me` are refused, the credentials
+  are not asked, and one account is served from its own installation.
   `tests/agent_files.rs`: the shipped `mcp.json` is the GitHub server over http at `127.0.0.1:8082` with exactly the
   twelve reads (none starts with a verb that writes) and **no credential of any kind** (no header, no `env`, no
   `${VAR}`); the embedded files bound to another origin are refused (`Invalid`), and at their own with nothing
@@ -1863,7 +1895,11 @@ database of its own, so the role needs `CREATEDB`):
   GitHub has received **zero** requests when the coder is ready (the listing uses the placeholder), the model is
   offered the twelve tools in order after the coder's own and none that writes, `github__get_me` and
   `github__list_branches` reach the mock carrying the coder's credentials of that call (the token; or the pinned
-  installation's token, minted once for both), never the placeholder, and no secret is in a log. The other tests of
+  installation's token, minted once for both), never the placeholder, and no secret is in a log. A third mode is an
+  App by owner: `list_branches` for `acme` and for `other` are two lookups, two mints and two calls, each with its own
+  owner's token; an account the App is not installed on is an error result naming the App and the owner, an owner off the
+  list one naming `GITHUB_APP_OWNERS`, and `get_me` and a search that names no account are error results, none of the four
+  reaching the server or GitHub, and nothing is looked up for the owner that is off the list. The other tests of
   those two files use the shipped folder without its `mcp.json` (`common::plain_folder`), since a test would have to
   run the sidecar; `adam-mcp`'s `wiremock_compose` connects `mock-github-mcp`; `dev/coder-e2e.sh`,
   `docker/coder/test/*.sh` and `deploy/coder/tests/render-check.sh` check the stack, the image and the chart.
@@ -1929,16 +1965,28 @@ database of its own, so the role needs `CREATEDB`):
 * GitHub credentials: the unit tests of `src/config.rs` (a token is one way; an App is the other, with the key from a
   file or from the variable, in PKCS#1 or PKCS#8, `\n` escapes accepted; both, a partial App set, an installation ID that is
   not a positive integer and a key given twice are every problem at once and never a value; a key that cannot be used is
-  refused at startup naming the variable and not the key; a control plane reads none of it, bad values included), of
-  `src/redact.rs` (a secret added later is scrubbed by every clone, only the latest 16 are kept, a token is registered as it is
+  refused at startup naming the variable and not the key; a control plane reads none of it, bad values included;
+  `an_app_without_an_installation_id_needs_its_owners` (owners in any separator and case, neither is a problem naming
+  both, an entry that is no account name), `the_installation_id_and_the_owners_are_one_or_the_other` (a pin with owners,
+  owners with a token) and `a_star_is_any_owner` (and not beside names)), of
+  `src/redact.rs` (a secret added later is scrubbed by every clone, only the latest 128 are kept,
+  `the_redactor_remembers_two_tokens_per_cached_installation`, a token is registered as it is
   handed out, an App's key is redacted as its PEM and as its body) and of `src/repos.rs` (an App mints at the API root, for the
-  allowed hosts only); in `tests/binary.rs`, `a_github_app_configuration_is_checked_at_startup_and_exits_78_with_every_problem`
-  and `a_github_app_installation_gets_its_token_minted_and_opens_the_pull_request` (with Postgres: the real binary against a
-  mock that hands a token for a JWT, every call to the repositories' API carries it, and no secret is in the output); in
+  allowed hosts only; `an_app_without_a_pin_mints_per_owner_against_github_api_url`: two owners, an organisation and a
+  person, two installations looked up with the JWT and two tokens, an owner off the list and a foreign host refused with
+  nothing sent); in `tests/binary.rs`, `a_github_app_configuration_is_checked_at_startup_and_exits_78_with_every_problem`,
+  `an_app_with_neither_installation_nor_owners_is_refused_at_startup` (neither, a pin with owners, owners with a token:
+  78, naming the variables),
+  `a_github_app_installation_gets_its_token_minted_and_opens_the_pull_request` (with Postgres: the real binary against a
+  mock that hands a token for a JWT, every call to the repositories' API carries it, and no secret is in the output) and
+  `a_github_app_without_an_installation_id_opens_pull_requests_for_two_owners` (two tasks for two owners: the installations
+  are found with the JWT, a token is minted for each, every call to a repository's API carries its owner's token and
+  never the other's, a repository whose owner is off the list is never looked up); in
   `tests/tools.rs`, `a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_return`; in `tests/e2e.rs`
   (per store), `a_refused_github_app_fails_the_run_naming_its_own_variables`. The compose scenarios run twice, the second time
-  as an App (`GITHUB_AUTH=app`, `-f dev/compose.github-app.yaml`: an init service makes a throwaway key), and assert that the
-  mock saw the trade and that every call to `/repos/...` carried the installation token and never the JWT.
+  as an App (`GITHUB_AUTH=app`, `-f dev/compose.github-app.yaml`: an init service makes a throwaway key, and the App has
+  `GITHUB_APP_OWNERS` and no pin), and assert that the mock saw the installation looked up with a JWT (the first run after the
+  coder started), the trade, and that every call to `/repos/...` carried the installation token and never the JWT.
 * Scratch projects: `tests/tools.rs` (`a_scratch_project_is_built_checked_and_committed_locally`: the file tools, `run_checks`
   (an artifact with no `repository`), `run_command` (a stray file and a sneaky commit are undone, as in a worktree) and OpenCode
   work in it, `commit_and_push` is a local commit with no artifact and no remote branch, `open_pull_request` is refused and

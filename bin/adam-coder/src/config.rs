@@ -18,7 +18,8 @@
 //! | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
 //! | `GITHUB_TOKEN` | git push and pull request token; only ever sent to the `ALLOWED_REPO_HOSTS` | one of this or the App's three, for `all` and `worker` |
 //! | `GITHUB_APP_ID` | the GitHub App's application ID or client ID (the JWT's `iss`); App mode, instead of `GITHUB_TOKEN` | required with the App's other two |
-//! | `GITHUB_APP_INSTALLATION_ID` | the installation's ID, a positive integer | required in App mode |
+//! | `GITHUB_APP_INSTALLATION_ID` | the installation's ID, a positive integer: **pins** the App to that one installation, which serves every repository (no lookup) | App mode: this or `GITHUB_APP_OWNERS`, exactly one |
+//! | `GITHUB_APP_OWNERS` | the accounts (users and organisations, comma- or space-separated, compared without case) the App may act for, **without a pin**: the installation of each repository's owner is found with the App's JWT. `*` is every account the App is installed on (a startup warning: a public App can be installed by anyone). Refused with a pin and in token mode (exit 78) | App mode: this or `GITHUB_APP_INSTALLATION_ID`, exactly one |
 //! | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 or PKCS#8), as a file or inline (`\n` escapes accepted); exactly one; parsed at startup | one required in App mode |
 //! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them; the first is the host `owner/name` stands for | `github.com` |
 //! | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees; empty turns the tool off | empty (off) |
@@ -103,7 +104,7 @@ pub use adam_service::{ConfigError, McpSettings};
 use adam_service::{
     ModelConfig, ServiceConfig, WorkerSettings, is_worker_id, parse_flag, parse_or,
 };
-use adam_workspace::{AppKey, WorkspaceError};
+use adam_workspace::{AppKey, AppOwners, WorkspaceError};
 use secrecy::{ExposeSecret as _, SecretString};
 use url::Url;
 
@@ -431,9 +432,22 @@ fn is_native_executable(path: &std::path::Path) -> std::io::Result<bool> {
 pub enum GitHubAuth {
     /// `GITHUB_TOKEN`: one token for every repository, for as long as it is valid.
     Token(SecretString),
-    /// `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and a private key: installation access tokens,
-    /// minted as they are needed and good for an hour.
+    /// `GITHUB_APP_ID`, a private key, and `GITHUB_APP_INSTALLATION_ID` or `GITHUB_APP_OWNERS`:
+    /// installation access tokens, minted as they are needed and good for an hour.
     App(GitHubAppConfig),
+}
+
+/// Which installation of the App the coder uses: one that is named, or the one of each owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppInstallations {
+    /// `GITHUB_APP_INSTALLATION_ID`: this installation serves every repository, with no lookup
+    /// ([ADR 0009](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0009-github-per-installation-read-through-mcp.md)).
+    Pinned(u64),
+    /// `GITHUB_APP_OWNERS`: the installation of a repository's owner is found with the App's JWT,
+    /// for the accounts this allows and no others
+    /// ([ADR 0017](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md),
+    /// D1 and D2).
+    Owners(AppOwners),
 }
 
 /// The GitHub App of [`GitHubAuth::App`].
@@ -441,8 +455,8 @@ pub enum GitHubAuth {
 pub struct GitHubAppConfig {
     /// `GITHUB_APP_ID`: the App's application ID, or its client ID (the JWT's `iss`).
     pub app_id: String,
-    /// `GITHUB_APP_INSTALLATION_ID`: a positive integer.
-    pub installation_id: u64,
+    /// `GITHUB_APP_INSTALLATION_ID` (a pin) or `GITHUB_APP_OWNERS`: exactly one.
+    pub installations: AppInstallations,
     /// The private key, parsed at startup (`GITHUB_APP_PRIVATE_KEY_PATH` or `GITHUB_APP_PRIVATE_KEY`).
     pub key: AppKey,
     /// The PEM the key was read from, kept so that the redactor can register it.
@@ -468,6 +482,19 @@ impl GitHubAuth {
         }
     }
 
+    /// Whether the installation is found by the owner of each repository (a GitHub App with
+    /// `GITHUB_APP_OWNERS`, no pin): a call to the GitHub MCP server then has to name its account, and
+    /// `get_me` (an App is not a user) is refused.
+    pub fn finds_installations(&self) -> bool {
+        matches!(
+            self,
+            Self::App(GitHubAppConfig {
+                installations: AppInstallations::Owners(_),
+                ..
+            })
+        )
+    }
+
     /// What to tell a model (and a person) to check when GitHub rejects the credentials: the
     /// variables of this way of authenticating.
     pub fn check_hint(&self) -> &'static str {
@@ -475,10 +502,29 @@ impl GitHubAuth {
             Self::Token(_) => {
                 "GITHUB_TOKEN is valid and may push and open pull requests for the repository"
             }
-            Self::App(_) => {
+            Self::App(GitHubAppConfig {
+                installations: AppInstallations::Pinned(_),
+                ..
+            }) => {
                 "the GitHub App's credentials (GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and the \
                  private key) are valid and that the App is installed on the repository with write \
                  access to its contents and pull requests"
+            }
+            Self::App(GitHubAppConfig {
+                installations: AppInstallations::Owners(AppOwners::Any),
+                ..
+            }) => {
+                "the GitHub App's credentials (GITHUB_APP_ID and the private key) are valid and that \
+                 the App is installed on the repository's owner with write access to the \
+                 repository's contents and pull requests"
+            }
+            Self::App(GitHubAppConfig {
+                installations: AppInstallations::Owners(AppOwners::Only(_)),
+                ..
+            }) => {
+                "the GitHub App's credentials (GITHUB_APP_ID and the private key) are valid, that \
+                 GITHUB_APP_OWNERS lists the repository's owner, and that the App is installed on \
+                 that account with write access to the repository's contents and pull requests"
             }
         }
     }
@@ -490,18 +536,30 @@ impl GitHubAuth {
         let token = get("GITHUB_TOKEN");
         let app_id = get("GITHUB_APP_ID");
         let installation = get("GITHUB_APP_INSTALLATION_ID");
+        let owners = get("GITHUB_APP_OWNERS");
         let key_path = get("GITHUB_APP_PRIVATE_KEY_PATH");
         let key_inline = get("GITHUB_APP_PRIVATE_KEY");
-        let any_app = app_id.is_some()
+        let app_core = app_id.is_some()
             || installation.is_some()
             || key_path.is_some()
             || key_inline.is_some();
+        let any_app = app_core || owners.is_some();
         match (token, any_app) {
             (Some(token), false) => Some(Self::Token(SecretString::from(token))),
             (None, false) => {
                 problems.push(
                     "GITHUB_TOKEN is required (a personal access token), or GITHUB_APP_ID, \
-                     GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY_PATH (a GitHub App)"
+                     GITHUB_APP_INSTALLATION_ID (or GITHUB_APP_OWNERS) and \
+                     GITHUB_APP_PRIVATE_KEY_PATH (a GitHub App)"
+                        .into(),
+                );
+                None
+            }
+            (Some(_), true) if !app_core => {
+                problems.push(
+                    "GITHUB_APP_OWNERS is for a GitHub App, and GITHUB_TOKEN selects a personal \
+                     access token: a token has no installations to choose between (unset \
+                     GITHUB_APP_OWNERS, or leave GITHUB_TOKEN unset or empty for an App)"
                         .into(),
                 );
                 None
@@ -515,13 +573,16 @@ impl GitHubAuth {
                 );
                 None
             }
-            (None, true) => Self::parse_app(app_id, installation, key_path, key_inline, problems),
+            (None, true) => {
+                Self::parse_app(app_id, installation, owners, key_path, key_inline, problems)
+            }
         }
     }
 
     fn parse_app(
         app_id: Option<String>,
         installation: Option<String>,
+        owners: Option<String>,
         key_path: Option<String>,
         key_inline: Option<String>,
         problems: &mut Vec<String>,
@@ -531,18 +592,36 @@ impl GitHubAuth {
         if app_id.is_none() {
             problems.push("GITHUB_APP_ID is required for a GitHub App".into());
         }
-        let installation_id = match installation.as_deref().map(str::trim) {
-            None => {
-                problems.push("GITHUB_APP_INSTALLATION_ID is required for a GitHub App".into());
+        // Exactly one of a pin and the accounts: a pin serves every repository from one installation,
+        // the accounts are the whole point of finding an installation for each. Both would leave it
+        // open which one wins.
+        let installations = match (installation.as_deref().map(str::trim), owners.as_deref()) {
+            (None, None) => {
+                problems.push(
+                    "GITHUB_APP_INSTALLATION_ID (one installation) or GITHUB_APP_OWNERS (the \
+                     accounts the App may act for, the installation of each found for it) is \
+                     required for a GitHub App"
+                        .into(),
+                );
                 None
             }
-            Some(raw) => match raw.parse::<u64>() {
-                Ok(id) if id > 0 => Some(id),
+            (Some(_), Some(_)) => {
+                problems.push(
+                    "GITHUB_APP_INSTALLATION_ID and GITHUB_APP_OWNERS are both set: pin one \
+                     installation, or list the accounts the App may act for and let it find their \
+                     installations, not both"
+                        .into(),
+                );
+                None
+            }
+            (Some(raw), None) => match raw.parse::<u64>() {
+                Ok(id) if id > 0 => Some(AppInstallations::Pinned(id)),
                 _ => {
                     problems.push("GITHUB_APP_INSTALLATION_ID must be a positive integer".into());
                     None
                 }
             },
+            (None, Some(raw)) => parse_owners(raw, problems).map(AppInstallations::Owners),
         };
         // Exactly one source of the key. The file is what a deployment mounts; the variable holds
         // the PEM itself, often with its newlines written as `\n` by a secret store or an env file.
@@ -591,7 +670,7 @@ impl GitHubAuth {
         }
         Some(Self::App(GitHubAppConfig {
             app_id: app_id?,
-            installation_id: installation_id?,
+            installations: installations?,
             key: key?,
             pem: SecretString::from(pem),
         }))
@@ -605,7 +684,7 @@ impl std::fmt::Debug for GitHubAuth {
             Self::App(app) => f
                 .debug_struct("GitHubAuth::App")
                 .field("app_id", &app.app_id)
-                .field("installation_id", &app.installation_id)
+                .field("installations", &app.installations)
                 .finish_non_exhaustive(),
         }
     }
@@ -884,6 +963,46 @@ impl WorkerConfig {
             mcp,
         })
     }
+}
+
+/// `GITHUB_APP_OWNERS`: account names separated by commas or white space, compared without case, or
+/// `*` alone for every account the App is installed on. A name that is no account name, `*` beside
+/// others and an empty list are problems (naming the variable and the entry, never more); `None`
+/// after one.
+fn parse_owners(raw: &str, problems: &mut Vec<String>) -> Option<AppOwners> {
+    let before = problems.len();
+    let names: Vec<String> = raw
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|o| o.trim().to_ascii_lowercase())
+        .filter(|o| !o.is_empty())
+        .collect();
+    if names.is_empty() {
+        problems.push(
+            "GITHUB_APP_OWNERS has no account (give logins separated by commas or spaces, or `*` \
+             for every account the App is installed on)"
+                .into(),
+        );
+        return None;
+    }
+    if names.iter().any(|n| n == "*") {
+        if names.len() > 1 {
+            problems.push(
+                "GITHUB_APP_OWNERS: `*` stands for every account the App is installed on and \
+                 cannot be listed with others"
+                    .into(),
+            );
+            return None;
+        }
+        return Some(AppOwners::Any);
+    }
+    for name in &names {
+        if !is_account_name(name) {
+            problems.push(format!(
+                "GITHUB_APP_OWNERS entry {name:?} is not an account name (letters, digits, `-`, `_` and `.`, a comma or space between owners, or `*` for any)"
+            ));
+        }
+    }
+    (problems.len() == before).then(|| AppOwners::only(names))
 }
 
 /// Whether `owner` can be an account name on a code host: letters, digits, `-`, `_` and `.`, at
@@ -1749,7 +1868,7 @@ mod tests {
                 panic!("{label}: an App")
             };
             assert_eq!(app.app_id, "12345");
-            assert_eq!(app.installation_id, 67890);
+            assert_eq!(app.installations, AppInstallations::Pinned(67890));
             assert_eq!(app.pem.expose_secret().trim(), pem.trim(), "{label}");
             // What the redactor must know: the PEM, and its body on one line.
             let secrets = c.worker.as_ref().unwrap().github.secrets();
@@ -1765,7 +1884,7 @@ mod tests {
                 !debug.contains("BEGIN") && !debug.contains(&secrets[1][..40]),
                 "{label}: {debug}"
             );
-            assert!(debug.contains("installation_id: 67890"), "{debug}");
+            assert!(debug.contains("installations: Pinned(67890)"), "{debug}");
             assert!(
                 c.worker
                     .unwrap()
@@ -1785,6 +1904,188 @@ mod tests {
             panic!("an App")
         };
         assert_eq!(app.app_id, "Iv23liClientId");
+    }
+
+    /// The App's variables with the pin replaced by `owners`, and the key as a file under `dir`.
+    fn owners_vars(owners: &str, dir: &std::path::Path) -> Vec<(&'static str, String)> {
+        let file = dir.join("app.pem");
+        std::fs::write(&file, &TestAppKey::generate().pkcs1_pem).unwrap();
+        vec![
+            ("GITHUB_APP_ID", "12345".to_owned()),
+            ("GITHUB_APP_OWNERS", owners.to_owned()),
+            (
+                "GITHUB_APP_PRIVATE_KEY_PATH",
+                file.to_string_lossy().into_owned(),
+            ),
+        ]
+    }
+
+    /// Without `GITHUB_APP_INSTALLATION_ID` an App needs `GITHUB_APP_OWNERS`, the accounts it may
+    /// act for (fail closed: there is no default, because a public App can be installed by anyone):
+    /// logins separated by commas or spaces, compared without case; the installation of each is
+    /// found at run time. Neither variable is a problem that names both.
+    #[test]
+    fn an_app_without_an_installation_id_needs_its_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        // Neither: a problem that names the pin and the owners, with the rest of the App fine.
+        let mut neither = owners_vars("x", dir.path());
+        neither.remove(1);
+        let problems = problems_of(&without_token(&neither));
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0]
+                .starts_with("GITHUB_APP_INSTALLATION_ID (one installation) or GITHUB_APP_OWNERS"),
+            "{problems:?}"
+        );
+
+        // Owners in any of the separators, in any case: a set, lowercased.
+        for raw in [
+            "acme,Other-Org,octocat",
+            "ACME  other-org\toctocat",
+            " acme, other-org ,octocat, ",
+        ] {
+            let c = parse_owned(&without_token(&owners_vars(raw, dir.path())))
+                .unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+            let github = &c.worker.as_ref().unwrap().github;
+            let GitHubAuth::App(app) = github else {
+                panic!("{raw:?}: an App")
+            };
+            assert_eq!(
+                app.installations,
+                AppInstallations::Owners(AppOwners::only(["acme", "other-org", "octocat"])),
+                "{raw:?}"
+            );
+            if let AppInstallations::Owners(owners) = &app.installations {
+                assert!(owners.allows("Acme") && owners.allows("OCTOCAT"), "{raw:?}");
+                assert!(!owners.allows("attacker"), "{raw:?}");
+            }
+            assert!(github.finds_installations());
+            // The hint names the variable that says which accounts, and not the pin.
+            assert!(github.check_hint().contains("GITHUB_APP_OWNERS"), "{raw:?}");
+            assert!(!github.check_hint().contains("INSTALLATION_ID"), "{raw:?}");
+            // Debug shows the accounts and nothing of the key.
+            let debug = format!("{c:?}");
+            assert!(
+                debug.contains("Owners(") && debug.contains("octocat"),
+                "{debug}"
+            );
+            assert!(!debug.contains("BEGIN"), "{debug}");
+        }
+        // A pin is the other way, and the one the hint and the bearer treat as before.
+        let pinned = parse_owned(&without_token(&app_vars((
+            "GITHUB_APP_PRIVATE_KEY_PATH",
+            owners_vars("x", dir.path())[2].1.clone(),
+        ))))
+        .unwrap();
+        assert!(!pinned.worker.as_ref().unwrap().github.finds_installations());
+
+        // Something that is no account name, and an empty list: every problem, naming the variable.
+        for (raw, wants) in [
+            ("acme/widgets", "GITHUB_APP_OWNERS entry \"acme/widgets\""),
+            ("acme,-bad", "GITHUB_APP_OWNERS entry \"-bad\""),
+            ("acme,evil.example:8443", "GITHUB_APP_OWNERS entry"),
+            (", ,", "GITHUB_APP_OWNERS has no account"),
+        ] {
+            let problems = problems_of(&without_token(&owners_vars(raw, dir.path())));
+            assert!(
+                problems.iter().any(|p| p.contains(wants)),
+                "{raw:?}: {problems:?}"
+            );
+        }
+    }
+
+    /// A pin and the owners are two answers to "which installation": both together would leave it
+    /// open which wins, so they are refused (exit 78, naming both variables), and the owners are
+    /// for an App only: with a token there are no installations to choose between.
+    #[test]
+    fn the_installation_id_and_the_owners_are_one_or_the_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let said = |problems: &[String], text: &str| problems.iter().any(|p| p.contains(text));
+
+        let mut both = owners_vars("acme", dir.path());
+        both.push(("GITHUB_APP_INSTALLATION_ID", "67890".to_owned()));
+        let problems = problems_of(&without_token(&both));
+        assert!(
+            said(
+                &problems,
+                "GITHUB_APP_INSTALLATION_ID and GITHUB_APP_OWNERS are both set"
+            ),
+            "{problems:?}"
+        );
+        // It is a configuration error (exit 78), which lists every problem and no value.
+        let error = parse_owned(&without_token(&both)).unwrap_err();
+        assert_eq!(error.class(), ErrorClass::Invalid);
+        assert!(!error.to_string().contains("67890"), "{error}");
+
+        // A token with owners and nothing of an App.
+        let mut vars = without_token(&[("GITHUB_APP_OWNERS", "acme".to_owned())]);
+        vars.insert("GITHUB_TOKEN".into(), "ghp_secret".into());
+        let problems = problems_of(&vars);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("GITHUB_APP_OWNERS is for a GitHub App")
+                    && p.contains("GITHUB_TOKEN")),
+            "{problems:?}"
+        );
+        assert!(
+            problems.iter().all(|p| !p.contains("ghp_secret")),
+            "{problems:?}"
+        );
+        // A token, owners and a part of an App: the refusal of both ways at once.
+        vars.insert("GITHUB_APP_ID".into(), "1".into());
+        let problems = problems_of(&vars);
+        assert!(
+            said(&problems, "GITHUB_TOKEN and the GITHUB_APP_*"),
+            "{problems:?}"
+        );
+        // Owners alone, with no token and no App: it is an App with everything else missing.
+        let problems = problems_of(&without_token(&[("GITHUB_APP_OWNERS", "acme".to_owned())]));
+        assert!(said(&problems, "GITHUB_APP_ID is required"), "{problems:?}");
+        assert!(
+            said(&problems, "GITHUB_APP_PRIVATE_KEY_PATH (a file)"),
+            "{problems:?}"
+        );
+        // A control plane reads none of it.
+        let mut vars = without_token(&[("GITHUB_APP_OWNERS", "acme".to_owned())]);
+        vars.insert("GITHUB_TOKEN".into(), "ghp_secret".into());
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse_owned(&vars).is_ok());
+    }
+
+    /// `*` is every account the App is installed on, an explicit choice (and a warning at startup);
+    /// it cannot be listed beside accounts, which would say two things.
+    #[test]
+    fn a_star_is_any_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        for raw in ["*", " * ", "*,"] {
+            let c = parse_owned(&without_token(&owners_vars(raw, dir.path())))
+                .unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+            let github = &c.worker.as_ref().unwrap().github;
+            let GitHubAuth::App(app) = github else {
+                panic!("{raw:?}: an App")
+            };
+            assert_eq!(
+                app.installations,
+                AppInstallations::Owners(AppOwners::Any),
+                "{raw:?}"
+            );
+            assert!(github.finds_installations());
+            assert!(
+                github
+                    .check_hint()
+                    .contains("installed on the repository's owner")
+            );
+        }
+        for raw in ["*,acme", "acme *"] {
+            let problems = problems_of(&without_token(&owners_vars(raw, dir.path())));
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.starts_with("GITHUB_APP_OWNERS: `*` stands for every account")),
+                "{raw:?}: {problems:?}"
+            );
+        }
     }
 
     #[test]
@@ -1828,7 +2129,7 @@ mod tests {
         ]);
         let problems = problems_of(&vars);
         for name in [
-            "GITHUB_APP_INSTALLATION_ID is required",
+            "GITHUB_APP_INSTALLATION_ID (one installation) or GITHUB_APP_OWNERS",
             "GITHUB_APP_PRIVATE_KEY_PATH (a file)",
             "GITHUB_API_URL",
         ] {

@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use adam_workspace::{
-    DynGitCredentials, GitHubApp, HostScoped, ScopedToken, WorkspaceError, Workspaces,
+    AppOwners, DynGitCredentials, GitHubApp, HostScoped, ScopedToken, WorkspaceError, Workspaces,
 };
 use secrecy::ExposeSecret as _;
 
 use crate::WorkerConfig;
-use crate::config::GitHubAuth;
+use crate::config::{AppInstallations, GitHubAuth};
 use crate::redact::{RedactingCredentials, Redactor};
 
 /// The workspaces the coder works in: the workspace root, restricted to the
@@ -20,7 +20,10 @@ use crate::redact::{RedactingCredentials, Redactor};
 ///
 /// The credentials are the installation's own: the personal access token of `GITHUB_TOKEN`
 /// ([`ScopedToken`]), or the installation tokens of the GitHub App ([`GitHubApp`], minted against
-/// `GITHUB_API_URL` and checked for the host first, [`HostScoped`]). Either way they are wrapped so
+/// `GITHUB_API_URL` and checked for the host first, [`HostScoped`]): of the one installation
+/// `GITHUB_APP_INSTALLATION_ID` pins ([`GitHubApp::new`]), or of the installation of each
+/// repository's owner, found with the App's JWT, for the accounts of `GITHUB_APP_OWNERS`
+/// ([`GitHubApp::discovering`]). Either way they are wrapped so
 /// that every token handed out is registered with `redactor` ([`RedactingCredentials`]), and they
 /// are returned for the code host to use too: one source of tokens for git and for the REST API.
 ///
@@ -41,12 +44,32 @@ pub fn workspaces_for(
             ))
         }
         GitHubAuth::App(app) => {
-            let minting = GitHubApp::new(
-                config.github_api_url.as_str(),
-                app.app_id.clone(),
-                app.installation_id,
-                app.key.clone(),
-            )?;
+            let minting = match &app.installations {
+                // One installation serves every repository: no lookup (ADR 0009).
+                AppInstallations::Pinned(installation) => GitHubApp::new(
+                    config.github_api_url.as_str(),
+                    app.app_id.clone(),
+                    *installation,
+                    app.key.clone(),
+                )?,
+                // The installation of each owner, found with the App's JWT, for these accounts and
+                // no others (ADR 0017, D1 and D2).
+                AppInstallations::Owners(owners) => {
+                    if *owners == AppOwners::Any {
+                        tracing::warn!(
+                            "GITHUB_APP_OWNERS=*: the coder acts for every account the GitHub App \
+                             is installed on, and a public App can be installed by anyone; list \
+                             the accounts instead"
+                        );
+                    }
+                    GitHubApp::discovering(
+                        config.github_api_url.as_str(),
+                        app.app_id.clone(),
+                        app.key.clone(),
+                        owners.clone(),
+                    )?
+                }
+            };
             Arc::new(HostScoped::new(
                 config.allowed_repo_hosts.iter().map(String::as_str),
                 minting,
@@ -247,5 +270,119 @@ mod tests {
             .token_for(&RepoRef::new("https://github.com/o/r.git", "main"))
             .await
             .unwrap();
+    }
+    /// A GitHub App without a pin (`GITHUB_APP_OWNERS`): the installation of each repository's
+    /// owner is looked up at `GITHUB_API_URL` with the App's JWT, one token is minted for each
+    /// installation, an owner outside the list is refused before anything is looked up or signed
+    /// (and so is a host that is not allowed), and every token is registered with the redactor.
+    #[tokio::test]
+    async fn an_app_without_a_pin_mints_per_owner_against_github_api_url() {
+        use adam_workspace::testing::TestAppKey;
+        use secrecy::ExposeSecret as _;
+        use wiremock::matchers::{header_regex, method, path};
+
+        let key = TestAppKey::generate();
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("app.pem");
+        std::fs::write(&file, &key.pkcs8_pem).unwrap();
+        let github = MockServer::start().await;
+        let jwt = r"^Bearer eyJ[\w-]+\.[\w-]+\.[\w-]+$";
+        let lookup = |id: u64, login: &str| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": id,
+                "account": {"login": login},
+                "suspended_at": null,
+            }))
+        };
+        // `acme` is an organisation, `octocat` a person (the organisation lookup says 404).
+        Mock::given(method("GET"))
+            .and(path("/orgs/acme/installation"))
+            .and(header_regex("authorization", jwt))
+            .respond_with(lookup(111, "acme"))
+            .expect(1)
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/orgs/octocat/installation"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/users/octocat/installation"))
+            .and(header_regex("authorization", jwt))
+            .respond_with(lookup(222, "octocat"))
+            .expect(1)
+            .mount(&github)
+            .await;
+        for (id, token) in [
+            (111, "ghs_tokenOfTheAcmeInstallation01"),
+            (222, "ghs_tokenOfOctocatInstallation02"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!("/app/installations/{id}/access_tokens")))
+                .and(header_regex("authorization", jwt))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "token": token,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                })))
+                .expect(1)
+                .mount(&github)
+                .await;
+        }
+        let worker = config(
+            &[
+                ("GITHUB_TOKEN", ""),
+                ("GITHUB_APP_ID", "12345"),
+                ("GITHUB_APP_OWNERS", "Acme octocat"),
+                ("GITHUB_APP_PRIVATE_KEY_PATH", &file.to_string_lossy()),
+                ("GITHUB_API_URL", &github.uri()),
+            ],
+            &tmp.path().join("work"),
+        );
+        assert!(worker.github.finds_installations());
+        let redactor = Redactor::default();
+        let (_, creds) = workspaces_for(&worker, &redactor).unwrap();
+        let repo = |url: &str| RepoRef::new(url, "main");
+
+        // Another host, and an owner that is not on the list: refused, nothing asked of GitHub.
+        for url in [
+            "https://evil.example/acme/r.git",
+            "https://github.com/attacker/r.git",
+        ] {
+            let err = creds.token_for(&repo(url)).await.unwrap_err();
+            assert!(matches!(err, WorkspaceError::Invalid(_)), "{url}: {err:?}");
+        }
+        let err = creds
+            .token_for(&repo("https://github.com/attacker/r.git"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("GITHUB_APP_OWNERS"), "{err}");
+        assert!(
+            github.received_requests().await.unwrap().is_empty(),
+            "nothing was looked up or signed"
+        );
+
+        // Two owners, two installations, two tokens (the case of the owner does not matter), each
+        // looked up once and minted once however often they are asked for.
+        for spelling in ["acme", "ACME", "Acme"] {
+            let acme = creds
+                .token_for(&repo(&format!("https://github.com/{spelling}/widgets.git")))
+                .await
+                .unwrap();
+            assert_eq!(acme.expose_secret(), "ghs_tokenOfTheAcmeInstallation01");
+            let octocat = creds
+                .token_for(&repo("https://github.com/octocat/hello.git"))
+                .await
+                .unwrap();
+            assert_eq!(octocat.expose_secret(), "ghs_tokenOfOctocatInstallation02");
+        }
+        for token in [
+            "ghs_tokenOfTheAcmeInstallation01",
+            "ghs_tokenOfOctocatInstallation02",
+        ] {
+            assert_eq!(redactor.scrub(token), "[redacted]", "{token} is registered");
+        }
+        // The mocks' `expect(1)` are checked when the server is dropped.
     }
 }

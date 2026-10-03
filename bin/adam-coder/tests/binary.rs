@@ -980,6 +980,18 @@ impl GitHubMcpSidecar {
     }
 }
 
+/// How the coder authenticates in the test of the real GitHub MCP server.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Auth {
+    Token,
+    Pinned,
+    Owners,
+}
+
+/// The installation tokens the mock GitHub gives in the owners mode, by installation.
+const ACME_TOKEN: &str = "ghs_binaryAcmeInstallationToken0123456789";
+const OTHER_TOKEN: &str = "ghs_binaryOtherInstallationToken012345678";
+
 /// The shipped agent against the **real** `github-mcp-server` in `http` mode, the way the chart runs
 /// it (`ADAM_TEST_GITHUB_MCP_SERVER` = the path of that binary, for example copied out of the image
 /// with `docker cp`; skipped without it, and without Postgres): the server is a sidecar with no
@@ -989,12 +1001,19 @@ impl GitHubMcpSidecar {
 /// * **F10 of ADR 0017**: after startup, before any run, the mock GitHub has received **zero**
 ///   requests. The listing carries the placeholder bearer and the server does not call GitHub for it.
 /// * A call reaches GitHub (a mock, the server's `--gh-host`) carrying **the coder's credentials of
-///   that call**: the personal access token, or the pinned installation's token the coder minted
-///   (once: the second call is the cached token). Never the placeholder.
+///   that call**: the personal access token; the pinned installation's token the coder minted (once:
+///   the second call is the cached token); or, for an App that finds the installation of each owner,
+///   the token of the installation of the owner the call is about. Never the placeholder.
+/// * With owners, `list_branches` for `acme` and for `other` are two lookups, two mints and two
+///   calls, each with its own token; an account the App is not installed on is an error result that
+///   names the App and the owner, one that is not on `GITHUB_APP_OWNERS` an error result that names
+///   the variable, `get_me` and a search that names no account are error results too, and **none of
+///   these four reaches the server or GitHub**, and no installation is looked up for the account
+///   that is not on the list.
 /// * No credential is in the logs.
 ///
-/// Two modes, in one test because they share the binary: a token, and a GitHub App pinned to its
-/// installation (`GITHUB_APP_INSTALLATION_ID`).
+/// Three modes, in one test because they share the binary: a token, a GitHub App pinned to its
+/// installation (`GITHUB_APP_INSTALLATION_ID`), and an App with `GITHUB_APP_OWNERS`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_embedded_agent_connects_the_real_github_mcp_server() {
     let Some(binary) = std::env::var_os("ADAM_TEST_GITHUB_MCP_SERVER")
@@ -1009,11 +1028,19 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
     };
     let tmp = tempfile::tempdir().unwrap();
     let key = Arc::new(adam_workspace::testing::TestAppKey::generate());
+    let branches = |slug: &str, branch: &str| {
+        (
+            format!("/api/v3/repos/{slug}/branches"),
+            json!([{"name": branch, "protected": false,
+                    "commit": {"sha": "0123456789abcdef0123456789abcdef01234567",
+                               "url": "https://example.invalid/c"}}]),
+        )
+    };
 
-    for app in [false, true] {
-        let mode = if app { "pinned App" } else { "token" };
+    for auth in [Auth::Token, Auth::Pinned, Auth::Owners] {
+        let mode = format!("{auth:?}");
         let github = MockServer::start().await;
-        // What the server asks of a classic token's scopes (`ghp_`), and the two calls below.
+        // What the server asks of a classic token's scopes (`ghp_`), and what the calls reach.
         Mock::given(method("HEAD"))
             .and(path("/api/v3/"))
             .respond_with(ResponseTemplate::new(200).insert_header("X-OAuth-Scopes", "repo"))
@@ -1027,15 +1054,17 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
             )
             .mount(&github)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/api/v3/repos/acme/widgets/branches"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
-                {"name": "trunk-of-widgets", "protected": false,
-                 "commit": {"sha": "0123456789abcdef0123456789abcdef01234567", "url": "https://example.invalid/c"}}
-            ])))
-            .mount(&github)
-            .await;
-        // The coder's own REST root: the trade of a JWT for the installation token.
+        for (api_path, body) in [
+            branches("acme/widgets", "trunk-of-widgets"),
+            branches("other/gadgets", "trunk-of-gadgets"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(api_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&github)
+                .await;
+        }
+        // The coder's own REST root: the trade of a JWT for an installation token, for the pin.
         let minted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Mock::given(method("POST"))
             .and(path("/app/installations/67890/access_tokens"))
@@ -1045,23 +1074,95 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
             })
             .mount(&github)
             .await;
+        // And, for the owners: `acme` is an organisation, `other` a person (the organisation lookup
+        // says 404), `not-installed` is neither; one token for each installation.
+        let installation = |id: u64, login: &str| {
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id": id, "account": {"login": login}, "suspended_at": null}))
+        };
+        let lookups = [
+            ("/orgs/acme/installation", installation(111, "acme")),
+            ("/orgs/other/installation", ResponseTemplate::new(404)),
+            ("/users/other/installation", installation(222, "other")),
+            (
+                "/orgs/not-installed/installation",
+                ResponseTemplate::new(404),
+            ),
+            (
+                "/users/not-installed/installation",
+                ResponseTemplate::new(404),
+            ),
+        ];
+        for (lookup, answer) in lookups {
+            Mock::given(method("GET"))
+                .and(path(lookup))
+                .respond_with(answer)
+                .mount(&github)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/app"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"slug": "adam-test-app", "html_url": "https://github.example/apps/adam-test-app"}),
+            ))
+            .mount(&github)
+            .await;
+        let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for (id, token) in [(111, ACME_TOKEN), (222, OTHER_TOKEN)] {
+            Mock::given(method("POST"))
+                .and(path(format!("/app/installations/{id}/access_tokens")))
+                .respond_with(MintFixed {
+                    token,
+                    minted: mints.clone(),
+                })
+                .mount(&github)
+                .await;
+        }
 
+        // What the model does: two reads of the same kind in the first two modes, and in the owners
+        // mode a read for each owner followed by the four calls the coder refuses.
+        let replies = if auth == Auth::Owners {
+            vec![
+                tool_reply(
+                    "g1",
+                    "github__list_branches",
+                    json!({"owner": "acme", "repo": "widgets"}),
+                ),
+                tool_reply(
+                    "g2",
+                    "github__list_branches",
+                    json!({"owner": "other", "repo": "gadgets"}),
+                ),
+                tool_reply(
+                    "g3",
+                    "github__list_branches",
+                    json!({"owner": "not-installed", "repo": "x"}),
+                ),
+                tool_reply(
+                    "g4",
+                    "github__list_branches",
+                    json!({"owner": "outsider", "repo": "x"}),
+                ),
+                tool_reply("g5", "github__get_me", json!({})),
+                tool_reply("g6", "github__search_code", json!({"query": "fn main"})),
+                text_reply("Read acme/widgets and other/gadgets."),
+            ]
+        } else {
+            vec![
+                tool_reply("g1", "github__get_me", json!({})),
+                tool_reply(
+                    "g2",
+                    "github__list_branches",
+                    json!({"owner": "acme", "repo": "widgets"}),
+                ),
+                text_reply("You are octocat, and acme/widgets has trunk-of-widgets."),
+            ]
+        };
         let model = MockServer::start().await;
         let asked = Arc::new(Mutex::new(Vec::new()));
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(Script {
-                replies: vec![
-                    tool_reply("g1", "github__get_me", json!({})),
-                    tool_reply(
-                        "g2",
-                        "github__list_branches",
-                        json!({"owner": "acme", "repo": "widgets"}),
-                    ),
-                    text_reply("You are octocat, and acme/widgets has trunk-of-widgets."),
-                ],
-                asked,
-            })
+            .respond_with(Script { replies, asked })
             .mount(&model)
             .await;
 
@@ -1078,11 +1179,17 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
         )
         .unwrap();
 
-        let work = tmp.path().join(format!("work-{}", mode.replace(' ', "-")));
-        let mut env = if app {
-            app_env(&db.url(), &work, &key, tmp.path())
-        } else {
-            valid_env(&db.url(), &work)
+        let work = tmp.path().join(format!("work-{mode}"));
+        let mut env = match auth {
+            Auth::Token => valid_env(&db.url(), &work),
+            Auth::Pinned => app_env(&db.url(), &work, &key, tmp.path()),
+            Auth::Owners => owners_env(
+                &db.url(),
+                &work,
+                &key,
+                tmp.path(),
+                "acme,other,not-installed",
+            ),
         };
         env.retain(|(k, _)| k != "ADAM_AGENT_DIR");
         env.extend([
@@ -1173,74 +1280,150 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
             offered[0], "prepare_workspace",
             "the coder's own come first: {offered:?}"
         );
-        // The calls reached the real server, and the answers are what GitHub (the mock) said.
+        // The calls, in order, and what the model was told of each.
         let last_request: Value =
             serde_json::from_slice(&requests[requests.len() - 1].body).unwrap();
-        let tool_results: Vec<String> = last_request["messages"]
+        let results: Vec<String> = last_request["messages"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|m| m["role"] == "tool")
             .map(|m| m["content"].as_str().unwrap_or_default().to_owned())
             .collect();
-        assert_eq!(tool_results.len(), 2, "{mode}: {tool_results:?}");
-        assert!(
-            tool_results[0].contains("octocat"),
-            "{mode}: {}",
-            tool_results[0]
-        );
-        assert!(
-            tool_results[1].contains("trunk-of-widgets"),
-            "{mode}: {}",
-            tool_results[1]
-        );
-
-        // The credentials the server called GitHub with are the coder's own, one per call, in the
-        // mode it runs in: never the listing's placeholder.
         let seen = github.received_requests().await.unwrap();
-        let want = if app {
-            format!("Bearer {APP_TOKEN}")
-        } else {
-            format!("Bearer {GITHUB_TOKEN}")
+        let bearer_of = |api_path: &str| -> Vec<String> {
+            seen.iter()
+                .filter(|r| r.url.path() == api_path)
+                .map(|r| {
+                    r.headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("none")
+                        .to_owned()
+                })
+                .collect()
         };
-        for api_path in ["/api/v3/user", "/api/v3/repos/acme/widgets/branches"] {
-            let calls: Vec<_> = seen.iter().filter(|r| r.url.path() == api_path).collect();
-            assert_eq!(calls.len(), 1, "{mode} {api_path}: {seen:?}");
-            let bearer = calls[0]
-                .headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_else(|| {
-                    panic!("{mode} {api_path}: no bearer: {seen:?}\n{}", coder.logs())
-                });
-            assert_eq!(bearer, want, "{mode} {api_path}");
+        let logs = coder.logs();
+        match auth {
+            Auth::Token | Auth::Pinned => {
+                assert_eq!(results.len(), 2, "{mode}: {results:?}");
+                assert!(results[0].contains("octocat"), "{mode}: {}", results[0]);
+                assert!(
+                    results[1].contains("trunk-of-widgets"),
+                    "{mode}: {}",
+                    results[1]
+                );
+                // The credentials the server called GitHub with are the coder's own, one per call,
+                // in the mode it runs in: never the listing's placeholder.
+                let want = if auth == Auth::Pinned {
+                    format!("Bearer {APP_TOKEN}")
+                } else {
+                    format!("Bearer {GITHUB_TOKEN}")
+                };
+                for api_path in ["/api/v3/user", "/api/v3/repos/acme/widgets/branches"] {
+                    assert_eq!(
+                        bearer_of(api_path),
+                        std::slice::from_ref(&want),
+                        "{mode} {api_path}\n{logs}"
+                    );
+                }
+                if auth == Auth::Pinned {
+                    // One mint serves both calls (the second is the cached token), by the coder and
+                    // not by the server, which holds no key.
+                    assert_eq!(
+                        minted.load(std::sync::atomic::Ordering::SeqCst),
+                        1,
+                        "{mode}"
+                    );
+                } else {
+                    assert_eq!(
+                        minted.load(std::sync::atomic::Ordering::SeqCst),
+                        0,
+                        "{mode}: no App, no trade"
+                    );
+                }
+                assert_eq!(mints.load(std::sync::atomic::Ordering::SeqCst), 0, "{mode}");
+            }
+            Auth::Owners => {
+                assert_eq!(results.len(), 6, "{mode}: {results:?}");
+                // Two owners, two installations, two tokens: each call has its own owner's.
+                assert!(
+                    results[0].contains("trunk-of-widgets"),
+                    "{mode}: {}",
+                    results[0]
+                );
+                assert!(
+                    results[1].contains("trunk-of-gadgets"),
+                    "{mode}: {}",
+                    results[1]
+                );
+                assert_eq!(
+                    bearer_of("/api/v3/repos/acme/widgets/branches"),
+                    [format!("Bearer {ACME_TOKEN}")],
+                    "{mode}\n{logs}"
+                );
+                assert_eq!(
+                    bearer_of("/api/v3/repos/other/gadgets/branches"),
+                    [format!("Bearer {OTHER_TOKEN}")],
+                    "{mode}\n{logs}"
+                );
+                let count = |line: &str| -> usize {
+                    seen.iter()
+                        .filter(|r| format!("{} {}", r.method, r.url.path()) == line)
+                        .count()
+                };
+                assert_eq!(count("GET /orgs/acme/installation"), 1, "{seen:?}");
+                assert_eq!(count("GET /orgs/other/installation"), 1, "{seen:?}");
+                assert_eq!(count("GET /users/other/installation"), 1, "{seen:?}");
+                assert_eq!(
+                    mints.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "one mint for each installation"
+                );
+                assert_eq!(
+                    minted.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "there is no pin"
+                );
+                // An account the App is not installed on: the model is told which App and whose
+                // account, and the server and GitHub's repository API never hear of it.
+                assert!(
+                    results[2].contains("adam-test-app") && results[2].contains("not-installed"),
+                    "{mode}: {}",
+                    results[2]
+                );
+                assert!(
+                    bearer_of("/api/v3/repos/not-installed/x/branches").is_empty(),
+                    "{seen:?}"
+                );
+                // An owner that is not on the list: the variable is named, and nothing at all was
+                // looked up or signed for it.
+                assert!(
+                    results[3].contains("GITHUB_APP_OWNERS"),
+                    "{mode}: {}",
+                    results[3]
+                );
+                assert!(
+                    seen.iter().all(|r| !r.url.path().contains("outsider")),
+                    "{mode}: GitHub heard of the account that is not on the list: {seen:?}"
+                );
+                // `get_me` and a search that names no account: said why, and not sent.
+                assert!(results[4].contains("not a user"), "{mode}: {}", results[4]);
+                assert!(results[5].contains("one account"), "{mode}: {}", results[5]);
+                assert!(bearer_of("/api/v3/user").is_empty(), "{seen:?}");
+            }
         }
         assert!(
             seen.iter().all(|r| !format!("{:?}", r.headers)
                 .contains(adam_coder::github_mcp::LISTING_ONLY_BEARER)),
             "{mode}: the placeholder reached GitHub: {seen:?}"
         );
-        if app {
-            // One mint serves both calls (the second is the cached token), by the coder and not by
-            // the server, which holds no key.
-            assert_eq!(
-                minted.load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "{mode}"
-            );
-        } else {
-            assert_eq!(
-                minted.load(std::sync::atomic::Ordering::SeqCst),
-                0,
-                "{mode}: no App, no trade"
-            );
-        }
 
         coder.sigterm().await;
         let status = coder.exit_within(Duration::from_secs(30)).await;
         assert_eq!(status.code(), Some(0), "{mode}: {}", coder.logs());
-        let visible = format!("{}{}", coder.logs(), tool_results.concat());
-        for secret in [GITHUB_TOKEN, APP_TOKEN] {
+        let visible = format!("{}{}", coder.logs(), results.concat());
+        for secret in [GITHUB_TOKEN, APP_TOKEN, ACME_TOKEN, OTHER_TOKEN] {
             assert!(!visible.contains(secret), "{mode}: {secret} is visible");
         }
     }
@@ -1388,6 +1571,39 @@ fn seed_remote(dir: &Path) -> (PathBuf, PathBuf) {
     (remote, home)
 }
 
+/// The replies of the happy path in `repo_url`: prepare, delegate, checks, commit and push, pull
+/// request, done.
+fn happy_replies(repo_url: &str) -> Vec<Value> {
+    vec![
+        tool_reply(
+            "c1",
+            "prepare_workspace",
+            json!({"repo_url": repo_url, "base_branch": "main"}),
+        ),
+        tool_reply(
+            "c2",
+            "delegate_to_opencode",
+            json!({"instructions": "add hello.txt containing hello"}),
+        ),
+        tool_reply(
+            "c3",
+            "run_checks",
+            json!({"command": "test -f hello.txt && cat hello.txt"}),
+        ),
+        tool_reply(
+            "c4",
+            "commit_and_push",
+            json!({"message": "feat: add hello.txt"}),
+        ),
+        tool_reply(
+            "c5",
+            "open_pull_request",
+            json!({"title": "feat: add hello.txt", "body": "Adds hello.txt.\n\n## Verification\n- passed"}),
+        ),
+        text_reply("Opened the pull request."),
+    ]
+}
+
 /// Mount the happy-path model on `model`: prepare, delegate, checks, commit and push, pull
 /// request, done. Returns the turn of every request, in arrival order.
 async fn mount_happy_model(model: &MockServer) -> Arc<Mutex<Vec<usize>>> {
@@ -1395,30 +1611,7 @@ async fn mount_happy_model(model: &MockServer) -> Arc<Mutex<Vec<usize>>> {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(Script {
-            replies: vec![
-                tool_reply(
-                    "c1",
-                    "prepare_workspace",
-                    json!({"repo_url": "https://github.com/octo/widgets", "base_branch": "main"}),
-                ),
-                tool_reply(
-                    "c2",
-                    "delegate_to_opencode",
-                    json!({"instructions": "add hello.txt containing hello"}),
-                ),
-                tool_reply(
-                    "c3",
-                    "run_checks",
-                    json!({"command": "test -f hello.txt && cat hello.txt"}),
-                ),
-                tool_reply("c4", "commit_and_push", json!({"message": "feat: add hello.txt"})),
-                tool_reply(
-                    "c5",
-                    "open_pull_request",
-                    json!({"title": "feat: add hello.txt", "body": "Adds hello.txt.\n\n## Verification\n- passed"}),
-                ),
-                text_reply("Opened the pull request."),
-            ],
+            replies: happy_replies("https://github.com/octo/widgets"),
             asked: asked.clone(),
         })
         .mount(model)
@@ -2256,6 +2449,47 @@ fn app_env(
     env
 }
 
+/// [`app_env`] with the pin replaced by `GITHUB_APP_OWNERS`: the installation of each owner is
+/// found with the App's JWT.
+fn owners_env(
+    database_url: &str,
+    workspace: &Path,
+    key: &adam_workspace::testing::TestAppKey,
+    dir: &Path,
+    owners: &str,
+) -> Vec<(String, String)> {
+    let mut env = app_env(database_url, workspace, key, dir);
+    env.retain(|(k, _)| k != "GITHUB_APP_INSTALLATION_ID");
+    env.push(("GITHUB_APP_OWNERS".to_owned(), owners.to_owned()));
+    env
+}
+
+/// What GitHub does with the trade of a JWT for an installation token of one installation of an
+/// App with several: the same token every time (good for years), after counting the trade.
+struct MintFixed {
+    token: &'static str,
+    minted: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Respond for MintFixed {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let jwt_shaped = request
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("Bearer eyJ"));
+        if !jwt_shaped {
+            return ResponseTemplate::new(401).set_body_json(json!({"message": "Bad credentials"}));
+        }
+        self.minted
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ResponseTemplate::new(201).set_body_json(json!({
+            "token": self.token,
+            "expires_at": "2099-01-01T00:00:00Z",
+        }))
+    }
+}
+
 /// A token or a GitHub App, never both and never a part of an App: every problem at once (exit 78,
 /// before anything connects), each naming its variable, none carrying a token or a key; and a
 /// complete App configuration is accepted (the process gets as far as Postgres).
@@ -2356,6 +2590,323 @@ async fn a_github_app_configuration_is_checked_at_startup_and_exits_78_with_ever
         err.contains("GITHUB_APP_PRIVATE_KEY_PATH") && err.contains("cannot be read"),
         "{err}"
     );
+}
+
+/// An App with no pin takes a task for each of two owners to a pull request: the installation of
+/// each owner is found with the App's JWT (`octo` is an organisation, `other` a person: the
+/// organisation lookup says 404 first), one token is minted for each, **every call to a
+/// repository's API carries the token of that repository's owner**, never the other's and never a
+/// JWT, a push to a repository that is not on `GITHUB_APP_OWNERS` is refused before anything is
+/// looked up or signed, and nothing secret is in a log or on the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_github_app_without_an_installation_id_opens_pull_requests_for_two_owners() {
+    let Some(db) = TestDb::create().await else {
+        return;
+    };
+    let key = Arc::new(adam_workspace::testing::TestAppKey::generate());
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    // Two remotes, and the private git config that makes each repository on github.com point at one.
+    let remotes = [("octo", "widgets"), ("other", "gadgets")];
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut gitconfig = String::new();
+    let mut remote_paths = Vec::new();
+    for (owner, name) in remotes {
+        let (remote, _) = seed_remote(&dir.join(owner));
+        gitconfig.push_str(&format!(
+            "[url \"{}\"]\n\tinsteadOf = https://github.com/{owner}/{name}.git\n",
+            remote.display()
+        ));
+        remote_paths.push(remote);
+    }
+    std::fs::write(home.join(".gitconfig"), gitconfig).unwrap();
+
+    // The model takes whichever repository the message names through the happy path.
+    struct ByRepository;
+    impl Respond for ByRepository {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            let repo = if body["messages"].to_string().contains("other/gadgets") {
+                "https://github.com/other/gadgets"
+            } else {
+                "https://github.com/octo/widgets"
+            };
+            let turn = body["messages"]
+                .as_array()
+                .map_or(0, |m| m.iter().filter(|m| m["role"] == "tool").count());
+            match happy_replies(repo).get(turn) {
+                Some(reply) => chat_response(request, reply),
+                None => ResponseTemplate::new(500).set_body_string("script exhausted"),
+            }
+        }
+    }
+    let model = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ByRepository)
+        .mount(&model)
+        .await;
+
+    let github = MockServer::start().await;
+    common::mount_repository(&github, "octo/widgets").await;
+    common::mount_repository(&github, "other/gadgets").await;
+    let installation = |id: u64, login: &str| {
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"id": id, "account": {"login": login}, "suspended_at": null}))
+    };
+    let jwt_only =
+        || wiremock::matchers::header_regex("authorization", r"^Bearer eyJ[\w-]+\.[\w-]+\.[\w-]+$");
+    for (lookup, answer) in [
+        ("/orgs/octo/installation", installation(111, "octo")),
+        ("/orgs/other/installation", ResponseTemplate::new(404)),
+        ("/users/other/installation", installation(222, "other")),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(lookup))
+            .and(jwt_only())
+            .respond_with(answer)
+            .mount(&github)
+            .await;
+    }
+    let mints = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for (id, token) in [(111, ACME_TOKEN), (222, OTHER_TOKEN)] {
+        Mock::given(method("POST"))
+            .and(path(format!("/app/installations/{id}/access_tokens")))
+            .respond_with(MintFixed {
+                token,
+                minted: mints.clone(),
+            })
+            .mount(&github)
+            .await;
+    }
+
+    let mut env = owners_env(&db.url(), &dir.join("work"), &key, dir, "Octo other");
+    env.extend([
+        ("MODEL_BASE_URL".to_owned(), model.uri()),
+        ("GITHUB_API_URL".to_owned(), github.uri()),
+        ("HOME".to_owned(), home.to_string_lossy().into_owned()),
+        (
+            "GIT_CONFIG_GLOBAL".to_owned(),
+            home.join(".gitconfig").to_string_lossy().into_owned(),
+        ),
+        (
+            "OPENCODE_COMMAND".to_owned(),
+            common::fake_agent().to_string_lossy().into_owned(),
+        ),
+        ("FAKE_ACP_SCENARIO".to_owned(), "write-file".to_owned()),
+        ("FAKE_ACP_WRITE_PATH".to_owned(), "hello.txt".to_owned()),
+        ("FAKE_ACP_WRITE_CONTENT".to_owned(), "hello\n".to_owned()),
+    ]);
+    let mut coder = Proc::spawn(&env);
+    let addr = coder.ready().await;
+    let client = common::a2a_client(addr, A2A_TOKEN).await;
+    let mut streamed = String::new();
+    for (owner, name) in remotes {
+        let mut stream = client
+            .send_streaming_message(&SendMessageRequest {
+                message: Message::new(
+                    Role::User,
+                    vec![Part::text(format!(
+                        "In https://github.com/{owner}/{name} (base main) add hello.txt containing hello"
+                    ))],
+                ),
+                configuration: None,
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let mut last = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while !last.as_ref().is_some_and(TaskState::is_terminal) {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(Ok(item))) => {
+                    streamed.push_str(&format!("{item:?}\n"));
+                    match item {
+                        StreamResponse::StatusUpdate(u) => last = Some(u.status.state),
+                        StreamResponse::Task(t) => last = Some(t.status.state),
+                        _ => {}
+                    }
+                }
+                other => panic!("{owner}/{name} did not finish: {other:?}\n{}", coder.logs()),
+            }
+        }
+        assert_eq!(
+            last,
+            Some(TaskState::Completed),
+            "{owner}/{name}\n{}",
+            coder.logs()
+        );
+    }
+    for remote in &remote_paths {
+        let branches = common::git(
+            remote,
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/agent",
+            ],
+        );
+        assert_eq!(
+            branches.lines().count(),
+            1,
+            "{}: {branches}",
+            remote.display()
+        );
+    }
+
+    // The installations were found with the JWT, once each, and one token minted for each.
+    let seen = github.received_requests().await.unwrap();
+    let count = |line: &str| {
+        seen.iter()
+            .filter(|r| format!("{} {}", r.method, r.url.path()) == line)
+            .count()
+    };
+    for line in [
+        "GET /orgs/octo/installation",
+        "GET /orgs/other/installation",
+        "GET /users/other/installation",
+        "POST /app/installations/111/access_tokens",
+        "POST /app/installations/222/access_tokens",
+    ] {
+        assert_eq!(count(line), 1, "{line}: {seen:?}");
+    }
+    assert_eq!(mints.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // Every call to a repository's API carried the token of its owner's installation.
+    for (slug, token) in [("octo/widgets", ACME_TOKEN), ("other/gadgets", OTHER_TOKEN)] {
+        let calls: Vec<_> = seen
+            .iter()
+            .filter(|r| r.url.path().starts_with(&format!("/repos/{slug}/")))
+            .collect();
+        assert!(
+            calls.len() >= 2,
+            "{slug}: the probe and the pull request: {calls:?}"
+        );
+        for call in &calls {
+            assert_eq!(
+                call.headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok()),
+                Some(format!("Bearer {token}").as_str()),
+                "{slug}: {} {}",
+                call.method,
+                call.url
+            );
+        }
+        assert_eq!(
+            calls.iter().filter(|r| r.method.as_str() == "POST").count(),
+            1,
+            "{slug}: one pull request"
+        );
+    }
+
+    // A repository whose owner is not on the list is refused before anything is looked up or signed.
+    let before = github.received_requests().await.unwrap().len();
+    let mut stream = client
+        .send_streaming_message(&SendMessageRequest {
+            message: Message::new(
+                Role::User,
+                vec![Part::text(
+                    "In https://github.com/attacker/loot (base main) add hello.txt containing hello",
+                )],
+            ),
+            configuration: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while let Ok(Some(Ok(item))) = tokio::time::timeout_at(deadline, stream.next()).await {
+        streamed.push_str(&format!("{item:?}\n"));
+    }
+    let after = github.received_requests().await.unwrap();
+    assert!(
+        after[before..]
+            .iter()
+            .all(|r| !r.url.path().contains("attacker")),
+        "GitHub was asked about an account that is not on the list: {:?}",
+        &after[before..]
+    );
+
+    coder.sigterm().await;
+    let status = coder.exit_within(Duration::from_secs(30)).await;
+    assert_eq!(status.code(), Some(0), "{}", coder.logs());
+    let body: String = key
+        .pkcs1_pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    let visible = format!("{}{streamed}", coder.logs());
+    for secret in [
+        ACME_TOKEN,
+        OTHER_TOKEN,
+        body.as_str(),
+        &body[..60],
+        "BEGIN RSA PRIVATE KEY",
+    ] {
+        assert!(!visible.contains(secret), "{secret}");
+    }
+    db.finish().await;
+}
+
+/// An App with neither a pinned installation nor owners to find installations for is a
+/// configuration error (exit 78, before anything connects) that names both variables and no value;
+/// so are a pin together with owners, and owners with a token.
+#[tokio::test]
+async fn an_app_with_neither_installation_nor_owners_is_refused_at_startup() {
+    let key = adam_workspace::testing::TestAppKey::generate();
+    let tmp = tempfile::tempdir().unwrap();
+    let unreachable = "postgres://u:p@127.0.0.1:1/x";
+    let refused = |env: Vec<(String, String)>| async move {
+        let mut p = Proc::spawn(&env);
+        let status = p.exit_within(Duration::from_secs(45)).await;
+        let chain = failure(&p)["error"].as_str().unwrap_or_default().to_owned();
+        (status.code(), chain, p)
+    };
+
+    // Neither.
+    let mut env = app_env(unreachable, tmp.path(), &key, tmp.path());
+    env.retain(|(k, _)| k != "GITHUB_APP_INSTALLATION_ID");
+    let (code, chain, p) = refused(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    assert!(
+        chain.contains("GITHUB_APP_INSTALLATION_ID") && chain.contains("GITHUB_APP_OWNERS"),
+        "{chain}"
+    );
+    assert!(!chain.contains("BEGIN"), "{chain}");
+
+    // A pin and owners.
+    let mut env = app_env(unreachable, tmp.path(), &key, tmp.path());
+    env.push(("GITHUB_APP_OWNERS".to_owned(), "acme".to_owned()));
+    let (code, chain, p) = refused(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    assert!(
+        chain.contains("GITHUB_APP_INSTALLATION_ID and GITHUB_APP_OWNERS are both set"),
+        "{chain}"
+    );
+
+    // Owners and a token.
+    let mut env = valid_env(unreachable, tmp.path());
+    env.push(("GITHUB_APP_OWNERS".to_owned(), "acme".to_owned()));
+    let (code, chain, p) = refused(env).await;
+    assert_eq!(code, Some(78), "{}", p.logs());
+    assert!(
+        chain.contains("GITHUB_APP_OWNERS is for a GitHub App") && chain.contains("GITHUB_TOKEN"),
+        "{chain}"
+    );
+    assert!(!chain.contains(GITHUB_TOKEN), "{chain}");
+
+    // Owners alone are accepted: the process goes on to Postgres.
+    let env = owners_env(unreachable, tmp.path(), &key, tmp.path(), "acme,*");
+    let (code, chain, _) = refused(env).await;
+    assert_eq!(code, Some(78), "`*` beside an account is refused: {chain}");
+    assert!(chain.contains("`*` stands for every account"), "{chain}");
+    let env = owners_env(unreachable, tmp.path(), &key, tmp.path(), "Acme other-org");
+    let (code, chain, p) = refused(env).await;
+    assert_eq!(code, Some(69), "{}", p.logs());
+    assert!(chain.starts_with("connecting to Postgres: "), "{chain}");
 }
 
 /// What GitHub does with the trade of a JWT for an installation token: checks the signature against
