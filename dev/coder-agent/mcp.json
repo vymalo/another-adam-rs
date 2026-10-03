@@ -3,9 +3,6 @@
     "github": {
       "type": "http",
       "url": "http://mock-github-mcp:8080/mcp",
-      "headers": {
-        "Authorization": "Bearer ${GITHUB_MCP_TOKEN:-dev-github-mcp-token}"
-      },
       "tools": [
         "get_me",
         "search_repositories",

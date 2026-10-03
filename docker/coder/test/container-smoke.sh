@@ -9,7 +9,10 @@
 # $DATABASE_URL (default postgres://postgres:postgres@127.0.0.1:5432/postgres;
 # CI provides a service container). The container shares the host network, so
 # 127.0.0.1 reaches the stub model, Postgres and the container's own port
-# (MODEL_PORT, default 18080, and CODER_PORT, default 8080, move them).
+# (MODEL_PORT, default 18080, CODER_PORT, default 8080, and MCP_PORT, default 8082, which has to be the
+# port the shipped mcp.json names, move them). A second container of the same image is the GitHub MCP
+# server, the sidecar of the chart's pod: the coder's shipped agent files read it over http at
+# 127.0.0.1:8082, with no credential in the file and none in the server.
 # Verified by CI only: the authoring environment has no docker daemon.
 set -eu
 
@@ -20,6 +23,8 @@ fi
 image=$1
 here=$(cd "$(dirname "$0")" && pwd)
 name=coder-smoke
+mcp_name=coder-smoke-github-mcp
+mcp_port=${MCP_PORT:-8082}
 model_port=${MODEL_PORT:-18080}
 coder_port=${CODER_PORT:-8080}
 token=smoke-token
@@ -33,7 +38,7 @@ cleanup() {
     echo "--- container logs ---"
     docker logs "$name" 2>&1 | tail -n 80 || true
   fi
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker rm -f "$name" "$mcp_name" >/dev/null 2>&1 || true
   if [ -n "$model_pid" ]; then kill "$model_pid" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
@@ -44,7 +49,16 @@ bad() { echo "FAIL $1"; fail=1; }
 python3 "$here/fake-model.py" "$model_port" &
 model_pid=$!
 
-docker rm -f "$name" >/dev/null 2>&1 || true
+docker rm -f "$name" "$mcp_name" >/dev/null 2>&1 || true
+# The sidecar, as the chart runs it: the same image, read-only, four toolsets, loopback, no credential.
+docker run -d --name "$mcp_name" --network host --entrypoint tini "$image" -- github-mcp-server http \
+  --read-only --toolsets context,repos,issues,pull_requests --listen-host 127.0.0.1 --port "$mcp_port" >/dev/null
+waited=0
+until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$mcp_port/"; do
+  waited=$((waited + 1))
+  if [ "$waited" -ge 30 ]; then echo "the GitHub MCP server does not listen on $mcp_port"; docker logs "$mcp_name" 2>&1 | tail -n 20; exit 1; fi
+  sleep 1
+done
 docker run -d --name "$name" --network host \
   -e DATABASE_URL="$database_url" \
   -e MODEL_BASE_URL="http://127.0.0.1:$model_port/v1" \
@@ -52,7 +66,6 @@ docker run -d --name "$name" --network host \
   -e MODEL=fake-model \
   -e GITHUB_TOKEN=smoke-github-token \
   -e A2A_BEARER_TOKENS="$token" \
-  -e MCP_ALLOW_STDIO=true \
   -e PUBLIC_URL="http://127.0.0.1:$coder_port/" \
   -e LISTEN_ADDR="127.0.0.1:$coder_port" \
   "$image" >/dev/null
@@ -85,17 +98,17 @@ if echo "$out" | grep -q "invalid configuration" && ! echo "$out" | grep -qi "op
 else
   bad "DEVCONTAINER_RUNTIME=podman does not accept the image's OpenCode: $out"
 fi
-# Local-process MCP servers are the coder's alone: the image sets no MCP_ALLOW_STDIO (an `adam-agent`
-# run from it refuses such servers unless its own deployment opts in), and the coder's deployment sets it,
-# which this script does for the container above.
+# Local-process MCP servers are the deployment's to allow: the image sets no MCP_ALLOW_STDIO (an `adam-agent`
+# run from it refuses such servers unless its own deployment opts in), and the coder above did not need it:
+# its shipped agent files reach the GitHub server over http.
 if [ -z "$(docker run --rm --entrypoint sh "$image" -c 'printf %s "${MCP_ALLOW_STDIO:-}"' 2>/dev/null)" ]; then
   ok "the image does not allow local-process MCP servers: only the coder's deployment does"
 else
   bad "the image sets MCP_ALLOW_STDIO: every agent of the image would allow local-process MCP servers"
 fi
-# The GitHub MCP server of the shipped `mcp.json`: the coder (embedded agent files, MCP_ALLOW_STDIO=true as
-# its deployment sets it) started it as a child process and connected it (the check above already needed it
-# to start), and it lists the twelve read tools and no write tool.
+# The GitHub MCP server of the shipped `mcp.json`: the coder (embedded agent files, no MCP_ALLOW_STDIO) connected
+# the sidecar over http (the check above already needed it to start), and the binary lists the twelve read
+# tools and no write tool.
 if docker logs "$name" 2>&1 | grep -q 'connected to the MCP server.*github'; then
   ok "the coder connected the GitHub MCP server"
 else

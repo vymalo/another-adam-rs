@@ -68,12 +68,15 @@
 #       no: mock-github never saw the creation, git-server never heard of the repository, no pull request
 #         was opened, and the task waits for the person.
 #   * the coder reads GitHub through the GitHub MCP server, here the mock of dev/coder-agent/mcp.json
-#     (mock-github-mcp). Its journal is not reset: the coder connects the server when it starts,
-#     before this script. So the journal holds at least one `initialize` and one `tools/list`, and
-#     the default scenario (OpenCode; its script reads the repository's branches with
+#     (mock-github-mcp, at GITHUB_MCP_URL). The file holds no credential: the coder sends the credentials
+#     of each call (ADR 0017, D4). Its journal is not reset: the coder connects the server when it starts,
+#     before this script, listing the tools with a placeholder bearer (`ghs_adam_listing_only`). So the
+#     journal holds at least one `initialize` and one `tools/list`, every `tools/list` carries the
+#     placeholder, and the default scenario (OpenCode; its script reads the repository's branches with
 #     `github__list_branches` right after preparing the workspace) added exactly one `tools/call` of
-#     `list_branches` to it, with the bearer of the dev file, and the model was given its answer;
-#     every other scenario adds none.
+#     `list_branches` to it, and the model was given its answer; every `tools/call` in the journal carries
+#     the coder's own credentials (the token below, or the installation token of an App); every other
+#     scenario adds no call.
 #   * the coder's GitHub credentials, as the stack was started with them (GITHUB_AUTH):
 #       token (default): every call the coder made to mock-github's `/repos/...` carried
 #         `Authorization: Bearer dev-github-token` (MOCK_GITHUB_TOKEN, the compose file's dummy);
@@ -323,6 +326,9 @@ mcp_count() {
 }
 branches_before=$(mcp_count tools/call list_branches)
 calls_before=$(mcp_count tools/call)
+# When this run began, in the journal's milliseconds: the bearer of a call is checked only for this
+# run's calls (a run before it, as a GitHub App, carried that run's installation token).
+mcp_since=$(( $(date +%s) * 1000 ))
 # model_saw_branches: requests the scripted model got whose history holds the answer of the
 # `github__list_branches` call (the tool message of call `coder-gh-1`, which names the branch main).
 model_saw_branches() {
@@ -700,13 +706,27 @@ if [ "$scenario" = default ] && [ "${NO_OPENCODE:-}" != 1 ]; then
   else
     bad "mock-github-mcp saw $branches_before then $branches_after tools/call of list_branches, want exactly one more"
   fi
-  # The call carried the bearer of the dev mcp.json (GITHUB_MCP_TOKEN, or its default).
-  want_bearer="Bearer ${GITHUB_MCP_TOKEN:-dev-github-mcp-token}"
-  wrong=$(curl -s --max-time 30 -X POST "$github_mcp/__admin/requests/find" \
-    -H 'Content-Type: application/json' \
-    -d '{"method":"POST","urlPath":"/mcp"}' \
-    | jq -r --arg want "$want_bearer" '[.requests[] | .headers | with_entries(.key |= ascii_downcase) | select(.authorization != $want)] | length' 2>/dev/null || echo '?')
-  if [ "$wrong" = 0 ]; then ok "every request to mock-github-mcp carried '$want_bearer'"; else bad "$wrong request(s) to mock-github-mcp did not carry '$want_bearer'"; fi
+  # The dev mcp.json holds no credential: the coder gives each call the credentials of that call (ADR 0017,
+  # D4), the token of the stack or, as a GitHub App, the installation token it minted. The listing at
+  # startup carries a placeholder and no call does.
+  case "$github_auth" in
+    token) want_bearer="Bearer ${MOCK_GITHUB_TOKEN-dev-github-token}"; how=exact ;;
+    app) want_bearer='Bearer ghs_mockinstallationtoken'; how=prefix ;;
+  esac
+  # mcp_wrong_bearers <JSON-RPC method> <wanted bearer> <exact|prefix> [since ms]: how many requests of the
+  # journal with that method (logged at or after `since`, when given) carry another `Authorization` (or
+  # none), or ? when the mock does not answer.
+  mcp_wrong_bearers() {
+    patterns=$(jq -nc --arg m "$1" '[{matchesJsonPath: {expression: "$.method", equalTo: $m}}]')
+    curl -s --max-time 30 -X POST "$github_mcp/__admin/requests/find" \
+      -H 'Content-Type: application/json' \
+      -d "{\"method\":\"POST\",\"urlPath\":\"/mcp\",\"bodyPatterns\":$patterns}" \
+      | jq -r --arg want "$2" --arg how "$3" --argjson since "${4:-0}" '[.requests[] | select((.loggedDate // 0) >= $since) | .headers | with_entries(.key |= ascii_downcase) | (.authorization // "") | select(if $how == "exact" then . != $want else (startswith($want) | not) end)] | length' 2>/dev/null || echo '?'
+  }
+  wrong=$(mcp_wrong_bearers tools/call "$want_bearer" "$how" "$mcp_since")
+  if [ "$wrong" = 0 ]; then ok "every tools/call to mock-github-mcp carried the coder's credentials ('$want_bearer...')"; else bad "$wrong tools/call request(s) to mock-github-mcp did not carry '$want_bearer'"; fi
+  wrong=$(mcp_wrong_bearers tools/list 'Bearer ghs_adam_listing_only' exact)
+  if [ "$wrong" = 0 ]; then ok "every tools/list to mock-github-mcp carried the startup placeholder, not a credential"; else bad "$wrong tools/list request(s) to mock-github-mcp did not carry the placeholder 'Bearer ghs_adam_listing_only'"; fi
   # And the model was given what it answered: the branch main.
   saw_after=$(model_saw_branches)
   if [ "$saw_before" != '?' ] && [ "$saw_after" != '?' ] && [ "$saw_after" -gt "$saw_before" ]; then

@@ -1,5 +1,6 @@
 //! `adam-mcp` against the `mock-github-mcp` WireMock of `compose.yaml`: the GitHub MCP server's
-//! streamable HTTP endpoint as the dev stack's coder sees it (`dev/coder-agent/mcp.json`).
+//! streamable HTTP endpoint as the dev stack's coder sees it (`dev/coder-agent/mcp.json`; the coder sends
+//! the bearer of each call itself, and this test writes the header into its own file instead).
 //!
 //! Runs only when `ADAM_TEST_MOCK_GITHUB_MCP_URL` is set (the endpoint, for example
 //! `http://127.0.0.1:8085/mcp`); otherwise it passes without doing anything. Start the mock with
@@ -50,7 +51,7 @@ async fn the_dev_stacks_github_mcp_mock_is_a_server_this_client_can_use() {
     // Plain http to a container is for development only: the policy says so.
     let policy = McpPolicy::default().allow_insecure(true);
 
-    // With the bearer the stack gives it, the way `dev/coder-agent/mcp.json` writes it.
+    // With a bearer in the file (the coder's own file has none: it sends one per call).
     let config = http_config(
         "github",
         &url,
