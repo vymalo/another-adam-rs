@@ -520,9 +520,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("survivor");
         // The timeout leaves a login shell on a loaded machine time to start and
-        // print (400 ms did not, once, in CI); the grandchild outlives it by far.
-        let timeout = Duration::from_secs(2);
-        let grandchild_delay = 4;
+        // print (400 ms did not, once, in CI, nor did 2 s under the instrumented
+        // coverage run); the grandchild outlives it by far.
+        let timeout = Duration::from_secs(5);
+        let grandchild_delay = 8;
         // A background grandchild that would create a file if it survived.
         let script = format!(
             "(sleep {grandchild_delay}; touch {}) & echo started; sleep 60",
@@ -534,7 +535,7 @@ mod tests {
         assert!(!out.passed());
         assert!(out.tail.contains("started"), "{:?}", out.tail);
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < timeout + Duration::from_secs(5),
             "returned promptly, not after the sleeps"
         );
         // The grandchild started before the timeout, so a survivor would have
