@@ -674,6 +674,38 @@ npm --prefix tools/docs-check ci          # once per clone
 node tools/docs-check/check-docs.mjs
 ```
 
+The same check covers the repository's own agent skills (below): their frontmatter, their mirrors and
+every repository path they cite.
+
+### Agent context and skills
+
+[`CLAUDE.md`](CLAUDE.md) (`AGENTS.md` is a symlink to it) is the guide for an agent working in this
+repository: layout, rules, commands, and which skill to use when. Skills live in `.agents/skills/`,
+mirrored by symlinks in `.claude/skills`, `.goose/skills` and `.kiro/skills`. The vendored ones are
+pinned in `skills-lock.json` (licences in [`third-party-notices.md`](third-party-notices.md)) and
+updated with the skills CLI, never by hand.
+
+**Skills this repository provides.** Six first-party skills are for the repositories that integrate
+adam-rs; each says to read adam-rs files at the revision you pin:
+
+| Skill | For |
+|---|---|
+| `adam-agent-folder` | an agent that is only a folder, served by `adam-agent` |
+| `adam-embed` | hosting adam agents in your own Rust process |
+| `adam-store-adapter` | implementing or updating a `Store` or `Notifier` |
+| `adam-a2a-extensions` | the A2A extensions an adam agent declares, and how a client activates them |
+| `adam-coder-deploy` | the coder image and its Helm chart |
+| `adam-upgrade` | moving a consumer from one adam-rs revision to another |
+
+```sh
+npx skills add vymalo/another-adam-rs --list                          # these six, and only these
+npx skills add vymalo/another-adam-rs --skill adam-agent-folder --skill adam-upgrade -a claude-code -y
+npx skills update -p -y                                               # later: take their newer versions
+```
+
+The consumer's `skills-lock.json` pins what it installed. `update-vendored-skills` is internal and
+is not listed.
+
 ## Roadmap
 
 1. ~~Store trait and adapters~~ (this repo)
