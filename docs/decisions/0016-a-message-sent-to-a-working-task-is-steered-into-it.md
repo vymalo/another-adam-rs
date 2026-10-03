@@ -10,6 +10,13 @@ the task that is running). **Built:** `STEER_EXTENSION` and `ExtensionConfig::st
 `BackendError::UnsupportedOperation`, the steer path of `RuntimeTaskBackend::submit`, `Ctx::arrived` and
 `Ctx::reopen_on_arrival`, `Conversation::read_ids`, and the recorded model step's `seen`.
 
+*Amended 2026-10-03:* a task is `working` from the moment a worker claims its run, not from its first commit. A turn
+commits once, so during the first model call the run still read as version 1 and the task as `submitted`, and the
+orchestration layer, which steers only a thread that is `working`, held a message sent then until the turn was over. The
+run's lease now says it (`Store::lease_until`, `RunView::claimed`), and the worker announces its first claim as
+`Status(Runnable, claimed)`. A steer is accepted in `submitted` and in `working` exactly as before; only which of the two
+a task reads has changed.
+
 ## Context
 
 The orchestration layer lets a person write while an agent works ("you were wrong since line 1"). A2A leaves a message with the

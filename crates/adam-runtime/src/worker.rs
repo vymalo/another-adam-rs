@@ -26,6 +26,9 @@ use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
 
 type InFlight = Arc<Mutex<HashSet<RunId>>>;
 
+/// The `detail` of the status event a worker emits when it first claims a run.
+pub(crate) const CLAIMED: &str = "claimed";
+
 impl Runtime {
     /// Worker loop until `shutdown` resolves: claim due runs, advance each by
     /// one transition, commit it (compare-and-swap), renew the lease while
@@ -294,6 +297,21 @@ fn spawn_cancel_watch(inner: Arc<Inner>, run: RunId, token: CancelToken) -> Abor
 #[tracing::instrument(skip_all, fields(run = %lease.run.id, agent = %lease.run.agent))]
 async fn advance(inner: Arc<Inner>, lease: Lease, guard: InFlightGuard) {
     let run = lease.run.id;
+    // The first claim of a run is news to whoever watches it: the lease now says a worker is on
+    // it, so its view reads `claimed` (see `RunView::claimed`) and an A2A task turns `working`,
+    // though nothing is committed until the whole turn is. A subscriber re-reads the run on any
+    // status event, so this prompts the read; the poll finds it anyway. Later claims (version
+    // above 1) follow a commit, and the run was already `working`.
+    if lease.run.status == RunStatus::Runnable && lease.run.version <= 1 {
+        inner
+            .emit_status(
+                run,
+                &lease.run.agent,
+                RunStatus::Runnable,
+                Some(CLAIMED.into()),
+            )
+            .await;
+    }
     let renewer = inner
         .cfg
         .lease_renewal

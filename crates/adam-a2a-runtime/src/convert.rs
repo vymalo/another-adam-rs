@@ -66,12 +66,20 @@ pub fn default_inbound(message: &Message) -> Result<Inbound, String> {
 ///
 /// | Run | Task |
 /// |---|---|
-/// | runnable, never committed by a worker | `submitted` |
+/// | runnable, never committed by a worker, no worker holds it (`RunView::claimed`) | `submitted` |
+/// | runnable, never committed by a worker, a worker holds it | `working` |
 /// | runnable, or parked on a timer | `working` |
 /// | parked with no timer (`RunView::waiting`) | `input-required` |
 /// | done | `completed` |
 /// | failed with `cancelled: ...` | `canceled` |
 /// | failed otherwise | `failed` |
+///
+/// A whole turn (the model calls and the tool calls) commits once, so the first model call of a
+/// task can last a long time with nothing committed. The lease a worker takes when it claims the
+/// run is what says it is being worked on: from then on the task is `working`, which is what a
+/// client that steers a running task (`steer/v1`) waits for. A lease that ran out (the worker
+/// died) is not a worker at work: the task reads `submitted` again until another worker claims
+/// it. After the first commit the version says `working` for good.
 pub fn task_state(view: &RunView) -> TaskState {
     match view.status {
         RunStatus::Done => TaskState::Completed,
@@ -88,8 +96,9 @@ pub fn task_state(view: &RunView) -> TaskState {
         }
         RunStatus::Parked if view.waiting => TaskState::InputRequired,
         RunStatus::Parked => TaskState::Working,
-        // Version 1 is the record as created: no worker has committed yet.
-        RunStatus::Runnable if view.version <= 1 => TaskState::Submitted,
+        // Version 1 is the record as created: no worker has committed yet. Until one holds it, it
+        // is only submitted.
+        RunStatus::Runnable if view.version <= 1 && !view.claimed => TaskState::Submitted,
         RunStatus::Runnable => TaskState::Working,
     }
 }
@@ -371,6 +380,7 @@ mod tests {
             status,
             wake_at: None,
             waiting: status == RunStatus::Parked,
+            claimed: false,
             output: None,
             error: None,
             attempt: 0,
@@ -408,6 +418,60 @@ mod tests {
         assert_eq!(task_state(&v), TaskState::Failed);
         v.error = Some("cancelled: by client".into());
         assert_eq!(task_state(&v), TaskState::Canceled);
+    }
+
+    /// A worker holding a run that nothing has committed yet makes its task `working`, not
+    /// `submitted`: the first model call of a turn commits nothing for as long as it lasts.
+    #[test]
+    fn a_claimed_run_is_working_before_its_first_commit() {
+        let mut v = view(RunStatus::Runnable);
+        v.version = 1;
+        v.claimed = false;
+        assert_eq!(task_state(&v), TaskState::Submitted, "nobody holds it");
+        v.claimed = true;
+        assert_eq!(task_state(&v), TaskState::Working, "a worker holds it");
+        // The same task after its first commit: working, claimed or not (between two steps nobody
+        // holds the run, and it must not fall back).
+        v.version = 2;
+        assert_eq!(task_state(&v), TaskState::Working);
+        v.claimed = false;
+        assert_eq!(task_state(&v), TaskState::Working);
+    }
+
+    /// A lease only matters to a run that is runnable: whatever else the view says wins.
+    #[test]
+    fn a_claim_changes_no_other_state() {
+        for (status, error, expected) in [
+            (RunStatus::Done, None, TaskState::Completed),
+            (RunStatus::Failed, Some("boom"), TaskState::Failed),
+            (
+                RunStatus::Failed,
+                Some("cancelled: by client"),
+                TaskState::Canceled,
+            ),
+            (RunStatus::Parked, None, TaskState::InputRequired),
+        ] {
+            let mut v = view(status);
+            v.version = 1;
+            v.claimed = true;
+            v.error = error.map(str::to_owned);
+            assert_eq!(task_state(&v), expected, "{status:?}");
+        }
+    }
+
+    /// The status a subscriber is sent differs between the two (so the change is announced), and
+    /// the claimed one carries no message: there is nothing to say yet.
+    #[test]
+    fn claiming_changes_the_status_key_and_adds_no_message() {
+        let mut v = view(RunStatus::Runnable);
+        v.version = 1;
+        let before = status_of(&v, &prompt());
+        v.claimed = true;
+        let after = status_of(&v, &prompt());
+        assert_eq!(before.state, TaskState::Submitted);
+        assert_eq!(after.state, TaskState::Working);
+        assert!(after.message.is_none());
+        assert_ne!(status_key(&before), status_key(&after));
     }
 
     #[test]

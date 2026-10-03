@@ -356,14 +356,26 @@ async fn new_with_uses_the_live_signals_it_is_given() {
         .unwrap();
     let mut events = broadcast.subscribe_run(adam_core::RunId(task.id.parse().unwrap()));
     let (stop, worker) = spawn_worker(&service);
-    let first = tokio::time::timeout(Duration::from_secs(10), events.recv())
-        .await
-        .expect("an event");
+    // The worker says it took the run, then the step's own event follows.
+    let mut heard = Vec::new();
+    for _ in 0..2 {
+        heard.push(
+            tokio::time::timeout(Duration::from_secs(10), events.recv())
+                .await
+                .expect("an event"),
+        );
+    }
     assert_eq!(
-        first,
-        Some(RunEvent::Progress {
-            message: "echoing".into()
-        })
+        heard,
+        [
+            Some(RunEvent::Status {
+                status: adam_core::RunStatus::Runnable,
+                detail: Some("claimed".into())
+            }),
+            Some(RunEvent::Progress {
+                message: "echoing".into()
+            })
+        ]
     );
     wait_for(&service, &alice(), &task.id, TaskState::Completed).await;
     let _ = stop.send(());
