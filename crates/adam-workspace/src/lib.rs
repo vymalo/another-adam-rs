@@ -87,7 +87,7 @@ pub use error::{WorkspaceError, WorkspaceResult};
 #[cfg(feature = "github")]
 pub use github::GitHub;
 #[cfg(feature = "github")]
-pub use github_app::{AppKey, GitHubApp};
+pub use github_app::{AppKey, AppOwners, GitHubApp, Installation, MAX_CACHED_INSTALLATIONS};
 pub use repo::{RepoLocation, RepoRef};
 pub use run_workspace::{Collision, CopyReport, RunWorkspace, Scratch, Slot, SlotKind, copy_into};
 pub use workspace::Workspaces;

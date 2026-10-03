@@ -173,15 +173,20 @@ async fn a_token_the_endpoint_does_not_accept_is_unauthorized_and_the_token_is_n
 
 #[tokio::test]
 async fn an_endpoint_that_is_down_fails_without_the_token() {
-    // A port that is bound and never listened on: a connection to it is refused, and while the
-    // socket is held no other test's server can be given the port (a dropped server frees it, and
-    // a server of another test, run in parallel, answered 401 there).
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    // A port held by a listener that closes every connection unanswered: no other test's server
+    // can be given a port that is listened on (a socket that was only bound was shared with a
+    // server of another test, run in parallel, which answered 401 there), and the endpoint gets
+    // no answer at all.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "http://{}/thread-tools/thread-1/mcp",
-        socket.local_addr().unwrap()
+        listener.local_addr().unwrap()
     );
+    let closer = tokio::spawn(async move {
+        while let Ok((connection, _)) = listener.accept().await {
+            drop(connection);
+        }
+    });
     let endpoint = Endpoint::new(&url, &token("good-token"), &McpPolicy::default()).unwrap();
     let error = endpoint.list_tools().await.unwrap_err();
     assert!(
@@ -189,7 +194,7 @@ async fn an_endpoint_that_is_down_fails_without_the_token() {
         "{error:?}"
     );
     assert!(!error.to_string().contains("good-token"));
-    drop(socket);
+    closer.abort();
 }
 
 #[tokio::test]
