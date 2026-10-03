@@ -30,6 +30,12 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "github.auth=app needs github.app.privateKeySecret: the name of a Secret with the App's private key under the key private-key.pem" -}}
 {{- end -}}
 {{- end -}}
+{{- if .Values.githubMcp.enabled -}}
+{{- $port := int64 .Values.githubMcp.port -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail (printf "githubMcp.port must be a port number (1 to 65535), got %q" (toString .Values.githubMcp.port)) -}}
+{{- end -}}
+{{- end -}}
 {{- if and (gt (int .Values.replicaCount) 1) (include "coder.runsWorkers" .) (not $placement) -}}
 {{- fail "replicaCount > 1 needs workspace.placement (shared, affinity or isolated): runs move between workers at every step, and without a placement a run that lands on a worker without its worktree forks into a second pull request (see deploy/coder/README.md, Workspace placement)" -}}
 {{- end -}}

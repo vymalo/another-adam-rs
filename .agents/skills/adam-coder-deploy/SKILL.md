@@ -52,6 +52,11 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    * `github.auth: token` (default) or `app`
      (`github.app.id`, `.installationId`, `.privateKeySecret`); `createRepoOwners` turns the
      repository-creation tool on.
+   * `githubMcp` (default on): the official GitHub MCP server as a **native sidecar** (an init
+     container with `restartPolicy: Always`, Kubernetes 1.29+) of every pod that runs workers,
+     `github-mcp-server http --read-only` on 127.0.0.1:8082 from the coder's own image. It holds no
+     Secret, key or token: the coder sends the credentials of each call, and `GITHUB_MCP_URL` says
+     where it is. The coder's shipped agent files name port 8082 (ADR 0017).
    * Secrets come from an `ExternalSecret` (`externalSecrets.*`): `MODEL_API_KEY`, `GITHUB_TOKEN`,
      `A2A_BEARER_TOKENS`. The defaults point at one owner's cluster (`secretStoreRef`, `key`):
      override them for yours.
@@ -93,9 +98,15 @@ Then the compose scenarios of the `image` job in `.github/workflows/coder.yml`
 * The build context is the repository root, not `docker/coder`.
 * A workspace base tag that is a placeholder (`...PENDING`) makes the workflow skip the build
   with a warning instead of failing.
-* The image sets no `MCP_ALLOW_STDIO`: it belongs to the coder's deployment (the chart sets
-  it); `adam-agent` from this image refuses local-process MCP servers unless its own
-  deployment sets it.
+* The image sets no `MCP_ALLOW_STDIO`; `adam-agent` from this image refuses local-process MCP
+  servers unless its own deployment sets it. The coder no longer needs it: its shipped agent files
+  read the GitHub MCP server over http (the sidecar), so a coder started without the sidecar stops
+  at startup with exit 69. The chart still sets `MCP_ALLOW_STDIO` for one release, for agent
+  folders written before the sidecar.
+* In compose, run the GitHub MCP server beside the coder in its network namespace
+  (`network_mode: service:coder`, the same image, entrypoint `tini -- github-mcp-server`, command
+  `http --read-only --toolsets context,repos,issues,pull_requests --listen-host 127.0.0.1 --port
+  8082`), as `compose.yaml`'s `github-mcp` does.
 * `volumeClaimTemplates` are immutable: switching `workspace.placement` between a per-pod volume
   and a shared one needs `kubectl delete statefulset <release>-coder --cascade=orphan` before
   `helm upgrade` (chart README, "Workspace placement").

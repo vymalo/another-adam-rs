@@ -35,6 +35,45 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if include "coder.githubMcp" . }}
+      initContainers:
+        {{- /*
+          A native sidecar (an init container with restartPolicy Always: it starts before the coder, is probed
+          before the coder starts, restarts on its own and stops after it). The official GitHub MCP server in http
+          mode reads the token of each request from its Authorization header and holds none: no Secret, no
+          key, no GITHUB_TOKEN. Loopback only. --read-only and the four toolsets are what the coder's tools
+          allow-list assumes. ADR 0017, D4.
+        */}}
+        - name: github-mcp
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          restartPolicy: Always
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          command: ["tini", "--", "github-mcp-server"]
+          args:
+            - http
+            - --read-only
+            - --toolsets
+            - context,repos,issues,pull_requests
+            - --listen-host
+            - 127.0.0.1
+            - --port
+            - {{ int64 .Values.githubMcp.port | quote }}
+          {{- with .Values.githubMcp.host }}
+          env:
+            {{- /* The GitHub host of the server (GitHub Enterprise); empty is github.com. It has to be the first of config.allowedRepoHosts. */}}
+            - name: GITHUB_HOST
+              value: {{ . | quote }}
+          {{- end }}
+          startupProbe:
+            tcpSocket:
+              port: {{ int64 .Values.githubMcp.port }}
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            {{- toYaml .Values.githubMcp.resources | nindent 12 }}
+      {{- end }}
       containers:
         - name: coder
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -87,9 +126,14 @@ spec:
               value: {{ .Values.config.checkTimeoutSecs | quote }}
             - name: WORKSPACE_SWEEP_SECS
               value: {{ .Values.config.workspaceSweepSecs | quote }}
-            {{- /* The shipped mcp.json starts the pinned github-mcp-server, a local process: the coder's alone to allow (the image sets nothing; ADR 0009, decision 8). A control plane connects no MCP server. */}}
+            {{- /* Kept for one release: a vendored agent folder written before the GitHub MCP server became a sidecar (ADR 0017, D4) still starts it as a child process. The shipped mcp.json no longer does. The image sets nothing; a control plane connects no MCP server. */}}
             - name: MCP_ALLOW_STDIO
               value: "true"
+            {{- if include "coder.githubMcp" . }}
+            {{- /* The sidecar below, on loopback: the coder gives each call to it the credentials of that call. The shipped mcp.json names port 8082. */}}
+            - name: GITHUB_MCP_URL
+              value: {{ printf "http://127.0.0.1:%d" (int64 .Values.githubMcp.port) | quote }}
+            {{- end }}
             - name: ALLOWED_REPO_HOSTS
               value: {{ join "," .Values.config.allowedRepoHosts | quote }}
             - name: GITHUB_API_URL

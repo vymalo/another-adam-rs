@@ -58,6 +58,14 @@ Whether this pod authenticates to GitHub as an App installation: github.auth=app
 {{- end -}}
 
 {{/*
+Whether this pod runs the GitHub MCP server beside the coder (a native sidecar): githubMcp.enabled, and the
+role runs workers (a control plane connects no MCP server). Renders "true" or nothing, like coder.runsWorkers.
+*/}}
+{{- define "coder.githubMcp" -}}
+{{- if and .Values.githubMcp.enabled (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 GITHUB_APP_ID: the application ID or the client ID. A number from a values file is a float64 to Helm
 and would print as 1.234567e+06, so numbers go through int64; a string (a client ID, or a quoted ID) is
 used as it is.

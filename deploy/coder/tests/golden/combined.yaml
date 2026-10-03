@@ -89,6 +89,37 @@ spec:
         runAsUser: 10001
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        - name: github-mcp
+          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          command: ["tini", "--", "github-mcp-server"]
+          args:
+            - http
+            - --read-only
+            - --toolsets
+            - context,repos,issues,pull_requests
+            - --listen-host
+            - 127.0.0.1
+            - --port
+            - "8082"
+          startupProbe:
+            tcpSocket:
+              port: 8082
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
       containers:
         - name: coder
           image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
@@ -125,6 +156,8 @@ spec:
               value: "300"
             - name: MCP_ALLOW_STDIO
               value: "true"
+            - name: GITHUB_MCP_URL
+              value: "http://127.0.0.1:8082"
             - name: ALLOWED_REPO_HOSTS
               value: "github.com"
             - name: GITHUB_API_URL

@@ -115,6 +115,28 @@ github:
     # GITHUB_APP_PRIVATE_KEY_PATH to the file. The chart never carries the key itself.
     privateKeySecret: ""
 
+# The GitHub MCP server the coder reads GitHub through (ADR 0017, D4), as a native sidecar of every pod
+# that runs workers (an init container with restartPolicy: Always; Kubernetes 1.29 and later, GA in
+# 1.33). It is `github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests` from
+# the coder's own image, on loopback, holding no credential: the coder sends the token of each call
+# in its Authorization header, so one process serves every account the coder can act for, and no
+# key or token is at rest in it. A control plane renders none of it.
+githubMcp:
+  enabled: true
+  # The port it listens on, on 127.0.0.1. The coder's shipped agent files name 8082: another port
+  # needs an agent folder (ADAM_AGENT_DIR) whose mcp.json names it. The chart sets GITHUB_MCP_URL to
+  # match.
+  port: 8082
+  # GITHUB_HOST of the server: the GitHub Enterprise host, as config.allowedRepoHosts' first entry
+  # (nothing can check that across containers). Empty is github.com.
+  host: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
 service:
   port: 8080
 

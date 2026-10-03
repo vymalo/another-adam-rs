@@ -54,9 +54,10 @@ golden="$chart/tests/golden/combined.yaml"
 # command above, at the same --namespace and --set, only for a deliberate change).
 check "the default render equals tests/golden/combined.yaml" cmp -s "$out" "$golden"
 
-# Local-process MCP servers are the coder's alone to allow (ADR 0009, decision 8): the image sets nothing,
-# and the worker's deployment says so, because its shipped mcp.json starts the pinned github-mcp-server.
-check "the worker allows local-process MCP servers (the shipped mcp.json starts github-mcp-server)" count 'name: MCP_ALLOW_STDIO' 1
+# Local-process MCP servers are the coder's alone to allow (ADR 0009, decision 8): the image sets nothing.
+# The shipped mcp.json no longer starts one (the GitHub MCP server is a sidecar, ADR 0017, D4), but the worker
+# keeps the variable for one release, for a vendored agent folder that still does.
+check "the worker keeps allowing local-process MCP servers for one release" count 'name: MCP_ALLOW_STDIO' 1
 
 check "never exposed: no Ingress, Route or Gateway" lacks '^kind: (Ingress|IngressRoute|HTTPRoute|Gateway)$'
 check "never exposed: no LoadBalancer or NodePort" lacks 'type: (LoadBalancer|NodePort)'
@@ -432,5 +433,76 @@ done
 check "app with a numeric installationId from --set renders" helm_app --set github.app.installationId=42
 check "token mode ignores the github.app values" \
   helm template coder "$chart" --namespace coder-ns --set github.app.id= --set github.app.installationId=nope
+
+# The GitHub MCP server: a native sidecar (an init container with restartPolicy Always) of every pod that
+# runs workers, in http mode with no credential at all (ADR 0017, D4). The coder sends the token of each call.
+# sidecar [file]: the init containers of the StatefulSet (just the sidecar), from the render or a file.
+sidecar() {
+  doc StatefulSet "${1:-$out}" | awk '/^      initContainers:$/ { on = 1; next } /^      containers:$/ { on = 0 } on'
+}
+coder_container() { # the coder's own container of the StatefulSet
+  doc StatefulSet "${1:-$out}" | awk '/^      containers:$/ { on = 1 } /^      (volumes|nodeSelector|affinity|tolerations):$/ { on = 0 } on'
+}
+shas() { sidecar "$out" | grep -Eq -- "$1"; }
+slacks() { ! sidecar "$out" | grep -Eq -- "$1"; }
+chas() { coder_container "$out" | grep -Eq -- "$1"; }
+clacks() { ! coder_container "$out" | grep -Eq -- "$1"; }
+
+helm template coder "$chart" --namespace coder-ns > "$out"
+check "the pod has one init container, the GitHub MCP server" count '^        - name: github-mcp$' 1
+check "it is a native sidecar: restartPolicy Always" shas '^          restartPolicy: Always$'
+check "it is the coder's own image" shas '^          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-[0-9a-zA-Z]+"$'
+check "it runs github-mcp-server in http mode" shas '^          command: \["tini", "--", "github-mcp-server"\]$'
+check "it is read-only" shas '^            - --read-only$'
+check "it has the four toolsets the coder's tools allow-list assumes" shas '^            - context,repos,issues,pull_requests$'
+check "it listens on loopback only: --listen-host 127.0.0.1" shas '^            - 127.0.0.1$'
+check "it listens on 8082" shas '^            - "8082"$'
+check "it is probed on its port before the coder starts: a startupProbe" shas 'startupProbe:'
+check "the probe is a TCP connect to 8082" shas '^              port: 8082$'
+check "it holds no credential: no env, Secret, volume, token or key" \
+  slacks 'env:|secretKeyRef|secretName|volumeMounts|GITHUB_TOKEN|GITHUB_APP|MODEL_API_KEY|PRIVATE KEY|name: GITHUB_HOST'
+check "it has the container security context" shas 'allowPrivilegeEscalation: false'
+check "it has resources" shas '^          resources:$'
+check "the coder is told where it is: GITHUB_MCP_URL, once" count 'name: GITHUB_MCP_URL$' 1
+check "GITHUB_MCP_URL is on loopback at the port" chas '^              value: "http://127.0.0.1:8082"$'
+check "the coder still has the GitHub settings it had" count "$model_and_github" 5
+check "the sidecar adds no health probe path (the coder's three are the only httpGet ones)" count 'path: /healthz' 3
+
+# Values-driven: the port (and the coder's URL with it), the host (only the sidecar has it), off.
+helm template coder "$chart" --namespace coder-ns --set githubMcp.port=9100 --set githubMcp.host=ghe.example.com > "$out"
+check "the port is values-driven in the arguments" shas '^            - "9100"$'
+check "the port is values-driven in the probe" shas '^              port: 9100$'
+check "GITHUB_MCP_URL follows the port" chas '^              value: "http://127.0.0.1:9100"$'
+check "the host is the sidecar's GITHUB_HOST" shas 'name: GITHUB_HOST'
+check "GITHUB_HOST carries the host" shas '^              value: "ghe.example.com"$'
+check "the coder's container has no GITHUB_HOST" clacks 'GITHUB_HOST'
+helm template coder "$chart" --namespace coder-ns --set githubMcp.enabled=false > "$out"
+check "githubMcp.enabled=false renders no sidecar and no GITHUB_MCP_URL" lacks 'initContainers:|name: github-mcp$|GITHUB_MCP_URL|restartPolicy: Always'
+check "an invalid githubMcp.port fails to render" \
+  fails helm template coder "$chart" --namespace coder-ns --set githubMcp.port=70000
+check "port 0 fails to render" fails helm template coder "$chart" --namespace coder-ns --set githubMcp.port=0
+check "a port that is no number fails to render" \
+  fails helm template coder "$chart" --namespace coder-ns --set-string githubMcp.port=http
+
+# Only the roles that run workers connect an MCP server: a control plane, and the split front, have none.
+helm template coder "$chart" --namespace coder-ns --set config.role=control-plane > "$out"
+check "a control plane renders no sidecar and no GITHUB_MCP_URL" lacks 'initContainers:|name: github-mcp$|GITHUB_MCP_URL'
+for role in all worker; do
+  helm template coder "$chart" --namespace coder-ns --set config.role=$role > "$out"
+  check "the $role role runs the sidecar" count '^        - name: github-mcp$' 1
+done
+helm template coder "$chart" --namespace coder-ns --set topology=split > "$out"
+check "split: the worker StatefulSet runs the sidecar" dhas StatefulSet '^        - name: github-mcp$'
+check "split: the worker is told where it is" dhas StatefulSet 'name: GITHUB_MCP_URL$'
+check "split: the front Deployment has no sidecar and no GITHUB_MCP_URL" dlacks Deployment 'initContainers:|github-mcp|GITHUB_MCP_URL'
+check "split: the StatefulSet identity still equals the combined one (the PVC is reused)" \
+  [ "$(sts_identity "$out")" = "$(sts_identity "$golden")" ]
+helm_app > "$out"
+check "app: the sidecar still holds no key and mounts nothing" \
+  slacks 'github-app|secretName|volumeMounts|GITHUB_APP|PRIVATE KEY'
+check "app: the key is mounted into the coder's container only" chas 'mountPath: /var/run/secrets/github-app'
+helm template coder "$chart" --namespace coder-ns --set workspace.placement=shared \
+  --set workspace.sharedVolume.storageClass=$rwx_class --set replicaCount=3 > "$out"
+check "shared: every worker has the sidecar (it is part of the pod)" count '^        - name: github-mcp$' 1
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi
