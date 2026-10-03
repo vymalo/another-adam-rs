@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use adam_workspace::testing::TestAppKey;
 use adam_workspace::{
-    AppKey, CodeHost, GitCredentials, GitHub, GitHubApp, HostScoped, NewPullRequest, PullRequest,
-    RepoRef, StaticToken, WorkspaceError,
+    AppKey, AppOwners, CodeHost, GitCredentials, GitHub, GitHubApp, HostScoped, NewPullRequest,
+    PullRequest, RepoRef, StaticToken, WorkspaceError,
 };
 use secrecy::ExposeSecret as _;
 
@@ -184,6 +184,78 @@ async fn pull_requests_and_scenarios_against_the_mock() {
         .await
         .expect("open with an installation token");
     assert_eq!(pr.head, "agent/app");
+}
+
+/// A GitHub App that is given no installation finds one for each owner at the mock: `local` is on
+/// installation 67890 and `other-org` on 67891 (the account's login is the one asked for), a JWT-less
+/// lookup is refused by the mock (so the coder's request is shaped as GitHub's is), `not-installed` is
+/// a 404 that names the App as `GET /app` spells it, and an owner outside the list is refused before
+/// any request. The lookups are stateless, so this test does not wait for the one above.
+#[tokio::test]
+async fn a_github_app_finds_the_installation_of_an_owner_at_the_mock() {
+    let Some(root) = std::env::var("ADAM_TEST_MOCK_GITHUB_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    else {
+        eprintln!("skipping: ADAM_TEST_MOCK_GITHUB_URL not set");
+        return;
+    };
+    let root = root.trim_end_matches('/').to_owned();
+    let key = TestAppKey::generate();
+    let app = GitHubApp::discovering(
+        &root,
+        "12345",
+        AppKey::from_pem(&key.pkcs1_pem).expect("the key is read"),
+        AppOwners::only(["local", "other-org", "not-installed"]),
+    )
+    .expect("the App");
+    assert_eq!(app.pinned_installation(), None);
+
+    let local = app.installation_for("local").await.expect("local");
+    assert_eq!((local.id, local.account.as_str()), (67890, "local"));
+    let other = app.installation_for("other-org").await.expect("other-org");
+    assert_eq!((other.id, other.account.as_str()), (67891, "other-org"));
+
+    // A token for a repository of each owner: the mock's installation token.
+    let scoped = HostScoped::new(["git-server"], app);
+    for owner in ["local", "other-org"] {
+        let repo = RepoRef::new(
+            format!("http://git-server:8080/{owner}/sandbox.git"),
+            "main",
+        );
+        let token = scoped.token_for(&repo).await.expect("a token is minted");
+        assert!(
+            token
+                .expose_secret()
+                .starts_with("ghs_mockinstallationtoken"),
+            "{owner}"
+        );
+    }
+
+    // Not installed: both lookups are 404, and the message names the App and the owner.
+    let repo = RepoRef::new("http://git-server:8080/not-installed/sandbox.git", "main");
+    let err = scoped.token_for(&repo).await.expect_err("not installed");
+    assert!(matches!(err, WorkspaceError::Auth(_)), "{err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains("`adam-coder-dev`") && message.contains("`not-installed`"),
+        "{message}"
+    );
+
+    // An owner that is not on the list never gets as far as the mock.
+    let repo = RepoRef::new("http://git-server:8080/stranger/sandbox.git", "main");
+    let err = scoped.token_for(&repo).await.expect_err("not allowed");
+    assert!(matches!(err, WorkspaceError::Invalid(_)), "{err:?}");
+    assert!(err.to_string().contains("GITHUB_APP_OWNERS"), "{err}");
+
+    // The mock itself: a bearer that is not a JWT is refused, for the lookup as for the mint.
+    let refused = reqwest::Client::new()
+        .get(format!("{root}/orgs/local/installation"))
+        .bearer_auth("ghp_not_a_jwt")
+        .send()
+        .await
+        .expect("the mock answers");
+    assert_eq!(refused.status().as_u16(), 401);
 }
 
 /// Creating a repository against the mock: the owners of the dev stack (`local`, `scratch`) are

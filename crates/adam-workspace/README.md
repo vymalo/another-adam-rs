@@ -34,7 +34,7 @@ authentication behave like the real tool.
 | `GitCredentials` (trait), `DynGitCredentials` | `token_for(&RepoRef) -> SecretString` |
 | `StaticToken`, `ScopedToken` | one token for any host, or bound to named hosts (`from_env(..)` for both) |
 | `HostScoped<C>` | any credentials, issued only for named hosts: `new(hosts, inner)` checks the host of the repository (and refuses a local one) **before** `inner` is asked, as `ScopedToken` does for its token |
-| `GitHubApp`, `AppKey` | credentials of a GitHub App installation (feature `github`): `AppKey::from_pem(&str)` parses the App's RSA key once; `GitHubApp::new(api_base, app_id, installation_id, key)` mints installation access tokens and keeps each until five minutes before it expires ([below](#github-app-credentials)); `with_clock(..)` moves its clock |
+| `GitHubApp`, `AppKey`, `AppOwners`, `Installation`, `MAX_CACHED_INSTALLATIONS` | credentials of a GitHub App (feature `github`): `AppKey::from_pem(&str)` parses the App's RSA key once; `GitHubApp::new(api_base, app_id, installation_id, key)` is **pinned** to one installation, and `GitHubApp::discovering(api_base, app_id, key, AppOwners)` finds the installation of each repository's owner (`installation_for(owner)` is the lookup, `pinned_installation()` says which mode); both mint installation access tokens and keep each until five minutes before it expires ([below](#github-app-credentials)); `with_clock(..)` moves its clock. `AppOwners::{Any, Only}` (`only(logins)`, `allows(owner)`, without case) is which accounts a discovering App may act for; an `Installation` is `{ id, account }` (`#[non_exhaustive]`); `MAX_CACHED_INSTALLATIONS` (64) bounds the tokens kept |
 | `CodeHost` (trait), `DynCodeHost` | `open_pull_request`, `find_pull_request` (matches the head **and** `repo.base_branch`), `find_pull_request_on_head` (the head alone, whatever the base: for a continued branch), `comment_on_pull_request`, and four that have defaults (a host that cannot is an error, `None`, or no login): **`find_repository(repo)`** (the repository if the host has it, `Ok(None)` if not: what a caller unsure its `create_repository` took effect asks), **`create_repository(NewRepository)`** (an **empty** repository: `NewRepository { repo: the address it will have, private, description, kind }` and `CreatedRepository { full_name, clone_url, html_url, default_branch }`; an existing name is `Invalid` "already exists"), **`owner_kind(owner, host_repo)`** (`OwnerKind::{User, Organization}`) and **`authenticated_login(host_repo)`** (`None` for credentials that are not a person's: an installation token); `NewPullRequest`, `PullRequest` |
 | `GitHub` | GitHub REST `CodeHost`: `new(creds)`, `with_api_base(url)`; idempotent (returns the open pull request of the same head and base). `create_repository` is `POST /orgs/{owner}/repos` for an organisation and `POST /user/repos` for the authenticated user, with `auto_init: false`; the token is asked for the repository's future address, so the host check and the credentials are those of its host; `owner_kind` is `GET /users/{owner}` (`type`); `find_repository` is `GET /repos/{owner}/{name}` (`404` is `None`); `authenticated_login` is `GET /user`, and a `403` that is not a rate limit (what an installation token gets) is `None` |
 | `MemoryCodeHost` | in-memory `CodeHost` that records pull requests and comments (`comments()`) and the repositories it was asked to create (`created()`; `with_organization(owner)`, `with_login(login)`), feature `test-util` |
@@ -182,17 +182,30 @@ stateDiagram-v2
 
 ## GitHub App credentials
 
-`GitHubApp` is a `GitCredentials` for one installation of a GitHub App
-([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md)). Wrap it in
-`HostScoped` so the host is checked before anything is signed; the coder does.
+`GitHubApp` is a `GitCredentials` for a GitHub App
+([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md),
+[ADR 0017](../../docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md)). Wrap it in
+`HostScoped` so the host is checked before anything is signed; the coder does. There are two ways to say which installation
+mints the token:
+
+* **Pinned**: `GitHubApp::new(api_base, app_id, installation_id, key)`. One installation, one token for every repository, no
+  lookup. Nothing changed for it.
+* **Discovering**: `GitHubApp::discovering(api_base, app_id, key, owners)`. The installation is the one on the **owner** of the
+  repository, found with the App's JWT, so one process serves every account the App is installed on that `owners` allows.
 
 ```rust,ignore
 let key = AppKey::from_pem(&std::fs::read_to_string("app.pem")?)?;   // PKCS#1 or PKCS#8, parsed once
-let app = GitHubApp::new("https://api.github.com", "12345", 67890, key)?;
+// One installation:
+let app = GitHubApp::new("https://api.github.com", "12345", 67890, key.clone())?;
+// Or: the installation of each owner, for these accounts only (compared without case):
+let app = GitHubApp::discovering("https://api.github.com", "12345", key, AppOwners::only(["acme", "octocat"]))?;
 let creds = Arc::new(HostScoped::new(["github.com"], app));
 let workspaces = Workspaces::new(root, creds.clone());
 let github = GitHub::new(creds)?;                                        // the same tokens for the REST calls
 ```
+
+`AppOwners::Any` is every account the App is installed on: for a public App that is every account whose owner chose to
+install it, so name the owners unless that is what is wanted. An empty `only([])` allows nothing.
 
 ```mermaid
 sequenceDiagram
@@ -203,9 +216,21 @@ sequenceDiagram
   C->>H: token_for(repo)
   H->>H: host allowed? (else Invalid, nothing is signed)
   H->>A: token_for(repo)
+  opt discovering
+    A->>A: owner allowed? (else Invalid, nothing is looked up or signed)
+    alt the owner's installation is kept
+      A->>A: the kept installation
+    else not kept (one lookup at a time for an owner)
+      A->>G: GET /orgs/{owner}/installation (Bearer JWT)
+      opt 404
+        A->>G: GET /users/{owner}/installation (Bearer JWT)
+      end
+      A->>A: keep it, or "not installed" for 60 seconds (Auth, naming the App from GET /app)
+    end
+  end
   alt a cached token has more than 5 minutes left
     A-->>C: it
-  else none, or about to expire (one caller at a time, the others wait for it)
+  else none, or about to expire (one caller at a time for an installation, the others wait for it)
     A->>A: JWT: RS256, iat now-60s, exp now+540s, iss the App
     A->>G: POST /app/installations/{id}/access_tokens (Bearer JWT)
     G-->>A: 201 {token, expires_at}
@@ -223,22 +248,60 @@ stateDiagram-v2
   Expiring --> Expiring: mint failed, the next call tries again
 ```
 
+What is kept about an account, for a discovering App (the state diagram of
+[ADR 0017](../../docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md) is the same):
+
+```mermaid
+stateDiagram-v2
+  [*] --> Unknown: the first call for an owner
+  Unknown --> Installed: a lookup answers 200 as the owner's own login
+  Unknown --> NotInstalled: both lookups answer 404
+  Unknown --> Unknown: suspended, rate limited, 5xx or no answer, nothing is kept
+  NotInstalled --> Installed: asked again after 60 seconds, and found
+  NotInstalled --> NotInstalled: asked again after 60 seconds, and still 404
+  NotInstalled --> Unknown: asked again after 60 seconds, and it failed
+  Installed --> Unknown: a mint for its installation answers 404
+  Installed --> Evicted: more than 256 accounts, the least recently used goes
+  NotInstalled --> Evicted: more than 256 accounts, the least recently used goes
+  Evicted --> [*]
+```
+
 * **The key is parsed once**, in `AppKey::from_pem`: the first private key in the PEM, which must be an unencrypted RSA
   key of 2048 to 8192 bits, PKCS#1 (`BEGIN RSA PRIVATE KEY`, what GitHub lets the owner download) or PKCS#8. Anything else is
   `Invalid`, with a message that never carries the key, so a deployment finds a bad key at startup.
-* **Single flight.** The cache is behind a `tokio` mutex held while a token is minted, so 16 callers that arrive together make
-  one request and share its token. A mint that fails is not cached.
+* **Single flight.** Each installation has a token slot behind a `tokio` mutex held while its token is minted, so 16 callers
+  that arrive together make one request and share its token, while two installations mint at the same time. Each account has
+  an entry behind its own mutex held during its lookup, so callers for one owner make one lookup. A mint that fails is not
+  cached.
+* **Kept, and for how long.** An account's installation is kept until a mint for it answers `404` (uninstalled, or installed
+  again under a new ID): the entry is dropped and the owner looked up **once** more. "Not installed" is believed for 60
+  seconds, by the clock of `with_clock`. Logins are compared without case. An account GitHub reports under another login (a
+  rename) is not kept under the name that was asked for, and its new login has to be allowed too. A lookup that fails, or
+  finds a suspended installation, is never kept. At most `MAX_CACHED_INSTALLATIONS` (64) installations' tokens and 256
+  accounts are kept, the least recently used going first and found again with one request.
 * **`iss`** is the App's application ID or its client ID: a number when the ID is one, a string otherwise.
-* **Errors.** `401`, `403` and `404` are `Auth` (the message names `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and the key
-  variables of the coder, and what GitHub said, with the JWT scrubbed), `429` and a `403` with no rate limit left are
-  `RateLimited` (with `Retry-After`), `5xx`, a transport failure and an answer that cannot be read are `Transient`. Neither the JWT
-  nor a token is in an error, a `Debug` output or a log line.
+* **Errors.** `401`, `403` and `404` to a mint or a lookup are `Auth` (the message names `GITHUB_APP_ID` and the key variables
+  of the coder, and `GITHUB_APP_INSTALLATION_ID` only for a pinned App, and what GitHub said, with the JWT scrubbed). An App
+  that is not installed on the owner is `Auth` ("the GitHub App `<slug>` is not installed on `<owner>` (install it at
+  `<html_url>/installations/new`, or grant it the repository)"; the slug and page come from `GET /app`, read once, the first
+  time a message needs them, and the App's ID is named when that fails), and so is a suspended installation. An owner that
+  `AppOwners` does not allow, that is not a login, or a local repository is `Invalid` (the message names `GITHUB_APP_OWNERS`),
+  before anything is looked up or signed. `429` and a `403` with no rate limit left are `RateLimited` (with `Retry-After`),
+  `5xx`, a transport failure and an answer that cannot be read are `Transient`, for a lookup as for a mint. Neither the JWT
+  nor a token is in an error, a `Debug` output or a log line (`owner` and `installation` are tracing fields). `Debug` shows
+  the mode and the owners.
+* **`installation_for(owner)`** is the lookup on its own (an `Installation`), and `Invalid` for a pinned App.
 * **The token is not shaped.** Nothing reads its length or characters: GitHub began a staged rollout of a longer, stateless
   token format on 2026-04-27 (*verified 2026-10-01*, docs.github.com), and a token is good for an hour.
 * *Verified 2026-10-01 against docs.github.com:* the JWT is `RS256` with `iat` best set 60 seconds in the past, `exp` at most
   ten minutes ahead and `iss` the client ID or application ID; the endpoint answers `201 {token, expires_at}`; the token is
-  the password of `x-access-token` for git over HTTPS and a bearer for REST. *Unverified:* GitHub Enterprise Server's endpoint
-  (it is read from `api_base`, `https://<host>/api/v3`) and a live App.
+  the password of `x-access-token` for git over HTTPS and a bearer for REST. *Verified 2026-10-03* (OpenAPI description of
+  `github/rest-api-description`): `GET /orgs/{org}/installation`, `GET /users/{username}/installation` and `GET /app` take the
+  App's JWT, an installation has `id`, a nullable `account` and `suspended_at`, `GET /app` has `slug` and `html_url`.
+  *Unverified:* that the lookups answer `404` when the App is not installed (the description lists only `200`), whether the
+  user lookup also answers for an organisation, that logins are case-insensitive, what a lookup by a former login answers, the
+  rate limits of the lookups, GitHub Enterprise Server's endpoints (read from `api_base`, `https://<host>/api/v3`) and a live
+  App.
 * **`testing::TestAppKey`** (features `github` and `test-util`) makes an RSA key at run time (`pkcs1_pem`, `pkcs8_pem`) and
   verifies a JWT's signature (`verify_jwt`), so no test needs a committed key.
 
@@ -422,9 +485,20 @@ Offline. The `git` CLI must be on `PATH`.
   it expires (a clock the test moves) and then replaced; sixteen callers at once make one request; a foreign host is refused
   before anything is minted (no request at all); a refusal names the variables and is not retried; `429`, a rate-limited `403`
   and a `5xx` are what they should be, an unreachable GitHub is transient; a failed mint is tried again and the JWT is never in
-  the error. `tests/wiremock_compose.rs` (gated by `ADAM_TEST_MOCK_GITHUB_URL`) trades a JWT at the compose mock and opens a
-  pull request with the token it gives. Unit tests of `src/github_app.rs` (keys in either form, nothing else) and
-  `src/credentials.rs` (`HostScoped`).
+  the error. The same file runs a **discovering** App against a fake GitHub (`GET /app`, the two lookups and the mint, each
+  checking the JWT's signature, with a clock the test moves): the owner's installation is looked up with the JWT and kept; two
+  owners get two tokens and one mint each; logins are compared without case; a person's account is found after the
+  organisation lookup says `404`; an account that is not installed is an `Auth` error naming the App and the owner (no
+  request at +59 s, a new lookup at +61 s, the App's name read once, its ID named when `GET /app` fails); an owner that is
+  not allowed is refused before any request, and `AppOwners::Any` only when said; a suspended installation is refused; a mint
+  that answers `404` drops the entry and looks the owner up once more (and does not loop); sixteen callers for one owner make
+  one lookup and one mint; two installations mint at the same time; a rate-limited, failing or unreachable lookup is typed and
+  not kept; a renamed owner is not kept under the old login; a pinned App makes no lookup; the caches are bounded; and
+  `Debug` shows no secret. `tests/wiremock_compose.rs` (gated by `ADAM_TEST_MOCK_GITHUB_URL`) trades a JWT at the compose mock
+  and opens a pull request with the token it gives, and a discovering App finds the installations of `local` (67890) and
+  `other-org` (67891) there, is told `not-installed` by name, and is refused a JWT-less lookup. Unit tests of
+  `src/github_app.rs` (keys in either form, nothing else; the LRU; `AppOwners`; the account names) and `src/credentials.rs`
+  (`HostScoped`).
 * `tests/github.rs`: the `GitHub` code host against a `wiremock` server,
   including the match on head and base and the comment on a pull request, error classes, `Retry-After` and transport source chains; and, in its `create` module, repository creation: the request shape for an organisation (`POST /orgs/{owner}/repos`, empty, private, with the description) and for a user (`POST /user/repos`, a missing description not sent), `422` as `Invalid` "already exists" and a `403` as `Auth` with no token in the text, the owner's kind from `GET /users/{owner}` (an owner that is not a path segment refused before a request), a person's login and none for an installation token (a rate limit and a bad token are errors), and the trait's defaults. `tests/wiremock_compose.rs` also creates a repository at the compose mock (`scratch` is an organisation, an installation token has no login, `[mock:already-exists]` is `Invalid`). `MemoryCodeHost` has a unit test for its creation.
 * Unit tests in `src/error.rs` (`class_table` and the source-chain checks) and

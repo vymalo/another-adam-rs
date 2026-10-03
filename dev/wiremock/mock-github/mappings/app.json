@@ -42,6 +42,244 @@
           "documentation_url": "https://docs.github.com/rest"
         }
       }
+    },
+    {
+      "name": "GitHub App: the App itself (GET /app)",
+      "priority": 1,
+      "metadata": {
+        "note": "What the coder reads to name the App in 'not installed' messages."
+      },
+      "request": {
+        "method": "GET",
+        "urlPath": "/app",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "id": 12345,
+          "slug": "adam-coder-dev",
+          "name": "adam-coder-dev",
+          "html_url": "https://github.com/apps/adam-coder-dev"
+        }
+      }
+    },
+    {
+      "name": "GitHub App: org lookup, not installed (login `not-installed`)",
+      "priority": 2,
+      "request": {
+        "method": "GET",
+        "urlPath": "/orgs/not-installed/installation",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+          }
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "message": "Not Found",
+          "documentation_url": "https://docs.github.com/rest"
+        }
+      }
+    },
+    {
+      "name": "GitHub App: user lookup, not installed (login `not-installed`)",
+      "priority": 2,
+      "request": {
+        "method": "GET",
+        "urlPath": "/users/not-installed/installation",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+          }
+        }
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "message": "Not Found",
+          "documentation_url": "https://docs.github.com/rest"
+        }
+      }
+    },
+    {
+      "name": "GitHub App: org lookup, a second installation (login `other-org`)",
+      "priority": 3,
+      "request": {
+        "method": "GET",
+        "urlPath": "/orgs/other-org/installation",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "id": 67891,
+          "account": {
+            "login": "{{request.pathSegments.[1]}}"
+          },
+          "app_id": 12345,
+          "app_slug": "adam-coder-dev",
+          "repository_selection": "all",
+          "permissions": {
+            "contents": "write",
+            "pull_requests": "write",
+            "metadata": "read"
+          },
+          "suspended_at": null
+        }
+      }
+    },
+    {
+      "name": "GitHub App: user lookup, a second installation (login `other-org`)",
+      "priority": 3,
+      "request": {
+        "method": "GET",
+        "urlPath": "/users/other-org/installation",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "id": 67891,
+          "account": {
+            "login": "{{request.pathSegments.[1]}}"
+          },
+          "app_id": 12345,
+          "app_slug": "adam-coder-dev",
+          "repository_selection": "all",
+          "permissions": {
+            "contents": "write",
+            "pull_requests": "write",
+            "metadata": "read"
+          },
+          "suspended_at": null
+        }
+      }
+    },
+    {
+      "name": "GitHub App: org lookup, any other account is on installation 67890",
+      "priority": 5,
+      "metadata": {
+        "note": "The installation lookups of an App that finds the installation of each owner (dev/compose.github-app.yaml with GITHUB_APP_OWNERS, and the wiremock_compose test). Any account is installed with id 67890, the one the mint mapping accepts, its login the one asked for; `other-org` is on 67891 (a second installation); `not-installed` is not installed anywhere. The organisation and the user lookup answer alike, so the coder's second request is never needed here (the wiremock tests of adam-workspace cover the 404 of the organisation lookup)."
+      },
+      "request": {
+        "method": "GET",
+        "urlPathPattern": "/orgs/[^/]+/installation",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "id": 67890,
+          "account": {
+            "login": "{{request.pathSegments.[1]}}"
+          },
+          "app_id": 12345,
+          "app_slug": "adam-coder-dev",
+          "repository_selection": "all",
+          "permissions": {
+            "contents": "write",
+            "pull_requests": "write",
+            "metadata": "read"
+          },
+          "suspended_at": null
+        }
+      }
+    },
+    {
+      "name": "GitHub App: user lookup, any other account is on installation 67890",
+      "priority": 5,
+      "request": {
+        "method": "GET",
+        "urlPathPattern": "/users/[^/]+/installation",
+        "headers": {
+          "Authorization": {
+            "matches": "Bearer eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8",
+          "X-GitHub-Media-Type": "github.v3; format=json"
+        },
+        "jsonBody": {
+          "id": 67890,
+          "account": {
+            "login": "{{request.pathSegments.[1]}}"
+          },
+          "app_id": 12345,
+          "app_slug": "adam-coder-dev",
+          "repository_selection": "all",
+          "permissions": {
+            "contents": "write",
+            "pull_requests": "write",
+            "metadata": "read"
+          },
+          "suspended_at": null
+        }
+      }
+    },
+    {
+      "name": "GitHub App: an installation lookup or GET /app with anything but a JWT is refused",
+      "priority": 9,
+      "request": {
+        "method": "GET",
+        "urlPathPattern": "/(app|(orgs|users)/[^/]+/installation)"
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "Content-Type": "application/json; charset=utf-8"
+        },
+        "jsonBody": {
+          "message": "A JSON web token could not be decoded",
+          "documentation_url": "https://docs.github.com/rest"
+        }
+      }
     }
   ]
 }
