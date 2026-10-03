@@ -384,8 +384,12 @@ An installation is a token or a GitHub App, never both
 ([ADR 0009](docs/decisions/0009-github-per-installation-read-through-mcp.md)). The compose file runs the
 token. The override `dev/compose.github-app.yaml` runs the same coder as an App: an init service makes a
 throwaway RSA key into a volume (`openssl genrsa`; no key is committed), `GITHUB_TOKEN` is turned off, and the
-coder gets `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_PATH`. It signs a JWT,
-trades it at `mock-github` for an installation token and gives that to `git` and to the REST calls.
+coder gets `GITHUB_APP_ID`, `GITHUB_APP_OWNERS` (`local,scratch,other-org`: **no** `GITHUB_APP_INSTALLATION_ID`, so
+the App is not pinned) and `GITHUB_APP_PRIVATE_KEY_PATH`. It signs a JWT, finds the installation of each repository's
+owner at `mock-github` (`GET /orgs/{owner}/installation`, then `/users/{owner}/installation`: every owner is on
+installation 67890 and `other-org` on 67891), trades the JWT for an installation token and gives that to `git`, to the
+REST calls and to the GitHub MCP calls. An owner that is not on the list is refused before anything is looked up.
+A pinned App (`GITHUB_APP_INSTALLATION_ID`) is covered by the tests of the crates and of the binary.
 
 ```sh
 docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app up -d --build --wait \
@@ -394,7 +398,8 @@ GITHUB_AUTH=app sh dev/coder-e2e.sh                  # likewise NO_OPENCODE=1, S
 ```
 
 With `GITHUB_AUTH=app` the script asserts, besides everything above, that `mock-github` saw at least one
-`POST /app/installations/67890/access_tokens` and that **every** call to `/repos/...` (the pull request's
+`POST /app/installations/67890/access_tokens` (and, with `EXPECT_INSTALLATION_LOOKUP=1`, for the first run after the
+coder started, which keeps what it found, at least one installation lookup with a JWT, for an owner on the list) and that **every** call to `/repos/...` (the pull request's
 included) carried `Bearer ghs_mockinstallationtoken...` and never the JWT, and that every `tools/call` to
 `mock-github-mcp` carried it too (the coder sends the credentials of each MCP call itself, and a placeholder to list
 the tools). With the default `token` it asserts that every such call carried the dummy token. WireMock cannot check an RS256 signature, so the mock accepts any

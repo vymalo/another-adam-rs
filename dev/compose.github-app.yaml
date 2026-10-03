@@ -1,12 +1,18 @@
-# The coder as a GitHub App installation instead of a token (compose override).
+# The coder as a GitHub App instead of a token (compose override).
 #
 #   docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app up -d --build --wait
 #
-# `GITHUB_TOKEN` is turned off (an installation is a token or an App, never both), and the coder gets
-# GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID and the path of a private key: it signs a JWT with the
-# key and trades it at mock-github (`POST /app/installations/67890/access_tokens`, see
-# dev/wiremock/mock-github/mappings/app.json) for the installation token that git and the REST API
-# are then given. `dev/coder-e2e.sh` with GITHUB_AUTH=app asserts exactly that.
+# `GITHUB_TOKEN` is turned off (a token or an App, never both), and the coder gets GITHUB_APP_ID, the path
+# of a private key and **GITHUB_APP_OWNERS, with no GITHUB_APP_INSTALLATION_ID**: the App is not pinned to
+# an installation, so for the owner of each repository the coder finds the installation with the App's
+# JWT (`GET /orgs/{owner}/installation`, then `GET /users/{owner}/installation`, see
+# dev/wiremock/mock-github/mappings/app.json: every owner is on installation 67890 and `other-org` on
+# 67891), and trades the JWT for that installation's token (`POST /app/installations/67890/access_tokens`)
+# that git, the REST API and the GitHub MCP server's calls (the mock) are then given. The owners are the
+# accounts the coder may act for and none other: `local` (the repositories of git-server), `scratch` (what
+# the scratch and create-repo scenarios publish to) and `other-org`. Pinned mode (`GITHUB_APP_INSTALLATION_ID`)
+# is covered by the tests of the crates and of the binary. `dev/coder-e2e.sh` with GITHUB_AUTH=app asserts
+# the lookup and the trade.
 #
 # The key is made here, once, into a volume: an init service runs `openssl genrsa` and gives the
 # file to the coder's user (10001), read-only. No key is ever committed. It is a throwaway for the
@@ -43,7 +49,9 @@ services:
     environment:
       GITHUB_TOKEN: ""
       GITHUB_APP_ID: "12345"
-      GITHUB_APP_INSTALLATION_ID: "67890"
+      # No GITHUB_APP_INSTALLATION_ID: the installation of each owner is found (a pin and the owners are
+      # exclusive). `local` and `scratch` are the owners of the stack's repositories.
+      GITHUB_APP_OWNERS: local,scratch,other-org
       GITHUB_APP_PRIVATE_KEY_PATH: /run/github-app/github-app.pem
     volumes:
       - coder-github-app-key:/run/github-app:ro

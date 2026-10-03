@@ -130,6 +130,10 @@ jobs:
             --set github.app.privateKeySecret=coder-github-app --set workspace.placement=shared \
             --set workspace.sharedVolume.storageClass=longhorn --set replicaCount=3 \
             > "$RUNNER_TEMP/rendered-app-shared.yaml"
+          # The same App with no pin: owners instead of an installation ID (GITHUB_APP_OWNERS).
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set github.auth=app --set github.app.id=1234567 --set 'github.app.owners={acme,octocat}' \
+            --set github.app.privateKeySecret=coder-github-app > "$RUNNER_TEMP/rendered-app-owners.yaml"
           for attempt in 1 2 3; do
             status=0
             "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
@@ -139,6 +143,7 @@ jobs:
                 "$RUNNER_TEMP/rendered-split.yaml" "$RUNNER_TEMP/rendered-isolated.yaml" \
                 "$RUNNER_TEMP/rendered-affinity.yaml" "$RUNNER_TEMP/rendered-shared-split.yaml" \
                 "$RUNNER_TEMP/rendered-app.yaml" "$RUNNER_TEMP/rendered-app-shared.yaml" \
+                "$RUNNER_TEMP/rendered-app-owners.yaml" \
                 > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
             cat "$RUNNER_TEMP/kubeconform.out"
             if [ "$status" -eq 0 ]; then exit 0; fi
@@ -337,7 +342,9 @@ jobs:
           # repositories' API carried that token.
           export GITHUB_AUTH=app
           docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app up -d --no-build --wait coder
-          NO_OPENCODE=1 sh dev/coder-e2e.sh
+          # The App has no pinned installation (GITHUB_APP_OWNERS): the first run after the coder started
+          # also asserts the installation lookup, which the coder then keeps.
+          EXPECT_INSTALLATION_LOOKUP=1 NO_OPENCODE=1 sh dev/coder-e2e.sh
           sh dev/coder-e2e.sh
           SCENARIO=files sh dev/coder-e2e.sh
           SCENARIO=scratch sh dev/coder-e2e.sh

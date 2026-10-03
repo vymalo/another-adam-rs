@@ -81,7 +81,10 @@
 #       token (default): every call the coder made to mock-github's `/repos/...` carried
 #         `Authorization: Bearer dev-github-token` (MOCK_GITHUB_TOKEN, the compose file's dummy);
 #       app: the stack was started with `-f dev/compose.github-app.yaml`, the coder holds a GitHub
-#         App's key and no token: mock-github's journal holds at least one
+#         App's key, no token and no installation ID (GITHUB_APP_OWNERS=local,scratch,other-org): with
+#         EXPECT_INSTALLATION_LOOKUP=1 (the first run after the coder started: it keeps what it found)
+#         mock-github's journal holds at least one installation lookup, with a JWT, for an owner on the
+#         list and no other; and its journal holds at least one
 #         `POST /app/installations/67890/access_tokens` (the trade of a signed JWT for a token), and
 #         every call to `/repos/...`, the pull request's included, carried the installation token it
 #         gave, `Bearer ghs_mockinstallationtoken...`, and never the JWT (`Bearer eyJ...`).
@@ -112,6 +115,7 @@
 # It prints one "ok" or "FAIL" line per check and exits 1 if any failed.
 #
 # Environment (defaults match compose.yaml on one machine):
+#   EXPECT_INSTALLATION_LOOKUP  (unset)   1 with GITHUB_AUTH=app: assert the coder found the installation (see above)
 #   CODER_URL        http://127.0.0.1:${CODER_PORT:-8080}
 #   CODER_TOKEN      dev-token
 #   MOCK_GITHUB_URL  http://127.0.0.1:${MOCK_GITHUB_PORT:-8082}
@@ -768,6 +772,23 @@ case "$github_auth" in
     if [ "$n_calls" -ge 1 ] && [ "$wrong" = 0 ]; then ok "all $n_calls call(s) to the repositories' API carried the token"; else bad "token mode: $wrong of $n_calls call(s) to /repos/... did not carry '$want' ($auths)"; fi
     ;;
   app)
+    # The coder holds no pin (GITHUB_APP_OWNERS): it found the installation of the repository's owner with
+    # the App's JWT. It keeps what it found, so only the first run after the coder started sees the lookup
+    # (the CI job says so: EXPECT_INSTALLATION_LOOKUP=1); the trade of a token is seen by every run, since the
+    # mock's tokens last four minutes.
+    if [ "${EXPECT_INSTALLATION_LOOKUP:-}" = 1 ]; then
+      lookups=$tmp/lookups.json
+      curl -s --max-time 30 -X POST "$github/__admin/requests/find" \
+        -H 'Content-Type: application/json' \
+        -d '{"method":"GET","urlPathPattern":"/(orgs|users)/[^/]+/installation"}' > "$lookups" || true
+      n_lookups=$(jq -r '.requests | length' "$lookups" 2>/dev/null || echo 0)
+      not_jwt=$(jq -r '[.requests[] | .headers | with_entries(.key |= ascii_downcase) | select((.authorization // "") | test("^Bearer eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$") | not)] | length' "$lookups" 2>/dev/null || echo '?')
+      if [ "$n_lookups" -ge 1 ] && [ "$not_jwt" = 0 ]; then ok "the coder found the installation of the owner with the App's JWT ($n_lookups lookup(s) at /orgs|users/<owner>/installation)"; else bad "installation lookups: $n_lookups, of which $not_jwt without a JWT; want at least 1, all with a JWT (is the stack started with -f dev/compose.github-app.yaml, GITHUB_APP_OWNERS and no installation ID, and is this the first run after the coder started?)"; fi
+      listed=$(jq -r '[.requests[] | .url | split("/")[2]] | unique | join(" ")' "$lookups" 2>/dev/null || true)
+      for owner in $listed; do
+        case "$owner" in local | scratch | other-org) ;; *) bad "the coder looked up the installation of '$owner', which is not on GITHUB_APP_OWNERS" ;; esac
+      done
+    fi
     mints=$(curl -s --max-time 30 -X POST "$github/__admin/requests/find" \
       -H 'Content-Type: application/json' \
       -d '{"method":"POST","urlPath":"/app/installations/67890/access_tokens"}' | jq -r '.requests | length' 2>/dev/null || echo '?')
