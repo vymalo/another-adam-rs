@@ -483,6 +483,49 @@ async fn an_unnamed_repository_is_not_probed_for_its_default_branch() {
     assert!(!remote.received_requests().await.unwrap().is_empty());
 }
 
+/// A repository whose owner the GitHub App may not act for is refused with that reason and nothing
+/// else: the advice about a branch (`Pass base_branch ...`) belongs to a missing default branch, and
+/// was once glued, with no punctuation, to this unrelated refusal.
+#[tokio::test]
+async fn an_owner_refusal_carries_no_advice_about_a_branch() {
+    use adam_workspace::{GitCredentials, RepoRef, WorkspaceError, Workspaces};
+    use secrecy::SecretString;
+
+    struct NotAllowed;
+
+    #[async_trait::async_trait]
+    impl GitCredentials for NotAllowed {
+        async fn token_for(&self, _repo: &RepoRef) -> Result<SecretString, WorkspaceError> {
+            Err(WorkspaceError::Invalid(
+                "the GitHub App is not allowed to act for `vaam-apps`: it is not in GITHUB_APP_OWNERS"
+                    .into(),
+            ))
+        }
+    }
+
+    let rig = Rig::new().await;
+    let host = "127.0.0.1:9";
+    let env = Arc::new(ToolEnv::new(
+        Workspaces::new(rig.fx.tmp.path().join("owner-work"), Arc::new(NotAllowed))
+            .allow_hosts([host.to_owned()])
+            .allow_local(true),
+        rig.fx.env.code_host.clone(),
+        rig.fx.env.settings.clone(),
+    ));
+    let ctx = ToolCtx::detached("tool", "call-x", Arc::new(CollectingSink::new()))
+        .with_state(env.clone());
+    let url = format!("http://{host}/vaam-apps/site.git");
+    say(&env, &ctx, &format!("work on {url}")).await;
+
+    // No `base_branch`: the default branch is asked of the remote with the credentials first.
+    let out = PrepareWorkspace.call(&ctx, json!({"repo_url": url})).await;
+    assert!(is_error(&out), "{out:?}");
+    let said = text(out);
+    assert!(said.contains("GITHUB_APP_OWNERS"), "{said}");
+    assert!(!said.contains("base_branch"), "{said}");
+    assert!(!said.contains("ask_user"), "{said}");
+}
+
 #[tokio::test]
 async fn tools_that_need_a_workspace_say_so() {
     let rig = Rig::new().await;
