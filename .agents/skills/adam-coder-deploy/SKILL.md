@@ -63,11 +63,14 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      `A2A_BEARER_TOKENS`. The defaults point at one owner's cluster (`secretStoreRef`, `key`):
      override them for yours.
    * `mcp.websearch.url` (our web search MCP Service, in cluster) and `mcp.context7.enabled` (hosted
-     Context7), both off by default and byte-for-byte invisible when off. With either on, the chart
-     mounts its own agent folder (a ConfigMap: copies of `bin/adam-coder/agent/` under `deploy/coder/agent`,
-     kept equal by `render-check.sh`, plus the servers) at `ADAM_AGENT_DIR` in every pod. Their keys
-     (`SEARCH_MCP_TOKEN`, `CONTEXT7_API_KEY`) come from the ExternalSecret, never from values; a plain
-     `http` URL turns `MCP_ALLOW_INSECURE` on (chart README, "Extra MCP servers").
+     Context7), both off by default and byte-for-byte invisible when off. With either on, the chart renders
+     ONE file of servers (a ConfigMap in the shape of `mcp.json`, no copy of the agent's prompt) and sets
+     `ADAM_EXTRA_MCP_FILE` on the workers: the binary adds those servers to its own `mcp.json` at startup
+     (a name clash is exit 78). Their keys (`SEARCH_MCP_TOKEN`, `CONTEXT7_API_KEY`) come from the
+     ExternalSecret, never from values; both servers are `optional` by default (down, or no key: skipped
+     with a warning, not exit 69); a plain `http` URL needs `mcp.websearch.allowInsecure` (or
+     `config.extraEnv.MCP_ALLOW_INSECURE`). Put the AWS properties in place before turning one on (chart
+     README, "Extra MCP servers").
    * No Ingress: the service is cluster-internal and reached over A2A with a bearer token.
    * Devcontainers are off on Kubernetes (README "Devcontainers are off here").
 5. **Change the chart with its guards.** Render-time validation is in

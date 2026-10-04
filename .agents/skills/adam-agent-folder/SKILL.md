@@ -56,6 +56,15 @@ before you rely on a detail here.
    * `MCP_ALLOW_INSECURE=true` for plain `http` to another machine (development only).
    * `MCP_ALLOW_URL_VARS=true` to allow `${VAR}` inside a `url`.
    * `type: sse` is not supported.
+   * `"optional": true` on a server: if it is down, refuses its credentials, lacks an allow-listed tool or its
+     `${VAR}` has no value, it is skipped with a warning and the process starts without it (a required server
+     that is down is exit 69). A header whose `${VAR}` is empty is an error (a skip when optional).
+   * **More servers without copying the folder**: `ADAM_EXTRA_MCP_FILE=/path/mcp.json`, a file in the same
+     shape, is added to the folder's own `mcp.json` at startup by the roles that run workers (`adam-agent` and
+     `adam-coder`, which has the shipped `github` server in its embedded copy). A name the folder already has
+     is exit 78 and nothing is replaced. Every `${VAR}` a `mcp.json` names is treated as a secret of the
+     process: `adam-coder` hides it from the processes of runs and redacts its value, `adam-agent` scrubs it
+     from the steps.
 6. **Make it readable by uid 10001** (the image's user) and mount it read-only. Run the image with
    the entrypoint overridden (the coder's entrypoint is `adam-coder`):
 
