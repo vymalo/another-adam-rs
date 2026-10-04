@@ -62,6 +62,12 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    * Secrets come from an `ExternalSecret` (`externalSecrets.*`): `MODEL_API_KEY`, `GITHUB_TOKEN`,
      `A2A_BEARER_TOKENS`. The defaults point at one owner's cluster (`secretStoreRef`, `key`):
      override them for yours.
+   * `mcp.websearch.url` (our web search MCP Service, in cluster) and `mcp.context7.enabled` (hosted
+     Context7), both off by default and byte-for-byte invisible when off. With either on, the chart
+     mounts its own agent folder (a ConfigMap: copies of `bin/adam-coder/agent/` under `deploy/coder/agent`,
+     kept equal by `render-check.sh`, plus the servers) at `ADAM_AGENT_DIR` in every pod. Their keys
+     (`SEARCH_MCP_TOKEN`, `CONTEXT7_API_KEY`) come from the ExternalSecret, never from values; a plain
+     `http` URL turns `MCP_ALLOW_INSECURE` on (chart README, "Extra MCP servers").
    * No Ingress: the service is cluster-internal and reached over A2A with a bearer token.
    * Devcontainers are off on Kubernetes (README "Devcontainers are off here").
 5. **Change the chart with its guards.** Render-time validation is in
