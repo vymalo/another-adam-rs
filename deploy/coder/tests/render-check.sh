@@ -460,7 +460,9 @@ check "it has the four toolsets the coder's tools allow-list assumes" shas '^   
 check "it listens on loopback only: --listen-host 127.0.0.1" shas '^            - 127.0.0.1$'
 check "it listens on 8082" shas '^            - "8082"$'
 check "it is probed on its port before the coder starts: a startupProbe" shas 'startupProbe:'
-check "the probe is a TCP connect to 8082" shas '^              port: 8082$'
+check "the probe connects to 8082 on loopback from inside the container (the server listens there only)" \
+  shas '^              command: \["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8082"\]$'
+check "the probe is not a kubelet TCP probe: that one connects to the pod IP, which the server does not listen on" slacks 'tcpSocket:'
 check "it holds no credential: no env, Secret, volume, token or key" \
   slacks 'env:|secretKeyRef|secretName|volumeMounts|GITHUB_TOKEN|GITHUB_APP|MODEL_API_KEY|PRIVATE KEY|name: GITHUB_HOST'
 check "it has the container security context" shas 'allowPrivilegeEscalation: false'
@@ -473,7 +475,7 @@ check "the sidecar adds no health probe path (the coder's three are the only htt
 # Values-driven: the port (and the coder's URL with it), the host (only the sidecar has it), off.
 helm template coder "$chart" --namespace coder-ns --set githubMcp.port=9100 --set githubMcp.host=ghe.example.com > "$out"
 check "the port is values-driven in the arguments" shas '^            - "9100"$'
-check "the port is values-driven in the probe" shas '^              port: 9100$'
+check "the port is values-driven in the probe" shas '/dev/tcp/127.0.0.1/9100"\]$'
 check "GITHUB_MCP_URL follows the port" chas '^              value: "http://127.0.0.1:9100"$'
 check "the host is the sidecar's GITHUB_HOST" shas 'name: GITHUB_HOST'
 check "GITHUB_HOST carries the host" shas '^              value: "ghe.example.com"$'

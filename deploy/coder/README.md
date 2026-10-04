@@ -250,7 +250,9 @@ The coder reads GitHub through the official GitHub MCP server ([ADR
 workers (`all`, `worker`, and the StatefulSet of `topology: split`; **not** a control plane or the split front) has it as
 a **native sidecar**: an init container with `restartPolicy: Always` named `github-mcp`, the coder's own image,
 `github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests --listen-host 127.0.0.1 --port 8082`.
-It starts before the coder, is probed (TCP, `startupProbe`) before the coder starts, restarts on its own and stops
+It starts before the coder, is probed (`startupProbe`: an `exec` of `bash` that opens `127.0.0.1:<port>` inside the
+container; a kubelet `tcpSocket` probe connects to the pod IP, which the server does not listen on, and failed every
+start) before the coder starts, restarts on its own and stops
 after the coder. It holds **no credential**: no Secret, no key, no `GITHUB_TOKEN`, no volume, and no environment but
 `GITHUB_HOST` when `githubMcp.host` is set. It listens on loopback only, so nothing but the coder container reaches it,
 and the coder sends it the token of each call. The coder is told where it is with `GITHUB_MCP_URL`

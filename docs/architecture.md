@@ -2237,7 +2237,7 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   exactly one, and the render fails for both or neither.
 * **The GitHub MCP server** is a native sidecar of every pod that runs workers (`githubMcp`: an init container with
   `restartPolicy: Always`, the coder's own image, `github-mcp-server http --read-only --toolsets
-  context,repos,issues,pull_requests` on 127.0.0.1:8082, a TCP startup probe, no Secret, no environment but
+  context,repos,issues,pull_requests` on 127.0.0.1:8082, a startup probe that opens 127.0.0.1:8082 from inside the container (an `exec`: a kubelet TCP probe connects to the pod IP), no Secret, no environment but
   `GITHUB_HOST` when `githubMcp.host` is set). The coder is told where it is with `GITHUB_MCP_URL`. A control plane
   has none. `MCP_ALLOW_STDIO` stays for one release, for an agent folder written before the sidecar. Native sidecars
   need Kubernetes 1.29 or later (*unverified*, from memory).
