@@ -842,11 +842,11 @@ check "url off needs neither the ExternalSecret property nor the option's other 
 
 # An existing database: database.enabled=false and database.existingSecret. No Cluster is
 # rendered, and every pod that sets DATABASE_URL reads it from that Secret and key.
-# dburl prints "<secret> <key>" for each DATABASE_URL of the render (or of the file in $1).
+# dburl prints "<secret> <key>" for each DATABASE_URL of the render.
 dburl() {
   awk '/name: DATABASE_URL$/ { on = 1; next }
        on && /^ *name: / { n = $2 }
-       on && /^ *key: / { print n " " $2; on = 0 }' "${1:-$out}"
+       on && /^ *key: / { print n " " $2; on = 0 }' "$out"
 }
 dburl_is() { # dburl_is <number of pods> <secret> <key>: that many pods, all reading it
   [ "$(dburl | wc -l | tr -d ' ')" -eq "$1" ] && [ "$(dburl | sort -u)" = "$2 $3" ]
