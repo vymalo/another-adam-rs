@@ -230,6 +230,10 @@ impl GitCmd {
             cmd.arg("-c").arg(format!("{k}={v}"));
         }
         cmd.args(&self.args);
+        // An empty environment plus what git needs: the repository's own configuration can run a
+        // program (a `filter.*.clean` written by a check script), and it must not find the coder's
+        // secrets in the environment it runs in.
+        crate::git_env::confine_git_env(&mut cmd);
         for var in SCRUBBED_ENV {
             cmd.env_remove(var);
         }

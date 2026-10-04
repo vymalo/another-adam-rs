@@ -1066,14 +1066,19 @@ async fn rig_over(
 #[tokio::test]
 async fn a_variable_a_mcp_json_names_is_hidden_from_checks_commands_and_opencode() {
     let def = def_with_extra_server_reading("SEARCH_MCP_TOKEN");
-    let names: Vec<String> = def.mcp_env_references().into_iter().collect();
+    // What `build_agent` does with the definition: protect the names, wrap the environment.
+    let protected = adam_coder::mcp_secrets::protect(
+        &def.mcp_env_references(),
+        &adam_coder::Redactor::default(),
+        |_| None,
+    );
     assert_eq!(
-        names,
+        protected.hidden,
         ["SEARCH_MCP_TOKEN"],
         "the shipped github entry names none"
     );
 
-    let rig = rig_over(|fake| Arc::new(adam_workspace::HidingEnvironment::new(fake, names))).await;
+    let rig = rig_over(|fake| adam_coder::mcp_secrets::hiding(fake, &protected.hidden)).await;
     rig.prepare().await;
     RunCommand
         .call(&rig.ctx, json!({"command": "env"}))
@@ -1103,18 +1108,69 @@ async fn a_variable_a_mcp_json_names_is_hidden_from_checks_commands_and_opencode
     }
 }
 
+#[test]
+fn the_names_the_coders_own_processes_need_are_never_hidden_or_redacted() {
+    // A file that reads `${PATH}` or `${MODEL_API_KEY}` (a stdio server's `env`) must not blank them
+    // for every command and for OpenCode, nor redact `PATH` from every output.
+    let names: std::collections::BTreeSet<String> = [
+        "MODEL_API_KEY",
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "USER",
+        "SEARCH_MCP_TOKEN",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let redactor = adam_coder::Redactor::default();
+    let values = |name: &str| Some(format!("value-of-{name}-0123456789"));
+    let protected = adam_coder::mcp_secrets::protect(&names, &redactor, values);
+    assert_eq!(protected.hidden, ["SEARCH_MCP_TOKEN"]);
+    assert_eq!(
+        protected.skipped,
+        [
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "MODEL_API_KEY",
+            "PATH",
+            "TMPDIR",
+            "USER"
+        ]
+    );
+    assert_eq!(protected.registered, 1);
+    assert_eq!(
+        redactor.scrub("value-of-PATH-0123456789"),
+        "value-of-PATH-0123456789"
+    );
+    assert_eq!(
+        redactor.scrub("value-of-SEARCH_MCP_TOKEN-0123456789"),
+        "[redacted]"
+    );
+    // With nothing to hide the environment is left as it is.
+    let local: adam_workspace::DynEnvironment = Arc::new(adam_workspace::Local);
+    assert!(Arc::ptr_eq(
+        &local,
+        &adam_coder::mcp_secrets::hiding(local.clone(), &[])
+    ));
+}
+
 #[tokio::test]
 async fn a_variable_a_mcp_json_names_is_really_absent_from_a_check_and_redacted_from_its_output() {
-    // `HOME` is in the environment of every process: it stands in for a key a deployment gives the
-    // coder (the real names are found and registered the same way, from the same `mcp.json` scan).
-    let Ok(home) = std::env::var("HOME") else {
+    // `CARGO_PKG_NAME` is in the environment of every test process (cargo sets it): it stands in for
+    // a key a deployment gives the coder (the real names are found and registered the same way, from
+    // the same `mcp.json` scan).
+    let Ok(home) = std::env::var("CARGO_PKG_NAME") else {
         return;
     };
-    let names: Vec<String> = def_with_extra_server_reading("HOME")
+    let names: Vec<String> = def_with_extra_server_reading("CARGO_PKG_NAME")
         .mcp_env_references()
         .into_iter()
         .collect();
-    let probe = r#"printf 'home=[%s]' "${HOME-unset}""#;
+    let probe = r#"printf 'home=[%s]' "${CARGO_PKG_NAME-unset}""#;
 
     // Without the hiding a check sees it, so the rest proves something.
     let open = rig_over(|_| Arc::new(adam_workspace::Local)).await;

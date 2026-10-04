@@ -37,6 +37,13 @@ const SECRET_WORDS: [&str; 8] = [
     "PRIVATE",
 ];
 
+/// Names an `mcp.json` may read (`"PATH": "${PATH}"` in a stdio server's `env`) that are not secrets:
+/// naming one does not make its value something to scrub from every step (`/usr/bin:/bin` would be
+/// replaced everywhere). `MODEL_API_KEY` is the exception: it is a secret, and the configuration's
+/// copy of it is scrubbed already.
+const NOT_SECRET_WHEN_NAMED: [&str; 6] =
+    ["MODEL_API_KEY", "PATH", "HOME", "LANG", "TMPDIR", "USER"];
+
 /// The secret values of `config` and of `vars` (the process environment as pairs): the model's key,
 /// the A2A bearer tokens, the password of `DATABASE_URL` (as written and decoded), and the value of
 /// each variable named like a secret (and, for a comma-separated value such as a list of tokens, each
@@ -75,7 +82,9 @@ pub fn secret_values_named(
         secrets.push(percent_decode(password));
     }
     for (name, value) in vars {
-        let is_named = named.contains(&name);
+        let is_named = named.contains(&name)
+            && !NOT_SECRET_WHEN_NAMED.contains(&name.as_str())
+            && !name.starts_with("LC_");
         let name = name.to_ascii_uppercase();
         if is_named || SECRET_WORDS.iter().any(|word| name.contains(word)) {
             secrets.extend(value.split(',').map(|part| part.trim().to_owned()));
@@ -188,8 +197,22 @@ mod tests {
         let secrets = secret_values_named(&config(), vars.clone(), &named);
         assert!(secrets.contains(&"access-0123456789".to_owned()));
         assert!(!secrets.contains(&"/usr/bin:/bin".to_owned()));
+        // Naming `PATH` (a stdio server's `env`) does not make it a secret.
+        let both: BTreeSet<String> = ["SEARCH_ACCESS".to_owned(), "PATH".to_owned()].into();
+        assert!(
+            !secret_values_named(&config(), vars.clone(), &both)
+                .contains(&"/usr/bin:/bin".to_owned())
+        );
+        // What a step is given is scrubbed with it: the closure `step_io_named` hands the step.
+        assert_eq!(
+            scrub(&secrets, "Bearer access-0123456789 on /usr/bin:/bin"),
+            "Bearer [redacted] on /usr/bin:/bin"
+        );
         let io = step_io_named(&config(), vars, &named);
-        let _ = io;
+        assert_eq!(
+            format!("{io:?}"),
+            "StepIo { on: true, redact: true, input_max: 4096, output_max: 8192 }"
+        );
     }
 
     #[test]

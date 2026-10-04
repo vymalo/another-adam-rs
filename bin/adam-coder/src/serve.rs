@@ -30,7 +30,7 @@ use std::sync::Arc;
 use adam_devcontainer::{DevContainer, Network, Runtime};
 use adam_model::DynModel;
 use adam_service::{Agents, RuntimeOptions, claim_scope_for};
-use adam_workspace::{DynCodeHost, DynEnvironment, GitHub, GitIdentity, HidingEnvironment};
+use adam_workspace::{DynCodeHost, DynEnvironment, GitHub, GitIdentity};
 use anyhow::Context as _;
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -115,21 +115,17 @@ async fn build_agent(
         tracing::info!(file = %file.display(), "extra MCP servers added to the agent's own");
         def = extended;
     }
-    let secret_vars: Vec<String> = def.mcp_env_references().into_iter().collect();
-    let registered = redactor.add_env_values(secret_vars.iter().map(String::as_str), |name| {
+    let protected = crate::mcp_secrets::protect(&def.mcp_env_references(), &redactor, |name| {
         std::env::var(name).ok()
     });
     tracing::info!(
-        hidden = ?secret_vars,
-        registered,
-        "variables the MCP servers refer to are hidden from the processes of runs and redacted from tool output"
+        hidden = ?protected.hidden,
+        skipped = ?protected.skipped,
+        registered = protected.registered,
+        "variables the MCP servers refer to are hidden from the processes of runs, and their values never reach the model"
     );
-    let environment = environment_for(worker, &root).await?;
-    let environment: DynEnvironment = if secret_vars.is_empty() {
-        environment
-    } else {
-        Arc::new(HidingEnvironment::new(environment, secret_vars))
-    };
+    let environment =
+        crate::mcp_secrets::hiding(environment_for(worker, &root).await?, &protected.hidden);
     let env = Arc::new(
         ToolEnv::new(workspaces, code_host, settings)
             .with_environment(environment)

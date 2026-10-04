@@ -304,6 +304,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",

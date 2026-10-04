@@ -426,6 +426,8 @@ struct Applied {
 /// configuration and every variable that would point git elsewhere: the patch comes from the model.
 async fn git_apply(root: &Path, flags: &[&str], patch: &str) -> io::Result<Applied> {
     let mut cmd = Command::new("git");
+    // From an empty environment: the repository's own configuration can run a program.
+    adam_workspace::confine_git_env(&mut cmd);
     cmd.args([
         "-c",
         "core.hooksPath=/dev/null",

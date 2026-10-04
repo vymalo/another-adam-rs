@@ -61,6 +61,7 @@ mod credentials;
 mod environment;
 mod error;
 mod git;
+mod git_env;
 #[cfg(feature = "github")]
 mod github;
 #[cfg(feature = "github")]
@@ -84,6 +85,7 @@ pub use environment::{
     NoProgress, PreparedCommand, Program, SecretRef, login_shell,
 };
 pub use error::{WorkspaceError, WorkspaceResult};
+pub use git_env::{GIT_INHERITED_ENV, confine_git_env};
 #[cfg(feature = "github")]
 pub use github::GitHub;
 #[cfg(feature = "github")]
