@@ -1293,3 +1293,40 @@ async fn a_mistake_in_the_file_is_an_error_even_for_an_optional_server() {
         .unwrap_err();
     assert!(matches!(&error, Error::Url { .. }), "{error}");
 }
+
+#[tokio::test]
+async fn an_optional_server_with_a_mistake_in_its_file_is_still_an_error() {
+    let up = TestHttpServer::start(None).await;
+    let policy = McpPolicy::default().allow_stdio(true);
+
+    // A command that does not exist is a misspelling, not an outage.
+    let config = common::config(
+        r#"{"mcpServers": {"fs": {"command": "adam-mcp-test-no-such-command", "optional": true}}}"#,
+    );
+    let error = McpServers::connect(&config, &Env::new(), &policy)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Spawn { server, .. } if server == "fs"),
+        "{error}"
+    );
+
+    // So is a server name the model cannot be shown (the file's loader refuses one, so the config is
+    // made by hand here).
+    let config = adam_agent_fs::McpConfig {
+        servers: std::collections::BTreeMap::from([(
+            "bad__name".to_owned(),
+            adam_agent_fs::McpServer::Remote {
+                kind: adam_agent_fs::RemoteKind::Http,
+                url: up.url(),
+                headers: Default::default(),
+                tools: None,
+                optional: true,
+            },
+        )]),
+    };
+    let error = McpServers::connect(&config, &Env::new(), &policy)
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, Error::Name { .. }), "{error}");
+}

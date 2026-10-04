@@ -91,8 +91,9 @@ impl McpServers {
     /// `${VAR}` has no value (unset, or empty in a header), or that cannot be dialled, initialized
     /// or listed, or whose allow-list names a tool it lacks, is skipped with a `warn!` naming the
     /// server and the reason (never a value), and the others connect without it. A mistake in the
-    /// file or the policy (a refused URL, `type: sse`, a local process the policy does not allow)
-    /// is an error even for an optional server: it never succeeds later.
+    /// file or the policy (a refused URL, `type: sse`, a local process the policy does not allow, a
+    /// command that does not exist, a tool name that cannot be shown to the model) is an error even
+    /// for an optional server: it never succeeds later.
     ///
     /// # Errors
     ///
@@ -124,8 +125,10 @@ impl McpServers {
                     tracing::info!(server = %name, "connected to the MCP server");
                     servers.push(server);
                 }
-                // A third party that is down must not keep the process down with it.
-                Err(error) if optional => tracing::warn!(
+                // A third party that is down must not keep the process down with it: only what a
+                // later start can mend is skipped. A mistake in the file (a misspelled command, a
+                // tool name that cannot be shown to the model) stays an error.
+                Err(error) if optional && skippable(&error) => tracing::warn!(
                     server = %name,
                     %error,
                     "the optional MCP server is skipped: it could not be reached or listed, \
@@ -213,6 +216,21 @@ impl McpTool {
         use adam_llm_agent::Tool as _;
         self.spec().name
     }
+}
+
+/// Whether an optional server that failed with `error` is skipped: the server could not be reached or
+/// listed (`Connect`, which includes a refused credential, and `ListTools`), an allow-listed tool is
+/// missing (`UnknownTool`), or a variable has no value (`Var`). Everything else is a mistake in the file
+/// or the policy, which a later start does not mend: a command that does not exist (`Spawn`), a name the
+/// model cannot be shown (`Name`), a refused binding.
+fn skippable(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Connect { .. }
+            | Error::ListTools { .. }
+            | Error::UnknownTool { .. }
+            | Error::Var { .. }
+    )
 }
 
 /// What the first pass decided for one server.

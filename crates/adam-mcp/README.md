@@ -231,14 +231,15 @@ by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A 
   (`Accept`, `Mcp-Session-Id`, `Last-Event-ID`: *verified 2026-09-29*, `RESERVED_HEADERS` in the `rmcp` source) is
   refused by `rmcp` when the first request is made, which is a startup error (`Error::Connect`).
 * **`optional: true`** (an adam extension, on a `command` or a `url` server) lets a third party be down without taking the
-  process with it: an optional server whose `${VAR}` has no value (unset, or empty in a header), that cannot be dialled,
-  initialized or listed (`Connect`, `Spawn`, `ListTools`, a refused credential), or whose allow-list names a tool it
+  process with it: an optional server whose `${VAR}` has no value (unset, or empty in a header), that cannot be dialled or
+  initialized or refuses its credential (`Connect`), cannot be listed (`ListTools`), or whose allow-list names a tool it
   lacks (`UnknownTool`) is **skipped with a `warn!`** (`the optional MCP server is skipped`, with the server and the
   reason, never a value) and the other servers connect without it; its tools do not exist, so a `tools:` entry of the
-  agent that names one fails at `bind`. A mistake in the file or the policy (`type: sse`, a refused URL or header, a
-  local process the policy does not allow, a binding) is an error even for an optional server, because it never
-  succeeds later. Without `optional` (or `optional: false`) a server that is down is `Connect` (transient: exit 69 in
-  the binaries), as before. Tests: `tests/http.rs` (`an_optional_server_*`, `a_required_server_that_is_down_*`).
+  agent that names one fails at `bind`. **Only what a later start can mend is skipped**: a mistake in the file or the
+  policy (`type: sse`, a refused URL or header, a local process the policy does not allow, a command that does not exist
+  (`Spawn`), a server name the model cannot be shown (`Name`), a binding) is an error even for an optional server. Without
+  `optional` (or `optional: false`) a server that is down is `Connect` (transient: exit 69 in the binaries), as before.
+  Tests: `tests/http.rs` (`an_optional_server_*`, `a_required_server_that_is_down_*`).
 * **`tools:`** (an adam extension) is an allow-list: exactly the listed tools, in the list's order; a listed tool the
   server lacks is `Error::UnknownTool` at startup (fail closed). Without it every tool is kept whose
   `<server>__<tool>` fits `^[A-Za-z0-9_-]{1,64}$`; the others are skipped with a `warn!` (a server cannot break
