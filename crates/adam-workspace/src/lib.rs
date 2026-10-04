@@ -80,8 +80,8 @@ pub use code_host::{
 pub use credentials::{DynGitCredentials, GitCredentials, HostScoped, ScopedToken, StaticToken};
 pub use environment::{
     DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress, EnvSession, EnvStep,
-    EnvStepState, Environment, ExecId, ExecSpec, Local, LocalSession, NoProgress, PreparedCommand,
-    Program, SecretRef, login_shell,
+    EnvStepState, Environment, ExecId, ExecSpec, HidingEnvironment, Local, LocalSession,
+    NoProgress, PreparedCommand, Program, SecretRef, login_shell,
 };
 pub use error::{WorkspaceError, WorkspaceResult};
 #[cfg(feature = "github")]
