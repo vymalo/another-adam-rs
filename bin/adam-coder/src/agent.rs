@@ -74,6 +74,11 @@ impl AgentStarter for CoderStarter {
     }
 }
 
+/// What the prompt says in place of the folder's `repository_creation` var when no owner may create
+/// repositories (`CREATE_REPO_OWNERS` empty): the tool is not offered then, and the model must not
+/// offer what it cannot do (a "new repository" among the options of a question, say).
+const REPOSITORY_CREATION_OFF: &str = "Creating a repository is switched off in this deployment: you have no tool for it, and no one can make one through you. If the person has no repository for what you built, ask them to create an empty one themselves and tell you its address, as your final reply or with `ask_user`, and then `publish_scratch` to it as above. Never offer to create a repository, and never offer \"a new repository\" as an option of a question: only repositories that already exist.";
+
 /// [`LlmAgent`](adam_llm_agent::LlmAgent) + the coder's completion policy.
 ///
 /// The `LlmAgent` is assembled from `agent/instructions.md` (the prompt, the limits, the
@@ -245,6 +250,19 @@ impl CoderAgent {
             .contains_key("scratch_check_cycles")
         {
             def.var("scratch_check_cycles", env.settings.scratch_check_cycles)
+        } else {
+            def
+        };
+        // With no owner allowed to create repositories the tool is not offered (`coder_tools`), and
+        // the prompt says so instead of describing it. The folder's own text stays for when one is.
+        let def = if env.settings.create_repo_owners.is_empty()
+            && def
+                .manifest()
+                .frontmatter
+                .vars
+                .contains_key("repository_creation")
+        {
+            def.var("repository_creation", REPOSITORY_CREATION_OFF)
         } else {
             def
         };

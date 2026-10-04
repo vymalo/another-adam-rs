@@ -431,6 +431,13 @@ pub(crate) fn resolve_slot(
 /// Every coder tool, in the order they are offered to the model: the seventeen of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
+/// `create_repository` is offered only when some owner may create repositories
+/// ([`CoderSettings::create_repo_owners`], `CREATE_REPO_OWNERS`): with none, the tool is not in the
+/// set (sixteen of the workflow), so the model cannot offer a new repository to the person or call
+/// it with an owner of its own making. The agent says so in its prompt ([`CoderAgent`](crate::CoderAgent)
+/// fills the `repository_creation` var). A folder whose `tools:` names `create_repository` is
+/// refused as an unknown tool while no owner is allowed. The settings are read when this is called.
+///
 /// Each tool is wrapped so that what it returns or fails with passes through
 /// [`ToolEnv::redactor`] first. The tools read `env` from the agent's state:
 /// give it to the agent that gets these tools
@@ -443,12 +450,18 @@ pub(crate) fn resolve_slot(
 /// (a caller that composes its own agent records them with
 /// [`RunNotes::name_repos`](notes::RunNotes::name_repos) and [`named::named_in`]).
 pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
-    tools![
+    let before = tools![
         prepare::PrepareWorkspace,
         scratch::StartScratch,
         scratch::PublishScratch,
         consent::RequestRepository,
-        create::CreateRepository,
+    ];
+    let creating = if env.settings.create_repo_owners.is_empty() {
+        ToolSet::new()
+    } else {
+        ToolSet::new().tool(create::CreateRepository)
+    };
+    let after = tools![
         inspect::RunCommand,
         make::Run,
         files::ReadFile,
@@ -461,9 +474,12 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         environment::RebuildEnvironment,
         publish::CommitAndPush,
         publish::OpenPullRequest,
-    ]
-    .extend(env.ui.tools())
-    .wrap(Redacting::layer(env.redactor.clone()))
+    ];
+    before
+        .extend(creating)
+        .extend(after)
+        .extend(env.ui.tools())
+        .wrap(Redacting::layer(env.redactor.clone()))
 }
 
 /// A tool whose results and errors are scrubbed by a [`Redactor`].

@@ -253,7 +253,7 @@ async fn postgres_backing() -> Option<Backing> {
 // ------------------------------------------------------------------- happy path
 
 async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store: DynStore) {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new("hello\n").await.offering_creation();
     let mock = Arc::new(MockModel::new());
     happy_script(&mock, &fx.remote_url());
     let server = Server::start(coder_with(&fx, &mock, store)).await;
