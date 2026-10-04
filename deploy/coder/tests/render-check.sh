@@ -747,7 +747,7 @@ check "ADAM_AGENT_DIR in extraEnv is the deployment's own business again (unchan
 # byte-for-byte invisible when off (the golden above). Like MODEL_API_KEY it belongs to the roles that run workers.
 placeholder='https://gateway.example.invalid/v1'
 # url_env: the MODEL_BASE_URL entry of the worker StatefulSet's env, with the lines that say where its value is.
-url_env() { doc StatefulSet "${1:-$out}" | grep -A4 -- 'name: MODEL_BASE_URL$'; }
+url_env() { doc StatefulSet "$out" | grep -A4 -- 'name: MODEL_BASE_URL$'; }
 urlhas() { url_env | grep -Eq -- "$1"; }
 urllacks() { ! url_env | grep -Eq -- "$1"; }
 helm_url() { helm template coder "$chart" --namespace coder-ns "$@"; }
