@@ -9,7 +9,10 @@ use tokio::process::Command;
 
 /// Run `git <args>` in `dir`; `Some(stdout)` (trimmed) on exit 0.
 pub(crate) async fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    // From an empty environment: a filter the repository configures runs in it (`git add` below).
+    adam_workspace::confine_git_env(&mut cmd);
+    let out = cmd
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -277,7 +280,9 @@ pub(crate) async fn working_tree_id(dir: &Path) -> Option<String> {
         let run = |args: &'static [&'static str]| {
             let tmp = tmp.clone();
             async move {
-                let out = Command::new("git")
+                let mut cmd = Command::new("git");
+                adam_workspace::confine_git_env(&mut cmd);
+                let out = cmd
                     .args([
                         "-c",
                         "core.hooksPath=/dev/null",
@@ -412,6 +417,39 @@ mod tests {
         // second than the entry's to look older than it.
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
         assert_eq!(working_tree_id(dir).await.unwrap(), expected);
+    }
+
+    /// Repository code can write a `filter.*.clean` command to `.git/config` (a check script can),
+    /// and a committed `.gitattributes` makes the coder's own `git add` run it. The coder's git
+    /// starts from an empty environment, so what the filter sees holds none of the coder's secrets.
+    #[tokio::test]
+    async fn a_filter_the_repository_configures_runs_without_the_coders_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo");
+        std::fs::create_dir(&dir).unwrap();
+        let seen = tmp.path().join("seen-by-filter");
+        git(&dir, None, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(dir.join("README.md"), "widgets\n").unwrap();
+        git(&dir, None, &["add", "-A"]);
+        git(&dir, None, &["commit", "--quiet", "-m", "seed"]);
+        git(
+            &dir,
+            None,
+            &[
+                "config",
+                "filter.spy.clean",
+                &format!("sh -c 'env > {}; cat'", seen.display()),
+            ],
+        );
+        std::fs::write(dir.join(".gitattributes"), "*.txt filter=spy\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "to be filtered\n").unwrap();
+
+        // `working_tree_id` runs `git add -A` in a copy of the index: the filter runs.
+        assert!(working_tree_id(&dir).await.is_some());
+        let env = std::fs::read_to_string(&seen).expect("the filter ran");
+        // `CARGO_PKG_NAME` is set by cargo in every test process: it stands for a secret.
+        assert!(!env.contains("CARGO_PKG_NAME"), "{env}");
+        assert!(env.contains("PATH="), "what git needs is kept: {env}");
     }
 }
 

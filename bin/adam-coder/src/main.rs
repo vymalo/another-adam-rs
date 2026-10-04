@@ -26,6 +26,8 @@ async fn main() -> ExitCode {
         )
         .init();
 
+    adam_coder::harden::make_non_dumpable();
+
     // Nothing is known to be secret until the configuration is read; its errors name variables,
     // never their values.
     let config = match Config::from_env().context("reading the configuration") {

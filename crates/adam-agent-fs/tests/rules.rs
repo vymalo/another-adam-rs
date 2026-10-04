@@ -1047,3 +1047,75 @@ fn an_invalid_root_name_falls_back_to_the_default_with_a_warning() {
     assert_eq!(report.diagnostics[0].severity, Severity::Error);
     assert!(report.package.agents.is_empty());
 }
+
+#[test]
+fn optional_is_a_boolean_that_defaults_to_false() {
+    use adam_agent_fs::parse_mcp;
+    use std::path::Path;
+
+    let mut diagnostics = Vec::new();
+    let config = parse_mcp(
+        Path::new("mcp.json"),
+        r#"{"mcpServers":{
+            "a":{"type":"http","url":"https://a.example.com","optional":true},
+            "b":{"type":"http","url":"https://b.example.com","optional":false},
+            "c":{"command":"x","optional":true},
+            "d":{"command":"y"}}}"#,
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let optional: Vec<(&str, bool)> = config
+        .servers
+        .iter()
+        .map(|(name, server)| (name.as_str(), server.is_optional()))
+        .collect();
+    assert_eq!(
+        optional,
+        [("a", true), ("b", false), ("c", true), ("d", false)]
+    );
+
+    // Not a boolean: the file is refused as a whole, with the line.
+    let mut diagnostics = Vec::new();
+    let config = parse_mcp(
+        Path::new("mcp.json"),
+        r#"{"mcpServers":{"a":{"type":"http","url":"https://a.example.com","optional":"yes"}}}"#,
+        &mut diagnostics,
+    );
+    assert!(config.is_none());
+    assert!(
+        diagnostics[0].to_string().contains("invalid JSON"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn merging_adds_servers_and_refuses_a_name_both_have() {
+    use adam_agent_fs::parse_mcp;
+    use std::path::Path;
+
+    let read = |text: &str| {
+        let mut diagnostics = Vec::new();
+        let config = parse_mcp(Path::new("mcp.json"), text, &mut diagnostics).unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        config
+    };
+    let own = read(r#"{"mcpServers":{"github":{"type":"http","url":"http://127.0.0.1:8082/"}}}"#);
+    let extra = read(
+        r#"{"mcpServers":{"websearch":{"type":"http","url":"https://s.example.com","optional":true}}}"#,
+    );
+    let merged = own.clone().merged_with(extra.clone()).unwrap();
+    let names: Vec<&str> = merged.servers.keys().map(String::as_str).collect();
+    assert_eq!(names, ["github", "websearch"]);
+    assert!(merged.servers["websearch"].is_optional());
+    assert!(!merged.servers["github"].is_optional());
+
+    let clash = read(
+        r#"{"mcpServers":{"websearch":{"command":"a"},"github":{"command":"b"},"zed":{"command":"c"}}}"#,
+    );
+    assert_eq!(
+        own.merged_with(clash).unwrap_err(),
+        ["github"],
+        "the clashing names, and nothing merged"
+    );
+}

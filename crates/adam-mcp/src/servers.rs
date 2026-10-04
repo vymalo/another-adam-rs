@@ -87,64 +87,105 @@ impl McpServers {
     /// initialized and asked for its tools, and the `tools:` allow-list (or, without one, every
     /// tool whose `<server>__<tool>` name fits `^[A-Za-z0-9_-]{1,64}$`) is applied.
     ///
+    /// A server with `optional: true` is the exception to "everything is an error": one whose
+    /// `${VAR}` has no value (unset, or empty in a header), or that cannot be dialled, initialized
+    /// or listed, or whose allow-list names a tool it lacks, is skipped with a `warn!` naming the
+    /// server and the reason (never a value), and the others connect without it. A mistake in the
+    /// file or the policy (a refused URL, `type: sse`, a local process the policy does not allow, a
+    /// command that does not exist, a tool name that cannot be shown to the model) is an error even
+    /// for an optional server: it never succeeds later.
+    ///
     /// # Errors
     ///
-    /// The first problem, as [`Error`]. When it comes from a later server, the servers already
-    /// connected are closed (their processes killed) on the way out.
+    /// The first problem, as [`Error`], of a server that is not optional. When it comes from a
+    /// later server, the servers already connected are closed (their processes killed) on the way
+    /// out.
     pub async fn connect(config: &McpConfig, env: &Env, policy: &McpPolicy) -> Result<Self, Error> {
         let mut plans = Vec::with_capacity(config.servers.len());
         for (name, server) in &config.servers {
-            plans.push(Plan::new(name, server, env, policy)?);
+            match Plan::new(name, server, env, policy) {
+                Ok(plan) => plans.push((plan, server.is_optional())),
+                // An optional server whose variable has no value is left out: it is the
+                // deployment's key that is missing, not a mistake in the file.
+                Err(error @ Error::Var { .. }) if server.is_optional() => {
+                    tracing::warn!(
+                        server = %name,
+                        %error,
+                        "the optional MCP server is skipped: its tools are not available"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
         }
         let mut servers = Vec::with_capacity(plans.len());
-        for plan in plans {
-            let Plan {
-                recipe,
-                allow,
-                call_timeout,
-                per_call,
-            } = plan;
-            let name = recipe.server.clone();
-            let (target, listed) = match per_call {
-                // A bound server is listed with the listing bearer, and dialled again per call.
-                Some(per_call) => {
-                    let per_call = Arc::new(per_call);
-                    let listed = per_call.list().await?;
-                    (Target::PerCall(per_call), listed)
+        for (plan, optional) in plans {
+            let name = plan.recipe.server.clone();
+            match Self::open(plan).await {
+                Ok(server) => {
+                    tracing::info!(server = %name, "connected to the MCP server");
+                    servers.push(server);
                 }
-                None => {
-                    let (connection, listed) = Connection::open(recipe).await?;
-                    (Target::Kept(connection), listed)
-                }
-            };
-            let selected = match select_tools(&name, listed, allow.as_deref()) {
-                Ok(selected) => selected,
-                Err(error) => {
-                    target.close().await;
-                    return Err(error);
-                }
-            };
-            let tools = selected
-                .into_iter()
-                .map(|s| {
-                    Arc::new(McpTool::new(
-                        s.spec,
-                        name.clone(),
-                        s.remote,
-                        s.title,
-                        target.clone(),
-                        call_timeout,
-                    ))
-                })
-                .collect();
-            tracing::info!(server = %name, "connected to the MCP server");
-            servers.push(Server {
-                name,
-                target,
-                tools,
-            });
+                // A third party that is down must not keep the process down with it: only what a
+                // later start can mend is skipped. A mistake in the file (a misspelled command, a
+                // tool name that cannot be shown to the model) stays an error.
+                Err(error) if optional && skippable(&error) => tracing::warn!(
+                    server = %name,
+                    %error,
+                    "the optional MCP server is skipped: it could not be reached or listed, \
+                     and its tools are not available"
+                ),
+                Err(error) => return Err(error),
+            }
         }
         Ok(Self { servers })
+    }
+
+    /// Dial one planned server, list its tools and apply its allow-list.
+    async fn open(plan: Plan) -> Result<Server, Error> {
+        let Plan {
+            recipe,
+            allow,
+            call_timeout,
+            per_call,
+        } = plan;
+        let name = recipe.server.clone();
+        let (target, listed) = match per_call {
+            // A bound server is listed with the listing bearer, and dialled again per call.
+            Some(per_call) => {
+                let per_call = Arc::new(per_call);
+                let listed = per_call.list().await?;
+                (Target::PerCall(per_call), listed)
+            }
+            None => {
+                let (connection, listed) = Connection::open(recipe).await?;
+                (Target::Kept(connection), listed)
+            }
+        };
+        let selected = match select_tools(&name, listed, allow.as_deref()) {
+            Ok(selected) => selected,
+            Err(error) => {
+                target.close().await;
+                return Err(error);
+            }
+        };
+        let tools = selected
+            .into_iter()
+            .map(|s| {
+                Arc::new(McpTool::new(
+                    s.spec,
+                    name.clone(),
+                    s.remote,
+                    s.title,
+                    target.clone(),
+                    call_timeout,
+                ))
+            })
+            .collect();
+        Ok(Server {
+            name,
+            target,
+            tools,
+        })
     }
 
     /// The tools of every server, named `<server>__<tool>`, servers in the order of their names
@@ -177,6 +218,21 @@ impl McpTool {
     }
 }
 
+/// Whether an optional server that failed with `error` is skipped: the server could not be reached or
+/// listed (`Connect`, which includes a refused credential, and `ListTools`), an allow-listed tool is
+/// missing (`UnknownTool`), or a variable has no value (`Var`). Everything else is a mistake in the file
+/// or the policy, which a later start does not mend: a command that does not exist (`Spawn`), a name the
+/// model cannot be shown (`Name`), a refused binding.
+fn skippable(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Connect { .. }
+            | Error::ListTools { .. }
+            | Error::UnknownTool { .. }
+            | Error::Var { .. }
+    )
+}
+
 /// What the first pass decided for one server.
 struct Plan {
     recipe: Recipe,
@@ -206,6 +262,7 @@ impl Plan {
                 args,
                 env: declared,
                 tools,
+                ..
             } => {
                 if !policy.stdio_allowed() {
                     return Err(Error::StdioNotAllowed {
@@ -246,6 +303,7 @@ impl Plan {
                 url: url_text,
                 headers,
                 tools,
+                ..
             } => {
                 if *kind == RemoteKind::Sse {
                     return Err(Error::SseUnsupported {
@@ -309,8 +367,8 @@ impl Plan {
                         header: key.clone(),
                     };
                     let header_name = HeaderName::from_bytes(key.as_bytes()).map_err(|_| bad())?;
-                    let header_value =
-                        HeaderValue::from_str(&expander.expand(value)?).map_err(|_| bad())?;
+                    let header_value = HeaderValue::from_str(&expander.expand_header(value)?)
+                        .map_err(|_| bad())?;
                     expanded_headers.push((header_name, header_value));
                 }
                 let per_call = binding.map(|binding| {
@@ -636,6 +694,7 @@ mod tests {
             url: url.to_owned(),
             headers: Default::default(),
             tools: None,
+            optional: false,
         }
     }
 
@@ -655,6 +714,7 @@ mod tests {
             args: vec![],
             env: Default::default(),
             tools: None,
+            optional: false,
         };
         // The refusal is a plan error: nothing was started, and the command was never looked up.
         let error = plan_error(stdio, &McpPolicy::default());
@@ -670,6 +730,7 @@ mod tests {
             url: "https://x.example.com/mcp?key=${MCP_KEY}".to_owned(),
             headers,
             tools: None,
+            optional: false,
         };
         let env = Env::new()
             .var("MCP_TOKEN", "tok-4c1e9d7a")
@@ -736,6 +797,7 @@ mod tests {
             url: "https://x.example.com/mcp".to_owned(),
             headers,
             tools: None,
+            optional: false,
         };
         assert!(Plan::new("srv", &server, &env, &McpPolicy::default()).is_ok());
     }
@@ -777,6 +839,7 @@ mod tests {
             url: "https://x.example.com/mcp".to_owned(),
             headers,
             tools: None,
+            optional: false,
         };
         let error = plan_error(server, &McpPolicy::default());
         assert!(matches!(&error, Error::Header { header, .. } if header == "Authorization"));

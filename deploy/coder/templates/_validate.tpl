@@ -44,6 +44,55 @@ from service.yaml, which every render contains, so they always run.
 {{- fail (printf "githubMcp.port must be a port number (1 to 65535), got %q" (toString .Values.githubMcp.port)) -}}
 {{- end -}}
 {{- end -}}
+{{- /* The extra MCP servers (values `mcp.*`): a file the binary merges over the agent's own mcp.json. */ -}}
+{{- range $path, $value := dict "mcp.context7.enabled" .Values.mcp.context7.enabled "mcp.websearch.allowInsecure" .Values.mcp.websearch.allowInsecure -}}
+{{- if not (has (toString $value) (list "true" "false")) -}}
+{{- fail (printf "%s must be true or false, got %q" $path (toString $value)) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (include "coder.mcpWebsearch" .) (include "coder.mcpContext7" .) -}}
+{{- if hasKey .Values.config.extraEnv "ADAM_EXTRA_MCP_FILE" -}}
+{{- fail "config.extraEnv.ADAM_EXTRA_MCP_FILE is set while mcp.websearch.url or mcp.context7.enabled is on: the chart then sets it itself, to the file it mounts" -}}
+{{- end -}}
+{{- range $id, $on := dict "websearch" (include "coder.mcpWebsearch" .) "context7" (include "coder.mcpContext7" .) -}}
+{{- if $on -}}
+{{- $s := get $.Values.mcp $id -}}
+{{- $url := trim (toString $s.url) -}}
+{{- if not (regexMatch "^https?://[^/@?#[:space:]$]+([/?][^[:space:]$]*)?$" $url) -}}
+{{- fail (printf "mcp.%s.url must be an http or https URL with no user name, password or ${VAR} in it (a secret in a URL reaches the logs), got %q" $id $url) -}}
+{{- end -}}
+{{- if not (regexMatch "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$" (toString $s.header)) -}}
+{{- fail (printf "mcp.%s.header must be an HTTP header name, got %q" $id (toString $s.header)) -}}
+{{- end -}}
+{{- if contains "${" (toString $s.valuePrefix) -}}
+{{- fail (printf "mcp.%s.valuePrefix must be plain text such as \"Bearer \": the token is added by the chart, from the Secret" $id) -}}
+{{- end -}}
+{{- if not (kindIs "slice" $s.tools) -}}
+{{- fail (printf "mcp.%s.tools must be a list of tool names (for example [web_search]), got %q" $id (toString $s.tools)) -}}
+{{- end -}}
+{{- if not (kindIs "bool" $s.optional) -}}
+{{- fail (printf "mcp.%s.optional must be true or false, got %q" $id (toString $s.optional)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and (include "coder.mcpPlainHttp" .) (hasKey .Values.config.extraEnv "MCP_ALLOW_INSECURE") (not (include "coder.extraEnvInsecure" .)) -}}
+{{- fail (printf "config.extraEnv.MCP_ALLOW_INSECURE is %q while an extra MCP server is at a plain http:// URL on another machine: the coder would refuse that server at startup. Set it to \"true\" (knowing that it covers every MCP server and the thread-tools endpoints), remove it, or use an https URL" (toString (get .Values.config.extraEnv "MCP_ALLOW_INSECURE"))) -}}
+{{- end -}}
+{{- if and (include "coder.mcpPlainHttp" .) (not (eq (toString .Values.mcp.websearch.allowInsecure) "true")) (not (include "coder.extraEnvInsecure" .)) -}}
+{{- fail "an extra MCP server is at a plain http:// URL on another machine, which the coder refuses unless MCP_ALLOW_INSECURE is set: set mcp.websearch.allowInsecure=true (or config.extraEnv.MCP_ALLOW_INSECURE=\"true\") knowing that it covers every MCP server of the agent and the thread-tools endpoints senders announce, and that the bearer crosses the network in the clear; or use an https URL" -}}
+{{- end -}}
+{{- if include "coder.runsWorkers" . -}}
+{{- if not .Values.externalSecrets.enabled -}}
+{{- fail "mcp.websearch.url or mcp.context7.enabled is on, and their keys come from the ExternalSecret only: set externalSecrets.enabled=true (a key is never a chart value)" -}}
+{{- end -}}
+{{- if and (include "coder.mcpWebsearch" .) (not .Values.externalSecrets.properties.searchMcpToken) -}}
+{{- fail "mcp.websearch.url is set: externalSecrets.properties.searchMcpToken must name the AWS property of its bearer token" -}}
+{{- end -}}
+{{- if and (include "coder.mcpContext7" .) (not .Values.externalSecrets.properties.context7ApiKey) -}}
+{{- fail "mcp.context7.enabled is true: externalSecrets.properties.context7ApiKey must name the AWS property of its API key" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and (gt (int .Values.replicaCount) 1) (include "coder.runsWorkers" .) (not $placement) -}}
 {{- fail "replicaCount > 1 needs workspace.placement (shared, affinity or isolated): runs move between workers at every step, and without a placement a run that lands on a worker without its worktree forks into a second pull request (see deploy/coder/README.md, Workspace placement)" -}}
 {{- end -}}

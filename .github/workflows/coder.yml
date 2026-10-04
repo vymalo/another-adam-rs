@@ -134,6 +134,14 @@ jobs:
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set github.auth=app --set github.app.id=1234567 --set 'github.app.owners={acme,octocat}' \
             --set github.app.privateKeySecret=coder-github-app > "$RUNNER_TEMP/rendered-app-owners.yaml"
+          # The extra MCP servers on (mcp.websearch.url and mcp.context7.enabled): the servers ConfigMap and
+          # its volume, in the combined pod, and in the split worker (the front gets none).
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set mcp.websearch.url=http://search-mcp.another-agentic-system.svc.cluster.local:8080/mcp \
+            --set mcp.websearch.allowInsecure=true --set mcp.context7.enabled=true > "$RUNNER_TEMP/rendered-mcp.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set mcp.websearch.url=https://search.example.com/mcp --set mcp.context7.enabled=true \
+            --set topology=split --set front.replicas=2 > "$RUNNER_TEMP/rendered-mcp-split.yaml"
           for attempt in 1 2 3; do
             status=0
             "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
@@ -144,6 +152,7 @@ jobs:
                 "$RUNNER_TEMP/rendered-affinity.yaml" "$RUNNER_TEMP/rendered-shared-split.yaml" \
                 "$RUNNER_TEMP/rendered-app.yaml" "$RUNNER_TEMP/rendered-app-shared.yaml" \
                 "$RUNNER_TEMP/rendered-app-owners.yaml" \
+                "$RUNNER_TEMP/rendered-mcp.yaml" "$RUNNER_TEMP/rendered-mcp-split.yaml" \
                 > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
             cat "$RUNNER_TEMP/kubeconform.out"
             if [ "$status" -eq 0 ]; then exit 0; fi

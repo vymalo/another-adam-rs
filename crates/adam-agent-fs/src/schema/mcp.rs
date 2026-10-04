@@ -35,6 +35,9 @@ pub enum McpServer {
         env: BTreeMap<String, String>,
         /// The allow-list of tools (an adam extension); `None` allows all.
         tools: Option<Vec<String>>,
+        /// `optional: true` (an adam extension): a server that cannot be reached at startup is
+        /// skipped with a warning instead of stopping the process.
+        optional: bool,
     },
     /// A server reached over the network (`type` and `url`).
     Remote {
@@ -46,10 +49,20 @@ pub enum McpServer {
         headers: BTreeMap<String, String>,
         /// The allow-list of tools (an adam extension); `None` allows all.
         tools: Option<Vec<String>>,
+        /// `optional: true` (an adam extension): a server that cannot be reached at startup is
+        /// skipped with a warning instead of stopping the process.
+        optional: bool,
     },
 }
 
 impl McpServer {
+    /// Whether the server may be missing: `optional: true` in the file.
+    pub fn is_optional(&self) -> bool {
+        match self {
+            Self::Stdio { optional, .. } | Self::Remote { optional, .. } => *optional,
+        }
+    }
+
     /// The allow-list of tools, when there is one.
     pub fn tools(&self) -> Option<&[String]> {
         match self {
@@ -80,6 +93,27 @@ pub struct McpConfig {
 }
 
 impl McpConfig {
+    /// This config with the servers of `extra` added. Server names must be different: a name in
+    /// both is returned (sorted) and nothing is merged, so a file added over the agent's own
+    /// `mcp.json` can never replace one of its servers.
+    ///
+    /// # Errors
+    ///
+    /// The names that both configs have.
+    pub fn merged_with(mut self, extra: McpConfig) -> Result<McpConfig, Vec<String>> {
+        let clashes: Vec<String> = extra
+            .servers
+            .keys()
+            .filter(|name| self.servers.contains_key(*name))
+            .cloned()
+            .collect();
+        if !clashes.is_empty() {
+            return Err(clashes);
+        }
+        self.servers.extend(extra.servers);
+        Ok(self)
+    }
+
     /// The names of every environment variable the config refers to with `${NAME}` or
     /// `${NAME:-default}`, sorted. Names only, never values.
     pub fn env_references(&self) -> BTreeSet<String> {
@@ -217,6 +251,7 @@ pub(crate) struct RawServer {
     pub(crate) url: Option<String>,
     pub(crate) headers: BTreeMap<String, String>,
     pub(crate) tools: Option<Vec<String>>,
+    pub(crate) optional: Option<bool>,
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
 }

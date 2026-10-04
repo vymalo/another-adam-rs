@@ -32,8 +32,28 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), AgentError> {
     // The files first, for every role and before anything connects.
-    let folder = folder::load(&config.agent_dir)?;
+    let mut folder = folder::load(&config.agent_dir)?;
     folder::log(&folder);
+
+    // The extra MCP servers `ADAM_EXTRA_MCP_FILE` names are added to the folder's own, by the
+    // roles that connect servers; a name the folder has is refused.
+    if let Some(file) = config
+        .worker
+        .as_ref()
+        .and_then(|worker| worker.extra_mcp_file.as_ref())
+    {
+        let (def, warnings) = folder
+            .def
+            .clone()
+            .with_extra_mcp_file(file)
+            .map_err(|e| AgentError::ExtraMcp(Box::new(e)))?;
+        for warning in &warnings {
+            tracing::warn!("{warning}");
+        }
+        tracing::info!(file = %file.display(), "extra MCP servers added to the folder's own");
+        folder.def = def;
+    }
+    let named_vars = folder.def.mcp_env_references();
 
     // The card of the files this process runs, for the roles that serve A2A.
     let card = config
@@ -52,7 +72,7 @@ pub async fn serve(
             options: settings.options(),
             // What a call was given and what it answered go into its step: the secrets of this
             // process (the configuration's and the environment's) are scrubbed from both.
-            step_io: redact::step_io(&config, redact::process_vars()),
+            step_io: redact::step_io_named(&config, redact::process_vars(), &named_vars),
         }),
         _ => None,
     };

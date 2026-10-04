@@ -885,6 +885,7 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
         url,
         headers,
         tools,
+        optional,
     } = &config.servers["github"]
     else {
         panic!(
@@ -893,6 +894,10 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
         );
     };
     assert_eq!(*kind, RemoteKind::Http);
+    assert!(
+        !*optional,
+        "GitHub is the coder's one required server: without it a worker must not start"
+    );
     assert_eq!(url, "http://127.0.0.1:8082/");
     assert!(
         headers.is_empty(),

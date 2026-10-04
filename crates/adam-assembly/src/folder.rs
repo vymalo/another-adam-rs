@@ -7,6 +7,8 @@
 //!
 //! The environment variable [`AGENT_DIR_ENV`] names the folder a deployment mounts;
 //! [`agent_dir_from_env`] reads it, and [`agent_dir`] reads it with a default.
+//! [`EXTRA_MCP_FILE_ENV`] names one more file, of MCP servers to add to the agent's own
+//! (`AgentDef::with_extra_mcp_file`): [`extra_mcp_file_from_env`] reads it.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -19,6 +21,17 @@ use crate::error::Error;
 /// The environment variable that names the agent folder to read at run time:
 /// `ADAM_AGENT_DIR=/etc/adam/agent`.
 pub const AGENT_DIR_ENV: &str = "ADAM_AGENT_DIR";
+
+/// The environment variable that names a file of extra MCP servers, in the shape of `mcp.json`
+/// (`{"mcpServers": {...}}`), to add to the agent's own at startup:
+/// `ADAM_EXTRA_MCP_FILE=/etc/adam/extra-mcp/mcp.json`. It adds servers to the folder's `mcp.json`
+/// (or to the embedded copy's) and never replaces one: see [`AgentDef::with_extra_mcp_file`].
+pub const EXTRA_MCP_FILE_ENV: &str = "ADAM_EXTRA_MCP_FILE";
+
+/// [`EXTRA_MCP_FILE_ENV`] when it is set and not empty, else `None`: there is nothing to add.
+pub fn extra_mcp_file_from_env() -> Option<PathBuf> {
+    from_env_value(std::env::var_os(EXTRA_MCP_FILE_ENV))
+}
 
 /// The directory to read: [`AGENT_DIR_ENV`] when it is set and not empty, else `default`.
 pub fn agent_dir(default: impl Into<PathBuf>) -> PathBuf {

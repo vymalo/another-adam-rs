@@ -2,13 +2,13 @@
 //! checks it against the registered tools and renders the prompts.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use adam_agent_fs::{
-    AgentManifest, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
-    ManifestSource, ModelRef, Strictness, Subagent, ToolList,
+    AgentManifest, Diagnostic, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
+    ManifestSource, McpConfig, ModelRef, Strictness, Subagent, ToolList,
 };
 use adam_llm_agent::{DynTool, Limits, ToolSet};
 use secrecy::SecretString;
@@ -173,6 +173,84 @@ impl AgentDef {
     /// The manifest this definition was made from.
     pub fn manifest(&self) -> &AgentManifest {
         &self.manifest
+    }
+
+    /// Add the MCP servers of `extra` to the root agent's own (`mcp.json`), so that
+    /// [`connect_mcp`](Self::connect_mcp) connects both and `bind` checks the sum. The servers of
+    /// subagents are untouched. A name that both have is an error and nothing is added: a file
+    /// that is added over an agent can never replace one of its servers. `file` names where
+    /// `extra` came from, for the diagnostic.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Manifest`] with an [`Invalid`](adam_agent_fs::Error::Invalid) error that names `file`
+    /// and every clashing server.
+    pub fn with_extra_mcp(mut self, extra: McpConfig, file: &Path) -> Result<Self, Error> {
+        let own = self.manifest.mcp.take().unwrap_or_default();
+        match own.clone().merged_with(extra) {
+            Ok(merged) => {
+                self.manifest.mcp = Some(merged);
+                Ok(self)
+            }
+            Err(names) => {
+                let diagnostics = names
+                    .iter()
+                    .map(|name| {
+                        Diagnostic::error(
+                            file,
+                            None,
+                            format!(
+                                "the server `{name}` is also in the agent's own `mcp.json`: \
+                                 rename it in this file (a server of the agent is never replaced)"
+                            ),
+                        )
+                    })
+                    .collect();
+                Err(Error::Manifest(adam_agent_fs::Error::Invalid {
+                    diagnostics,
+                }))
+            }
+        }
+    }
+
+    /// Read the file `file` (the `mcpServers` shape of `mcp.json`, parsed by the same loader) and
+    /// add its servers with [`with_extra_mcp`](Self::with_extra_mcp). Returns the definition and
+    /// what the loader warned about (an unknown key, a literal credential), for the caller to log.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Manifest`]: the file cannot be read ([`Io`](adam_agent_fs::Error::Io)), has errors
+    /// (invalid JSON, a bad server: every finding, as `path:line: error: ...`), or names a server
+    /// the agent already has.
+    pub fn with_extra_mcp_file(self, file: &Path) -> Result<(Self, Vec<Diagnostic>), Error> {
+        let text = std::fs::read_to_string(file).map_err(|source| {
+            Error::Manifest(adam_agent_fs::Error::Io {
+                path: file.to_path_buf(),
+                source,
+            })
+        })?;
+        let mut diagnostics = Vec::new();
+        let config = adam_agent_fs::parse_mcp(file, &text, &mut diagnostics);
+        let Some(config) = config.filter(|_| !diagnostics.iter().any(Diagnostic::is_error)) else {
+            return Err(Error::Manifest(adam_agent_fs::Error::Invalid {
+                diagnostics,
+            }));
+        };
+        Ok((self.with_extra_mcp(config, file)?, diagnostics))
+    }
+
+    /// The names of the environment variables the MCP servers of this definition (every local
+    /// agent's, extra servers included) refer to as `${NAME}` or `${NAME:-default}`, sorted: what
+    /// a deployment hides from the processes the agent starts and registers with its redactor.
+    /// Names only, never values.
+    pub fn mcp_env_references(&self) -> BTreeSet<String> {
+        let mut agents = Vec::new();
+        mcp::local_agents(&self.manifest, &self.manifest.name, &mut agents);
+        agents
+            .into_iter()
+            .filter_map(|(_, manifest)| manifest.mcp.as_ref())
+            .flat_map(McpConfig::env_references)
+            .collect()
     }
 
     /// Supply the value of a var of the root agent. It overrides the default under `vars`, and

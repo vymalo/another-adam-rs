@@ -80,12 +80,24 @@ impl<'a> Expander<'a> {
     /// and so is the whole expanded text when it contained one (a header `Bearer <token>`, a URL
     /// with a key in its query), so no third-party message can repeat either.
     pub(crate) fn expand(&mut self, text: &str) -> Result<String, Error> {
+        self.expand_with(text, false)
+    }
+
+    /// [`expand`](Self::expand) for the value of a header: a `${VAR}` with no default whose
+    /// variable is empty is an error ([`VarProblem::Empty`]), because the header would be sent
+    /// with its credential missing (`Authorization: Bearer `) and the server's answer would be
+    /// the only sign of it.
+    pub(crate) fn expand_header(&mut self, text: &str) -> Result<String, Error> {
+        self.expand_with(text, true)
+    }
+
+    fn expand_with(&mut self, text: &str, forbid_empty: bool) -> Result<String, Error> {
         let mut out = String::with_capacity(text.len());
         let mut from_variable = false;
         for segment in split_env_references(text) {
             match segment {
                 Segment::Literal(literal) => out.push_str(literal),
-                Segment::Ref(reference) => match self.value(&reference)? {
+                Segment::Ref(reference) => match self.value(&reference, forbid_empty)? {
                     Value::Variable(value) => {
                         self.redactor.add(&value);
                         out.push_str(&value);
@@ -102,7 +114,7 @@ impl<'a> Expander<'a> {
         Ok(out)
     }
 
-    fn value(&self, reference: &EnvRef) -> Result<Value, Error> {
+    fn value(&self, reference: &EnvRef, forbid_empty: bool) -> Result<Value, Error> {
         let fail = |problem| Error::Var {
             server: self.server.to_owned(),
             var: reference.name.clone(),
@@ -119,10 +131,11 @@ impl<'a> Expander<'a> {
             },
         };
         // POSIX `:-`: the default stands for a variable that is unset *or empty*. Without a
-        // default, an empty variable expands to nothing, as in a shell.
+        // default, an empty variable expands to nothing, as in a shell, except in a header.
         match (set, &reference.default) {
             (Some(value), _) if !value.is_empty() => Ok(Value::Variable(value)),
             (_, Some(default)) => Ok(Value::Default(default.clone())),
+            (Some(_), None) if forbid_empty => Err(fail(VarProblem::Empty)),
             (Some(_), None) => Ok(Value::Variable(String::new())),
             (None, None) => Err(fail(VarProblem::Missing)),
         }
@@ -173,6 +186,32 @@ mod tests {
         // An empty default is a default: unset gives nothing, and no error.
         assert_eq!(expand(&env, &format!("[${{{UNSET}:-}}]")).unwrap().0, "[]");
         // Without a default, an empty variable is empty (as in a shell), not missing.
+        assert_eq!(expand(&env, "[${EMPTY}]").unwrap().0, "[]");
+    }
+
+    #[test]
+    fn an_empty_variable_is_an_error_in_a_header_unless_it_has_a_default() {
+        let env = Env::new().var("EMPTY", "").var("SET", "tok");
+        let header = |text: &str| {
+            let mut redactor = Redactor::default();
+            Expander::new("search", &env, &mut redactor).expand_header(text)
+        };
+        let error = header("Bearer ${EMPTY}").unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Var { server, var, problem: VarProblem::Empty } if server == "search" && var == "EMPTY"
+        ));
+        assert!(error.to_string().contains("is empty"), "{error}");
+        assert_eq!(header("Bearer ${SET}").unwrap(), "Bearer tok");
+        assert_eq!(header("Bearer ${EMPTY:-dev}").unwrap(), "Bearer dev");
+        // Unset stays the error it was, and elsewhere an empty variable is still empty.
+        assert!(matches!(
+            header(&format!("${{{UNSET}}}")).unwrap_err(),
+            Error::Var {
+                problem: VarProblem::Missing,
+                ..
+            }
+        ));
         assert_eq!(expand(&env, "[${EMPTY}]").unwrap().0, "[]");
     }
 

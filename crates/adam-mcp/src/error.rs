@@ -13,6 +13,10 @@ pub enum VarProblem {
     Missing,
     /// Set, and not valid Unicode.
     NotUnicode,
+    /// Set to nothing, in a header, and the reference has no `:-default`: a credential that
+    /// expands to nothing (`Authorization: Bearer ` with the token gone) is a mistake, not a
+    /// header.
+    Empty,
 }
 
 impl fmt::Display for VarProblem {
@@ -20,6 +24,7 @@ impl fmt::Display for VarProblem {
         f.write_str(match self {
             Self::Missing => "is not set",
             Self::NotUnicode => "is not valid Unicode",
+            Self::Empty => "is empty",
         })
     }
 }

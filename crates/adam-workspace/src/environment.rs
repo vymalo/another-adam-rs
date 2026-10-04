@@ -532,6 +532,124 @@ impl EnvSession for LocalSession {
     }
 }
 
+/// An [`Environment`] that hides some variables of the caller's own environment from **every**
+/// process of every run, whatever the spec says: the names are added to each [`ExecSpec::hide`]
+/// before the inner session prepares it.
+///
+/// This is how a process that holds secrets keeps them from the code it runs for others (a
+/// repository's checks, a command the model asked for, a coding agent): the names are the
+/// deployment's, known at startup, and a caller that builds a spec cannot forget them. Everything
+/// else is the inner environment's: describe, kill, secrets, tool paths, release, rebuild.
+///
+/// ```
+/// use adam_workspace::{ExecSpec, HidingEnvironment, Local, NoProgress};
+/// # async fn demo(workspace: &adam_workspace::RunWorkspace) -> Result<(), adam_workspace::EnvError> {
+/// use adam_workspace::Environment as _;
+/// let env = HidingEnvironment::new(std::sync::Arc::new(Local), ["SEARCH_MCP_TOKEN"]);
+/// let session = env.ensure(workspace, &NoProgress).await?;
+/// let command = session.prepare(&ExecSpec::shell("env", "/work"))?;
+/// assert_eq!(command.env_remove, ["SEARCH_MCP_TOKEN"]);
+/// # Ok(()) }
+/// ```
+pub struct HidingEnvironment {
+    inner: DynEnvironment,
+    hidden: Arc<Vec<String>>,
+}
+
+impl HidingEnvironment {
+    /// `inner`, with `names` hidden from every process. Duplicates and blanks are dropped.
+    pub fn new<I, S>(inner: DynEnvironment, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut hidden: Vec<String> = Vec::new();
+        for name in names.into_iter().map(Into::into) {
+            if !name.trim().is_empty() && !hidden.contains(&name) {
+                hidden.push(name);
+            }
+        }
+        Self {
+            inner,
+            hidden: Arc::new(hidden),
+        }
+    }
+
+    /// The names hidden, in the order they were given.
+    pub fn hidden(&self) -> &[String] {
+        &self.hidden
+    }
+}
+
+impl fmt::Debug for HidingEnvironment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HidingEnvironment")
+            .field("hidden", &self.hidden)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl Environment for HidingEnvironment {
+    async fn ensure(
+        &self,
+        workspace: &RunWorkspace,
+        progress: &dyn EnvProgress,
+    ) -> Result<Arc<dyn EnvSession>, EnvError> {
+        let inner = self.inner.ensure(workspace, progress).await?;
+        Ok(Arc::new(HidingSession {
+            inner,
+            hidden: Arc::clone(&self.hidden),
+        }))
+    }
+
+    async fn release(&self, run: &str) -> Result<(), EnvError> {
+        self.inner.release(run).await
+    }
+
+    async fn held_runs(&self) -> Result<Vec<String>, EnvError> {
+        self.inner.held_runs().await
+    }
+
+    async fn rebuild(&self, run: &str, use_default: bool) -> Result<bool, EnvError> {
+        self.inner.rebuild(run, use_default).await
+    }
+}
+
+struct HidingSession {
+    inner: Arc<dyn EnvSession>,
+    hidden: Arc<Vec<String>>,
+}
+
+#[async_trait]
+impl EnvSession for HidingSession {
+    fn describe(&self) -> EnvDescription {
+        self.inner.describe()
+    }
+
+    fn prepare(&self, spec: &ExecSpec) -> Result<PreparedCommand, EnvError> {
+        let mut spec = spec.clone();
+        for name in self.hidden.iter() {
+            if !spec.hide.contains(name) {
+                spec.hide.push(name.clone());
+            }
+        }
+        self.inner.prepare(&spec)
+    }
+
+    async fn kill(&self, exec: &ExecId) {
+        self.inner.kill(exec).await;
+    }
+
+    fn tool_path(&self, name: &str) -> Option<PathBuf> {
+        self.inner.tool_path(name)
+    }
+
+    fn secret_ref(&self, name: &str) -> Option<SecretRef> {
+        self.inner.secret_ref(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,5 +791,51 @@ mod tests {
         assert!(!Local.rebuild("any-run", false).await.unwrap());
         assert!(!Local.rebuild("any-run", true).await.unwrap());
         assert_eq!(LocalSession.tool_path("opencode"), None);
+    }
+
+    #[tokio::test]
+    async fn a_hiding_environment_hides_its_names_from_every_command_and_keeps_the_specs_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HidingEnvironment::new(
+            Arc::new(Local),
+            ["MCP_SECRET", " ", "MCP_SECRET", "OTHER_SECRET"],
+        );
+        assert_eq!(env.hidden(), ["MCP_SECRET", "OTHER_SECRET"]);
+        let workspace = crate::Workspaces::new(
+            dir.path().join("root"),
+            Arc::new(crate::StaticToken::new("t")),
+        )
+        .run("run-1")
+        .unwrap();
+        let session = env.ensure(&workspace, &NoProgress).await.unwrap();
+        assert_eq!(session.describe().kind, EnvKind::Local);
+
+        // The caller's spec names one variable of its own and not ours; the command still has
+        // both removed, and the spec's own `env` for a hidden name does not bring it back.
+        let spec = ExecSpec::shell(
+            r#"printf '%s|%s|%s' "${MCP_SECRET-unset}" "${OTHER_SECRET-unset}" "${KEPT-unset}""#,
+            dir.path(),
+        )
+        .env("MCP_SECRET", "set by the caller")
+        .env("OTHER_SECRET", "set by the caller")
+        .env("KEPT", "kept")
+        .hide(["GITHUB_TOKEN"]);
+        let prepared = session.prepare(&spec).unwrap();
+        assert_eq!(
+            prepared.env_remove,
+            ["GITHUB_TOKEN", "MCP_SECRET", "OTHER_SECRET"]
+        );
+        let out = prepared.command().output().await.unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|unset|kept");
+
+        // The rest is the inner environment's.
+        assert!(env.held_runs().await.unwrap().is_empty());
+        env.release("any").await.unwrap();
+        assert!(!env.rebuild("any", false).await.unwrap());
+        assert_eq!(
+            session.secret_ref("model-key"),
+            Some(SecretRef::Env("MODEL_API_KEY".to_owned()))
+        );
     }
 }

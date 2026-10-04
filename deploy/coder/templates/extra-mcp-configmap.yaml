@@ -1,0 +1,14 @@
+{{- if include "coder.extraMcp" . }}
+# The extra MCP servers of the coder (values `mcp.*`), in the shape of mcp.json. The workers merge them over the
+# agent's own mcp.json at startup (ADAM_EXTRA_MCP_FILE); the agent's prompt and files stay in the binary. No
+# credential is in it: the headers are ${VAR} references, expanded from the pod's environment (the ExternalSecret).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coder.extraMcpConfigMapName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+data:
+  mcp.json: |
+    {{- include "coder.extraMcpJson" . | nindent 4 }}
+{{- end }}

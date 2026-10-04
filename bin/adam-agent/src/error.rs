@@ -38,6 +38,10 @@ pub enum AgentError {
          MCP_ALLOW_URL_VARS decide which kinds they may be)"
     )]
     Mcp(#[source] Box<AssemblyError>),
+    /// The file of extra MCP servers (`ADAM_EXTRA_MCP_FILE`) cannot be read, has errors, or names
+    /// a server the folder already has.
+    #[error("adding the extra MCP servers of ADAM_EXTRA_MCP_FILE to the folder's own")]
+    ExtraMcp(#[source] Box<AssemblyError>),
     /// The files and the code disagree: an unknown tool in `tools:`, a var with no value, a
     /// placeholder the frontmatter does not declare, a model alias the assembly refuses.
     #[error("assembling the agent")]
@@ -53,7 +57,7 @@ impl AgentError {
     pub(crate) fn own_class(&self) -> Option<ErrorClass> {
         match self {
             Self::Folder { .. } => Some(ErrorClass::Invalid),
-            Self::Card(e) | Self::Mcp(e) | Self::Assembly(e) => Some(e.class()),
+            Self::Card(e) | Self::Mcp(e) | Self::ExtraMcp(e) | Self::Assembly(e) => Some(e.class()),
             Self::Model(_) | Self::Serve(_) => None,
         }
     }

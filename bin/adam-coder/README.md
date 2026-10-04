@@ -1303,6 +1303,62 @@ rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
   that points `github` at another origin or gives it an `Authorization` header is refused at startup (78), and a
   `stdio` server of that name is left alone with a warning (a folder written before the sidecar keeps working).
 
+
+#### Extra MCP servers (`ADAM_EXTRA_MCP_FILE`)
+
+A deployment that wants the coder to have more MCP servers than its own `mcp.json` (the embedded copy's `github`, or the
+folder's) gives **one more file** instead of a copy of the agent's files. `ADAM_EXTRA_MCP_FILE` names it; the roles that
+run workers read it at startup, add its servers to the agent's own **before** `connect_mcp`
+(`AgentDef::with_extra_mcp_file`, [`adam-assembly`](../../crates/adam-assembly/README.md#extra-mcp-servers-adam_extra_mcp_file)),
+and log `extra MCP servers added to the agent's own` (with the loader's warnings). The chart renders it from its `mcp.*`
+values ([chart README](../../deploy/coder/README.md#extra-mcp-servers-web-search-and-context7)), so the prompt and the
+shipped files stay in the binary and cannot disagree with it.
+
+```json
+{ "mcpServers": {
+    "websearch": { "type": "http", "url": "http://search-mcp.ns.svc:8080/mcp",
+                   "headers": { "Authorization": "Bearer ${SEARCH_MCP_TOKEN}" }, "optional": true },
+    "context7":  { "type": "http", "url": "https://mcp.context7.com/mcp",
+                   "headers": { "Authorization": "Bearer ${CONTEXT7_API_KEY}" }, "optional": true } } }
+```
+
+* **Same rules as `mcp.json`**: the parser, `${VAR}` in `headers`, `args` and `env`, `tools`, the policy (`MCP_ALLOW_*`: a
+  plain `http` URL to another machine needs `MCP_ALLOW_INSECURE=true`, which is one switch for every server of the agent
+  and for the thread-tools endpoints a sender announces).
+* **A name clash is an error** (exit 78, one `path:line: error:` per name, nothing merged): the file adds servers and
+  never replaces the agent's own, `github` included.
+* **`optional: true`** (also allowed in `mcp.json`): an optional server that is down, refuses its credentials, cannot be
+  listed, lacks an allow-listed tool or whose variable has no value is skipped with a warning and the worker starts
+  without it (exit 69 is only for a required server that is down). A mistake in the file stays an error even for an optional
+  server (a command that does not exist, a refused URL, a server name the model cannot be shown). A header whose `${VAR}` is
+  **empty** (and has no default) is an error for a required server (exit 78: `Authorization: Bearer ` is never sent) and a
+  skip for an optional one.
+* **The variables a `mcp.json` names are this process's secrets.** Every `${VAR}` of the agent's own and the extra file's
+  servers (`AgentDef::mcp_env_references`, defaults included) is **hidden from every process a run starts** (the checks,
+  `run_command`, `run`, OpenCode, in the coder's own container: `HidingEnvironment` over the environment adds the names to
+  every `ExecSpec::hide`, beside the fixed lists `HIDDEN_FROM_CHECKS` and `HIDDEN_FROM_CHILD`), and **its value is
+  registered with the [`Redactor`](crate::Redactor) for good** (`Redactor::add_fixed`, which the installation tokens a GitHub
+  App mints never push out), so a repository's test script cannot read it with `env` and **the model never sees it**: what a
+  tool prints, an error and a step are scrubbed. (Commits are not scrubbed: a file a run writes is committed as it is.) The
+  startup log lists the names, the ones left alone and how many values were registered, never a value; the code is
+  [`mcp_secrets`](crate::mcp_secrets).
+  * **Never hidden**: `MODEL_API_KEY` (OpenCode reads it), `PATH`, `HOME`, `LANG`, `LC_*`, `TMPDIR`, `USER`. A file that
+    reads one (`"PATH": "${PATH}"` in a stdio server's `env`) would otherwise blank it for every command and redact it from
+    every output, so these names are skipped with a warning that names the variable. The server still gets the value when it
+    connects. (Skipping rather than refusing to start: a harmless `${HOME}` should not stop the coder.)
+* **What keeps those keys from repository code, and what does not.**
+  * The coder's own `git` (`add`, `apply`, the tree-id probes) starts from an **empty environment** plus a short allow-list
+    (`adam_workspace::confine_git_env`), because a `filter.<x>.clean` that a check script writes to `.git/config` and a
+    committed `.gitattributes` would otherwise run in the coder's full environment on its next `git add -A`.
+  * The process is **non-dumpable** at startup (`harden::make_non_dumpable`, `prctl(PR_SET_DUMPABLE, 0)` through `rustix`'s
+    safe call), so a child of the same user without `CAP_SYS_PTRACE` cannot read `/proc/<coder pid>/environ`.
+  * **Remaining**: the one invocation that carries the token (fetch, ls-remote, push) has it in its environment, and the
+    mirror guard that removes the configuration keys which would run a program there is a list, not a proof; a proxy URL with a password in `HTTPS_PROXY` is inherited by git; a process with `CAP_SYS_PTRACE`, or root,
+    reads everything (the chart drops all capabilities); a value shorter than four characters is not redacted; and a secret
+    a run's code is *given* on purpose (the model key OpenCode reads, a file the model reads) is as exposed as that act.
+* Tests: `tests/environment.rs` (`a_variable_a_mcp_json_names_is_*`, `the_names_the_coders_own_processes_need_*`), `src/config.rs`, `src/redact.rs`, `src/harden.rs`, `src/tools/gitcli.rs` (a malicious filter);
+  `adam-assembly/tests/extra_mcp.rs`, `adam-mcp/tests/http.rs` (`an_optional_server_*`).
+
 ### Retry safety
 
 Each tool's side effect runs inside `LlmAgent`'s journaled `tool:<call id>`
@@ -1385,6 +1441,7 @@ way; every problem is reported at once at startup):
 | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (the image sets them) | `devcontainer`, `podman-remote` |
 | `OPENCODE_BINARY` | with `podman`: the OpenCode mounted into every container; **a native executable (an ELF file)**, since it is mounted and run there | `OPENCODE_COMMAND`'s program, found on `PATH` and resolved to its real file |
 | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the prompt, card, skills, subagents and `mcp.json`, **read once at startup by every role**; it must be an existing directory (exit 78 naming the variable otherwise). See [A folder at run time](#a-folder-at-run-time-adam_agent_dir) | unset: the copy embedded in the binary |
+| `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers in the shape of `mcp.json`, **added** to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file (exit 78 naming the variable otherwise). A server name the agent already has is refused (exit 78, nothing is replaced). It is read with the loader of `mcp.json` (`${VAR}`, `tools`, `optional`). See [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file) | unset: only the agent's own servers |
 
 Everything from `MODEL_BASE_URL` down, except `ADAM_AGENT_DIR` (every role reads that one), is read by the roles that run workers (`all`, `worker`)
 only (the `MCP_ALLOW_*` flags too: a control plane connects no MCP server), and arrives in `Config::worker`, a `WorkerConfig` that is `Some` exactly for those roles.

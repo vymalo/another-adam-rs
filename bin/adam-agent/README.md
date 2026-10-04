@@ -167,6 +167,7 @@ same way; every problem is reported at once at startup):
 | Variable | Meaning | Default |
 |---|---|---|
 | `ADAM_AGENT_DIR` | the agent folder; **required by every role**, and an existing directory (exit 78 naming the variable otherwise) | required |
+| `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers in the shape of `mcp.json`, added to the folder's own before they connect (an existing file, else exit 78; a name the folder already has is refused, exit 78). Same parser, `${VAR}`, `tools`, `optional` and policy as `mcp.json`; the variables it names are scrubbed from the tool-call steps like the folder's own (`redact::step_io_named`). See [`adam-assembly`](../../crates/adam-assembly/README.md#extra-mcp-servers-adam_extra_mcp_file) | unset: only the folder's servers |
 | `ROLE` | what this process runs: `all`, `control-plane` or `worker` (see [Roles](#roles)) | `all` |
 | `DATABASE_URL` | Postgres for the run store | required |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
@@ -179,6 +180,8 @@ same way; every problem is reported at once at startup):
 | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the folder's MCP servers may be (see above) | `false` each |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 | `RUST_LOG` | log filter (JSON logs on stdout) | `info` |
+
+**`optional` and `tools:`**: a server marked `optional: true` that is skipped (down, no key, a missing allow-listed tool) has no tools, so a `tools:` entry of the agent that names one of them (`search__web_search`, `search__*`) makes the folder exit 78 at startup. Leave an optional server's tools out of `tools:`, or make the server required.
 
 There is no `GITHUB_TOKEN`, no workspace and no placement: the agent has no worktree. Runs are not pinned to a
 worker, so several workers share one database and any of them steps any run.
@@ -253,6 +256,7 @@ The binary is `main.rs` over a small library, so everything it does is testable 
 | `folder::load(path)`, `folder::log(&folder)` | read the folder (every diagnostic in the error), say which files run |
 | `card_of(&def, &public_url)` | the A2A card the files declare |
 | `assemble(def, model, alias, &policy)` | connect the MCP servers, bind `ask_user`, `show` and `ui_catalog` and the thread-tools source (the `policy` is also the one for the thread-tools URL), give the root and each subagent the model: the `Assembly`. `assemble_with(.., step_io)` also says how the tool-call steps report their input and output |
+| `redact::step_io_named(&config, vars, &names)`, `redact::secret_values_named` | the same, and also the variables in `names` whatever their names look like (`AgentDef::mcp_env_references`: what the folder's and the extra file's servers read as `${VAR}`); `serve` uses it |
 | `redact::step_io(&config, vars)`, `redact::secret_values` | the `StepIo` that scrubs the secrets of the configuration and of the environment variables `vars` (`redact::process_vars()` in `serve`: the process's, without what is not text) from the input and output of every tool-call step; `WorkerParts::step_io` carries it |
 | `agents(def, card, workers)` | the `Agents` for `adam_service::serve` or a composition of your own: the whole agent with `workers: Some(WorkerParts)`, its starter with `None` |
 | `AgentError`, `exit_code(&err)` | why a step failed, and the exit code of a chain of causes |

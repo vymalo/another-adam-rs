@@ -22,9 +22,15 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.podAnnotations (include "coder.extraMcp" .) }}
       annotations:
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if include "coder.extraMcp" . }}
+        {{- /* A changed servers file is a deploy: the file is read at startup only. */}}
+        checksum/extra-mcp: {{ include (print $.Template.BasePath "/extra-mcp-configmap.yaml") . | sha256sum }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
@@ -129,6 +135,16 @@ spec:
             {{- /* Kept for one release: a vendored agent folder written before the GitHub MCP server became a sidecar (ADR 0017, D4) still starts it as a child process. The shipped mcp.json no longer does. The image sets nothing; a control plane connects no MCP server. */}}
             - name: MCP_ALLOW_STDIO
               value: "true"
+            {{- if include "coder.extraMcp" . }}
+            {{- /* The extra MCP servers (mcp.*): merged over the agent's own mcp.json at startup. */}}
+            - name: ADAM_EXTRA_MCP_FILE
+              value: {{ include "coder.extraMcpFile" . | quote }}
+            {{- end }}
+            {{- if include "coder.mcpInsecure" . }}
+            {{- /* mcp.websearch.allowInsecure: plain http to another machine, for EVERY server of the agent and for the thread-tools endpoints a sender announces. Never automatic. */}}
+            - name: MCP_ALLOW_INSECURE
+              value: "true"
+            {{- end }}
             {{- if include "coder.githubMcp" . }}
             {{- /* The sidecar below, on loopback: the coder gives each call to it the credentials of that call. The shipped mcp.json names port 8082. */}}
             - name: GITHUB_MCP_URL
@@ -192,6 +208,20 @@ spec:
                   name: {{ include "coder.secretName" . }}
                   key: GITHUB_TOKEN
             {{- end }}
+            {{- if include "coder.mcpWebsearch" . }}
+            - name: SEARCH_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coder.secretName" . }}
+                  key: SEARCH_MCP_TOKEN
+            {{- end }}
+            {{- if include "coder.mcpContext7" . }}
+            - name: CONTEXT7_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coder.secretName" . }}
+                  key: CONTEXT7_API_KEY
+            {{- end }}
             {{- end }}
             {{- if not $split }}
             - name: A2A_BEARER_TOKENS
@@ -230,7 +260,12 @@ spec:
               mountPath: /var/run/secrets/github-app
               readOnly: true
             {{- end }}
-      {{- if or (include "coder.sharedWork" .) $githubApp }}
+            {{- if include "coder.extraMcp" . }}
+            - name: extra-mcp
+              mountPath: {{ include "coder.extraMcpDir" . }}
+              readOnly: true
+            {{- end }}
+      {{- if or (include "coder.sharedWork" .) $githubApp (include "coder.extraMcp" .) }}
       volumes:
         {{- if include "coder.sharedWork" . }}
         - name: work
@@ -246,6 +281,13 @@ spec:
             items:
               - key: private-key.pem
                 path: private-key.pem
+        {{- end }}
+        {{- if include "coder.extraMcp" . }}
+        - name: extra-mcp
+          configMap:
+            name: {{ include "coder.extraMcpConfigMapName" . }}
+            # Readable by the runtime user whatever fsGroup does: a mcp.json of ${VAR} references, no secret.
+            defaultMode: 0444
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

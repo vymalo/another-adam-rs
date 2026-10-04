@@ -522,6 +522,9 @@ async fn the_servers_of_mcp_json_give_the_agent_their_tools() {
 async fn an_mcp_tools_step_carries_its_title_input_and_output_without_the_processs_secrets() {
     use futures::StreamExt as _;
     const FROM_THE_ENVIRONMENT: &str = "env-secret-4f9a1c7d";
+    // A value whose variable's name says nothing (`SEARCH_ACCESS`): only the `mcp.json` that reads it
+    // makes it a secret (`AgentDef::mcp_env_references`).
+    const NAMED_ONLY: &str = "named-only-5d2b8e61";
     const MODEL_KEY: &str = "sk-model-key-8b2e";
 
     let server = TestHttpServer::start(Some(MCP_TOKEN)).await;
@@ -531,7 +534,7 @@ async fn an_mcp_tools_step_carries_its_title_input_and_output_without_the_proces
     mock.push_tool_calls(vec![ToolCall {
         id: "m1".into(),
         name: "test__echo".into(),
-        arguments: json!({"text": format!("found {FROM_THE_ENVIRONMENT} and {MODEL_KEY}")}),
+        arguments: json!({"text": format!("found {FROM_THE_ENVIRONMENT} and {MODEL_KEY} and {NAMED_ONLY}")}),
     }])
     .push_text("ok");
     let model: DynModel = mock.clone();
@@ -556,9 +559,13 @@ async fn an_mcp_tools_step_carries_its_title_input_and_output_without_the_proces
     };
     let config = adam_agent::Config::from_lookup(lookup).expect("a valid configuration");
     let mut parts = worker_parts(model);
-    parts.step_io = adam_agent::redact::step_io(
+    parts.step_io = adam_agent::redact::step_io_named(
         &config,
-        [("SEARCH_API_KEY".to_owned(), FROM_THE_ENVIRONMENT.to_owned())],
+        [
+            ("SEARCH_API_KEY".to_owned(), FROM_THE_ENVIRONMENT.to_owned()),
+            ("SEARCH_ACCESS".to_owned(), NAMED_ONLY.to_owned()),
+        ],
+        &["SEARCH_ACCESS".to_owned()].into(),
     );
     let agents = build(def_with_env(&folder, None), None, Some(parts))
         .await
@@ -605,15 +612,15 @@ async fn an_mcp_tools_step_carries_its_title_input_and_output_without_the_proces
     assert_eq!(report(false)["label"], "Echo it back");
     assert_eq!(
         report(false)["input"],
-        json!({"text": "found [redacted] and [redacted]"})
+        json!({"text": "found [redacted] and [redacted] and [redacted]"})
     );
     assert_eq!(
         report(true)["output"],
-        json!({"text": "found [redacted] and [redacted]"})
+        json!({"text": "found [redacted] and [redacted] and [redacted]"})
     );
     // What the model was told is what the tool answered: the copy for the observer is the one scrubbed.
     let everything = serde_json::to_string(&reports).unwrap();
-    for secret in [FROM_THE_ENVIRONMENT, MODEL_KEY, MCP_TOKEN] {
+    for secret in [FROM_THE_ENVIRONMENT, MODEL_KEY, NAMED_ONLY, MCP_TOKEN] {
         assert!(!everything.contains(secret), "{secret} in {everything}");
     }
 }

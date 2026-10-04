@@ -54,7 +54,7 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 
 | Item | What |
 |---|---|
-| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`), `name()`, `manifest()`, `bind(ToolSet)` |
+| `AgentDef` | `from_manifest(impl IntoManifest)`, `card(url, version)` (feature `a2a`; the root's card before anything is bound), `from_source(&impl ManifestSource, Strictness)` (one per agent of a package, with the bytes of the skills' files), `resources_from(&impl ManifestSource)`, `var(name, value)`, `agent_var(agent, name, value)`, `env(name, value)` (a value for the environment variable `auth: bearer:VAR` reads), `allow_insecure_remotes(bool)`, `remote_timeout(Duration)`, `mcp_tools(agent, ToolSet)` (the MCP tools of an agent, from a client of your own), `connect_mcp(&McpPolicy)` (feature `mcp`: connect to the servers of every agent's `mcp.json`), `with_extra_mcp(McpConfig, &Path)` and `with_extra_mcp_file(&Path)` (add the servers of another file to the root's own `mcp.json`; a name both have is an error, see [Extra MCP servers](#extra-mcp-servers-adam_extra_mcp_file)), `mcp_env_references()` (the `${VAR}` names every local agent's servers refer to), `name()`, `manifest()`, `bind(ToolSet)` |
 | `IntoManifest` | `AgentManifest`, `&AgentManifest`, `EmbeddedAgent` and `&EmbeddedAgent` (what `include_agent!` gives; these bring the bytes of the skills' files) |
 | `SkillFiles` | the bytes of the files skills bundle (opaque: made by `IntoManifest` and `resources_from`) |
 | `LOAD_SKILL`, `READ_SKILL_FILE` | the names of the two skill tools |
@@ -67,6 +67,7 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `connect_mcp(&McpPolicy)` (feature `mcp`), `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
 | `Reloaded`, `ToolChange`, `ReloadError`, `WatchError` (feature `dev`) | what a reload did (`generation`, `changed`, `tool_changes`, `retired`), why it changed nothing (`Load(Error)` with `diagnostics()`, `NeedsRestart { added }`), why a watcher did not start |
 | `AgentFolder` | one agent read from a folder when the process starts (no feature): `AgentFolder::load(path)` gives `root`, `def` (an `AgentDef`), `warnings` and `digest`; the folder holds exactly one agent, else `Error::NotOneAgent` |
+| `extra_mcp_file_from_env`, `EXTRA_MCP_FILE_ENV` | `ADAM_EXTRA_MCP_FILE` when set and not blank, else `None`: a file of extra MCP servers (below). No feature |
 | `agent_dir_from_env`, `agent_dir`, `AGENT_DIR_ENV`, `AgentDef::from_dir` | where the folder is: `ADAM_AGENT_DIR` when set and not blank (`agent_dir_from_env` is `None` otherwise, `agent_dir(default)` falls back to `default`), and one `AgentDef` per agent of a directory. No feature |
 | `Error`, `Origin` | the closed error enum, and the agent and file every file-related variant carries |
 | `AliasProblem`, `TemplateProblem`, `SkillField`, `ToolClash`, `RemoteAuthProblem`, `RemoteUrlProblem` | closed enums inside `Error::ModelAlias`, `Error::Template`, `Error::UnknownSkill`, `Error::SubagentToolClash` (which may name a parent's MCP tool: `ToolClash::McpTool`), `Error::RemoteAuth` and `Error::RemoteUrl` |
@@ -542,6 +543,25 @@ let assembly = AgentDef::from_manifest(AGENT)?
   (the root's for the root, a subagent directory's for that subagent). They are not added to the `ToolSet` given
   to `bind`, so a subagent inherits none of its parent's, and two directories may each have a server called
   `linear`, connected separately with their own headers. `connect_mcp` walks the root and every local subagent.
+
+### Extra MCP servers (`ADAM_EXTRA_MCP_FILE`)
+
+A deployment that wants an agent to have more MCP servers than its folder (or its embedded copy) names does not copy
+the agent's files: it gives **one more file** in the shape of `mcp.json`, and the binary adds its servers to the root
+agent's own before `connect_mcp`. `AgentDef::with_extra_mcp_file(path)` reads it with the loader of `mcp.json`
+(`adam_agent_fs::parse_mcp`: the same fields, `${VAR}` and `optional`), returns the definition and what the loader
+warned about, and `AgentDef::with_extra_mcp(config, path)` is the same for a config already parsed. The rules:
+
+* a server name that the agent already has is an error (`Error::Manifest`, `Invalid`, one `path:line: error:` per
+  name, naming the extra file): a file added over an agent never replaces one of its servers, and nothing is added;
+* an unreadable file is `Error::Io` and one with errors is `Invalid`, both before anything connects (exit 78 in the
+  binaries);
+* the servers of subagents are untouched; the digest of a folder is the folder's, not the sum;
+* `mcp_env_references()` is the union of the `${VAR}` names of every local agent's servers, extras included:
+  `adam-coder` hides exactly those from the processes it starts and registers their values with its redactor.
+
+`adam-coder` and `adam-agent` read the file named by `ADAM_EXTRA_MCP_FILE` (`EXTRA_MCP_FILE_ENV`, `extra_mcp_file_from_env`).
+Tests: `tests/extra_mcp.rs`.
 * **Selection is `tools:`.** The catalog `tools:` selects from is the registered tools plus the agent's own MCP
   tools, so `tools: [ask_user, "linear__*"]`, a misspelt name with its suggestion and `NoToolMatches` all work as
   before. A root without `tools:` gets everything registered and its own MCP tools; a subagent that lists none

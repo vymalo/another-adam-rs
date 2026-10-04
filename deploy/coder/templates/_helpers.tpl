@@ -167,3 +167,90 @@ of its own, which is today's single-worker render.
 {{- define "coder.workClaim" -}}
 {{- default (printf "%s-work" (include "coder.fullname" .) | trunc 63 | trimSuffix "-") .Values.workspace.sharedVolume.existingClaim -}}
 {{- end -}}
+
+{{/*
+The extra MCP servers (values `mcp.*`, off by default). websearch is on when its url is set, context7 when
+mcp.context7.enabled is true (the string "false" is off). Each renders "true" or nothing. The binary merges
+them over the agent's own mcp.json at startup (ADAM_EXTRA_MCP_FILE): the chart ships no copy of the agent's files.
+*/}}
+{{- define "coder.mcpWebsearch" -}}
+{{- if trim (toString .Values.mcp.websearch.url) -}}true{{- end -}}
+{{- end -}}
+
+{{- define "coder.mcpContext7" -}}
+{{- if eq (toString .Values.mcp.context7.enabled) "true" -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Whether this pod gets the extra servers file: one is on, and the role runs workers (only a worker connects an MCP
+server). "true" or nothing.
+*/}}
+{{- define "coder.extraMcp" -}}
+{{- if and (or (include "coder.mcpWebsearch" .) (include "coder.mcpContext7" .)) (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/* Name of the ConfigMap that holds the extra servers file. */}}
+{{- define "coder.extraMcpConfigMapName" -}}
+{{- printf "%s-mcp" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Where it is mounted, and ADAM_EXTRA_MCP_FILE. */}}
+{{- define "coder.extraMcpDir" -}}/etc/adam/extra-mcp{{- end -}}
+{{- define "coder.extraMcpFile" -}}/etc/adam/extra-mcp/mcp.json{{- end -}}
+
+{{/*
+Whether an extra server's URL is plain http to another machine, which the coder refuses unless the deployment sets
+MCP_ALLOW_INSECURE (the same rule as crates/adam-mcp/src/url.rs: https, or http to localhost, *.localhost and loopback).
+Takes the URL; renders "true" or nothing.
+*/}}
+{{- define "coder.plainHttpRemote" -}}
+{{- $url := lower (trim (toString .)) -}}
+{{- if and (hasPrefix "http://" $url) (not (regexMatch "^http://(localhost|[^/:?#]*\\.localhost|127\\.[0-9.]+|\\[::1\\])([:/?#]|$)" $url)) -}}true{{- end -}}
+{{- end -}}
+
+{{/* Whether a server of the extra file is at a plain http URL to another machine. "true" or nothing. */}}
+{{- define "coder.mcpPlainHttp" -}}
+{{- if or (and (include "coder.mcpWebsearch" .) (include "coder.plainHttpRemote" .Values.mcp.websearch.url)) (and (include "coder.mcpContext7" .) (include "coder.plainHttpRemote" .Values.mcp.context7.url)) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Whether config.extraEnv sets MCP_ALLOW_INSECURE to a true value (the binary reads true and 1, without case).
+"true" or nothing.
+*/}}
+{{- define "coder.extraEnvInsecure" -}}
+{{- if has (lower (toString (get .Values.config.extraEnv "MCP_ALLOW_INSECURE"))) (list "true" "1") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the chart sets MCP_ALLOW_INSECURE on the workers: a server of the extra file is at a plain http URL to
+another machine (Context7's included, whichever servers are on), mcp.websearch.allowInsecure is true, and
+extraEnv does not set the variable already. Never automatic. "true" or nothing.
+*/}}
+{{- define "coder.mcpInsecure" -}}
+{{- if and (include "coder.runsWorkers" .) (include "coder.mcpPlainHttp" .) (eq (toString .Values.mcp.websearch.allowInsecure) "true") (not (hasKey .Values.config.extraEnv "MCP_ALLOW_INSECURE")) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The extra servers file: `{"mcpServers": {...}}` with the servers that are on, in the shape of mcp.json. A server's
+key is its id: the model sees its tools as `<id>__<tool>`. Credentials are `${VAR}` references, filled from the
+environment when a worker starts, never values: SEARCH_MCP_TOKEN and CONTEXT7_API_KEY come from the ExternalSecret.
+`optional` is written only when true (the binary's default is required).
+*/}}
+{{- define "coder.extraMcpJson" -}}
+{{- $servers := dict -}}
+{{- if include "coder.mcpWebsearch" . -}}
+{{- $s := .Values.mcp.websearch -}}
+{{- $server := dict "type" "http" "url" (trim $s.url) "headers" (dict $s.header (printf "%s${SEARCH_MCP_TOKEN}" (toString $s.valuePrefix))) -}}
+{{- if $s.tools -}}{{- $_ := set $server "tools" $s.tools -}}{{- end -}}
+{{- if $s.optional -}}{{- $_ := set $server "optional" true -}}{{- end -}}
+{{- $_ := set $servers "websearch" $server -}}
+{{- end -}}
+{{- if include "coder.mcpContext7" . -}}
+{{- $s := .Values.mcp.context7 -}}
+{{- $server := dict "type" "http" "url" (trim $s.url) "headers" (dict $s.header (printf "%s${CONTEXT7_API_KEY}" (toString $s.valuePrefix))) -}}
+{{- if $s.tools -}}{{- $_ := set $server "tools" $s.tools -}}{{- end -}}
+{{- if $s.optional -}}{{- $_ := set $server "optional" true -}}{{- end -}}
+{{- $_ := set $servers "context7" $server -}}
+{{- end -}}
+{{- toPrettyJson (dict "mcpServers" $servers) -}}
+{{- end -}}

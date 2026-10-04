@@ -35,7 +35,7 @@ Directory walking uses `std::fs`, so there is no `walkdir` dependency either.
 | `Schedule` | `name` (`a/b` from the path), `cron`, `timezone`, `agent`, `prompt` |
 | `AgentFrontmatter`, `Limits`, `Card`, `ToolList`, `ModelRef`, `SkillSelection` | the shared agent and subagent schema; unknown keys are kept in `extra` |
 | `SkillFrontmatter`, `ScheduleFrontmatter` | the other two YAML schemas |
-| `McpConfig`, `McpServer`, `RemoteKind`, `EnvRef` | `mcp.json`; `env_references()` lists the `${VAR}` names, never values |
+| `McpConfig`, `McpServer`, `RemoteKind`, `EnvRef` | `mcp.json`; `env_references()` lists the `${VAR}` names, never values; `merged_with(extra)` adds the servers of another config and refuses a name both have (it returns the clashing names, nothing merged); `McpServer::is_optional()` is `optional: true` (a server that may be missing at startup; `McpServer`'s variants gained the field `optional`, so a struct pattern without `..` or a literal breaks) |
 | `split_env_references(text)`, `Segment` | the one grammar of `${VAR}` / `${VAR:-default}`: a text cut into `Literal` and `Ref(EnvRef)` segments (a `${` that is not a reference stays in the literal text). `env_references()` is built on it, and so is the run-time expansion of `adam-mcp`; a property test checks that it agrees with the scanner it replaced and that the segments write back to the text. `EnvRef::written()` is the reference as written |
 | `split(text)` | the frontmatter splitter: `Split { frontmatter, body, .. }` or `SplitError::Unterminated` |
 | `parse_skill`, `parse_mcp` | the pure text-to-value parsers, for callers that hold text and not a directory |
