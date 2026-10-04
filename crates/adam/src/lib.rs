@@ -5,8 +5,8 @@ pub use adam_agent_fs as agent_fs;
 pub use adam_assembly as assembly;
 pub use adam_assembly::{
     AGENT_DIR_ENV, AgentDef, AgentFolder, AgentInfo, AliasProblem, Assembly, BoundDef,
-    Error as AssemblyError, IntoManifest, Origin, RemoteInfo, TemplateProblem, agent_dir,
-    agent_dir_from_env,
+    EXTRA_MCP_FILE_ENV, Error as AssemblyError, IntoManifest, Origin, RemoteInfo, TemplateProblem,
+    agent_dir, agent_dir_from_env, extra_mcp_file_from_env,
 };
 // Dev reload, only with the feature `dev`: the agent directory watched and swapped when a file
 // changes. See `adam_assembly::LiveAssembly`.

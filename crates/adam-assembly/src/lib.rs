@@ -163,7 +163,10 @@ pub use dev::{
 pub use error::{
     AliasProblem, Error, Origin, RemoteAuthProblem, RemoteUrlProblem, SkillField, ToolClash,
 };
-pub use folder::{AGENT_DIR_ENV, AgentFolder, agent_dir, agent_dir_from_env};
+pub use folder::{
+    AGENT_DIR_ENV, AgentFolder, EXTRA_MCP_FILE_ENV, agent_dir, agent_dir_from_env,
+    extra_mcp_file_from_env,
+};
 pub use skills::{LOAD_SKILL, READ_SKILL_FILE, SkillError, SkillFiles};
 pub use subagent::SubagentTool;
 pub use template::TemplateProblem;
