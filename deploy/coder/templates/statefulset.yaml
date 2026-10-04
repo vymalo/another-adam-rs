@@ -72,9 +72,10 @@ spec:
             - name: GITHUB_HOST
               value: {{ . | quote }}
           {{- end }}
+          {{- /* An exec probe, not tcpSocket: the kubelet's TCP probe connects to the pod IP, and the server listens on loopback only. */}}
           startupProbe:
-            tcpSocket:
-              port: {{ int64 .Values.githubMcp.port }}
+            exec:
+              command: ["bash", "-c", {{ printf "exec 3<>/dev/tcp/127.0.0.1/%d" (int64 .Values.githubMcp.port) | quote }}]
             periodSeconds: 2
             failureThreshold: 30
           resources:

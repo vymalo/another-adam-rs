@@ -110,8 +110,8 @@ spec:
             - --port
             - "8082"
           startupProbe:
-            tcpSocket:
-              port: 8082
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8082"]
             periodSeconds: 2
             failureThreshold: 30
           resources:
