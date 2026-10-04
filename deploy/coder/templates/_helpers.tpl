@@ -213,17 +213,21 @@ Takes the URL; renders "true" or nothing.
 {{- if or (and (include "coder.mcpWebsearch" .) (include "coder.plainHttpRemote" .Values.mcp.websearch.url)) (and (include "coder.mcpContext7" .) (include "coder.plainHttpRemote" .Values.mcp.context7.url)) -}}true{{- end -}}
 {{- end -}}
 
-{{/* Whether the deployment sets MCP_ALLOW_INSECURE itself, in config.extraEnv. "true" or nothing. */}}
+{{/*
+Whether config.extraEnv sets MCP_ALLOW_INSECURE to a true value (the binary reads true and 1, without case).
+"true" or nothing.
+*/}}
 {{- define "coder.extraEnvInsecure" -}}
-{{- if eq (toString (get .Values.config.extraEnv "MCP_ALLOW_INSECURE")) "true" -}}true{{- end -}}
+{{- if has (lower (toString (get .Values.config.extraEnv "MCP_ALLOW_INSECURE"))) (list "true" "1") -}}true{{- end -}}
 {{- end -}}
 
 {{/*
-Whether the chart sets MCP_ALLOW_INSECURE on the workers: only when websearch is on, mcp.websearch.allowInsecure is
-true and extraEnv does not set it already. Never automatic. "true" or nothing.
+Whether the chart sets MCP_ALLOW_INSECURE on the workers: a server of the extra file is at a plain http URL to
+another machine (Context7's included, whichever servers are on), mcp.websearch.allowInsecure is true, and
+extraEnv does not set the variable already. Never automatic. "true" or nothing.
 */}}
 {{- define "coder.mcpInsecure" -}}
-{{- if and (include "coder.runsWorkers" .) (include "coder.mcpWebsearch" .) (eq (toString .Values.mcp.websearch.allowInsecure) "true") (not (hasKey .Values.config.extraEnv "MCP_ALLOW_INSECURE")) -}}true{{- end -}}
+{{- if and (include "coder.runsWorkers" .) (include "coder.mcpPlainHttp" .) (eq (toString .Values.mcp.websearch.allowInsecure) "true") (not (hasKey .Values.config.extraEnv "MCP_ALLOW_INSECURE")) -}}true{{- end -}}
 {{- end -}}
 
 {{/*

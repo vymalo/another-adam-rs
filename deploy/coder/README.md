@@ -358,9 +358,11 @@ without.
   expanded when a worker starts. The ConfigMap has no secret in it. `valuePrefix` is plain text (`Bearer `): a `${` in it
   fails the render. With `externalSecrets.enabled: false` the render fails too, because a key has nowhere else to come from.
 * **The binary keeps those keys from repository code.** Every `${VAR}` a `mcp.json` names (the agent's own and this file's)
-  is hidden from every process a run starts (a repository's checks, `run_command`, OpenCode) and its value is redacted from
-  tool output, the steps and commits (`bin/adam-coder/README.md`, "Extra MCP servers"); a process of the same user can still
-  read `/proc/<pid>/environ` of the coder, as it can for `GITHUB_TOKEN`.
+  is hidden from every process a run starts (a repository's checks, `run_command`, OpenCode), and its value is scrubbed from
+  tool output, errors and steps, so the model never sees it (commits are not scrubbed). The coder's own `git` starts from an
+  empty environment, and the process is non-dumpable, so a child cannot read `/proc/<pid>/environ`. What remains (the token
+  of the one `git` invocation that fetches or pushes, a proxy URL with a password, a process with `CAP_SYS_PTRACE`) is listed
+  in `bin/adam-coder/README.md`, "Extra MCP servers" and [ADR 0018](../../docs/decisions/0018-extra-mcp-servers-are-a-file-merged-over-the-agents-own.md).
 * **All the properties are read under `externalSecrets.key`.** Set it to the AWS secret that holds `search_mcp_token` and
   `context7_api_key` (and the coder's own properties, or point them at the properties of that secret).
 * **The URL of a server is no secret** and the render refuses one with a user name, a password, a `${VAR}` or a scheme other

@@ -681,6 +681,22 @@ helm_mcp --set mcp.websearch.url=$search_url --set-string config.extraEnv.MCP_AL
 check "... one MCP_ALLOW_INSECURE, the deployment's" count 'name: MCP_ALLOW_INSECURE$' 1
 check "a plain http Context7 URL needs the opt-in too" \
   fails helm_mcp --set mcp.context7.enabled=true --set mcp.context7.url=http://ctx.example.com/mcp
+check "a plain http Context7 URL with the opt-in sets MCP_ALLOW_INSECURE although websearch is off" \
+  helm_mcp --set mcp.context7.enabled=true --set mcp.context7.url=http://ctx.example.com/mcp --set mcp.websearch.allowInsecure=true
+helm_mcp --set mcp.context7.enabled=true --set mcp.context7.url=http://ctx.example.com/mcp --set mcp.websearch.allowInsecure=true > "$out"
+check "... once, on the worker" count 'name: MCP_ALLOW_INSECURE$' 1
+check "extraEnv MCP_ALLOW_INSECURE=\"false\" with a plain http URL fails" \
+  fails helm_mcp --set mcp.websearch.url=$search_url --set mcp.websearch.allowInsecure=true --set-string config.extraEnv.MCP_ALLOW_INSECURE=false
+message=$(helm_mcp --set mcp.websearch.url=$search_url --set-string config.extraEnv.MCP_ALLOW_INSECURE=false 2>&1 || true)
+check "... and the error says so" says "$message" 'config.extraEnv.MCP_ALLOW_INSECURE is "false"'
+check "extraEnv MCP_ALLOW_INSECURE=\"false\" with an https URL is the deployment's business" \
+  helm_mcp --set mcp.websearch.url=https://search.example.com/mcp --set-string config.extraEnv.MCP_ALLOW_INSECURE=false
+check "extraEnv MCP_ALLOW_INSECURE=1 counts as the opt-in" \
+  helm_mcp --set mcp.websearch.url=$search_url --set-string config.extraEnv.MCP_ALLOW_INSECURE=1
+check "allowInsecure with an https URL sets nothing" \
+  helm_mcp --set mcp.websearch.url=https://search.example.com/mcp --set mcp.websearch.allowInsecure=true
+helm_mcp --set mcp.websearch.url=https://search.example.com/mcp --set mcp.websearch.allowInsecure=true > "$out"
+check "... no MCP_ALLOW_INSECURE" lacks 'MCP_ALLOW_INSECURE'
 check "allowInsecure with no server on renders nothing" \
   helm_mcp --set mcp.websearch.allowInsecure=true
 helm_mcp --set mcp.websearch.allowInsecure=true > "$out"

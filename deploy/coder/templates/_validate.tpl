@@ -75,6 +75,9 @@ from service.yaml, which every render contains, so they always run.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- if and (include "coder.mcpPlainHttp" .) (hasKey .Values.config.extraEnv "MCP_ALLOW_INSECURE") (not (include "coder.extraEnvInsecure" .)) -}}
+{{- fail (printf "config.extraEnv.MCP_ALLOW_INSECURE is %q while an extra MCP server is at a plain http:// URL on another machine: the coder would refuse that server at startup. Set it to \"true\" (knowing that it covers every MCP server and the thread-tools endpoints), remove it, or use an https URL" (toString (get .Values.config.extraEnv "MCP_ALLOW_INSECURE"))) -}}
+{{- end -}}
 {{- if and (include "coder.mcpPlainHttp" .) (not (eq (toString .Values.mcp.websearch.allowInsecure) "true")) (not (include "coder.extraEnvInsecure" .)) -}}
 {{- fail "an extra MCP server is at a plain http:// URL on another machine, which the coder refuses unless MCP_ALLOW_INSECURE is set: set mcp.websearch.allowInsecure=true (or config.extraEnv.MCP_ALLOW_INSECURE=\"true\") knowing that it covers every MCP server of the agent and the thread-tools endpoints senders announce, and that the bearer crosses the network in the clear; or use an https URL" -}}
 {{- end -}}
