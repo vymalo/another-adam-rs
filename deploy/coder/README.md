@@ -50,18 +50,82 @@ a devcontainer, but this deployment runs without a container runtime"), and a to
 | Env | AWS property (default) | Rendered for |
 |---|---|---|
 | `MODEL_API_KEY` | `adam_coder_model_api_key` | roles that run workers (`all`, `worker`) |
+| `MODEL_BASE_URL` | `model_base_url` (`externalSecrets.properties.modelBaseUrl`) | roles that run workers, only with `config.modelBaseUrlFromSecret: true`, see [The model gateway's URL from the secret](#the-model-gateways-url-from-the-secret) |
 | `GITHUB_TOKEN` | `adam_coder_github_token` | roles that run workers (`all`, `worker`), with `github.auth: token` (the default) |
 | `A2A_BEARER_TOKENS` | `adam_coder_a2a_bearer_tokens` (comma-separated) | roles that serve A2A (`all`, `control-plane`): the front with `topology: split`, not the worker |
 | `SEARCH_MCP_TOKEN` | `search_mcp_token` (`externalSecrets.properties.searchMcpToken`) | roles that run workers, only with `mcp.websearch.url` set, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 | `CONTEXT7_API_KEY` | `context7_api_key` (`externalSecrets.properties.context7ApiKey`) | roles that run workers, only with `mcp.context7.enabled`, same section |
 
-With `config.role=control-plane` the chart renders neither `MODEL_API_KEY` nor `GITHUB_TOKEN`,
+`MODEL_BASE_URL` is a secret only by choice: the default is a literal from `config.modelBaseUrl`. With `config.role=control-plane` the chart renders neither `MODEL_API_KEY` nor `GITHUB_TOKEN`,
 in the pod or in the `ExternalSecret`, and `externalSecrets.properties.modelApiKey` and
 `githubToken` may be `null`. For the other roles those two properties are `required`: a render
 without them fails (`githubToken` only with `github.auth: token`; see [GitHub](#github-a-token-or-an-app-installation)).
 
 The orchestrator holds one of the bearer tokens (its agent list names the
 environment variable it reads it from).
+
+## The model gateway's URL from the secret
+
+By default `MODEL_BASE_URL` is the literal `config.modelBaseUrl` (a placeholder, `https://gateway.example.invalid/v1`, that is never
+a real gateway). A deployment that does not want its gateway's URL written in git sets `config.modelBaseUrlFromSecret: true`: the
+worker's `MODEL_BASE_URL` is then a `secretKeyRef` to the chart's Secret, and the `ExternalSecret` copies one more key into it.
+
+```yaml
+externalSecrets:
+  key: prod/another-agentic/env       # the AWS secret that holds model_base_url
+  # properties.modelBaseUrl: model_base_url   # the default name of the JSON property
+config:
+  modelBaseUrlFromSecret: true        # and no config.modelBaseUrl: the placeholder, or empty, counts as unset
+```
+
+A deployment sets exactly: `config.modelBaseUrlFromSecret=true`, `externalSecrets.key` to the AWS secret that holds the property
+(`prod/another-agentic/env`), and, only if the property is not called `model_base_url`, `externalSecrets.properties.modelBaseUrl`.
+The AWS property itself holds the full URL with its `/v1` prefix, for example `https://api.ai.camer.digital/v1`, and that value is not in
+this repository.
+
+| | |
+|---|---|
+| Rendered for | the roles that run workers (`all`, `worker`; the split worker), like `MODEL_API_KEY`. A control plane and the split front render nothing, read no property, and need none: the option does nothing for them |
+| In the pod | `MODEL_BASE_URL` `valueFrom.secretKeyRef` (`<secret>`, key `MODEL_BASE_URL`), once, in place of `value:` |
+| In the `ExternalSecret` | `secretKey: MODEL_BASE_URL`, `remoteRef.property: externalSecrets.properties.modelBaseUrl` under `externalSecrets.key` |
+| Everything else | unchanged: `MODEL`, `OPENCODE_MODEL` and `MODEL_API_KEY` are as before, and the default render is byte for byte `tests/golden/combined.yaml` |
+
+**What reads the URL.** Only the binary, from the environment variable, at startup (`bin/adam-coder/src/config.rs`). OpenCode's inline
+configuration is built from it at run time (`bin/adam-coder/src/opencode.rs`, `baseURL`), so it needs nothing from the chart. Nothing else in
+the chart uses the URL: the `NetworkPolicy` leaves egress open, the extra MCP servers' file and the front do not name it. The chart renders
+the literal in no template when the option is on (`tests/render-check.sh` asserts that the placeholder appears nowhere in the render). **No
+Rust change and no new image are needed**: the binary already reads `MODEL_BASE_URL` and does not care where Kubernetes got it, so the chart
+and the image can be deployed in any order.
+
+**Refusals** (`templates/_validate.tpl`; each stops `helm template` and `helm install`, not the rollout):
+
+* `config.modelBaseUrlFromSecret` is not `true` or `false` (a quoted `"false"` is refused, not read as on).
+* The option with a `config.modelBaseUrl` that is a real URL: it would be written in git and ignored. **The default placeholder counts as unset**,
+  and so does an empty or `null` value, so a deployment only has to leave `config.modelBaseUrl` alone; the error never prints the URL.
+* The option with `MODEL_BASE_URL` in `config.extraEnv` (the chart sets it itself, and a second entry would win silently).
+* The option with `externalSecrets.enabled=false` (a URL kept out of git has nowhere else to come from) or with
+  `externalSecrets.properties.modelBaseUrl` empty or `null`.
+
+**Order of operations: put the AWS property in place before turning the option on** (the same rule as the
+[extra MCP servers](#extra-mcp-servers-web-search-and-context7)).
+
+1. Add `model_base_url` to the AWS secret `externalSecrets.key` names, with the URL as its value. Check that it is not empty: a blank
+   value is refused by the binary at startup (`MODEL_BASE_URL is required`, `crates/adam-service/src/config.rs`).
+2. Then set `config.modelBaseUrlFromSecret=true` (and drop any `config.modelBaseUrl` of your own).
+
+If you turn it on first, **a property that is missing in AWS fails the whole ExternalSecret sync** (see "What happens when you do not" in
+the extra MCP servers' section): `MODEL_API_KEY`, `GITHUB_TOKEN` and `A2A_BEARER_TOKENS` stop being refreshed too, and the new pods wait in
+`CreateContainerConfigError` for a key the Secret does not have yet. Rolling back is `config.modelBaseUrlFromSecret=false` with
+`config.modelBaseUrl` set again.
+
+**Changing the URL later.** A container reads a `secretKeyRef` at start, and the chart does not hash the Secret, so a new value in AWS
+reaches the pods only when they restart (External Secrets refreshes the Secret every `externalSecrets.refreshInterval`, then
+`kubectl rollout restart statefulset/<release>`): the same as `MODEL_API_KEY`.
+
+**What this does not hide.** The URL is not a credential: it is kept out of git, not out of the cluster. It is still in the pod's environment
+(visible to whoever can `exec` into it or read the pod spec, which names the Secret but not the value) and the binary logs its configuration at
+startup with the URL in it (`ModelConfig`'s `Debug` prints `base_url`, `crates/adam-service/src/config.rs`), so it reaches the pod's logs. Hiding it
+from the logs would be a Rust change; none is made here. Keep the credential, `MODEL_API_KEY`, in the same place as before.
 
 ## Topology
 
@@ -170,7 +234,7 @@ refuses a non-empty `config.role`. See the crate README (`bin/adam-coder/README.
 "Roles") for what each role starts and needs.
 
 A control plane needs no model, GitHub or workspace configuration, so with
-`config.role=control-plane` the chart leaves out `MODEL_BASE_URL`, `MODEL`, `OPENCODE_MODEL`,
+`config.role=control-plane` the chart leaves out `MODEL_BASE_URL` (the literal, or the Secret key of `config.modelBaseUrlFromSecret`), `MODEL`, `OPENCODE_MODEL`,
 `WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `WORKSPACE_SWEEP_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
 `PR_DRAFT`, `GIT_AUTHOR_*`, `WORKSPACE_ROOT`, `GITHUB_MCP_URL` and the GitHub MCP server sidecar, the GitHub App settings and key volume (`github.auth: app`) and the two secrets above (the helper
 `coder.runsWorkers` in `templates/_helpers.tpl`). The render of `all` and `worker` is unchanged.

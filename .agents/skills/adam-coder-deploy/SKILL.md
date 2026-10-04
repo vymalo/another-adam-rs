@@ -62,6 +62,15 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    * Secrets come from an `ExternalSecret` (`externalSecrets.*`): `MODEL_API_KEY`, `GITHUB_TOKEN`,
      `A2A_BEARER_TOKENS`. The defaults point at one owner's cluster (`secretStoreRef`, `key`):
      override them for yours.
+   * The model gateway's URL (`MODEL_BASE_URL`) is the literal `config.modelBaseUrl` (a placeholder by
+     default). To keep it out of git set `config.modelBaseUrlFromSecret: true`: the workers read it by
+     `secretKeyRef` and the ExternalSecret copies `externalSecrets.properties.modelBaseUrl`
+     (`model_base_url`) from `externalSecrets.key`. Leave `config.modelBaseUrl` unset (the placeholder
+     counts as unset; a real URL beside the option is refused, as are `externalSecrets.enabled=false`, a
+     missing property name and `MODEL_BASE_URL` in `config.extraEnv`). Add the AWS property before turning
+     it on: a missing property fails the whole ExternalSecret sync. Chart only: the binary reads the
+     env var either way, so there is no image dependency (chart README, "The model gateway's URL from the
+     secret").
    * `mcp.websearch.url` (our web search MCP Service, in cluster) and `mcp.context7.enabled` (hosted
      Context7), both off by default and byte-for-byte invisible when off. With either on, the chart renders
      ONE file of servers (a ConfigMap in the shape of `mcp.json`, no copy of the agent's prompt) and sets
