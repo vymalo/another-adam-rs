@@ -140,8 +140,8 @@ async fn the_prompt_carries_the_rules_the_code_relies_on() {
         // The answer is announced with the thread tool when the model has it, and the prompt reads
         // the same without it (the reply that ends the turn is the answer, as before).
         "**If you have a `turn_output` tool**",
-        "**do not repeat the answer after it**",
-        "your last words are your answer, as they are when you have\n  no such tool",
+        "**the turn ends with the call**",
+        "your last words are your answer,\n  as they are when you have no such tool",
     ] {
         assert!(text.contains(needle), "prompt lost: {needle}");
     }

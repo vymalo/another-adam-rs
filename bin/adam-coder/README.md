@@ -1142,7 +1142,8 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
   above") and puts the result first; and replies render as Markdown (headings, bold, lists, tables, links, code
   blocks), so the coder uses them when they help and not for a one-line answer. **When it has a `turn_output` tool** (the
   thread tool of an orchestration layer that lists it, [ADR 0014](../../docs/decisions/0014-a-turn-output-answer-is-the-runs-answer.md))
-  it gives that answer by calling the tool with the whole answer, ends with one short line and does not repeat the answer;
+  it gives that answer by calling the tool with the whole answer once everything else is done and writes nothing after it (the
+  call ends the turn: no closing line, no copy of the answer);
   the instructions read the same without the tool (the reply that ends the turn is the answer) and when the call fails.
   `show` and `ui_catalog` are as
   [`adam-ui`](../../crates/adam-ui/README.md) makes them (`show` refuses a `Choices` form: ask with `ask_user`).
