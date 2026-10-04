@@ -7,7 +7,7 @@ pub mod exit;
 mod serve;
 mod service;
 
-pub use adam_model_openai::OpenAiConfigError;
+pub use adam_model_openai::{OpenAiConfigError, endpoint_for_logs};
 #[cfg(feature = "mcp")]
 pub use config::McpSettings;
 pub use config::{

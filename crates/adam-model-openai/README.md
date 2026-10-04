@@ -39,7 +39,10 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   for headers and then the silence between chunks.
 * The key is a `SecretString`, sent as a sensitive `Authorization: Bearer`
   header, and never appears in `Debug`, errors or logs. An empty key sends no
-  header.
+  header. The gateway's address is not shown either: the `Debug` of `OpenAiConfig` and of
+  `OpenAiCompatible` print its scheme, host and port only (`endpoint_for_logs(url)`, public: `<unset>` for a blank
+  one, `<set>` for one that is no absolute URL), because a deployment keeps the address in a secret
+  (an internal host, a tenant in the path, a key in the query).
 * A message whose content has several text parts (a continued conversation merges adjacent
   user messages) goes out as **one string**, the parts joined with a blank line (`\n\n`); the
   parts stay in the stored state. An array of typed parts is for a part that is not text
@@ -83,7 +86,7 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
   tool calls, error mapping and classes, timeouts, source chains). Always
   runs, no network.
 * Unit tests: `src/errors.rs` (`status_mapping`), `src/lib.rs`
-  (`config_error_class_table`) and `src/wire.rs` (the request shape, including several text parts
+  (`config_error_class_table`, `debug_shows_the_gateway_by_scheme_and_host_only`) and `src/wire.rs` (the request shape, including several text parts
   sent as one string).
 * `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
   streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`)

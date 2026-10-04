@@ -43,7 +43,7 @@ use std::str::FromStr;
 use adam_error::{Classify, ErrorClass};
 use adam_host::Role;
 use adam_model::DynModel;
-use adam_model_openai::{OpenAiCompatible, OpenAiConfig, OpenAiConfigError};
+use adam_model_openai::{OpenAiCompatible, OpenAiConfig, OpenAiConfigError, endpoint_for_logs};
 use secrecy::SecretString;
 use url::Url;
 
@@ -187,7 +187,13 @@ impl std::fmt::Debug for ServiceConfig {
             .field("role", &self.role)
             .field("database_url", &"[REDACTED]")
             .field("a2a_bearer_tokens", &self.a2a_bearer_tokens.len())
-            .field("public_url", &self.public_url.as_ref().map(Url::as_str))
+            .field(
+                "public_url",
+                &self
+                    .public_url
+                    .as_ref()
+                    .map(|u| endpoint_for_logs(u.as_str())),
+            )
             .field("listen_addr", &self.listen_addr)
             .field("worker", &self.worker)
             .finish()
@@ -339,7 +345,8 @@ pub struct ModelConfig {
 impl std::fmt::Debug for ModelConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelConfig")
-            .field("base_url", &self.base_url)
+            // The gateway's address is a secret of the deployment: scheme and host only.
+            .field("base_url", &endpoint_for_logs(&self.base_url))
             .field("alias", &self.alias)
             .finish_non_exhaustive()
     }
@@ -768,6 +775,9 @@ mod tests {
         assert_eq!(model.base_url, "https://gw.example/v1");
         assert_eq!(model.alias, "large");
         assert!(!format!("{model:?}").contains("sk-secret"));
+        // The gateway's address is kept in a secret by deployments: only its scheme and host print.
+        assert!(format!("{model:?}").contains("https://gw.example"));
+        assert!(!format!("{model:?}").contains("/v1"));
         model.client().expect("a usable client");
 
         // An empty key is allowed, an unset one is not.

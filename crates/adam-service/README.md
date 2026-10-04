@@ -31,7 +31,7 @@ an agent does.
 |---|---|
 | `ServiceConfig::parse(&lookup, &mut problems)` | `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`, and for a role that runs workers `WORKERS` and `WORKER_ID`. A role reads only what it uses; every problem is collected, none stops the parse |
 | `WorkerSettings` | `WORKERS` (at least 1) and `WORKER_ID` (`is_worker_id`); `options()` gives the `RuntimeOptions` |
-| `ModelConfig::parse`, `client()` | `MODEL_BASE_URL`, `MODEL_API_KEY` (may be empty, not unset), `MODEL`; the OpenAI-compatible client over them |
+| `ModelConfig::parse`, `client()` | `MODEL_BASE_URL`, `MODEL_API_KEY` (may be empty, not unset), `MODEL`; the OpenAI-compatible client over them. Its `Debug` (the startup log prints the configuration) shows the gateway by **scheme and host only** (`adam_service::endpoint_for_logs`, re-exported from `adam-model-openai`), the key not at all, and `ServiceConfig`'s shows `PUBLIC_URL` the same way and `DATABASE_URL` as `[REDACTED]`: deployments keep these addresses in secrets |
 | `McpSettings::parse`, `policy()` (feature `mcp`) | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` and `THREAD_TOOLS_MAX_CALL_SECS`; the `McpPolicy` for `AgentDef::connect_mcp` and the thread-tools client |
 | `parse_or`, `parse_flag`, `parse_file`, `is_worker_id` | the helpers a binary parses its own variables with, into the same list of problems (`parse_file`: an existing file, or a problem naming the variable; `ADAM_EXTRA_MCP_FILE` of `adam-coder` and `adam-agent`) |
 | `ConfigError { problems }` | what a non-empty list becomes (`ConfigError::check(problems)`); `Classify` gives `Invalid` |
