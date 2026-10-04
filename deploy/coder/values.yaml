@@ -151,35 +151,50 @@ githubMcp:
       memory: 256Mi
 
 # Extra MCP servers for the coder, on top of the GitHub one. Both are off by default, and with both off the
-# render is exactly what it was without this block. With either on, the chart supplies the coder's whole
-# agent folder as a ConfigMap (the shipped prompt and card, and the shipped mcp.json plus these servers),
-# mounted at ADAM_AGENT_DIR in every pod, so ADAM_AGENT_DIR is then the chart's: leave it out of
-# config.extraEnv. The coder has them in every conversation: the model sees their tools as
-# `websearch__<tool>` and `context7__<tool>`. The keys are never values: they come from the ExternalSecret
-# (externalSecrets.properties.searchMcpToken, .context7ApiKey) into the environment of the workers, and
-# mcp.json holds `${SEARCH_MCP_TOKEN}` and `${CONTEXT7_API_KEY}`, expanded when a worker starts.
+# render is exactly what it was without this block. With either on, the chart renders ONE file of servers
+# (a ConfigMap, in the shape of mcp.json) and sets ADAM_EXTRA_MCP_FILE on the workers: the binary merges
+# it over the agent's own mcp.json at startup (a name clash with the agent's own servers stops it, exit 78).
+# The agent's prompt and files stay in the binary, so the chart and the image cannot disagree about them.
+# The coder has them in every conversation: the model sees their tools as `websearch__<tool>` and
+# `context7__<tool>`. The keys are never values: they come from the ExternalSecret
+# (externalSecrets.properties.searchMcpToken, .context7ApiKey) into the environment of the workers, the
+# file holds `${SEARCH_MCP_TOKEN}` and `${CONTEXT7_API_KEY}`, and the binary hides every variable a
+# mcp.json names from the checks, commands and OpenCode it starts, and redacts its value from tool output.
+#
+# Put the AWS properties in place BEFORE turning a server on (README "Extra MCP servers": a property that is
+# missing in AWS fails the whole ExternalSecret sync, a key missing from the Secret keeps new pods in
+# CreateContainerConfigError, and an empty value is refused by the binary).
 mcp:
   # Our web search server (Brave behind our own MCP pod, deployed by the another-agentic-system
   # chart). On when `url` is set; empty (default) is off. The Service of that release, in cluster, for
-  # example http://<service>.<namespace>.svc.cluster.local:<port>/mcp. A plain http URL to another
-  # machine is refused by the coder unless MCP_ALLOW_INSECURE is set, which the chart then does on the
-  # workers (the bearer crosses the cluster network in the clear: prefer https where the server has it).
+  # example http://<service>.<namespace>.svc.cluster.local:<port>/mcp.
   websearch:
     url: ""
     # The request header that carries the token, and the text before it (the value is
     # `<valuePrefix>${SEARCH_MCP_TOKEN}`): `Authorization: Bearer <token>` by default.
     header: Authorization
     valuePrefix: "Bearer "
-    # Optional allow-list of the server's tools (adam extension of mcp.json). Empty keeps all of them;
-    # a name the server does not have stops the worker at startup (exit 78/69).
+    # Optional allow-list of the server's tools (a list). Empty keeps all of them; a name the server lacks
+    # skips an optional server (and stops a required one).
     tools: []
-  # Context7, the hosted documentation server. On with `enabled: true`.
+    # A third party that is down must not crash-loop the coder: an optional server that cannot be
+    # reached or listed, or whose key has no value, is skipped with a warning and the worker starts
+    # without it. false makes it required (the worker exits 69 while it is down).
+    optional: true
+    # A plain http:// URL to a host that is not this machine is refused by the coder unless
+    # MCP_ALLOW_INSECURE is set, and the render fails without one of: this value true (the chart then
+    # sets MCP_ALLOW_INSECURE on the workers), or config.extraEnv.MCP_ALLOW_INSECURE: "true". The variable
+    # is ONE switch: it covers every MCP server of the agent and the thread-tools endpoints that A2A
+    # senders announce, and the bearer crosses the network in the clear. Prefer an https URL.
+    allowInsecure: false
+  # Context7, the hosted documentation server. On with `enabled: true` (a boolean).
   context7:
     enabled: false
     url: https://mcp.context7.com/mcp
     header: Authorization
     valuePrefix: "Bearer "
     tools: []
+    optional: true
 
 service:
   port: 8080

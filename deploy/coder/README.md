@@ -14,7 +14,7 @@ own CloudNativePG database, for the `netcup-k8s` cluster.
 | `NetworkPolicy` | (both workloads with `topology: split`) ingress only from the namespace `another-agentic-system`; egress open (git, the gateway, registries) |
 | `Cluster` (CNPG) | the coder's database; `DATABASE_URL` is the `uri` key of the `<release>-db-app` Secret CNPG creates |
 | `ExternalSecret` | `ssegning-aws` / `prod/meta/test-app`; the property of each value is in `externalSecrets.properties` |
-| `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-agent`, the coder's agent folder (prompt, card and `mcp.json`), mounted at `ADAM_AGENT_DIR` in every pod, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
+| `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-mcp`, one file of extra MCP servers in the shape of `mcp.json`, mounted in the pods that run workers and named by `ADAM_EXTRA_MCP_FILE`, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 
 ```sh
 helm lint deploy/coder
@@ -270,10 +270,11 @@ organisation; a token needs the `repo` scope.
 
 The binary reads its prompt, card and skills from the folder `ADAM_AGENT_DIR` names, once, at startup
 (`bin/adam-coder/README.md`, "Where the prompt and the card live"); unset, it runs the copy embedded in the
-image, which is what this chart deploys **unless an [extra MCP server](#extra-mcp-servers-web-search-and-context7)
-is on**: then the chart mounts its own folder (a ConfigMap) and sets `ADAM_AGENT_DIR` itself. Beyond that the chart
-does not expose a folder of your own, and `config.extraEnv.ADAM_AGENT_DIR` alone would name a path the pod does not
-have, which stops the pod with exit code 78 (with an extra MCP server on, the chart refuses it at render time).
+image, which is what this chart deploys. **The chart does not expose a folder**: it has no volume for one, and
+`config.extraEnv.ADAM_AGENT_DIR` alone would name a path the pod does not have, which stops the pod with exit code
+78. What the chart can add to the embedded files is MCP servers, as one extra file
+([below](#extra-mcp-servers-web-search-and-context7)): the prompt and the card stay in the binary, so the chart and
+the image cannot disagree about them.
 
 ## Extra MCP servers: web search and Context7
 
@@ -284,61 +285,93 @@ both off the render is byte for byte what it was (`tests/golden/combined.yaml`).
 | | `websearch` | `context7` |
 |---|---|---|
 | What | our web search server (Brave behind our own MCP pod, deployed by the `another-agentic-system` chart) | Context7, hosted (library documentation) |
-| Turned on by | `mcp.websearch.url`: **the URL of the Service**, in cluster (empty is off) | `mcp.context7.enabled: true` |
+| Turned on by | `mcp.websearch.url`: **the URL of the Service**, in cluster (empty is off) | `mcp.context7.enabled: true` (a boolean) |
 | URL | the value, for example `http://<service>.<namespace>.svc.cluster.local:<port>/mcp` | `mcp.context7.url`, default `https://mcp.context7.com/mcp` |
 | Header | `mcp.websearch.header: value`, default `Authorization: Bearer <token>` | `Authorization: Bearer <key>` (`mcp.context7.header` and `valuePrefix` are values too) |
 | Secret env var | `SEARCH_MCP_TOKEN` | `CONTEXT7_API_KEY` |
 | AWS property | `search_mcp_token` (`externalSecrets.properties.searchMcpToken`) | `context7_api_key` (`externalSecrets.properties.context7ApiKey`) |
-| Optional | `mcp.websearch.tools`: an allow-list (empty keeps every tool of the server) | `mcp.context7.tools`, for example `[resolve-library-id, query-docs]` |
+| `optional` | `mcp.websearch.optional`, default `true` | `mcp.context7.optional`, default `true` |
+| Optional | `mcp.websearch.tools`: an allow-list (a list; empty keeps every tool of the server) | `mcp.context7.tools`, for example `[resolve-library-id, query-docs]` |
+| Plain `http` | needs `mcp.websearch.allowInsecure: true` (below) | needs the same opt-in |
 
 ```yaml
 externalSecrets:
   key: prod/another-agentic/env        # the AWS secret that holds search_mcp_token and context7_api_key
 mcp:
   websearch:
-    url: http://<service>.<namespace>.svc.cluster.local:<port>/mcp   # the web search Service of the another-agentic-system release
+    url: https://<service>.<namespace>.svc.cluster.local:<port>/mcp   # the web search Service of the another-agentic-system release
+    # url: http://...  needs  allowInsecure: true  (see below)
   context7:
     enabled: true
 ```
 
-**How it works.** The coder reads one agent folder, and the image holds the shipped one only inside the binary, so with
-either server on the chart builds the folder: `agent/instructions.md` and `agent/mcp.json` in this chart are copies of
-`bin/adam-coder/agent/` (`tests/render-check.sh` fails when they differ: change both together), and the ConfigMap
-`<release>-coder-agent` holds the prompt as it is and the `mcp.json` with the servers that are on added. It is mounted
-read-only at `/etc/adam/agent` in **every pod** of the release (the control plane serves the card from it, the workers
-build the agent from it, so they agree), with `ADAM_AGENT_DIR=/etc/adam/agent`. A change to it rolls the pods (a
-`checksum/agent-files` annotation): the folder is read at startup only, and a changed tool set can fail the replay of a
-run that is mid-turn, as any deploy of new code can ([ADR 0004](../../docs/decisions/0004-agent-folders-at-run-time.md)).
-The rendered entries:
+**How it works.** The coder reads one agent folder, and the image holds the shipped one only inside the binary. The
+chart therefore does not copy it: with either server on it renders **one file of servers**, the ConfigMap
+`<release>-coder-mcp` (`mcp.json` in the shape of the agent's, with only `websearch` and/or `context7`), mounts it
+read-only at `/etc/adam/extra-mcp` in the pods that run workers (the combined pod, the split worker; not the front, not a
+control plane), and sets `ADAM_EXTRA_MCP_FILE=/etc/adam/extra-mcp/mcp.json`. At startup the worker adds those servers to
+the agent's own (`github`) before it connects them ([ADR 0018](../../docs/decisions/0018-extra-mcp-servers-are-a-file-merged-over-the-agents-own.md),
+`bin/adam-coder/README.md`, "Extra MCP servers"); a name clash with one of the agent's own servers stops it (exit 78). A
+change to the file rolls the pods (`checksum/extra-mcp`): the file is read at startup only, and a changed tool set can
+fail the replay of a run that is mid-turn, as any deploy of new code can
+([ADR 0004](../../docs/decisions/0004-agent-folders-at-run-time.md)). The rendered entries:
 
 ```json
-"websearch": { "type": "http", "url": "<mcp.websearch.url>", "headers": { "Authorization": "Bearer ${SEARCH_MCP_TOKEN}" } },
-"context7":  { "type": "http", "url": "https://mcp.context7.com/mcp", "headers": { "Authorization": "Bearer ${CONTEXT7_API_KEY}" } }
+"websearch": { "type": "http", "url": "<mcp.websearch.url>", "headers": { "Authorization": "Bearer ${SEARCH_MCP_TOKEN}" }, "optional": true },
+"context7":  { "type": "http", "url": "https://mcp.context7.com/mcp", "headers": { "Authorization": "Bearer ${CONTEXT7_API_KEY}" }, "optional": true }
 ```
 
-The `github` entry is the shipped one, and follows `githubMcp.port` while the sidecar runs (the coder refuses a `github`
-URL whose origin is not `GITHUB_MCP_URL`). `tests/render-check.sh` parses the rendered `mcp.json` with `jq`; the same
-text, as a symlinked ConfigMap mount, was loaded by `adam_assembly::AgentFolder::load` and
-`adam_agent_fs::Dir` under `Strictness::Strict` (no warning; `websearch`, `context7` and `github` as `http` servers; the
-references `CONTEXT7_API_KEY` and `SEARCH_MCP_TOKEN`), *verified 2026-10-04* on this revision.
+`tests/render-check.sh` parses the rendered file with `jq`. The same entries, in a file next to the agent's, were loaded by
+`adam_assembly::AgentDef::with_extra_mcp_file` (tests in `crates/adam-assembly/tests/extra_mcp.rs`): the same parser as
+`mcp.json`, the `${VAR}` references `CONTEXT7_API_KEY` and `SEARCH_MCP_TOKEN`.
+
+**Order of operations: put the AWS properties in place before turning an option on.**
+
+1. Add `search_mcp_token` and/or `context7_api_key` to the AWS secret `externalSecrets.key` names
+   (`prod/another-agentic/env`). Check them: an **empty value** is refused by the binary (below).
+2. Make sure the web search Service is up and its token is the one you stored.
+3. Then set `mcp.websearch.url` / `mcp.context7.enabled`.
+
+What happens when you do not:
+
+* **A property that is missing in AWS fails the whole ExternalSecret sync**: External Secrets does not create the Secret
+  with the keys it could read, it reports the error and keeps the previous Secret. The existing keys (`MODEL_API_KEY`,
+  `GITHUB_TOKEN`, `A2A_BEARER_TOKENS`) stop being refreshed too, so a rotation of those is frozen until the property is
+  there. This is why the properties come first.
+* **A key that is missing from the Secret** (the Secret exists but the sync has not added the key yet) leaves the new pods
+  in `CreateContainerConfigError`; the pods that are running keep running.
+* **An empty value** (the property exists and is blank) is not sent: the binary refuses a header whose `${VAR}` is empty. A
+  required server stops the worker (exit 78, naming the variable, never the value); an `optional` one is skipped with a
+  warning (`the optional MCP server is skipped`), so web search is silently absent until the value is fixed. Look for that
+  line in the worker's log.
+
+**Optional servers.** Both are `optional: true` by default (`mcp.websearch.optional`, `mcp.context7.optional`): a
+third party that is down, a key with no value, a refused credential or an allow-list that names a tool the server lacks is
+**skipped with a warning** and the worker starts without it, instead of exiting 69 and crash-looping the coder. The coder
+does not retry later: its tools exist from the next restart. Set `optional: false` for a server the coder must not run
+without.
 
 **The trust boundary.**
 
 * **The keys are never chart values.** They come from the `ExternalSecret` (`SEARCH_MCP_TOKEN`, `CONTEXT7_API_KEY`) into the
-  environment of the roles that run workers only, and `mcp.json` holds `${SEARCH_MCP_TOKEN}` and `${CONTEXT7_API_KEY}`,
-  expanded when a worker starts (an unset one stops it with exit 78, naming the variable, never the value). The ConfigMap
-  has no secret in it. The control plane and the split front read the folder and get no key (they connect no server).
-  `valuePrefix` is plain text (`Bearer `): a `${` in it fails the render. With `externalSecrets.enabled: false` the
-  render fails too, because a key has nowhere else to come from.
+  environment of the roles that run workers only, and the file holds `${SEARCH_MCP_TOKEN}` and `${CONTEXT7_API_KEY}`,
+  expanded when a worker starts. The ConfigMap has no secret in it. `valuePrefix` is plain text (`Bearer `): a `${` in it
+  fails the render. With `externalSecrets.enabled: false` the render fails too, because a key has nowhere else to come from.
+* **The binary keeps those keys from repository code.** Every `${VAR}` a `mcp.json` names (the agent's own and this file's)
+  is hidden from every process a run starts (a repository's checks, `run_command`, OpenCode) and its value is redacted from
+  tool output, the steps and commits (`bin/adam-coder/README.md`, "Extra MCP servers"); a process of the same user can still
+  read `/proc/<pid>/environ` of the coder, as it can for `GITHUB_TOKEN`.
 * **All the properties are read under `externalSecrets.key`.** Set it to the AWS secret that holds `search_mcp_token` and
   `context7_api_key` (and the coder's own properties, or point them at the properties of that secret).
 * **The URL of a server is no secret** and the render refuses one with a user name, a password, a `${VAR}` or a scheme other
   than `http`/`https` in it (a URL reaches the logs).
-* **A plain `http` URL to another machine is refused by the coder** unless `MCP_ALLOW_INSECURE=true`
-  (`crates/adam-mcp/src/url.rs`: https, or http to `localhost` and loopback). For an in-cluster Service over `http` the
-  chart therefore sets it on the workers, unless `config.extraEnv` sets it. **It is one switch for every server of the folder**
-  and the bearer then crosses the cluster network in the clear: serve the web search Service over `https` where you can
-  (the chart sets nothing for an `https` URL, and for a loopback one).
+* **Plain `http` is an explicit opt-in, never automatic.** The coder refuses a plain `http` URL to another machine unless
+  `MCP_ALLOW_INSECURE=true`. The render **fails** for such a URL (websearch, or a Context7 URL you override) without
+  `mcp.websearch.allowInsecure: true` (the chart then sets `MCP_ALLOW_INSECURE=true` on the workers) or the deployment's own
+  `config.extraEnv.MCP_ALLOW_INSECURE: "true"` (the chart then sets nothing, so it is not duplicated). **That variable is one
+  switch**: it applies to every MCP server of the agent, and to the thread-tools endpoints that A2A senders announce
+  (`serve.rs`, `adam-ui`'s thread-tools client), and the bearer crosses the network in the clear. Serve the Service over `https`
+  where you can; an `https` or loopback URL needs none of this.
 * **Context7 is hosted**: its API key goes out of the cluster, in an `Authorization` header over HTTPS, and what the model
   asks of it (a library name, a question) is sent to Context7.
 
@@ -348,13 +381,20 @@ the web search Service (same namespace or another) and to `mcp.context7.com` on 
 adding both. The web search Service's own `NetworkPolicy` (in the `another-agentic-system` chart) must admit the coder's
 pods, and a cluster-wide default-deny egress is the cluster's to open for Context7's host.
 
+**The GitHub sidecar's port.** The agent's own `mcp.json` names the `github` server at `http://127.0.0.1:8082/`, and the coder
+refuses a `github` URL whose origin is not `GITHUB_MCP_URL`. `githubMcp.port` sets `GITHUB_MCP_URL` and the sidecar's port
+but not the embedded file, so **any value other than 8082 stops the worker (exit 78)** until the agent's files name that
+port: this was already so before the extra servers, and the extra file never touches `github`.
+
 **Facts about Context7**, *verified 2026-10-04* in Context7's documentation
 (<https://context7.com/docs/resources/all-clients>, <https://github.com/upstash/context7>): the remote MCP endpoint is
 `https://mcp.context7.com/mcp` (`/mcp/oauth` is its OAuth variant); the API key is sent as `Authorization: Bearer
 YOUR_API_KEY` (the documentation's configurations for the clients it lists use that header, not a `CONTEXT7_API_KEY`
 header); its tools are `resolve-library-id` and `query-docs`. *Unverified*: that the server accepts a key obtained
 from the dashboard for every plan, and the web search server's own header and tool names (the system side is built in
-parallel): `mcp.websearch.header`, `valuePrefix` and `tools` are values for that reason.
+parallel): `mcp.websearch.header`, `valuePrefix` and `tools` are values for that reason. *Unverified*: how External Secrets
+behaves for a missing property beyond what its documentation says (the sync fails and the Secret is not updated); not tried
+on the cluster.
 
 ## Known risks
 

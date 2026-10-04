@@ -44,10 +44,15 @@ from service.yaml, which every render contains, so they always run.
 {{- fail (printf "githubMcp.port must be a port number (1 to 65535), got %q" (toString .Values.githubMcp.port)) -}}
 {{- end -}}
 {{- end -}}
-{{- if include "coder.agentFolder" . -}}
-{{- /* The extra MCP servers (values `mcp.*`). The chart owns the agent folder then. */ -}}
-{{- if hasKey .Values.config.extraEnv "ADAM_AGENT_DIR" -}}
-{{- fail "config.extraEnv.ADAM_AGENT_DIR is set while mcp.websearch.url or mcp.context7.enabled is on: the chart then mounts the agent folder (the shipped files plus those servers) at ADAM_AGENT_DIR itself" -}}
+{{- /* The extra MCP servers (values `mcp.*`): a file the binary merges over the agent's own mcp.json. */ -}}
+{{- range $path, $value := dict "mcp.context7.enabled" .Values.mcp.context7.enabled "mcp.websearch.allowInsecure" .Values.mcp.websearch.allowInsecure -}}
+{{- if not (has (toString $value) (list "true" "false")) -}}
+{{- fail (printf "%s must be true or false, got %q" $path (toString $value)) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (include "coder.mcpWebsearch" .) (include "coder.mcpContext7" .) -}}
+{{- if hasKey .Values.config.extraEnv "ADAM_EXTRA_MCP_FILE" -}}
+{{- fail "config.extraEnv.ADAM_EXTRA_MCP_FILE is set while mcp.websearch.url or mcp.context7.enabled is on: the chart then sets it itself, to the file it mounts" -}}
 {{- end -}}
 {{- range $id, $on := dict "websearch" (include "coder.mcpWebsearch" .) "context7" (include "coder.mcpContext7" .) -}}
 {{- if $on -}}
@@ -62,7 +67,16 @@ from service.yaml, which every render contains, so they always run.
 {{- if contains "${" (toString $s.valuePrefix) -}}
 {{- fail (printf "mcp.%s.valuePrefix must be plain text such as \"Bearer \": the token is added by the chart, from the Secret" $id) -}}
 {{- end -}}
+{{- if not (kindIs "slice" $s.tools) -}}
+{{- fail (printf "mcp.%s.tools must be a list of tool names (for example [web_search]), got %q" $id (toString $s.tools)) -}}
 {{- end -}}
+{{- if not (kindIs "bool" $s.optional) -}}
+{{- fail (printf "mcp.%s.optional must be true or false, got %q" $id (toString $s.optional)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and (include "coder.mcpPlainHttp" .) (not (eq (toString .Values.mcp.websearch.allowInsecure) "true")) (not (include "coder.extraEnvInsecure" .)) -}}
+{{- fail "an extra MCP server is at a plain http:// URL on another machine, which the coder refuses unless MCP_ALLOW_INSECURE is set: set mcp.websearch.allowInsecure=true (or config.extraEnv.MCP_ALLOW_INSECURE=\"true\") knowing that it covers every MCP server of the agent and the thread-tools endpoints senders announce, and that the bearer crosses the network in the clear; or use an https URL" -}}
 {{- end -}}
 {{- if include "coder.runsWorkers" . -}}
 {{- if not .Values.externalSecrets.enabled -}}

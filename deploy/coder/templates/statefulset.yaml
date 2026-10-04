@@ -22,14 +22,14 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- if or .Values.podAnnotations (include "coder.agentFolder" .) }}
+      {{- if or .Values.podAnnotations (include "coder.extraMcp" .) }}
       annotations:
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-        {{- if include "coder.agentFolder" . }}
-        {{- /* A changed prompt or mcp.json is a deploy: the agent folder is read at startup only. */}}
-        checksum/agent-files: {{ include (print $.Template.BasePath "/agent-configmap.yaml") . | sha256sum }}
+        {{- if include "coder.extraMcp" . }}
+        {{- /* A changed servers file is a deploy: the file is read at startup only. */}}
+        checksum/extra-mcp: {{ include (print $.Template.BasePath "/extra-mcp-configmap.yaml") . | sha256sum }}
         {{- end }}
       {{- end }}
     spec:
@@ -135,8 +135,13 @@ spec:
             {{- /* Kept for one release: a vendored agent folder written before the GitHub MCP server became a sidecar (ADR 0017, D4) still starts it as a child process. The shipped mcp.json no longer does. The image sets nothing; a control plane connects no MCP server. */}}
             - name: MCP_ALLOW_STDIO
               value: "true"
-            {{- if and (include "coder.mcpInsecure" .) (not (hasKey .Values.config.extraEnv "MCP_ALLOW_INSECURE")) }}
-            {{- /* An extra MCP server (mcp.*) at a plain http URL on another machine: the coder refuses one unless the deployment allows it. */}}
+            {{- if include "coder.extraMcp" . }}
+            {{- /* The extra MCP servers (mcp.*): merged over the agent's own mcp.json at startup. */}}
+            - name: ADAM_EXTRA_MCP_FILE
+              value: {{ include "coder.extraMcpFile" . | quote }}
+            {{- end }}
+            {{- if include "coder.mcpInsecure" . }}
+            {{- /* mcp.websearch.allowInsecure: plain http to another machine, for EVERY server of the agent and for the thread-tools endpoints a sender announces. Never automatic. */}}
             - name: MCP_ALLOW_INSECURE
               value: "true"
             {{- end }}
@@ -176,11 +181,6 @@ spec:
               value: {{ .Values.config.gitAuthorName | quote }}
             - name: GIT_AUTHOR_EMAIL
               value: {{ .Values.config.gitAuthorEmail | quote }}
-            {{- end }}
-            {{- if include "coder.agentFolder" . }}
-            {{- /* The chart's own agent folder (mcp.*): the shipped files plus the extra MCP servers. */}}
-            - name: ADAM_AGENT_DIR
-              value: {{ include "coder.agentDir" . | quote }}
             {{- end }}
             {{- range $name, $value := .Values.config.extraEnv }}
             - name: {{ $name }}
@@ -260,12 +260,12 @@ spec:
               mountPath: /var/run/secrets/github-app
               readOnly: true
             {{- end }}
-            {{- if include "coder.agentFolder" . }}
-            - name: agent-files
-              mountPath: {{ include "coder.agentDir" . }}
+            {{- if include "coder.extraMcp" . }}
+            - name: extra-mcp
+              mountPath: {{ include "coder.extraMcpDir" . }}
               readOnly: true
             {{- end }}
-      {{- if or (include "coder.sharedWork" .) $githubApp (include "coder.agentFolder" .) }}
+      {{- if or (include "coder.sharedWork" .) $githubApp (include "coder.extraMcp" .) }}
       volumes:
         {{- if include "coder.sharedWork" . }}
         - name: work
@@ -282,12 +282,11 @@ spec:
               - key: private-key.pem
                 path: private-key.pem
         {{- end }}
-        {{- if include "coder.agentFolder" . }}
-        - name: agent-files
+        {{- if include "coder.extraMcp" . }}
+        - name: extra-mcp
           configMap:
-            name: {{ include "coder.agentConfigMapName" . }}
-            # Readable by the runtime user whatever fsGroup does: the files are the prompt and a
-            # mcp.json of ${VAR} references, no secret.
+            name: {{ include "coder.extraMcpConfigMapName" . }}
+            # Readable by the runtime user whatever fsGroup does: a mcp.json of ${VAR} references, no secret.
             defaultMode: 0444
         {{- end }}
       {{- end }}

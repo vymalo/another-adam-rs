@@ -170,30 +170,33 @@ of its own, which is today's single-worker render.
 
 {{/*
 The extra MCP servers (values `mcp.*`, off by default). websearch is on when its url is set, context7 when
-mcp.context7.enabled. Each renders "true" or nothing. With either on the chart supplies the coder's whole agent
-folder (the ConfigMap in agent-configmap.yaml), because the image holds its files only inside the binary and the
-coder reads one folder: the shipped files plus these servers.
+mcp.context7.enabled is true (the string "false" is off). Each renders "true" or nothing. The binary merges
+them over the agent's own mcp.json at startup (ADAM_EXTRA_MCP_FILE): the chart ships no copy of the agent's files.
 */}}
 {{- define "coder.mcpWebsearch" -}}
 {{- if trim (toString .Values.mcp.websearch.url) -}}true{{- end -}}
 {{- end -}}
 
 {{- define "coder.mcpContext7" -}}
-{{- if .Values.mcp.context7.enabled -}}true{{- end -}}
+{{- if eq (toString .Values.mcp.context7.enabled) "true" -}}true{{- end -}}
 {{- end -}}
 
-{{/* Whether the agent folder comes from this chart: any extra MCP server is on. "true" or nothing. */}}
-{{- define "coder.agentFolder" -}}
-{{- if or (include "coder.mcpWebsearch" .) (include "coder.mcpContext7" .) -}}true{{- end -}}
+{{/*
+Whether this pod gets the extra servers file: one is on, and the role runs workers (only a worker connects an MCP
+server). "true" or nothing.
+*/}}
+{{- define "coder.extraMcp" -}}
+{{- if and (or (include "coder.mcpWebsearch" .) (include "coder.mcpContext7" .)) (include "coder.runsWorkers" .) -}}true{{- end -}}
 {{- end -}}
 
-{{/* Name of the ConfigMap that holds the agent folder. */}}
-{{- define "coder.agentConfigMapName" -}}
-{{- printf "%s-agent" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{/* Name of the ConfigMap that holds the extra servers file. */}}
+{{- define "coder.extraMcpConfigMapName" -}}
+{{- printf "%s-mcp" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{/* Where the agent folder is mounted: ADAM_AGENT_DIR (the folder is `agent/` itself). */}}
-{{- define "coder.agentDir" -}}/etc/adam/agent{{- end -}}
+{{/* Where it is mounted, and ADAM_EXTRA_MCP_FILE. */}}
+{{- define "coder.extraMcpDir" -}}/etc/adam/extra-mcp{{- end -}}
+{{- define "coder.extraMcpFile" -}}/etc/adam/extra-mcp/mcp.json{{- end -}}
 
 {{/*
 Whether an extra server's URL is plain http to another machine, which the coder refuses unless the deployment sets
@@ -205,37 +208,45 @@ Takes the URL; renders "true" or nothing.
 {{- if and (hasPrefix "http://" $url) (not (regexMatch "^http://(localhost|[^/:?#]*\\.localhost|127\\.[0-9.]+|\\[::1\\])([:/?#]|$)" $url)) -}}true{{- end -}}
 {{- end -}}
 
-{{/* Whether the workers need MCP_ALLOW_INSECURE for an extra server: "true" or nothing. */}}
-{{- define "coder.mcpInsecure" -}}
-{{- if include "coder.runsWorkers" . -}}
+{{/* Whether a server of the extra file is at a plain http URL to another machine. "true" or nothing. */}}
+{{- define "coder.mcpPlainHttp" -}}
 {{- if or (and (include "coder.mcpWebsearch" .) (include "coder.plainHttpRemote" .Values.mcp.websearch.url)) (and (include "coder.mcpContext7" .) (include "coder.plainHttpRemote" .Values.mcp.context7.url)) -}}true{{- end -}}
 {{- end -}}
+
+{{/* Whether the deployment sets MCP_ALLOW_INSECURE itself, in config.extraEnv. "true" or nothing. */}}
+{{- define "coder.extraEnvInsecure" -}}
+{{- if eq (toString (get .Values.config.extraEnv "MCP_ALLOW_INSECURE")) "true" -}}true{{- end -}}
 {{- end -}}
 
 {{/*
-The coder's mcp.json: the shipped one (agent/mcp.json, a copy of bin/adam-coder/agent/mcp.json that
-tests/render-check.sh keeps equal) plus the extra servers that are on. The GitHub entry follows githubMcp.port when
-the sidecar runs (the coder refuses a `github` URL whose origin is not GITHUB_MCP_URL). A server's key is its id: the
-model sees its tools as `<id>__<tool>`. Credentials are `${VAR}` references, filled from the environment at start,
-never values: SEARCH_MCP_TOKEN and CONTEXT7_API_KEY come from the ExternalSecret.
+Whether the chart sets MCP_ALLOW_INSECURE on the workers: only when websearch is on, mcp.websearch.allowInsecure is
+true and extraEnv does not set it already. Never automatic. "true" or nothing.
 */}}
-{{- define "coder.agentMcpJson" -}}
-{{- $cfg := .Files.Get "agent/mcp.json" | fromJson -}}
-{{- $servers := get $cfg "mcpServers" -}}
-{{- if include "coder.githubMcp" . -}}
-{{- $_ := set (get $servers "github") "url" (printf "http://127.0.0.1:%d/" (int64 .Values.githubMcp.port)) -}}
+{{- define "coder.mcpInsecure" -}}
+{{- if and (include "coder.runsWorkers" .) (include "coder.mcpWebsearch" .) (eq (toString .Values.mcp.websearch.allowInsecure) "true") (not (hasKey .Values.config.extraEnv "MCP_ALLOW_INSECURE")) -}}true{{- end -}}
 {{- end -}}
+
+{{/*
+The extra servers file: `{"mcpServers": {...}}` with the servers that are on, in the shape of mcp.json. A server's
+key is its id: the model sees its tools as `<id>__<tool>`. Credentials are `${VAR}` references, filled from the
+environment when a worker starts, never values: SEARCH_MCP_TOKEN and CONTEXT7_API_KEY come from the ExternalSecret.
+`optional` is written only when true (the binary's default is required).
+*/}}
+{{- define "coder.extraMcpJson" -}}
+{{- $servers := dict -}}
 {{- if include "coder.mcpWebsearch" . -}}
 {{- $s := .Values.mcp.websearch -}}
 {{- $server := dict "type" "http" "url" (trim $s.url) "headers" (dict $s.header (printf "%s${SEARCH_MCP_TOKEN}" (toString $s.valuePrefix))) -}}
 {{- if $s.tools -}}{{- $_ := set $server "tools" $s.tools -}}{{- end -}}
+{{- if $s.optional -}}{{- $_ := set $server "optional" true -}}{{- end -}}
 {{- $_ := set $servers "websearch" $server -}}
 {{- end -}}
 {{- if include "coder.mcpContext7" . -}}
 {{- $s := .Values.mcp.context7 -}}
 {{- $server := dict "type" "http" "url" (trim $s.url) "headers" (dict $s.header (printf "%s${CONTEXT7_API_KEY}" (toString $s.valuePrefix))) -}}
 {{- if $s.tools -}}{{- $_ := set $server "tools" $s.tools -}}{{- end -}}
+{{- if $s.optional -}}{{- $_ := set $server "optional" true -}}{{- end -}}
 {{- $_ := set $servers "context7" $server -}}
 {{- end -}}
-{{- toPrettyJson $cfg -}}
+{{- toPrettyJson (dict "mcpServers" $servers) -}}
 {{- end -}}
