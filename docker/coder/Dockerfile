@@ -95,10 +95,12 @@ RUN curl -fsSL -o /tmp/podman-remote.tar.gz \
  && rm -rf /tmp/podman-remote.tar.gz /tmp/podman-remote.sha256 /tmp/bin \
  && npm install -g --no-fund --no-audit "@devcontainers/cli@${DEVCONTAINERS_CLI_VERSION}"
 
-# MCP_ALLOW_STDIO is **not** set here: the image carries two binaries, and only the coder (whose shipped
-# mcp.json starts the pinned github-mcp-server) may start local-process MCP servers. The coder's deployment
-# sets it (the chart, compose.yaml, the container smoke test); `adam-agent` from this image refuses such
-# servers unless its own deployment opts in (ADR 0009, decision 8).
+# MCP_ALLOW_STDIO is **not** set here: the image carries two binaries, and only the coder may start
+# local-process MCP servers if its deployment says so (the chart and compose.yaml still set it for one
+# release); `adam-agent` from this image refuses such servers unless its own deployment opts in. The coder's
+# shipped mcp.json no longer starts one: it reads `github-mcp-server http`, which the deployment runs as a
+# sidecar from this same image (the chart's `githubMcp`, the `github-mcp` service of compose.yaml) and which
+# holds no credential (ADR 0017, D4). The binary stays in the image for that, and for the stdio listing test.
 ENV WORKSPACE_ROOT=/work \
     LISTEN_ADDR=0.0.0.0:8080 \
     RUST_LOG=info \

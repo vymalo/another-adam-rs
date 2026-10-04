@@ -43,9 +43,15 @@ const TRUNCATED: &str = " [truncated]";
 pub const MIN_SECRET_LEN: usize = 4;
 
 /// How many of the secrets that were registered after startup ([`Redactor::add`]: the installation
-/// tokens a GitHub App mints, one an hour) are remembered; the oldest is forgotten first. A token
-/// that old has long expired, and the list is read at every scrub.
-const MAX_ADDED: usize = 16;
+/// tokens a GitHub App mints, one an hour for each installation) are remembered; the oldest is
+/// forgotten first. A token that old has long expired, and the list is read at every scrub.
+///
+/// An App that finds the installation of each owner keeps up to
+/// [`MAX_CACHED_INSTALLATIONS`](adam_workspace::MAX_CACHED_INSTALLATIONS) installations' tokens, and
+/// one more of each while a refresh overlaps the old one: twice that many are remembered here, so
+/// no token the credentials can still hold, or hand out, is forgotten ([ADR 0017](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md),
+/// D5). Sixteen, as before, was one live token with room to spare.
+const MAX_ADDED: usize = 2 * adam_workspace::MAX_CACHED_INSTALLATIONS;
 
 /// What a [`Redactor`] knows: the secrets of startup, and the latest of those added since.
 #[derive(Default)]
@@ -118,8 +124,9 @@ impl Redactor {
 
     /// Also redact `secret` (and its Base64 forms) from now on, in this redactor and every clone of
     /// it: a value the process only learned while it ran, such as an installation token minted
-    /// for a GitHub App. Adding a known value changes nothing; only the latest 16 added
-    /// values are kept (those of startup are never dropped).
+    /// for a GitHub App. Adding a known value changes nothing; only the latest
+    /// `2 * MAX_CACHED_INSTALLATIONS` (128) added values are kept (those of startup are never
+    /// dropped).
     pub fn add(&self, secret: &str) {
         if secret.len() < MIN_SECRET_LEN {
             return;
@@ -420,13 +427,13 @@ mod tests {
         r.add("startup-secret");
         r.add("abc");
         assert_eq!(format!("{r:?}"), before);
-        // The sixteen latest are kept; the oldest is forgotten, the startup secret never is.
-        for n in 2..=17 {
-            r.add(&format!("ghs_minted_{n:02}"));
+        // The latest are kept; the oldest is forgotten, the startup secret never is.
+        for n in 2..=MAX_ADDED + 1 {
+            r.add(&format!("ghs_minted_{n:03}"));
         }
         assert_eq!(r.scrub("ghs_minted_1"), "ghs_minted_1", "forgotten");
         assert_eq!(
-            r.scrub("ghs_minted_02 ghs_minted_17"),
+            r.scrub(&format!("ghs_minted_002 ghs_minted_{:03}", MAX_ADDED + 1)),
             "[redacted] [redacted]"
         );
         assert_eq!(r.scrub("startup-secret"), "[redacted]");
@@ -435,6 +442,48 @@ mod tests {
         assert!(empty.is_empty());
         empty.add("ghs_first_token");
         assert!(!empty.is_empty());
+    }
+
+    /// A GitHub App that finds the installation of each owner keeps a token for each of up to
+    /// `MAX_CACHED_INSTALLATIONS` installations, and one more for each while a refresh overlaps:
+    /// the redactor remembers two per cached installation, so none of them is forgotten while the
+    /// credentials can still hand it out, and the one after that makes the oldest go.
+    #[test]
+    fn the_redactor_remembers_two_tokens_per_cached_installation() {
+        let installations = adam_workspace::MAX_CACHED_INSTALLATIONS;
+        assert_eq!(MAX_ADDED, 2 * installations);
+        let r = Redactor::new(["startup-secret"]);
+        let token = |installation: usize, generation: usize| {
+            format!("ghs_inst{installation:03}_gen{generation}_token")
+        };
+        for installation in 0..installations {
+            for generation in 0..2 {
+                r.add(&token(installation, generation));
+            }
+        }
+        for installation in 0..installations {
+            for generation in 0..2 {
+                assert_eq!(
+                    r.scrub(&token(installation, generation)),
+                    REDACTED,
+                    "installation {installation}, token {generation} is still remembered"
+                );
+            }
+        }
+        // One token more than the bound: the oldest of all goes, the rest stay.
+        r.add("ghs_one_more_token");
+        assert_eq!(
+            r.scrub(&token(0, 0)),
+            token(0, 0),
+            "the oldest is forgotten"
+        );
+        assert_eq!(r.scrub(&token(0, 1)), REDACTED);
+        assert_eq!(r.scrub("ghs_one_more_token"), REDACTED);
+        assert_eq!(
+            r.scrub("startup-secret"),
+            REDACTED,
+            "a startup secret never is"
+        );
     }
 
     /// Credentials that hand out a token the redactor has never heard of.

@@ -212,28 +212,35 @@ impl Respond for CreatePull {
 /// A mock GitHub for `octo/widgets`: lists and creates pull requests.
 pub async fn mock_github() -> MockServer {
     let github = MockServer::start().await;
+    mount_repository(&github, "octo/widgets").await;
+    github
+}
+
+/// Make `github` list and create pull requests, and take comments on them, for the repository
+/// `slug` (`owner/name`), with its own pull requests.
+pub async fn mount_repository(github: &MockServer, slug: &str) {
     let pulls = Arc::new(Pulls::default());
     Mock::given(method("GET"))
-        .and(path("/repos/octo/widgets/pulls"))
+        .and(path(format!("/repos/{slug}/pulls")))
         .respond_with(ListPulls {
             pulls: pulls.clone(),
         })
-        .mount(&github)
+        .mount(github)
         .await;
     Mock::given(method("POST"))
-        .and(path("/repos/octo/widgets/pulls"))
+        .and(path(format!("/repos/{slug}/pulls")))
         .respond_with(CreatePull { pulls })
-        .mount(&github)
+        .mount(github)
         .await;
     // Comments on a pull request (the issue's comments).
     Mock::given(method("POST"))
-        .and(wiremock::matchers::path_regex(
-            r"^/repos/octo/widgets/issues/\d+/comments$",
-        ))
+        .and(wiremock::matchers::path_regex(format!(
+            r"^/repos/{}/issues/\d+/comments$",
+            slug.replace('.', r"\.")
+        )))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
-        .mount(&github)
+        .mount(github)
         .await;
-    github
 }
 
 /// Make the mock GitHub answer every API call with `status` from now on.
@@ -1054,11 +1061,11 @@ pub fn folder() -> TempDir {
 }
 
 /// [`folder`] without its `agent/mcp.json`: the shipped agent as a deployment that connects no MCP
-/// server mounts it. The shipped file names the GitHub server, a local process that only starts
-/// with `MCP_ALLOW_STDIO` and the `github-mcp-server` binary (the coder image has the binary, the coder's
-/// deployment sets the variable), so a test
-/// that starts a worker on a folder, or assembles one, takes this and says itself which servers it
-/// connects (`tests/binary.rs`, `tests/agent_files.rs`); the shipped file is tested as it is.
+/// server mounts it. The shipped file names the GitHub server's sidecar over http
+/// (127.0.0.1:8082, with the coder's credentials bound to it by the deployment), which has to be
+/// running, so a test that starts a worker on a folder, or assembles one, takes this and says itself
+/// which servers it connects (`tests/binary.rs`, `tests/agent_files.rs`); the shipped file is
+/// tested as it is.
 pub fn plain_folder() -> TempDir {
     let tmp = folder();
     std::fs::remove_file(tmp.path().join("agent/mcp.json"))

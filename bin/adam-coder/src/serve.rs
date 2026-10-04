@@ -35,6 +35,7 @@ use anyhow::Context as _;
 use secrecy::{ExposeSecret as _, SecretString};
 
 use crate::agent::CoderStarter;
+use crate::github_mcp::{GitHubReadBearer, SERVER_NAME as GITHUB_SERVER};
 use crate::janitor::Janitor;
 use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
@@ -71,7 +72,7 @@ async fn build_agent(
     let (workspaces, creds) =
         workspaces_for(worker, &redactor).context("building the GitHub credentials")?;
     let code_host: DynCodeHost = Arc::new(
-        GitHub::new(creds)
+        GitHub::new(creds.clone())
             .context("building the GitHub client")?
             .with_api_base(worker.github_api_url.as_str()),
     );
@@ -106,20 +107,39 @@ async fn build_agent(
             // deployment's policy (MCP_ALLOW_INSECURE, timeouts) decides.
             .with_mcp_policy(worker.mcp.policy()),
     );
+    // The GitHub MCP server holds no credentials: the deployment binds its name and its origin
+    // (`GITHUB_MCP_URL`) to the coder's own credentials, which give each call the token that fits
+    // what it is about (ADR 0017, D4). A folder that points `github` elsewhere, or gives it an
+    // `Authorization` header, is refused at connect. The conversation's own tools (the policy of
+    // `ToolEnv` above) are unbound: they carry the sender's bearer.
+    let bearer = Arc::new(GitHubReadBearer::new(
+        creds,
+        worker
+            .allowed_repo_hosts
+            .first()
+            .map_or("github.com", String::as_str),
+        // An App that finds the installation of each owner needs each call to name its account.
+        worker.github.finds_installations(),
+    ));
+    let policy =
+        worker
+            .mcp
+            .policy()
+            .bearer_per_call(GITHUB_SERVER, worker.github_mcp_url.as_str(), bearer);
     // The MCP servers the folder's `mcp.json` names are connected now, at startup, before the
     // agent is bound: a server that is down, a local process the policy does not allow, a
     // `${VAR}` that is unset are startup errors with their own exit code (69 or 78), never
-    // something found in the middle of a run. Without an `mcp.json` (the embedded copy has none)
-    // this connects to nothing.
+    // something found in the middle of a run. Without an `mcp.json` this connects to nothing.
     let def = files
         .def()
         .map_err(|e| *e)
         .context("reading the agent definition")?
-        .connect_mcp(&worker.mcp.policy())
+        .connect_mcp(&policy)
         .await
         .context(
             "connecting the MCP servers of the agent files (MCP_ALLOW_STDIO, MCP_ALLOW_INSECURE and \
-             MCP_ALLOW_URL_VARS decide which kinds they may be)",
+             MCP_ALLOW_URL_VARS decide which kinds they may be; GITHUB_MCP_URL is where the `github` \
+             server must be)",
         )?;
     // The alias comes from the environment, and the files may come from a folder, so a bad one of
     // either is a startup error, not a panic. The error is unboxed so its class (exit 78 for a

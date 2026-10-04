@@ -8,12 +8,33 @@ and 8, and its alternative "Let github-mcp-server hold the App").
 changes: the coder's configuration (`GITHUB_APP_OWNERS`, an optional `GITHUB_APP_INSTALLATION_ID`, its startup checks and
 the chart), **D4** (GitHub read through `github-mcp-server http` with a token per call), **D5** (the redactor's bound) and
 **D6** (read-only tokens). Until then the coder is exactly as ADR 0009 says: its `GitHubApp` is pinned. The sequence
-diagram of an MCP call comes with the change that builds D4.*
+diagram of an MCP call comes with the change that builds D4. (The notes below say what was built since.)*
 
 *Status note, 2026-10-03: **D4's adam-mcp part is built** (`crates/adam-mcp`): `CallBearer`, `McpPolicy::bearer_per_call`
 (a server name plus an origin), and the refusals at connect (`Error::BearerBinding`: another origin, or an `Authorization`
 header of the file's own; a `stdio` server of the bound name gets no binding and a warning). Still not built: the coder's
 use of it (the router that picks a token per call, `GITHUB_MCP_URL`, the embedded `mcp.json`, the sidecar).*
+
+*Status note, 2026-10-03: **D4's coder part is built for a token and for a pinned installation**
+(`bin/adam-coder/src/github_mcp.rs`: `GitHubReadBearer`, `target_of`; `GITHUB_MCP_URL`; the embedded `mcp.json` is the
+`http` form with no credential; `serve.rs` binds the bearer to the server's name and origin; the chart's `githubMcp`
+native sidecar and compose's `github-mcp` service). **F10 is verified** (below). The bearer already carries the rules
+for an App that finds the installation of each owner (a search that names no account or several, and `get_me`, are
+error results), but nothing builds such an App yet, so they are not exercised: the coder's `GITHUB_APP_OWNERS`, D5 and
+D6 follow. `MCP_ALLOW_STDIO` stays in the chart for one release, for an agent folder that still starts the server as a
+child process.*
+
+*Status note, 2026-10-03: **D1 to D5 are built.** The coder's `GITHUB_APP_INSTALLATION_ID` is an optional pin and
+`GITHUB_APP_OWNERS` (comma- or space-separated, without case, `*` for any with a startup warning) is required without one
+(`GitHubAppConfig { installations: AppInstallations::{Pinned, Owners} }`; a pin with owners, owners with a token, neither
+variable, `*` beside names, and an entry that is no account name are exit 78 naming the variables); `repos.rs` builds
+`GitHubApp::new` or `GitHubApp::discovering`; the discovery rules of `GitHubReadBearer` are exercised (a search with no
+account or several, an owner that is no login, and `get_me` are error results, and nothing is asked of the credentials for
+them); D5's `MAX_ADDED` is `2 * MAX_CACHED_INSTALLATIONS` (128); the chart has `github.app.owners` and refuses a pin with
+owners and neither; the compose override runs the App by owner with `GITHUB_APP_OWNERS: local,scratch,other-org` against the
+mock's lookups. `bin/adam-coder/tests/binary.rs` runs the real server in `http` mode with owners and shows, for two owners,
+two lookups, two mints and two calls each with its own token. **Not built: D6** (read-only tokens for MCP calls). **Not run:**
+a live GitHub App, GitHub Enterprise Server, and F2, F3, F7 and F8 above against GitHub.*
 
 ## Context
 
@@ -42,7 +63,7 @@ With a pinned installation that cannot happen today.
 | F7 | Owner logins are case-insensitive; the API returns the canonical case in `account.login`. | **unverified** (common knowledge, not from a document) |
 | F8 | A renamed or transferred repository answers `301` at the repository lookup. Whether an organisation or user lookup by a former login redirects is not known. | the `301`: **verified** (OpenAPI); the rest **unverified** |
 | F9 | `github-mcp-server` v1.12.2 and v1.14.0 (the latest tag; `v1.13.0` exists too). `stdio` App mode needs exactly one installation (`internal/githubapp` `validate`: "GitHub App installation ID is required") and its token provider is one function per process. The `http` subcommand takes no credential flags: it reads the token **per request** from `Authorization` (`Bearer ...` or raw); a missing header is `401`; a token whose prefix it does not recognise (`ghp_`, `github_pat_`, `gho_`, `ghu_`, `ghs_`, or the old 40-hex form) is refused. It is stateless streamable HTTP and builds one MCP server per request. `--read-only`, `--toolsets` and `--tools` bound the tool set; the `/readonly` and `/x/{toolset}` routes and the headers can only narrow it. It fetches scopes only for classic `ghp_` tokens. `--listen-host` and `--port` (default 8082) are `http`-only; `--gh-host` (`GITHUB_HOST`) is global. | **verified 2026-10-03 by reading the source** (`cmd/github-mcp-server/main.go`, `pkg/http/handler.go`, `pkg/http/server.go`, `pkg/http/middleware/{token,pat_scope}.go`, `pkg/utils/token.go`). **Not run.** |
-| F10 | In `http` mode, `tools/list` sent with a placeholder `ghs_...` bearer makes no request to GitHub. | **unverified.** The binary test of the change that builds D4 has to prove it. |
+| F10 | In `http` mode, `tools/list` sent with a placeholder `ghs_...` bearer makes no request to GitHub. | **verified 2026-10-03** by running `github-mcp-server` v1.12.2 built from source (`go install github.com/github/github-mcp-server/cmd/github-mcp-server@v1.12.2`, not the image's binary): `tests/binary.rs` `the_embedded_agent_connects_the_real_github_mcp_server` counts the requests a mock GitHub receives when the coder is ready and finds none, in both modes it runs; a `curl` of `initialize` and `tools/list` against a server whose `--gh-host` is a logging listener saw none either. CI runs the same test against the binary of the pinned image (`ci.yml`, `conformance`). A token with no recognised prefix is `400` and a request with no `Authorization` is `401`, also run. |
 | F11 | The twelve allow-listed read tools at v1.12.2 take `owner` and `repo` (eight of them), `query` (`search_issues`, with an optional `owner`/`repo`; `search_repositories` and `search_code` take `query` only), or nothing (`get_me`, which with an installation token hits `GET /user` and gets `403`). | **verified 2026-10-03**, `pkg/github/{repositories,search,issues,pullrequests,context_tools}.go` |
 | F12 | Native Kubernetes sidecars (an init container with `restartPolicy: Always`) are beta and on by default from 1.29, and GA in 1.33. | **unverified** (from memory) |
 
@@ -54,7 +75,8 @@ tried.**
 ## Decision
 
 1. **D1. The installation is found per owner; `GITHUB_APP_INSTALLATION_ID` becomes an optional pin.** *Built in the library
-   (`GitHubApp::discovering`; `GitHubApp::new` is the pinned constructor, unchanged); the coder's variable follows.*
+   (`GitHubApp::discovering`; `GitHubApp::new` is the pinned constructor, unchanged) and in the coder
+   (`GITHUB_APP_INSTALLATION_ID` is the optional pin).*
    * With a pin, behaviour is exactly ADR 0009: no lookup, one token for every repository.
    * Without a pin, the installation is resolved from the owner of the repository's URL, with the App's JWT:
      1. `GET /orgs/{owner}/installation`;
@@ -62,9 +84,9 @@ tried.**
      3. on `404` again, "not installed".
    * By owner and not by repository, because creating a repository (`create_repository` asks for credentials for an address
      that does not exist yet) needs the installation too.
-   * A pin and an owner list together are a configuration error (the coder's exit 78; follows with its configuration).
-2. **D2. An owner allow-list is required when there is no pin: fail closed.** *Built in the library (`AppOwners`); the coder's
-   `GITHUB_APP_OWNERS` follows.* Logins are compared without case; `AppOwners::Any` (the coder's `*`) is every account the App
+   * A pin and an owner list together are a configuration error (the coder's exit 78, naming both variables).
+2. **D2. An owner allow-list is required when there is no pin: fail closed.** *Built in the library (`AppOwners`) and in the coder
+   (`GITHUB_APP_OWNERS`).* Logins are compared without case; `AppOwners::Any` (the coder's `*`) is every account the App
    is installed on, and the coder logs a warning for it. There is no default, because of F6.
    * The check runs **before anything is looked up or signed** and applies on every path (git, REST, `create_repository`, and
      later MCP reads). `CREATE_REPO_OWNERS` still applies on top, and `ALLOWED_REPO_HOSTS` (`HostScoped`) stays outermost.
@@ -96,7 +118,8 @@ tried.**
    * **A missing permission**: an installation with "selected repositories" that lacks the repository fails at `git` or at
      the REST call, as today.
 4. **D4. The GitHub MCP server runs in `http` mode, holds no credentials, and the coder supplies a token per call.**
-   *Recommended; not built.*
+   *Built, in the coder, for a token, a pinned installation and an App that finds the installation of each owner, on
+   top of adam-mcp's `CallBearer`.*
    * **Process**: `github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests --listen-host 127.0.0.1
      --port 8082` as a native sidecar in the chart (F12), or a service sharing the coder's network in compose.
    * **Agent folder**: the embedded `mcp.json` becomes `{"type":"http","url":"http://127.0.0.1:8082/","tools":[the twelve]}`
@@ -117,7 +140,7 @@ tried.**
      feeding the `stdio` server a minted token: it is static for the process and expires within the hour; (d) coder-only
      wrappers over `adam_mcp::Endpoint`, with no adam-mcp change: smaller, but it moves the allow-list out of the agent
      folder (second choice).
-5. **D5. The redactor scales with the cache.** *Not built.* `bin/adam-coder/src/redact.rs` `MAX_ADDED` becomes
+5. **D5. The redactor scales with the cache.** *Built.* `bin/adam-coder/src/redact.rs` `MAX_ADDED` becomes
    `2 * adam_workspace::MAX_CACHED_INSTALLATIONS`. ADR 0009 decision 6's 16 assumes one live token; with 64 installations
    there can be 64, and one more while a refresh overlaps. The constant is public for that reason.
 6. **D6. Down-scoping.** *Not built.*
@@ -192,6 +215,43 @@ stateDiagram-v2
   NotInstalled --> Evicted: more than 256 accounts, the least recently used goes
   Evicted --> [*]
 ```
+
+## The path of an MCP call
+
+```mermaid
+sequenceDiagram
+  participant M as the model
+  participant T as McpTool (adam-mcp)
+  participant B as GitHubReadBearer
+  participant H as the coder's credentials (HostScoped, redactor)
+  participant S as github-mcp-server http (sidecar)
+  participant G as GitHub
+  Note over T,S: at startup: tools/list with ghs_adam_listing_only, no request reaches GitHub
+  M->>T: github__get_file_contents {owner, repo, path}
+  T->>B: for_call("get_file_contents", arguments)
+  B->>B: target_of: Repository { owner, repo }
+  alt a discovering App, and the call names no account or several, or is get_me
+    B-->>T: Permanent: name one account (nothing is sent)
+  else
+    B->>H: token_for(https://host/owner/repo)
+    alt refused (host, owner list, not installed) or failed
+      H-->>B: error
+      B-->>T: Permanent is an error result for the model, Transient retries the step (nothing was sent)
+    else a token (the redactor learns it)
+      H-->>B: token
+      B-->>T: token
+      T->>S: initialize, tools/call (Authorization: Bearer token), close
+      S->>G: the request, with that token
+      G-->>S: the answer
+      S-->>T: the result
+      T-->>M: the result, scrubbed of the token
+    end
+  end
+```
+
+The state of the call is adam-mcp's own (`Checked`, `Listed`, `Calling`, `Closed`:
+[its README](../../crates/adam-mcp/README.md#a-bearer-per-call)); the coder adds no state of its own, because the bearer keeps
+nothing between calls: the tokens are cached by the credentials, as before. `bin/adam-coder/src/github_mcp.rs` is the code.
 
 The cache of tokens is the one of ADR 0009 (`Empty`, `Fresh`, `Expiring`), one for each installation and at most
 `MAX_CACHED_INSTALLATIONS` of them. `crates/adam-workspace/src/github_app.rs` is the code, and

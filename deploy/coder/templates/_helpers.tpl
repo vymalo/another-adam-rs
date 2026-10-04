@@ -58,6 +58,14 @@ Whether this pod authenticates to GitHub as an App installation: github.auth=app
 {{- end -}}
 
 {{/*
+Whether this pod runs the GitHub MCP server beside the coder (a native sidecar): githubMcp.enabled, and the
+role runs workers (a control plane connects no MCP server). Renders "true" or nothing, like coder.runsWorkers.
+*/}}
+{{- define "coder.githubMcp" -}}
+{{- if and .Values.githubMcp.enabled (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 GITHUB_APP_ID: the application ID or the client ID. A number from a values file is a float64 to Helm
 and would print as 1.234567e+06, so numbers go through int64; a string (a client ID, or a quoted ID) is
 used as it is.
@@ -67,11 +75,41 @@ used as it is.
 {{- if kindIs "string" $id -}}{{- trim $id -}}{{- else if gt (int64 $id) 0 -}}{{- int64 $id -}}{{- end -}}
 {{- end -}}
 
+{{/*
+Whether github.app.installationId is set at all (a pin): anything but empty or null, so that a bad value (0, abc) is
+still caught by the validation and is not mistaken for "no pin". Renders "true" or nothing.
+*/}}
+{{- define "coder.githubAppPinned" -}}
+{{- $n := .Values.github.app.installationId -}}
+{{- if and (not (kindIs "invalid" $n)) (ne (trim (toString $n)) "") -}}true{{- end -}}
+{{- end -}}
+
 {{/* GITHUB_APP_INSTALLATION_ID: a positive integer, from a number or a string; 0 when it is neither. */}}
 {{- define "coder.githubAppInstallationId" -}}
 {{- $n := .Values.github.app.installationId -}}
 {{- if kindIs "string" $n -}}{{- $n = trim $n -}}{{- end -}}
 {{- if and (kindIs "string" $n) (not (regexMatch "^[0-9]+$" $n)) -}}0{{- else -}}{{- int64 $n -}}{{- end -}}
+{{- end -}}
+
+{{/*
+GITHUB_APP_OWNERS: the accounts the App may act for when no installation is pinned, as the list github.app.owners
+is (or a string of names separated by commas or spaces), joined with commas. Entries are trimmed and blanks dropped;
+`*` is every account the App is installed on (the binary refuses it beside others). Empty when there are none.
+*/}}
+{{- define "coder.githubAppOwners" -}}
+{{- $owners := .Values.github.app.owners -}}
+{{- $names := list -}}
+{{- if kindIs "string" $owners -}}
+{{- range regexSplit "[,[:space:]]+" (trim $owners) -1 -}}
+{{- if . -}}{{- $names = append $names . -}}{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- range $owners -}}
+{{- $name := trim (toString .) -}}
+{{- if $name -}}{{- $names = append $names $name -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- join "," $names -}}
 {{- end -}}
 
 {{/* The URL clients use for the JSON-RPC endpoint (the agent card advertises it). */}}

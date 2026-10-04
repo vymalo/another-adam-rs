@@ -7,15 +7,19 @@ of the slice build: the coder's own tools stay in process, and GitHub is *read* 
 GitHub MCP server. The status notes at the end say which are built.
 
 *Amended 2026-10-03 ([ADR 0017](0017-a-github-app-works-on-every-account-it-is-installed-on.md)):* decision 1's "exactly one"
-stays, but the installation need not be named: an App without `GITHUB_APP_INSTALLATION_ID` finds the installation of each
-repository's owner, for the accounts a required owner list allows (0017's D1 and D2, **built in `adam-workspace`**:
-`GitHubApp::discovering`; the coder's configuration follows), and a pinned App is as this record says. Decision 5's message
-names `GITHUB_APP_INSTALLATION_ID` only for a pinned App (built), and a not-installed account, a suspended installation and an
+stays, but the installation need not be named: an App **with `GITHUB_APP_OWNERS` and no `GITHUB_APP_INSTALLATION_ID`** finds
+the installation of each repository's owner, for the accounts the required list allows (0017's D1 and D2; built in
+`adam-workspace`, `GitHubApp::discovering`, and in the coder, where `GITHUB_APP_INSTALLATION_ID` is an optional pin and a
+pin with owners, neither, or owners with a token are exit 78); a pinned App is as this record says. Decision 5's message
+names `GITHUB_APP_INSTALLATION_ID` only for a pinned App, and a not-installed account, a suspended installation and an
 owner outside the list are `Auth` or `Invalid` errors of their own. Decision 6's 16 remembered tokens are a bound for one
-installation; 0017's D5 raises it to follow the cache (not built). Decision 8's "GitHub is read through the official server
-over stdio, which holds the App" and the alternative "Let github-mcp-server hold the App" are revisited by 0017's D4: the
-server runs in `http` mode with no credentials and the coder supplies a token per call (not built; until then decision 8
-stands as written, for a pinned App or a token).
+installation; 0017's D5 raises it to `2 * MAX_CACHED_INSTALLATIONS` (128) to follow the cache (built). Decision 8's "GitHub is
+read through the official server over stdio, which holds the App" and the alternative "Let github-mcp-server hold the App"
+are revisited by 0017's D4: the server runs in `http` mode, as a sidecar, with no credentials, and the coder supplies the
+token of each call (**built** for a token, a pinned App and an App by owner: the shipped `mcp.json` is the `http` form,
+`GITHUB_MCP_URL` says where the sidecar is, the chart runs it). So decision 8's `MCP_ALLOW_STDIO`, the `GITHUB_APP_*`
+variables handed to a child process and the App's key as a file for that child no longer describe the shipped file, and the
+key is nowhere but in the coder.
 
 ## Context
 

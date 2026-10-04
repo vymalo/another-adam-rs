@@ -1,15 +1,8 @@
 {
   "mcpServers": {
     "github": {
-      "command": "github-mcp-server",
-      "args": ["stdio", "--read-only", "--toolsets", "context,repos,issues,pull_requests"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN:-}",
-        "GITHUB_APP_ID": "${GITHUB_APP_ID:-}",
-        "GITHUB_APP_INSTALLATION_ID": "${GITHUB_APP_INSTALLATION_ID:-}",
-        "GITHUB_APP_PRIVATE_KEY_PATH": "${GITHUB_APP_PRIVATE_KEY_PATH:-}",
-        "GITHUB_HOST": "${GITHUB_MCP_HOST:-}"
-      },
+      "type": "http",
+      "url": "http://127.0.0.1:8082/",
       "tools": [
         "get_me",
         "search_repositories",

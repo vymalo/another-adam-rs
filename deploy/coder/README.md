@@ -6,7 +6,7 @@ own CloudNativePG database, for the `netcup-k8s` cluster.
 
 | Object | What |
 |---|---|
-| `StatefulSet` | `replicaCount` replicas (1 by default; the worker with `topology: split`), `work` at `/work`: a PVC per pod on `longhorn` by default (mirrors and worktrees persist), or one shared claim, see [Workspace placement](#workspace-placement); `fsGroupChangePolicy: OnRootMismatch`, uid/gid 10001, probes on `/healthz` |
+| `StatefulSet` | `replicaCount` replicas (1 by default; the worker with `topology: split`), `work` at `/work`: a PVC per pod on `longhorn` by default (mirrors and worktrees persist), or one shared claim, see [Workspace placement](#workspace-placement); `fsGroupChangePolicy: OnRootMismatch`, uid/gid 10001, probes on `/healthz`; on the roles that run workers, the GitHub MCP server as a native sidecar, see [The GitHub MCP server](#the-github-mcp-server-a-sidecar) |
 | `PersistentVolumeClaim` | `workspace.placement` `shared` or `affinity` without `workspace.sharedVolume.existingClaim` only: `<release>-coder-work`, ReadWriteMany, kept on `helm uninstall` |
 | `Deployment` | `topology: split` only: the front (`<release>-coder-front`), `ROLE=control-plane`, no volume, `front.replicas` replicas |
 | `PodDisruptionBudget` | `topology: split` with `front.replicas` above 1: `minAvailable: 1` for the front |
@@ -169,12 +169,40 @@ refuses a non-empty `config.role`. See the crate README (`bin/adam-coder/README.
 A control plane needs no model, GitHub or workspace configuration, so with
 `config.role=control-plane` the chart leaves out `MODEL_BASE_URL`, `MODEL`, `OPENCODE_MODEL`,
 `WORKERS`, `MAX_CHECK_CYCLES`, `CHECK_TIMEOUT_SECS`, `WORKSPACE_SWEEP_SECS`, `ALLOWED_REPO_HOSTS`, `GITHUB_API_URL`,
-`PR_DRAFT`, `GIT_AUTHOR_*`, `WORKSPACE_ROOT`, the GitHub App settings and key volume (`github.auth: app`) and the two secrets above (the helper
+`PR_DRAFT`, `GIT_AUTHOR_*`, `WORKSPACE_ROOT`, `GITHUB_MCP_URL` and the GitHub MCP server sidecar, the GitHub App settings and key volume (`github.auth: app`) and the two secrets above (the helper
 `coder.runsWorkers` in `templates/_helpers.tpl`). The render of `all` and `worker` is unchanged.
 A `combined` control plane still mounts the `work` volume, because a StatefulSet's
 `volumeClaimTemplates` are immutable; the `split` front has no volume at all.
 `.github/workflows/coder.yml` runs kubeconform on the default, control-plane and split
 renders, and `tests/render-check.sh` asserts all three.
+
+## The GitHub MCP server: a sidecar
+
+The coder reads GitHub through the official GitHub MCP server ([ADR
+0017](../../docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md), D4). Every pod that runs
+workers (`all`, `worker`, and the StatefulSet of `topology: split`; **not** a control plane or the split front) has it as
+a **native sidecar**: an init container with `restartPolicy: Always` named `github-mcp`, the coder's own image,
+`github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests --listen-host 127.0.0.1 --port 8082`.
+It starts before the coder, is probed (TCP, `startupProbe`) before the coder starts, restarts on its own and stops
+after the coder. It holds **no credential**: no Secret, no key, no `GITHUB_TOKEN`, no volume, and no environment but
+`GITHUB_HOST` when `githubMcp.host` is set. It listens on loopback only, so nothing but the coder container reaches it,
+and the coder sends it the token of each call. The coder is told where it is with `GITHUB_MCP_URL`
+(`http://127.0.0.1:<port>`).
+
+```yaml
+githubMcp:
+  enabled: true        # false renders no sidecar and no GITHUB_MCP_URL (the coder's own GITHUB_MCP_URL is then yours to set)
+  port: 8082           # the shipped agent files name 8082: another port needs an agent folder that names it
+  host: ""             # GITHUB_HOST of the server, for GitHub Enterprise: the first of config.allowedRepoHosts (not checked)
+  resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 256Mi } }
+```
+
+* **Kubernetes 1.29 or later** (native sidecars are beta and on by default from 1.29 and GA in 1.33: *unverified*, from
+  memory; `tests` render for 1.31 in kubeconform). A cluster without them would treat `restartPolicy` on an init
+  container as an error, or run it as a one-shot init container that never finishes.
+* `MCP_ALLOW_STDIO` stays on the roles that run workers for one release, for a consumer whose vendored agent folder
+  still starts `github-mcp-server stdio` as a child process. The embedded files no longer do.
+* `githubMcp.port` outside 1 to 65535 fails the render. A control plane renders none of it.
 
 ## GitHub: a token or an App installation
 
@@ -185,11 +213,20 @@ accepts exactly one (`bin/adam-coder/README.md`, "GitHub credentials").
 * **`token`** is the chart as it was: `GITHUB_TOKEN` from the `ExternalSecret`
   (`externalSecrets.properties.githubToken`). The default render is byte for byte what it was
   (`tests/golden/combined.yaml`).
-* **`app`** is a GitHub App installation. Set `github.app.id` (the application ID or the client ID),
-  `github.app.installationId` (a positive integer) and `github.app.privateKeySecret`, the name of a Secret in
-  the release's namespace with one key, **`private-key.pem`**: the App's private key as GitHub gives it (PKCS#1) or
-  PKCS#8. The chart mounts it read-only at `/var/run/secrets/github-app` (mode 0440, group `fsGroup`) and sets
-  `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_PATH`. `GITHUB_TOKEN` is neither
+* **`app`** is a GitHub App. Set `github.app.id` (the application ID or the client ID),
+  `github.app.privateKeySecret`, the name of a Secret in the release's namespace with one key, **`private-key.pem`**: the
+  App's private key as GitHub gives it (PKCS#1) or PKCS#8, and **exactly one of**
+  * `github.app.installationId`, a positive integer: the App is **pinned** to that one installation, which serves every
+    repository (`GITHUB_APP_INSTALLATION_ID`; a deployment that works on one account), or
+  * `github.app.owners`, a list of accounts (users and organisations; `*` for every account the App is installed on, which
+    the coder warns about): **no pin**, the installation of each repository's owner is found with the App's key, and a
+    token is minted for each, so one deployment works on several accounts (`GITHUB_APP_OWNERS`, [ADR
+    0017](../../docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md)). There is **no default
+    list**: a public App can be installed by anyone, so the list, and not the installation, says which accounts the coder may
+    act for. A list of names or a string separated by commas or spaces; compared without case.
+
+  The chart mounts the key read-only at `/var/run/secrets/github-app` (mode 0440, group `fsGroup`) and sets
+  `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` and the pin or the owners. `GITHUB_TOKEN` is neither
   rendered nor required, and the `ExternalSecret` has no entry for it. **The chart never holds the key**: make the
   Secret yourself, or with another `ExternalSecret`, for example
   `kubectl create secret generic coder-github-app --from-file=private-key.pem=app.pem`.
@@ -197,16 +234,18 @@ accepts exactly one (`bin/adam-coder/README.md`, "GitHub credentials").
 ```sh
 helm template coder deploy/coder --set github.auth=app --set github.app.id=1234567 \
   --set github.app.installationId=98765432 --set github.app.privateKeySecret=coder-github-app
+helm template coder deploy/coder --set github.auth=app --set github.app.id=1234567 \
+  --set 'github.app.owners={acme,octocat}' --set github.app.privateKeySecret=coder-github-app
 ```
 
 The render fails, naming the value, for `github.auth` that is neither, and (for a role that runs workers, in app
-mode) for an empty `github.app.id`, an `installationId` that is not a positive integer, or an empty
-`privateKeySecret`. A numeric `id` or `installationId` from a values file keeps its digits (Helm reads such numbers
-as floats; the chart converts them). A control plane renders no GitHub setting and no key volume in either mode, and
-with `topology: split` only the worker StatefulSet has them. The coder reads the key at startup: after rotating the
-Secret, restart the pods. The key is a second volume of the pod, beside the per-pod claim or the shared one
-(`.github/workflows/coder.yml` runs kubeconform on both renders; `tests/render-check.sh` asserts them). *Unverified:*
-a live rollout against a real App; the renders are checked, not applied.
+mode) for an empty `github.app.id`, an `installationId` that is not a positive integer, **both `installationId` and
+`owners`**, **neither of them**, or an empty `privateKeySecret`. A numeric `id` or `installationId` from a values file keeps its
+digits (Helm reads such numbers as floats; the chart converts them). A control plane renders no GitHub setting and no key volume in
+either mode, and with `topology: split` only the worker StatefulSet has them. The coder reads the key at startup: after
+rotating the Secret, restart the pods. The key is a second volume of the pod, beside the per-pod claim or the shared one
+(`.github/workflows/coder.yml` runs kubeconform on the renders, with the pin and with owners; `tests/render-check.sh` asserts
+them). *Unverified:* a live rollout against a real App; the renders are checked, not applied.
 
 ## Repositories
 

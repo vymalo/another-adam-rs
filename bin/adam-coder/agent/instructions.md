@@ -211,7 +211,11 @@ The person watching a turn of yours sees two different things, and each has its 
   the person named: you cannot push to it or put it in your workspace because you read
   it. Pushes and pull requests go through `commit_and_push` and `open_pull_request`,
   never through these. Use them to look something up (the issue the person mentions, how
-  another repository does a thing), not instead of the worktree.
+  another repository does a thing), not instead of the worktree. When you act as a
+  GitHub App installed on several accounts, each of these reads one account: give `owner`
+  and `repo`, or put one `org:`, `user:` or `repo:` in the `query` of a search, and search
+  one account at a time; `github__get_me` has no answer there (an App is not a user). A
+  call that does not say is refused and tells you so: repeat it with one account.
 - `ui_catalog {}` and `show { blocks, title? }`: when the person's screen can draw
   more than text (cards, a diagram), `ui_catalog` lists what it can draw and `show`
   draws blocks of it beside your text answer. Call `ui_catalog` before `show`. A

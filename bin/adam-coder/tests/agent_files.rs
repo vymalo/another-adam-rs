@@ -38,7 +38,7 @@ use adam_model::{
 use adam_runtime::Runtime;
 use async_trait::async_trait;
 // A folder here is the shipped agent without its `mcp.json` (the shipped one names the GitHub
-// server, a local process: see `common::plain_folder`); the tests of `mcp.json` write their own.
+// server's sidecar: see `common::plain_folder`); the tests of `mcp.json` write their own.
 use common::{Fixture, edit_instructions, plain_folder as folder};
 use futures::stream::BoxStream;
 use serde_json::json;
@@ -864,14 +864,14 @@ const GITHUB_TOOLS: [&str; 12] = [
     "pull_request_read",
 ];
 
-/// The shipped `mcp.json` is the official GitHub MCP server over stdio, read-only, with the four
-/// toolsets the coder reads and the twelve tools above and no others, and it hands the child the
-/// credentials the coder already has and nothing else: a token or the App's id, installation and key
-/// *file* (never the key itself), and the host. The values are `${VAR:-}`, so an unset variable is
-/// an empty one, which the server counts as unset (verified against v1.12.2, ADR 0009).
+/// The shipped `mcp.json` is the official GitHub MCP server over **http**, at the sidecar of the
+/// pod (127.0.0.1:8082), and says nothing about credentials: no `env`, no `headers`, no key or
+/// token (the deployment gives each call its bearer, `GitHubReadBearer`, ADR 0017). It lists the
+/// twelve read tools above and no others; the server itself is started read-only with four
+/// toolsets, by the deployment.
 #[test]
 fn the_shipped_mcp_json_names_the_github_server_read_only() {
-    use adam::agent_fs::McpServer;
+    use adam::agent_fs::{McpServer, RemoteKind};
 
     let def = AgentFiles::Embedded.def().unwrap();
     let config = def
@@ -880,27 +880,23 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
         .as_ref()
         .expect("the shipped agent has an mcp.json");
     assert_eq!(config.servers.keys().collect::<Vec<_>>(), ["github"]);
-    let McpServer::Stdio {
-        command,
-        args,
-        env,
+    let McpServer::Remote {
+        kind,
+        url,
+        headers,
         tools,
     } = &config.servers["github"]
     else {
         panic!(
-            "the GitHub server is a local process: {:?}",
+            "the GitHub server is a sidecar reached over http: {:?}",
             config.servers["github"]
         );
     };
-    assert_eq!(command, "github-mcp-server");
-    assert_eq!(
-        args,
-        &[
-            "stdio",
-            "--read-only",
-            "--toolsets",
-            "context,repos,issues,pull_requests"
-        ]
+    assert_eq!(*kind, RemoteKind::Http);
+    assert_eq!(url, "http://127.0.0.1:8082/");
+    assert!(
+        headers.is_empty(),
+        "no credential in the file, the deployment's bearer is the only one: {headers:?}"
     );
     assert_eq!(tools.as_deref(), Some(&GITHUB_TOOLS.map(String::from)[..]));
     // Nothing that writes: every name is a read, and none of the verbs of the server's write tools.
@@ -912,40 +908,62 @@ fn the_shipped_mcp_json_names_the_github_server_read_only() {
             assert!(!tool.starts_with(verb), "{tool} writes");
         }
     }
-    // The credentials the coder holds, by the names the server reads, and the host.
-    let passed: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    assert_eq!(
-        passed,
-        [
-            ("GITHUB_APP_ID", "${GITHUB_APP_ID:-}"),
-            (
-                "GITHUB_APP_INSTALLATION_ID",
-                "${GITHUB_APP_INSTALLATION_ID:-}"
-            ),
-            (
-                "GITHUB_APP_PRIVATE_KEY_PATH",
-                "${GITHUB_APP_PRIVATE_KEY_PATH:-}"
-            ),
-            ("GITHUB_HOST", "${GITHUB_MCP_HOST:-}"),
-            ("GITHUB_PERSONAL_ACCESS_TOKEN", "${GITHUB_TOKEN:-}"),
-        ],
-        "the key itself (GITHUB_APP_PRIVATE_KEY) is not handed to a child"
+    // Nothing in the file refers to a variable: no token, no key, no host.
+    assert!(
+        config.env_references().is_empty(),
+        "the file reads no variable: {:?}",
+        config.env_references()
     );
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent/mcp.json"),
+    )
+    .unwrap();
+    for word in ["Authorization", "TOKEN", "KEY", "env\""] {
+        assert!(!text.contains(word), "{word} is in mcp.json:\n{text}");
+    }
 }
 
-/// A deployment that does not allow local processes does not get the GitHub server, and says so
-/// at startup, naming the variable that decides (78); the coder's deployment allows them (`MCP_ALLOW_STDIO`).
+/// The shipped file is only half of the server's configuration: the deployment binds the server's
+/// name to an origin and the coder's credentials. Without that binding nothing sends the sidecar a
+/// credential, and **a binding to another origin refuses the file** (fail closed, 78 at startup):
+/// what the agent's files name is never sent a bearer the deployment gave for somewhere else. A
+/// server that is not there is a transient failure (69: the sidecar may be starting).
 #[tokio::test]
-async fn the_shipped_mcp_json_starts_no_local_process_unless_the_deployment_allows_it() {
+async fn the_shipped_mcp_json_reaches_its_server_only_at_the_origin_the_deployment_bound() {
+    use std::sync::Arc;
+
+    use adam_coder::GitHubReadBearer;
+    use adam_workspace::{DynGitCredentials, StaticToken};
+
+    let creds: DynGitCredentials = Arc::new(StaticToken::new("ghp_binding_test_token"));
+    let bearer = Arc::new(GitHubReadBearer::new(creds, "github.com", false));
+    let elsewhere =
+        McpPolicy::default().bearer_per_call("github", "http://127.0.0.1:9", bearer.clone());
     let error = AgentFiles::Embedded
         .def()
         .unwrap()
-        .connect_mcp(&McpPolicy::default())
+        .connect_mcp(&elsewhere)
         .await
-        .expect_err("a local process is not allowed by default");
-    assert!(error.to_string().contains("local process"), "{error}");
+        .expect_err("the file names another origin than the one the deployment bound");
     assert!(error.to_string().contains("github"), "{error}");
-    assert_eq!(error.class(), ErrorClass::Invalid);
+    assert!(
+        !error.to_string().contains("ghp_binding_test_token"),
+        "{error}"
+    );
+    assert_eq!(error.class(), ErrorClass::Invalid, "{error}");
+
+    // At the bound origin, with nothing listening: the server may be up later.
+    let here = McpPolicy::default().bearer_per_call("github", "http://127.0.0.1:8082", bearer);
+    if std::net::TcpStream::connect("127.0.0.1:8082").is_ok() {
+        return; // something else of this machine is on the sidecar's port: nothing to assert
+    }
+    let error = AgentFiles::Embedded
+        .def()
+        .unwrap()
+        .connect_mcp(&here)
+        .await
+        .expect_err("nothing listens at the sidecar's address");
+    assert_eq!(error.class(), ErrorClass::Transient, "{error}");
 }
 
 /// A folder whose `mcp.json` lists servers that were never connected is refused at assembly, not

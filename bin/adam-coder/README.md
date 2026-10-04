@@ -1293,10 +1293,15 @@ rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
   another machine needs `MCP_ALLOW_INSECURE=true` (development only); `https` and loopback need nothing.
 * **A server that is down** at startup stops the process with exit 69, so a supervisor restarts it until the server
   is up; a mistake in the files or the policy is 78. A tool call that fails is an error result the model reads.
-* A folder without an `mcp.json` connects nothing. **The embedded copy has one**: it names the GitHub MCP server, a
-  local process (see [GitHub over MCP](#github-over-mcp-read-only)), so a coder on the embedded files needs
-  `MCP_ALLOW_STDIO=true` (the coder's deployment sets it, not the image) and `github-mcp-server` on its `PATH` (which the image has). A **control plane** serves the
-  card and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
+* A folder without an `mcp.json` connects nothing. **The embedded copy has one**: it names the GitHub MCP server over
+  `http` at `http://127.0.0.1:8082/`, the sidecar of the pod (see [GitHub over MCP](#github-over-mcp-read-only)), so a
+  coder on the embedded files needs that server running (with nothing there it stops with 69 until it is), and
+  `GITHUB_MCP_URL` at the same origin as the file's URL (with another one it stops with 78). A **control plane**
+  serves the card and starts runs, which needs no tools, so it connects no server: only `all` and `worker` do.
+* **The deployment can give one server a bearer per call.** The coder does this for `github`
+  (`McpPolicy::bearer_per_call`, `GITHUB_MCP_URL`): the file says which server exists and holds no credential, a file
+  that points `github` at another origin or gives it an `Authorization` header is refused at startup (78), and a
+  `stdio` server of that name is left alone with a warning (a folder written before the sidecar keeps working).
 
 ### Retry safety
 
@@ -1346,10 +1351,13 @@ way; every problem is reported at once at startup):
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
 | `GITHUB_TOKEN` | push and pull request token (a personal access token); only ever sent to the `ALLOWED_REPO_HOSTS`. Must be unset or empty in App mode | one of this or the App's variables, for `all` and `worker` |
-| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` | GitHub App mode: the App's application ID or client ID (the JWT's `iss`), and the installation's ID (a positive integer). See [GitHub credentials](#github-credentials-a-token-or-an-app-installation) | both required in App mode, unset in token mode |
+| `GITHUB_APP_ID` | GitHub App mode: the App's application ID or client ID (the JWT's `iss`). See [GitHub credentials](#github-credentials-a-token-or-an-app-installation) | required in App mode |
+| `GITHUB_APP_INSTALLATION_ID` | App mode: **pins** the App to one installation (a positive integer), which serves every repository, with no lookup | App mode: this or `GITHUB_APP_OWNERS`, exactly one |
+| `GITHUB_APP_OWNERS` | App mode **without a pin**: the accounts (users and organisations) the App may act for, separated by commas or spaces, compared without case, or `*` for every account the App is installed on (a startup warning; refused beside other names). The installation of each repository's owner is found with the App's JWT. The chart's `github.app.owners` | App mode: this or `GITHUB_APP_INSTALLATION_ID`, exactly one |
 | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 as GitHub gives it, or PKCS#8): a file, or inline (`\n` escapes accepted). Exactly one. Parsed at startup | one required in App mode |
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
+| `GITHUB_MCP_URL` | where the GitHub MCP server is (`github-mcp-server http`, the sidecar of the pod): an http(s) URL with no credentials, of which only the origin counts. The agent folder's `github` server has to be at that origin, and the coder gives that server the credentials of each call. The chart sets it from `githubMcp.port`; `compose.yaml` points it at `mock-github-mcp`. Read by the roles that run workers | `http://127.0.0.1:8082` |
 | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees; empty turns the tool off. The chart's `github.createRepoOwners` | empty (off) |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
@@ -1363,7 +1371,7 @@ way; every problem is reported at once at startup):
 | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 | `PR_DRAFT` | open pull requests as drafts | `false` |
 | `OPENCODE_COMMAND` | the ACP program and arguments | `opencode acp` |
-| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. **The coder's deployment sets it, the image does not** (the image carries `github-mcp-server`, which the shipped `mcp.json` starts, but also `adam-agent`, which must refuse local processes unless its own deployment opts in): the chart sets it on the roles that run workers, `compose.yaml` on the `coder` service, and the container smoke test passes it | `false` |
+| `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers). The file would decide what this process runs, with its rights: leave it off unless the image ships the server. The shipped `mcp.json` does not need it any more (the GitHub server is the sidecar, over http); the chart and `compose.yaml` still set it for one release, for an agent folder written before the sidecar. The image does not set it (it also carries `adam-agent`, which must refuse local processes unless its own deployment opts in) | `false` |
 | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
@@ -1517,21 +1525,40 @@ remotes never receive the token.
 ### GitHub credentials: a token or an App installation
 
 A worker authenticates to GitHub one of two ways, **exactly one**
-([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md)):
+([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md)), and an App one of two ways, **exactly one**
+([ADR 0017](../../docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md)):
 
-| | token | GitHub App installation |
-|---|---|---|
-| Variables | `GITHUB_TOKEN` | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and one of `GITHUB_APP_PRIVATE_KEY_PATH` (a file) or `GITHUB_APP_PRIVATE_KEY` (the PEM; `\n` escapes accepted) |
-| `GITHUB_TOKEN` | required | must be unset or empty |
-| Whose | a person's, until it is revoked | the App's, scoped to what the App was granted on the installation; its tokens last an hour |
-| Credentials | `ScopedToken` for `ALLOWED_REPO_HOSTS` | `HostScoped<GitHubApp>` for the same hosts |
+| | token | GitHub App, pinned | GitHub App, by owner |
+|---|---|---|---|
+| Variables | `GITHUB_TOKEN` | `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and one of `GITHUB_APP_PRIVATE_KEY_PATH` (a file) or `GITHUB_APP_PRIVATE_KEY` (the PEM; `\n` escapes accepted) | `GITHUB_APP_ID`, **`GITHUB_APP_OWNERS`**, and the key |
+| `GITHUB_TOKEN` | required | must be unset or empty | must be unset or empty |
+| Whose | a person's, until it is revoked | the App's, scoped to what the App was granted on the one installation; its tokens last an hour | the App's, on the installation of each owner; one token for each |
+| Which repositories | every one the token reaches | every one of that installation, no lookup | those of an owner on the list, whose installation is found with the App's JWT (`GET /orgs/{owner}/installation`, then `GET /users/{owner}/installation`) |
+| Credentials | `ScopedToken` for `ALLOWED_REPO_HOSTS` | `HostScoped<GitHubApp::new>` for the same hosts | `HostScoped<GitHubApp::discovering>` for the same hosts |
 
-Both set, an App set that is partial (`GITHUB_APP_ID` without the installation or the key, a key with both its
-file and its variable), an installation ID that is not a positive integer, a key file that cannot be read, and a
+**`GITHUB_APP_OWNERS` is required without a pin and has no default: fail closed.** A public App can be installed by
+anyone (*verified 2026-10-03*, docs.github.com "Making a GitHub App public or private"), so "the App is installed on this
+account" says nothing about whether the deployment wants it to act there: a prompt-injected "push this to
+`attacker/repo`" would otherwise get a working token for any account that installed the App. The list is checked
+**before anything is looked up or signed**, for every path (git, REST, `create_repository`, and the GitHub MCP reads), and
+`CREATE_REPO_OWNERS` and `ALLOWED_REPO_HOSTS` still apply on top. `*` says every account the App is installed on, on
+purpose, and logs a warning at startup. A private App can only be installed on its own account (*verified 2026-10-03*,
+same page), so working across accounts needs a public (or an enterprise-owned: *unverified*) App.
+
+Both set, an App set that is partial (`GITHUB_APP_ID` without the key, a key with both its file and its variable),
+**neither the pin nor the owners**, **a pin together with owners**, **owners with a token**, `*` beside other names, an
+owner that is no account name, an installation ID that is not a positive integer, a key file that cannot be read, and a
 key that is not an unencrypted RSA key in PEM form (PKCS#1, as GitHub lets the owner download it, or PKCS#8) are
 configuration errors: exit 78, every problem listed, the name of the variable and never a value. The key is
 **parsed at startup**, so a deployment learns of a bad one when it rolls out, not at the first push. A rotated
 key needs a restart. `GITHUB_APP_ID` is the App's application ID or its client ID (the JWT's `iss`).
+**Breaking change of the library's API:** `GitHubAppConfig::installation_id: u64` is now `installations: AppInstallations`
+(`Pinned(u64)` or `Owners(AppOwners)`), so code that builds or reads a `GitHubAppConfig` has to say which;
+`GitHubAuth::finds_installations()` says whether the installation is found by owner, and `WorkerConfig` has a new field,
+`github_mcp_url`. What an App by owner
+does with an account (the account cache, the 60 seconds a "not installed" is believed, the token slot of each
+installation, the errors) is [`adam-workspace`'s](../../crates/adam-workspace/README.md#github-app-credentials) and
+ADR 0017's D3.
 
 ```mermaid
 sequenceDiagram
@@ -1563,16 +1590,19 @@ stateDiagram-v2
 ```
 
 A token the App minted is a secret from the moment it exists: the redactor is shared, and the credentials add
-each token they hand out (at most 16 are remembered, oldest forgotten first), so a tool result, an error or a
+each token they hand out (up to `2 * MAX_CACHED_INSTALLATIONS`, 128, are remembered, oldest forgotten first: two for each
+installation an App by owner can hold a token for), so a tool result, an error or a
 log line that quotes one is scrubbed (the App's PEM and its Base64 body are registered at startup). The key is
 hidden from OpenCode and from the project's commands as `GITHUB_TOKEN` is; a key file is a path, and sits
 wherever the deployment mounted it (the chart: `/var/run/secrets/github-app/private-key.pem`, read-only, mode
 0440, group `fsGroup`).
 
 A refused mint is told to the person as it is for a bad token: `401`, `403` and `404` from GitHub are an
-authentication error that names `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and the key, and a run that ends at
-one fails naming them (and that the App must be installed on the repository, with write access to its contents
-and pull requests). A rate limit is a rate limit (with the wait GitHub asked for), and a `5xx` or a transport
+authentication error that names `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` (for an App by owner, `GITHUB_APP_OWNERS`
+in its place: the hint says the owner has to be on the list) and the key, and a run that ends at one fails naming them (and
+that the App must be installed on the repository, with write access to its contents and pull requests). An owner the
+App is not installed on, one that is not on the list, and a suspended installation are errors of their own that name
+the App and the owner. A rate limit is a rate limit (with the wait GitHub asked for), and a `5xx` or a transport
 failure is transient. The token endpoint is `{GITHUB_API_URL}/app/installations/{id}/access_tokens`, so GitHub
 Enterprise Server and a mock need no other variable. The deployment's own example is
 `dev/compose.github-app.yaml` (an init service makes a throwaway key; the mock gives an installation token that
@@ -1583,71 +1613,104 @@ lasts four minutes, so the coder renews it all the time) and `deploy/coder` (`gi
 The coder **reads** GitHub (the files, branches, commits, issues and pull requests of any repository its credentials
 can see, including repositories it was not given) through the official
 [GitHub MCP server](https://github.com/github/github-mcp-server), and **writes** only through its own tools. The
-shipped `agent/mcp.json` ([ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md),
-decision 8):
+server runs in `http` mode as a **sidecar** of the pod and **holds no credential**: it reads the token of each request
+from its `Authorization` header, and the coder sends the credentials of each call
+([ADR 0017](../../docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md), D4, which changes
+decision 8 of [ADR 0009](../../docs/decisions/0009-github-per-installation-read-through-mcp.md)). The shipped
+`agent/mcp.json`:
 
 ```json
 { "mcpServers": { "github": {
-  "command": "github-mcp-server",
-  "args": ["stdio", "--read-only", "--toolsets", "context,repos,issues,pull_requests"],
-  "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN:-}", "GITHUB_APP_ID": "${GITHUB_APP_ID:-}",
-           "GITHUB_APP_INSTALLATION_ID": "${GITHUB_APP_INSTALLATION_ID:-}",
-           "GITHUB_APP_PRIVATE_KEY_PATH": "${GITHUB_APP_PRIVATE_KEY_PATH:-}", "GITHUB_HOST": "${GITHUB_MCP_HOST:-}" },
+  "type": "http",
+  "url": "http://127.0.0.1:8082/",
   "tools": ["get_me", "search_repositories", "get_file_contents", "list_branches", "list_commits", "get_commit",
             "search_code", "list_issues", "issue_read", "search_issues", "list_pull_requests", "pull_request_read"] } } }
 ```
 
-* **Read-only twice over.** The server is started with `--read-only` (it offers no write tool) and the `tools`
-  allow-list names twelve reads, so the model sees `github__get_me`, `github__search_repositories`,
-  `github__get_file_contents`, `github__list_branches`, `github__list_commits`, `github__get_commit`,
-  `github__search_code`, `github__list_issues`, `github__issue_read`, `github__search_issues`,
-  `github__list_pull_requests` and `github__pull_request_read`, after the coder's own tools, and nothing that
-  writes. Pushes and pull requests go through `commit_and_push` and `open_pull_request`, behind the gate. Reading a
-  repository there does not put it in the workspace and does not make it one the person named: it still cannot be
-  pushed to ([the rules](#the-rules-in-code)). A tool the server does not list stops the coder at startup (the
-  allow-list is checked), so a change of the server's tool names cannot go unseen.
-* **The credentials are the coder's.** The same variables, by the names the server reads, in either mode: a
-  **token** (`GITHUB_TOKEN`, handed over as `GITHUB_PERSONAL_ACCESS_TOKEN`) or a **GitHub App installation**
-  (`GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`; the server signs its own JWT and
-  trades it for an installation token). The mode that is not in use is an empty variable, which the server counts
-  as unset (*verified* 2026-10-01 against v1.12.2, by source and by running it in both modes), so no variable is
-  conditional. `GITHUB_MCP_HOST` (empty: github.com) is the server's `GITHUB_HOST`, for GitHub Enterprise
-  (`https://<host>`; the coder's own `GITHUB_API_URL` is separate).
-* **The App's key must be a file.** `GITHUB_APP_PRIVATE_KEY` (the key in a variable) is not handed to a child
-  process. A server that has an App and no key does not start, and the coder stops at startup (exit 69, with a "cannot
-  connect ... Broken pipe" message that does not say why: run the server by hand to read its own complaint);
-  the chart mounts the key as a file (`GITHUB_APP_PRIVATE_KEY_PATH`) and needs nothing. A deployment that keeps the key in a
-  variable has no GitHub MCP server: mount a copy of the folder without that server (`ADAM_AGENT_DIR`).
-* **A deployment must allow it.** The server is a local process: `MCP_ALLOW_STDIO=true` and the binary on `PATH`
-  (the image has the binary; **the coder's deployment sets the variable**, since the image also carries `adam-agent`, which
-  must refuse local processes unless its own deployment opts in; a control plane connects nothing). Without the variable the process stops at startup with
-  exit 78 naming it, and with it and no binary with exit 69, never in the middle of a run, and no message holds a
-  credential. The image pins the binary by tag and digest (v1.12.2) and its build and the container smoke test list
-  its tools over stdio, with no credential at all (the server lists tools without calling GitHub, *verified*; a
-  *call* with no credential starts its OAuth login, so no credential is never a way to run).
-* **Development and the e2e do not start it.** The compose file mounts `dev/coder-agent/mcp.json` over the folder's
-  `mcp.json`: the same twelve tools from `mock-github-mcp`, a WireMock of the server's streamable HTTP endpoint over
-  plain `http` (`MCP_ALLOW_INSECURE=true`), behind a bearer. The default script of `mock-coder` reads
-  `github__list_branches` of `local/sandbox` right after `prepare_workspace`, and `dev/coder-e2e.sh` asserts the mock
-  saw `initialize`, `tools/list` and exactly one such call, and that the model was given the answer.
+* **Read-only twice over.** The sidecar is started with `--read-only` (it offers no write tool) and four toolsets
+  (`github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests --listen-host 127.0.0.1 --port
+  8082`: the chart's `githubMcp`, the `github-mcp` service of `compose.yaml`), and the `tools` allow-list names twelve
+  reads, so the model sees `github__get_me`, `github__search_repositories`, `github__get_file_contents`,
+  `github__list_branches`, `github__list_commits`, `github__get_commit`, `github__search_code`, `github__list_issues`,
+  `github__issue_read`, `github__search_issues`, `github__list_pull_requests` and `github__pull_request_read`, after
+  the coder's own tools, and nothing that writes. Pushes and pull requests go through `commit_and_push` and
+  `open_pull_request`, behind the gate. Reading a repository there does not put it in the workspace and does not make
+  it one the person named: it still cannot be pushed to ([the rules](#the-rules-in-code)). A tool the server does not
+  list stops the coder at startup (the allow-list is checked), so a change of the server's tool names cannot go
+  unseen.
+* **The credentials are the coder's, chosen per call.** The deployment binds the server's name and origin
+  (`GITHUB_MCP_URL`, `http://127.0.0.1:8082` by default) to a `GitHubReadBearer` (`src/github_mcp.rs`, an
+  `adam_mcp::CallBearer`). For each call it reads what the call is about (`target_of`: the `owner` and `repo` of the
+  arguments, or for a search the one non-negated `repo:`, `org:` or `user:` of its `query`) and asks the coder's own
+  credentials for a token for that repository on the first of `ALLOWED_REPO_HOSTS`: the **host check, the redactor and
+  the cache are the ones `git` and the REST calls go through**. With a **token** (`GITHUB_TOKEN`, sent as `Bearer` on
+  every call) or a **pinned App installation** (the installation token the coder minted, the same one for every
+  call) the call's subject only chooses what the credentials look at: one token serves any call, a search that names
+  no account and `get_me` included. A refusal of the credentials (`Auth`, `Invalid`, `NotFound`) is an error result the
+  model reads, and nothing is sent to the server; `RateLimited` and `Transient` fail the step transiently and it is
+  retried (nothing was sent). **An App by owner** (`GITHUB_APP_OWNERS`, no pin) needs a call to be about **one account**:
+  a search that names none or several (`org:a org:b`) is an error result that says to give `owner` (and `repo`) or one
+  `org:`, `user:` or `repo:`, and `github__get_me` (the authenticated *user*, which an App is not: the server's `GET /user`
+  is a `403` for an installation token) is an error result; neither is sent, and no installation is looked up for a
+  guess. The call's owner then decides the installation, through `GitCredentials::token_for`, so the owner list, the
+  account cache and the token cache apply. The model's arguments are untrusted: an `owner` or `repo` with a character outside
+  `A-Z a-z 0-9 . - _` is never put in a URL.
+* **No credential in the file, none in the server.** A file that gives `github` an `Authorization` header, or points it
+  at another origin than `GITHUB_MCP_URL`, is refused at startup (exit 78, naming the server and `GITHUB_MCP_URL`):
+  a bearer the deployment gave for one place is never sent to another. The tools are listed at startup with the
+  placeholder `ghs_adam_listing_only`, which has the form of an installation token and is not a credential: the
+  server's `tools/list` makes **no request to GitHub** (*verified 2026-10-03* against `github-mcp-server` v1.12.2
+  built from source by `go install`, by `the_embedded_agent_connects_the_real_github_mcp_server`: the mock GitHub has
+  received zero requests when the coder is ready). A token whose prefix the server does not recognise (`ghp_`,
+  `github_pat_`, `gho_`, `ghu_`, `ghs_` and the old 40-hex form are) is refused by it with a `400`, and a request with
+  no header with a `401` (*verified 2026-10-03*, running v1.12.2: `dev-github-token` gets `400`); a personal access
+  token that is none of those has no GitHub MCP server. The key of an App is the coder's alone: the server's container
+  has no key, no token and no Secret.
+* **A deployment must run it.** The sidecar is a second process of the pod: with nothing at `GITHUB_MCP_URL` the
+  coder stops at startup with exit 69 (the sidecar may be starting; a supervisor retries), and never in the middle of a
+  run. The chart runs it as a native sidecar (an init container with `restartPolicy: Always`) on the roles that run
+  workers; `compose.yaml` runs it beside the `coder` service in the same network namespace; a control plane connects
+  nothing. `GITHUB_HOST` is the server's own variable for GitHub Enterprise (the chart's `githubMcp.host`; it has to be
+  the first of `ALLOWED_REPO_HOSTS`, which nothing can check across containers). The image pins the binary by tag
+  and digest (v1.12.2) and its build and the container smoke test list its tools over stdio, with no credential at all
+  (the server lists tools without calling GitHub, *verified*).
+* **Development and the e2e read a mock.** The compose file mounts `dev/coder-agent/mcp.json` over the folder's
+  `mcp.json` (the same twelve tools from `mock-github-mcp`, a WireMock of the server's streamable HTTP endpoint over
+  plain `http`, with `MCP_ALLOW_INSECURE=true` and `GITHUB_MCP_URL=http://mock-github-mcp:8080`, and no credential in
+  the file). The default script of `mock-coder` reads `github__list_branches` of `local/sandbox` right after
+  `prepare_workspace`, and `dev/coder-e2e.sh` asserts the mock saw `initialize`, `tools/list` (with the placeholder) and
+  exactly one such call, that every `tools/call` carried the coder's own credentials (the token, or the installation
+  token of the App), and that the model was given the answer.
 
 ```mermaid
 sequenceDiagram
   participant P as the coder process (worker)
-  participant S as github-mcp-server (child, stdio)
+  participant B as GitHubReadBearer
+  participant C as the coder's credentials
+  participant S as github-mcp-server http (sidecar, no credential)
   participant G as GitHub
   participant M as the model
-  P->>P: MCP_ALLOW_STDIO set? (else exit 78), the command on PATH? (else exit 69)
-  P->>S: start, env: the coder's credentials by the server's names
-  P->>S: initialize, tools/list
+  P->>P: the file's github server is at GITHUB_MCP_URL, with no Authorization header? (else exit 78)
+  P->>B: for_listing
+  B-->>P: ghs_adam_listing_only
+  P->>S: initialize, tools/list (that bearer): no request to GitHub
   S-->>P: 25 tools (read-only, four toolsets): the twelve of the allow-list must all be there
   Note over P,S: serving: the model is offered the twelve as github__<name>
   M->>P: github__list_branches {owner, repo}
-  P->>S: tools/call
-  S->>G: REST or GraphQL, the token or the installation token
-  G-->>S: the answer
-  S-->>P: the result (an error result is the model's to read)
-  P-->>M: the tool result
+  P->>B: for_call("list_branches", arguments)
+  B->>C: token_for(https://host/owner/repo)
+  alt refused (the host is not allowed)
+    C-->>B: error
+    B-->>P: an error result for the model, nothing is sent
+  else a token (registered with the redactor)
+    C-->>B: token
+    B-->>P: token
+    P->>S: initialize, tools/call (Authorization: Bearer token), close
+    S->>G: REST or GraphQL, with that token
+    G-->>S: the answer
+    S-->>P: the result (an error result is the model's to read), scrubbed of the token
+    P-->>M: the tool result
+  end
 ```
 
 ### Secrets in output
@@ -1812,19 +1875,34 @@ database of its own, so the role needs `CREATEDB`):
   fetched; a `wait` adds nothing and records nothing, and the tool asks the same question again; a yes to a question the model wrote with `ask_user` grants nothing. `tests/tool_specs.rs` pins the
   tool's spec and that it is one of the two tools that ask the person. `dev/coder-e2e.sh` (`SCENARIO=second-repo`,
   with `ANSWER=yes` and `ANSWER=no`) runs the chain through the stack.
-* **GitHub over MCP** ([above](#github-over-mcp-read-only)). `tests/agent_files.rs`: the shipped `mcp.json` is the
-  GitHub server over stdio with `--read-only`, four toolsets and exactly the twelve reads (none starts with a verb
-  that writes), and hands the child only the credentials the coder holds (never the key itself); a deployment that
-  does not allow local processes does not get it and is told which variable decides. `tests/binary.rs`: the worker
-  on the embedded files stops with 78 without `MCP_ALLOW_STDIO` and 69 without the binary, naming the server and
-  never a credential; and, with `ADAM_TEST_GITHUB_MCP_SERVER` set to a `github-mcp-server` (CI copies it out of the
-  image the Dockerfile pins; the case skips itself without it), the whole binary connects the **real** server as a
-  child and a call reaches a mock of GitHub with the right credential: the model is offered the twelve tools in
-  order after the coder's own and none that writes, `github__get_me` returns the mock's user, no secret is in a log,
-  in both modes (a token, and an App with an empty token variable, where the server trades a JWT at the
-  installation's token endpoint). The other tests of those two files use the shipped folder without its `mcp.json`
-  (`common::plain_folder`), since a test machine has no such binary; `adam-mcp`'s `wiremock_compose` connects
-  `mock-github-mcp`; `dev/coder-e2e.sh` and `docker/coder/test/*.sh` check the stack and the image.
+* **GitHub over MCP** ([above](#github-over-mcp-read-only)). `src/github_mcp.rs` (unit): the owner and repository of a
+  call choose the credentials asked for, on the configured host, for every tool that takes them, and a name that is not
+  a URL component never reaches a URL; a search names its account with `repo:`, `org:` or `user:` (negated qualifiers
+  and quoted phrases are not read, two owners are two accounts); a token and a pinned installation serve every call
+  (a search with no account, two accounts, `get_me`), a bearer for another host than its credentials refuses; what the
+  credentials say reaches the call typed (a refusal for the model, a transient failure retried, no token in either); for
+  an App by owner (`a_search_with_no_or_several_accounts_is_refused_without_a_pin`, `get_me_is_refused_for_an_app_without_a_pin`)
+  a search with no account or several, a call with an owner that is no login, and `get_me` are refused, the credentials
+  are not asked, and one account is served from its own installation.
+  `tests/agent_files.rs`: the shipped `mcp.json` is the GitHub server over http at `127.0.0.1:8082` with exactly the
+  twelve reads (none starts with a verb that writes) and **no credential of any kind** (no header, no `env`, no
+  `${VAR}`); the embedded files bound to another origin are refused (`Invalid`), and at their own with nothing
+  listening are `Transient`. `tests/binary.rs`: the worker on the embedded files stops with 78 when `GITHUB_MCP_URL`
+  is another origin than the file's (naming the server and the variable) and with 69 when nothing listens, never with
+  a credential; and, with `ADAM_TEST_GITHUB_MCP_SERVER` set to a `github-mcp-server` (CI copies it out of the image
+  the Dockerfile pins; the case skips itself without it, and without Postgres), the whole binary connects the **real**
+  server in `http` mode, run as the chart runs it with no credential and no environment, on a free port: the mock
+  GitHub has received **zero** requests when the coder is ready (the listing uses the placeholder), the model is
+  offered the twelve tools in order after the coder's own and none that writes, `github__get_me` and
+  `github__list_branches` reach the mock carrying the coder's credentials of that call (the token; or the pinned
+  installation's token, minted once for both), never the placeholder, and no secret is in a log. A third mode is an
+  App by owner: `list_branches` for `acme` and for `other` are two lookups, two mints and two calls, each with its own
+  owner's token; an account the App is not installed on is an error result naming the App and the owner, an owner off the
+  list one naming `GITHUB_APP_OWNERS`, and `get_me` and a search that names no account are error results, none of the four
+  reaching the server or GitHub, and nothing is looked up for the owner that is off the list. The other tests of
+  those two files use the shipped folder without its `mcp.json` (`common::plain_folder`), since a test would have to
+  run the sidecar; `adam-mcp`'s `wiremock_compose` connects `mock-github-mcp`; `dev/coder-e2e.sh`,
+  `docker/coder/test/*.sh` and `deploy/coder/tests/render-check.sh` check the stack, the image and the chart.
 * `tests/agent_files.rs`: the prompt, limits and card in `agent/instructions.md`, against the Rust they replaced and
   against the instruction snapshot. `the_prompt_carries_the_rules_the_code_relies_on` runs on the assembled prompt;
   `the_prompt_gives_the_agent_a_name_and_asks_for_plain_words` pins what #55 added (the persona lines first, the
@@ -1887,16 +1965,28 @@ database of its own, so the role needs `CREATEDB`):
 * GitHub credentials: the unit tests of `src/config.rs` (a token is one way; an App is the other, with the key from a
   file or from the variable, in PKCS#1 or PKCS#8, `\n` escapes accepted; both, a partial App set, an installation ID that is
   not a positive integer and a key given twice are every problem at once and never a value; a key that cannot be used is
-  refused at startup naming the variable and not the key; a control plane reads none of it, bad values included), of
-  `src/redact.rs` (a secret added later is scrubbed by every clone, only the latest 16 are kept, a token is registered as it is
+  refused at startup naming the variable and not the key; a control plane reads none of it, bad values included;
+  `an_app_without_an_installation_id_needs_its_owners` (owners in any separator and case, neither is a problem naming
+  both, an entry that is no account name), `the_installation_id_and_the_owners_are_one_or_the_other` (a pin with owners,
+  owners with a token) and `a_star_is_any_owner` (and not beside names)), of
+  `src/redact.rs` (a secret added later is scrubbed by every clone, only the latest 128 are kept,
+  `the_redactor_remembers_two_tokens_per_cached_installation`, a token is registered as it is
   handed out, an App's key is redacted as its PEM and as its body) and of `src/repos.rs` (an App mints at the API root, for the
-  allowed hosts only); in `tests/binary.rs`, `a_github_app_configuration_is_checked_at_startup_and_exits_78_with_every_problem`
-  and `a_github_app_installation_gets_its_token_minted_and_opens_the_pull_request` (with Postgres: the real binary against a
-  mock that hands a token for a JWT, every call to the repositories' API carries it, and no secret is in the output); in
+  allowed hosts only; `an_app_without_a_pin_mints_per_owner_against_github_api_url`: two owners, an organisation and a
+  person, two installations looked up with the JWT and two tokens, an owner off the list and a foreign host refused with
+  nothing sent); in `tests/binary.rs`, `a_github_app_configuration_is_checked_at_startup_and_exits_78_with_every_problem`,
+  `an_app_with_neither_installation_nor_owners_is_refused_at_startup` (neither, a pin with owners, owners with a token:
+  78, naming the variables),
+  `a_github_app_installation_gets_its_token_minted_and_opens_the_pull_request` (with Postgres: the real binary against a
+  mock that hands a token for a JWT, every call to the repositories' API carries it, and no secret is in the output) and
+  `a_github_app_without_an_installation_id_opens_pull_requests_for_two_owners` (two tasks for two owners: the installations
+  are found with the JWT, a token is minted for each, every call to a repository's API carries its owner's token and
+  never the other's, a repository whose owner is off the list is never looked up); in
   `tests/tools.rs`, `a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_return`; in `tests/e2e.rs`
   (per store), `a_refused_github_app_fails_the_run_naming_its_own_variables`. The compose scenarios run twice, the second time
-  as an App (`GITHUB_AUTH=app`, `-f dev/compose.github-app.yaml`: an init service makes a throwaway key), and assert that the
-  mock saw the trade and that every call to `/repos/...` carried the installation token and never the JWT.
+  as an App (`GITHUB_AUTH=app`, `-f dev/compose.github-app.yaml`: an init service makes a throwaway key, and the App has
+  `GITHUB_APP_OWNERS` and no pin), and assert that the mock saw the installation looked up with a JWT (the first run after the
+  coder started), the trade, and that every call to `/repos/...` carried the installation token and never the JWT.
 * Scratch projects: `tests/tools.rs` (`a_scratch_project_is_built_checked_and_committed_locally`: the file tools, `run_checks`
   (an artifact with no `repository`), `run_command` (a stray file and a sneaky commit are undone, as in a worktree) and OpenCode
   work in it, `commit_and_push` is a local commit with no artifact and no remote branch, `open_pull_request` is refused and

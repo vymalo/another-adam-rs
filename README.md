@@ -154,6 +154,7 @@ docker compose down -v             # stop and forget all state (volumes included
 | `mock-github-mcp` | `http://127.0.0.1:8085/mcp` | WireMock: the GitHub MCP server's streamable HTTP endpoint, as the coder reads GitHub through it: behind a bearer (`401` without), `initialize`, `tools/list` (the twelve read tools of the coder's allow-list) and `tools/call` of `get_me` and `list_branches`; any other tool is an error result "not scripted". The coder's `mcp.json` in this stack is `dev/coder-agent/mcp.json`, mounted over the folder's (production starts the real `github-mcp-server` as a child process) |
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded with `local/sandbox.git` and creating an empty repository on first use for the owners of `AUTO_CREATE_OWNERS` (`scratch` in the compose file); no authentication |
 | `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder agent built from `docker/coder/Dockerfile`, bearer token `dev-token`; its agent files are the folder `bin/adam-coder/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`, see "Changing what the coder says") |
+| `github-mcp` (profile `app`) | none (the coder's network, `127.0.0.1:8082`) | the real GitHub MCP server (`github-mcp-server http --read-only`, the coder's image) as the sidecar of the `coder` service, holding no credential; idle in this stack, whose coder reads `mock-github-mcp` |
 | `agent` (profile `app`) | `http://127.0.0.1:8084/` | the general agent: `adam-agent` from the **coder's image** (`entrypoint: ["tini", "--", "adam-agent"]`, so there is no second image), bearer token `dev-token`, serving the folder `dev/agents/assistant/agent` mounted read-only at `/etc/adam/agent` (`ADAM_AGENT_DIR`); model `mock-assistant`; shares the coder's database (runs are scoped by the agent's name). See "A general agent from a folder" |
 
 Host ports can be moved with `POSTGRES_PORT`, `MONGODB_PORT`, `MOCK_OPENAI_PORT`,
@@ -233,15 +234,19 @@ empty repository for the owners of `AUTO_CREATE_OWNERS` on first use). The scena
 ### `mock-github-mcp`
 
 The coder reads GitHub through the official GitHub MCP server, read-only ([ADR
-0009](docs/decisions/0009-github-per-installation-read-through-mcp.md); "GitHub over MCP" in
-[`bin/adam-coder`](bin/adam-coder/README.md#github-over-mcp-read-only)). Production starts the real binary inside
-the coder image; this stack has no GitHub to talk to, so the mock stands in for it over the streamable HTTP
-transport and the coder's `mcp.json` is `dev/coder-agent/mcp.json`, mounted over the folder's own (the
-folder in `CODER_AGENT_DIR` must therefore have an `mcp.json`: a copy of `bin/adam-coder/agent` does). The coder is
+0009](docs/decisions/0009-github-per-installation-read-through-mcp.md) and [ADR
+0017](docs/decisions/0017-a-github-app-works-on-every-account-it-is-installed-on.md); "GitHub over MCP" in
+[`bin/adam-coder`](bin/adam-coder/README.md#github-over-mcp-read-only)). Production runs the real binary in `http`
+mode as a sidecar of the coder's pod (the `github-mcp` service of this stack is the same, in the coder's network, and
+idle: nothing here has a GitHub for it); the stack has no GitHub to talk to, so the mock stands in for it over the
+streamable HTTP transport and the coder's `mcp.json` is `dev/coder-agent/mcp.json`, mounted over the folder's own
+(the folder in `CODER_AGENT_DIR` must therefore have an `mcp.json`: a copy of `bin/adam-coder/agent` does), with
+`GITHUB_MCP_URL=http://mock-github-mcp:8080` so that the coder binds its credentials to that origin. The coder is
 given `MCP_ALLOW_INSECURE=true` for it (plain `http` to another container; development only).
 
-Every `POST /mcp` needs `Authorization: Bearer <anything>` (the dev file sends `dev-github-mcp-token`) or gets
-`401`. The mock answers JSON (no session id, no standalone stream, `GET` and `DELETE` are `405`), which is
+Every `POST /mcp` needs `Authorization: Bearer <anything>` or gets `401`. The dev file holds none: the coder sends the
+credentials of each call (its token, or the installation token of its App) and a placeholder
+(`ghs_adam_listing_only`) to list the tools at startup. The mock answers JSON (no session id, no standalone stream, `GET` and `DELETE` are `405`), which is
 what `rmcp`, the client of `adam-mcp`, accepts (*verified* by `cargo test -p adam-mcp --test wiremock_compose`,
 which CI runs against this service). Its scripted answers: `get_me` is `{"login":"dev-user"}`, `list_branches`
 is `[{"name":"main"}]`; the other ten tools are listed with their schemas and answer an error result.
@@ -305,9 +310,10 @@ artifacts are there, that `mock-github` saw exactly one
 `git-server` has the branch with `hello.txt` containing `hello`. It also checks the GitHub MCP side: the journal of
 `mock-github-mcp` (not reset: the coder connects the server when it starts, before the script) holds `initialize` and
 `tools/list`, and the default scenario (the one with OpenCode, whose script reads `github__list_branches` right after
-`prepare_workspace`) added exactly one `tools/call` of `list_branches`, with the dev bearer, and the model was given
+`prepare_workspace`) added exactly one `tools/call` of `list_branches`, and the model was given
 its answer (the `mock-openai` journal has a request whose history holds the tool message that names `main`); every
-other scenario adds none. `TIMEOUT`, `CODER_URL`, `CODER_TOKEN`, `MOCK_GITHUB_URL`, `MOCK_GITHUB_MCP_URL`,
+`tools/call` carries the coder's own credentials (the dummy token, or the installation token) and every `tools/list` the
+startup placeholder, since the dev file holds no credential; every other scenario adds no call. `TIMEOUT`, `CODER_URL`, `CODER_TOKEN`, `MOCK_GITHUB_URL`, `MOCK_GITHUB_MCP_URL`,
 `MOCK_OPENAI_URL` and `GIT_SERVER_URL` override the defaults (see the script's header).
 
 `SCENARIO=scratch` is two messages. The task names no repository ("Write a fib.sh that prints the first 7
@@ -378,8 +384,12 @@ An installation is a token or a GitHub App, never both
 ([ADR 0009](docs/decisions/0009-github-per-installation-read-through-mcp.md)). The compose file runs the
 token. The override `dev/compose.github-app.yaml` runs the same coder as an App: an init service makes a
 throwaway RSA key into a volume (`openssl genrsa`; no key is committed), `GITHUB_TOKEN` is turned off, and the
-coder gets `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID` and `GITHUB_APP_PRIVATE_KEY_PATH`. It signs a JWT,
-trades it at `mock-github` for an installation token and gives that to `git` and to the REST calls.
+coder gets `GITHUB_APP_ID`, `GITHUB_APP_OWNERS` (`local,scratch,other-org`: **no** `GITHUB_APP_INSTALLATION_ID`, so
+the App is not pinned) and `GITHUB_APP_PRIVATE_KEY_PATH`. It signs a JWT, finds the installation of each repository's
+owner at `mock-github` (`GET /orgs/{owner}/installation`, then `/users/{owner}/installation`: every owner is on
+installation 67890 and `other-org` on 67891), trades the JWT for an installation token and gives that to `git`, to the
+REST calls and to the GitHub MCP calls. An owner that is not on the list is refused before anything is looked up.
+A pinned App (`GITHUB_APP_INSTALLATION_ID`) is covered by the tests of the crates and of the binary.
 
 ```sh
 docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app up -d --build --wait \
@@ -388,9 +398,11 @@ GITHUB_AUTH=app sh dev/coder-e2e.sh                  # likewise NO_OPENCODE=1, S
 ```
 
 With `GITHUB_AUTH=app` the script asserts, besides everything above, that `mock-github` saw at least one
-`POST /app/installations/67890/access_tokens` and that **every** call to `/repos/...` (the pull request's
-included) carried `Bearer ghs_mockinstallationtoken...` and never the JWT. With the default `token` it asserts
-that every such call carried the dummy token. WireMock cannot check an RS256 signature, so the mock accepts any
+`POST /app/installations/67890/access_tokens` (and, with `EXPECT_INSTALLATION_LOOKUP=1`, for the first run after the
+coder started, which keeps what it found, at least one installation lookup with a JWT, for an owner on the list) and that **every** call to `/repos/...` (the pull request's
+included) carried `Bearer ghs_mockinstallationtoken...` and never the JWT, and that every `tools/call` to
+`mock-github-mcp` carried it too (the coder sends the credentials of each MCP call itself, and a placeholder to list
+the tools). With the default `token` it asserts that every such call carried the dummy token. WireMock cannot check an RS256 signature, so the mock accepts any
 bearer that looks like a JWT; the signature, `iss` and lifetime are checked by
 `cargo test -p adam-workspace --test github_app` against a key made for the test. CI runs the four scenarios a
 second time this way (`.github/workflows/coder.yml`, step "Compose e2e").
