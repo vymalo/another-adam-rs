@@ -4374,6 +4374,10 @@ mod cases {
         );
         let worker = spawn_worker(&back);
         wait_done(&back, first).await;
+        // Stop the worker before `second` exists: `ChainAgent` finishes in one step, so a worker
+        // that is still polling can claim and finish `second` between the insert below and the
+        // read of its status, and the `Runnable` assertion would then see `Done`.
+        worker.stop().await;
 
         let second = RunId::new();
         assert!(
@@ -4392,7 +4396,8 @@ mod cases {
                 before: vec!["one".into()]
             }
         );
-        // The worker steps it like any run; the prior run is untouched.
+        // A worker steps it like any run; the prior run is untouched.
+        let worker = spawn_worker(&back);
         wait_done(&back, second).await;
         assert_eq!(
             chain_of(&back.view(first).await.unwrap().unwrap()).text,
