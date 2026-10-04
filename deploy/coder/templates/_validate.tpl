@@ -93,6 +93,24 @@ from service.yaml, which every render contains, so they always run.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- /* config.modelBaseUrlFromSecret: MODEL_BASE_URL from the ExternalSecret, not from config.modelBaseUrl. */ -}}
+{{- if not (kindIs "bool" .Values.config.modelBaseUrlFromSecret) -}}
+{{- fail (printf "config.modelBaseUrlFromSecret must be true or false, got %q" (toString .Values.config.modelBaseUrlFromSecret)) -}}
+{{- end -}}
+{{- if include "coder.modelBaseUrlFromSecret" . -}}
+{{- if include "coder.modelBaseUrlLiteral" . -}}
+{{- fail "config.modelBaseUrlFromSecret is on and config.modelBaseUrl is set: the gateway's URL comes from the ExternalSecret then, so a URL in values would be written in git and ignored. Remove config.modelBaseUrl (the default placeholder, or empty, counts as unset), or turn the option off" -}}
+{{- end -}}
+{{- if hasKey .Values.config.extraEnv "MODEL_BASE_URL" -}}
+{{- fail "config.modelBaseUrlFromSecret is on and config.extraEnv sets MODEL_BASE_URL: the chart sets it itself, from the ExternalSecret. Remove it from config.extraEnv" -}}
+{{- end -}}
+{{- if not .Values.externalSecrets.enabled -}}
+{{- fail "config.modelBaseUrlFromSecret is on and its value comes from the ExternalSecret only: set externalSecrets.enabled=true, or turn the option off and set config.modelBaseUrl" -}}
+{{- end -}}
+{{- if not .Values.externalSecrets.properties.modelBaseUrl -}}
+{{- fail "config.modelBaseUrlFromSecret is on: externalSecrets.properties.modelBaseUrl must name the AWS property that holds the gateway's URL (model_base_url)" -}}
+{{- end -}}
+{{- end -}}
 {{- if and (gt (int .Values.replicaCount) 1) (include "coder.runsWorkers" .) (not $placement) -}}
 {{- fail "replicaCount > 1 needs workspace.placement (shared, affinity or isolated): runs move between workers at every step, and without a placement a run that lands on a worker without its worktree forks into a second pull request (see deploy/coder/README.md, Workspace placement)" -}}
 {{- end -}}

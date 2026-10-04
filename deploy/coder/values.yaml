@@ -54,8 +54,17 @@ config:
   # settings or key volume (github.app): it only starts, delivers to, cancels
   # and views runs. `all` and `worker` need all of them.
   role: ""
-  # OpenAI-compatible gateway, with its /v1 prefix. Roles that run workers only.
+  # OpenAI-compatible gateway, with its /v1 prefix. Roles that run workers only. The default is a
+  # placeholder that is never a real gateway: set it to the URL of yours, or keep the URL out of
+  # git with modelBaseUrlFromSecret below.
   modelBaseUrl: "https://gateway.example.invalid/v1"
+  # true: MODEL_BASE_URL comes from the ExternalSecret (externalSecrets.properties.modelBaseUrl),
+  # like MODEL_API_KEY, and modelBaseUrl above must stay unset (the placeholder, or empty): the chart
+  # refuses a real URL there, and refuses the option with externalSecrets.enabled=false or with
+  # properties.modelBaseUrl empty. Roles that run workers only; a control plane renders neither. Add
+  # the AWS property BEFORE turning this on: a missing property fails the whole ExternalSecret sync.
+  # The URL is not a credential and still shows in the pod's environment and the startup log.
+  modelBaseUrlFromSecret: false
   # Model alias of the agent, and the one OpenCode uses through the same gateway.
   model: "coder"
   opencodeModel: "coder"
@@ -271,6 +280,9 @@ externalSecrets:
     # required, and may be set to null. githubToken is also neither rendered nor
     # required with github.auth=app.
     modelApiKey: adam_coder_model_api_key
+    # The gateway's base URL, read only with config.modelBaseUrlFromSecret=true, and only by the
+    # roles that run workers. With the option off nothing reads it.
+    modelBaseUrl: model_base_url
     githubToken: adam_coder_github_token
     # Comma-separated bearer tokens the A2A server accepts.
     a2aBearerTokens: adam_coder_a2a_bearer_tokens
