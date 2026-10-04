@@ -156,10 +156,32 @@ impl Redactor {
         registered.rebuild();
     }
 
+    /// Redact `secret` (and its Base64 forms) from now on, **for good**: unlike [`add`](Self::add) it
+    /// is never forgotten, however many installation tokens are added after it. For a value the
+    /// process learns once, after it started, and holds as long as it runs (a key an MCP server's
+    /// header reads from the environment). Adding a known value changes nothing; a value too
+    /// short to be safe to replace is ignored.
+    pub fn add_fixed(&self, secret: &str) {
+        if secret.len() < MIN_SECRET_LEN || self.read().fixed.iter().any(|s| s == secret) {
+            return;
+        }
+        let mut registered = self
+            .registered
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if registered.fixed.iter().any(|s| s == secret) {
+            return;
+        }
+        // It may have been added as a rotating value first: it is fixed now.
+        registered.added.retain(|s| s != secret);
+        registered.fixed.push(secret.to_owned());
+        registered.rebuild();
+    }
+
     /// Register the values of the environment variables `names` (looked up with `lookup`): the
     /// variables a `mcp.json` refers to as `${VAR}`, which hold credentials of this process. A
-    /// name with no value, or a value too short to be a secret, adds nothing. Returns how many
-    /// values were registered. Names only are ever logged, never values.
+    /// name with no value, or a value too short to be a secret, adds nothing. The values are
+    /// permanent ([`add_fixed`](Self::add_fixed)). Returns how many values were registered. Names only are ever logged, never values.
     pub fn add_env_values<'a>(
         &self,
         names: impl IntoIterator<Item = &'a str>,
@@ -168,7 +190,7 @@ impl Redactor {
         let mut registered = 0;
         for name in names {
             if let Some(value) = lookup(name).filter(|v| v.len() >= MIN_SECRET_LEN) {
-                self.add(&value);
+                self.add_fixed(&value);
                 registered += 1;
             }
         }
@@ -378,6 +400,36 @@ mod tests {
             r.scrub("Bearer search-tok-9f3a1c / ctx7sk-0123456789 / abc"),
             "Bearer [redacted] / [redacted] / abc"
         );
+    }
+
+    #[test]
+    fn registered_environment_values_survive_any_number_of_added_tokens() {
+        let r = Redactor::new(["startup-secret-value"]);
+        let registered = r.add_env_values(["MCP_KEY"], |_| Some("mcp-key-0123456789".to_owned()));
+        assert_eq!(registered, 1);
+        // The installation tokens a GitHub App mints are added one an hour for each installation:
+        // far more than the bounded list keeps.
+        for n in 0..(MAX_ADDED + 1) {
+            r.add(&format!("ghs_installation_token_{n:04}"));
+        }
+        assert_eq!(
+            r.scrub("key mcp-key-0123456789 / ghs_installation_token_0000"),
+            "key [redacted] / ghs_installation_token_0000",
+            "the oldest token is forgotten, the key never is"
+        );
+        assert_eq!(r.scrub("startup-secret-value"), "[redacted]");
+        assert_eq!(
+            r.scrub(&format!("ghs_installation_token_{:04}", MAX_ADDED)),
+            "[redacted]"
+        );
+        // A value first learned as a rotating one becomes permanent, and a repeat adds nothing.
+        r.add("late-rotating-value");
+        r.add_fixed("late-rotating-value");
+        r.add_fixed("late-rotating-value");
+        for n in 0..(MAX_ADDED + 1) {
+            r.add(&format!("ghs_other_token_{n:04}"));
+        }
+        assert_eq!(r.scrub("late-rotating-value"), "[redacted]");
     }
 
     #[test]
