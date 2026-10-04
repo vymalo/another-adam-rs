@@ -19,6 +19,14 @@ adam = "0.1"
 | `mcp` | no | `mcp.json` tools: `adam::mcp` (the MCP client: `McpPolicy`, `Env`, `McpServers`) and `AgentDef::connect_mcp`, which connects each agent's MCP servers at startup and gives it their tools as `<server>__<tool>` (turns on `adam-assembly/mcp`; see [MCP tools](../adam-assembly/README.md#mcp-tools-feature-mcp)). Off by default: a build cannot start a process or reach a server because an `mcp.json` said so unless it opts in |
 | `dev` | no | dev reload: `adam::LiveAssembly` watches the agent directory and swaps the agents when a file changes (turns on `adam-assembly/dev`, which brings `notify`). Off by default, so a release build cannot watch and reload prompts unless it opts in. Reading a folder once, at startup, needs no feature: `adam::AgentFolder` |
 
+`adam::EXTRA_MCP_FILE_ENV` (`ADAM_EXTRA_MCP_FILE`) and `adam::extra_mcp_file_from_env()` name a file of extra MCP servers, in
+the shape of `mcp.json`, that a binary adds to the agent's own with `AgentDef::with_extra_mcp_file` (a name both have is an
+error; `AgentDef::mcp_env_references` lists the `${VAR}` names of every local agent's servers). No feature for those;
+connecting the servers is the feature `mcp`. See
+[extra MCP servers](../adam-assembly/README.md#extra-mcp-servers-adam_extra_mcp_file) and
+[ADR 0018](../../docs/decisions/0018-extra-mcp-servers-are-a-file-merged-over-the-agents-own.md). `adam::agent_fs::McpServer`
+has the field `optional` (`optional: true` in the file: a server that may be missing at startup).
+
 The authoring layer around it (agent directories, skills, subagents) is designed in
 [`docs/authoring.md`](../../docs/authoring.md). What exists: `#[tool]`, the agent directory
 embedded at build time (`adam::include_agent!()`, below), and `AgentDef`, which binds it to

@@ -181,6 +181,8 @@ same way; every problem is reported at once at startup):
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 | `RUST_LOG` | log filter (JSON logs on stdout) | `info` |
 
+**`optional` and `tools:`**: a server marked `optional: true` that is skipped (down, no key, a missing allow-listed tool) has no tools, so a `tools:` entry of the agent that names one of them (`search__web_search`, `search__*`) makes the folder exit 78 at startup. Leave an optional server's tools out of `tools:`, or make the server required.
+
 There is no `GITHUB_TOKEN`, no workspace and no placement: the agent has no worktree. Runs are not pinned to a
 worker, so several workers share one database and any of them steps any run.
 

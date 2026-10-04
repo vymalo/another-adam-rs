@@ -59,6 +59,8 @@ before you rely on a detail here.
    * `"optional": true` on a server: if it is down, refuses its credentials, lacks an allow-listed tool or its
      `${VAR}` has no value, it is skipped with a warning and the process starts without it (a required server
      that is down is exit 69). A header whose `${VAR}` is empty is an error (a skip when optional).
+     Naming a skipped optional server's tools in the agent's `tools:` (`search__*`) makes the folder exit 78,
+     so leave an optional server's tools out of `tools:` or make the server required.
    * **More servers without copying the folder**: `ADAM_EXTRA_MCP_FILE=/path/mcp.json`, a file in the same
      shape, is added to the folder's own `mcp.json` at startup by the roles that run workers (`adam-agent` and
      `adam-coder`, which has the shipped `github` server in its embedded copy). A name the folder already has
