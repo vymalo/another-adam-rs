@@ -1155,3 +1155,141 @@ async fn a_server_of_another_name_is_not_bound_and_shutdown_closes_a_bound_one()
         "no bearer was asked for after shutdown"
     );
 }
+
+/// A URL nothing listens on: the port was free a moment ago.
+async fn a_url_nobody_answers() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}/mcp")
+}
+
+fn two_servers(down: &str, down_extra: &str, up: &str) -> adam_agent_fs::McpConfig {
+    common::config(&format!(
+        r#"{{"mcpServers": {{
+            "down": {{"type": "http", "url": "{down}"{down_extra}}},
+            "up": {{"type": "http", "url": "{up}"}}}}}}"#
+    ))
+}
+
+#[tokio::test]
+async fn an_optional_server_that_is_down_is_skipped_with_a_warning_and_the_rest_connect() {
+    let logs = LogCapture::start();
+    let up = TestHttpServer::start(None).await;
+    let down = a_url_nobody_answers().await;
+    let config = two_servers(&down, r#", "optional": true"#, &up.url());
+    let servers = connect(&config).await;
+    assert_eq!(
+        servers.names(),
+        expected_names("up"),
+        "only the one that is up"
+    );
+    let text = logs.text();
+    assert!(
+        text.contains("the optional MCP server is skipped") && text.contains("down"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_required_server_that_is_down_still_stops_startup_as_transient() {
+    let up = TestHttpServer::start(None).await;
+    let down = a_url_nobody_answers().await;
+    let config = two_servers(&down, "", &up.url());
+    let error = McpServers::connect(&config, &Env::new(), &McpPolicy::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Connect { server, .. } if server == "down"),
+        "{error}"
+    );
+    // The class the worker's exit code (69, a supervisor retries) comes from.
+    assert_eq!(error.class(), ErrorClass::Transient);
+    // `optional: false` is the same as absent.
+    let config = two_servers(&down, r#", "optional": false"#, &up.url());
+    assert!(
+        McpServers::connect(&config, &Env::new(), &McpPolicy::default())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn an_optional_server_that_refuses_the_credentials_or_lacks_an_allowed_tool_is_skipped() {
+    let guarded = TestHttpServer::start(Some(TOKEN)).await;
+    let up = TestHttpServer::start(None).await;
+    let config = common::config(&format!(
+        r#"{{"mcpServers": {{
+            "locked": {{"type": "http", "url": "{}", "optional": true,
+                        "headers": {{"Authorization": "Bearer wrong-token-4c2a9e"}}}},
+            "renamed": {{"type": "http", "url": "{}", "optional": true, "tools": ["no_such_tool"]}},
+            "up": {{"type": "http", "url": "{}"}}}}}}"#,
+        guarded.url(),
+        up.url(),
+        up.url()
+    ));
+    let servers = connect(&config).await;
+    assert_eq!(servers.names(), expected_names("up"));
+}
+
+#[tokio::test]
+async fn an_optional_server_whose_key_has_no_value_is_skipped_and_a_required_one_is_an_error() {
+    let up = TestHttpServer::start(None).await;
+    let headers = r#""headers": {"Authorization": "Bearer ${MCP_TEST_OPTIONAL_KEY}"}"#;
+    let one = |optional: &str| {
+        common::config(&format!(
+            r#"{{"mcpServers": {{
+                "keyed": {{"type": "http", "url": "{}", {headers}{optional}}},
+                "up": {{"type": "http", "url": "{}"}}}}}}"#,
+            up.url(),
+            up.url()
+        ))
+    };
+    // Unset: skipped when optional, and nothing is sent to it.
+    let before = up.requests();
+    let servers = connect(&one(r#", "optional": true"#)).await;
+    assert_eq!(servers.names(), expected_names("up"));
+    let after_optional = up.requests();
+    assert!(after_optional > before, "`up` was listed");
+
+    // Empty (a Secret key with no value): the same, and an error when required.
+    let empty = Env::new().var("MCP_TEST_OPTIONAL_KEY", "");
+    let servers = McpServers::connect(&one(r#", "optional": true"#), &empty, &McpPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(servers.names(), expected_names("up"));
+    let error = McpServers::connect(&one(""), &empty, &McpPolicy::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Var { var, problem: VarProblem::Empty, .. }
+            if var == "MCP_TEST_OPTIONAL_KEY"),
+        "{error}"
+    );
+    assert_eq!(error.class(), ErrorClass::Invalid);
+    let error = McpServers::connect(&one(""), &Env::new(), &McpPolicy::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Var {
+                problem: VarProblem::Missing,
+                ..
+            }
+        ),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_mistake_in_the_file_is_an_error_even_for_an_optional_server() {
+    // Plain http to another machine without the opt-in never succeeds later.
+    let config = common::config(
+        r#"{"mcpServers": {"s": {"type": "http", "url": "http://search.example.com/mcp", "optional": true}}}"#,
+    );
+    let error = McpServers::connect(&config, &Env::new(), &McpPolicy::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, Error::Url { .. }), "{error}");
+}

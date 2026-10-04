@@ -158,6 +158,7 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
                 args: raw.args,
                 env: raw.env,
                 tools: raw.tools,
+                optional: raw.optional.unwrap_or(false),
             }
         }
         (Declared::Unset, None, Some(_)) => {
@@ -222,6 +223,7 @@ fn convert(sink: &mut Sink<'_>, name: &str, raw: RawServer) -> Option<McpServer>
                 url: url.to_owned(),
                 headers: raw.headers,
                 tools: raw.tools,
+                optional: raw.optional.unwrap_or(false),
             }
         }
     };

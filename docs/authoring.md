@@ -181,7 +181,8 @@ all of them with no error; that is a conformance test since S4.
   <https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2633>; the field details are
   *unverified* until the PR is read in full). There is no ratified standard yet.
 * A `url` without `type` is an error, as in Claude Code. `tools` (an adam extension) is an allow-list.
-  The model-facing name is `<server>__<tool>`.
+  The model-facing name is `<server>__<tool>`. `optional: true` (an adam extension) lets a server be missing at
+  startup: if it cannot be reached or listed, or its `${VAR}` has no value, it is skipped with a warning.
 * `${VAR}` and `${VAR:-default}` are expanded **at startup only**. A missing variable without a default
   fails startup (fail closed). `build.rs` records the names and never the values.
 * stdio servers spawn processes: allowed only when the composition root opts in (`McpPolicy::allow_stdio`).
