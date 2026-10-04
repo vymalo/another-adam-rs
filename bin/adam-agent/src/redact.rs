@@ -11,6 +11,8 @@
 //! was transformed (hashed, split over two lines), is not found. The orchestration layer redacts
 //! patterns (bearer tokens, JWTs, keys) as well; this is the agent's half.
 
+use std::collections::BTreeSet;
+
 use adam_llm_agent::StepIo;
 use secrecy::ExposeSecret as _;
 
@@ -43,6 +45,18 @@ pub fn secret_values(
     config: &Config,
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> Vec<String> {
+    secret_values_named(config, vars, &BTreeSet::new())
+}
+
+/// [`secret_values`], and also the value of each variable of `vars` whose name is in `named`
+/// whatever the name looks like: the variables the agent's `mcp.json` files refer to as `${VAR}`
+/// (`AgentDef::mcp_env_references`), which hold credentials even when their names say nothing
+/// (`BRAVE_KEY` is found by its name, `SEARCH_ACCESS` is not).
+pub fn secret_values_named(
+    config: &Config,
+    vars: impl IntoIterator<Item = (String, String)>,
+    named: &BTreeSet<String>,
+) -> Vec<String> {
     let mut secrets: Vec<String> = Vec::new();
     if let Some(worker) = &config.worker {
         secrets.push(worker.model.api_key.expose_secret().to_owned());
@@ -61,8 +75,9 @@ pub fn secret_values(
         secrets.push(percent_decode(password));
     }
     for (name, value) in vars {
+        let is_named = named.contains(&name);
         let name = name.to_ascii_uppercase();
-        if SECRET_WORDS.iter().any(|word| name.contains(word)) {
+        if is_named || SECRET_WORDS.iter().any(|word| name.contains(word)) {
             secrets.extend(value.split(',').map(|part| part.trim().to_owned()));
             secrets.push(value);
         }
@@ -93,7 +108,16 @@ pub fn process_vars() -> impl Iterator<Item = (String, String)> {
 /// The [`StepIo`] of this process: every string of a call's input and output scrubbed of the secrets
 /// of `config` and of the environment `vars`, then cut to the contract's bounds.
 pub fn step_io(config: &Config, vars: impl IntoIterator<Item = (String, String)>) -> StepIo {
-    let secrets = secret_values(config, vars);
+    step_io_named(config, vars, &BTreeSet::new())
+}
+
+/// [`step_io`] that also scrubs the variables in `named` ([`secret_values_named`]).
+pub fn step_io_named(
+    config: &Config,
+    vars: impl IntoIterator<Item = (String, String)>,
+    named: &BTreeSet<String>,
+) -> StepIo {
+    let secrets = secret_values_named(config, vars, named);
     if secrets.is_empty() {
         return StepIo::default();
     }
@@ -148,6 +172,24 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn a_variable_an_mcp_json_names_is_scrubbed_whatever_its_name_looks_like() {
+        let vars = env(&[
+            ("SEARCH_ACCESS", "access-0123456789"),
+            ("PATH", "/usr/bin:/bin"),
+        ]);
+        let named: BTreeSet<String> = ["SEARCH_ACCESS".to_owned()].into();
+        assert!(
+            !secret_values(&config(), vars.clone()).contains(&"access-0123456789".to_owned()),
+            "its name says nothing"
+        );
+        let secrets = secret_values_named(&config(), vars.clone(), &named);
+        assert!(secrets.contains(&"access-0123456789".to_owned()));
+        assert!(!secrets.contains(&"/usr/bin:/bin".to_owned()));
+        let io = step_io_named(&config(), vars, &named);
+        let _ = io;
     }
 
     #[test]

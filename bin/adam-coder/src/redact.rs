@@ -156,6 +156,25 @@ impl Redactor {
         registered.rebuild();
     }
 
+    /// Register the values of the environment variables `names` (looked up with `lookup`): the
+    /// variables a `mcp.json` refers to as `${VAR}`, which hold credentials of this process. A
+    /// name with no value, or a value too short to be a secret, adds nothing. Returns how many
+    /// values were registered. Names only are ever logged, never values.
+    pub fn add_env_values<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a str>,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> usize {
+        let mut registered = 0;
+        for name in names {
+            if let Some(value) = lookup(name).filter(|v| v.len() >= MIN_SECRET_LEN) {
+                self.add(&value);
+                registered += 1;
+            }
+        }
+        registered
+    }
+
     /// The secrets the process holds: every accepted A2A bearer token, the password of
     /// `DATABASE_URL`, and, for a role that runs workers, the model key and the GitHub credentials
     /// (a control plane holds neither): the personal access token, or the private key of the
@@ -332,6 +351,33 @@ mod tests {
             "Authorization: Basic [redacted]"
         );
         assert!(matches!(r.scrub("nothing here"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn the_values_of_named_variables_are_registered_when_there_are_any() {
+        let r = Redactor::new(Vec::<String>::new());
+        let vars = |name: &str| match name {
+            "SEARCH_MCP_TOKEN" => Some("search-tok-9f3a1c".to_owned()),
+            "CONTEXT7_API_KEY" => Some("ctx7sk-0123456789".to_owned()),
+            "SHORT" => Some("abc".to_owned()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        };
+        let registered = r.add_env_values(
+            [
+                "SEARCH_MCP_TOKEN",
+                "CONTEXT7_API_KEY",
+                "SHORT",
+                "EMPTY",
+                "UNSET",
+            ],
+            vars,
+        );
+        assert_eq!(registered, 2, "unset, empty and too short add nothing");
+        assert_eq!(
+            r.scrub("Bearer search-tok-9f3a1c / ctx7sk-0123456789 / abc"),
+            "Bearer [redacted] / [redacted] / abc"
+        );
     }
 
     #[test]

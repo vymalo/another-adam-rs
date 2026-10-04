@@ -11,7 +11,8 @@ pub use adam_model_openai::OpenAiConfigError;
 #[cfg(feature = "mcp")]
 pub use config::McpSettings;
 pub use config::{
-    ConfigError, ModelConfig, ServiceConfig, WorkerSettings, is_worker_id, parse_flag, parse_or,
+    ConfigError, ModelConfig, ServiceConfig, WorkerSettings, is_worker_id, parse_file, parse_flag,
+    parse_or,
 };
 pub use exit::{
     EX_CONFIG, EX_GENERAL, EX_OSERR, EX_SOFTWARE, EX_UNAVAILABLE, exit_code, exit_code_with,

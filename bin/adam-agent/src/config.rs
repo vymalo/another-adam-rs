@@ -52,6 +52,9 @@ pub struct WorkerConfig {
     pub model: ModelConfig,
     /// `MCP_ALLOW_*`: what the MCP servers of the folder's `mcp.json` may be.
     pub mcp: McpSettings,
+    /// `ADAM_EXTRA_MCP_FILE`: a file of MCP servers (the shape of `mcp.json`) added to the
+    /// folder's own before they connect, an existing file. `None`: only the folder's servers.
+    pub extra_mcp_file: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Config {
@@ -69,6 +72,7 @@ impl std::fmt::Debug for WorkerConfig {
         f.debug_struct("WorkerConfig")
             .field("model", &self.model)
             .field("mcp", &self.mcp)
+            .field("extra_mcp_file", &self.extra_mcp_file)
             .finish()
     }
 }
@@ -119,6 +123,11 @@ impl Config {
         let worker = service.worker.is_some().then(|| WorkerConfig {
             model: ModelConfig::parse(&lookup, &mut problems),
             mcp: McpSettings::parse(&lookup, &mut problems),
+            extra_mcp_file: adam_service::parse_file(
+                &|name: &str| lookup(name).filter(|v| !v.trim().is_empty()),
+                adam::EXTRA_MCP_FILE_ENV,
+                &mut problems,
+            ),
         });
 
         ConfigError::check(problems)?;
@@ -176,6 +185,34 @@ mod tests {
         assert_eq!(worker.model.alias, "large");
         assert_eq!(worker.model.api_key.expose_secret(), "sk-secret");
         assert_eq!(worker.mcp, McpSettings::default());
+    }
+
+    #[test]
+    fn the_extra_mcp_file_is_read_by_the_workers_and_must_be_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("extra.json");
+        std::fs::write(&file, r#"{"mcpServers": {}}"#).unwrap();
+        let mut vars = full(dir.path());
+        assert_eq!(parse(&vars).unwrap().worker.unwrap().extra_mcp_file, None);
+        vars.insert("ADAM_EXTRA_MCP_FILE".into(), file.display().to_string());
+        assert_eq!(
+            parse(&vars).unwrap().worker.unwrap().extra_mcp_file,
+            Some(file)
+        );
+        for bad in [
+            dir.path().display().to_string(),
+            "/not/a/file.json".to_owned(),
+        ] {
+            vars.insert("ADAM_EXTRA_MCP_FILE".into(), bad);
+            assert!(
+                problems_of(&vars)
+                    .iter()
+                    .any(|p| p.starts_with("ADAM_EXTRA_MCP_FILE"))
+            );
+        }
+        // A control plane connects no server: the variable is not its business.
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse(&vars).unwrap().worker.is_none());
     }
 
     /// No default, no embedded copy: without the variable the process does not start, and the

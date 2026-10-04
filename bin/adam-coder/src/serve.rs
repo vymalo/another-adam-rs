@@ -30,7 +30,7 @@ use std::sync::Arc;
 use adam_devcontainer::{DevContainer, Network, Runtime};
 use adam_model::DynModel;
 use adam_service::{Agents, RuntimeOptions, claim_scope_for};
-use adam_workspace::{DynCodeHost, DynEnvironment, GitHub, GitIdentity};
+use adam_workspace::{DynCodeHost, DynEnvironment, GitHub, GitIdentity, HidingEnvironment};
 use anyhow::Context as _;
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -96,7 +96,40 @@ async fn build_agent(
     settings.draft_pull_requests = worker.pr_draft;
     settings.identity = GitIdentity::new(&worker.git_author_name, &worker.git_author_email);
 
+    // The agent's definition: its own files, with the extra MCP servers `ADAM_EXTRA_MCP_FILE` names
+    // added (a name the agent already has is refused: exit 78). Read before the environment, because
+    // the variables its servers refer to (`${VAR}` in a header) are secrets of this process: they are
+    // hidden from every process a run starts (a repository's checks, a command, OpenCode) and
+    // redacted from what the tools answer, like the fixed ones.
+    let mut def = files
+        .def()
+        .map_err(|e| *e)
+        .context("reading the agent definition")?;
+    if let Some(file) = &worker.extra_mcp_file {
+        let (extended, warnings) = def
+            .with_extra_mcp_file(file)
+            .context("adding the extra MCP servers (ADAM_EXTRA_MCP_FILE)")?;
+        for warning in &warnings {
+            tracing::warn!("{warning}");
+        }
+        tracing::info!(file = %file.display(), "extra MCP servers added to the agent's own");
+        def = extended;
+    }
+    let secret_vars: Vec<String> = def.mcp_env_references().into_iter().collect();
+    let registered = redactor.add_env_values(secret_vars.iter().map(String::as_str), |name| {
+        std::env::var(name).ok()
+    });
+    tracing::info!(
+        hidden = ?secret_vars,
+        registered,
+        "variables the MCP servers refer to are hidden from the processes of runs and redacted from tool output"
+    );
     let environment = environment_for(worker, &root).await?;
+    let environment: DynEnvironment = if secret_vars.is_empty() {
+        environment
+    } else {
+        Arc::new(HidingEnvironment::new(environment, secret_vars))
+    };
     let env = Arc::new(
         ToolEnv::new(workspaces, code_host, settings)
             .with_environment(environment)
@@ -130,10 +163,7 @@ async fn build_agent(
     // agent is bound: a server that is down, a local process the policy does not allow, a
     // `${VAR}` that is unset are startup errors with their own exit code (69 or 78), never
     // something found in the middle of a run. Without an `mcp.json` this connects to nothing.
-    let def = files
-        .def()
-        .map_err(|e| *e)
-        .context("reading the agent definition")?
+    let def = def
         .connect_mcp(&policy)
         .await
         .context(

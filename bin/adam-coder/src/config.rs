@@ -51,6 +51,7 @@
 //! | `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
 //! | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (set by the image) | `devcontainer`, `podman-remote` |
 //! | `OPENCODE_BINARY` | with `podman`: the OpenCode that is mounted into every devcontainer; a native executable (an ELF file) | `OPENCODE_COMMAND`'s program, found on `PATH` and resolved to its real file |
+//! | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers, in the shape of `mcp.json`, added to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file, and a server name the agent already has is refused at startup (exit 78). A variable it names as `${VAR}` is hidden from every process the coder starts and its value is redacted from tool output, like the `mcp.json`'s own | unset: only the agent's own servers |
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
 //!
 //! # Roles
@@ -183,6 +184,9 @@ pub struct WorkerConfig {
     pub opencode_command: Vec<String>,
     /// `MCP_ALLOW_*`: what the MCP servers of the agent folder's `mcp.json` may be.
     pub mcp: McpSettings,
+    /// `ADAM_EXTRA_MCP_FILE`: a file of MCP servers (the shape of `mcp.json`) added to the agent's
+    /// own before they connect, an existing file. `None`: only the agent's own servers.
+    pub extra_mcp_file: Option<PathBuf>,
     /// `DEVCONTAINER_*`: where the run's commands and OpenCode run.
     pub devcontainer: DevcontainerConfig,
 }
@@ -713,6 +717,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("pr_draft", &self.pr_draft)
             .field("opencode_command", &self.opencode_command)
             .field("mcp", &self.mcp)
+            .field("extra_mcp_file", &self.extra_mcp_file)
             .field("devcontainer", &self.devcontainer)
             .finish_non_exhaustive()
     }
@@ -847,6 +852,7 @@ impl WorkerConfig {
         let pr_draft = parse_flag(get, "PR_DRAFT", problems);
         let allow_local_repos = parse_flag(get, "ALLOW_LOCAL_REPOS", problems);
         let mcp = McpSettings::parse(lookup, problems);
+        let extra_mcp_file = adam_service::parse_file(get, adam::EXTRA_MCP_FILE_ENV, problems);
         let allowed_repo_hosts = match get("ALLOWED_REPO_HOSTS") {
             None => vec![DEFAULT_REPO_HOST.to_owned()],
             Some(raw) => {
@@ -961,6 +967,7 @@ impl WorkerConfig {
             ),
             opencode_command,
             mcp,
+            extra_mcp_file,
         })
     }
 }
@@ -1315,6 +1322,49 @@ mod tests {
         vars.insert("ROLE", "control-plane");
         vars.insert("GITHUB_MCP_URL", "garbage");
         assert!(parse(&vars).is_ok(), "a control plane does not read it");
+    }
+
+    #[test]
+    fn the_extra_mcp_file_is_read_by_the_workers_and_must_be_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mcp.json");
+        std::fs::write(&file, r#"{"mcpServers": {}}"#).unwrap();
+        let file_text = file.to_str().unwrap().to_owned();
+        let with = |value: &str| {
+            let get = |name: &str| match name {
+                "ADAM_EXTRA_MCP_FILE" => Some(value.to_owned()),
+                other => full().get(other).map(|v| (*v).to_owned()),
+            };
+            Config::from_lookup(get)
+        };
+        assert_eq!(worker(&full()).extra_mcp_file, None);
+        assert_eq!(
+            with(&file_text).unwrap().worker.unwrap().extra_mcp_file,
+            Some(file)
+        );
+        assert_eq!(
+            with("   ").unwrap().worker.unwrap().extra_mcp_file,
+            None,
+            "blank is unset"
+        );
+        for bad in [dir.path().to_str().unwrap(), "/not/a/file.json"] {
+            let error = with(bad).unwrap_err();
+            assert!(
+                error
+                    .problems
+                    .iter()
+                    .any(|p| p.starts_with("ADAM_EXTRA_MCP_FILE")),
+                "{error}"
+            );
+        }
+        // A control plane connects no server, so it does not validate the variable.
+        let mut vars = full();
+        vars.insert("ROLE", "control-plane");
+        let get = |name: &str| match name {
+            "ADAM_EXTRA_MCP_FILE" => Some("/not/a/file.json".to_owned()),
+            other => vars.get(other).map(|v| (*v).to_owned()),
+        };
+        assert!(Config::from_lookup(get).unwrap().worker.is_none());
     }
 
     #[test]

@@ -1020,3 +1020,148 @@ async fn a_service_that_does_not_answer_gives_the_coders_own_container_with_one_
     // The run stays where it fell back to: the second command did not ask the service again.
     assert_eq!(asked_after[0], asked_after[1], "{asked_after:?}");
 }
+
+// ----------------------------------------------------------- variables the MCP servers refer to
+
+/// The shipped agent with an extra server whose header reads `${name}`: what `build_agent` does with
+/// `ADAM_EXTRA_MCP_FILE`.
+fn def_with_extra_server_reading(name: &str) -> adam::AgentDef {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("mcp.json");
+    std::fs::write(
+        &file,
+        format!(
+            r#"{{"mcpServers": {{"websearch": {{"type": "http", "url": "https://search.example.com/mcp",
+                "headers": {{"Authorization": "Bearer ${{{name}}}"}}, "optional": true}}}}}}"#
+        ),
+    )
+    .unwrap();
+    let (def, warnings) = adam_coder::AgentFiles::Embedded
+        .def()
+        .unwrap()
+        .with_extra_mcp_file(&file)
+        .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    def
+}
+
+/// A rig whose processes go through `wrap(the recording fake)`.
+async fn rig_over(
+    wrap: impl FnOnce(Arc<FakeEnvironment>) -> adam_workspace::DynEnvironment,
+) -> Rig {
+    let fx = Fixture::new("hello\n").await;
+    let fake = FakeEnvironment::new(Some(&fx.root));
+    let fx = fx.using(wrap(fake.clone()));
+    let sink = CollectingSink::new();
+    let ctx =
+        ToolCtx::detached("tool", "call-1", Arc::new(sink.clone())).with_state(fx.env.clone());
+    Rig {
+        fx,
+        fake,
+        sink,
+        ctx,
+    }
+}
+
+#[tokio::test]
+async fn a_variable_a_mcp_json_names_is_hidden_from_checks_commands_and_opencode() {
+    let def = def_with_extra_server_reading("SEARCH_MCP_TOKEN");
+    let names: Vec<String> = def.mcp_env_references().into_iter().collect();
+    assert_eq!(
+        names,
+        ["SEARCH_MCP_TOKEN"],
+        "the shipped github entry names none"
+    );
+
+    let rig = rig_over(|fake| Arc::new(adam_workspace::HidingEnvironment::new(fake, names))).await;
+    rig.prepare().await;
+    RunCommand
+        .call(&rig.ctx, json!({"command": "env"}))
+        .await
+        .unwrap();
+    RunChecks
+        .call(&rig.ctx, json!({"command": "env"}))
+        .await
+        .unwrap();
+    DelegateToOpenCode
+        .call(&rig.ctx, json!({"instructions": "add hello.txt"}))
+        .await
+        .unwrap();
+
+    let specs = rig.fake.session.specs.lock().unwrap().clone();
+    assert_eq!(specs.len(), 3, "a command, a check and OpenCode: {specs:?}");
+    for spec in &specs {
+        assert!(
+            spec.hide.iter().any(|name| name == "SEARCH_MCP_TOKEN"),
+            "{spec:?}"
+        );
+        // The fixed lists are still there beside it.
+        assert!(
+            spec.hide.iter().any(|name| name == "GITHUB_TOKEN"),
+            "{spec:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_variable_a_mcp_json_names_is_really_absent_from_a_check_and_redacted_from_its_output() {
+    // `HOME` is in the environment of every process: it stands in for a key a deployment gives the
+    // coder (the real names are found and registered the same way, from the same `mcp.json` scan).
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let names: Vec<String> = def_with_extra_server_reading("HOME")
+        .mcp_env_references()
+        .into_iter()
+        .collect();
+    let probe = r#"printf 'home=[%s]' "${HOME-unset}""#;
+
+    // Without the hiding a check sees it, so the rest proves something.
+    let open = rig_over(|_| Arc::new(adam_workspace::Local)).await;
+    open.prepare().await;
+    let seen = RunChecks
+        .call(&open.ctx, json!({"command": probe}))
+        .await
+        .unwrap();
+    assert!(
+        seen.content.contains(&format!("home=[{home}]")),
+        "{}",
+        seen.content
+    );
+
+    // With it, the real process of a check and of a command does not.
+    let rig = rig_over(|_| {
+        Arc::new(adam_workspace::HidingEnvironment::new(
+            Arc::new(adam_workspace::Local),
+            names.clone(),
+        ))
+    })
+    .await;
+    rig.prepare().await;
+    for tool in [
+        RunChecks.call(&rig.ctx, json!({"command": probe})).await,
+        RunCommand.call(&rig.ctx, json!({"command": probe})).await,
+    ] {
+        let out = tool.unwrap();
+        assert!(out.content.contains("home=[unset]"), "{}", out.content);
+    }
+
+    // Its value is redacted from what a tool answers, registered the way `build_agent` does it.
+    let registered = rig
+        .fx
+        .env
+        .redactor
+        .add_env_values(names.iter().map(String::as_str), |name| {
+            std::env::var(name).ok()
+        });
+    let long_enough = home.len() >= adam_coder::redact::MIN_SECRET_LEN;
+    assert_eq!(registered, usize::from(long_enough));
+    if long_enough {
+        let echoed = RunCommand
+            .call(&rig.ctx, json!({"command": format!("echo leaked={home}")}))
+            .await
+            .unwrap();
+        assert!(!echoed.content.contains(&home), "{}", echoed.content);
+        assert!(echoed.content.contains("leaked="), "{}", echoed.content);
+    }
+}

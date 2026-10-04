@@ -33,7 +33,7 @@ an agent does.
 | `WorkerSettings` | `WORKERS` (at least 1) and `WORKER_ID` (`is_worker_id`); `options()` gives the `RuntimeOptions` |
 | `ModelConfig::parse`, `client()` | `MODEL_BASE_URL`, `MODEL_API_KEY` (may be empty, not unset), `MODEL`; the OpenAI-compatible client over them |
 | `McpSettings::parse`, `policy()` (feature `mcp`) | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` and `THREAD_TOOLS_MAX_CALL_SECS`; the `McpPolicy` for `AgentDef::connect_mcp` and the thread-tools client |
-| `parse_or`, `parse_flag`, `is_worker_id` | the helpers a binary parses its own variables with, into the same list of problems |
+| `parse_or`, `parse_flag`, `parse_file`, `is_worker_id` | the helpers a binary parses its own variables with, into the same list of problems (`parse_file`: an existing file, or a problem naming the variable; `ADAM_EXTRA_MCP_FILE` of `adam-coder` and `adam-agent`) |
 | `ConfigError { problems }` | what a non-empty list becomes (`ConfigError::check(problems)`); `Classify` gives `Invalid` |
 | `RuntimeOptions`, `LiveSignals` | how the runtime is set up (worker id, claim scope, concurrency, lease, poll), and how a process learns of other processes (`LiveSignals::local()` or the Postgres `NOTIFY` ones `serve` builds) |
 | `Service { runtime, backend }` | `Service::new(builder, name, options)`, `new_with(.., live)`, `with_inbound(Option<InboundFn>)` (how an A2A message becomes the agent's input), `router(card, auth)`, `run_worker(shutdown)`; `router(&backend, card, auth)` for a composition that holds the parts itself |

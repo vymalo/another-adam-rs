@@ -93,6 +93,27 @@ fn not_blank(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<Str
     lookup(name).filter(|v| !v.trim().is_empty())
 }
 
+/// The path in the variable `name`, which must be an existing file: `None` when it is unset (or
+/// blank), and also, after adding a problem naming the variable, when it is not a file (a path
+/// that does not exist, or a directory). Reads the file system, not the file.
+pub fn parse_file(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    problems: &mut Vec<String>,
+) -> Option<std::path::PathBuf> {
+    let raw = get(name)?;
+    let path = std::path::PathBuf::from(raw.trim());
+    if path.is_file() {
+        Some(path)
+    } else {
+        problems.push(format!(
+            "{name} {:?} is not a file (name an existing file, or unset it)",
+            path.display().to_string()
+        ));
+        None
+    }
+}
+
 /// The value of the variable `name` parsed as a `T`, or `default` when it is unset (or blank).
 /// A value that does not parse adds a problem and also gives `default`.
 pub fn parse_or<T: FromStr>(
@@ -493,6 +514,32 @@ mod tests {
 
     fn mentions(problems: &[String], name: &str) -> bool {
         problems.iter().any(|p| p.starts_with(name))
+    }
+
+    #[test]
+    fn a_file_variable_must_name_an_existing_file() {
+        let dir =
+            std::env::temp_dir().join(format!("adam-service-parse-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("mcp.json");
+        std::fs::write(&file, "{}").unwrap();
+        let file_text = file.display().to_string();
+        let dir_text = dir.display().to_string();
+        let run = |value: Option<&str>| {
+            let mut problems = Vec::new();
+            let get = |_: &str| value.map(str::to_owned);
+            let found = parse_file(&get, "ADAM_EXTRA_MCP_FILE", &mut problems);
+            (found, problems)
+        };
+        assert_eq!(run(None), (None, vec![]));
+        assert_eq!(run(Some(&file_text)), (Some(file.clone()), vec![]));
+        assert_eq!(run(Some(&format!("  {file_text} "))), (Some(file), vec![]));
+        for bad in [dir_text.as_str(), "/definitely/not/here.json"] {
+            let (found, problems) = run(Some(bad));
+            assert_eq!(found, None);
+            assert!(mentions(&problems, "ADAM_EXTRA_MCP_FILE"), "{problems:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
