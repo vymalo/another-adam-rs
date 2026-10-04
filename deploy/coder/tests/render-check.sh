@@ -1,4 +1,6 @@
 #!/bin/sh
+# The ${VAR} of mcp.json, in the checks of the extra MCP servers, are text, not expansions.
+# shellcheck disable=SC2016
 # Assertions on the rendered chart: the properties the design depends on, so a
 # careless edit to the templates or values fails CI instead of exposing the
 # coder. Needs only `helm`, `grep` and `awk`.
@@ -580,5 +582,135 @@ check "token mode ignores github.app.owners" \
   helm template coder "$chart" --namespace coder-ns --set 'github.app.owners={acme}'
 helm template coder "$chart" --namespace coder-ns --set 'github.app.owners={acme}' > "$out"
 check "token mode renders no GITHUB_APP_OWNERS" lacks 'GITHUB_APP_OWNERS'
+
+# The extra MCP servers (values `mcp.*`): our web search server and Context7, off by default. With either
+# on, the chart supplies the coder's whole agent folder as a ConfigMap (the image holds its files only inside
+# the binary, and the coder reads one folder) and the keys come from the ExternalSecret as env vars that
+# mcp.json names as ${VAR}; never as chart values.
+repo="$chart/../.."
+check "off: the chart's copy of the shipped prompt equals bin/adam-coder/agent/instructions.md" \
+  cmp -s "$chart/agent/instructions.md" "$repo/bin/adam-coder/agent/instructions.md"
+check "off: the chart's copy of the shipped mcp.json equals bin/adam-coder/agent/mcp.json" \
+  cmp -s "$chart/agent/mcp.json" "$repo/bin/adam-coder/agent/mcp.json"
+helm template coder "$chart" --namespace coder-ns > "$out"
+check "off: no agent ConfigMap, no ADAM_AGENT_DIR, no extra key, no MCP_ALLOW_INSECURE, no checksum" \
+  lacks 'kind: ConfigMap|ADAM_AGENT_DIR|agent-files|SEARCH_MCP_TOKEN|CONTEXT7_API_KEY|MCP_ALLOW_INSECURE|checksum/'
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set mcp.websearch.url= --set mcp.context7.enabled=false > "$out"
+check "off, set explicitly: the render equals the golden" cmp -s "$out" "$golden"
+
+mcp_json() { doc ConfigMap "${1:-$out}" | awk '/^  mcp.json: \|$/ { on = 1; next } on { sub(/^    /, ""); print }'; }
+mcp_prompt() { doc ConfigMap "${1:-$out}" | awk '/^  instructions.md: \|$/ { on = 1; next } /^  mcp.json: \|$/ { on = 0 } on { sub(/^    /, ""); print }'; }
+# jqt <filter>: true when the filter holds on the rendered mcp.json.
+jqt() { filter=$1; shift; mcp_json "$out" | jq -e "$@" "$filter" >/dev/null; }
+search_url=http://search-mcp.coder-ns.svc.cluster.local:8080/mcp
+helm_mcp() { helm template coder "$chart" --namespace coder-ns "$@"; }
+
+helm_mcp --set mcp.websearch.url=$search_url > "$out"
+check "websearch: one ConfigMap, the agent folder" count '^kind: ConfigMap$' 1
+check "websearch: mcp.json parses as JSON" jqt '.'
+check "websearch: mcp.json has only mcpServers at the top" jqt 'keys == ["mcpServers"]'
+check "websearch: the servers are github and websearch (not context7)" jqt '.mcpServers | keys == ["github","websearch"]'
+check "websearch: type http, the URL as set" jqt '.mcpServers.websearch | .type == "http" and .url == $u' --arg u "$search_url"
+check "websearch: the header is Authorization: Bearer \${SEARCH_MCP_TOKEN}" \
+  jqt '.mcpServers.websearch.headers == {"Authorization": "Bearer ${SEARCH_MCP_TOKEN}"}'
+check "websearch: no tools allow-list unless set" jqt '.mcpServers.websearch | has("tools") | not'
+check "websearch: the github entry is the shipped one" \
+  [ "$(mcp_json "$out" | jq -S .mcpServers.github)" = "$(jq -S .mcpServers.github "$chart/agent/mcp.json")" ]
+check "websearch: the prompt in the ConfigMap is the shipped one" \
+  [ "$(mcp_prompt "$out")" = "$(cat "$chart/agent/instructions.md")" ]
+check "websearch: every server entry has only the keys mcp.json knows (type, url, headers, tools)" \
+  jqt '[.mcpServers[] | keys[] ] | all(. == "type" or . == "url" or . == "headers" or . == "tools")'
+check "websearch: server ids are valid (letters, digits, - and _, no __)" \
+  jqt '.mcpServers | keys | all(test("^[A-Za-z0-9_-]{1,64}$") and (contains("__") | not))'
+check "websearch: the ExternalSecret copies SEARCH_MCP_TOKEN from the property search_mcp_token" \
+  dhas ExternalSecret 'secretKey: SEARCH_MCP_TOKEN$' 
+check "websearch: ... and nothing for Context7" dlacks ExternalSecret 'CONTEXT7'
+check "websearch: the property is search_mcp_token" dhas ExternalSecret 'property: search_mcp_token$'
+check "websearch: the worker reads SEARCH_MCP_TOKEN from the Secret" \
+  dhas StatefulSet 'name: SEARCH_MCP_TOKEN$'
+check "websearch: ... as a secretKeyRef, never a value" \
+  [ "$(doc StatefulSet | grep -A1 'name: SEARCH_MCP_TOKEN$' | tail -1 | tr -d ' ')" = "valueFrom:" ]
+check "websearch: ADAM_AGENT_DIR is /etc/adam/agent and the folder is mounted read-only there (1/3)" dhas StatefulSet 'name: ADAM_AGENT_DIR$'
+check "websearch: ADAM_AGENT_DIR is /etc/adam/agent and the folder is mounted read-only there (2/3)" dhas StatefulSet 'mountPath: /etc/adam/agent$'
+check "websearch: ADAM_AGENT_DIR is /etc/adam/agent and the folder is mounted read-only there (3/3)" dhas StatefulSet 'name: agent-files$'
+check "websearch: the pod restarts when the folder changes: checksum/agent-files" dhas StatefulSet 'checksum/agent-files: '
+check "websearch: a plain http URL to another machine turns MCP_ALLOW_INSECURE on, once" count 'name: MCP_ALLOW_INSECURE$' 1
+check "websearch: no token value anywhere in the render" lacks 'search_mcp_token_value|Bearer [A-Za-z0-9]'
+check "websearch: the NetworkPolicy still restricts ingress only (egress to the Service stays open)" \
+  dlacks NetworkPolicy '^    - Egress$|^  egress:'
+sum_on=$(grep 'checksum/agent-files' "$out")
+helm_mcp --set mcp.websearch.url=${search_url}2 > "$out"
+check "websearch: a new URL changes the checksum" [ "$sum_on" != "$(grep 'checksum/agent-files' "$out")" ]
+
+helm_mcp --set mcp.context7.enabled=true > "$out"
+check "context7: mcp.json parses and has github and context7" jqt '.mcpServers | keys == ["context7","github"]'
+check "context7: the verified endpoint over https, Authorization: Bearer \${CONTEXT7_API_KEY}" \
+  jqt '.mcpServers.context7 == {"type":"http","url":"https://mcp.context7.com/mcp","headers":{"Authorization":"Bearer ${CONTEXT7_API_KEY}"}}'
+check "context7: the ExternalSecret copies CONTEXT7_API_KEY from the property context7_api_key (1/2)" dhas ExternalSecret 'secretKey: CONTEXT7_API_KEY$'
+check "context7: the ExternalSecret copies CONTEXT7_API_KEY from the property context7_api_key (2/2)" dhas ExternalSecret 'property: context7_api_key$'
+check "context7: nothing for websearch" lacks 'SEARCH_MCP_TOKEN|MCP_ALLOW_INSECURE'
+check "context7: the worker reads CONTEXT7_API_KEY from the Secret" dhas StatefulSet 'name: CONTEXT7_API_KEY$'
+
+helm_mcp --set mcp.websearch.url=$search_url --set mcp.context7.enabled=true > "$out"
+check "both: the servers are context7, github and websearch" jqt '.mcpServers | keys == ["context7","github","websearch"]'
+check "both: every \${VAR} of mcp.json is an env var of the worker, from the Secret" \
+  [ "$(mcp_json "$out" | grep -o '\${[A-Z0-9_]*}' | sort -u | tr -d '${}' | tr '\n' ' ')" = "CONTEXT7_API_KEY SEARCH_MCP_TOKEN " ]
+check "both: the ExternalSecret has both keys beside the existing ones" \
+  [ "$(doc ExternalSecret | grep -c 'secretKey:')" -eq 5 ]
+
+# A deployment's own values: header name, prefix, tools, https, other property names and AWS secret.
+helm_mcp --set mcp.websearch.url=https://search.example.com/mcp --set mcp.websearch.header=X-Search-Token \
+  --set mcp.websearch.valuePrefix= --set 'mcp.websearch.tools={web_search}' \
+  --set 'mcp.context7.enabled=true' --set 'mcp.context7.tools={resolve-library-id,query-docs}' \
+  --set externalSecrets.properties.searchMcpToken=other_prop --set externalSecrets.key=prod/another-agentic/env > "$out"
+check "values: the header name and an empty prefix" jqt '.mcpServers.websearch.headers == {"X-Search-Token": "${SEARCH_MCP_TOKEN}"}'
+check "values: tools allow-lists" \
+  jqt '.mcpServers.websearch.tools == ["web_search"] and .mcpServers.context7.tools == ["resolve-library-id","query-docs"]'
+check "values: an https URL needs no MCP_ALLOW_INSECURE" lacks 'MCP_ALLOW_INSECURE'
+check "values: the AWS property and key are the deployment's (1/2)" dhas ExternalSecret 'property: other_prop$'
+check "values: the AWS property and key are the deployment's (2/2)" dhas ExternalSecret 'key: prod/another-agentic/env$'
+for url in http://localhost:9000/mcp http://127.0.0.1:9000/mcp http://search.localhost/mcp; do
+  helm_mcp --set mcp.websearch.url=$url > "$out"
+  check "a loopback http URL ($url) needs no MCP_ALLOW_INSECURE" lacks 'MCP_ALLOW_INSECURE'
+done
+helm_mcp --set mcp.websearch.url=$search_url --set-string 'config.extraEnv.MCP_ALLOW_INSECURE=true' > "$out"
+check "the deployment's own MCP_ALLOW_INSECURE is not duplicated" count 'name: MCP_ALLOW_INSECURE$' 1
+helm_mcp --set mcp.websearch.url=$search_url --set githubMcp.port=9100 > "$out"
+check "the github entry follows githubMcp.port, as GITHUB_MCP_URL does (1/2)" jqt '.mcpServers.github.url == "http://127.0.0.1:9100/"'
+check "the github entry follows githubMcp.port, as GITHUB_MCP_URL does (2/2)" chas '^              value: "http://127.0.0.1:9100"$'
+helm_mcp --set mcp.websearch.url=$search_url --set githubMcp.enabled=false > "$out"
+check "without the sidecar the github entry is left as shipped" jqt '.mcpServers.github.url == "http://127.0.0.1:8082/"'
+
+# Roles: the control plane reads the same folder (the card) and connects no server, so it gets no key.
+helm_mcp --set mcp.websearch.url=$search_url --set mcp.context7.enabled=true --set topology=split > "$out"
+check "split: one ConfigMap, shared by the front and the worker" count '^kind: ConfigMap$' 1
+check "split: the front mounts the folder and names ADAM_AGENT_DIR (1/3)" dhas Deployment 'name: ADAM_AGENT_DIR$'
+check "split: the front mounts the folder and names ADAM_AGENT_DIR (2/3)" dhas Deployment 'mountPath: /etc/adam/agent$'
+check "split: the front mounts the folder and names ADAM_AGENT_DIR (3/3)" dhas Deployment 'checksum/agent-files: '
+check "split: the front gets no key and no MCP_ALLOW_INSECURE" dlacks Deployment 'SEARCH_MCP_TOKEN|CONTEXT7_API_KEY|MCP_ALLOW_INSECURE'
+check "split: the worker gets both keys (1/2)" dhas StatefulSet 'name: SEARCH_MCP_TOKEN$'
+check "split: the worker gets both keys (2/2)" dhas StatefulSet 'name: CONTEXT7_API_KEY$'
+helm_mcp --set mcp.websearch.url=$search_url --set mcp.context7.enabled=true --set config.role=control-plane > "$out"
+check "control plane: the folder is mounted, but no key is read and no MCP_ALLOW_INSECURE (1/2)" has 'name: ADAM_AGENT_DIR$'
+check "control plane: the folder is mounted, but no key is read and no MCP_ALLOW_INSECURE (2/2)" dlacks StatefulSet 'name: (SEARCH_MCP_TOKEN|CONTEXT7_API_KEY|MCP_ALLOW_INSECURE)$'
+check "control plane: the ExternalSecret copies no MCP key" dlacks ExternalSecret 'SEARCH_MCP_TOKEN|CONTEXT7_API_KEY|search_mcp_token|context7_api_key'
+helm_mcp --set mcp.websearch.url=$search_url --set github.auth=app --set github.app.id=1 --set github.app.installationId=2 \
+  --set github.app.privateKeySecret=k --set workspace.placement=shared --set workspace.sharedVolume.storageClass=x --set replicaCount=2 > "$out"
+check "with the App key and a shared volume the folder is a third volume" count '^        - name: (agent-files|github-app|work)$' 3
+
+# Guards.
+for bad in 'mcp.websearch.url=ftp://x/mcp' 'mcp.websearch.url=search.svc/mcp' 'mcp.websearch.url=http://user:pw@search.svc/mcp' \
+           'mcp.websearch.url=http://search.svc/mcp?key=$SECRET' 'mcp.websearch.url=http://${HOST}/mcp' 'mcp.websearch.header=bad header' \
+           'mcp.websearch.valuePrefix=${TOKEN}' 'mcp.websearch.header=' ; do
+  check "a bad value fails to render: $bad" fails helm_mcp --set mcp.websearch.url=http://search.svc/mcp --set-string "$bad"
+done
+check "context7 with a bad URL fails to render" fails helm_mcp --set mcp.context7.enabled=true --set mcp.context7.url=ftp://x
+check "a server on with externalSecrets.enabled=false fails (a key is never a chart value)" \
+  fails helm_mcp --set mcp.context7.enabled=true --set externalSecrets.enabled=false
+check "a server on with its property name empty fails" fails helm_mcp --set mcp.context7.enabled=true --set externalSecrets.properties.context7ApiKey=
+check "a server on with config.extraEnv.ADAM_AGENT_DIR fails (the chart owns the folder)" \
+  fails helm_mcp --set mcp.context7.enabled=true --set-string config.extraEnv.ADAM_AGENT_DIR=/x
+check "ADAM_AGENT_DIR in extraEnv with both servers off still renders (unchanged)" \
+  helm_mcp --set-string config.extraEnv.ADAM_AGENT_DIR=/x
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi
