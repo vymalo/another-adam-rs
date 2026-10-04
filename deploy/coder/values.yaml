@@ -251,9 +251,18 @@ persistence:
   accessModes:
     - ReadWriteOnce
 
-# The coder's own Postgres, created by CloudNativePG.
+# The coder's Postgres: its own CloudNativePG Cluster (enabled: true, the default), or an
+# existing database (enabled: false and existingSecret.name, see the README, "Database").
 database:
   enabled: true
+  # With enabled: false: the Secret (in the release namespace) holding the connection string,
+  # postgresql://user:password@host:5432/dbname. Every pod that connects reads DATABASE_URL
+  # from it. The chart creates neither the database nor the Secret; name and key are refused
+  # empty when enabled is false, and name is refused when enabled is true.
+  existingSecret:
+    name: ""
+    key: uri
+  # name, owner, instances and storage are for the Cluster of enabled: true only.
   name: adam
   owner: adam
   instances: 1
