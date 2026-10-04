@@ -54,14 +54,7 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
-            {{- if .Values.database.enabled }}
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  # Created by CloudNativePG for the app database and owner.
-                  name: {{ include "coder.dbName" . }}-app
-                  key: uri
-            {{- end }}
+            {{- include "coder.databaseUrlEnv" . | nindent 12 }}
             {{- if .Values.externalSecrets.enabled }}
             - name: A2A_BEARER_TOKENS
               valueFrom:

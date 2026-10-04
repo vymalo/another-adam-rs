@@ -39,6 +39,27 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end -}}
 
 {{/*
+The DATABASE_URL entry of a container's env, for every pod that connects to the store (the
+StatefulSet and the front). With `database.enabled` it is the `uri` key of the Secret CNPG
+creates for the chart's own Cluster; otherwise it is `database.existingSecret` (the render
+refuses to get here without one, see coder.validate). Indent it to the env list.
+*/}}
+{{- define "coder.databaseUrlEnv" -}}
+- name: DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+{{- if .Values.database.enabled }}
+      # Created by CloudNativePG for the app database and owner.
+      name: {{ include "coder.dbName" . }}-app
+      key: uri
+{{- else }}
+      # An existing database: the Secret is not this chart's.
+      name: {{ .Values.database.existingSecret.name }}
+      key: {{ default "uri" .Values.database.existingSecret.key }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Whether this pod runs workers: every role but `control-plane` (an empty role is
 `all`). The role is trimmed and lower-cased first, as the binary parses it, so
 " Control-Plane " is a control plane here too. Renders "true" or nothing, so

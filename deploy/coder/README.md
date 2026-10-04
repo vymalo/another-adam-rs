@@ -2,7 +2,8 @@
 
 The coder agent (`bin/adam-coder`) as one StatefulSet (`topology: combined`, the
 default) or as a front Deployment plus a worker StatefulSet (`topology: split`), with its
-own CloudNativePG database, for the `netcup-k8s` cluster.
+own CloudNativePG database or an existing one (see [Database](#database)), for the `netcup-k8s`
+cluster.
 
 | Object | What |
 |---|---|
@@ -12,7 +13,7 @@ own CloudNativePG database, for the `netcup-k8s` cluster.
 | `PodDisruptionBudget` | `topology: split` with `front.replicas` above 1: `minAvailable: 1` for the front |
 | `Service` | ClusterIP only. **No Ingress**: the orchestrator reaches it in-cluster over A2A with a bearer token |
 | `NetworkPolicy` | (both workloads with `topology: split`) ingress only from the namespace `another-agentic-system`; egress open (git, the gateway, registries) |
-| `Cluster` (CNPG) | the coder's database; `DATABASE_URL` is the `uri` key of the `<release>-db-app` Secret CNPG creates |
+| `Cluster` (CNPG) | `database.enabled` (the default) only: the coder's database; `DATABASE_URL` is the `uri` key of the `<release>-db-app` Secret CNPG creates. With `database.enabled: false` no Cluster is rendered and `DATABASE_URL` is read from `database.existingSecret`, see [Database](#database) |
 | `ExternalSecret` | `ssegning-aws` / `prod/meta/test-app`; the property of each value is in `externalSecrets.properties` |
 | `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-mcp`, one file of extra MCP servers in the shape of `mcp.json`, mounted in the pods that run workers and named by `ADAM_EXTRA_MCP_FILE`, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 
@@ -187,6 +188,55 @@ rollout):
 * `shared` and `affinity` need `workspace.sharedVolume.storageClass` or
   `workspace.sharedVolume.existingClaim`: there is no default class, because most storage
   classes cannot serve ReadWriteMany and the claim would stay `Pending`.
+* `database.enabled: false` needs `database.existingSecret.name` (every role needs
+  `DATABASE_URL`), and `database.enabled: true` refuses it: the chart creates its own Cluster or
+  reads an existing database, not both.
+
+## Database
+
+| Value | Default | |
+|---|---|---|
+| `database.enabled` | `true` | The chart creates a CloudNativePG `Cluster` named `<release>-db` (`database.name`, `owner`, `instances`, `storage`) and every pod reads `DATABASE_URL` from the `uri` key of the Secret CNPG creates, `<release>-db-app`. The render is the one this chart always had (`tests/golden/combined.yaml`). |
+| `database.existingSecret.name` | `""` | With `database.enabled: false`: a Secret in the release namespace that holds the connection string. Required then, refused with `enabled: true`. |
+| `database.existingSecret.key` | `uri` | The key of that Secret; empty means `uri`. |
+
+```sh
+helm template coder deploy/coder \
+  --set database.enabled=false \
+  --set database.existingSecret.name=coder-db-uri   # key uri
+```
+
+With an existing database the chart renders no `Cluster`, and every pod that sets `DATABASE_URL`
+(the StatefulSet, and the front Deployment with `topology: split`, whatever `config.role` is)
+reads that Secret and key. The Secret is not this chart's: it must exist before the pods start
+(a missing one leaves them in `CreateContainerConfigError`), and the chart neither creates nor
+deletes it. The `database.name`, `owner`, `instances` and `storage` values are not read.
+
+What the existing database must be:
+
+* **The database and its role must exist**, and the Secret's value is a Postgres connection
+  string, `postgresql://user:password@host:5432/dbname` (the `uri` key CNPG writes has the same
+  shape; `ServiceConfig` in `crates/adam-service/src/config.rs` reads it as `DATABASE_URL`).
+* **The role must be able to create tables in the connection's default schema.** Every role,
+  including a control plane, runs `Store::migrate` at startup (`crates/adam-service/src/serve.rs`,
+  `crates/adam-store-postgres/src/lib.rs`): in one transaction, under an advisory lock, it runs
+  `CREATE TABLE IF NOT EXISTS` for `adam_meta`, `adam_runs` and `adam_journal`, `CREATE INDEX IF
+  NOT EXISTS` for their indexes and, on a database a release before schema version 2 made,
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`. It creates no schema, extension or role. The
+  simplest way to satisfy this is a role that owns the database (what CNPG's `initdb` makes). On
+  PostgreSQL 15 and later `public` is writable only by the database owner by default, so a role
+  that merely connects needs `GRANT CREATE ON SCHEMA public` (or whichever schema its
+  `search_path` starts with). The role also keeps `USAGE` and the table rights on what it made,
+  and a later release's migration runs as the same role. The tables are named with the prefix
+  `adam_`, so the database can be shared with other applications' tables but not with another
+  coder release (two would share one ledger): give each release its own database.
+* **Reach the primary directly**, for example the `-rw` Service of a CNPG cluster. The runtime
+  signals wake-ups and cancels with `LISTEN`/`NOTIFY` on the store's pool
+  (`crates/adam-store-postgres`, `adam-notify-postgres`), which needs session-level connections;
+  a transaction-mode pooler in front of it would break those signals (correctness does not depend
+  on them, polling decides, but latency does). *Unverified*: not tried behind a pooler.
+* The chart restricts only ingress (`networkPolicy`); egress to the database needs no rule here.
+  A policy on the database's own namespace or pods must admit the coder's pods.
 
 ## Workspace placement
 
@@ -467,7 +517,8 @@ on the cluster.
 ## Known risks
 
 * **No database backups.** Losing the CNPG volume loses the run ledger (what
-  is running, what finished), not the pushed branches or pull requests.
+  is running, what finished), not the pushed branches or pull requests. With
+  `database.enabled: false` backups are the existing database's owner's business.
 * **A pinned run whose worker never returns is stranded.** With `affinity` or `isolated` a
   run is stepped only by the worker that first claimed it. If that pod is scaled in, or its
   volume is deleted (always the case for `isolated` when the PVC is lost), no other worker
