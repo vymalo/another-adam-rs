@@ -169,7 +169,8 @@ impl SourceCtx {
 ///   does, so a recorded result is never computed again, and a call that dies before it is recorded
 ///   runs again: a tool of a source must be safe to retry.
 /// * The agent's own tools come first and win a name clash: a listed tool whose name an own tool
-///   (or an earlier source) already has is left out, with a warning. At most [`MAX_SOURCE_TOOLS`]
+///   (or an earlier source) already has is left out, with a warning (at debug level when the source
+///   [expects the repeat](Self::expects_repeat)). At most [`MAX_SOURCE_TOOLS`]
 ///   are offered.
 /// * A tool of a source cannot wait on a task of another system
 ///   ([`ToolError::AwaitRemote`]): the wait is answered with an error result, because the agent
@@ -218,6 +219,17 @@ pub trait ToolSource: Send + Sync + 'static {
         let _ = (ctx, specs);
     }
 
+    /// Whether `name`, a tool this source listed and the agent leaves out because `taken` (the
+    /// tools already offered on this turn) has it, is a repeat the source **expects**: it offers
+    /// whatever the system behind it has, among which the agent may already have a tool of its own
+    /// (a server the agent connects itself and a conversation attaches too). The agent logs such
+    /// a clash at debug level instead of warning at every model turn. The default, `false`, is a
+    /// clash nobody expected. The tool is left out either way.
+    fn expects_repeat(&self, name: &str, taken: &[ToolSpec]) -> bool {
+        let _ = (name, taken);
+        false
+    }
+
     /// Run the tool `name` with `args`. `None`: this source does not offer a tool of that name,
     /// and the next one is asked; the agent answers a name nobody owns with an error result.
     ///
@@ -264,7 +276,12 @@ pub(crate) async fn offered(
                 continue;
             }
             if taken.iter().chain(&out).any(|t| t.name == spec.name) {
-                tracing::warn!(tool = %spec.name, "a tool source offered a name that is already taken: left out");
+                let known: Vec<ToolSpec> = taken.iter().chain(&out).cloned().collect();
+                if source.expects_repeat(&spec.name, &known) {
+                    tracing::debug!(tool = %spec.name, "a tool source offered a tool the agent already has: left out");
+                } else {
+                    tracing::warn!(tool = %spec.name, "a tool source offered a name that is already taken: left out");
+                }
                 continue;
             }
             if out.len() >= MAX_SOURCE_TOOLS {

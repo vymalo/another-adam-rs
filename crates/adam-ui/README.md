@@ -83,7 +83,9 @@ inbound function reads a screen's action as JSON text.
 * **The thread tools** are not tools of this crate: `ThreadTools` lists the endpoint (`tools/list` over one
   connection, with the grant's bearer token) each time the model is about to be called, and answers a call to a
   tool that is none of the agent's own by calling the endpoint (`tools/call`). A listed tool whose name no model
-  provider accepts is left out (with a warning); one that clashes with an own tool loses to it. The source of a
+  provider accepts is left out (with a warning); one that clashes with an own tool loses to it, with a warning, **except a relayed
+  tool** (`<server>__<tool>`: the conversation attached a server the agent's own `mcp.json` has too, as a web search), whose omission is
+  a debug line (`ToolSource::expects_repeat`; `tests/duplicate_tools.rs`). The source of a
   `Ui` leaves **`get_ui_catalog`** out and refuses a call to it: the model has `ui_catalog` for the same thing, and
   two tools for one thing made it call whichever it remembered (the catalog is still read again through the endpoint,
   by this crate, when a message does not carry it). **`turn_output { text }`** is the one tool of the endpoint it knows by
@@ -201,6 +203,8 @@ stateDiagram-v2
 * `tests/relay.rs`: the tools the orchestrator reports and the mentions, against the fake endpoint with `_meta` on its tools:
   what a listing says (and what a malformed `_meta` does not say), a long call that waits for the tool's `timeoutSecs`
   where the default would have given up, the cap that limits what a tool asks for, a cancel that drops a 30 s call at
+* `tests/duplicate_tools.rs`: a whole agent whose own tools have the names the endpoint lists too: the relayed one
+  (`websearch__web_search`) is left out with a debug line, the plain one (`plain_tool`) with a warning (`LogCapture`).
   once (and the endpoint has nothing in flight afterwards), the request's `_meta` (a `callId` repeated by a retried step,
   different for another call and another run, hashed past 256 bytes; a `parentStepId` only when there is one), a whole
   agent whose relayed call has no step of its own beside a plain one that has, a step retried after a lost journal write

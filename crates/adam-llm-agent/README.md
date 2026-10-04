@@ -162,7 +162,11 @@ sequenceDiagram
 
 The sources are read inside the step of the model call, so a replay of a turn whose answer is recorded reads
 nothing and the journal has no new entries: only the answer is recorded, not the tools it was given. A listed tool
-whose name an own tool or an earlier source has is left out, with a warning (the agent's own tools win), at most
+whose name an own tool or an earlier source has is left out, with a warning (the agent's own tools win), **unless the source
+says it expects the repeat** (`ToolSource::expects_repeat(name, taken)`, default `false`: it offers whatever the system behind it
+has, among which a tool the agent already owns): the omission is then a debug line, not a warning at every model turn
+(`adam-ui`'s thread-tools source says so for a relayed `<server>__<tool>`, the web search a conversation attaches that the agent's own
+`mcp.json` names too; any other clash still warns). At most
 `MAX_SOURCE_TOOLS` (64) are offered, and an agent with no source behaves exactly as before. A source's tool may ask
 the person and wait for a child run, but not wait on a remote task (`AwaitRemote` is answered with an error result:
 the agent polls the tool that started the task, and a source's tool is not known then).

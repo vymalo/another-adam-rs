@@ -352,6 +352,13 @@ fn fits(name: &str) -> bool {
 
 /// The tools of the thread-tools endpoint a run's messages announced, as a
 /// [`ToolSource`]: every tool the endpoint lists, under its listed name, listed again at every
+/// Whether `name` is the name of a tool the orchestration layer relays from a server attached to the
+/// conversation: `<server>__<tool>`, the shape the agent's own MCP tools have too (`websearch__fetch`).
+fn is_relayed(name: &str) -> bool {
+    name.split_once("__")
+        .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
+}
+
 /// model turn, so the tools of later slices of the orchestration layer (the relayed tools of attached
 /// servers, `ask_agent`) appear with no change here.
 ///
@@ -371,6 +378,12 @@ fn fits(name: &str) -> bool {
 /// remembered; the catalog is still read through the endpoint, by this crate, when a message does
 /// not carry it) and that **describes `show` with the components of the screen** of the
 /// conversation (see [`refine`](ToolSource::refine)).
+/// **A server the agent already has.** A conversation can attach a server (a web search) that the
+/// agent's own `mcp.json` names too: the endpoint then lists `websearch__web_search` and the agent
+/// has the tool of that name, which wins. That is expected at every model turn, so the source says
+/// so ([`ToolSource::expects_repeat`]) and the loop logs the omission at debug level; any other
+/// clash (a plain name the agent has too) is still a warning.
+///
 #[derive(Clone)]
 pub struct ThreadTools {
     client: Arc<ThreadToolsClient>,
@@ -433,6 +446,10 @@ impl ToolSource for ThreadTools {
             Ok(grant) => grant,
             Err(Unavailable::Absent) => return Listing::default(),
             Err(why) => {
+    fn expects_repeat(&self, name: &str, _taken: &[ToolSpec]) -> bool {
+        is_relayed(name)
+    }
+
                 tracing::debug!(reason = why.reason(), "no thread tools are offered");
                 return Listing::default();
             }
