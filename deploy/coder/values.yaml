@@ -150,6 +150,37 @@ githubMcp:
     limits:
       memory: 256Mi
 
+# Extra MCP servers for the coder, on top of the GitHub one. Both are off by default, and with both off the
+# render is exactly what it was without this block. With either on, the chart supplies the coder's whole
+# agent folder as a ConfigMap (the shipped prompt and card, and the shipped mcp.json plus these servers),
+# mounted at ADAM_AGENT_DIR in every pod, so ADAM_AGENT_DIR is then the chart's: leave it out of
+# config.extraEnv. The coder has them in every conversation: the model sees their tools as
+# `websearch__<tool>` and `context7__<tool>`. The keys are never values: they come from the ExternalSecret
+# (externalSecrets.properties.searchMcpToken, .context7ApiKey) into the environment of the workers, and
+# mcp.json holds `${SEARCH_MCP_TOKEN}` and `${CONTEXT7_API_KEY}`, expanded when a worker starts.
+mcp:
+  # Our web search server (Brave behind our own MCP pod, deployed by the another-agentic-system
+  # chart). On when `url` is set; empty (default) is off. The Service of that release, in cluster, for
+  # example http://<service>.<namespace>.svc.cluster.local:<port>/mcp. A plain http URL to another
+  # machine is refused by the coder unless MCP_ALLOW_INSECURE is set, which the chart then does on the
+  # workers (the bearer crosses the cluster network in the clear: prefer https where the server has it).
+  websearch:
+    url: ""
+    # The request header that carries the token, and the text before it (the value is
+    # `<valuePrefix>${SEARCH_MCP_TOKEN}`): `Authorization: Bearer <token>` by default.
+    header: Authorization
+    valuePrefix: "Bearer "
+    # Optional allow-list of the server's tools (adam extension of mcp.json). Empty keeps all of them;
+    # a name the server does not have stops the worker at startup (exit 78/69).
+    tools: []
+  # Context7, the hosted documentation server. On with `enabled: true`.
+  context7:
+    enabled: false
+    url: https://mcp.context7.com/mcp
+    header: Authorization
+    valuePrefix: "Bearer "
+    tools: []
+
 service:
   port: 8080
 
@@ -228,11 +259,18 @@ externalSecrets:
     githubToken: adam_coder_github_token
     # Comma-separated bearer tokens the A2A server accepts.
     a2aBearerTokens: adam_coder_a2a_bearer_tokens
+    # The tokens of the extra MCP servers (mcp.* above), read only by the roles that run workers and
+    # only when that server is on. Found under the same `key` as the others: a deployment that turns
+    # them on sets `key` to the AWS secret that holds all of them.
+    searchMcpToken: search_mcp_token
+    context7ApiKey: context7_api_key
   # Name of the Kubernetes Secret it creates. Empty: <release>-coder.
   targetSecretName: ""
 
 # Only the orchestrator's namespace may reach the pod. Egress is left open (git
-# hosts, the model gateway, package registries).
+# hosts, the model gateway, package registries, and the extra MCP servers of `mcp`: the web search
+# Service and Context7 on 443), so this policy needs no rule for them. Do not add `Egress` to its
+# policyTypes without adding them.
 networkPolicy:
   enabled: true
   allowedNamespace: another-agentic-system

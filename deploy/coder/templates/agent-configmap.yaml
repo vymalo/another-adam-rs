@@ -1,0 +1,17 @@
+{{- if include "coder.agentFolder" . }}
+# The coder's agent folder, mounted at ADAM_AGENT_DIR in every pod of the release (the control plane serves the
+# card from it, the workers build the agent from it). instructions.md is the shipped prompt and card; mcp.json is
+# the shipped one plus the extra MCP servers that are on. No credential is in it: the servers' headers are
+# ${VAR} references, expanded from the pod's environment (the ExternalSecret) when a worker starts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coder.agentConfigMapName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+data:
+  instructions.md: |
+    {{- .Files.Get "agent/instructions.md" | nindent 4 }}
+  mcp.json: |
+    {{- include "coder.agentMcpJson" . | nindent 4 }}
+{{- end }}

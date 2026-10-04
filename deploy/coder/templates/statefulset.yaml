@@ -22,9 +22,15 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.podAnnotations (include "coder.agentFolder" .) }}
       annotations:
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if include "coder.agentFolder" . }}
+        {{- /* A changed prompt or mcp.json is a deploy: the agent folder is read at startup only. */}}
+        checksum/agent-files: {{ include (print $.Template.BasePath "/agent-configmap.yaml") . | sha256sum }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
@@ -129,6 +135,11 @@ spec:
             {{- /* Kept for one release: a vendored agent folder written before the GitHub MCP server became a sidecar (ADR 0017, D4) still starts it as a child process. The shipped mcp.json no longer does. The image sets nothing; a control plane connects no MCP server. */}}
             - name: MCP_ALLOW_STDIO
               value: "true"
+            {{- if and (include "coder.mcpInsecure" .) (not (hasKey .Values.config.extraEnv "MCP_ALLOW_INSECURE")) }}
+            {{- /* An extra MCP server (mcp.*) at a plain http URL on another machine: the coder refuses one unless the deployment allows it. */}}
+            - name: MCP_ALLOW_INSECURE
+              value: "true"
+            {{- end }}
             {{- if include "coder.githubMcp" . }}
             {{- /* The sidecar below, on loopback: the coder gives each call to it the credentials of that call. The shipped mcp.json names port 8082. */}}
             - name: GITHUB_MCP_URL
@@ -166,6 +177,11 @@ spec:
             - name: GIT_AUTHOR_EMAIL
               value: {{ .Values.config.gitAuthorEmail | quote }}
             {{- end }}
+            {{- if include "coder.agentFolder" . }}
+            {{- /* The chart's own agent folder (mcp.*): the shipped files plus the extra MCP servers. */}}
+            - name: ADAM_AGENT_DIR
+              value: {{ include "coder.agentDir" . | quote }}
+            {{- end }}
             {{- range $name, $value := .Values.config.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}
@@ -191,6 +207,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "coder.secretName" . }}
                   key: GITHUB_TOKEN
+            {{- end }}
+            {{- if include "coder.mcpWebsearch" . }}
+            - name: SEARCH_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coder.secretName" . }}
+                  key: SEARCH_MCP_TOKEN
+            {{- end }}
+            {{- if include "coder.mcpContext7" . }}
+            - name: CONTEXT7_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coder.secretName" . }}
+                  key: CONTEXT7_API_KEY
             {{- end }}
             {{- end }}
             {{- if not $split }}
@@ -230,7 +260,12 @@ spec:
               mountPath: /var/run/secrets/github-app
               readOnly: true
             {{- end }}
-      {{- if or (include "coder.sharedWork" .) $githubApp }}
+            {{- if include "coder.agentFolder" . }}
+            - name: agent-files
+              mountPath: {{ include "coder.agentDir" . }}
+              readOnly: true
+            {{- end }}
+      {{- if or (include "coder.sharedWork" .) $githubApp (include "coder.agentFolder" .) }}
       volumes:
         {{- if include "coder.sharedWork" . }}
         - name: work
@@ -246,6 +281,14 @@ spec:
             items:
               - key: private-key.pem
                 path: private-key.pem
+        {{- end }}
+        {{- if include "coder.agentFolder" . }}
+        - name: agent-files
+          configMap:
+            name: {{ include "coder.agentConfigMapName" . }}
+            # Readable by the runtime user whatever fsGroup does: the files are the prompt and a
+            # mcp.json of ${VAR} references, no secret.
+            defaultMode: 0444
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

@@ -20,9 +20,15 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- if or .Values.podAnnotations (include "coder.agentFolder" .) }}
       annotations:
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if include "coder.agentFolder" . }}
+        {{- /* A changed prompt or mcp.json is a deploy: the agent folder is read at startup only. */}}
+        checksum/agent-files: {{ include (print $.Template.BasePath "/agent-configmap.yaml") . | sha256sum }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
@@ -50,6 +56,10 @@ spec:
               value: "control-plane"
             - name: PUBLIC_URL
               value: {{ include "coder.publicUrl" . | quote }}
+            {{- if include "coder.agentFolder" . }}
+            - name: ADAM_AGENT_DIR
+              value: {{ include "coder.agentDir" . | quote }}
+            {{- end }}
             {{- range $name, $value := .Values.config.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}
@@ -90,6 +100,19 @@ spec:
             timeoutSeconds: 3
           resources:
             {{- toYaml .Values.front.resources | nindent 12 }}
+          {{- if include "coder.agentFolder" . }}
+          volumeMounts:
+            - name: agent-files
+              mountPath: {{ include "coder.agentDir" . }}
+              readOnly: true
+          {{- end }}
+      {{- if include "coder.agentFolder" . }}
+      volumes:
+        - name: agent-files
+          configMap:
+            name: {{ include "coder.agentConfigMapName" . }}
+            defaultMode: 0444
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -167,3 +167,75 @@ of its own, which is today's single-worker render.
 {{- define "coder.workClaim" -}}
 {{- default (printf "%s-work" (include "coder.fullname" .) | trunc 63 | trimSuffix "-") .Values.workspace.sharedVolume.existingClaim -}}
 {{- end -}}
+
+{{/*
+The extra MCP servers (values `mcp.*`, off by default). websearch is on when its url is set, context7 when
+mcp.context7.enabled. Each renders "true" or nothing. With either on the chart supplies the coder's whole agent
+folder (the ConfigMap in agent-configmap.yaml), because the image holds its files only inside the binary and the
+coder reads one folder: the shipped files plus these servers.
+*/}}
+{{- define "coder.mcpWebsearch" -}}
+{{- if trim (toString .Values.mcp.websearch.url) -}}true{{- end -}}
+{{- end -}}
+
+{{- define "coder.mcpContext7" -}}
+{{- if .Values.mcp.context7.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/* Whether the agent folder comes from this chart: any extra MCP server is on. "true" or nothing. */}}
+{{- define "coder.agentFolder" -}}
+{{- if or (include "coder.mcpWebsearch" .) (include "coder.mcpContext7" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/* Name of the ConfigMap that holds the agent folder. */}}
+{{- define "coder.agentConfigMapName" -}}
+{{- printf "%s-agent" (include "coder.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Where the agent folder is mounted: ADAM_AGENT_DIR (the folder is `agent/` itself). */}}
+{{- define "coder.agentDir" -}}/etc/adam/agent{{- end -}}
+
+{{/*
+Whether an extra server's URL is plain http to another machine, which the coder refuses unless the deployment sets
+MCP_ALLOW_INSECURE (the same rule as crates/adam-mcp/src/url.rs: https, or http to localhost, *.localhost and loopback).
+Takes the URL; renders "true" or nothing.
+*/}}
+{{- define "coder.plainHttpRemote" -}}
+{{- $url := lower (trim (toString .)) -}}
+{{- if and (hasPrefix "http://" $url) (not (regexMatch "^http://(localhost|[^/:?#]*\\.localhost|127\\.[0-9.]+|\\[::1\\])([:/?#]|$)" $url)) -}}true{{- end -}}
+{{- end -}}
+
+{{/* Whether the workers need MCP_ALLOW_INSECURE for an extra server: "true" or nothing. */}}
+{{- define "coder.mcpInsecure" -}}
+{{- if include "coder.runsWorkers" . -}}
+{{- if or (and (include "coder.mcpWebsearch" .) (include "coder.plainHttpRemote" .Values.mcp.websearch.url)) (and (include "coder.mcpContext7" .) (include "coder.plainHttpRemote" .Values.mcp.context7.url)) -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The coder's mcp.json: the shipped one (agent/mcp.json, a copy of bin/adam-coder/agent/mcp.json that
+tests/render-check.sh keeps equal) plus the extra servers that are on. The GitHub entry follows githubMcp.port when
+the sidecar runs (the coder refuses a `github` URL whose origin is not GITHUB_MCP_URL). A server's key is its id: the
+model sees its tools as `<id>__<tool>`. Credentials are `${VAR}` references, filled from the environment at start,
+never values: SEARCH_MCP_TOKEN and CONTEXT7_API_KEY come from the ExternalSecret.
+*/}}
+{{- define "coder.agentMcpJson" -}}
+{{- $cfg := .Files.Get "agent/mcp.json" | fromJson -}}
+{{- $servers := get $cfg "mcpServers" -}}
+{{- if include "coder.githubMcp" . -}}
+{{- $_ := set (get $servers "github") "url" (printf "http://127.0.0.1:%d/" (int64 .Values.githubMcp.port)) -}}
+{{- end -}}
+{{- if include "coder.mcpWebsearch" . -}}
+{{- $s := .Values.mcp.websearch -}}
+{{- $server := dict "type" "http" "url" (trim $s.url) "headers" (dict $s.header (printf "%s${SEARCH_MCP_TOKEN}" (toString $s.valuePrefix))) -}}
+{{- if $s.tools -}}{{- $_ := set $server "tools" $s.tools -}}{{- end -}}
+{{- $_ := set $servers "websearch" $server -}}
+{{- end -}}
+{{- if include "coder.mcpContext7" . -}}
+{{- $s := .Values.mcp.context7 -}}
+{{- $server := dict "type" "http" "url" (trim $s.url) "headers" (dict $s.header (printf "%s${CONTEXT7_API_KEY}" (toString $s.valuePrefix))) -}}
+{{- if $s.tools -}}{{- $_ := set $server "tools" $s.tools -}}{{- end -}}
+{{- $_ := set $servers "context7" $server -}}
+{{- end -}}
+{{- toPrettyJson $cfg -}}
+{{- end -}}
