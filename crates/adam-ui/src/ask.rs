@@ -37,8 +37,12 @@ const ANSWER_ACTION: &str = "answer";
 /// ([`Ui::with_ask_lead`](crate::Ui::with_ask_lead)): when to ask.
 pub const DEFAULT_ASK_LEAD: &str = "Ask the person you are talking to a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent before something that cannot be undone. Be specific.";
 
-/// What the description of `ask_user` says after the lead, about `choices`.
-const CHOICES_GUIDE: &str = "To ask several questions with fixed answers at once, pass `choices`: the person gets one form with a list of options per question and answers them together; their answers come back as the result. Without `choices` the question is plain text.";
+/// What the description of `ask_user` says after the lead, about `choices`: the constraints the
+/// tool enforces, so that the first call is right.
+const CHOICES_GUIDE: &str = "`question` is always required, with or without `choices`: it is the sentence the person reads first. To ask several questions with fixed answers at once, also pass `choices`: the person gets one form with a list of options per question and answers them together; their answers come back as the result. Each entry of `choices` needs its own `question` and `options`, and every question needs 2 to 8 options (with a single possible answer, or none that you know, do not use `choices`: ask a plain question); there are at most 8 questions. An `id` or option `value` is 1 to 64 characters of letters, digits and `- _ . :`. Example: {\"question\": \"A few things I need before I start.\", \"choices\": [{\"id\": \"db\", \"question\": \"Which database?\", \"options\": [\"Postgres\", \"MongoDB\"]}]} Without `choices` the question is plain text.";
+
+/// The pattern of a question id and of an option value: the `Choices` component's own.
+const ID_PATTERN: &str = "^[A-Za-z0-9_.:-]{1,64}$";
 
 /// What the model passes.
 #[derive(Debug, Deserialize)]
@@ -165,7 +169,8 @@ fn normalize(choices: Vec<ChoiceArg>) -> Result<Vec<Question>, String> {
         }
         if choice.options.len() < MIN_OPTIONS || choice.options.len() > MAX_OPTIONS {
             return Err(format!(
-                "question `{id}` has {} options; it needs {MIN_OPTIONS} to {MAX_OPTIONS}",
+                "question `{id}` has {} options; it needs {MIN_OPTIONS} to {MAX_OPTIONS} (with a \
+                 single possible answer, ask a plain question without `choices`)",
                 choice.options.len()
             ));
         }
@@ -317,26 +322,26 @@ impl Tool for AskUser {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "What you need to know"},
+                    "question": {"type": "string", "minLength": 1, "description": "Required, even when `choices` is given: what you need to know, or the sentence that opens the form"},
                     "choices": {
                         "type": "array",
                         "maxItems": MAX_QUESTIONS,
-                        "description": "Questions with fixed answers, asked together as one form (at most 8). Omit for an open question.",
+                        "description": "Questions with fixed answers, asked together as one form (at most 8). Each needs `question` and `options` (2 to 8). Omit for an open question.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "id": {"type": "string", "description": "A short id for the question (letters, digits, - _ . :), used in the answer; defaults to q1, q2, ..."},
-                                "question": {"type": "string", "description": "The question"},
+                                "id": {"type": "string", "pattern": ID_PATTERN, "description": "A short id for the question (1 to 64 letters, digits, - _ . :), used in the answer; defaults to q1, q2, ..."},
+                                "question": {"type": "string", "minLength": 1, "description": "Required: the question"},
                                 "options": {
                                     "type": "array",
                                     "minItems": MIN_OPTIONS,
                                     "maxItems": MAX_OPTIONS,
-                                    "description": "The answers to pick from: 2 to 8, each a label or {value, label, description}",
+                                    "description": "Required: the answers to pick from, 2 to 8 of them (a question with fewer than 2 or more than 8 is refused), each a label or {value, label, description}",
                                     "items": {"anyOf": [
                                         {"type": "string"},
                                         {"type": "object", "properties": {
-                                            "value": {"type": "string", "description": "A short id for the option (letters, digits, - _ . :); made from the label when omitted"},
-                                            "label": {"type": "string"},
+                                            "value": {"type": "string", "pattern": ID_PATTERN, "description": "A short id for the option (1 to 64 letters, digits, - _ . :); made from the label when omitted"},
+                                            "label": {"type": "string", "minLength": 1},
                                             "description": {"type": "string"}},
                                          "required": ["label"]}]}
                                 },
@@ -364,7 +369,10 @@ impl Tool for AskUser {
         };
         let question = args.question.trim();
         if question.is_empty() {
-            return Ok(ToolOutput::error("question is required"));
+            return Ok(ToolOutput::error(
+                "`question` is required and cannot be empty, even when `choices` is given: it is the \
+                 sentence the person reads first",
+            ));
         }
         if args.choices.is_empty() {
             return Err(ToolError::needs_input(question));
@@ -540,9 +548,25 @@ mod tests {
         )
         .spec();
         assert!(coder.description.starts_with(
-            "Ask the person who gave you the task a question. Be specific. To ask several"
+            "Ask the person who gave you the task a question. Be specific. `question` is always required"
         ));
+        // The constraints are in the description and in the schema, so the first call is right.
+        for stated in [
+            "`question` is always required",
+            "2 to 8 options",
+            "at most 8 questions",
+        ] {
+            assert!(
+                spec.description.contains(stated),
+                "{stated}: {}",
+                spec.description
+            );
+        }
         assert_eq!(spec.parameters["required"], json!(["question"]));
+        assert_eq!(spec.parameters["properties"]["question"]["minLength"], 1);
+        let entry = &spec.parameters["properties"]["choices"]["items"];
+        assert_eq!(entry["required"], json!(["question", "options"]));
+        assert_eq!(entry["properties"]["id"]["pattern"], ID_PATTERN);
         assert_eq!(spec.parameters["properties"]["choices"]["maxItems"], 8);
         let option = &spec.parameters["properties"]["choices"]["items"]["properties"]["options"];
         assert_eq!(option["minItems"], 2);

@@ -62,7 +62,11 @@ inbound function reads a screen's action as JSON text.
   call's result: `The person answered through the interface:` and one line per question, `- db: pg`. When the
   screen cannot draw it (no catalog, none with `Choices`, one that cannot be read now) the options are listed in
   the question's text and the answer is free text. It parks the run, so `asks_user()` is `true` and
-  `adam-assembly` keeps it out of subagents.
+  `adam-assembly` keeps it out of subagents. The constraints are stated where the model reads them, so the first
+  call is right: the description says `question` is required **even with `choices`** (the line that opens the
+  form), that a question needs 2 to 8 options and that ids and values are `^[A-Za-z0-9_.:-]{1,64}$`, with an
+  example; the schema has `required`, `minItems`, `maxItems`, `minLength` and that `pattern` on the places they
+  apply to. A refusal of one option (or none) says to ask a plain question instead.
 * **`show { blocks, title? }`** draws blocks of the screen's components one under the other: ids `b1`...`bn`, in a
   `Column` that is the root (a `Text` heading first when there is a title; a single block with no title is the
   root itself). Each block is `{component, ...properties}`, **validated against the component's JSON Schema**
