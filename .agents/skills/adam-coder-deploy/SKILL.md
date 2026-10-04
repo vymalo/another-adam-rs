@@ -47,6 +47,10 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
 4. **The chart** (`deploy/coder/README.md` documents every value):
    * `topology: combined` (default, one StatefulSet) or `split` (a front Deployment with
      `ROLE=control-plane` plus the worker StatefulSet).
+   * `database.enabled: true` (default) creates a CloudNativePG `Cluster`; `database.enabled: false`
+     with `database.existingSecret.name` (and `.key`, `uri` by default) reads `DATABASE_URL` of every
+     pod from a Secret you provide and renders no `Cluster`. The role must be able to create tables
+     in its default schema: every role migrates at startup (`deploy/coder/README.md`, "Database").
    * `workspace.placement`: empty, `isolated`, `affinity` or `shared` (ADR 0002,
      `docs/decisions/0002-workspace-placement.md`); `replicaCount` above 1 needs one.
    * `github.auth: token` (default) or `app` (`github.app.id`, `.privateKeySecret`, and exactly

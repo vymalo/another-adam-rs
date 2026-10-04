@@ -840,4 +840,69 @@ check "url on as a word fails" fails helm_url --set-string config.modelBaseUrlFr
 check "url off needs neither the ExternalSecret property nor the option's other values" \
   helm_url --set externalSecrets.properties.modelBaseUrl=null --set config.modelBaseUrl=https://gw.example.com/v1
 
+# An existing database: database.enabled=false and database.existingSecret. No Cluster is
+# rendered, and every pod that sets DATABASE_URL reads it from that Secret and key.
+# dburl prints "<secret> <key>" for each DATABASE_URL of the render (or of the file in $1).
+dburl() {
+  awk '/name: DATABASE_URL$/ { on = 1; next }
+       on && /^ *name: / { n = $2 }
+       on && /^ *key: / { print n " " $2; on = 0 }' "${1:-$out}"
+}
+dburl_is() { # dburl_is <number of pods> <secret> <key>: that many pods, all reading it
+  [ "$(dburl | wc -l | tr -d ' ')" -eq "$1" ] && [ "$(dburl | sort -u)" = "$2 $3" ]
+}
+helm_db() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }
+extdb='--set database.enabled=false --set database.existingSecret.name=coder-db-uri'
+
+helm_db > "$out"
+check "database default: the CNPG Cluster and its app Secret, key uri" dburl_is 1 coder-db-app uri
+check "database default: no existing Secret is named" lacks 'coder-db-uri'
+# shellcheck disable=SC2086
+helm_db $extdb > "$out"
+check "existing database: no CNPG Cluster is rendered" lacks '^kind: Cluster$'
+check "existing database: DATABASE_URL is the named Secret, key uri by default" dburl_is 1 coder-db-uri uri
+check "existing database: the CNPG app Secret is not referenced" lacks 'coder-db-app'
+# shellcheck disable=SC2086
+helm_db $extdb --set database.existingSecret.key=DB_URI > "$out"
+check "existing database: the key is configurable" dburl_is 1 coder-db-uri DB_URI
+# shellcheck disable=SC2086
+helm_db $extdb --set database.existingSecret.key= > "$out"
+check "existing database: an empty key falls back to uri" dburl_is 1 coder-db-uri uri
+# shellcheck disable=SC2086
+helm_db $extdb --set topology=split > "$out"
+check "existing database, split: no Cluster" lacks '^kind: Cluster$'
+check "existing database, split: the front and the worker both read it" dburl_is 2 coder-db-uri uri
+check "existing database, split: the Deployment reads it" \
+  [ "$(doc Deployment | awk '/name: DATABASE_URL$/{on=1} on&&/name: coder-db-uri$/{print "y"; exit}')" = y ]
+check "existing database, split: the StatefulSet reads it" \
+  [ "$(doc StatefulSet | awk '/name: DATABASE_URL$/{on=1} on&&/name: coder-db-uri$/{print "y"; exit}')" = y ]
+# shellcheck disable=SC2086
+helm_db $extdb --set topology=split --set front.replicas=2 --set database.existingSecret.key=DB_URI > "$out"
+check "existing database, split with two fronts: both workloads read the configured key" dburl_is 2 coder-db-uri DB_URI
+# shellcheck disable=SC2086
+helm_db $extdb --set config.role=control-plane > "$out"
+check "existing database, control-plane role: DATABASE_URL is the Secret" dburl_is 1 coder-db-uri uri
+# shellcheck disable=SC2086
+helm_db $extdb --set config.role=worker > "$out"
+check "existing database, worker role: DATABASE_URL is the Secret" dburl_is 1 coder-db-uri uri
+# shellcheck disable=SC2086
+helm_db $extdb --set workspace.placement=shared --set workspace.sharedVolume.storageClass=rwx --set replicaCount=2 > "$out"
+check "existing database, shared placement with two workers: DATABASE_URL is the Secret" dburl_is 1 coder-db-uri uri
+# shellcheck disable=SC2086
+helm_db $extdb --set networkPolicy.enabled=true --set topology=split > "$out"
+check "existing database, with a NetworkPolicy: no Cluster, still one DATABASE_URL per workload" dburl_is 2 coder-db-uri uri
+check "existing database, with a NetworkPolicy: egress stays unrestricted (the database needs none)" \
+  lacks '^    - Egress$'
+
+message=$(helm_db --set database.enabled=false 2>&1 || true)
+check "database off with no Secret fails" fails helm_db --set database.enabled=false
+check "... the error names database.existingSecret.name" says "$message" 'database.existingSecret.name'
+check "database off with a blank Secret name fails" fails helm_db --set database.enabled=false --set-string 'database.existingSecret.name= '
+check "database off with no Secret fails in split too" \
+  fails helm_db --set database.enabled=false --set topology=split
+message=$(helm_db --set database.existingSecret.name=coder-db-uri 2>&1 || true)
+check "database on with an existing Secret named fails (one or the other)" \
+  fails helm_db --set database.existingSecret.name=coder-db-uri
+check "... the error names both values" says "$message" 'database.enabled=true and database.existingSecret.name'
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

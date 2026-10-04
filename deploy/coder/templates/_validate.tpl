@@ -9,6 +9,13 @@ from service.yaml, which every render contains, so they always run.
 {{- if and (eq .Values.topology "split") .Values.config.role -}}
 {{- fail "config.role is for topology=combined; topology=split sets ROLE itself (control-plane on the front, worker on the StatefulSet)" -}}
 {{- end -}}
+{{- $dbSecret := default "" .Values.database.existingSecret.name | toString | trim -}}
+{{- if and .Values.database.enabled $dbSecret -}}
+{{- fail "database.enabled=true and database.existingSecret.name are both set: the chart creates its own Cluster, or it reads an existing database's Secret, not both" -}}
+{{- end -}}
+{{- if and (not .Values.database.enabled) (not $dbSecret) -}}
+{{- fail "database.enabled=false needs database.existingSecret.name (a Secret in the release namespace whose key, `uri` by default, holds the Postgres connection string): every pod needs DATABASE_URL" -}}
+{{- end -}}
 {{- $placement := include "coder.placement" . -}}
 {{- if eq $placement "a2a-only" -}}
 {{- fail "workspace.placement a2a-only is refused for the coder: every tool of the coder needs a workspace (a2a-only is for hosts whose agents only call remote agents). Use shared, affinity or isolated" -}}
