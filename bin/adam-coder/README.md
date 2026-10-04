@@ -1350,8 +1350,8 @@ shipped files stay in the binary and cannot disagree with it.
   * The coder's own `git` (`add`, `apply`, the tree-id probes) starts from an **empty environment** plus a short allow-list
     (`adam_workspace::confine_git_env`), because a `filter.<x>.clean` that a check script writes to `.git/config` and a
     committed `.gitattributes` would otherwise run in the coder's full environment on its next `git add -A`.
-  * The process is **non-dumpable** at startup (`harden::make_non_dumpable`, `prctl(PR_SET_DUMPABLE, 0)` through `rustix`'s
-    safe call), so a child of the same user without `CAP_SYS_PTRACE` cannot read `/proc/<coder pid>/environ`.
+  * The process is **non-dumpable** at startup (`harden::make_non_dumpable`, which lives in `adam-service` and is re-exported here,
+    and which `adam-agent` calls too; `prctl(PR_SET_DUMPABLE, 0)` through `rustix`'s safe call), so a child of the same user without `CAP_SYS_PTRACE` cannot read `/proc/<coder pid>/environ`.
   * **Remaining**: the one invocation that carries the token (fetch, ls-remote, push) has it in its environment, and the
     mirror guard that removes the configuration keys which would run a program there is a list, not a proof; a proxy URL with a password in `HTTPS_PROXY` is inherited by git; a process with `CAP_SYS_PTRACE`, or root,
     reads everything (the chart drops all capabilities); a value shorter than four characters is not redacted; and a secret
@@ -1794,7 +1794,7 @@ characters are not registered. The same redactor scrubs the input and the output
 SIGTERM stops accepting connections and lets in-flight steps finish and commit
 (see [Roles](#roles) for what stops in which order); a step cut short by a hard kill
 is taken over by the next start when its lease expires. Logs are JSON on stdout
-(`RUST_LOG` filters).
+(`RUST_LOG` filters; unset, the filter is `info,rmcp=warn`: the MCP client library logs a whole `peer_info` at INFO, then "task cancelled" and "serve finished", each time the thread-tools endpoint is connected, which is every model turn. Setting `RUST_LOG` replaces the default whole). The startup line prints the configuration with the gateway (`MODEL_BASE_URL`), the GitHub API and MCP addresses and `PUBLIC_URL` as scheme and host only, the database URL as `[REDACTED]`: a deployment keeps them in secrets.
 
 Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
 

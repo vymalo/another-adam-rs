@@ -11,7 +11,6 @@ use std::process::ExitCode;
 
 use adam_coder::{Config, Redactor, exit_code};
 use anyhow::Context as _;
-use tracing_subscriber::EnvFilter;
 
 /// Exit code 0 after a clean shutdown; otherwise the sysexits-style code of the error's root cause
 /// ([`adam_coder::exit`]: 78 configuration, 69 dependency unreachable, 71 OS error, 70 internal, 1
@@ -19,14 +18,13 @@ use tracing_subscriber::EnvFilter;
 /// the process's secrets, written by the same logger as everything else.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(adam_service::logging::env_filter())
         .init();
 
-    adam_coder::harden::make_non_dumpable();
+    adam_service::harden::make_non_dumpable();
 
     // Nothing is known to be secret until the configuration is read; its errors name variables,
     // never their values.

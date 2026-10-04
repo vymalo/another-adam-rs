@@ -4,6 +4,8 @@
 
 pub mod config;
 pub mod exit;
+pub mod harden;
+pub mod logging;
 mod serve;
 mod service;
 

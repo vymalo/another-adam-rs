@@ -19,7 +19,6 @@ path = "src/main.rs"
 [dependencies]
 # `set_dumpable_behavior`: the process stops its same-user children from reading its environment
 # (`/proc/<pid>/environ`) with a safe call, so `forbid(unsafe_code)` holds. Already in the tree.
-rustix = { version = "1", default-features = false, features = ["process", "std"] }
 adam = { workspace = true, features = ["a2a", "mcp"] }
 adam-a2a.workspace = true
 adam-a2a-runtime.workspace = true

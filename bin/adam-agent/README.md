@@ -144,6 +144,10 @@ works against a *stateless* server too (`POST /mcp` answered with JSON, no `Mcp-
 `DELETE`: the shape a small mock has), which `tests/` runs against (*verified 2026-10-01*, see
 [Tests](#tests)); a server that streams its answers or keeps sessions works as well (`adam-mcp`'s own tests).
 
+* **The process is non-dumpable.** At startup `adam-agent` calls `adam_service::harden::make_non_dumpable` (`prctl(PR_SET_DUMPABLE, 0)`,
+  Linux), as `adam-coder` does: the command of a `stdio` MCP server (when the deployment allows one) is a process of the same user, and
+  without it `cat /proc/<agent pid>/environ` would give it the model key, the database URL and every variable of the process. A failure is a
+  warning in the log and not fatal.
 * **Environment variables in `headers`**: `${SEARCH_TOKEN}` and `${VAR:-default}` read the process environment.
   Put credentials there. Unset and no default: exit 78 naming the variable, never its value.
 * **Environment variables in a `url`** (`"url": "${SEARCH_URL}"`, so that one folder serves a laptop and a
@@ -179,7 +183,7 @@ same way; every problem is reported at once at startup):
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the folder's MCP servers may be (see above) | `false` each |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
-| `RUST_LOG` | log filter (JSON logs on stdout) | `info` |
+| `RUST_LOG` | log filter (JSON logs on stdout); when set it replaces the default whole, so `RUST_LOG=info` shows `rmcp` again | `info,rmcp=warn` (the MCP client library's per-connection lines are quiet; `adam_service::logging`) |
 
 **`optional` and `tools:`**: a server marked `optional: true` that is skipped (down, no key, a missing allow-listed tool) has no tools, so a `tools:` entry of the agent that names one of them (`search__web_search`, `search__*`) makes the folder exit 78 at startup. Leave an optional server's tools out of `tools:`, or make the server required.
 

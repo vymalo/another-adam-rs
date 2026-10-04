@@ -27,11 +27,13 @@ adam-notify-postgres.workspace = true
 adam-runtime.workspace = true
 adam-store-postgres.workspace = true
 axum.workspace = true
+rustix = { version = "1", default-features = false, features = ["process", "std"] }
 secrecy.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tokio-util.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
