@@ -50,6 +50,32 @@ plane starts runs without them (see docs/architecture.md, "Roles").
 {{- end -}}
 
 {{/*
+The value of config.modelBaseUrl in values.yaml, a placeholder that is never a real gateway (the
+`.invalid` TLD is reserved, RFC 6761). It counts as "no URL given": with config.modelBaseUrlFromSecret
+the chart accepts an empty value or this one, and refuses anything else. Keep it equal to values.yaml
+(render-check.sh renders the option on with the default, so a drift fails there).
+*/}}
+{{- define "coder.modelBaseUrlPlaceholder" -}}https://gateway.example.invalid/v1{{- end -}}
+
+{{/*
+Whether config.modelBaseUrl holds a URL somebody chose: not empty and not the placeholder above.
+Renders "true" or nothing.
+*/}}
+{{- define "coder.modelBaseUrlLiteral" -}}
+{{- $url := trim (toString (default "" .Values.config.modelBaseUrl)) -}}
+{{- if and $url (ne $url (include "coder.modelBaseUrlPlaceholder" .)) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Whether MODEL_BASE_URL comes from the ExternalSecret (config.modelBaseUrlFromSecret) instead of
+config.modelBaseUrl: the option is on and the role runs workers (a control plane never reads the
+model). Renders "true" or nothing, like coder.runsWorkers.
+*/}}
+{{- define "coder.modelBaseUrlFromSecret" -}}
+{{- if and (include "coder.runsWorkers" .) (eq (toString .Values.config.modelBaseUrlFromSecret) "true") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 Whether this pod authenticates to GitHub as an App installation: github.auth=app, and the role runs workers
 (a control plane never talks to GitHub). Renders "true" or nothing, like coder.runsWorkers.
 */}}

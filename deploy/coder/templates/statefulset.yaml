@@ -119,7 +119,15 @@ spec:
             {{- end }}
             {{- if include "coder.runsWorkers" . }}
             - name: MODEL_BASE_URL
+              {{- if include "coder.modelBaseUrlFromSecret" . }}
+              {{- /* config.modelBaseUrlFromSecret: the gateway's URL is in AWS, never in values or git. */}}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "coder.secretName" . }}
+                  key: MODEL_BASE_URL
+              {{- else }}
               value: {{ .Values.config.modelBaseUrl | quote }}
+              {{- end }}
             - name: MODEL
               value: {{ .Values.config.model | quote }}
             - name: OPENCODE_MODEL
