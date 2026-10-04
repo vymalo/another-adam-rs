@@ -142,6 +142,13 @@ jobs:
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set mcp.websearch.url=https://search.example.com/mcp --set mcp.context7.enabled=true \
             --set topology=split --set front.replicas=2 > "$RUNNER_TEMP/rendered-mcp-split.yaml"
+          # The gateway's URL from the ExternalSecret (config.modelBaseUrlFromSecret): a secretKeyRef and one more
+          # key in the ExternalSecret, in the combined pod and in the split worker.
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set config.modelBaseUrlFromSecret=true > "$RUNNER_TEMP/rendered-model-url.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set config.modelBaseUrlFromSecret=true --set topology=split --set front.replicas=2 \
+            > "$RUNNER_TEMP/rendered-model-url-split.yaml"
           for attempt in 1 2 3; do
             status=0
             "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
@@ -153,6 +160,7 @@ jobs:
                 "$RUNNER_TEMP/rendered-app.yaml" "$RUNNER_TEMP/rendered-app-shared.yaml" \
                 "$RUNNER_TEMP/rendered-app-owners.yaml" \
                 "$RUNNER_TEMP/rendered-mcp.yaml" "$RUNNER_TEMP/rendered-mcp-split.yaml" \
+                "$RUNNER_TEMP/rendered-model-url.yaml" "$RUNNER_TEMP/rendered-model-url-split.yaml" \
                 > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
             cat "$RUNNER_TEMP/kubeconform.out"
             if [ "$status" -eq 0 ]; then exit 0; fi

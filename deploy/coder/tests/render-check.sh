@@ -742,4 +742,100 @@ check "a server on with config.extraEnv.ADAM_EXTRA_MCP_FILE fails (the chart set
 check "ADAM_AGENT_DIR in extraEnv is the deployment's own business again (unchanged)" \
   helm_mcp --set mcp.context7.enabled=true --set-string config.extraEnv.ADAM_AGENT_DIR=/x
 
+# config.modelBaseUrlFromSecret: the model gateway's URL (MODEL_BASE_URL) from the ExternalSecret instead of
+# config.modelBaseUrl, so a deployment keeps it out of git (the owner's decision of 2026-10-04). Off by default,
+# byte-for-byte invisible when off (the golden above). Like MODEL_API_KEY it belongs to the roles that run workers.
+placeholder='https://gateway.example.invalid/v1'
+# url_env: the MODEL_BASE_URL entry of the worker StatefulSet's env, with the lines that say where its value is.
+url_env() { doc StatefulSet "${1:-$out}" | grep -A4 -- 'name: MODEL_BASE_URL$'; }
+urlhas() { url_env | grep -Eq -- "$1"; }
+urllacks() { ! url_env | grep -Eq -- "$1"; }
+helm_url() { helm template coder "$chart" --namespace coder-ns "$@"; }
+
+helm_url > "$out"
+check "url off: MODEL_BASE_URL is the literal config.modelBaseUrl" urlhas "^              value: \"$placeholder\"$"
+check "url off: no secretKeyRef for MODEL_BASE_URL" urllacks 'secretKeyRef|valueFrom'
+check "url off: the ExternalSecret copies no MODEL_BASE_URL" dlacks ExternalSecret 'MODEL_BASE_URL|model_base_url'
+helm_url --set config.modelBaseUrl=https://gw.example.com/v1 > "$out"
+check "url off: config.modelBaseUrl is values-driven" urlhas '^              value: "https://gw.example.com/v1"$'
+helm_url --set config.modelBaseUrlFromSecret=false --set externalSecrets.properties.modelBaseUrl=null > "$out"
+check "url off: the property name is not read (null is fine)" dlacks ExternalSecret 'model_base_url|MODEL_BASE_URL'
+
+for role in "" all worker; do
+  if [ -n "$role" ]; then set -- --set "config.role=$role"; else set --; fi
+  label=${role:-default}
+  helm_url --set config.modelBaseUrlFromSecret=true "$@" > "$out"
+  check "url on, $label role: MODEL_BASE_URL is read from the Secret" urlhas '^                  key: MODEL_BASE_URL$'
+  check "url on, $label role: from the chart's Secret (named like MODEL_API_KEY's)" \
+    [ "$(url_env | grep -Ec '^ +name: coder$')" -eq 1 ]
+  check "url on, $label role: no literal value for MODEL_BASE_URL" urllacks '^              value:'
+  check "url on, $label role: the placeholder is rendered nowhere" lacks 'gateway.example.invalid'
+  check "url on, $label role: MODEL_BASE_URL is set exactly once" count 'name: MODEL_BASE_URL$' 1
+  check "url on, $label role: the ExternalSecret copies the property into MODEL_BASE_URL" \
+    dhas ExternalSecret '^    - secretKey: MODEL_BASE_URL$'
+  check "url on, $label role: the default AWS property is model_base_url" dhas ExternalSecret '^        property: model_base_url$'
+  check "url on, $label role: model, GitHub and OpenCode settings unchanged in number" count "$model_and_github" 5
+  check "url on, $label role: the ExternalSecret has one more key (MODEL_API_KEY, MODEL_BASE_URL, GITHUB_TOKEN, A2A_BEARER_TOKENS)" \
+    dcount ExternalSecret 'secretKey:' 4
+done
+
+helm_url --set config.modelBaseUrlFromSecret=true --set externalSecrets.properties.modelBaseUrl=gateway_url --set externalSecrets.key=prod/another-agentic/env > "$out"
+check "url on: the AWS property is values-driven" dhas ExternalSecret '^        property: gateway_url$'
+check "url on: it is read under externalSecrets.key" dhas ExternalSecret '^        key: prod/another-agentic/env$'
+check "url on: no model_base_url when the property is renamed" dlacks ExternalSecret 'property: model_base_url'
+
+# What counts as unset: the placeholder (the default) and an empty value, not a URL.
+check "url on: the default placeholder counts as unset" helm_url --set config.modelBaseUrlFromSecret=true
+check "url on: an explicit placeholder counts as unset" helm_url --set config.modelBaseUrlFromSecret=true --set "config.modelBaseUrl=$placeholder"
+check "url on: an empty config.modelBaseUrl counts as unset" helm_url --set config.modelBaseUrlFromSecret=true --set-string config.modelBaseUrl=
+check "url on: a null config.modelBaseUrl counts as unset" helm_url --set config.modelBaseUrlFromSecret=true --set config.modelBaseUrl=null
+helm_url --set config.modelBaseUrlFromSecret=true --set-string config.modelBaseUrl= > "$out"
+check "url on with an empty config.modelBaseUrl: still from the Secret, nothing literal" urlhas '^                  key: MODEL_BASE_URL$'
+
+# The URL itself is never in the render, whatever the option (a secret property is read at runtime).
+helm_url --set config.modelBaseUrlFromSecret=true --set topology=split --set front.replicas=2 > "$out"
+check "url on, split: the worker reads MODEL_BASE_URL from the Secret" urlhas '^                  key: MODEL_BASE_URL$'
+check "url on, split: the front has no MODEL_BASE_URL" dlacks Deployment 'MODEL_BASE_URL|model_base_url'
+check "url on, split: the ExternalSecret copies it for the worker" dhas ExternalSecret '^    - secretKey: MODEL_BASE_URL$'
+check "url on, split: the worker still has the five model and GitHub settings" dcount StatefulSet "$model_and_github" 5
+
+# A control plane never reads the model: nothing is rendered, and nothing is required, even with the option on.
+helm_url --set config.modelBaseUrlFromSecret=true --set config.role=control-plane \
+  --set externalSecrets.properties.modelApiKey=null --set externalSecrets.properties.githubToken=null \
+  --set externalSecrets.properties.modelBaseUrl=null > "$out"
+check "url on, control plane: no MODEL_BASE_URL in the pod" lacks 'MODEL_BASE_URL'
+check "url on, control plane: none in the ExternalSecret, no property read" lacks 'model_base_url|secretKey: MODEL_BASE_URL'
+check "url on, control plane: a control plane with the option and a real URL renders (it reads neither)" \
+  helm_url --set config.modelBaseUrlFromSecret=true --set config.role=control-plane --set config.modelBaseUrl=https://gw.example.com/v1 \
+    --set externalSecrets.properties.modelApiKey=null --set externalSecrets.properties.githubToken=null
+
+# Guards.
+message=$(helm_url --set config.modelBaseUrlFromSecret=true --set config.modelBaseUrl=https://gw.example.com/v1 2>&1 || true)
+check "url on with a real config.modelBaseUrl fails (a URL in values is written in git and ignored)" \
+  fails helm_url --set config.modelBaseUrlFromSecret=true --set config.modelBaseUrl=https://gw.example.com/v1
+check "... the error names both values and says what counts as unset" says "$message" 'config.modelBaseUrl.*placeholder'
+check "... and never prints the URL" fails says "$message" 'gw.example.com'
+check "url on with a whitespace-padded real URL fails" \
+  fails helm_url --set config.modelBaseUrlFromSecret=true --set-string 'config.modelBaseUrl= https://gw.example.com/v1 '
+check "url on with a real config.modelBaseUrl fails in split too" \
+  fails helm_url --set topology=split --set config.modelBaseUrlFromSecret=true --set config.modelBaseUrl=https://gw.example.com/v1
+message=$(helm_url --set config.modelBaseUrlFromSecret=true --set externalSecrets.properties.modelBaseUrl=null 2>&1 || true)
+check "url on with no AWS property name fails" \
+  fails helm_url --set config.modelBaseUrlFromSecret=true --set externalSecrets.properties.modelBaseUrl=null
+check "... the error names externalSecrets.properties.modelBaseUrl" says "$message" 'externalSecrets.properties.modelBaseUrl'
+check "url on with an empty AWS property name fails" \
+  fails helm_url --set config.modelBaseUrlFromSecret=true --set-string externalSecrets.properties.modelBaseUrl=
+message=$(helm_url --set config.modelBaseUrlFromSecret=true --set externalSecrets.enabled=false 2>&1 || true)
+check "url on with externalSecrets.enabled=false fails" \
+  fails helm_url --set config.modelBaseUrlFromSecret=true --set externalSecrets.enabled=false
+check "... the error names externalSecrets.enabled" says "$message" 'externalSecrets.enabled'
+check "url on with MODEL_BASE_URL in config.extraEnv fails (the chart sets it)" \
+  fails helm_url --set config.modelBaseUrlFromSecret=true --set-string config.extraEnv.MODEL_BASE_URL=https://gw.example.com/v1
+check "url off with MODEL_BASE_URL in config.extraEnv is unchanged (the deployment's own business)" \
+  helm_url --set-string config.extraEnv.MODEL_BASE_URL=https://gw.example.com/v1
+check "url on as a string fails (a bool is a bool)" fails helm_url --set-string config.modelBaseUrlFromSecret=false
+check "url on as a word fails" fails helm_url --set-string config.modelBaseUrlFromSecret=yes
+check "url off needs neither the ExternalSecret property nor the option's other values" \
+  helm_url --set externalSecrets.properties.modelBaseUrl=null --set config.modelBaseUrl=https://gw.example.com/v1
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi
