@@ -1562,7 +1562,8 @@ async fn an_empty_remote_has_no_default_branch() {
         .default_branch(remote.to_str().unwrap())
         .await
         .unwrap_err();
-    assert!(matches!(err, WorkspaceError::NotFound(_)), "{err:?}");
+    assert!(matches!(err, WorkspaceError::NoDefaultBranch(_)), "{err:?}");
+    assert_eq!(err.class(), adam_error::ErrorClass::NotFound);
     assert!(err.to_string().contains("no default branch"), "{err}");
     // A refused url is refused before anything runs.
     let closed = Workspaces::new(tmp.path().join("w2"), Arc::new(StaticToken::new(TOKEN)))

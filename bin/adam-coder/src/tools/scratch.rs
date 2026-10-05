@@ -405,12 +405,15 @@ async fn find_or_make_slot(
         (None, true) => DEFAULT_BASE.to_owned(),
         (None, false) => match env.workspaces.default_branch(url).await {
             Ok(base) => base,
-            Err(e @ (WorkspaceError::Invalid(_) | WorkspaceError::NotFound(_))) => {
-                return Err(Ok(ToolOutput::error(format!(
-                    "{e} Pass base_branch, or ask the person which branch to use with ask_user."
-                ))));
+            Err(e) => {
+                return match super::prepare::default_branch_refusal(
+                    &e,
+                    "Pass base_branch, or ask the person which branch to use with ask_user.",
+                ) {
+                    Some(said) => Err(Ok(ToolOutput::error(said))),
+                    None => Err(Err(env.delivery_error(ctx, &e).await)),
+                };
             }
-            Err(e) => return Err(Err(env.delivery_error(ctx, &e).await)),
         },
     };
     let repo = RepoRef::new(url, &base);

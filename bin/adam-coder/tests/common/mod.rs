@@ -564,6 +564,18 @@ impl Fixture {
         }
     }
 
+    /// The same fixture with an owner that may create repositories (`CREATE_REPO_OWNERS=acme`), so
+    /// that `coder_tools` offers `create_repository` (it does not with the default settings, which
+    /// name nobody).
+    #[must_use]
+    pub fn offering_creation(mut self) -> Self {
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .settings
+            .create_repo_owners = vec!["acme".to_owned()];
+        self
+    }
+
     /// The same fixture with the processes of runs going through `environment`.
     #[must_use]
     pub fn using(mut self, environment: DynEnvironment) -> Self {

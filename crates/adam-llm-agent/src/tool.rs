@@ -192,6 +192,18 @@ pub struct ToolOutput {
     /// written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
+    /// The announced [`answer`](Self::answer) is also **the end of the turn**: once the calls the
+    /// model asked for in this turn are answered, the run finishes with it and the model is not
+    /// called again. See [`final_answer`](Self::final_answer). Ignored without an answer, and never
+    /// read from an error result.
+    ///
+    /// Absent from a journal written before it existed, and not written while it is `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ends_turn: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ToolOutput {
@@ -202,6 +214,7 @@ impl ToolOutput {
             is_error: false,
             artifacts: Vec::new(),
             answer: None,
+            ends_turn: false,
         }
     }
 
@@ -213,6 +226,7 @@ impl ToolOutput {
             is_error: true,
             artifacts: Vec::new(),
             answer: None,
+            ends_turn: false,
         }
     }
 
@@ -227,6 +241,21 @@ impl ToolOutput {
     #[must_use]
     pub fn announcing(mut self, text: impl Into<String>) -> Self {
         self.answer = Some(text.into());
+        self
+    }
+
+    /// Announce `text` as the run's answer **and end the turn with it**: like
+    /// [`announcing`](Self::announcing), and once the calls of this model turn are answered the run
+    /// finishes with `text` as its output, with no further model call, so the model has no closing
+    /// line to write after an answer the person has already read. A message that reached the run
+    /// meanwhile is read first: the model is called again with it, and the announcement ends there
+    /// as a new turn's would. A call that fails ends nothing.
+    ///
+    /// For a tool whose call *is* the model's answer (`turn_output` of `adam-ui`).
+    #[must_use]
+    pub fn final_answer(mut self, text: impl Into<String>) -> Self {
+        self.answer = Some(text.into());
+        self.ends_turn = true;
         self
     }
 

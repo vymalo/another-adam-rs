@@ -202,6 +202,12 @@ pub struct Conversation {
     /// written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub announced: Option<String>,
+    /// The announcement is also the end of the turn
+    /// ([`ToolOutput::final_answer`](crate::ToolOutput::final_answer)): when the calls owed are
+    /// answered the run finishes with [`announced`](Self::announced) and calls no model. Cleared
+    /// with it. Absent from state written before it existed, and not written while `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub announced_final: bool,
     /// What the tool sources said about the tools they offered on the latest model turn
     /// ([`ToolNote`](crate::ToolNote)): which calls the system behind a source reports as steps itself
     /// (the agent reports none) and how long a call may run. It is the notes of **that turn's

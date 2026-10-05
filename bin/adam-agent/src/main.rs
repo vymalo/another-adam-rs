@@ -12,7 +12,6 @@ use std::process::ExitCode;
 
 use adam_agent::{Config, exit_code};
 use anyhow::Context as _;
-use tracing_subscriber::EnvFilter;
 
 /// Exit code 0 after a clean shutdown; otherwise the sysexits-style code of the error's root cause
 /// ([`adam_agent::exit`]: 78 configuration, 69 dependency unreachable, 71 OS error, 70 internal, 1
@@ -20,12 +19,15 @@ use tracing_subscriber::EnvFilter;
 /// the same logger as everything else.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(adam_service::logging::env_filter())
         .init();
+
+    // Before anything else is read: a same-user child (an MCP server's command) cannot read this
+    // process's `/proc/<pid>/environ`, where the model key and the database URL are.
+    adam_service::harden::make_non_dumpable();
 
     // Its errors name variables, never their values.
     let config = match Config::from_env().context("reading the configuration") {

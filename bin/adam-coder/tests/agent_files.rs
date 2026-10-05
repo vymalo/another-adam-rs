@@ -50,6 +50,10 @@ const SNAPSHOT: &str = include_str!("fixtures/agent/prompt.txt");
 /// The check cycles of scratch work that [`coder`] gives the agent (the shipped default).
 const SCRATCH_CYCLES: u32 = 5;
 
+/// What the shipped folder's `repository_creation` var says: the sentence for a deployment where an
+/// owner may create repositories (the folded `vars.repository_creation` of `agent/instructions.md`).
+const CREATION_ON: &str = "If the person has no repository for it and says you may make one (\"create a repository for it\"), use `create_repository` for an owner they name: it asks them, and only a yes creates it. Then `publish_scratch` to the repository it reports, as above.";
+
 /// What the model is sent for `cycles` and the shipped name: the snapshot with both put in. The
 /// snapshot's final newline is dropped, as the loader drops it from every body
 /// (`adam-agent-fs` trims trailing whitespace).
@@ -57,6 +61,7 @@ fn expected_prompt(cycles: u32) -> String {
     let rendered = SNAPSHOT
         .replace("{{max_check_cycles}}", &cycles.to_string())
         .replace("{{scratch_check_cycles}}", &SCRATCH_CYCLES.to_string())
+        .replace("{{repository_creation}}", CREATION_ON)
         .replace("{{display_name}}", "Coder");
     assert!(
         rendered.ends_with(".\n"),
@@ -90,7 +95,12 @@ const TOOLS: [&str; 20] = [
 ];
 
 async fn coder(cycles: u32) -> (Fixture, CoderAgent) {
-    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = cycles).await;
+    // A deployment that allows creating repositories: the tool is offered and the prompt describes it.
+    let fx = Fixture::with("hello\n", |s| {
+        s.max_check_cycles = cycles;
+        s.create_repo_owners = vec!["acme".to_owned()];
+    })
+    .await;
     let model: DynModel = Arc::new(MockModel::new());
     let agent = CoderAgent::new(model, "test-model", fx.env.clone());
     (fx, agent)
@@ -130,8 +140,8 @@ async fn the_prompt_carries_the_rules_the_code_relies_on() {
         // The answer is announced with the thread tool when the model has it, and the prompt reads
         // the same without it (the reply that ends the turn is the answer, as before).
         "**If you have a `turn_output` tool**",
-        "**do not repeat the answer after it**",
-        "your last words are your answer, as they are when you have\n  no such tool",
+        "**the turn ends with the call**",
+        "your last words are your answer,\n  as they are when you have no such tool",
     ] {
         assert!(text.contains(needle), "prompt lost: {needle}");
     }
@@ -161,6 +171,43 @@ async fn the_prompt_gives_the_agent_a_name_and_asks_for_plain_words() {
     assert!(!text.contains("{{"), "unreplaced placeholder");
     // The old instruction that made a greeting a task with something missing is gone.
     assert!(!text.contains("A greeting or a\n   vague request is not a task"));
+}
+
+/// With no owner allowed to create repositories the tool is not offered, and the prompt says there
+/// is none instead of describing it: the model must not offer "a new repository" to the person
+/// (a deployment's live chats showed it doing so, then calling the tool with an owner it made up).
+#[tokio::test]
+async fn the_prompt_says_there_is_no_repository_creation_when_none_is_allowed() {
+    let fx = Fixture::new("hello\n").await;
+    assert!(fx.env.settings.create_repo_owners.is_empty());
+    let model: DynModel = Arc::new(MockModel::new());
+    let agent = CoderAgent::new(model, "test-model", fx.env.clone());
+    let text = prompt_of(&agent);
+    assert!(
+        text.contains("Creating a repository is switched off"),
+        "{text}"
+    );
+    assert!(text.contains("never offer \"a new repository\""), "{text}");
+    assert!(
+        !text.contains("create_repository"),
+        "the prompt names a tool the model is not offered"
+    );
+    assert!(!text.contains("{{"), "unreplaced placeholder");
+    assert!(
+        !agent.assembly().info()[0]
+            .tools
+            .iter()
+            .any(|t| t == "create_repository")
+    );
+    // Allowed, it is the folder's own sentence again, and the tool is there.
+    let (_fx, agent) = coder(3).await;
+    assert!(prompt_of(&agent).contains("use `create_repository` for an owner they name"));
+    assert!(
+        agent.assembly().info()[0]
+            .tools
+            .iter()
+            .any(|t| t == "create_repository")
+    );
 }
 
 #[tokio::test]
@@ -264,7 +311,7 @@ async fn the_assemblys_card_is_the_card_a_control_plane_serves() {
 /// the journal records (the step names, which a replay checks).
 #[tokio::test]
 async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new("hello\n").await.offering_creation();
     let mock = Arc::new(MockModel::new());
     // No workspace yet: the tool answers with an error result and has no effect.
     mock.push_tool_calls(vec![ToolCall {
@@ -423,7 +470,11 @@ async fn a_copy_of_the_shipped_folder_is_the_embedded_agent() {
 /// edited prompt, with no rebuild. The limit is still the process's (`max_check_cycles`).
 #[tokio::test]
 async fn editing_the_folder_changes_what_the_model_is_sent() {
-    let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 5).await;
+    let fx = Fixture::with("hello\n", |s| {
+        s.max_check_cycles = 5;
+        s.create_repo_owners = vec!["acme".to_owned()];
+    })
+    .await;
     let tmp = folder();
     edit_instructions(&tmp, |text| format!("{text}\nAlways answer in French.\n"));
     let files = files_of(&tmp);
@@ -786,7 +837,7 @@ async fn connected_def(
 /// result. The token reaches the server from `${TEST_MCP_TOKEN}`.
 #[tokio::test]
 async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new("hello\n").await.offering_creation();
     let server = TestHttpServer::start(Some(MCP_TOKEN)).await;
     let tmp = folder();
     write_mcp_json(&tmp, &server.url());

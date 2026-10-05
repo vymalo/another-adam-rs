@@ -462,6 +462,11 @@ impl LlmAgentBuilder {
 /// model closes with; the closing words are still said, as `agent_text` with their `stream`, and the
 /// output names no stream. A message that reaches the run ends the turn and clears the announcement.
 ///
+/// A tool can also **end the turn with its announcement** ([`ToolOutput::final_answer`]): once the
+/// calls of that model turn are answered, the run finishes with the announced text and the model is
+/// not called again, so there are no closing words to say after an answer that was already handed
+/// over ([`Conversation::announced_final`]). A message that reached the run meanwhile is read first.
+///
 /// # Child runs
 ///
 /// A tool that returns [`ToolError::AwaitRun`] has started a child run (with
@@ -632,6 +637,7 @@ impl LlmAgent {
         // the one before is not the answer of this one.
         if !texts.as_slice().is_empty() {
             state.announced = None;
+            state.announced_final = false;
         }
         if let Some(PendingWait::Question(q)) = &state.pending_wait {
             let Some(answer) = texts.next() else {
@@ -972,8 +978,8 @@ impl LlmAgent {
                     artifacts,
                     answer,
                 } => {
-                    if answer.is_some() {
-                        state.announced = answer;
+                    if let Some(answer) = answer {
+                        state.announce(answer);
                     }
                     (message, artifacts)
                 }
@@ -1357,8 +1363,8 @@ impl LlmAgent {
                 let (message, artifacts, answer, outcome) =
                     output_message(ctx, &wait.call_id, output, used).await;
                 state.artifacts.extend(artifacts);
-                if answer.is_some() {
-                    state.announced = answer;
+                if let Some(answer) = answer {
+                    state.announce(answer);
                 }
                 owed(state, message);
                 Ok(Some(outcome))
@@ -1404,7 +1410,7 @@ async fn output_message(
     call_id: &str,
     mut output: ToolOutput,
     files_used: u64,
-) -> (Message, Vec<ArtifactRef>, Option<String>, StepState) {
+) -> (Message, Vec<ArtifactRef>, Option<Announcement>, StepState) {
     let mut used = files_used;
     let mut refused: Vec<String> = Vec::new();
     output.artifacts.retain(|a| {
@@ -1446,7 +1452,12 @@ async fn output_message(
     for artifact in output.artifacts {
         ctx.emit(RunEvent::from(artifact)).await;
     }
-    let answer = output.answer.take().filter(|_| !output.is_error);
+    let ends_turn = output.ends_turn;
+    let answer = output
+        .answer
+        .take()
+        .filter(|_| !output.is_error)
+        .map(|text| Announcement { text, ends_turn });
     let message = Message::Tool {
         call_id: call_id.to_owned(),
         content: output.content,
@@ -1535,12 +1546,26 @@ impl AgentStarter for LlmStarter {
     }
 }
 
+/// What a tool announced as the run's answer, and whether it ended the turn with it.
+struct Announcement {
+    text: String,
+    ends_turn: bool,
+}
+
+impl Conversation {
+    /// Keep an announcement: the last one wins, and it ends the turn only if it says so.
+    fn announce(&mut self, announcement: Announcement) {
+        self.announced = Some(announcement.text);
+        self.announced_final = announcement.ends_turn;
+    }
+}
+
 enum ToolResult {
     Answered {
         message: Message,
         artifacts: Vec<ArtifactRef>,
         /// What the tool announced as the run's answer, from a result that is not an error.
-        answer: Option<String>,
+        answer: Option<Announcement>,
     },
     NeedsInput {
         question: String,
@@ -1695,6 +1720,19 @@ impl Agent for LlmAgent {
         Ok(match flow {
             Flow::Next => {
                 if state.pending_calls.is_empty() {
+                    // A tool handed over the answer and ended the turn with it
+                    // (`ToolOutput::final_answer`): the calls it was asked with are answered, so
+                    // the run is done, with no model call to say a closing line after it. A
+                    // message that reached the run meanwhile is read first, by the model.
+                    if let Some(text) = state.announced.clone()
+                        && state.announced_final
+                        && state.deferred.is_empty()
+                        && ctx.arrived().await? == 0
+                    {
+                        let output = json!({ "text": text, "artifacts": state.artifacts });
+                        return Ok(Transition::Done { state, output });
+                    }
+                    state.announced_final = false;
                     state.messages.append(&mut state.deferred);
                 }
                 Transition::Continue(state)

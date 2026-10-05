@@ -15,7 +15,7 @@ pub type WorkspaceResult<T> = Result<T, WorkspaceError>;
 /// or from an HTTP response are scrubbed of the token before they are stored.
 ///
 /// Decide from [`Classify::class`], not from the variant: `Auth` is
-/// `Unauthenticated`, `NotFound` is `NotFound`, `Invalid` is `Invalid`,
+/// `Unauthenticated`, `NotFound` and `NoDefaultBranch` are `NotFound`, `Invalid` is `Invalid`,
 /// `Transient` is `Transient`, `RateLimited` is `RateLimited`, `Conflict` is
 /// `Rejected`, `Corrupt` is `Corrupt`, and `Git`, `Http` and `Io` are `Internal`.
 /// A message describes this layer only; [`adam_error::report`] prints the chain.
@@ -31,6 +31,12 @@ pub enum WorkspaceError {
     /// to the token).
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// The remote has no default branch: its `HEAD` names none (an empty repository). The one
+    /// failure of [`Workspaces::default_branch`](crate::Workspaces::default_branch) that a
+    /// caller solves by naming a branch; the text is the repository's address.
+    #[error("{0} has no default branch (is the repository empty?)")]
+    NoDefaultBranch(String),
 
     /// The request was understood but refused: bad input, a validation error
     /// from the code host (HTTP 422), a rejected push.
@@ -100,7 +106,7 @@ impl Classify for WorkspaceError {
     fn class(&self) -> ErrorClass {
         match self {
             Self::Auth(_) => ErrorClass::Unauthenticated,
-            Self::NotFound(_) => ErrorClass::NotFound,
+            Self::NotFound(_) | Self::NoDefaultBranch(_) => ErrorClass::NotFound,
             Self::Invalid(_) => ErrorClass::Invalid,
             Self::Transient { .. } => ErrorClass::Transient,
             Self::RateLimited { .. } => ErrorClass::RateLimited,
@@ -155,6 +161,7 @@ mod tests {
         match e {
             WorkspaceError::Auth(_) => ErrorClass::Unauthenticated,
             WorkspaceError::NotFound(_) => ErrorClass::NotFound,
+            WorkspaceError::NoDefaultBranch(_) => ErrorClass::NotFound,
             WorkspaceError::Invalid(_) => ErrorClass::Invalid,
             WorkspaceError::Transient { .. } => ErrorClass::Transient,
             WorkspaceError::RateLimited { .. } => ErrorClass::RateLimited,
@@ -187,6 +194,7 @@ mod tests {
                 message: "x".into(),
             },
             WorkspaceError::io("cannot do it", io::Error::other("disk on fire")),
+            WorkspaceError::NoDefaultBranch("x".into()),
         ]
     }
 

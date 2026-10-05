@@ -68,6 +68,29 @@ use futures::stream::{BoxStream, StreamExt};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use secrecy::{ExposeSecret, SecretString};
 
+/// `url` as a log line may show it: its scheme, host and port, nothing else. A gateway's address is
+/// often a secret of the deployment (an internal host, a path that names a tenant, a key in the
+/// query or the user part), so no `Debug` of this crate or of a configuration built on it prints
+/// more. `"<unset>"` for a blank `url` and `"<set>"` for one that is not an absolute URL with a
+/// host, which says that something is configured and nothing of what.
+#[must_use]
+pub fn endpoint_for_logs(url: &str) -> String {
+    let url = url.trim();
+    if url.is_empty() {
+        return "<unset>".to_owned();
+    }
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => match parsed.host_str() {
+            Some(host) => match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+                None => format!("{}://{host}", parsed.scheme()),
+            },
+            None => "<set>".to_owned(),
+        },
+        Err(_) => "<set>".to_owned(),
+    }
+}
+
 /// Configuration of an [`OpenAiCompatible`] client.
 #[derive(Clone)]
 pub struct OpenAiConfig {
@@ -97,7 +120,8 @@ impl OpenAiConfig {
 impl fmt::Debug for OpenAiConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenAiConfig")
-            .field("base_url", &self.base_url)
+            // Scheme and host only: see `endpoint_for_logs`.
+            .field("base_url", &endpoint_for_logs(&self.base_url))
             .field("api_key", &"[REDACTED]")
             .field("timeout", &self.timeout)
             // Header values can carry credentials (`x-api-key`); names cannot.
@@ -173,7 +197,7 @@ pub struct OpenAiCompatible {
 impl fmt::Debug for OpenAiCompatible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenAiCompatible")
-            .field("url", &self.url)
+            .field("url", &endpoint_for_logs(&self.url))
             .field("timeout", &self.timeout)
             .field("max_tokens_field", &self.max_tokens_field)
             .finish_non_exhaustive()
@@ -339,6 +363,35 @@ mod tests {
         let shown = format!("{client:?}");
         assert!(!shown.contains("sk-super-secret"), "{shown}");
         assert!(!shown.contains("header-secret"), "{shown}");
+    }
+
+    #[test]
+    fn debug_shows_the_gateway_by_scheme_and_host_only() {
+        // The gateway's address is a secret of the deployment: a path, a query and a user part
+        // never reach a log line.
+        let secret = "https://user:pw@gw.internal:8443/tenant-4711/v1?key=k-123";
+        let shown = format!("{:?}", config(secret));
+        assert!(shown.contains("https://gw.internal:8443"), "{shown}");
+        for hidden in ["tenant-4711", "k-123", "user", "pw", "/v1"] {
+            assert!(!shown.contains(hidden), "{hidden} leaked: {shown}");
+        }
+        let client = OpenAiCompatible::new(config(secret)).unwrap();
+        let shown = format!("{client:?}");
+        assert!(shown.contains("https://gw.internal:8443"), "{shown}");
+        for hidden in ["tenant-4711", "k-123", "pw", "chat/completions"] {
+            assert!(!shown.contains(hidden), "{hidden} leaked: {shown}");
+        }
+        assert_eq!(
+            endpoint_for_logs("https://api.example.com/v1"),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            endpoint_for_logs("http://localhost:8080/v1"),
+            "http://localhost:8080"
+        );
+        assert_eq!(endpoint_for_logs("  "), "<unset>");
+        assert_eq!(endpoint_for_logs("not a url"), "<set>");
+        assert_eq!(endpoint_for_logs("mailto:someone@example.com"), "<set>");
     }
 
     #[test]

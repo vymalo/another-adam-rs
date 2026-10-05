@@ -162,7 +162,11 @@ sequenceDiagram
 
 The sources are read inside the step of the model call, so a replay of a turn whose answer is recorded reads
 nothing and the journal has no new entries: only the answer is recorded, not the tools it was given. A listed tool
-whose name an own tool or an earlier source has is left out, with a warning (the agent's own tools win), at most
+whose name an own tool or an earlier source has is left out, with a warning (the agent's own tools win), **unless the source
+says it expects the repeat** (`ToolSource::expects_repeat(name, taken)`, default `false`: it offers whatever the system behind it
+has, among which a tool the agent already owns): the omission is then a debug line, not a warning at every model turn
+(`adam-ui`'s thread-tools source says so for a relayed `<server>__<tool>`, the web search a conversation attaches that the agent's own
+`mcp.json` names too; any other clash still warns). At most
 `MAX_SOURCE_TOOLS` (64) are offered, and an agent with no source behaves exactly as before. A source's tool may ask
 the person and wait for a child run, but not wait on a remote task (`AwaitRemote` is answered with an error result:
 the agent polls the tool that started the task, and a source's tool is not known then).
@@ -322,6 +326,13 @@ thread tool `turn_output` ([ADR 0014](../../docs/decisions/0014-a-turn-output-an
   the text of the A2A `completed` status. It names **no `stream`** and is never `truncated`: it is not the words the model
   streamed. The closing words are still said, as `agent_text` with the `stream` they were sent as, so the orchestration layer
   files them as working text.
+* **A tool can end the turn with its announcement** (`ToolOutput::final_answer(text)`, which also sets `ToolOutput::ends_turn`;
+  `Conversation::announced_final`, serde defaults both). Once the calls the model asked for in that turn are answered, the
+  run finishes with `{"text": <the announcement>, "artifacts": ..}` and **calls no model**, so no closing words follow an answer
+  that was already handed over (`adam-ui`'s `turn_output` does this, [ADR 0014](../../docs/decisions/0014-a-turn-output-answer-is-the-runs-answer.md),
+  amended 2026-10-04). A message that reached the run meanwhile (`Ctx::arrived`, or one deferred behind the owed calls) is read
+  first: the flag is dropped and the model is called with it. An error result ends nothing. Without it, the closing words
+  follow as before. Adding a field to `ToolOutput` breaks a struct literal of it: build one with the constructors.
 * **A message that reaches the run ends the turn** and clears the announcement (the person's answer to a question, a message
   that arrives while the run is going): what was announced is the answer of the turn before. A run that continues another
   starts with none.
@@ -441,7 +452,8 @@ The old `Conversation` JSON with `pending_question` is a literal in `src/convers
 announced answer is the run's output and the closing line is not, the last of several wins (in one message and across
 turns), a refused call changes nothing (and one after an announcement keeps it), no announcement leaves the closing words as
 the answer with their stream, a replay after a crash inside the next tool keeps the announced answer and does not call the
-tool again, a message that reaches the run clears it, and the serde shapes of older journals.
+tool again, a message that reaches the run clears it, a final answer ends the turn with no model call after it (and the calls
+of its model message are all answered first, and a refused one ends nothing), and the serde shapes of older journals.
 
 `tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
 the context of the start message reaching a tool, replace/delete/keep across messages, a continued run carrying the

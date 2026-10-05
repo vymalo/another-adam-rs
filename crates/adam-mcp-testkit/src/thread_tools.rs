@@ -157,7 +157,7 @@ fn turn_output_tool() -> Tool {
     Tool::new(
         TURN_OUTPUT,
         "Say that this is your answer for this turn, as Markdown: 1 to 65536 bytes. Call it once \
-         the answer is ready, then finish with one short line.",
+         the answer is ready; the turn ends with the call.",
         object(json!({
             "type": "object",
             "properties": {"text": {"type": "string", "minLength": 1,

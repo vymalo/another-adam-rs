@@ -1,13 +1,14 @@
-//! Keeping the coder's secrets from its own children, beyond the names it hides from them.
+//! Keeping an agent process's secrets from its own children, beyond the names it hides from them.
 //!
-//! The checks, commands and OpenCode of a run are processes of the coder's user, and a process of a
-//! user can read `/proc/<pid>/environ` of another of the same user. [`make_non_dumpable`] closes that
-//! door for the coder itself (Linux).
+//! The checks, commands and OpenCode of a run of the coder, and the commands of the MCP servers
+//! of any agent folder, are processes of the agent's user, and a process of a user can read
+//! `/proc/<pid>/environ` of another of the same user. [`make_non_dumpable`] closes that door for
+//! the process itself (Linux). Every agent binary calls it first (`adam-coder`, `adam-agent`).
 
 /// Make the process **non-dumpable** (`prctl(PR_SET_DUMPABLE, 0)`, through `rustix`'s safe call, so the
 /// crate stays `forbid(unsafe_code)`): `/proc/<pid>/environ`, `/proc/<pid>/mem` and ptrace of this process
 /// are then refused to every process of the same user that lacks `CAP_SYS_PTRACE`, which is what the
-/// children of a run are (the chart drops every capability). Without it, `cat /proc/<coder pid>/environ`
+/// children of a run are (the chart drops every capability). Without it, `cat /proc/<agent pid>/environ`
 /// in a repository's test script would give them every secret of this process (`GITHUB_TOKEN`,
 /// `MODEL_API_KEY`, the keys an MCP server reads) that hiding names cannot reach. The setting is
 /// inherited by `fork` and reset by `exec`, so the children themselves stay ordinary processes. A

@@ -1,7 +1,7 @@
 //! `prepare_workspace { repo_url, base_branch?, branch? }`.
 
 use adam::prelude::*;
-use adam_workspace::RepoRef;
+use adam_workspace::{RepoRef, WorkspaceError};
 
 use super::named::{key_of_argument, listed};
 use super::notes::RunNotes;
@@ -201,13 +201,32 @@ async fn default_base(env: &ToolEnv, ctx: &ToolCtx, url: &str) -> Result<String,
     }
     match env.workspaces.default_branch(url).await {
         Ok(base) => Ok(base),
-        Err(
-            e @ (adam_workspace::WorkspaceError::Invalid(_)
-            | adam_workspace::WorkspaceError::NotFound(_)),
-        ) => Err(Ok(ToolOutput::error(format!(
-            "{e} Pass base_branch, or ask the person which branch to start from with ask_user."
-        )))),
-        Err(e) => Err(Err(env.delivery_error(ctx, &e).await)),
+        Err(e) => match default_branch_refusal(
+            &e,
+            "Pass base_branch, or ask the person which branch to start from with ask_user.",
+        ) {
+            Some(said) => Err(Ok(ToolOutput::error(said))),
+            None => Err(Err(env.delivery_error(ctx, &e).await)),
+        },
+    }
+}
+
+/// What the model is told when `Workspaces::default_branch` fails in a way it can act on, or `None`
+/// for a failure that is not its to fix (the caller reports that one as a delivery error).
+///
+/// `hint` is the way out for a missing branch. It is added only when the remote has no default
+/// branch to start from: any other refusal (a repository the policy or the GitHub App's owners
+/// refuse, one that does not exist) is not solved by naming a branch, and the hint would be
+/// advice for another problem.
+pub(super) fn default_branch_refusal(e: &WorkspaceError, hint: &str) -> Option<String> {
+    use adam_error::{Classify, ErrorClass};
+    if !matches!(e.class(), ErrorClass::Invalid | ErrorClass::NotFound) {
+        return None;
+    }
+    if matches!(e, WorkspaceError::NoDefaultBranch(_)) {
+        Some(format!("{e} {hint}"))
+    } else {
+        Some(e.to_string())
     }
 }
 
@@ -284,6 +303,36 @@ mod tests {
             !some.contains("agent/other"),
             "another repository's branch is not offered: {some}"
         );
+    }
+
+    #[test]
+    fn the_branch_hint_is_for_a_missing_branch_only() {
+        const HINT: &str = "Pass base_branch.";
+        // No default branch: naming one is the way out.
+        let empty = WorkspaceError::NoDefaultBranch("https://github.com/a/b".into());
+        let said = default_branch_refusal(&empty, HINT).expect("the model can act on it");
+        assert!(said.contains("no default branch"), "{said}");
+        assert!(said.ends_with(" Pass base_branch."), "{said}");
+        // The owner the App may not act for: the hint would be advice for another problem.
+        let owner = WorkspaceError::Invalid(
+            "the GitHub App is not allowed to act for `vaam-apps`: it is not in GITHUB_APP_OWNERS"
+                .into(),
+        );
+        let said = default_branch_refusal(&owner, HINT).expect("the model can act on it");
+        assert!(said.contains("GITHUB_APP_OWNERS"), "{said}");
+        assert!(!said.contains("base_branch"), "{said}");
+        assert!(!said.contains("ask_user"), "{said}");
+        // A repository that is not there is not a branch problem either.
+        let missing = WorkspaceError::NotFound("repository not found".into());
+        let said = default_branch_refusal(&missing, HINT).expect("the model can act on it");
+        assert!(!said.contains("base_branch"), "{said}");
+        // Failures that are not the model's to fix are not its to read.
+        let down = WorkspaceError::Transient {
+            message: "network".into(),
+            source: None,
+        };
+        assert!(default_branch_refusal(&down, HINT).is_none());
+        assert!(default_branch_refusal(&WorkspaceError::Auth("no".into()), HINT).is_none());
     }
 
     #[test]

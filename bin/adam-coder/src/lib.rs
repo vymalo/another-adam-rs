@@ -26,7 +26,7 @@
 //! | [`files`] | [`AgentFiles`]: where those files come from, the embedded copy or a folder read once at startup, and why a folder is refused ([`AgentFilesError`]) |
 //! | [`github_mcp`] | [`GitHubReadBearer`]: the coder's credentials as the bearer of each call to the GitHub MCP server (`http` mode, a sidecar), chosen by the owner and repository the call is about |
 //! | [`redact`] | [`Redactor`]: the process's own secrets never leave in an error, an event or a tool result |
-//! | [`harden`] | `make_non_dumpable`: a same-user child cannot read the coder's `/proc/<pid>/environ` |
+//! | [`harden`] | `make_non_dumpable` (it lives in `adam-service`, and `adam-agent` calls it too): a same-user child cannot read the coder's `/proc/<pid>/environ` |
 //! | [`mcp_secrets`] | the variables an agent's `mcp.json` files read as `${VAR}`: hidden from the processes of runs (`HidingEnvironment`) and registered with the redactor, but never `PATH`, `HOME`, `MODEL_API_KEY` and the like |
 //! | [`opencode`] | OpenCode's generated configuration and how it is launched |
 //! | [`janitor`] | [`Janitor`]: the sweep that removes the workspaces of finished runs, a worker component of the process |
@@ -89,7 +89,7 @@ pub mod config;
 pub mod exit;
 pub mod files;
 pub mod github_mcp;
-pub mod harden;
+pub use adam_service::harden;
 pub mod janitor;
 pub mod mcp_secrets;
 pub mod opencode;

@@ -132,17 +132,18 @@ fn status_text(task: &Task) -> Option<&str> {
 const ANSWER: &str = "## Result\n\nThe pull request is **#12**.";
 
 #[tokio::test]
-async fn an_announced_answer_is_the_answer_the_completed_status_carries() {
+async fn an_announced_answer_is_the_answer_and_the_end_of_the_turn() {
     let server = ThreadToolsServer::start(&[SECRET]).await;
     server.enable_turn_output();
     let rig = Rig::new();
+    // The second reply is never asked for: the turn ends with the call.
     rig.model
         .push_tool_calls(vec![turn_output("t1", ANSWER)])
         .push_text("There it is.");
 
     let task = rig.run(&server, "do it").await;
 
-    // A plain A2A reader reads the answer the person was shown, not the closing line.
+    // A plain A2A reader reads the answer the person was shown, and there is no closing line.
     assert_eq!(status_text(&task), Some(ANSWER));
     let (output, state) = rig.state_of(&task).await;
     assert_eq!(output["text"], ANSWER);
@@ -150,36 +151,30 @@ async fn an_announced_answer_is_the_answer_the_completed_status_carries() {
     assert_eq!(state["announced"], ANSWER);
     // What the endpoint accepted: the text, as it was given.
     assert_eq!(server.announcements(), [ANSWER]);
-    // The model was offered the tool under its listed name, and told what to do next (not the
-    // endpoint's `{"delivered": true}`).
+    // The model was offered the tool under its listed name, and called once: it was not asked to
+    // say anything after its answer.
     let requests = rig.model.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1, "no model call after the answer");
     assert_eq!(
         names(&requests[0]),
         ["ask_user", "show", "ui_catalog", "turn_output"]
     );
     assert_eq!(
-        requests[1].messages.last(),
-        Some(&adam_model::Message::tool_result(
-            "t1",
-            TURN_OUTPUT_DELIVERED
-        ))
-    );
-    assert!(
-        TURN_OUTPUT_DELIVERED
-            .starts_with("Delivered to the person as your answer. Finish now with one short line")
+        TURN_OUTPUT_DELIVERED,
+        "Delivered to the person as your answer. Do not repeat it."
     );
 }
 
 #[tokio::test]
-async fn the_last_announcement_wins() {
+async fn the_last_announcement_of_a_turn_wins() {
     let server = ThreadToolsServer::start(&[SECRET]).await;
     server.enable_turn_output();
     let rig = Rig::new();
-    rig.model
-        .push_tool_calls(vec![turn_output("t1", "a first try")])
-        .push_tool_calls(vec![turn_output("t2", ANSWER)])
-        .push_text("Done.");
+    // Two calls of one model turn: the turn ends once both are answered, with the last.
+    rig.model.push_tool_calls(vec![
+        turn_output("t1", "a first try"),
+        turn_output("t2", ANSWER),
+    ]);
 
     let task = rig.run(&server, "do it").await;
 
@@ -188,6 +183,7 @@ async fn the_last_announcement_wins() {
     // answers with the last.
     assert_eq!(server.announcements(), ["a first try", ANSWER]);
     assert_eq!(rig.state_of(&task).await.0["text"], ANSWER);
+    assert_eq!(rig.model.requests().len(), 1);
 }
 
 #[tokio::test]

@@ -304,7 +304,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures",
- "rustix",
  "secrecy",
  "serde",
  "serde_json",
@@ -552,12 +551,14 @@ dependencies = [
  "adam-store-postgres",
  "async-trait",
  "axum",
+ "rustix",
  "secrecy",
  "serde_json",
  "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 

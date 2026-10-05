@@ -78,12 +78,14 @@ pub const GET_UI_CATALOG: &str = "get_ui_catalog";
 
 /// The tool with which an agent says "this is my answer for this turn": `turn_output { text }`.
 /// What it is told when the call succeeds is [`TURN_OUTPUT_DELIVERED`], and the text is the run's
-/// answer ([`ToolOutput::announcing`]).
+/// answer and the end of the turn ([`ToolOutput::final_answer`]).
 pub const TURN_OUTPUT: &str = "turn_output";
 
 /// What the model is told when `turn_output` delivered its answer. The endpoint's own `{"delivered":
-/// true}` says nothing to a model about what to do next.
-pub const TURN_OUTPUT_DELIVERED: &str = "Delivered to the person as your answer. Finish now with one short line, and do not repeat the answer.";
+/// true}` says nothing to a model about what to do next. The turn ends with the call (the run is
+/// finished without another model call), so the model normally never reads this; it does when a
+/// message reached the run meanwhile and it is called again with that message.
+pub const TURN_OUTPUT_DELIVERED: &str = "Delivered to the person as your answer. Do not repeat it.";
 
 /// The longest a listing waits for the endpoint, whatever the policy's connect timeout: it is paid
 /// at every model turn.
@@ -350,6 +352,13 @@ fn fits(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Whether `name` is the name of a tool the orchestration layer relays from a server attached to the
+/// conversation: `<server>__<tool>`, the shape the agent's own MCP tools have too (`websearch__fetch`).
+fn is_relayed(name: &str) -> bool {
+    name.split_once("__")
+        .is_some_and(|(server, tool)| !server.is_empty() && !tool.is_empty())
+}
+
 /// The tools of the thread-tools endpoint a run's messages announced, as a
 /// [`ToolSource`]: every tool the endpoint lists, under its listed name, listed again at every
 /// model turn, so the tools of later slices of the orchestration layer (the relayed tools of attached
@@ -360,11 +369,20 @@ fn fits(name: &str) -> bool {
 /// result), so the source belongs **last** among the sources of an agent.
 ///
 /// **`turn_output`.** The one tool of the endpoint this source knows by name: when a call to it
-/// succeeds, the model is told [`TURN_OUTPUT_DELIVERED`] and its `text` is announced as the run's
-/// answer ([`ToolOutput::announcing`]), so the run's output, and with it the A2A `completed` status,
-/// carries the Markdown the person was shown and not the model's closing line. A later successful call
-/// replaces it; a call the endpoint refuses (the turn is over, the text is empty or too long, the
+/// succeeds, its `text` is announced as the run's answer **and ends the turn**
+/// ([`ToolOutput::final_answer`]): once the calls of that model turn are answered, the run finishes
+/// with `text` as its output, so the A2A `completed` status carries the Markdown the person was
+/// shown, and the model is not called again to write a closing line after it (a line the person
+/// would read under the answer, and the orchestration layer would log as one more message). The
+/// model is told [`TURN_OUTPUT_DELIVERED`]; it reads it only when a message reached the run
+/// meanwhile and the model is called again. A call the endpoint refuses (the turn is over, the text is empty or too long, the
 /// endpoint is down) announces nothing and the model reads the error.
+///
+/// **A server the agent already has.** A conversation can attach a server (a web search) that the
+/// agent's own `mcp.json` names too: the endpoint then lists `websearch__web_search` and the agent
+/// has the tool of that name, which wins. That is expected at every model turn, so the source says
+/// so ([`ToolSource::expects_repeat`]) and the loop logs the omission at debug level; any other
+/// clash (a plain name the agent has too) is still a warning.
 ///
 /// [`Ui::source`](crate::Ui::source) makes one that **hides `get_ui_catalog`** from the model (the
 /// agent has `ui_catalog` for that, and two tools for one thing made models call whichever they
@@ -426,6 +444,10 @@ fn error_result(text: impl Into<String>) -> Option<Result<ToolOutput, ToolError>
 impl ToolSource for ThreadTools {
     async fn specs(&self, ctx: &SourceCtx) -> Vec<ToolSpec> {
         self.listing(ctx).await.specs
+    }
+
+    fn expects_repeat(&self, name: &str, _taken: &[ToolSpec]) -> bool {
+        is_relayed(name)
     }
 
     async fn listing(&self, ctx: &SourceCtx) -> Listing {
@@ -546,7 +568,7 @@ impl ToolSource for ThreadTools {
         match called {
             Ok(result) if result.is_error => Some(Ok(ToolOutput::error(result.text))),
             Ok(result) => Some(Ok(match announced {
-                Some(text) => ToolOutput::text(TURN_OUTPUT_DELIVERED).announcing(text),
+                Some(text) => ToolOutput::text(TURN_OUTPUT_DELIVERED).final_answer(text),
                 None => ToolOutput::text(result.text),
             })),
             Err(EndpointError::Unauthorized) => error_result(format!(
@@ -851,6 +873,7 @@ mod tests {
         // The model reads what to do next, not the endpoint's `{"delivered": true}`.
         assert_eq!(ok.content, TURN_OUTPUT_DELIVERED);
         assert_eq!(ok.answer.as_deref(), Some("## Answer\n\n42"));
+        assert!(ok.ends_turn, "the answer ends the turn");
         assert_eq!(server.announcements(), ["## Answer\n\n42"]);
 
         // Refused by the endpoint: the model reads the error, and nothing is announced.

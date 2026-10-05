@@ -78,7 +78,7 @@ fn spec_json(tool: &dyn adam_llm_agent::Tool) -> Value {
 
 #[tokio::test]
 async fn every_spec_equals_its_snapshot() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new("hello\n").await.offering_creation();
     let tools: Vec<_> = coder_tools(&fx.env).into_iter().collect();
     let names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
     assert_eq!(names, TOOLS, "the tools, in the order they are offered");
@@ -106,6 +106,31 @@ async fn every_spec_equals_its_snapshot() {
             path.display()
         );
     }
+}
+
+/// With no owner allowed to create repositories (the default: `CREATE_REPO_OWNERS` is empty) the
+/// tool is not offered at all, so the model cannot offer a new repository to the person or call
+/// the tool with an owner of its own making; everything else is offered, in the same order.
+#[tokio::test]
+async fn create_repository_is_not_offered_when_no_owner_may_create_one() {
+    let fx = Fixture::new("hello\n").await;
+    assert!(fx.env.settings.create_repo_owners.is_empty());
+    let names: Vec<String> = coder_tools(&fx.env)
+        .into_iter()
+        .map(|t| t.spec().name)
+        .collect();
+    let expected: Vec<&str> = TOOLS
+        .into_iter()
+        .filter(|name| *name != "create_repository")
+        .collect();
+    assert_eq!(names, expected);
+    // And the same fixture with an owner offers it, in its place after `request_repository`.
+    let fx = fx.offering_creation();
+    let names: Vec<String> = coder_tools(&fx.env)
+        .into_iter()
+        .map(|t| t.spec().name)
+        .collect();
+    assert_eq!(names, TOOLS);
 }
 
 #[test]
@@ -146,7 +171,7 @@ fn nullable_properties(prefix: &str, schema: &Value, found: &mut Vec<String>) {
 /// optional arguments say `null`, and `required` (the contract with the model) is what it is.
 #[tokio::test]
 async fn only_the_optional_arguments_are_nullable() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new("hello\n").await.offering_creation();
     let mut found = Vec::new();
     for tool in coder_tools(&fx.env) {
         let spec = tool.spec();
@@ -194,7 +219,7 @@ async fn only_the_optional_arguments_are_nullable() {
 /// answer it).
 #[tokio::test]
 async fn only_the_tools_that_ask_the_person_are_marked_so() {
-    let fx = Fixture::new("hello\n").await;
+    let fx = Fixture::new("hello\n").await.offering_creation();
     let asking: Vec<String> = coder_tools(&fx.env)
         .into_iter()
         .filter(|tool| tool.asks_user())

@@ -592,8 +592,8 @@ impl Workspaces {
     /// # Errors
     ///
     /// [`WorkspaceError::Invalid`] for a url the policy refuses,
-    /// [`WorkspaceError::NotFound`] when the remote has no `HEAD` that names a branch (an empty
-    /// repository), and the network and auth failures of `git ls-remote`.
+    /// [`WorkspaceError::NoDefaultBranch`] when the remote has no `HEAD` that names a branch (an
+    /// empty repository), and the network and auth failures of `git ls-remote`.
     #[tracing::instrument(skip(self))]
     pub async fn default_branch(&self, repo_url: &str) -> WorkspaceResult<String> {
         // Only the url matters here; the base branch is what the caller is asking for.
@@ -613,11 +613,8 @@ impl Workspaces {
             .maybe_auth(auth)
             .run()
             .await?;
-        parse_symref_head(&out.stdout_text()).ok_or_else(|| {
-            WorkspaceError::NotFound(format!(
-                "{repo_url} has no default branch (is the repository empty?)"
-            ))
-        })
+        parse_symref_head(&out.stdout_text())
+            .ok_or_else(|| WorkspaceError::NoDefaultBranch(repo_url.to_owned()))
     }
 
     /// The legacy worktree of `run` (the one [`prepare`](Self::prepare) makes), if it exists on

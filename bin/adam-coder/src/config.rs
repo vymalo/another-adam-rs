@@ -103,7 +103,8 @@ use adam_devcontainer::{Network, Runtime, Settings};
 use adam_host::Placement;
 pub use adam_service::{ConfigError, McpSettings};
 use adam_service::{
-    ModelConfig, ServiceConfig, WorkerSettings, is_worker_id, parse_flag, parse_or,
+    ModelConfig, ServiceConfig, WorkerSettings, endpoint_for_logs, is_worker_id, parse_flag,
+    parse_or,
 };
 use adam_workspace::{AppKey, AppOwners, WorkspaceError};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -703,8 +704,15 @@ impl std::fmt::Debug for WorkerConfig {
             .field("allowed_repo_hosts", &self.allowed_repo_hosts)
             .field("create_repo_owners", &self.create_repo_owners)
             .field("allow_local_repos", &self.allow_local_repos)
-            .field("github_api_url", &self.github_api_url.as_str())
-            .field("github_mcp_url", &self.github_mcp_url.as_str())
+            // Addresses are shown by scheme and host only, like the gateway's and the database's.
+            .field(
+                "github_api_url",
+                &endpoint_for_logs(self.github_api_url.as_str()),
+            )
+            .field(
+                "github_mcp_url",
+                &endpoint_for_logs(self.github_mcp_url.as_str()),
+            )
             .field("workspace_root", &self.workspace_root)
             .field("placement", &self.placement)
             .field("worker_id", &self.worker_id)
@@ -1200,6 +1208,22 @@ mod tests {
         // The short tokens are checked in their quoted form: a bare "one" is inside "None".
         for secret in ["hunter2", "sk-secret", "ghp_secret", "\"one\"", "\"two\""] {
             assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn debug_output_shows_the_gateway_by_scheme_and_host_only() {
+        // The deployment keeps the gateway's address in a secret: the startup log prints the whole
+        // configuration, and none of it may reach the log but the scheme and the host.
+        let mut vars = full();
+        vars.insert(
+            "MODEL_BASE_URL",
+            "https://user:pw@gw.internal:8443/tenant-4711/v1?key=k-123",
+        );
+        let text = format!("{:?}", parse(&vars).unwrap());
+        assert!(text.contains("https://gw.internal:8443"), "{text}");
+        for hidden in ["tenant-4711", "k-123", "user:pw", "/v1"] {
+            assert!(!text.contains(hidden), "{hidden} leaked: {text}");
         }
     }
 

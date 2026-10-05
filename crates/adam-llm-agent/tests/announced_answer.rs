@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, oneshot};
 
-const TOLD: &str = "Delivered to the person as your answer. Finish now with one short line.";
+const TOLD: &str = "Delivered to the person as your answer.";
 
 fn call(id: &str, name: &str, args: Value) -> ToolCall {
     ToolCall {
@@ -56,6 +56,32 @@ impl Tool for Announce {
             return Ok(refused);
         }
         Ok(ToolOutput::text(TOLD).announcing(text))
+    }
+}
+
+/// `finish { text }`: announces `text` as the answer and ends the turn with it, like `turn_output`
+/// of `adam-ui`.
+struct Finish;
+
+#[async_trait]
+impl Tool for Finish {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "finish".into(),
+            description: "Hand over the answer and end the turn.".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let text = args["text"].as_str().unwrap_or_default().to_owned();
+        if args["refuse"] == json!(true) {
+            let mut refused = ToolOutput::error("this turn is over");
+            refused.answer = Some(text);
+            refused.ends_turn = true;
+            return Ok(refused);
+        }
+        Ok(ToolOutput::text("Delivered.").final_answer(text))
     }
 }
 
@@ -421,4 +447,114 @@ fn an_older_journal_and_state_read_without_the_new_members() {
     assert_eq!(back.answer.as_deref(), Some("a"));
     let state: Conversation = serde_json::from_value(json!({"messages": []})).unwrap();
     assert_eq!(state.announced, None);
+}
+
+#[tokio::test]
+async fn a_final_answer_ends_the_turn_with_no_closing_line() {
+    let rig = Rig::new();
+    // The second reply would be the closing line: it must never be asked for.
+    rig.mock
+        .push_tool_calls(vec![call(
+            "c1",
+            "finish",
+            json!({"text": "## It is **42**."}),
+        )])
+        .push_text("There it is.");
+    let model: DynModel = rig.mock.clone();
+    let agent = LlmAgent::builder("llm", model, "test-model")
+        .tool(Finish)
+        .build();
+    let rt = rig.runtime(&agent, "w", false);
+    let run = rt
+        .start("llm", user_message("what is it?"), None)
+        .await
+        .expect("start");
+    let (stop, handle) = spawn_worker(&rt);
+    let view = wait_for(&rt, run, "done", |v| v.status == RunStatus::Done).await;
+    let _ = stop.send(());
+    handle.await.unwrap().unwrap();
+
+    assert_eq!(text_of(&view), "## It is **42**.");
+    let output = view.output.clone().unwrap();
+    assert!(output.get("stream").is_none(), "{output}");
+    assert_eq!(
+        rig.mock.requests().len(),
+        1,
+        "no model call after the answer"
+    );
+    // Nothing was said as words of the turn: the answer is the tool's, once.
+    let said = rig
+        .sink
+        .events_for(view.id)
+        .iter()
+        .filter(|e| matches!(e, RunEvent::Custom { kind, .. } if kind == "agent_text"))
+        .count();
+    assert_eq!(said, 0);
+    // The state is what a run that announced would carry, plus the mark that it ended the turn.
+    let state = conversation(&view);
+    assert_eq!(state.announced.as_deref(), Some("## It is **42**."));
+    assert!(state.announced_final);
+}
+
+#[tokio::test]
+async fn the_calls_of_the_turn_are_answered_before_a_final_answer_ends_it() {
+    let rig = Rig::new();
+    rig.mock.push_tool_calls(vec![
+        call("c1", "finish", json!({"text": "first"})),
+        call("c2", "finish", json!({"text": "second"})),
+    ]);
+    let model: DynModel = rig.mock.clone();
+    let agent = LlmAgent::builder("llm", model, "test-model")
+        .tool(Finish)
+        .build();
+    let rt = rig.runtime(&agent, "w", false);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let (stop, handle) = spawn_worker(&rt);
+    let view = wait_for(&rt, run, "done", |v| v.status == RunStatus::Done).await;
+    let _ = stop.send(());
+    handle.await.unwrap().unwrap();
+    // Both calls ran and the last one is the answer; the history holds both results.
+    assert_eq!(text_of(&view), "second");
+    assert_eq!(rig.mock.requests().len(), 1);
+    let tool_results = conversation(&view)
+        .messages
+        .iter()
+        .filter(|m| matches!(m, Message::Tool { .. }))
+        .count();
+    assert_eq!(tool_results, 2);
+}
+
+#[tokio::test]
+async fn a_refused_final_answer_ends_nothing() {
+    let rig = Rig::new();
+    rig.mock
+        .push_tool_calls(vec![call(
+            "c1",
+            "finish",
+            json!({"text": "too late", "refuse": true}),
+        )])
+        .push_text("The turn was over, so here it is: 42.");
+    let model: DynModel = rig.mock.clone();
+    let agent = LlmAgent::builder("llm", model, "test-model")
+        .tool(Finish)
+        .build();
+    let rt = rig.runtime(&agent, "w", false);
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let (stop, handle) = spawn_worker(&rt);
+    let view = wait_for(&rt, run, "done", |v| v.status == RunStatus::Done).await;
+    let _ = stop.send(());
+    handle.await.unwrap().unwrap();
+    assert_eq!(text_of(&view), "The turn was over, so here it is: 42.");
+    assert_eq!(
+        rig.mock.requests().len(),
+        2,
+        "the model read the error and answered"
+    );
+    assert!(!conversation(&view).announced_final);
 }

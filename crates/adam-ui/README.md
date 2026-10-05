@@ -62,7 +62,11 @@ inbound function reads a screen's action as JSON text.
   call's result: `The person answered through the interface:` and one line per question, `- db: pg`. When the
   screen cannot draw it (no catalog, none with `Choices`, one that cannot be read now) the options are listed in
   the question's text and the answer is free text. It parks the run, so `asks_user()` is `true` and
-  `adam-assembly` keeps it out of subagents.
+  `adam-assembly` keeps it out of subagents. The constraints are stated where the model reads them, so the first
+  call is right: the description says `question` is required **even with `choices`** (the line that opens the
+  form), that a question needs 2 to 8 options and that ids and values are `^[A-Za-z0-9_.:-]{1,64}$`, with an
+  example; the schema has `required`, `minItems`, `maxItems`, `minLength` and that `pattern` on the places they
+  apply to. A refusal of one option (or none) says to ask a plain question instead.
 * **`show { blocks, title? }`** draws blocks of the screen's components one under the other: ids `b1`...`bn`, in a
   `Column` that is the root (a `Text` heading first when there is a title; a single block with no title is the
   root itself). Each block is `{component, ...properties}`, **validated against the component's JSON Schema**
@@ -79,15 +83,20 @@ inbound function reads a screen's action as JSON text.
 * **The thread tools** are not tools of this crate: `ThreadTools` lists the endpoint (`tools/list` over one
   connection, with the grant's bearer token) each time the model is about to be called, and answers a call to a
   tool that is none of the agent's own by calling the endpoint (`tools/call`). A listed tool whose name no model
-  provider accepts is left out (with a warning); one that clashes with an own tool loses to it. The source of a
+  provider accepts is left out (with a warning); one that clashes with an own tool loses to it, with a warning, **except a relayed
+  tool** (`<server>__<tool>`: the conversation attached a server the agent's own `mcp.json` has too, as a web search), whose omission is
+  a debug line (`ToolSource::expects_repeat`; `tests/duplicate_tools.rs`). The source of a
   `Ui` leaves **`get_ui_catalog`** out and refuses a call to it: the model has `ui_catalog` for the same thing, and
   two tools for one thing made it call whichever it remembered (the catalog is still read again through the endpoint,
   by this crate, when a message does not carry it). **`turn_output { text }`** is the one tool of the endpoint it knows by
   name: when the endpoint accepts a call, the model is told `TURN_OUTPUT_DELIVERED` (*Delivered to the person as your
-  answer. Finish now with one short line, and do not repeat the answer.*) instead of the endpoint's `{"delivered": true}`,
-  and `text` is **announced as the run's answer** (`ToolOutput::announcing`): the run's output, and so the A2A `completed`
-  status message, carries it and not the model's closing line, and a plain A2A client reads what the orchestrator shows.
-  A later accepted call replaces it; a refused call (the turn is over, blank or oversize text, a grant the endpoint no
+  answer. Do not repeat it.*) instead of the endpoint's `{"delivered": true}`, and `text` is **announced as the run's
+  answer and ends the turn** (`ToolOutput::final_answer`): once the calls of that model turn are answered the run finishes
+  with `text` as its output, so the A2A `completed` status message carries it and a plain A2A client reads what the
+  orchestrator shows, and **the model is not called again**: there is no closing line to say after an answer the person
+  has read (a line the orchestration layer would file as one more message, next to a copy of the answer made from the
+  `completed` words it can no longer tell are a repeat). The model reads `TURN_OUTPUT_DELIVERED` only when a message
+  reached the run meanwhile and it is called again with it. Of several calls in one model message the last wins; a refused call (the turn is over, blank or oversize text, a grant the endpoint no
   longer accepts) announces nothing and the model reads the error. With an endpoint that does not list `turn_output`
   nothing changes ([ADR 0014](../../docs/decisions/0014-a-turn-output-answer-is-the-runs-answer.md)). The same source rewrites the description of `show` each turn
   from the catalog the conversation has, **when this process holds it** (in its cache, or in the message that
@@ -192,8 +201,10 @@ stateDiagram-v2
   `turn_output` call gives the model and the run (the result text, the announced text, every refusal).
 * `tests/turn_output.rs`: a whole agent behind A2A against the fake endpoint with `turn_output` enabled: the announced
   text is the `completed` status message and the run's output (no stream), the model was told what to do next, the last of
-  two announcements wins, a refused call (the turn is over, oversize) leaves the closing words as the answer and the model
+  two announcements of one model message wins, the turn ends with the call (one model call), a refused call (the turn is over, oversize) leaves the closing words as the answer and the model
   reads the error, and an endpoint without the tool changes nothing.
+* `tests/duplicate_tools.rs`: a whole agent whose own tools have the names the endpoint lists too: the relayed one
+  (`websearch__web_search`) is left out with a debug line, the plain one (`plain_tool`) with a warning (`LogCapture`).
 * `tests/relay.rs`: the tools the orchestrator reports and the mentions, against the fake endpoint with `_meta` on its tools:
   what a listing says (and what a malformed `_meta` does not say), a long call that waits for the tool's `timeoutSecs`
   where the default would have given up, the cap that limits what a tool asks for, a cancel that drops a 30 s call at

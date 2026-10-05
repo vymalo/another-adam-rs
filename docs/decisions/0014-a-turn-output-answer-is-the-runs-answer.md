@@ -8,6 +8,26 @@ the thread-tools endpoint, read at every model turn) **and [ADR 0011](0011-a-too
 (the call's step carries its input and output, as for every tool). **Built:** `ToolOutput::announcing`,
 `Conversation::announced`, the run's output, `adam-ui`'s `turn_output`, the instructions and the tests.
 
+*Amended 2026-10-04: a `turn_output` call ends the turn (it changes decisions 2, 4 and 6 below, and the "closing line"
+consequence).* The owner's chats showed every answer twice in the log of the orchestration layer, followed by a short line. The
+cause is in the sequence this ADR describes: the closing words of the model were said as `agent_text` (working text) **after**
+the announcement, so the orchestrator's "last words said" was the closing line and no longer the announced answer; then the
+`completed` status arrived carrying the announced answer as its words (decision 4 here), which no longer repeated the last words
+said, and the orchestrator wrote them as one more working message (`out-<task>-words-1`, the first message being the
+announcement `out-<task>-1`). The fix is on this side: a successful `turn_output` **is the end of the turn**. A tool says so
+with `ToolOutput::final_answer(text)` (`ToolOutput::ends_turn`, `Conversation::announced_final`, both serde defaults): once the
+calls of that model turn are answered, the run finishes with the announced text as its output and **no further model call**, so
+there is no closing line to say and the `completed` words directly follow the announcement they repeat, which the orchestrator
+drops (*unverified*, see below: it already does, *"words that repeat the announced answer are not said again"*). A message that
+reached the run meanwhile is read first: the model is called again with it and the announcement ends there. The result the model
+is told is *Delivered to the person as your answer. Do not repeat it.* (it reads it only in that case), the prompts say to write
+nothing after the call, and the consequence of drafting then replacing an answer with a second call in a later turn is gone (two
+calls of **one** model message still end with the last). The cause is also visible on the orchestrator's side (*unverified*:
+read in `orchestrator/crates/core/src/answer.rs` of `vymalo/another-agentic-system` on 2026-10-04, and not run against this
+agent): its ledger remembers only a digest of the **last** words said, so a `completed` whose words repeat the announced answer
+are dropped only when nothing was said in between. Comparing the status words to the announced answer as well as to the last
+words said would also cover an agent that still closes with a line; adam agents no longer need it.
+
 ## Context
 
 The owner asked the chat to show one answer per turn and everything else the agent says as working text. The orchestration
@@ -103,6 +123,12 @@ nothing in the loop let a tool set the run's output.
   model reads the error, and an endpoint without the tool changes nothing (`crates/adam-ui/tests/turn_output.rs`, and the unit
   tests of `crates/adam-ui/src/thread_tools.rs`); the coder's prompt tells it so and still reads without the tool
   (`bin/adam-coder/tests/agent_files.rs`).
+* *Verified 2026-10-04*, by tests in this repository: a final answer ends the turn with no model call after it and no closing
+  words said, the calls of its model message are all answered first and the last announcement is the answer, a refused one ends
+  nothing (`crates/adam-llm-agent/tests/announced_answer.rs`); a whole agent behind A2A against the fake endpoint: `turn_output`
+  is one model call and its text is the `completed` status message (`crates/adam-ui/tests/turn_output.rs`). *Unverified:* the
+  case of a message that arrives between the announcement and the end of the turn (read first by the model, by the code in
+  `LlmAgent::step`, with no test of its own).
 * *Unverified:* that the orchestration layer drops the `completed` words that repeat an announcement as its S7 describes
   (read from its documents in a local checkout, not run against this agent), and what a real model does with the result text
   (the coder's end-to-end scripts use a scripted model).
