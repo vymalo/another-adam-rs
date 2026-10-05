@@ -145,7 +145,10 @@ stateDiagram-v2
   duplicated by this crate. Nothing in the runtime depends on one arriving.
 * **Events do not echo and are not re-published.**
 * **Events are not replayable.** After a gap the durable record
-  (`Runtime::view`) is the truth; that is what the SSE subscription polls.
+  (`Runtime::view`) is the truth; that is what the SSE subscription polls. The only memory is the
+  `BroadcastSink` of each process, which keeps the last 30 seconds (at most 64 events) of a run for a
+  subscriber that attaches late; the events this crate delivers into `local` are recorded there like
+  local ones, from the moment the process hears them, and a gap in the connection is still a gap.
 * **The listener holds one connection of the pool for as long as `run` runs.**
   Size the pool for it (the store's default is 16). `LISTEN` is per session, so
   connect directly or through a session-mode pooler; a transaction-mode pooler

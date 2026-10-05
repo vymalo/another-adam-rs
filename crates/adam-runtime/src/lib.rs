@@ -104,7 +104,7 @@ pub use ctx::{Ctx, Emitter};
 pub use events::{
     Artifact, ArtifactFile, ArtifactFileError, BroadcastSink, CollectingSink, DynEventSink,
     EventSink, MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_FILENAME_BYTES, MAX_RUN_FILE_BYTES, NoopSink,
-    RunEvent, RunSubscription, SinkEvent,
+    REPLAY_EVENTS_PER_RUN, REPLAY_MAX_AGE, REPLAY_MAX_RUNS, RunEvent, RunSubscription, SinkEvent,
 };
 pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};

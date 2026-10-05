@@ -30,6 +30,15 @@ commit `d411249`:*
 > its own, `input` (on the report that starts it) and `output` (on the one that ends it), cut to 4 KiB and 8 KiB and
 > redacted by the agent first, so that a screen can open a step and show what the tool was given and answered.
 
+> **Amended 2026-10-05:** "live" in decisions 1 to 16 no longer means "only from the moment of subscription". A streaming
+> send submits the run and subscribes afterwards, and a worker could begin in that gap, so the start of a tool call's
+> step (the only report with its `input`) was lost and the step showed no input. `BroadcastSink` now keeps the recent
+> live events of each run (the newest 64, none older than 30 seconds, at most 64 runs; no `Status`, no `Artifact`, and
+> none after the run ends) and `subscribe_run` replays them before the live ones, with no gap and no duplicate. Events are
+> still best effort and never the truth; the durable record decides. A resubscribe within those 30 seconds may repeat a
+> step (a snapshot by id) or a text piece (it carries its `offset`), so decision 14's "not replayed to a client that
+> resubscribes" holds for the record and not for the last seconds. See `crates/adam-runtime/src/events.rs`.
+
 ## Decision
 
 1. **The extensions a request activates reach the backend.** `Caller::extensions` holds the URIs a request named (its

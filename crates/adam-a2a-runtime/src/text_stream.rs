@@ -17,7 +17,8 @@
 //! before a tool call (best effort, [`words_message`]) and on the status that ends the turn when its
 //! text is the streamed words (`completed`, or `input-required` for a reply the agent turned into a
 //! question; [`streamed_status`], durable). The chunks are transient: they are never in a
-//! `GetTask`, and a subscription does not replay them. The contract is the orchestration layer's
+//! `GetTask`, and a subscription does not replay them from the record (only the sink's replay of the last
+//! seconds can repeat a piece, with the `offset` it began at). The contract is the orchestration layer's
 //! (`docs/api/text-stream-v1.md` of `vymalo/another-agentic-system`).
 //!
 //! Only a client whose request activated `text-stream/v1` is sent chunks, and only it is sent the

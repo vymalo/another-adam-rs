@@ -28,7 +28,8 @@ over A2A).
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
 | `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`) |
-| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status` (after a commit, and `Status(Runnable, "claimed")` once, when a worker first takes a run), `Progress`, `Step`, `TextDelta`, `ReasoningDelta`, `Custom`, `Artifact` |
+| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status` (after a commit, and `Status(Runnable, "claimed")` once, when a worker first takes a run), `Progress`, `Step`, `TextDelta`, `ReasoningDelta`, `Custom`, `Artifact`. `BroadcastSink::subscribe_run(run)` starts with the run's recent events: see *A late subscriber* |
+| `REPLAY_EVENTS_PER_RUN`, `REPLAY_MAX_AGE`, `REPLAY_MAX_RUNS` | the bounds of `BroadcastSink`'s replay: 64 events per run, none older than 30 s, 64 runs |
 | `Artifact`, `ArtifactFile`, `ArtifactFileError`, `MAX_ARTIFACT_FILE_BYTES`, `MAX_ARTIFACT_FILENAME_BYTES`, `MAX_RUN_FILE_BYTES` | an output of the run, in two forms: a JSON artifact (`Artifact::new(name, mime_type, data)`) and a **file artifact** (`Artifact::file(name, media_type, filename, bytes)`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)), whose `file` holds the filename and the bytes and whose `data` is `null`. `Artifact` and `ArtifactFile` are `#[non_exhaustive]`; `RunEvent::Artifact` has a `file` member too. Journaled as `{"filename", "bytes": "<base64>"}`, and an artifact journaled before the file form existed has no `file` and reads as it did. `Artifact::file` refuses a file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`), a filename that is not a name (empty, a path, control characters, over 255 bytes) and a media type that is not `type/subtype`; `Debug` prints a file's size, never its bytes. A run keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files: the runtime keeps what it is given, and the agent loop (`adam-llm-agent`) enforces it. Journal cost: the bytes, as base64 (a third more), are in the journal entry of the step that made the file and in every commit of the run's state after it, which is why the caps are what they are |
 | `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput`, `MAX_STEP_ID_BYTES`, `MAX_STEP_LABEL_CHARS`, `MAX_STEP_DETAIL_CHARS`, `STEP_INPUT_MAX_BYTES`, `STEP_INPUT_STRING_MAX_CHARS`, `STEP_OUTPUT_MAX_BYTES` | `RunEvent::Step`: a step of the run's work (a tool call, a sub-agent's work, a command) started, moved or ended, and which step it runs under; a tool call's step can carry what the tool was given (`input`) and answered (`output`), cut to the contract's bounds; see *Steps* |
 | `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
@@ -160,6 +161,28 @@ step that starts the child: a message already in the inbox when a step starts is
 and an agent that parks without reading it sleeps until its timer. The design, the failure interleavings and
 the tests that make each happen are in [`docs/architecture.md`](../../docs/architecture.md#child-runs).
 `adam-llm-agent` does all of this for a tool that returns `ToolError::AwaitRun`.
+
+## A late subscriber
+
+A streaming A2A send submits a run and subscribes to it afterwards, and a worker may take the run in between: one fast
+model reply and the first tool call are over before anyone listens. Live events do not go in the durable record, so
+`BroadcastSink` keeps a small replay of each run's recent ones, and `subscribe_run(run)` delivers it first and then the
+live events, with no gap and no duplicate (`emit` records and sends, `subscribe_run` copies and subscribes, each under one
+`std::sync::Mutex` that is never held across an `.await`).
+
+* **Bounds** (`REPLAY_EVENTS_PER_RUN`, `REPLAY_MAX_AGE`, `REPLAY_MAX_RUNS`): the newest 64 events of a run, none older
+  than 30 seconds (pruned on `emit` and on `subscribe_run`), at most 64 runs (the run whose newest event is oldest goes
+  first). Memory stays bounded by these three, whatever the runs do.
+* **Not replayed:** `Status` (a prompt to read the durable record, which is the truth: a stale one is noise; a terminal one
+  also drops the run's buffer) and `Artifact` (durable in `RunView::artifacts`, and a file can be megabytes).
+  `BroadcastSink::subscribe()`, the feed of every run, stays "from now on".
+* **It is not the truth.** A subscriber still reads the durable run for state; the replay only keeps a step's start (the
+  one report with its `input`), a text piece or a progress line from being lost to a race. A process that has no sink
+  to a run's events (another process without `adam-notify-postgres`) replays nothing; with it, the events of other
+  processes arrive through `BroadcastSink::emit` too and are replayed like local ones.
+* **A repeat is possible, so a consumer must tolerate it:** subscribing to a run again within 30 seconds delivers its recent
+  events again. A step is a snapshot of its `id`'s state, and a text piece carries its `offset`; both are safe to see twice
+  (see `adam-a2a-runtime`, *Steps* and *Streamed text*).
 
 ## Steps
 

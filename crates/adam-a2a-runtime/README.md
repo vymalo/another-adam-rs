@@ -58,7 +58,7 @@ id); a new `SendMessage` is `Runtime::start_with_id` (delivering to the context'
 (`<subject>:<context id>`), so it survives restarts with no side table, and a
 task owned by someone else looks like one that does not exist. Subscriptions
 are built from `Runtime::view` and polling, so they work for a task started by
-another process or before a restart; live events only reduce latency. Across
+another process or before a restart; live events only reduce latency (a subscriber is first replayed the run's recent ones, see *Steps*). Across
 processes those events do not exist unless something carries them, so a
 subscription of a task another process is stepping advances at the durable poll.
 [`adam-notify-postgres`](../adam-notify-postgres/README.md) carries them (its
@@ -220,8 +220,14 @@ the label for a start or a move; the detail alone for a progress line of a step 
 `label: canceled` (then the detail) for an end. For an activated client the subscription holds back a report of the
 state a step is already in for a second (a change of state, the start and the end always go out), because the
 contract asks for at most one update per step per second; a client without steps gets every line. Steps are live
-events: a subscription that attaches after they were emitted, or in another process without an event sink,
-does not see them (the durable record of the task is unchanged).
+events: a subscription that attaches long after they were emitted (more than `REPLAY_MAX_AGE`, 30 s, or past the newest
+`REPLAY_EVENTS_PER_RUN`, 64, of the run), or in another process without an event sink, does not see them (the durable
+record of the task is unchanged). A subscription that attaches a moment after, as one does after `message/stream` has
+submitted the run and a worker has already begun, is **replayed** the run's recent live events first by
+`BroadcastSink::subscribe_run` (see *A late subscriber* of `adam-runtime`): without it the start of a step, the one report
+with its `input`, was lost to the race. A `SubscribeToTask` within those 30 seconds may therefore repeat a recent step
+or text piece; that is safe, because a step is a snapshot of its `id`'s state (`step_message` in `src/steps.rs`, which each
+report replaces for a client that activated `steps/v1`) and a text chunk says where it begins (`offset`, `append`).
 
 ## Streamed text
 
@@ -249,7 +255,8 @@ and on the status that ends the turn when its text is the streamed words (durabl
 (`output.stream`), and `input-required` for a question that is the model's own reply (`pending_wait.stream`, set by an agent
 that turns a reply into a question, as the coder does: `PendingQuestion::stream` of `adam-llm-agent`) while the status
 says that question. Chunks are transient: they are never in a task's
-`artifacts`, a resubscribe does not replay them, and a blocking `message/send` is unchanged. A client that did not activate
+`artifacts`, a resubscribe does not replay them from the record (the pieces of the last 30 seconds that the process still
+remembers may arrive again, each with the `offset` it began at, and the whole text that ends the turn is the truth), and a blocking `message/send` is unchanged. A client that did not activate
 the extension reads the whole reply with the turn, as it always did. On the wire the SDK writes a number of metadata as a
 float (`"offset": 3.0`): the contract reads a whole number either way.
 
