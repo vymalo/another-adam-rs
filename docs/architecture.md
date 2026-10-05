@@ -65,6 +65,7 @@ flowchart TB
         pgn["adam-notify-postgres"]
         ws["adam-workspace"]
         devc["adam-devcontainer"]
+        kube["adam-env-kubernetes"]
         acp["adam-acp"]
     end
     subgraph contracts["Contracts and ports"]
@@ -91,6 +92,8 @@ flowchart TB
     coder --> service
     coder --> ws
     devc --> ws
+    kube --> ws
+    coder --> kube
     coder --> host
     coder --> ui
     agent --> ui
@@ -178,6 +181,7 @@ flowchart TB
     host --> err
     pgn --> err
     devc --> err
+    kube --> err
 
     linkStyle 71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90 stroke:#999,stroke-width:1px
 ```
@@ -218,6 +222,10 @@ The layers, from the bottom:
   * `adam-devcontainer` is the other `Environment`: it runs a run's processes in the
     devcontainer of the run's first repository, on a rootless Podman service, through
     the official devcontainer CLI ([ADR 0010](decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)).
+  * `adam-env-kubernetes` is the third `Environment`: it runs a run's processes in a Kubernetes pod of the
+    run's own, made from a pod template the chart mounts, through `kube` and `pods/exec`; its binary,
+    `adam-kube-exec`, is what a command is spawned as
+    ([ADR 0019](decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)).
   * `adam-acp` is a client for the Agent Client Protocol: it drives a coding
     agent (OpenCode) over stdio.
   * `adam-notify-postgres` implements two ports of the runtime, `EventSink`
@@ -522,7 +530,7 @@ The boundaries, by what they swap:
 | `ModelClient` | `adam-model` | `OpenAiCompatible` | `MockModel` |
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` | `InMemoryBackend` (feature `test-util`) |
 | `CodeHost` | `adam-workspace` | `GitHub` (feature `github`, on by default) | `MemoryCodeHost` (feature `test-util`) |
-| `Environment` | `adam-workspace` | `Local` (the caller's own container), `DevContainer` (`adam-devcontainer`: the first repository's devcontainer, on a rootless Podman service) | the stub Podman and stub CLI of `adam-devcontainer`'s tests |
+| `Environment` | `adam-workspace` | `Local` (the caller's own container), `DevContainer` (`adam-devcontainer`: the first repository's devcontainer, on a rootless Podman service), `KubeEnvironment` (`adam-env-kubernetes`: a pod of the run's own, from the deployment's pod template) | the stub Podman and stub CLI of `adam-devcontainer`'s tests, the fake API server of `adam-env-kubernetes`'s tests |
 | `GitCredentials` | `adam-workspace` | `ScopedToken` (one token, limited to named hosts), `GitHubApp` (installation access tokens minted from a GitHub App's key, feature `github`, for one pinned installation or for the installation of each owner, found and cached; wrapped in `HostScoped`, which limits any credentials to named hosts), `StaticToken` (one token, any host) | none needed |
 | `Agent` | `adam-runtime` | `LlmAgent`, `CoderAgent` | test agents |
 | `AgentStarter` | `adam-runtime` | `LlmStarter`, `CoderStarter` | test starters |
@@ -794,6 +802,66 @@ stateDiagram-v2
     Failed --> Released: the janitor releases it
     Unmade --> Released: the janitor releases it
     Released --> [*]
+```
+
+#### A pod for each run
+
+The third environment, `KubeEnvironment` of [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), gives each active run a
+Kubernetes pod of its own ([ADR 0019](decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)): a build is bounded by the pod's memory
+(2Gi in the chart) and not by the coder's, which shrinks to about 1Gi. `adam-coder` composes it when `RUN_ENVIRONMENT=kubernetes` (the default is
+`local`; with `DEVCONTAINER_RUNTIME=podman` it is refused). The pod is made from a **template the deployment mounts**, which holds the image, the
+resources, the priority class, the security context and the volumes; the code adds a name, labels and annotations, and the pod mounts the coder's
+workspace volume at the same path. A command is `adam-kube-exec`, which runs `adam-exec` in the pod over `pods/exec` and exits with its code. No GitHub
+credential ever enters a pod. The chart (`runPods`) renders the objects around it: a priority class and a quota scoped to it, RBAC, an admission policy
+that refuses any pod of the coder's ServiceAccount but the intended one, and a network policy.
+
+```mermaid
+sequenceDiagram
+    participant T as tool (run_command, run_checks, delegate_to_opencode)
+    participant E as KubeEnvironment
+    participant A as API server
+    participant S as KubeSession
+    participant X as adam-kube-exec
+    participant P as adam-exec in the run pod
+    participant J as janitor
+    T->>E: ensure(workspace of the run, progress)
+    E->>A: GET the pod adam-run-hash, POST it from the template when it is not there
+    alt the quota refuses
+        E-->>T: EnvError::Unavailable (the tool waits for a slot and tries again)
+    else
+        E->>A: GET until the pod is Ready (a step says what it waits for)
+        E-->>T: the run's session
+    end
+    T->>S: prepare(program, cwd, env, hide)
+    S-->>T: adam-kube-exec with the pod, the cwd and the words
+    T->>X: spawn it in a process group of its own
+    X->>A: pods/exec adam-exec run or shell
+    A->>P: the command in its working directory
+    P-->>T: output and the exit code, through the client
+    opt a timeout or a cancel
+        T->>S: kill(the command's id) after killing the client
+        S->>A: pods/exec adam-exec kill id
+    end
+    opt no command used the pod for RUN_POD_IDLE_SECS
+        E->>A: pods/exec adam-exec active, then DELETE the pod when none runs
+    end
+    J->>E: release(run), and held_runs for what a crash left
+    E->>A: DELETE the pod
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Absent
+    Absent --> Absent: the quota refuses
+    Absent --> Starting: ensure makes the pod
+    Starting --> Ready: Running and Ready
+    Starting --> Deleted: no node, or the image is refused, for the whole wait
+    Ready --> Ready: exec, ensure reuses the pod
+    Ready --> Deleted: idle with no command running, or released
+    Ready --> Deleted: the pod ended and ensure replaces it
+    Starting --> Deleted: released
+    Deleted --> Absent
+    Absent --> [*]: the run ended
 ```
 
 A failure to make the environment is a result for the model (no check cycle is used, nothing runs); a secret is
@@ -2254,6 +2322,13 @@ Facts about the deployment (`docker/coder/Dockerfile`, `deploy/coder/`):
   `GITHUB_HOST` when `githubMcp.host` is set). The coder is told where it is with `GITHUB_MCP_URL`. A control plane
   has none. `MCP_ALLOW_STDIO` stays for one release, for an agent folder written before the sidecar. Native sidecars
   need Kubernetes 1.29 or later (*unverified*, from memory).
+* **Run pods** (`runPods.enabled`, off by default, [ADR 0019](decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)): the chart
+  renders the pod template (a ConfigMap), a `PriorityClass` and a `ResourceQuota` scoped to it (a quota cannot select pods by label),
+  a ServiceAccount with a Role for `pods` and `pods/exec`, a `ValidatingAdmissionPolicy` that refuses every pod of that
+  ServiceAccount but the intended one (this is what lets the coder make pods without being able to read the namespace's other Secrets),
+  and a `NetworkPolicy` for the run pods, and gives the coder pod `RUN_ENVIRONMENT=kubernetes` and a 1Gi limit. It needs Kubernetes 1.30 or
+  later and refuses an older cluster. Checked by `tests/render-check.sh`, kubeconform and the `run-pods` job of `ci.yml` (a `kind` cluster); the
+  Kubernetes version, Longhorn sharing a `ReadWriteOnce` volume on one node and the cluster's CIDRs are *unverified* on the owner's cluster.
 * **Known risks** (stated in the chart README): no database backups, a pinned run whose
   worker never returns is stranded, and `flock` on NFS or Longhorn RWX is unverified.
 
@@ -2403,6 +2478,7 @@ What the diagrams cannot say:
 | `adam-model-openai` | implementation | [crates/adam-model-openai](../crates/adam-model-openai/README.md) |
 | `adam-workspace` | implementation | [crates/adam-workspace](../crates/adam-workspace/README.md) |
 | `adam-devcontainer` | implementation | [crates/adam-devcontainer](../crates/adam-devcontainer/README.md) |
+| `adam-env-kubernetes` | implementation | [crates/adam-env-kubernetes](../crates/adam-env-kubernetes/README.md) |
 | `adam-acp` | implementation | [crates/adam-acp](../crates/adam-acp/README.md) |
 | `adam-notify-postgres` | implementation | [crates/adam-notify-postgres](../crates/adam-notify-postgres/README.md) |
 | `adam-runtime` | runtime | [crates/adam-runtime](../crates/adam-runtime/README.md) |
@@ -2464,6 +2540,8 @@ behind it are quoted in the ADR.
   inline config) is as recorded in `bin/adam-coder/src/opencode.rs`, which
   cites the OpenCode source at `sst/opencode@7945de2`. It was not re-checked
   here, and a live run against a real gateway is not covered by CI.
+* The run pods (ADR 0019) were tested against a fake API server and, in CI, a `kind` cluster; not on the
+  owner's cluster, whose Kubernetes version, CNI and Longhorn are unverified (the ADR lists what to check).
 * The chart was rendered but, per its README, not applied to a cluster or
   validated against the CRD schemas of the installed operators. The compose
   `app` profile was validated with `docker compose config` only when it was

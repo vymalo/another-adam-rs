@@ -15,6 +15,7 @@ cluster.
 | `NetworkPolicy` | (both workloads with `topology: split`) ingress only from the namespace `another-agentic-system`; egress open (git, the gateway, registries) |
 | `Cluster` (CNPG) | `database.enabled` (the default) only: the coder's database; `DATABASE_URL` is the `uri` key of the `<release>-db-app` Secret CNPG creates. With `database.enabled: false` no Cluster is rendered and `DATABASE_URL` is read from `database.existingSecret`, see [Database](#database) |
 | `ExternalSecret` | `ssegning-aws` / `prod/meta/test-app`; the property of each value is in `externalSecrets.properties` |
+| `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `PriorityClass`, `ResourceQuota`, `ValidatingAdmissionPolicy` and its binding, a second `NetworkPolicy` | `runPods.enabled` only, on the roles that run workers: a pod of its own for each active run, see [Run pods](#run-pods) |
 | `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-mcp`, one file of extra MCP servers in the shape of `mcp.json`, mounted in the pods that run workers and named by `ADAM_EXTRA_MCP_FILE`, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 
 ```sh
@@ -43,7 +44,8 @@ pod, as before. Why a pod cannot have it yet:
 * The service is the trust boundary and sees every run's files: a deployment that has it should have the platform's sandbox
   provider (`another-agentic-platform`) make one environment per run, not one shared service.
 
-Until then a repository's devcontainer is not used on Kubernetes: a run whose first repository has one says so in a step ("This repository has
+Until then a repository's devcontainer is not used on Kubernetes (the chart's own answer is [a pod for each run](#run-pods), which uses the
+deployment's image and not the repository's file): a run whose first repository has one says so in a step ("This repository has
 a devcontainer, but this deployment runs without a container runtime"), and a tool that only the devcontainer has is reported as missing.
 
 ## Secrets
@@ -527,6 +529,48 @@ from the dashboard for every plan, and the web search server's own header and to
 parallel): `mcp.websearch.header`, `valuePrefix` and `tools` are values for that reason. *Unverified*: how External Secrets
 behaves for a missing property beyond what its documentation says (the sync fails and the Secret is not updated); not tried
 on the cluster.
+
+## Run pods
+
+`runPods.enabled: true` ([ADR 0019](../../docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)) runs the processes of each active
+run, the project's checks, the commands that look around, OpenCode and everything it starts, in **a pod of the run's own**, so that a build is bounded by
+a pod's memory and not by the coder's. The files, git and every credential stay in the coder pod, which then needs about 1Gi instead of 6Gi.
+**Off by default, and then invisible**: the render is the golden `tests/golden/combined.yaml`, byte for byte (the chart version moved to 0.3.0, the one
+line that differs). Nothing of it is rendered for a control plane (`config.role: control-plane`), which starts no commands.
+
+What it renders, and why each is there:
+
+| Object | What |
+|---|---|
+| `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, `MODEL_API_KEY` from the ExternalSecret's Secret, `/work` the coder's workspace claim at the same path, and an init container that copies `adam-exec` and OpenCode out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations; a changed template is a deploy (a checksum annotation) |
+| `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot. `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
+| `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is mounted in the coder pod alone; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
+| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim and the one Secret (so no `hostPath`), reads a Secret other than the ExternalSecret's, or any by `envFrom`, is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
+| `NetworkPolicy` `<release>-coder-run-pods` | no ingress; egress to DNS and to the internet **except** `networkPolicy.blockedCIDRs` (RFC 1918, link-local, which holds the cloud metadata address, and the shared address space) and `networkPolicy.clusterCIDRs` (the pod and service CIDRs: yours to name), so builds reach registries and the model gateway and not the services of the cluster. A gateway inside the cluster needs `networkPolicy.extraEgress`. IPv4 only |
+
+The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_POD_NAMESPACE` (its own, by the downward API), `RUN_POD_INSTANCE` (the release),
+`RUN_POD_CONTAINER`, `RUN_POD_READY_TIMEOUT_SECS` (600: the first pull of the 2.85 GB image on a node), `RUN_POD_IDLE_SECS` (900) and `RUN_POD_WAIT_SECS` (600), a
+`WORKER_ID` from the pod name (a worker sweeps only its own idle pods), the ServiceAccount, and **`runPods.coderResources`
+(a 1Gi memory limit) instead of `resources`** (6Gi), which is untouched while run pods are off. Set `runPods.coderResources: null` to keep `resources`.
+
+**Where `/work` comes from.** The run pod mounts the coder's workspace volume at the same path, so a path means the same in both:
+
+* `workspace.placement: shared` or `affinity` (a `ReadWriteMany` volume): the run pod mounts that claim, on any node.
+* The default, a `ReadWriteOnce` claim of the coder pod (`work-<release>-coder-0`; `isolated` too): the template adds a **required pod affinity** to the coder pod
+  (`topologyKey: kubernetes.io/hostname`), so the run pod lands on the node that has the volume attached. **Unverified: that Longhorn lets two pods on one
+  node mount one `ReadWriteOnce` volume.** Kubernetes' definition of `ReadWriteOnce` is one *node*, which allows it; the owner checks it on the cluster.
+  More than one replica with these claims is refused (a run pod mounts one claim).
+
+A run pod sees the whole volume, the other runs' files included: it bounds a build's memory and the blast radius of a crash, it is not isolation between
+runs (ADR 0019, "Consequences"). The model key is a variable of the run pod, readable by its commands, as it was in the coder's own.
+
+**Checked by:** `tests/render-check.sh` (each object, the pod template, every rule of the policy, the quota's scope, the values and the refusals; the render is
+`tests/golden/run-pods.yaml`), kubeconform on the renders (`.github/workflows/coder.yml`), and the `run-pods` job of `.github/workflows/ci.yml`, which applies the
+objects to a `kind` cluster and runs the environment against it as the coder's ServiceAccount (`tests/kind-run-pods.sh`): a pod from the template, commands
+in it, a kill, the idle sweep, the policy refusing thirteen changes to the pod and the quota refusing the fifth. It does not run the coder over a model, and it
+does not check the NetworkPolicy (kind's network plugin may not enforce one). **Unverified on the cluster:** its Kubernetes version (1.30 or later), Longhorn
+sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy, and the HTTP status of an admission refusal (the
+coder treats 403, 422 and 400 as the deployment's mistake).
 
 ## Known risks
 

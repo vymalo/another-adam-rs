@@ -136,6 +136,67 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "config.modelBaseUrlFromSecret is on: externalSecrets.properties.modelBaseUrl must name the AWS property that holds the gateway's URL (model_base_url)" -}}
 {{- end -}}
 {{- end -}}
+{{- /* runPods (ADR 0019): a pod of its own for each active run. */ -}}
+{{- if not (kindIs "bool" .Values.runPods.enabled) -}}
+{{- fail (printf "runPods.enabled must be true or false, got %q" (toString .Values.runPods.enabled)) -}}
+{{- end -}}
+{{- if include "coder.runPods" . -}}
+{{- $rp := .Values.runPods -}}
+{{- if not .Values.externalSecrets.enabled -}}
+{{- fail "runPods.enabled needs externalSecrets.enabled=true: the model key reaches a run pod only as MODEL_API_KEY from the ExternalSecret's Secret, which the admission policy lets a run pod read, and no GitHub credential ever does" -}}
+{{- end -}}
+{{- if and (gt (int .Values.replicaCount) 1) (not (include "coder.sharedWork" .)) -}}
+{{- fail "runPods.enabled with replicaCount > 1 needs workspace.placement shared or affinity (a ReadWriteMany volume): a run pod mounts one claim, and the per-pod ReadWriteOnce claim of a coder pod cannot serve the runs of the others" -}}
+{{- end -}}
+{{- if not (kindIs "bool" $rp.admissionPolicy.enabled) -}}
+{{- fail (printf "runPods.admissionPolicy.enabled must be true or false, got %q" (toString $rp.admissionPolicy.enabled)) -}}
+{{- end -}}
+{{- if and (not $rp.admissionPolicy.enabled) (not (eq (toString $rp.admissionPolicy.disableAcknowledged) "true")) -}}
+{{- fail "runPods.admissionPolicy.enabled=false leaves the coder able to make any pod in its namespace (mount the host, read any Secret, run privileged): the admission policy is the guard that makes the RBAC safe. Keep it, or set runPods.admissionPolicy.disableAcknowledged=true to say you know" -}}
+{{- end -}}
+{{- if and $rp.admissionPolicy.enabled (semverCompare "<1.30.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- fail (printf "runPods needs Kubernetes 1.30 or later for its ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1), and this cluster is %s" .Capabilities.KubeVersion.Version) -}}
+{{- end -}}
+{{- if not (and $rp.image.repository $rp.image.tag) -}}
+{{- fail "runPods.image.repository and runPods.image.tag are required (and runPods.image.digest, which the chart ships: an image is pinned by tag and digest)" -}}
+{{- end -}}
+{{- if and $rp.image.digest (not (regexMatch "^sha256:[0-9a-f]{64}$" (toString $rp.image.digest))) -}}
+{{- fail (printf "runPods.image.digest must be sha256:<64 hex digits>, got %q" (toString $rp.image.digest)) -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" (toString $rp.container)) -}}
+{{- fail (printf "runPods.container must be a container name (lowercase letters, digits and -), got %q" (toString $rp.container)) -}}
+{{- end -}}
+{{- if not (get (get $rp.resources "limits" | default dict) "memory") -}}
+{{- fail "runPods.resources.limits.memory is required: the quota counts it, and a pod without a memory limit is refused by it" -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$" (toString $rp.quota.limitsMemory)) -}}
+{{- fail (printf "runPods.quota.limitsMemory must be a quantity such as 8Gi, got %q" (toString $rp.quota.limitsMemory)) -}}
+{{- end -}}
+{{- if lt (int64 $rp.quota.pods) 1 -}}
+{{- fail (printf "runPods.quota.pods must be at least 1, got %q" (toString $rp.quota.pods)) -}}
+{{- end -}}
+{{- range $name, $v := dict "idleSecs" $rp.idleSecs "waitSecs" $rp.waitSecs "readyTimeoutSecs" $rp.readyTimeoutSecs "cargoBuildJobs" $rp.cargoBuildJobs -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $v)) -}}
+{{- fail (printf "runPods.%s must be a whole number of at least 0, got %q" $name (toString $v)) -}}
+{{- end -}}
+{{- end -}}
+{{- if lt (int64 $rp.readyTimeoutSecs) 1 -}}
+{{- fail "runPods.readyTimeoutSecs must be at least 1" -}}
+{{- end -}}
+{{- if not (kindIs "map" $rp.extraEnv) -}}
+{{- fail "runPods.extraEnv must be a name -> value map" -}}
+{{- end -}}
+{{- if hasKey $rp.extraEnv "MODEL_API_KEY" -}}
+{{- fail "runPods.extraEnv sets MODEL_API_KEY: the chart sets it from the ExternalSecret, and a secret is never a chart value" -}}
+{{- end -}}
+{{- if not (eq (toString $rp.networkPolicy.enabled) "false") -}}
+{{- range concat $rp.networkPolicy.blockedCIDRs $rp.networkPolicy.clusterCIDRs -}}
+{{- if not (regexMatch "^[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}$" (toString .)) -}}
+{{- fail (printf "runPods.networkPolicy.blockedCIDRs and clusterCIDRs take IPv4 CIDRs such as 10.0.0.0/8, got %q" (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and (gt (int .Values.replicaCount) 1) (include "coder.runsWorkers" .) (not $placement) -}}
 {{- fail "replicaCount > 1 needs workspace.placement (shared, affinity or isolated): runs move between workers at every step, and without a placement a run that lands on a worker without its worktree forks into a second pull request (see deploy/coder/README.md, Workspace placement)" -}}
 {{- end -}}

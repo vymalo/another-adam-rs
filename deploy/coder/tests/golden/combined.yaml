@@ -11,7 +11,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.2.0
+    helm.sh/chart: coder-0.3.0
 spec:
   podSelector:
     matchLabels:
@@ -40,7 +40,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.2.0
+    helm.sh/chart: coder-0.3.0
 spec:
   type: ClusterIP
   selector:
@@ -62,7 +62,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.2.0
+    helm.sh/chart: coder-0.3.0
 spec:
   replicas: 1
   serviceName: coder
@@ -243,7 +243,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.2.0
+    helm.sh/chart: coder-0.3.0
 spec:
   instances: 1
   storage:
@@ -266,7 +266,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.2.0
+    helm.sh/chart: coder-0.3.0
 spec:
   refreshInterval: 1h
   secretStoreRef:

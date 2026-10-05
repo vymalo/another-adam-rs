@@ -67,11 +67,17 @@ async fn opencode_refusal(
 ) -> Result<Option<String>, ToolError> {
     let description = session.describe();
     if !env.settings.opencode.is_opencode()
-        || !matches!(description.kind, EnvKind::DevContainer { .. })
+        || !matches!(
+            description.kind,
+            EnvKind::DevContainer { .. } | EnvKind::Kubernetes { .. }
+        )
     {
         return Ok(None);
     }
-    if env.settings.container_network_none {
+    // The setting is the devcontainers' (DEVCONTAINER_NETWORK): a run pod's network is the cluster's.
+    if env.settings.container_network_none
+        && matches!(description.kind, EnvKind::DevContainer { .. })
+    {
         return Ok(Some(NO_NETWORK.to_owned()));
     }
     let run = ctx.run_id().to_string();

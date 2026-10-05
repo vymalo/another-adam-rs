@@ -462,3 +462,31 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app down -v
+
+  # The run pods (crates/adam-env-kubernetes, the chart's `runPods`, ADR 0019) against a real cluster:
+  # deploy/coder/tests/kind-run-pods.sh applies the chart's run-pod objects (the template, the priority
+  # class and quota, the RBAC, the admission policy and the network policy) to a kind cluster and runs the
+  # cluster test of adam-env-kubernetes as the coder's ServiceAccount. What it proves: the objects apply,
+  # the policy refuses what it should and the quota refuses a fifth pod, and a pod made from the chart's own
+  # template runs commands (both streams, exit codes, stdin), is killed, swept when idle and released through
+  # adam-kube-exec. What it does not: the coder over a model through it, the images (a small local one plays
+  # the run image and the coder's), and the NetworkPolicy (kind's network plugin may not enforce one).
+  # ADAM_TEST_REQUIRE_KUBERNETES makes the test fail instead of skipping, so a typo in the variables cannot
+  # turn the job green. The runner's preinstalled `kind` is used (*unverified*, from memory of the runner
+  # image's software list), with the node image that kind release defaults to; the script stops on a cluster
+  # older than Kubernetes 1.30.
+  run-pods:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: A kind cluster
+        run: |
+          set -eu
+          kind version
+          kind create cluster --wait 180s
+          kubectl version
+      - name: The chart's run pod objects, and the cluster test as the coder's ServiceAccount
+        run: sh deploy/coder/tests/kind-run-pods.sh

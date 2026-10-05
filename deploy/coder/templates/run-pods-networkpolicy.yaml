@@ -1,0 +1,48 @@
+{{- if and (include "coder.runPods" .) (eq (toString .Values.runPods.networkPolicy.enabled) "true") }}
+{{- $np := .Values.runPods.networkPolicy }}
+# runPods.enabled: what a run pod may reach. No ingress at all (nothing connects to a run pod: the coder execs in it
+# through the API server). Egress to DNS and to the internet, but not to private ranges, so a build reaches the
+# registries and the model gateway and not the services of the cluster. Only as real as the CNI that enforces it
+# (*unverified* for the owner's cluster). IPv4 only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "coder.runPodsName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: adam-coder
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: adam.vymalo.com/run
+        operator: Exists
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $np.dnsNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml $np.dnsPodLabels | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range (concat $np.blockedCIDRs $np.clusterCIDRs | uniq) }}
+              - {{ . }}
+              {{- end }}
+    {{- with $np.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

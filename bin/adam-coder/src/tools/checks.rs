@@ -71,7 +71,7 @@ pub struct Finding {
 /// devcontainers; a consumer that does not know the field ignores it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentReport {
-    /// What the environment is: `devcontainer`.
+    /// What the environment is: `devcontainer` or `kubernetes` (the run's own pod).
     pub kind: String,
     /// The `devcontainer.json` it was built from, as the repository calls it; absent for the default
     /// image.
@@ -90,6 +90,11 @@ impl EnvironmentReport {
                 source: source.as_deref().map(super::repository_file),
                 image: image.clone(),
             }),
+            EnvKind::Kubernetes { image, .. } => Some(Self {
+                kind: "kubernetes".to_owned(),
+                source: None,
+                image: image.clone().unwrap_or_default(),
+            }),
             _ => None,
         }
     }
@@ -103,7 +108,7 @@ impl EnvironmentReport {
 /// | `commit` | the 40-hex SHA of the `HEAD` of the run's workspace when the check ran; empty only when it could not be determined (`passed` is then `false`) |
 /// | `tree` | the git tree id (40 hex) of the code the check ran on, as `git add -A` would commit it; absent when it could not be computed |
 /// | `repository` | the URL of the repository of the slot the check ran in (for the verdict on a pushed commit, the repository it was pushed to); absent for a scratch project and in reports of an older coder |
-/// | `environment` | where the check ran, when that was a devcontainer: `{kind, source?, image}`; absent for a run in the coder's own container and in reports of an older coder |
+/// | `environment` | where the check ran, when that was a devcontainer or the run's own pod: `{kind, source?, image}`; absent for a run in the coder's own container and in reports of an older coder |
 /// | `summary` | one line |
 /// | `findings` | the failing checks; at most [`MAX_FINDINGS`] and [`MAX_FINDINGS_BYTES`] in total, the cut marked |
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +464,16 @@ pub(crate) fn missing_tool_text(
             " This repository has no devcontainer, so the commands run in the default \
              environment ({image}), which lacks `{name}`: a `.devcontainer/devcontainer.json` in \
              the repository can provide it."
+        ),
+        EnvKind::Kubernetes { pod, image } => format!(
+            " The commands of this workspace run in a pod of their own ({pod}{}), made from the \
+             deployment's pod template and not from the repository: the tool has to be in that \
+             image, so say that `{name}` must be added to the image the deployment uses for run \
+             pods.",
+            image
+                .as_deref()
+                .map(|image| format!(", image {image}"))
+                .unwrap_or_default()
         ),
         _ => String::new(),
     };

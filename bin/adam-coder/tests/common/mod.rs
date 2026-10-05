@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use adam_coder::opencode::OpenCodeLaunch;
@@ -585,6 +585,16 @@ impl Fixture {
         self
     }
 
+    /// The same fixture whose tools wait up to `wait` for an environment that is not available now
+    /// (`RUN_POD_WAIT_SECS`), instead of failing at the first `Unavailable`.
+    #[must_use]
+    pub fn waiting_for_slots(mut self, wait: std::time::Duration) -> Self {
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .unavailable_wait = Some(wait);
+        self
+    }
+
     /// The same fixture whose code host can create repositories ([`CreatingHost`]), for the
     /// organisations `organizations` (any other owner is a user), acting as `login` (`None`: an
     /// installation, which has no user), and for the owners `owners` (`CREATE_REPO_OWNERS`).
@@ -1123,6 +1133,9 @@ pub struct FakeEnvironment {
     pub release_fails: AtomicBool,
     /// `ensure` never returns while this is set (an environment that takes forever to build).
     pub hang: AtomicBool,
+    /// The next this many calls of `ensure` fail with `Unavailable` (a quota that is used up), and
+    /// then it works.
+    pub unavailable_for: AtomicUsize,
     /// The runs `rebuild` was called for, and whether it was to use the default.
     pub rebuilt: Mutex<Vec<(String, bool)>>,
     /// What `rebuild` says: whether there is anything of its own to make again.
@@ -1168,6 +1181,7 @@ impl FakeEnvironment {
             ensure_fails: Mutex::new(None),
             release_fails: AtomicBool::new(false),
             hang: AtomicBool::new(false),
+            unavailable_for: AtomicUsize::new(0),
             rebuilt: Mutex::new(Vec::new()),
             rebuild_says: AtomicBool::new(true),
             ensure_fails_after_rebuild: Mutex::new(None),
@@ -1191,6 +1205,13 @@ impl Environment for FakeEnvironment {
         }
         if self.hang.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
+        }
+        let left = self.unavailable_for.load(Ordering::SeqCst);
+        if left > 0 {
+            self.unavailable_for.store(left - 1, Ordering::SeqCst);
+            return Err(EnvError::Unavailable(
+                "the namespace's quota of run pods is used up".to_owned(),
+            ));
         }
         if let Some(fail) = *self.ensure_fails.lock().unwrap() {
             return Err(fail());

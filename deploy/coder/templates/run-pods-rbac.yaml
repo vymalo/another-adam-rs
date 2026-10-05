@@ -1,0 +1,45 @@
+{{- if include "coder.runPods" . }}
+{{- if include "coder.ownServiceAccount" . }}
+# runPods.enabled: the coder pod's ServiceAccount. Its token is mounted in the coder pod alone (the front Deployment
+# of topology=split and the run pods mount none).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "coder.serviceAccountName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+{{- end }}
+# What the coder does with run pods: make, find, watch and delete them, and exec in them. Nothing else: no Secret,
+# no ConfigMap, no other kind. `get` on pods/exec as well as `create`: kube's exec is a WebSocket, which the API
+# server authorizes as a GET (and, from Kubernetes 1.35, as a create too; *unverified*).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "coder.runPodsName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "coder.runPodsName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "coder.runPodsName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "coder.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

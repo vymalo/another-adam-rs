@@ -210,6 +210,14 @@ pub enum EnvKind {
         /// The image it runs.
         image: String,
     },
+    /// A pod of its own in a Kubernetes cluster (`adam-env-kubernetes`), made from the deployment's
+    /// pod template: the repository's own `devcontainer.json` is not used.
+    Kubernetes {
+        /// The pod's name.
+        pod: String,
+        /// The image of the container the processes run in, when the template names one.
+        image: Option<String>,
+    },
 }
 
 /// An environment, for a person to read.
