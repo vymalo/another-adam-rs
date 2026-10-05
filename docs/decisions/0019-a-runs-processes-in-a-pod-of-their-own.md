@@ -112,7 +112,7 @@ The facts, each with how it is known:
    ConfigMap) with `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}` and `CARGO_BUILD_JOBS=2`, all configurable;
    a **PriorityClass** `<release>-run` (value 0, `preemptionPolicy: Never`) and a **ResourceQuota** scoped to it
    (`limits.memory: 8Gi`, `pods: 4`), because a quota cannot select pods by label and a priority class is what it can select
-   by; RBAC for the coder's ServiceAccount on `pods` (create, delete, get, list, watch) and `pods/exec` (create), with a
+   by; RBAC for the coder's ServiceAccount on `pods` (create, delete, get, list, watch) and `pods/exec` (create and get: kube's exec is a WebSocket, which the API server authorizes as a GET, *unverified*, from memory; the `kind` job runs it), with a
    ServiceAccount the chart creates when it has none and the token mounted for the coder alone; a
    **ValidatingAdmissionPolicy and its binding**, matched to pods created by that ServiceAccount, which refuses a pod without
    the run label or the priority class, with an image other than the allowed ones, with a `hostPath` volume or a Secret other
@@ -229,6 +229,10 @@ commands are gone, which the coder sees as a command that ended with a non-zero 
   that is running keeps the pod.
 * The `NetworkPolicy` is only as real as the cluster's CNI enforces it (*unverified* for the owner's cluster), and it blocks
   in-cluster services: a model gateway inside the cluster needs `runPods.networkPolicy.extraEgress`.
+* **TLS needs a named provider.** `kube` builds its TLS configuration with rustls' process default, and rustls refuses to guess one when
+  a binary's tree enables two (the coder's does: sqlx's rustls enables `ring` beside `aws-lc-rs`), so the first `kube::Client` of the
+  coder, and of `adam-kube-exec` when it is built with the coder, would panic. `install_crypto_provider` names aws-lc-rs and both call it
+  (*verified* 2026-10-05 by a test in the coder, which panics without it in that tree). It adds `rustls` as a direct dependency of the crate.
 * `EnvKind` gains `Kubernetes { pod, image }` (it was `#[non_exhaustive]` already), so a `match` over it needs a wildcard,
   which the coder has. `adam-exec` gains `active`. Neither is a required method of a trait.
 

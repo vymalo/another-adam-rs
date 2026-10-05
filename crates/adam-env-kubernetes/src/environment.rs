@@ -121,6 +121,19 @@ impl Inner {
     }
 }
 
+/// Name the process's TLS provider (rustls' default, aws-lc-rs) unless one is named already.
+///
+/// `kube` builds its TLS configuration with the process default, and rustls refuses to guess one when a
+/// binary's dependency tree enables more than one provider, which the coder's does (an A2A client of the tree
+/// enables `ring`): without this the first client panics. [`KubeEnvironment::connect`] and `adam-kube-exec`
+/// call it; a caller that makes its own `kube::Client` calls it first. Idempotent.
+pub fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Another thread may have installed one in between: that is as good.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 /// The Kubernetes environment. Cheap to clone: the clones are one environment.
 #[derive(Clone)]
 pub struct KubeEnvironment {
@@ -200,6 +213,7 @@ impl KubeEnvironment {
     ///
     /// [`EnvError::Unavailable`] when no configuration is found or the client cannot be made.
     pub async fn connect(settings: Settings, template: PodTemplate) -> Result<Self, EnvError> {
+        install_crypto_provider();
         let client = Client::try_default()
             .await
             .map_err(|e| env_error(&e, "connecting to the cluster"))?;
@@ -612,5 +626,18 @@ impl Environment for KubeEnvironment {
         let _ = use_default;
         self.release(run).await?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_crypto_provider_is_named_once_and_naming_it_again_is_harmless() {
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        install_crypto_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 }

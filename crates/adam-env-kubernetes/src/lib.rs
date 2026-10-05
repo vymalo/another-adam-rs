@@ -56,7 +56,7 @@ mod template;
 #[cfg(test)]
 mod fake;
 
-pub use environment::KubeEnvironment;
+pub use environment::{KubeEnvironment, install_crypto_provider};
 pub use exec::{ExecError, ExitStatus, Target, exit_status, stdin_is_null, stream};
 pub use invocation::{DEFAULT_ADAM_EXEC, Invocation, Mode, UsageError, is_env_name, is_exec_id};
 pub use names::{

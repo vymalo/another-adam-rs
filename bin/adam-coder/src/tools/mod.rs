@@ -419,7 +419,7 @@ impl ToolEnv {
         let event = StepEvent::new(
             format!("env:{run}:slot"),
             StepKind::Command,
-            "Waiting for a slot for the run's environment".to_owned(),
+            "Waiting for a slot for the run's environment",
             state,
         )
         .with_icon(StepIcon::Execute)

@@ -25,7 +25,9 @@
 //! The values 64 and 69 are those of BSD `sysexits.h` (`EX_USAGE`, `EX_UNAVAILABLE`), *unverified*
 //! (from memory), as the coder's own exit codes are.
 
-use adam_env_kubernetes::{ExitStatus, Invocation, Target, stdin_is_null, stream};
+use adam_env_kubernetes::{
+    ExitStatus, Invocation, Target, install_crypto_provider, stdin_is_null, stream,
+};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{Api, Client};
 use tokio::signal::unix::{SignalKind, signal};
@@ -66,6 +68,8 @@ async fn run() -> u8 {
         Ok(invocation) => invocation,
         Err(e) => return fail(EX_USAGE, &e.to_string()),
     };
+    // The image's binaries are built together, so this binary's tree can enable two TLS providers.
+    install_crypto_provider();
     let client = match Client::try_default().await {
         Ok(client) => client,
         Err(e) => {

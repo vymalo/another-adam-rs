@@ -402,6 +402,26 @@ async fn an_environment_that_cannot_be_made_is_a_result_for_the_model_and_nothin
     );
 }
 
+/// `kube` builds its TLS configuration with rustls' process default provider (`ClientConfig::builder()`), and this
+/// binary's tree enables two providers (`aws-lc-rs`, and `ring` through sqlx's rustls): rustls then refuses to guess
+/// and panics ("Could not automatically determine the process-level CryptoProvider"), which is what the first
+/// `kube::Client` of the process would do on the in-cluster path. `install_crypto_provider` (called by the
+/// production `connect` and by `adam-kube-exec`) is the fix; this is the proof, in this tree.
+#[tokio::test]
+async fn the_kubernetes_client_builds_where_two_tls_providers_are_compiled_in() {
+    let ambiguous = std::panic::catch_unwind(|| {
+        let _ = rustls::ClientConfig::builder();
+    })
+    .is_err();
+    eprintln!("without naming a provider, rustls panics in this tree: {ambiguous}");
+    adam_env_kubernetes::install_crypto_provider();
+    adam_env_kubernetes::install_crypto_provider();
+    let _ = rustls::ClientConfig::builder();
+    let mut config = kube::Config::new("https://127.0.0.1:1".parse().unwrap());
+    config.accept_invalid_certs = true;
+    kube::Client::try_from(config).expect("a client");
+}
+
 // ------------------------------------------------------------------- waiting for a slot (run pods)
 
 fn slot_steps(rig: &Rig) -> Vec<(StepState, Option<String>)> {

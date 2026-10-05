@@ -27,6 +27,7 @@ coder `prepare`s a command and spawns it. The files, the paths and all git work 
 | `Settings` | the namespace, the release's instance label, the worker, the container the commands run in (`run`), the exec client program, where `adam-exec` and the tools are in the pod, the time to be ready, the idle timeout, the sweep interval and the environment `adam-kube-exec` is started with; `Settings::new(namespace, instance, worker)` has the defaults |
 | `Invocation` | the command line of `adam-kube-exec`: `to_args()`, `parse(args)`, `remote_argv()` (the command run in the pod); `Mode::{Run, Shell}`, `UsageError` |
 | `names` | `pod_name(run)` (`adam-run-<12 hex of the sha256 of the run id>`), `run_hash`, `selector(instance)` and the label and annotation keys (`MANAGED_BY_LABEL`, `INSTANCE_LABEL`, `RUN_LABEL`, `RUN_ID_ANNOTATION`, `WORKER_ANNOTATION`) |
+| `install_crypto_provider()` | names rustls' process default provider (aws-lc-rs) unless one is named: `kube` builds its TLS configuration with the default, and rustls panics rather than guess when a binary's tree enables two providers, which the coder's does (sqlx's rustls enables `ring`). `KubeEnvironment::connect` and `adam-kube-exec` call it; a caller that makes its own `kube::Client` calls it first. Idempotent. Proved in a tree that has both by a test in the coder (`tests/environment.rs`) |
 | `exec` | what `pods/exec` gives: `stream(..)` joins a command's stdin, stdout and stderr to the caller's, `exit_status(&Status)` reads the exit code, `stdin_is_null()` |
 
 ```rust,ignore

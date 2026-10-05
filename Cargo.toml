@@ -74,6 +74,9 @@ quote = "1"
 # Client only, and only the transports adam-mcp uses; the crate picks its own features.
 rmcp = { version = "3.5", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "stream", "json", "query"] }
+# The process-wide TLS provider (adam-env-kubernetes): kube builds its TLS configuration with it, and a binary whose tree enables both providers
+# (the coder's does) has to name one. Already in the tree under rustls.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 # Reads the PEM of a GitHub App's private key (adam-workspace): already in the tree under rustls.
 rustls-pki-types = "1"
 schemars = { version = "1.2", default-features = false, features = ["std"] }
