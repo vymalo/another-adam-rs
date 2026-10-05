@@ -253,7 +253,8 @@ async fn pump(
     tx: &mpsc::Sender<Result<TaskEvent, BackendError>>,
 ) -> Result<(), BackendError> {
     // Attach to live events first, so nothing that happens between the
-    // snapshot and the first poll is missed by both.
+    // snapshot and the first poll is missed by both. The subscription also starts
+    // with the run's recent events, which covers the gap between `submit` and here.
     let Some((run, view, context_id)) = backend.owned(caller, task_id).await? else {
         return Err(BackendError::TaskNotFound(task_id.to_owned()));
     };

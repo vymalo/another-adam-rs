@@ -11,8 +11,8 @@ use adam_a2a::{BackendError, Caller, STEPS_EXTENSION, TaskBackend, TaskEvent};
 use adam_a2a_runtime::RuntimeTaskBackend;
 use adam_core::MemoryStore;
 use adam_runtime::{
-    Agent, AgentError, BroadcastSink, Ctx, Inbound, RunEvent, Runtime, StepEvent, StepIcon,
-    StepKind, StepOutput, StepState, Transition,
+    Agent, AgentError, BroadcastSink, Ctx, EventSink, Inbound, RunEvent, Runtime, StepEvent,
+    StepIcon, StepKind, StepOutput, StepState, Transition,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -230,4 +230,66 @@ async fn an_extension_the_request_did_not_name_activates_nothing() {
     let messages = read(caller).await;
     assert_eq!(messages.len(), 7);
     assert!(messages.iter().all(|m| report(m).is_none()));
+}
+
+/// The race of a streaming send: the run is submitted, a worker takes it and reports its first tool
+/// call, and only then does the subscription attach. The start of a step is the only report with
+/// its `input`, so a step that began in that gap must still reach the client with it.
+#[tokio::test]
+async fn a_step_that_started_between_submit_and_subscribe_arrives_with_its_input() {
+    let events = BroadcastSink::default();
+    let runtime = Runtime::builder(Arc::new(MemoryStore::new()))
+        .agent(Stepper)
+        .event_sink(events.clone())
+        .poll_interval(Duration::from_millis(10))
+        .build();
+    let backend = RuntimeTaskBackend::new(runtime, events.clone(), "stepper")
+        .with_poll_interval(Duration::from_millis(10));
+    let caller = Caller::new("token-0").with_extensions([STEPS_EXTENSION]);
+    let task = backend
+        .submit(
+            caller.clone(),
+            Message::new(Role::User, vec![Part::text("go")]),
+            None,
+            None,
+        )
+        .await
+        .expect("submit");
+
+    // A worker would be here: it reports the first tool call before anyone listens.
+    let run = adam_core::RunId(task.id.parse().expect("a task id is a run id"));
+    let input = match json!({"repo": "vymalo/demo"}) {
+        Value::Object(input) => input,
+        _ => unreachable!(),
+    };
+    events
+        .emit(
+            run,
+            "stepper",
+            RunEvent::Step(
+                StepEvent::new(
+                    "tool:c1",
+                    StepKind::Tool,
+                    "prepare_workspace",
+                    StepState::Running,
+                )
+                .with_input(input),
+            ),
+        )
+        .await;
+
+    let mut stream: Events = backend.subscribe(&caller, &task.id);
+    assert!(matches!(next(&mut stream).await, TaskEvent::Snapshot(_)));
+    let TaskEvent::Status(update) = next(&mut stream).await else {
+        panic!("the step was lost");
+    };
+    let message = update.status.message.expect("the step's message");
+    assert_eq!(text(&message), "prepare_workspace");
+    assert_eq!(
+        report(&message),
+        Some(
+            &json!({"id": "tool:c1", "kind": "tool", "label": "prepare_workspace",
+                     "state": "running", "input": {"repo": "vymalo/demo"}})
+        )
+    );
 }

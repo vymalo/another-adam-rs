@@ -151,7 +151,9 @@ pub const MAX_REFERENCES: usize = 8;
 /// by another process or before a restart. Live events from the
 /// [`BroadcastSink`] only add low latency and intermediate progress: they are
 /// de-duplicated against what the durable record reports, and losing them
-/// never loses a state change or an artifact.
+/// never loses a state change or an artifact. A subscription starts with the
+/// run's recent live events (`BroadcastSink::subscribe_run`), so a step that began
+/// between `submit` and `subscribe` is not lost.
 ///
 /// # Wiring
 ///

@@ -37,7 +37,8 @@
 //! `detail` cut on a character boundary; an oversize `Step` keeps going without its `input` and
 //! `output` (up to 4 KiB and 8 KiB: a courtesy, the step and its state are what matter); any other
 //! oversize event is dropped (its artifact is still in the durable run). There is no events table and no
-//! sequence number: events are not replayable.
+//! sequence number: events are not replayable (the `BroadcastSink` a process delivers into keeps the
+//! last seconds of each run for a late subscriber, which covers a race, not a gap).
 //!
 //! # Running
 //!
