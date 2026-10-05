@@ -27,12 +27,15 @@
 use std::collections::HashMap;
 
 use a2a::{Artifact, Message, Part, Role, TaskArtifactUpdateEvent, TaskState};
-use adam_a2a::TEXT_STREAM_EXTENSION;
+use adam_a2a::{TEXT_STREAM_EXTENSION, TEXT_STREAM_KIND_REASONING};
 use adam_runtime::{MAX_STREAM_ID_BYTES, RunView};
 use serde_json::{Map, Value, json};
 
 /// The name of a stream's artifact: a reply.
 const ARTIFACT_NAME: &str = "reply";
+
+/// The name of a reasoning stream's artifact.
+const REASONING_ARTIFACT_NAME: &str = "reasoning";
 
 /// Whether `id` is a stream id the contract takes: 1 to [`MAX_STREAM_ID_BYTES`] bytes, no control
 /// characters.
@@ -53,30 +56,91 @@ pub(crate) fn chunk(
     last: bool,
     abandoned: bool,
 ) -> Option<TaskArtifactUpdateEvent> {
-    if !is_stream_id(stream) {
+    build(
+        task_id,
+        context_id,
+        &Piece {
+            stream,
+            offset,
+            text,
+            last,
+            abandoned,
+            reasoning: false,
+        },
+    )
+}
+
+/// The chunk of a **reasoning** stream: the same as [`chunk`], with the artifact named `reasoning`
+/// and `"kind": "reasoning"` beside the `offset`, so a reader says it apart from the reply. Its
+/// whole text is never stated (reasoning is not an answer: no status message carries it).
+pub(crate) fn reasoning_chunk(
+    task_id: &str,
+    context_id: &str,
+    stream: &str,
+    offset: u64,
+    text: String,
+    last: bool,
+    abandoned: bool,
+) -> Option<TaskArtifactUpdateEvent> {
+    build(
+        task_id,
+        context_id,
+        &Piece {
+            stream,
+            offset,
+            text,
+            last,
+            abandoned,
+            reasoning: true,
+        },
+    )
+}
+
+/// One piece of a stream, whichever it is.
+struct Piece<'a> {
+    stream: &'a str,
+    offset: u64,
+    text: String,
+    last: bool,
+    abandoned: bool,
+    reasoning: bool,
+}
+
+fn build(task_id: &str, context_id: &str, piece: &Piece<'_>) -> Option<TaskArtifactUpdateEvent> {
+    if !is_stream_id(piece.stream) {
         return None;
     }
     let mut entry = Map::new();
-    entry.insert("offset".into(), json!(offset));
-    if abandoned {
+    entry.insert("offset".into(), json!(piece.offset));
+    if piece.reasoning {
+        entry.insert("kind".into(), json!(TEXT_STREAM_KIND_REASONING));
+    }
+    if piece.abandoned {
         entry.insert("abandoned".into(), json!(true));
     }
     Some(TaskArtifactUpdateEvent {
         task_id: task_id.to_owned(),
         context_id: context_id.to_owned(),
         artifact: Artifact {
-            artifact_id: stream.to_owned(),
-            name: Some(ARTIFACT_NAME.to_owned()),
+            artifact_id: piece.stream.to_owned(),
+            name: Some(
+                if piece.reasoning {
+                    REASONING_ARTIFACT_NAME
+                } else {
+                    ARTIFACT_NAME
+                }
+                .to_owned(),
+            ),
             description: None,
-            parts: vec![Part::text(text)],
+            parts: vec![Part::text(piece.text.clone())],
             metadata: Some(HashMap::from([(
                 TEXT_STREAM_EXTENSION.to_owned(),
                 Value::Object(entry),
             )])),
             extensions: Some(vec![TEXT_STREAM_EXTENSION.to_owned()]),
         },
-        append: Some(offset > 0),
-        last_chunk: Some(last),
+        append: Some(piece.offset > 0),
+        last_chunk: Some(piece.last),
         metadata: None,
     })
 }
@@ -193,6 +257,35 @@ mod tests {
             later.artifact.metadata.expect("metadata")[TEXT_STREAM_EXTENSION],
             json!({"offset": 3})
         );
+    }
+
+    #[test]
+    fn a_reasoning_chunk_is_a_chunk_of_its_own_stream_marked_with_its_kind() {
+        let first = reasoning_chunk("t1", "c1", "s1-r", 0, "The user".into(), false, false)
+            .expect("a chunk");
+        assert_eq!(first.artifact.artifact_id, "s1-r");
+        assert_eq!(first.artifact.name.as_deref(), Some("reasoning"));
+        assert_eq!(first.artifact.parts, vec![Part::text("The user")]);
+        assert_eq!(
+            first.artifact.metadata.expect("metadata")[TEXT_STREAM_EXTENSION],
+            json!({"offset": 0, "kind": "reasoning"})
+        );
+        assert_eq!((first.append, first.last_chunk), (Some(false), Some(false)));
+        let last =
+            reasoning_chunk("t1", "c1", "s1-r", 8, String::new(), true, true).expect("a chunk");
+        assert_eq!((last.append, last.last_chunk), (Some(true), Some(true)));
+        assert_eq!(
+            last.artifact.metadata.expect("metadata")[TEXT_STREAM_EXTENSION],
+            json!({"offset": 8, "kind": "reasoning", "abandoned": true})
+        );
+        // A reply chunk has no `kind`: the marker is the only difference a reader needs.
+        let reply = chunk("t1", "c1", "s1", 0, "Hi".into(), false, false).expect("a chunk");
+        assert!(
+            reply.artifact.metadata.expect("metadata")[TEXT_STREAM_EXTENSION]
+                .get("kind")
+                .is_none()
+        );
+        assert!(reasoning_chunk("t1", "c1", "", 0, "x".into(), false, false).is_none());
     }
 
     #[test]

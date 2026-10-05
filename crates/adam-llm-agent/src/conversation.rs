@@ -858,6 +858,7 @@ mod tests {
         Message::Assistant {
             content: vec![],
             tool_calls: ids.iter().map(|id| call(id)).collect(),
+            reasoning: None,
         }
     }
 

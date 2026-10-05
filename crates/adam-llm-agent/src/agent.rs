@@ -11,7 +11,7 @@ use adam_model::{
     ToolSpec,
 };
 use adam_runtime::{
-    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, ChildStatus, Ctx, Inbound,
+    AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, ChildStatus, Ctx, Emitter, Inbound,
     MAX_RUN_FILE_BYTES, RUN_FINISHED_KIND, RunEvent, StepState, Transition,
 };
 use async_trait::async_trait;
@@ -151,6 +151,41 @@ fn stream_id(run: RunId, turn: u32) -> String {
     let mut suffix = uuid::Uuid::new_v4().simple().to_string();
     suffix.truncate(8);
     format!("{run}-m{turn}-{suffix}")
+}
+
+/// The id of the stream the reasoning of a model turn is sent as: apart from [`stream_id`]'s, which
+/// is the id of the message the words become.
+fn reasoning_stream_id(run: RunId, turn: u32) -> String {
+    let mut suffix = uuid::Uuid::new_v4().simple().to_string();
+    suffix.truncate(8);
+    format!("{run}-r{turn}-{suffix}")
+}
+
+/// What a turn does with the reasoning its model wrote: counts it (a DEBUG line with how many
+/// characters, never the text), says it as a stream of its own when it was not already sent while it
+/// was written (`streamed`), and **drops it from the response**, so it is in no journal, no output
+/// and no step. The reasoning a client echoes back lives in the message, which is not touched.
+async fn unthought(
+    emitter: &Emitter,
+    run: RunId,
+    turn: u32,
+    streamed: bool,
+    mut response: ModelResponse,
+) -> ModelResponse {
+    if let Some(reasoning) = response.reasoning.take() {
+        tracing::debug!(
+            run = %run,
+            turn,
+            reasoning_chars = reasoning.chars().count(),
+            streamed,
+            "the model reasoned before it answered"
+        );
+        if !streamed {
+            text_stream::say_reasoning(emitter, &reasoning, move || reasoning_stream_id(run, turn))
+                .await;
+        }
+    }
+    response
 }
 
 /// Configures an [`LlmAgent`]. Start with [`LlmAgent::builder`].
@@ -790,33 +825,37 @@ impl LlmAgent {
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
-                    return tokio::select! {
+                    let answer = tokio::select! {
                         biased;
-                        () = cancel.cancelled() => Err(ModelFailure::cancelled()),
-                        answer = model.complete(request) => answer
-                            .map(|response| Recorded {
-                                response,
-                                stream: None,
-                                notes,
-                                seen: Some(seen),
-                            })
-                            .map_err(ModelFailure::from),
+                        () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
+                        answer = model.complete(request) => answer.map_err(ModelFailure::from)?,
                     };
+                    return Ok(Recorded {
+                        response: unthought(&emitter, run, turn, false, answer).await,
+                        stream: None,
+                        notes,
+                        seen: Some(seen),
+                    });
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
                 // recorded with the answer: a replay calls no model and sends no pieces, but it knows
                 // which stream the words were, so it says them whole under the same id.
-                text_stream::stream_response(&model, request, &emitter, &cancel, || {
-                    stream_id(run, turn)
-                })
+                let streamed = text_stream::stream_response(
+                    &model,
+                    request,
+                    &emitter,
+                    &cancel,
+                    move || stream_id(run, turn),
+                    move || reasoning_stream_id(run, turn),
+                )
                 .await
-                .map(|streamed| Recorded {
-                    response: streamed.response,
+                .map_err(ModelFailure::from)?;
+                Ok(Recorded {
+                    response: unthought(&emitter, run, turn, true, streamed.response).await,
                     stream: streamed.stream,
                     notes,
                     seen: Some(seen),
                 })
-                .map_err(ModelFailure::from)
             })
             .await?;
         // A cancel ends the turn here: nothing the model said is acted on, said or kept. The run is
@@ -857,6 +896,7 @@ impl LlmAgent {
             message,
             finish,
             usage,
+            reasoning: _,
         } = response;
         if !matches!(message, Message::Assistant { .. }) {
             return Ok(Flow::Fail(

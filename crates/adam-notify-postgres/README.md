@@ -86,6 +86,8 @@ another `v`, or one that does not parse, is ignored (debug log).
 * a `TextDelta` (a piece of the model's answer as it is written) holds at most `MAX_TEXT_DELTA_BYTES` of `adam-runtime`
   (1024 bytes) and a stream id of at most 128 bytes: even a piece of control characters, which JSON writes in six bytes
   each, is about 6.5 KiB, and a unit test builds the largest of each kind, so it always fits and crosses whole;
+* a `ReasoningDelta` has a `TextDelta`'s bounds (the same piece, the same stream id) and so always fits and crosses whole. A process
+  that predates the variant cannot read the event and drops it (debug log), so reasoning is never taken for text in a rolling deploy;
 * any other oversize event (`Progress`, `Custom`, `Artifact`) is not sent to
   other processes (debug log). A file artifact whose bytes alone are over a payload is dropped without being serialized
   (a file is up to 4 MiB; only a tiny one fits); Artifacts still reach subscribers through the

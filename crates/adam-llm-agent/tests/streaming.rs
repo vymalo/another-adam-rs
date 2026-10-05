@@ -322,9 +322,11 @@ async fn the_words_before_a_tool_call_are_a_stream_of_their_own_and_the_answer_a
         message: Message::Assistant {
             content: vec![ContentPart::text("Let me look.")],
             tool_calls: vec![call("c1", "look")],
+            reasoning: None,
         },
         finish: FinishReason::ToolCalls,
         usage: Usage::default(),
+        reasoning: None,
     };
     let model = ScriptedStreams::new(vec![
         vec![
@@ -602,4 +604,222 @@ async fn a_journal_written_before_streaming_is_replayed_with_no_stream() {
         view.output,
         Some(json!({"text": "Fibonacci in Rust.", "artifacts": []}))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning
+// ---------------------------------------------------------------------------
+
+/// The `ReasoningDelta` events: `(stream, offset, text, last, abandoned)`.
+fn thoughts(events: &[RunEvent]) -> Vec<Piece> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            RunEvent::ReasoningDelta {
+                stream,
+                offset,
+                text,
+                last,
+                abandoned,
+            } => Some((stream.clone(), *offset, text.clone(), *last, *abandoned)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A response that reasoned: `reasoning` beside the text, which it is not part of.
+fn reasoned(text: &str, reasoning: &str) -> ModelResponse {
+    ModelResponse {
+        reasoning: Some(reasoning.to_owned()),
+        ..ModelResponse::text(text)
+    }
+}
+
+const THOUGHT: &str = "The user wants Fibonacci, so I should write it in Rust.";
+
+/// Everything a run keeps: its view and its journal, as one string to search.
+async fn kept(h: &Harness, run: RunId, view: &RunView) -> String {
+    let journal = h.store.journal_list(run).await.expect("journal");
+    format!("{} {journal:?}", serde_json::to_string(view).expect("view"))
+}
+
+#[tokio::test]
+async fn reasoning_is_a_stream_of_its_own_that_ends_before_the_words_and_is_kept_nowhere() {
+    let h = Harness::new();
+    let model = ScriptedStreams::new(vec![vec![
+        Ok(ModelDelta::Reasoning("The user wants Fibonacci, ".into())),
+        Ok(ModelDelta::Reasoning(
+            "so I should write it in Rust.".into(),
+        )),
+        Ok(ModelDelta::Text("Fib".into())),
+        Ok(ModelDelta::Text("onacci in Rust.".into())),
+        Ok(ModelDelta::Finished(reasoned(
+            "Fibonacci in Rust.",
+            THOUGHT,
+        ))),
+    ]]);
+    let (run, view) = h
+        .run(Harness::agent(model).build(), false, "fibonacci?")
+        .await;
+    assert_eq!(view.status, RunStatus::Done);
+    let events = h.events(run);
+
+    // The reasoning is its own stream, whole and in order, and its id is not the words'.
+    let thought = thoughts(&events);
+    assert_eq!(joined(&thought), THOUGHT);
+    let words_stream = pieces(&events)[0].0.clone();
+    assert_ne!(thought[0].0, words_stream);
+    assert!(thought.iter().all(|p| p.0 == thought[0].0 && !p.4));
+    assert!(
+        thought[0].0.starts_with(&format!("{run}-r0-")),
+        "{}",
+        thought[0].0
+    );
+    assert!(thought[0].0.len() <= MAX_STREAM_ID_BYTES);
+
+    // It is over before the first word is sent.
+    let position = |f: &dyn Fn(&RunEvent) -> bool| events.iter().position(f).expect("an event");
+    assert!(
+        position(&|e| matches!(e, RunEvent::ReasoningDelta { last: true, .. }))
+            < position(&|e| matches!(e, RunEvent::TextDelta { .. }))
+    );
+
+    // It is not the answer: not in the words, not in the output, not in the journal, not in the state.
+    assert_eq!(joined(&pieces(&events)), "Fibonacci in Rust.");
+    assert_eq!(
+        view.output,
+        Some(json!({"text": "Fibonacci in Rust.", "artifacts": [], "stream": words_stream}))
+    );
+    assert_eq!(words(&events), [("Fibonacci in Rust.".to_owned(), 0, None)]);
+    let everything = kept(&h, run, &view).await;
+    assert!(!everything.contains("Fibonacci,"), "{everything}");
+    assert!(!everything.contains("reasoning"), "{everything}");
+}
+
+#[tokio::test]
+async fn a_turn_that_reasons_and_calls_a_tool_ends_its_reasoning_when_the_call_begins() {
+    let h = Harness::new();
+    let first = ModelResponse {
+        reasoning: Some("I need to look first.".into()),
+        ..ModelResponse::tool_calls(vec![call("c1", "look")])
+    };
+    let model = ScriptedStreams::new(vec![
+        vec![
+            Ok(ModelDelta::Reasoning("I need to look first.".into())),
+            Ok(ModelDelta::ToolCallStarted {
+                id: "c1".into(),
+                name: "look".into(),
+            }),
+            Ok(ModelDelta::Finished(first)),
+        ],
+        vec![
+            Ok(ModelDelta::Reasoning("A file. Done.".into())),
+            Ok(ModelDelta::Text("It is a file.".into())),
+            Ok(ModelDelta::Finished(reasoned(
+                "It is a file.",
+                "A file. Done.",
+            ))),
+        ],
+    ]);
+    let (run, view) = h
+        .run(
+            Harness::agent(model).tool(Look).build(),
+            false,
+            "what is here?",
+        )
+        .await;
+    assert_eq!(view.status, RunStatus::Done);
+    let events = h.events(run);
+    let thought = thoughts(&events);
+    let of = |n: u32| -> Vec<Piece> {
+        thought
+            .iter()
+            .filter(|p| p.0.contains(&format!("-r{n}-")))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(joined(&of(0)), "I need to look first.");
+    assert_eq!(joined(&of(1)), "A file. Done.");
+    // The first turn wrote no words, and so opened no stream of words.
+    assert!(pieces(&events).iter().all(|p| p.0.contains("-m1-")));
+    assert_eq!(view.output.expect("output")["text"], "It is a file.");
+}
+
+#[tokio::test]
+async fn blank_reasoning_opens_no_stream() {
+    let h = Harness::new();
+    let model = ScriptedStreams::new(vec![vec![
+        Ok(ModelDelta::Reasoning("\n\n".into())),
+        Ok(ModelDelta::Text("Hi.".into())),
+        Ok(ModelDelta::Finished(reasoned("Hi.", "\n\n"))),
+    ]]);
+    let (run, _view) = h.run(Harness::agent(model).build(), false, "hi").await;
+    assert!(thoughts(&h.events(run)).is_empty());
+}
+
+#[tokio::test]
+async fn a_model_that_does_not_stream_still_has_its_reasoning_said_before_the_words() {
+    let h = Harness::new();
+    let mock = Arc::new(MockModel::new());
+    mock.push_response(reasoned("Fibonacci in Rust.", THOUGHT));
+    let (run, view) = h
+        .run(
+            Harness::agent(mock).stream_text(false).build(),
+            false,
+            "fibonacci?",
+        )
+        .await;
+    assert_eq!(view.status, RunStatus::Done);
+    let events = h.events(run);
+    assert_eq!(joined(&thoughts(&events)), THOUGHT);
+    assert!(pieces(&events).is_empty(), "the words are not streamed");
+    assert_eq!(
+        view.output,
+        Some(json!({"text": "Fibonacci in Rust.", "artifacts": []}))
+    );
+    let everything = kept(&h, run, &view).await;
+    assert!(!everything.contains("Fibonacci,"), "{everything}");
+}
+
+/// The history of a run never holds the reasoning, so no later request carries it: the model is not
+/// sent what it thought before (a client that must echo it is the model client's choice).
+#[tokio::test]
+async fn reasoning_is_never_in_a_later_request() {
+    let h = Harness::new();
+    let mock = Arc::new(MockModel::new());
+    mock.push_response(ModelResponse {
+        reasoning: Some("SECRET-THOUGHT-1".into()),
+        ..ModelResponse::tool_calls(vec![call("c1", "look")])
+    });
+    mock.push_response(reasoned("It is a file.", "SECRET-THOUGHT-2"));
+    let (_run, view) = h
+        .run(
+            Harness::agent(mock.clone()).tool(Look).build(),
+            false,
+            "what is here?",
+        )
+        .await;
+    assert_eq!(view.status, RunStatus::Done);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    let second = serde_json::to_string(&requests[1]).expect("request");
+    assert!(!second.contains("SECRET-THOUGHT"), "{second}");
+    assert!(
+        second.contains("a file"),
+        "the tool result is there: {second}"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_after_the_reasoning_began_ends_its_stream_abandoned() {
+    let h = Harness::new();
+    let model = ScriptedStreams::new(vec![vec![
+        Ok(ModelDelta::Reasoning("Let me think".into())),
+        Err(ModelError::invalid_request("boom")),
+    ]]);
+    let (run, view) = h.run(Harness::agent(model).build(), false, "hi").await;
+    assert_eq!(view.status, RunStatus::Failed);
+    let thought = thoughts(&h.events(run));
+    assert_eq!(joined(&thought), "Let me think");
+    assert!(thought.last().is_some_and(|p| p.3 && p.4), "{thought:?}");
 }

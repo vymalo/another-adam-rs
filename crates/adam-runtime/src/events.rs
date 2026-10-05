@@ -232,6 +232,32 @@ pub enum RunEvent {
         #[serde(default, skip_serializing_if = "is_false")]
         abandoned: bool,
     },
+    /// A piece of the **reasoning** the model is writing before its answer (a model in thinking
+    /// mode), shaped like [`RunEvent::TextDelta`] and with a stream of its own: one per model turn
+    /// that reasoned, ended (`last`) before the turn's words begin. Reasoning is not the answer:
+    /// it is in no run output, no turn output and no step output, and it is not durable (no whole
+    /// text follows; a client that wants it keeps the pieces). The A2A server serves it as
+    /// `text-stream/v1` chunks marked `kind: "reasoning"` to a client that activated the extension,
+    /// and as nothing to one that did not. The bounds are [`RunEvent::TextDelta`]'s.
+    ///
+    /// A new variant: a process that does not know it ignores the event (the wire of
+    /// `adam-notify-postgres` drops what it cannot read), so reasoning is never taken for text.
+    ReasoningDelta {
+        /// Which reasoning this is a piece of: unique within the run (and different from every
+        /// text stream's), at most [`MAX_STREAM_ID_BYTES`](crate::MAX_STREAM_ID_BYTES) bytes.
+        stream: String,
+        /// Where `text` begins in the whole reasoning of the stream, in UTF-8 bytes.
+        offset: u64,
+        /// The piece. At most [`MAX_TEXT_DELTA_BYTES`](crate::MAX_TEXT_DELTA_BYTES) bytes, whole
+        /// characters; empty only on the last piece.
+        text: String,
+        /// The last piece of the stream: nothing follows it.
+        #[serde(default, skip_serializing_if = "is_false")]
+        last: bool,
+        /// With `last`: the model failed before it finished.
+        #[serde(default, skip_serializing_if = "is_false")]
+        abandoned: bool,
+    },
     /// Application-defined event.
     Custom {
         /// Event kind.
@@ -473,6 +499,13 @@ mod tests {
                 last: true,
                 abandoned: true,
             },
+            RunEvent::ReasoningDelta {
+                stream: "run-r0-a1b2c3d4".into(),
+                offset: 0,
+                text: "The user asks".into(),
+                last: false,
+                abandoned: false,
+            },
         ];
         for e in events {
             let json = serde_json::to_value(&e).expect("serialize");
@@ -518,6 +551,22 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<RunEvent>(bare).expect("parse"),
             piece(false, false)
+        );
+    }
+
+    #[test]
+    fn a_reasoning_delta_is_tagged_apart_from_text() {
+        let piece = RunEvent::ReasoningDelta {
+            stream: "s-r".into(),
+            offset: 0,
+            text: "hm".into(),
+            last: true,
+            abandoned: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&piece).expect("serialize"),
+            serde_json::json!({"type": "reasoning_delta", "stream": "s-r", "offset": 0, "text": "hm",
+                               "last": true})
         );
     }
 

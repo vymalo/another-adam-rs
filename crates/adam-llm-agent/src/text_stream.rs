@@ -162,8 +162,10 @@ impl From<ModelError> for StreamStop {
 }
 
 /// Calls `model` with [`ModelClient::stream`](adam_model::ModelClient::stream) and sends the words
-/// as [`RunEvent::TextDelta`] events through `emitter` while they arrive. Returns the assembled
-/// response (the stream's last item) and the id of the stream the words were sent as, if any were.
+/// as [`RunEvent::TextDelta`] events through `emitter` while they arrive, and the reasoning that
+/// comes before them as [`RunEvent::ReasoningDelta`] events of a stream of its own. Returns the
+/// assembled response (the stream's last item) and the id of the stream the words were sent as, if
+/// any were.
 ///
 /// A failure is the failure of the call, whether the model's client gave it before the first byte or
 /// in the middle of the answer, so the caller treats it as it treats a failed
@@ -174,13 +176,17 @@ impl From<ModelError> for StreamStop {
 /// still coming, the model silent in the middle of it) the request and the stream are dropped at
 /// once, an open stream says it is abandoned, and the call is [`StreamStop::Cancelled`].
 ///
-/// `new_stream` makes the id of the stream, called when the first word that is not blank arrives.
+/// `new_stream` makes the id of the stream of words, called when the first word that is not blank
+/// arrives, and `new_reasoning_stream` the id of the stream of reasoning, called when the first
+/// reasoning that is not blank does. The reasoning stream ends (`last`) when the words, a tool call
+/// or the end of the answer begin, so it is always over before the words of its turn are.
 pub(crate) async fn stream_response(
     model: &DynModel,
     request: ModelRequest,
     emitter: &Emitter,
     cancel: &CancelToken,
-    new_stream: impl FnOnce() -> String,
+    new_stream: impl FnOnce() -> String + Send + 'static,
+    new_reasoning_stream: impl FnOnce() -> String + Send + 'static,
 ) -> Result<Streamed, StreamStop> {
     let mut deltas = tokio::select! {
         biased;
@@ -189,9 +195,8 @@ pub(crate) async fn stream_response(
     };
     let mut sender = Sender {
         emitter,
-        coalescer: Coalescer::new(FLUSH_INTERVAL, FLUSH_BYTES),
-        new_stream: Some(new_stream),
-        stream: None,
+        words: Lane::new(Kind::Words, Box::new(new_stream)),
+        reasoning: Lane::new(Kind::Reasoning, Box::new(new_reasoning_stream)),
     };
     loop {
         let next = tokio::select! {
@@ -200,20 +205,39 @@ pub(crate) async fn stream_response(
                 sender.abandon().await;
                 return Err(StreamStop::Cancelled);
             }
-            () = sleep_until_due(sender.coalescer.deadline()) => {
+            () = sleep_until_due(sender.deadline()) => {
                 sender.tick().await;
                 continue;
             }
             item = deltas.next() => item,
         };
         match next {
-            Some(Ok(ModelDelta::Text(text))) => sender.push(&text).await,
-            Some(Ok(ModelDelta::ToolCallStarted { .. })) => {}
+            Some(Ok(ModelDelta::Reasoning(thought))) => {
+                sender.reasoning.push(emitter, &thought).await
+            }
+            Some(Ok(ModelDelta::Text(text))) => {
+                // The reasoning is over once the words begin.
+                sender.reasoning.finish(emitter, None).await;
+                sender.words.push(emitter, &text).await;
+            }
+            Some(Ok(ModelDelta::ToolCallStarted { .. })) => {
+                sender.reasoning.finish(emitter, None).await;
+            }
             Some(Ok(ModelDelta::Finished(response))) => {
-                sender.finish(&response.message.text()).await;
+                sender
+                    .reasoning
+                    .finish(
+                        emitter,
+                        Some(response.reasoning.as_deref().unwrap_or_default()),
+                    )
+                    .await;
+                sender
+                    .words
+                    .finish(emitter, Some(&response.message.text()))
+                    .await;
                 return Ok(Streamed {
                     response,
-                    stream: sender.stream,
+                    stream: sender.words.stream,
                 });
             }
             Some(Err(error)) => {
@@ -230,6 +254,21 @@ pub(crate) async fn stream_response(
     }
 }
 
+/// Says the reasoning of an answer that was **not** streamed (`stream_text` off, or a client that
+/// cannot stream) as a stream of its own, in pieces, ended: it arrives whole, so it is cut and sent
+/// at once. Nothing is sent for reasoning that is blank. Returns the id of the stream, when there
+/// was one.
+pub(crate) async fn say_reasoning(
+    emitter: &Emitter,
+    reasoning: &str,
+    new_stream: impl FnOnce() -> String + Send + 'static,
+) -> Option<String> {
+    let mut lane = Lane::new(Kind::Reasoning, Box::new(new_stream));
+    lane.push(emitter, reasoning).await;
+    lane.finish(emitter, Some(reasoning)).await;
+    lane.stream
+}
+
 /// Resolves at `at`; never, when there is nothing waiting to be sent.
 async fn sleep_until_due(at: Option<Instant>) {
     match at {
@@ -238,41 +277,106 @@ async fn sleep_until_due(at: Option<Instant>) {
     }
 }
 
-/// The half of [`stream_response`] that says things: opens the stream, sends the pieces, ends it.
-struct Sender<'a, F> {
-    emitter: &'a Emitter,
-    coalescer: Coalescer,
-    new_stream: Option<F>,
-    stream: Option<String>,
+/// Which of the two streams of a model turn a [`Lane`] sends: they have the same shape and different
+/// events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// What the model writes as its answer: [`RunEvent::TextDelta`].
+    Words,
+    /// What it thinks before: [`RunEvent::ReasoningDelta`].
+    Reasoning,
 }
 
-impl<F: FnOnce() -> String> Sender<'_, F> {
-    async fn push(&mut self, text: &str) {
+type NewStream = Box<dyn FnOnce() -> String + Send>;
+
+/// One stream of a model turn: its coalescer, its id (made when it opens) and whether it has ended.
+struct Lane {
+    kind: Kind,
+    coalescer: Coalescer,
+    new_stream: Option<NewStream>,
+    stream: Option<String>,
+    ended: bool,
+}
+
+impl Lane {
+    fn new(kind: Kind, new_stream: NewStream) -> Self {
+        Self {
+            kind,
+            coalescer: Coalescer::new(FLUSH_INTERVAL, FLUSH_BYTES),
+            new_stream: Some(new_stream),
+            stream: None,
+            ended: false,
+        }
+    }
+
+    async fn push(&mut self, emitter: &Emitter, text: &str) {
+        if self.ended {
+            return;
+        }
         let pieces = self.coalescer.push(text, Instant::now());
-        self.send(pieces, false, false).await;
+        self.send(emitter, pieces, false, false).await;
     }
 
-    async fn tick(&mut self) {
+    async fn tick(&mut self, emitter: &Emitter) {
         let pieces = self.coalescer.tick(Instant::now());
-        self.send(pieces, false, false).await;
+        self.send(emitter, pieces, false, false).await;
     }
 
-    /// The model is done: what has not gone goes, and the last piece says it is the last.
-    async fn finish(&mut self, whole: &str) {
-        let pieces = self.coalescer.finish(whole, Instant::now());
-        self.send(pieces, true, false).await;
+    /// The lane is done: what has not gone goes, and the last piece says it is the last. `whole` is
+    /// what the model's answer says the text is (it may carry a tail the stream did not); `None`
+    /// when the end is only the end. A lane that already ended, or never opened, says nothing.
+    async fn finish(&mut self, emitter: &Emitter, whole: Option<&str>) {
+        if self.ended {
+            return;
+        }
+        let pieces = self
+            .coalescer
+            .finish(whole.unwrap_or_default(), Instant::now());
+        self.send(emitter, pieces, true, false).await;
+        // A lane that never opened is over too: what it is sent later (reasoning that comes after the
+        // words began) is not a stream that begins after them.
+        self.ended = true;
     }
 
     /// The model failed: what has not gone goes, and the last piece says there is no more.
-    async fn abandon(&mut self) {
+    async fn abandon(&mut self, emitter: &Emitter) {
+        if self.ended {
+            return;
+        }
         let pieces = self.coalescer.finish("", Instant::now());
-        self.send(pieces, true, true).await;
+        self.send(emitter, pieces, true, true).await;
+    }
+
+    fn event(
+        &self,
+        stream: String,
+        offset: u64,
+        text: String,
+        last: bool,
+        abandoned: bool,
+    ) -> RunEvent {
+        match self.kind {
+            Kind::Words => RunEvent::TextDelta {
+                stream,
+                offset,
+                text,
+                last,
+                abandoned,
+            },
+            Kind::Reasoning => RunEvent::ReasoningDelta {
+                stream,
+                offset,
+                text,
+                last,
+                abandoned,
+            },
+        }
     }
 
     /// Sends `pieces` as events of the stream, opening it if this is the first. With `end`, the last
     /// of them (an empty one, if the text had all gone) ends the stream, and `abandoned` says the
     /// model did not finish. Nothing is sent for a stream that was never opened.
-    async fn send(&mut self, pieces: Vec<Piece>, end: bool, abandoned: bool) {
+    async fn send(&mut self, emitter: &Emitter, pieces: Vec<Piece>, end: bool, abandoned: bool) {
         if !self.coalescer.is_open() || (pieces.is_empty() && !end) {
             return;
         }
@@ -287,32 +391,64 @@ impl<F: FnOnce() -> String> Sender<'_, F> {
                 id
             }
         };
+        if end {
+            self.ended = true;
+        }
         let mut pieces = pieces.into_iter().peekable();
         if end && pieces.peek().is_none() {
             // Everything had gone already: the end is a piece of its own, with nothing in it.
-            self.emitter
-                .emit(RunEvent::TextDelta {
-                    stream,
-                    offset: self.coalescer.sent(),
-                    text: String::new(),
-                    last: true,
-                    abandoned,
-                })
-                .await;
+            let event = self.event(
+                stream,
+                self.coalescer.sent(),
+                String::new(),
+                true,
+                abandoned,
+            );
+            emitter.emit(event).await;
             return;
         }
         while let Some(piece) = pieces.next() {
             let last = end && pieces.peek().is_none();
-            self.emitter
-                .emit(RunEvent::TextDelta {
-                    stream: stream.clone(),
-                    offset: piece.offset,
-                    text: piece.text,
-                    last,
-                    abandoned: last && abandoned,
-                })
-                .await;
+            let event = self.event(
+                stream.clone(),
+                piece.offset,
+                piece.text,
+                last,
+                last && abandoned,
+            );
+            emitter.emit(event).await;
         }
+    }
+}
+
+/// The half of [`stream_response`] that says things: the two lanes of a turn, reasoning and words.
+struct Sender<'a> {
+    emitter: &'a Emitter,
+    words: Lane,
+    reasoning: Lane,
+}
+
+impl Sender<'_> {
+    /// When what waits in either lane is due.
+    fn deadline(&self) -> Option<Instant> {
+        [
+            self.words.coalescer.deadline(),
+            self.reasoning.coalescer.deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    async fn tick(&mut self) {
+        self.reasoning.tick(self.emitter).await;
+        self.words.tick(self.emitter).await;
+    }
+
+    /// The model failed: both lanes that are open say there is no more, the reasoning first.
+    async fn abandon(&mut self) {
+        self.reasoning.abandon(self.emitter).await;
+        self.words.abandon(self.emitter).await;
     }
 }
 
@@ -462,6 +598,7 @@ mod tests {
             &emitter,
             &CancelToken::new(),
             || "s1".to_owned(),
+            || "r1".to_owned(),
         )
         .await
         .map_err(failed);
@@ -563,6 +700,7 @@ mod tests {
             &emitter,
             &CancelToken::new(),
             || "s1".to_owned(),
+            || "r1".to_owned(),
         )
         .await
         .map_err(failed);
@@ -637,9 +775,11 @@ mod tests {
             message: Message::Assistant {
                 content: vec![adam_model::ContentPart::text("Let me look.")],
                 tool_calls: vec![call],
+                reasoning: None,
             },
             finish: adam_model::FinishReason::ToolCalls,
             usage: adam_model::Usage::default(),
+            reasoning: None,
         };
         let (result, events) = run_items(vec![
             Ok(ModelDelta::Text("Let me look.".into())),
@@ -709,6 +849,7 @@ mod tests {
                     &emitter,
                     &CancelToken::new(),
                     || "s1".to_owned(),
+                    || "r1".to_owned(),
                 )
                 .await
                 .map_err(failed)
@@ -747,9 +888,14 @@ mod tests {
         let call = tokio::spawn({
             let (emitter, cancel) = (emitter.clone(), cancel.clone());
             async move {
-                stream_response(&model, ModelRequest::new("m"), &emitter, &cancel, || {
-                    "s1".to_owned()
-                })
+                stream_response(
+                    &model,
+                    ModelRequest::new("m"),
+                    &emitter,
+                    &cancel,
+                    || "s1".to_owned(),
+                    || "r1".to_owned(),
+                )
                 .await
             }
         });
@@ -800,9 +946,14 @@ mod tests {
         });
         let stop = tokio::time::timeout(
             Duration::from_secs(2),
-            stream_response(&model, ModelRequest::new("m"), &emitter, &cancel, || {
-                "s1".to_owned()
-            }),
+            stream_response(
+                &model,
+                ModelRequest::new("m"),
+                &emitter,
+                &cancel,
+                || "s1".to_owned(),
+                || "r1".to_owned(),
+            ),
         )
         .await
         .expect("a cancel ends the call")

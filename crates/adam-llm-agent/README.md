@@ -254,6 +254,20 @@ the `Progress` of `emit_progress` that earlier versions emitted (a breaking chan
 `tool_end`'s `ok` is `completed`, `error` and `transient_error` are `failed`, `needs_input` and `waiting` are `waiting`.
 `adam-a2a-runtime` serves steps to a client that activated `steps/v1` and as lines of text to one that did not.
 
+## Reasoning
+
+A model in thinking mode writes its reasoning before its answer ([ADR 0020](../../docs/decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md)).
+The streamed model step sends it as `RunEvent::ReasoningDelta` events, in **a stream of its own** (`<run id>-r<turn>-<8 hex digits>`,
+pieces cut as the words' are), which opens on the first reasoning that is not blank and **ends (`last`) when the words, a tool call or the
+end of the answer begin**, so it is over before the words of its turn are sent (`abandoned` when the model failed). With
+`stream_text(false)` the reasoning of the whole answer is said, in pieces, before its words. It is **not part of the answer**:
+
+* the step drops it from the response before the journal records it, so it is in no journal, no run state, no output text, no
+  `turn_output` and no step output, and a replay sends none (the exception is a model client set to echo reasoning, which keeps it in
+  the assistant message itself, so the history holds it: `MODEL_ECHO_REASONING`);
+* no later request carries it (`tests/streaming.rs`, `reasoning_is_never_in_a_later_request`);
+* how much a turn reasoned is one `DEBUG` line with `reasoning_chars`, never the text, and nothing at `INFO`.
+
 ## Streamed text
 
 A model turn is **streamed** by default ([`LlmAgentBuilder::stream_text`](src/agent.rs), [ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md)):

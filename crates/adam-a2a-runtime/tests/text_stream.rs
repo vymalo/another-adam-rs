@@ -155,6 +155,8 @@ struct Chunk {
     append: Option<bool>,
     last: Option<bool>,
     abandoned: Option<bool>,
+    /// The `kind` of the entry: `None` for a reply, `Some("reasoning")` for the model's reasoning.
+    kind: Option<String>,
 }
 
 async fn read(rig: &Rig, caller: Caller, text: &str) -> Read {
@@ -202,7 +204,11 @@ async fn read(rig: &Rig, caller: Caller, text: &str) -> Read {
                         other => panic!("a chunk is text: {other:?}"),
                     };
                     assert_eq!(artifact.parts.len(), 1);
-                    assert_eq!(artifact.name.as_deref(), Some("reply"));
+                    let kind = entry.get("kind").and_then(Value::as_str).map(str::to_owned);
+                    assert_eq!(
+                        artifact.name.as_deref(),
+                        Some(if kind.is_some() { "reasoning" } else { "reply" })
+                    );
                     assert_eq!(
                         artifact.extensions,
                         Some(vec![TEXT_STREAM_EXTENSION.to_owned()])
@@ -214,6 +220,7 @@ async fn read(rig: &Rig, caller: Caller, text: &str) -> Read {
                         append: update.append,
                         last: update.last_chunk,
                         abandoned: entry.get("abandoned").and_then(Value::as_bool),
+                        kind,
                     });
                 }
                 other => panic!("unexpected {other:?}"),
@@ -321,9 +328,11 @@ async fn the_words_before_a_tool_call_are_stated_as_a_working_status_with_the_st
                 name: "look".into(),
                 arguments: json!({}),
             }],
+            reasoning: None,
         },
         finish: FinishReason::ToolCalls,
         usage: Usage::default(),
+        reasoning: None,
     };
     let script = vec![
         vec![
@@ -682,4 +691,95 @@ async fn a_question_that_is_the_streamed_reply_is_stated_under_its_stream() {
     assert_eq!(text_of(message), "Hi! I'm Coder. Which repository?");
     assert_eq!(marker(message), Some(&json!({"streamId": "s-ask"})));
     assert!(read.chunks.iter().all(|c| c.id == "s-ask"));
+}
+
+// ---------------------------------------------------------------------------
+// Reasoning (ADR 0020)
+// ---------------------------------------------------------------------------
+
+/// A model that thinks, then writes: reasoning pieces, the words, the assembled answer with its reasoning.
+fn thinks_then_writes(thoughts: &[&str], pieces: &[&str]) -> Script {
+    let whole: String = pieces.concat();
+    let reasoning: String = thoughts.concat();
+    thoughts
+        .iter()
+        .map(|t| (PAUSE, Ok(ModelDelta::Reasoning((*t).to_owned()))))
+        .chain(
+            pieces
+                .iter()
+                .map(|p| (PAUSE, Ok(ModelDelta::Text((*p).to_owned())))),
+        )
+        .chain([(
+            Duration::ZERO,
+            Ok(ModelDelta::Finished(ModelResponse {
+                reasoning: Some(reasoning),
+                ..ModelResponse::text(whole)
+            })),
+        )])
+        .collect()
+}
+
+#[tokio::test]
+async fn an_activated_client_reads_the_reasoning_as_chunks_of_a_stream_of_its_own_before_the_reply()
+{
+    let rig = start(vec![thinks_then_writes(
+        &["The user wants ", "Fibonacci."],
+        &["Fib", "onacci in Rust."],
+    )]);
+    let read = read(&rig, activated(), "fibonacci?").await;
+
+    let (thought, reply): (Vec<&Chunk>, Vec<&Chunk>) =
+        read.chunks.iter().partition(|c| c.kind.is_some());
+    assert!(
+        !thought.is_empty() && !reply.is_empty(),
+        "{:?}",
+        read.chunks
+    );
+    // Marked, in a stream of its own, contiguous in bytes and ended.
+    assert!(
+        thought
+            .iter()
+            .all(|c| c.kind.as_deref() == Some("reasoning"))
+    );
+    let stream = &thought[0].id;
+    assert_ne!(stream, &reply[0].id);
+    let mut text = String::new();
+    for (n, chunk) in thought.iter().enumerate() {
+        assert_eq!(&chunk.id, stream);
+        assert_eq!(chunk.offset, json!(text.len()), "chunk {n}");
+        assert_eq!(chunk.append, Some(n > 0), "chunk {n}");
+        assert_eq!(chunk.last, Some(n + 1 == thought.len()), "chunk {n}");
+        text.push_str(&chunk.text);
+    }
+    assert_eq!(text, "The user wants Fibonacci.");
+    // It is over before the first piece of the reply.
+    let first_reply = read.chunks.iter().position(|c| c.kind.is_none()).unwrap();
+    let last_thought = read.chunks.iter().rposition(|c| c.kind.is_some()).unwrap();
+    assert!(last_thought < first_reply, "{:?}", read.chunks);
+    // The reply is the reply: its chunks add up to it, and the status that ends the turn states that
+    // stream; nothing states the reasoning, and no status carries it.
+    let reply_text: String = reply.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(reply_text, "Fibonacci in Rust.");
+    let (state, message) = read.statuses.last().unwrap();
+    assert_eq!(*state, TaskState::Completed);
+    let message = message.as_ref().expect("the answer");
+    assert_eq!(text_of(message), "Fibonacci in Rust.");
+    assert_eq!(marker(message), Some(&json!({"streamId": reply[0].id})));
+    let everything = format!("{:?}", read.statuses);
+    assert!(!everything.contains("Fibonacci."), "{everything}");
+}
+
+#[tokio::test]
+async fn a_client_that_did_not_activate_the_extension_reads_no_reasoning_and_the_same_reply() {
+    let rig = start(vec![thinks_then_writes(
+        &["The user wants Fibonacci."],
+        &["Fibonacci in Rust."],
+    )]);
+    let read = read(&rig, Caller::new("token-0"), "fibonacci?").await;
+    assert!(read.chunks.is_empty(), "{:?}", read.chunks);
+    let (state, message) = read.statuses.last().unwrap();
+    assert_eq!(*state, TaskState::Completed);
+    assert_eq!(text_of(message.as_ref().unwrap()), "Fibonacci in Rust.");
+    let everything = format!("{:?}", read.statuses);
+    assert!(!everything.contains("wants Fibonacci"), "{everything}");
 }

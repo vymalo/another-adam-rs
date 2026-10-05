@@ -253,6 +253,17 @@ says that question. Chunks are transient: they are never in a task's
 the extension reads the whole reply with the turn, as it always did. On the wire the SDK writes a number of metadata as a
 float (`"offset": 3.0`): the contract reads a whole number either way.
 
+### Reasoning chunks
+
+A `RunEvent::ReasoningDelta` is, for a client that activated `text-stream/v1`, a chunk of the same shape as the reply's with the
+artifact named `reasoning`, **its own `artifactId`** (the reasoning stream's id, never the reply's) and `"kind": "reasoning"` in the
+metadata entry beside `offset` (`{"offset": 0, "kind": "reasoning"}`; `abandoned` as for a reply): a reader that knows `kind`
+says it apart from the reply, a chunk with none is a reply. **No status message states it whole**: it is transient like every chunk,
+and a client that wants it keeps the pieces. Nothing for a client that did not activate the extension. Added on 2026-10-05
+([ADR 0020](../../docs/decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md)); a reader that predates `kind`
+reads these chunks as a reply of a stream nobody states, so the reader goes first in a rollout. Unit tests in `src/text_stream.rs`
+(`a_reasoning_chunk_is_a_chunk_of_its_own_stream_marked_with_its_kind`) and the subscription test of `tests/text_stream.rs`.
+
 ## Stable ids
 
 Ids are derived, never drawn at random per read, so a consumer that keys on
