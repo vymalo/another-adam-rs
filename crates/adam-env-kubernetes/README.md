@@ -93,6 +93,30 @@ empty argv, a non-UTF-8 word and a variable name that is not one are `EnvError::
 it cannot do is logged. Closing the exec client does not stop a command in the pod, so the caller kills the client **and**
 calls this.
 
+## `adam-kube-exec`
+
+The binary of this crate (`src/bin/adam-kube-exec.rs`, shipped in the coder's image) that a `PreparedCommand` names: it runs
+`env [-u NAME]... [NAME=VALUE]... /opt/adam/bin/adam-exec run|shell <id> <cwd> :<word>...` in the run container with `pods/exec`,
+copies its stdin to the command (unless its own stdin is `/dev/null`, in which case the command has none: a `cat` ends at once, as
+it does locally), copies stdout and stderr back as they come, and **exits with the command's exit code**.
+
+```text
+adam-kube-exec --namespace NS --pod POD [--container NAME] [--adam-exec PATH]
+               [--env NAME=VALUE]... [--unset NAME]... run|shell ID CWD :WORD...
+```
+
+It reaches the cluster as the coder's ServiceAccount does (`KUBERNETES_SERVICE_HOST` and the mounted token), or through
+`KUBECONFIG`. The options come first and everything after the mode is positional, so a word such as `--version` is never
+taken for an option; a command line that is wrong is refused before anything runs (`Invocation::parse`, tested for every
+refusal). Exit codes: the command's own (a command killed by a signal has 128 plus the signal, as the container runtime
+reports it); **64** a wrong command line; **69** the cluster could not run it or the connection ended before the command did;
+129, 130, 143 when the client itself is hung up, interrupted or terminated (`BSD sysexits.h`' values, *unverified*, from memory).
+Closing the client does not stop the command in the pod: the coder calls `kill`, which runs `adam-exec kill`.
+
+Closing stdin ends the command's stdin through `v5.channel.k8s.io` stream close, which `kube` negotiates (*verified* by
+reading `kube-client` 4.2.0); a cluster that does not speak it closes the whole stream instead and loses output. Kubernetes
+1.30 or later is assumed (*unverified* here, the owner's cluster).
+
 ## Teardown, and the idle timeout
 
 `release(run)` deletes the pod (with a two second grace period: the quota counts a pod until it is gone) and is idempotent: a
@@ -122,3 +146,17 @@ one line); none carries a secret, and the API server never echoes one in a refus
   steps, idempotency, concurrent calls, a create that races), the refusals above, `release`, `held_runs` (this release's pods
   only), the idle sweep (idle, busy, cannot be asked, another worker's, off), `prepare` and the quoting of the words, `kill`,
   and `tool_path` and `secret_ref`.
+* **Tests that need a cluster** (`tests/cluster.rs`): one test, gated on **`ADAM_TEST_KUBECONFIG`**, that makes a pod from the
+  chart's own template, runs commands in it through `adam-kube-exec` (both streams, the exit code, the working directory,
+  variables, every word its own argument, stdin and `/dev/null`, 3 MB of output, what a spec hides, that the coder's secrets are
+  not in the pod), kills a command (the client alone leaves it, `kill` stops it and ends the client), sweeps an idle pod and not
+  a busy one, releases, and checks that the chart's admission policy refuses each of thirteen changes to the pod while accepting
+  the unchanged one, and (with `ADAM_TEST_KUBE_QUOTA_PODS`) that the quota refuses one pod beyond its limit with
+  `EnvError::Unavailable`. The kubeconfig must be **the coder's ServiceAccount's**, or the policy tests nothing. Without the
+  variable the test says it skipped; **with `ADAM_TEST_REQUIRE_KUBERNETES=1` it fails instead** (the `run-pods` job of CI sets
+  it). The other variables (`ADAM_TEST_KUBE_TEMPLATE`, `ADAM_TEST_KUBE_NAMESPACE`, `ADAM_TEST_KUBE_INSTANCE`,
+  `ADAM_TEST_KUBE_WORKER`, `ADAM_TEST_KUBE_MODEL_KEY`) are in the header of the file, and the script that sets a `kind` cluster up
+  is [`deploy/coder/tests/kind-run-pods.sh`](../../deploy/coder/tests/kind-run-pods.sh). The `NetworkPolicy` is not exercised: it
+  needs a CNI that enforces it.
+* `ADAM_TEST_REQUIRE_DB=1`, which CI sets for the database suites, does **not** turn this test on: a runner without a cluster
+  would fail every other job.

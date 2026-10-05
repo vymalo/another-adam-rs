@@ -11,7 +11,8 @@
 # ADAM_AGENT_DIR (compose.yaml, service `agent`): one image and one package, so
 # there is nothing else to publish or to make public.
 #
-# Stage 1 compiles both binaries on a Debian trixie Rust image, so their glibc
+# Stage 1 compiles the binaries (and `adam-kube-exec`, the client a run's commands use to run in a pod of
+# their own, ADR 0019) on a Debian trixie Rust image, so their glibc
 # matches the runtime image (debian:trixie-slim). Stage 2 is the workspace
 # image (Rust, Flutter/Dart, Node, git, tini, OpenCode) with the binaries added.
 
@@ -52,8 +53,10 @@ COPY bin bin
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p adam-coder --bin adam-coder -p adam-agent --bin adam-agent \
+      -p adam-env-kubernetes --bin adam-kube-exec \
  && install -D -m 0755 target/release/adam-coder /out/adam-coder \
- && install -D -m 0755 target/release/adam-agent /out/adam-agent
+ && install -D -m 0755 target/release/adam-agent /out/adam-agent \
+ && install -D -m 0755 target/release/adam-kube-exec /out/adam-kube-exec
 
 FROM ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6 AS github-mcp
 
@@ -78,12 +81,19 @@ LABEL org.opencontainers.image.source="https://github.com/vymalo/another-adam-rs
 
 # hadolint ignore=DL3066
 USER root
-COPY --from=build /out/adam-coder /out/adam-agent /usr/local/bin/
+COPY --from=build /out/adam-coder /out/adam-agent /out/adam-kube-exec /usr/local/bin/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
+# The tools a run pod gets (ADR 0019): the chart's init container copies /opt/adam/bin/* into an emptyDir that the
+# run container mounts read-only at the same path, the layout of a devcontainer's tools directory. `adam-exec` is
+# the script the devcontainer crate embeds (one source, so the two environments cannot disagree about it), and
+# `opencode` is a link to the native binary the npm package put on PATH (the init container copies what it points
+# at, `cp -L`); the pod's image need carry neither.
+COPY --chmod=0755 crates/adam-devcontainer/src/adam-exec.sh /opt/adam/bin/adam-exec
 # /work holds mirrors and worktrees; the deployment mounts a volume there. The
 # base image already creates it owned by uid 10001, as does this line for a
 # base that does not.
-RUN install -d -o 10001 -g 10001 /work
+RUN install -d -o 10001 -g 10001 /work \
+ && bash -lc 'ln -s "$(readlink -f "$(command -v opencode)")" /opt/adam/bin/opencode'
 # The static client of the service's own release; `sha256sum -c` stops the build when the download is not
 # the pinned file. (Not `ADD --checksum`: the hadolint of the `lint Dockerfile` job cannot parse the flag.)
 RUN curl -fsSL -o /tmp/podman-remote.tar.gz \
@@ -119,15 +129,20 @@ EXPOSE 8080
 # is there, runs, and lists the twelve read tools of the coder's allow-list over stdio with no
 # credential (a missing name would stop the coder at startup). The devcontainer CLI and Podman's client
 # run, and the OpenCode that is mounted into every devcontainer is a native executable (an ELF file, not
-# the npm package's script: DEVCONTAINER_RUNTIME=podman refuses to start otherwise).
+# the npm package's script: DEVCONTAINER_RUNTIME=podman refuses to start otherwise). The run pod's tools are in
+# /opt/adam/bin (adam-exec, and OpenCode as a native executable), and adam-kube-exec rejects an empty command line.
 RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/github-mcp-tools.sh \
     bash -lc 'set -e; \
       test "$(id -u)" = 10001; \
-      command -v adam-coder adam-agent git opencode tini github-mcp-server devcontainer podman-remote; \
+      command -v adam-coder adam-agent adam-kube-exec git opencode tini github-mcp-server devcontainer podman-remote; \
       test "$(devcontainer --version)" = "0.89.0"; \
       podman-remote --version | grep -q "5\.8\.7"; \
       test "$(head -c 4 "$(readlink -f "$(command -v opencode)")" | tail -c 3)" = ELF; \
       github-mcp-server --version | grep -q "v1.12.2"; \
+      test -x /opt/adam/bin/adam-exec; \
+      test "$(head -c 4 /opt/adam/bin/opencode | tail -c 3)" = ELF; \
+      out="$(adam-kube-exec 2>&1 || true)"; \
+      echo "$out" | grep -q "expected run or shell"; \
       sh /tmp/github-mcp-tools.sh; \
       out="$(env -i PATH="$PATH" adam-coder 2>&1 || true)"; \
       echo "$out" | grep -q "invalid configuration"; \
