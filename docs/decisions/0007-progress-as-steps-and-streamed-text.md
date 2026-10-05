@@ -34,7 +34,7 @@ commit `d411249`:*
 > send submits the run and subscribes afterwards, and a worker could begin in that gap, so the start of a tool call's
 > step (the only report with its `input`) was lost and the step showed no input. `BroadcastSink` now keeps the recent
 > live events of each run (the newest 64, none older than 30 seconds, at most 64 runs; no `Status`, no `Artifact`, and
-> none after the run ends) and `subscribe_run` replays them before the live ones, with no gap and no duplicate. Events are
+> only since the run's last change of status, so a run taken up again after a question replays only its new turn) and `subscribe_run` replays them before the live ones, with no gap and no duplicate. Events are
 > still best effort and never the truth; the durable record decides. A resubscribe within those 30 seconds may repeat a
 > step (a snapshot by id) or a text piece (it carries its `offset`), so decision 14's "not replayed to a client that
 > resubscribes" holds for the record and not for the last seconds. See `crates/adam-runtime/src/events.rs`.

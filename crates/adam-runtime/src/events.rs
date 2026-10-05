@@ -434,15 +434,15 @@ impl Replay {
     }
 
     /// Note an event that is about to be sent. A status is not kept: it is a prompt to read the
-    /// durable record, which is the truth, and a stale one is noise; a terminal one even ends the
-    /// run's buffer, since nobody needs a finished run's events replayed. An artifact is not kept
-    /// either: it is durable (`RunView::artifacts`) and can be large.
+    /// durable record, which is the truth, and a stale one is noise. It also **ends the run's
+    /// buffer**: the replay holds what happened since the run last changed state. A run that parks
+    /// (its turn ended, it waits for a message) and is taken up again is one run, and its next
+    /// subscriber is there for the next turn, not to hear the last one again. An artifact is not
+    /// kept either: it is durable (`RunView::artifacts`) and can be large.
     fn record(&mut self, now: Instant, event: &SinkEvent) {
         match &event.event {
-            RunEvent::Status { status, .. } => {
-                if status.is_terminal() {
-                    self.runs.remove(&event.run);
-                }
+            RunEvent::Status { .. } => {
+                self.runs.remove(&event.run);
                 return;
             }
             RunEvent::Artifact { .. } => return,
@@ -515,7 +515,8 @@ impl Replay {
 /// steps, in between. The replay is a latency and fidelity aid, never the truth: it holds at most
 /// [`REPLAY_EVENTS_PER_RUN`] events per run, none older than [`REPLAY_MAX_AGE`], for at most
 /// [`REPLAY_MAX_RUNS`] runs; it holds no `Status` (read the durable record) and no `Artifact`
-/// (durable too); and a run's events are dropped when its status turns terminal.
+/// (durable too); and a run's events are dropped whenever its status changes (it holds what
+/// happened since the run last changed state).
 #[derive(Clone, Debug)]
 pub struct BroadcastSink {
     tx: broadcast::Sender<SinkEvent>,
@@ -967,7 +968,6 @@ mod tests {
         let run = RunId::new();
         sink.emit(run, "x", status(RunStatus::Runnable)).await;
         sink.emit(run, "x", progress(1)).await;
-        sink.emit(run, "x", status(RunStatus::Parked)).await;
         let mut sub = sink.subscribe_run(run);
         assert_eq!(drain(&mut sub).await, vec![progress(1)]);
         sink.emit(run, "x", status(RunStatus::Done)).await;
@@ -975,8 +975,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_terminal_status_drops_the_runs_replay() {
-        for end in [RunStatus::Done, RunStatus::Failed] {
+    async fn a_run_taken_up_again_replays_only_its_new_turn() {
+        // A turn that asks a question parks the run; the answer makes it runnable again. The
+        // subscriber of the answer must not hear the question's words again (a text stream of
+        // the last turn would be read as part of this one).
+        let sink = BroadcastSink::default();
+        let run = RunId::new();
+        sink.emit(run, "x", progress(1)).await;
+        sink.emit(run, "x", status(RunStatus::Parked)).await;
+        sink.emit(run, "x", status(RunStatus::Runnable)).await;
+        sink.emit(run, "x", progress(2)).await;
+        let mut sub = sink.subscribe_run(run);
+        assert_eq!(drain(&mut sub).await, vec![progress(2)]);
+    }
+
+    #[tokio::test]
+    async fn any_status_drops_the_runs_replay() {
+        for end in RunStatus::ALL {
             let sink = BroadcastSink::default();
             let run = RunId::new();
             sink.emit(run, "x", progress(1)).await;

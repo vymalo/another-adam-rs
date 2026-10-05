@@ -173,8 +173,9 @@ live events, with no gap and no duplicate (`emit` records and sends, `subscribe_
 * **Bounds** (`REPLAY_EVENTS_PER_RUN`, `REPLAY_MAX_AGE`, `REPLAY_MAX_RUNS`): the newest 64 events of a run, none older
   than 30 seconds (pruned on `emit` and on `subscribe_run`), at most 64 runs (the run whose newest event is oldest goes
   first). Memory stays bounded by these three, whatever the runs do.
-* **Not replayed:** `Status` (a prompt to read the durable record, which is the truth: a stale one is noise; a terminal one
-  also drops the run's buffer) and `Artifact` (durable in `RunView::artifacts`, and a file can be megabytes).
+* **Not replayed:** `Status` (a prompt to read the durable record, which is the truth: a stale one is noise; any status
+  also drops the run's buffer, so the replay is what happened since the run last changed state: a run that parked after a
+  question and is taken up again replays only its new turn) and `Artifact` (durable in `RunView::artifacts`, and a file can be megabytes).
   `BroadcastSink::subscribe()`, the feed of every run, stays "from now on".
 * **It is not the truth.** A subscriber still reads the durable run for state; the replay only keeps a step's start (the
   one report with its `input`), a text piece or a progress line from being lost to a race. A process that has no sink
