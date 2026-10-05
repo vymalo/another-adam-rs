@@ -100,6 +100,24 @@ from service.yaml, which every render contains, so they always run.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- /* config.modelExtraBody: a JSON object (a map, or a string that parses to one); config.modelEchoReasoning: a member name. */ -}}
+{{- with include "coder.modelExtraBody" . -}}
+{{- $parsed := fromJson . -}}
+{{- if or (hasKey $parsed "Error") (not (kindIs "map" $parsed)) -}}
+{{- fail "config.modelExtraBody must be a JSON object (a map, or a string like {\"reasoning_effort\":\"medium\"})" -}}
+{{- end -}}
+{{- if hasKey $.Values.config.extraEnv "MODEL_EXTRA_BODY" -}}
+{{- fail "config.modelExtraBody is set and config.extraEnv sets MODEL_EXTRA_BODY: set one" -}}
+{{- end -}}
+{{- range $key := list "model" "messages" "tools" "tool_choice" "stream" -}}
+{{- if hasKey $parsed $key -}}
+{{- fail (printf "config.modelExtraBody may not set %q: the runtime owns it" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.config.modelEchoReasoning (not (has (toString .Values.config.modelEchoReasoning) (list "reasoning_content" "reasoning"))) -}}
+{{- fail (printf "config.modelEchoReasoning must be empty, reasoning_content or reasoning, got %q" (toString .Values.config.modelEchoReasoning)) -}}
+{{- end -}}
 {{- /* config.modelBaseUrlFromSecret: MODEL_BASE_URL from the ExternalSecret, not from config.modelBaseUrl. */ -}}
 {{- if not (kindIs "bool" .Values.config.modelBaseUrlFromSecret) -}}
 {{- fail (printf "config.modelBaseUrlFromSecret must be true or false, got %q" (toString .Values.config.modelBaseUrlFromSecret)) -}}

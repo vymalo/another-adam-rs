@@ -123,6 +123,20 @@ the extra MCP servers' section): `MODEL_API_KEY`, `GITHUB_TOKEN` and `A2A_BEARER
 reaches the pods only when they restart (External Secrets refreshes the Secret every `externalSecrets.refreshInterval`, then
 `kubectl rollout restart statefulset/<release>`): the same as `MODEL_API_KEY`.
 
+## The model's reasoning
+
+A model in thinking mode writes its reasoning before its answer, and the chat shows it as a collapsed "Thinking" block
+([ADR 0020](../../docs/decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md)). Two values, rendered only for the
+roles that run workers, both empty by default (nothing is rendered, and the default render is byte for byte `tests/golden/combined.yaml`):
+
+| Value | Variable | What |
+|---|---|---|
+| `config.modelExtraBody` | `MODEL_EXTRA_BODY` | A JSON object merged into every chat-completions request, to make a gateway or a model emit its reasoning: a map (rendered as compact JSON) or a JSON string, for example `{reasoning_effort: medium}`, `{thinking: {type: enabled}}`, `{chat_template_kwargs: {enable_thinking: true}}`. **Not a secret**: it is in the pod's environment and in git. The chart refuses a value that is not a JSON object, one that sets `model`, `messages`, `tools`, `tool_choice` or `stream`, and one given beside `config.extraEnv.MODEL_EXTRA_BODY`; the binary refuses the same at startup (exit 78). It reaches the agent's own model calls, not OpenCode's |
+| `config.modelEchoReasoning` | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: send the reasoning of earlier turns back to the model under that name. Needed by DeepSeek's thinking mode with tools, which answers a request without it with a 400 (*verified 2026-10-05*, <https://api-docs.deepseek.com/guides/thinking_mode>); wrong for almost every other model. On, the reasoning is stored in the run's history |
+
+Roll out the orchestrator that reads reasoning chunks (`kind: "reasoning"` of `text-stream/v1`) before the coder that sends them. Checks:
+`tests/render-check.sh`.
+
 **What this does not hide.** The URL is not a credential: it is kept out of git, not out of the cluster. It is still in the pod's environment
 (visible to whoever can `exec` into it or read the pod spec, which names the Secret but not the value) and the binary logs its configuration at
 startup with the URL in it (`ModelConfig`'s `Debug` prints `base_url`, `crates/adam-service/src/config.rs`), so it reaches the pod's logs. Hiding it

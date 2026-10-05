@@ -68,6 +68,20 @@ config:
   # Model alias of the agent, and the one OpenCode uses through the same gateway.
   model: "coder"
   opencodeModel: "coder"
+  # MODEL_EXTRA_BODY: a JSON object merged into every chat-completions request, to make a gateway or a
+  # model emit its reasoning (the chat shows it as a collapsed "Thinking" block). NOT a secret: it
+  # is a value of the chart and shows in the pod's environment. A map (rendered as JSON) or a JSON
+  # string. Empty (default): nothing is added. The chart refuses a value that is not a JSON object
+  # and the process refuses one that sets model, messages, tools, tool_choice or stream (exit 78).
+  # Examples (check your gateway and model): {reasoning_effort: medium},
+  # {thinking: {type: enabled}}, {chat_template_kwargs: {enable_thinking: true}}.
+  # Roles that run workers only.
+  modelExtraBody: null
+  # MODEL_ECHO_REASONING: send the reasoning of earlier turns back to the model, under this member
+  # name: `reasoning_content` or `reasoning`. Empty (default): never sent, which is what almost every
+  # model wants. Needed by DeepSeek's thinking mode with tools, which answers a request without it
+  # with a 400. On, the reasoning is stored in the run's history and is sent in every later request.
+  modelEchoReasoning: ""
   # URL clients reach the JSON-RPC endpoint at (goes into the agent card).
   # Empty: the in-cluster Service URL.
   publicUrl: ""
