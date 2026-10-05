@@ -118,6 +118,9 @@ from service.yaml, which every render contains, so they always run.
 {{- if and .Values.config.modelEchoReasoning (not (has (toString .Values.config.modelEchoReasoning) (list "reasoning_content" "reasoning"))) -}}
 {{- fail (printf "config.modelEchoReasoning must be empty, reasoning_content or reasoning, got %q" (toString .Values.config.modelEchoReasoning)) -}}
 {{- end -}}
+{{- if and .Values.config.modelEchoReasoning (hasKey .Values.config.extraEnv "MODEL_ECHO_REASONING") -}}
+{{- fail "config.modelEchoReasoning is set and config.extraEnv sets MODEL_ECHO_REASONING: set one" -}}
+{{- end -}}
 {{- /* config.modelBaseUrlFromSecret: MODEL_BASE_URL from the ExternalSecret, not from config.modelBaseUrl. */ -}}
 {{- if not (kindIs "bool" .Values.config.modelBaseUrlFromSecret) -}}
 {{- fail (printf "config.modelBaseUrlFromSecret must be true or false, got %q" (toString .Values.config.modelBaseUrlFromSecret)) -}}

@@ -83,6 +83,8 @@ check "modelExtraBody and extraEnv MODEL_EXTRA_BODY together are refused" \
   fails helm_reasoning -f "$vals" --set-string config.extraEnv.MODEL_EXTRA_BODY={}
 check "modelEchoReasoning other than reasoning_content or reasoning is refused" \
   fails helm_reasoning --set config.modelEchoReasoning=yes
+check "modelEchoReasoning and extraEnv MODEL_ECHO_REASONING together are refused" \
+  fails helm_reasoning --set config.modelEchoReasoning=reasoning_content --set-string config.extraEnv.MODEL_ECHO_REASONING=reasoning
 # The checks below read the default render again.
 helm_reasoning > "$out"
 
