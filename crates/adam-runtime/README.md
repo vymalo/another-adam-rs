@@ -28,7 +28,7 @@ over A2A).
 | `Classify`, `ErrorClass` | re-exported from `adam-error` |
 | `Inbound` | a message delivered to a run |
 | `child_run_id`, `ChildStatus`, `ChildStarter`, `RUN_FINISHED_KIND` | child runs: the id a parent derives for the child of a call, the payload of the finished message (also what `Ctx::child_status` returns), and the message's `Inbound::kind` (`adam.run.finished`) |
-| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status` (after a commit, and `Status(Runnable, "claimed")` once, when a worker first takes a run), `Progress`, `Step`, `TextDelta`, `Custom`, `Artifact` |
+| `EventSink`, `RunEvent`, `BroadcastSink`, `CollectingSink`, `NoopSink`, `Artifact` | live, best-effort events: `Status` (after a commit, and `Status(Runnable, "claimed")` once, when a worker first takes a run), `Progress`, `Step`, `TextDelta`, `ReasoningDelta`, `Custom`, `Artifact` |
 | `Artifact`, `ArtifactFile`, `ArtifactFileError`, `MAX_ARTIFACT_FILE_BYTES`, `MAX_ARTIFACT_FILENAME_BYTES`, `MAX_RUN_FILE_BYTES` | an output of the run, in two forms: a JSON artifact (`Artifact::new(name, mime_type, data)`) and a **file artifact** (`Artifact::file(name, media_type, filename, bytes)`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)), whose `file` holds the filename and the bytes and whose `data` is `null`. `Artifact` and `ArtifactFile` are `#[non_exhaustive]`; `RunEvent::Artifact` has a `file` member too. Journaled as `{"filename", "bytes": "<base64>"}`, and an artifact journaled before the file form existed has no `file` and reads as it did. `Artifact::file` refuses a file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`), a filename that is not a name (empty, a path, control characters, over 255 bytes) and a media type that is not `type/subtype`; `Debug` prints a file's size, never its bytes. A run keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files: the runtime keeps what it is given, and the agent loop (`adam-llm-agent`) enforces it. Journal cost: the bytes, as base64 (a third more), are in the journal entry of the step that made the file and in every commit of the run's state after it, which is why the caps are what they are |
 | `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput`, `MAX_STEP_ID_BYTES`, `MAX_STEP_LABEL_CHARS`, `MAX_STEP_DETAIL_CHARS`, `STEP_INPUT_MAX_BYTES`, `STEP_INPUT_STRING_MAX_CHARS`, `STEP_OUTPUT_MAX_BYTES` | `RunEvent::Step`: a step of the run's work (a tool call, a sub-agent's work, a command) started, moved or ended, and which step it runs under; a tool call's step can carry what the tool was given (`input`) and answered (`output`), cut to the contract's bounds; see *Steps* |
 | `Notifier` (trait), `Signal`, `Delivery`, `LocalNotifier`, `DynNotifier` | cross-process wake-up and cancel; `RuntimeBuilder::notifier(..)`. See *Several processes* |
@@ -212,6 +212,16 @@ a piece begins in the whole text, **in UTF-8 bytes**; the last piece says `last`
 `MAX_TEXT_DELTA_BYTES` = 1024 bytes (`floor_boundary` cuts text there), so that the event fits a `NOTIFY` payload between
 processes. Live and meant to be lost, like every event: the whole text is what the run records and says
 (`AGENT_TEXT_KIND`, the `agent_text` event of `adam-llm-agent`, names the stream of words that came before a tool call).
+
+### Reasoning
+
+`RunEvent::ReasoningDelta { stream, offset, text, last, abandoned }` has the shape and the bounds of a `TextDelta` and is the
+reasoning a model in thinking mode writes **before** its answer, in a stream of its own (one per model turn that reasoned,
+ended before the turn's words begin). It is **not the answer**: it is in no run output, no `turn_output` and no step output,
+and it is not durable (no whole text follows, nothing records it: a client that wants it keeps the pieces).
+`adam-a2a-runtime` serves it as `text-stream/v1` chunks marked `kind: "reasoning"`
+([ADR 0020](../../docs/decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md)). A new variant of `RunEvent`: an
+exhaustive `match` needs an arm, and a process that predates it ignores the event.
 
 ## Several processes
 

@@ -333,11 +333,13 @@ async fn model_calls_tool_a_then_b_then_answers() {
         Message::Assistant {
             content: vec![],
             tool_calls: vec![a_call.clone()],
+            reasoning: None,
         },
         Message::tool_result("c1", "a-out"),
         Message::Assistant {
             content: vec![],
             tool_calls: vec![b_call.clone()],
+            reasoning: None,
         },
         Message::tool_result("c2", "b-out"),
         Message::assistant_text("all done"),
@@ -383,12 +385,14 @@ async fn parallel_calls_in_one_message_run_in_order() {
             message: Message::Assistant {
                 content: vec![adam_model::ContentPart::text("on it")],
                 tool_calls: vec![call("c1", "a", json!({})), call("c2", "b", json!({}))],
+                reasoning: None,
             },
             finish: adam_model::FinishReason::ToolCalls,
             usage: adam_model::Usage {
                 input_tokens: 5,
                 output_tokens: 7,
             },
+            reasoning: None,
         })
         .push_text("ok");
     let rt = h.runtime(&agent);
@@ -1441,6 +1445,7 @@ async fn a_run_that_continues_a_cancelled_one_answers_the_calls_that_were_owed()
                     call("c1", "ask", json!({})),
                     call("c2", "second", json!({})),
                 ],
+                reasoning: None,
             },
             Message::tool_error("c1", adam_llm_agent::STOPPED_BY_THE_PERSON),
             Message::tool_error("c2", adam_llm_agent::STOPPED_BY_THE_PERSON),
@@ -2100,6 +2105,7 @@ fn finished_conversation() -> Conversation {
             Message::Assistant {
                 content: vec![],
                 tool_calls: vec![call("c1", "a", json!({}))],
+                reasoning: None,
             },
             Message::tool_result("c1", "a-out"),
             Message::assistant_text("answer one"),
@@ -2295,6 +2301,7 @@ async fn a_run_cancelled_on_a_question_continues_without_the_stale_wait() {
             Message::Assistant {
                 content: vec![],
                 tool_calls: vec![call("c1", "ask", json!({}))],
+                reasoning: None,
             },
             Message::tool_error("c1", adam_llm_agent::STOPPED_BY_THE_PERSON),
             Message::user_text("just deploy to staging"),
@@ -2319,6 +2326,7 @@ fn the_carried_history_is_bounded_shortening_first_and_the_task_is_kept() {
             Message::Assistant {
                 content: vec![],
                 tool_calls: vec![call(&format!("c{i}"), "a", json!({}))],
+                reasoning: None,
             },
             Message::tool_result(format!("c{i}"), "x".repeat(output)),
             Message::assistant_text(format!("{i}{}", "y".repeat(answer))),

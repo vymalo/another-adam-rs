@@ -16,9 +16,10 @@ never see this crate's types. Retries are not done here: failures map onto
 | Item | What |
 |---|---|
 | `OpenAiConfig` | `base_url`, `api_key: SecretString`, `timeout`, `extra_headers`; `OpenAiConfig::new(base_url, api_key)` |
-| `OpenAiCompatible` | the client: `OpenAiCompatible::new(config)`, `.with_max_tokens_field(field)` |
+| `OpenAiCompatible` | the client: `OpenAiCompatible::new(config)`, `.with_max_tokens_field(field)`, `.with_extra_body(map)` (members merged into every request), `.with_echo_reasoning(Some(field))` (send reasoning back) |
+| `ReasoningField` | `ReasoningContent` (`reasoning_content`) or `Reasoning` (`reasoning`): the member that carries reasoning when a client echoes it |
 | `MaxTokensField` | `MaxTokens` (default) or `MaxCompletionTokens`, for models that want the newer field name |
-| `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `Client`; see *Errors* |
+| `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `Client`; see *Errors* |
 
 ```rust
 use std::sync::Arc;
@@ -52,6 +53,40 @@ Behaviour (details in the crate docs, `src/lib.rs`):
   the `reqwest` error as its `source`; a body that is not JSON is a `Protocol`
   that keeps the parser's error. The message does not repeat the source.
 
+## Reasoning
+
+A model in thinking mode sends its reasoning beside its answer, and this client reads it:
+
+| Where | Member | Becomes |
+|---|---|---|
+| stream, `choices[0].delta` | `reasoning_content` or `reasoning` (a string; the first that is not empty) | `ModelDelta::Reasoning`, then `ModelResponse.reasoning` |
+| completion, `choices[0].message` | `reasoning_content` or `reasoning` | `ModelResponse.reasoning` |
+
+A value that is not a string (a structured `reasoning` some gateways add) is ignored, and the chunk it came in still counts for its content
+and calls. The reasoning is **never** the answer's text (`Message::text()`), and **by default never in the history and never sent back**:
+`ModelResponse.reasoning` is for people to read. `with_extra_body(map)` merges a JSON object into every request body at its top level
+(it wins over what the client wrote; `model`, `messages`, `tools`, `tool_choice` and `stream` are refused with
+`OpenAiConfigError::ReservedBodyKey`), which is how a deployment turns reasoning on where the model needs a flag
+(`MODEL_EXTRA_BODY` of `adam-service`).
+
+**Sending it back is the exception, and it is the provider's rule, not ours** (*verified 2026-10-05*,
+<https://api-docs.deepseek.com/guides/thinking_mode>): DeepSeek, for a request that carries `tools`, "the `reasoning_content` must be
+fully passed back to the API in all subsequent requests... If your code does not correctly pass back `reasoning_content`, the API will return
+a 400 error", and for a request without `tools` it "does not need to be passed back; even if passed to the API, it will be ignored". So
+`with_echo_reasoning(Some(field))` keeps the reasoning in `Message::Assistant.reasoning` (the history, so a run's stored state grows with it) and
+sends it on the assistant message under `field`'s name; `None`, the default, sends none, whatever the message holds.
+
+Provider facts the parsing rests on, each *verified 2026-10-05* from the page named unless it says *unverified*:
+
+| Provider | Response field | Request flag to turn it on | Source |
+|---|---|---|---|
+| DeepSeek (API) | `reasoning_content`, a delta in a stream, beside `content` in a completion | `{"thinking": {"type": "enabled"}}` (on by default for the V4 models: "Thinking mode is enabled by default, with the default effort being `high`"); `{"thinking": {"type": "disabled"}}` turns it off | <https://api-docs.deepseek.com/guides/thinking_mode> |
+| GLM (Z.ai) | `reasoning_content` in streaming deltas | `{"thinking": {"type": "enabled"}}` or `"disabled"`; GLM-4.7 and later think by default, and the GLM-5.3 line cannot turn it off; `"clear_thinking": false` keeps the reasoning of earlier turns ("preserved thinking": it asks for the complete `reasoning_content` back on the assistant message) | <https://docs.z.ai/guides/capabilities/thinking-mode> |
+| LiteLLM | `reasoning_content` in a message and as a stream delta, for DeepSeek, Anthropic, Bedrock, Vertex AI, OpenRouter, xAI, Google AI Studio, Perplexity, Mistral, Groq (and `thinking_blocks` for Anthropic only, which this client does not read) | `reasoning_effort` (`low`, `medium`, `high`, across providers); `{"type": "enabled", "budget_tokens": n}` as `thinking` for Anthropic models | <https://docs.litellm.ai/docs/reasoning_content> |
+| vLLM | `reasoning` (current: "the primary field... previously `reasoning_content`, now deprecated"), a delta in a stream | model-dependent `chat_template_kwargs`: `{"thinking": true}` (DeepSeek-V3.1, Granite 3.2), `{"enable_thinking": false}` to turn off what is on by default (Qwen3); `reasoning_effort` for Gemma 4 | <https://docs.vllm.ai/en/latest/features/reasoning_outputs.html> |
+| OpenRouter | `reasoning` (a string) and `reasoning_details` (a structured array) in a message; in a stream's delta the page names `reasoning_details` (`delta.reasoning` as a string is *unverified* from the page, read as the same member) | `{"reasoning": {"effort": "low".."high" or "max_tokens": n or "exclude": true}}` | <https://openrouter.ai/docs/use-cases/reasoning-tokens> |
+| Ollama | the OpenAI-compatible endpoint takes `reasoning_effort` and `reasoning.effort`; the **name of its response field** there is *unverified* (the page says `message.thinking` for the native API only) | `reasoning_effort` | <https://docs.ollama.com/api/openai-compatibility> |
+
 ## Errors
 
 Failures map onto `adam_model::ModelError`, which is classified (see
@@ -71,8 +106,8 @@ An error object inside a `200` or a stream is `RateLimited` for a
 `rate_limit` type, `ContextLength` for a context-length code, `InvalidRequest`
 for `invalid_request` or `authentication`, and `Transient` for anything else.
 
-`OpenAiConfigError` (from `OpenAiCompatible::new`) is `Invalid` for
-`InvalidBaseUrl`, `InvalidHeader` and `InvalidApiKey`, and `Internal` for
+`OpenAiConfigError` (from `OpenAiCompatible::new` and `with_extra_body`) is `Invalid` for
+`InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey` and `ReservedBodyKey`, and `Internal` for
 `Client` (the HTTP client could not be built; the `reqwest` error is its
 `source`). No message carries the URL, the header value or the key.
 
@@ -83,7 +118,7 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
 ## Tests
 
 * `tests/http.rs`: the client against a `wiremock` server (requests, streaming,
-  tool calls, error mapping and classes, timeouts, source chains). Always
+  tool calls, error mapping and classes, timeouts, source chains, reasoning in a stream and a completion, the extra body on every request, reasoning sent back only when echoed). Always
   runs, no network.
 * Unit tests: `src/errors.rs` (`status_mapping`), `src/lib.rs`
   (`config_error_class_table`, `debug_shows_the_gateway_by_scheme_and_host_only`) and `src/wire.rs` (the request shape, including several text parts

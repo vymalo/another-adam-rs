@@ -1350,6 +1350,19 @@ the same words whole under the recorded stream id); a failure in the middle of t
 the event fits a `NOTIFY` payload between processes; and a client that did not activate the extension, and a blocking
 `message/send`, get the whole reply with the turn as ever.
 
+### Reasoning: what the model thinks, beside the words
+
+A model in thinking mode writes its reasoning before its answer, and the same streamed model step carries it
+([ADR 0020](decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md), with its sequence and state diagrams).
+`ModelClient::stream` yields `ModelDelta::Reasoning` pieces (`crates/adam-model-openai/src/wire.rs` reads
+`reasoning_content` and `reasoning`), `stream_response` (`crates/adam-llm-agent/src/text_stream.rs`) sends them as
+`RunEvent::ReasoningDelta` events of a stream of its own, ended before the words of the turn begin, and the subscription of
+`adam-a2a-runtime` turns each into a `text-stream/v1` chunk marked `"kind": "reasoning"` for a client that activated the
+extension. Nothing states it whole and nothing records it: the step drops it from the response before the journal, so it is in no
+run output, `turn_output` or step, and a replay sends none. What it does not say: the model is not sent its reasoning again unless
+its client is set to echo it (`MODEL_ECHO_REASONING`), which DeepSeek's thinking mode with tools requires, and `MODEL_EXTRA_BODY` is
+how a deployment asks a model that needs a flag to think.
+
 ## The run lifecycle
 
 `RunStatus` (`crates/adam-core/src/store/mod.rs`) has four values: `Runnable`,

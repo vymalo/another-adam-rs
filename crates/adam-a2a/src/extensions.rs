@@ -49,6 +49,11 @@ pub const STEPS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/step
 /// to a client whose request activated the extension.
 pub const TEXT_STREAM_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/text-stream/v1";
 
+/// The `kind` of a `text-stream/v1` chunk that carries the model's **reasoning**, not its reply:
+/// in the chunk's metadata entry under [`TEXT_STREAM_EXTENSION`], `{"offset": .., "kind": "reasoning"}`.
+/// A chunk with no `kind` is a reply. Added to `text-stream/v1` on 2026-10-05, additively (ADR 0020).
+pub const TEXT_STREAM_KIND_REASONING: &str = "reasoning";
+
 /// The URI of the `mentions/v1` extension: a message carries the agents the person mentioned in it
 /// (`agentId`, label, position in the text), in the metadata under this URI.
 pub const MENTIONS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/mentions/v1";

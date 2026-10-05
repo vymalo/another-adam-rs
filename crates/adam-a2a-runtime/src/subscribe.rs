@@ -151,6 +151,31 @@ impl Tracker {
                 .map(|chunk| vec![TaskEvent::Artifact(chunk)])
                 .unwrap_or_default()
             }
+            RunEvent::ReasoningDelta {
+                stream,
+                offset,
+                text,
+                last,
+                abandoned,
+            } => {
+                // Only to a client that activated the extension, and only as a chunk: reasoning is
+                // not the answer, so no status message states it whole, and a client that did not
+                // activate it reads nothing of it.
+                if !self.text_stream {
+                    return Vec::new();
+                }
+                text_stream::reasoning_chunk(
+                    &self.task_id,
+                    &self.context_id,
+                    &stream,
+                    offset,
+                    text,
+                    last,
+                    abandoned,
+                )
+                .map(|chunk| vec![TaskEvent::Artifact(chunk)])
+                .unwrap_or_default()
+            }
             RunEvent::Custom { kind, payload } => {
                 // The words of a turn that were streamed, said whole: a status of their own, with the
                 // stream's id, so the chunks they are the text of are known by it.

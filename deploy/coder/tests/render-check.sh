@@ -56,6 +56,38 @@ golden="$chart/tests/golden/combined.yaml"
 # command above, at the same --namespace and --set, only for a deliberate change).
 check "the default render equals tests/golden/combined.yaml" cmp -s "$out" "$golden"
 
+# The model's reasoning (ADR 0020 of adam-rs): MODEL_EXTRA_BODY is a value of the chart, not a secret,
+# empty by default (nothing is rendered), and a JSON object when it is set. MODEL_ECHO_REASONING likewise.
+check "by default no MODEL_EXTRA_BODY and no MODEL_ECHO_REASONING are rendered" \
+  lacks 'MODEL_EXTRA_BODY|MODEL_ECHO_REASONING'
+helm_reasoning() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }
+helm_reasoning --set config.modelExtraBody.reasoning_effort=medium --set config.modelEchoReasoning=reasoning_content > "$out"
+check "a map becomes MODEL_EXTRA_BODY as compact JSON, in the StatefulSet's env" \
+  dhas StatefulSet 'name: MODEL_EXTRA_BODY'
+check "... with the JSON as its value" dhas StatefulSet 'value: "\{\\"reasoning_effort\\":\\"medium\\"\}"'
+check "... and it is a plain value, never a secret reference" \
+  dlacks Secret 'MODEL_EXTRA_BODY'
+check "config.modelEchoReasoning becomes MODEL_ECHO_REASONING" \
+  dhas StatefulSet 'value: "reasoning_content"'
+printf 'config:\n  modelExtraBody: |\n    {"thinking": {"type": "enabled"}}\n' > "$vals"
+helm_reasoning -f "$vals" > "$out"
+check "a JSON string is taken as written" dhas StatefulSet 'name: MODEL_EXTRA_BODY'
+helm_reasoning -f "$vals" --set config.role=control-plane > "$out"
+check "a control plane runs no model: it renders neither variable" lacks 'MODEL_EXTRA_BODY|MODEL_ECHO_REASONING'
+for bad in '{oops' '[1]' '"text"' '{"model":"x"}' '{"stream":true}'; do
+  printf 'config:\n  modelExtraBody: %s\n' "'$bad'" > "$vals"
+  check "modelExtraBody $bad is refused" fails helm_reasoning -f "$vals"
+done
+printf 'config:\n  modelExtraBody: |\n    {"thinking": {"type": "enabled"}}\n' > "$vals"
+check "modelExtraBody and extraEnv MODEL_EXTRA_BODY together are refused" \
+  fails helm_reasoning -f "$vals" --set-string config.extraEnv.MODEL_EXTRA_BODY={}
+check "modelEchoReasoning other than reasoning_content or reasoning is refused" \
+  fails helm_reasoning --set config.modelEchoReasoning=yes
+check "modelEchoReasoning and extraEnv MODEL_ECHO_REASONING together are refused" \
+  fails helm_reasoning --set config.modelEchoReasoning=reasoning_content --set-string config.extraEnv.MODEL_ECHO_REASONING=reasoning
+# The checks below read the default render again.
+helm_reasoning > "$out"
+
 # Local-process MCP servers are the coder's alone to allow (ADR 0009, decision 8): the image sets nothing.
 # The shipped mcp.json no longer starts one (the GitHub MCP server is a sidecar, ADR 0017, D4), but the worker
 # keeps the variable for one release, for a vendored agent folder that still does.

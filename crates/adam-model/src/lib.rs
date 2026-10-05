@@ -17,6 +17,15 @@
 //! {"role":"tool","call_id":"call_1","content":"18C, sunny","is_error":false}
 //! ```
 //!
+//! # Reasoning
+//!
+//! A model in thinking mode writes its reasoning before its answer. It reaches a caller as
+//! [`ModelDelta::Reasoning`] pieces while the model writes and whole as [`ModelResponse::reasoning`].
+//! It is **not part of the answer**: [`Message::text`] never holds it, and it is not part of the
+//! history, so a client does not send it back, with one exception that the client chooses: a
+//! provider that **requires** it (DeepSeek's thinking mode with tools, *verified 2026-10-05*) is
+//! served by a client set to echo it, which then keeps it in [`Message::Assistant::reasoning`].
+//!
 //! # Testing agents
 //!
 //! [`MockModel`] is a scripted [`ModelClient`] that records the requests it

@@ -12,6 +12,8 @@
 //! | `MODEL_BASE_URL` | OpenAI-compatible gateway, with its `/v1` prefix ([`ModelConfig`]) | required for `all` and `worker` |
 //! | `MODEL_API_KEY` | bearer token for it (may be empty for local servers) | required for `all` and `worker` |
 //! | `MODEL` | model alias of the agent | required for `all` and `worker` |
+//! | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request, to make a gateway or a model emit its reasoning (`{"reasoning_effort":"medium"}`); **not secret**; an invalid value is a startup error ([`ModelConfig::extra_body`]) | unset (nothing added) |
+//! | `MODEL_ECHO_REASONING` | send the reasoning of earlier turns back, under this member name (`reasoning_content` or `reasoning`), for a provider that requires it (DeepSeek's thinking mode with tools); `false` or unset sends none ([`ModelConfig::echo_reasoning`]) | unset (never sent) |
 //! | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the MCP servers of an agent folder may be ([`McpSettings`], feature `mcp`) | `false` each |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400; [`McpSettings`], feature `mcp`) | `3600` |
 //!
@@ -43,7 +45,9 @@ use std::str::FromStr;
 use adam_error::{Classify, ErrorClass};
 use adam_host::Role;
 use adam_model::DynModel;
-use adam_model_openai::{OpenAiCompatible, OpenAiConfig, OpenAiConfigError, endpoint_for_logs};
+use adam_model_openai::{
+    OpenAiCompatible, OpenAiConfig, OpenAiConfigError, ReasoningField, endpoint_for_logs,
+};
 use secrecy::SecretString;
 use url::Url;
 
@@ -340,6 +344,13 @@ pub struct ModelConfig {
     pub api_key: SecretString,
     /// `MODEL`: the model alias the gateway knows.
     pub alias: String,
+    /// `MODEL_EXTRA_BODY`: members merged into every request body (a flag that makes the model
+    /// emit its reasoning). Not secret, and never a member the runtime owns (`model`, `messages`,
+    /// `tools`, `tool_choice`, `stream`). `None` when unset or `{}`.
+    pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    /// `MODEL_ECHO_REASONING`: the member name under which the reasoning of earlier turns is sent
+    /// back; `None` (the default) sends none.
+    pub echo_reasoning: Option<ReasoningField>,
 }
 
 impl std::fmt::Debug for ModelConfig {
@@ -348,6 +359,15 @@ impl std::fmt::Debug for ModelConfig {
             // The gateway's address is a secret of the deployment: scheme and host only.
             .field("base_url", &endpoint_for_logs(&self.base_url))
             .field("alias", &self.alias)
+            // The members, not their values.
+            .field(
+                "extra_body",
+                &self
+                    .extra_body
+                    .as_ref()
+                    .map(|m| m.keys().collect::<Vec<_>>()),
+            )
+            .field("echo_reasoning", &self.echo_reasoning)
             .finish_non_exhaustive()
     }
 }
@@ -379,6 +399,8 @@ impl ModelConfig {
             base_url,
             api_key: SecretString::from(api_key),
             alias,
+            extra_body: parse_extra_body(&get("MODEL_EXTRA_BODY"), problems),
+            echo_reasoning: parse_echo_reasoning(&get("MODEL_ECHO_REASONING"), problems),
         }
     }
 
@@ -389,9 +411,72 @@ impl ModelConfig {
     /// [`OpenAiConfigError`] for a `MODEL_BASE_URL` that is not an absolute http(s) URL or a key
     /// that cannot be a header value.
     pub fn client(&self) -> Result<DynModel, OpenAiConfigError> {
-        Ok(std::sync::Arc::new(OpenAiCompatible::new(
-            OpenAiConfig::new(self.base_url.clone(), self.api_key.clone()),
-        )?))
+        let mut client = OpenAiCompatible::new(OpenAiConfig::new(
+            self.base_url.clone(),
+            self.api_key.clone(),
+        ))?
+        .with_echo_reasoning(self.echo_reasoning);
+        if let Some(extra) = &self.extra_body {
+            client = client.with_extra_body(extra.clone())?;
+        }
+        Ok(std::sync::Arc::new(client))
+    }
+}
+
+/// `MODEL_EXTRA_BODY`: a JSON object, or a problem. The message names what is wrong and never
+/// repeats the value (a parse error of `serde_json` says where, not what).
+fn parse_extra_body(
+    raw: &Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let raw = raw.as_deref()?;
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(e) => {
+            problems.push(format!(
+                "MODEL_EXTRA_BODY is not valid JSON ({}, line {} column {})",
+                match e.classify() {
+                    serde_json::error::Category::Eof => "it ends too soon",
+                    _ => "it does not parse",
+                },
+                e.line(),
+                e.column()
+            ));
+            return None;
+        }
+    };
+    let serde_json::Value::Object(map) = value else {
+        problems.push(
+            "MODEL_EXTRA_BODY must be a JSON object, like {\"reasoning_effort\":\"medium\"}".into(),
+        );
+        return None;
+    };
+    for key in ["model", "messages", "tools", "tool_choice", "stream"] {
+        if map.contains_key(key) {
+            problems.push(format!(
+                "MODEL_EXTRA_BODY may not set `{key}`: the runtime owns it"
+            ));
+            return None;
+        }
+    }
+    Some(map).filter(|map| !map.is_empty())
+}
+
+/// `MODEL_ECHO_REASONING`: `reasoning_content`, `reasoning`, or off (`false`, `off`, `no`, `0`).
+fn parse_echo_reasoning(
+    raw: &Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<ReasoningField> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("false" | "off" | "no" | "0") => None,
+        Some("reasoning_content") => Some(ReasoningField::ReasoningContent),
+        Some("reasoning") => Some(ReasoningField::Reasoning),
+        Some(_) => {
+            problems.push(
+                "MODEL_ECHO_REASONING must be `reasoning_content`, `reasoning` or `false`".into(),
+            );
+            None
+        }
     }
 }
 
@@ -761,6 +846,80 @@ mod tests {
         let mut problems = Vec::new();
         let model = ModelConfig::parse(&lookup(vars), &mut problems);
         (model, problems)
+    }
+
+    fn model_vars() -> Vars {
+        HashMap::from([
+            ("MODEL_BASE_URL", "https://gw.example/v1"),
+            ("MODEL_API_KEY", "sk-secret"),
+            ("MODEL", "large"),
+        ])
+    }
+
+    #[test]
+    fn the_extra_body_is_a_json_object_or_a_startup_problem() {
+        let mut vars = model_vars();
+        // Unset, blank and `{}` add nothing.
+        for none in [None, Some(""), Some("  "), Some("{}")] {
+            if let Some(v) = none {
+                vars.insert("MODEL_EXTRA_BODY", v);
+            }
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{none:?}: {problems:?}");
+            assert!(model.extra_body.is_none(), "{none:?}");
+        }
+        vars.insert(
+            "MODEL_EXTRA_BODY",
+            r#"{"reasoning_effort":"medium","chat_template_kwargs":{"enable_thinking":true}}"#,
+        );
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        let extra = model.extra_body.as_ref().expect("an extra body");
+        assert_eq!(extra["reasoning_effort"], "medium");
+        // Its members show in `Debug`, its values do not.
+        let shown = format!("{model:?}");
+        assert!(shown.contains("reasoning_effort"), "{shown}");
+        assert!(!shown.contains("medium"), "{shown}");
+        model.client().expect("a usable client");
+
+        // Not JSON, not an object, or a member the runtime owns: a problem that names the variable
+        // and does not repeat the value.
+        for bad in [
+            "{oops",
+            "[1]",
+            "\"a string\"",
+            "null",
+            r#"{"model":"x"}"#,
+            r#"{"stream":false}"#,
+            r#"{"messages":[]}"#,
+        ] {
+            vars.insert("MODEL_EXTRA_BODY", bad);
+            let (model, problems) = model_problems(&vars);
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert!(mentions(&problems, "MODEL_EXTRA_BODY"), "{problems:?}");
+            assert!(!problems[0].contains("a string"), "{}", problems[0]);
+            assert!(model.extra_body.is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn reasoning_is_echoed_only_when_asked_and_under_a_name_that_is_checked() {
+        let mut vars = model_vars();
+        assert_eq!(model_problems(&vars).0.echo_reasoning, None);
+        for (value, want) in [
+            ("reasoning_content", Some(ReasoningField::ReasoningContent)),
+            ("reasoning", Some(ReasoningField::Reasoning)),
+            ("false", None),
+            ("off", None),
+        ] {
+            vars.insert("MODEL_ECHO_REASONING", value);
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{value}: {problems:?}");
+            assert_eq!(model.echo_reasoning, want, "{value}");
+        }
+        vars.insert("MODEL_ECHO_REASONING", "yes please");
+        let (_, problems) = model_problems(&vars);
+        assert!(mentions(&problems, "MODEL_ECHO_REASONING"), "{problems:?}");
     }
 
     #[test]

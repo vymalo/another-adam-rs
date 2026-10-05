@@ -7,7 +7,9 @@ use adam_model::{
     Classify, ErrorClass, FinishReason, Message, ModelClient, ModelDelta, ModelError, ModelRequest,
     ToolChoice, ToolSpec, Usage,
 };
-use adam_model_openai::{MaxTokensField, OpenAiCompatible, OpenAiConfig};
+use adam_model_openai::{
+    MaxTokensField, OpenAiCompatible, OpenAiConfig, OpenAiConfigError, ReasoningField,
+};
 use futures::StreamExt;
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -190,6 +192,7 @@ async fn tool_results_round_trip_into_the_next_request() {
             name: "weather".into(),
             arguments: json!({"city": "Paris"}),
         }],
+        reasoning: None,
     });
     req.messages.push(Message::tool_result("call_9", "18C"));
     client(&server).complete(req).await.unwrap();
@@ -625,4 +628,209 @@ async fn a_malformed_body_keeps_the_parser_error_as_its_source() {
         source.downcast_ref::<serde_json::Error>().is_some(),
         "{source:?}"
     );
+}
+
+// --------------------------------------------------------------- reasoning --
+
+fn plain_client(server: &MockServer) -> OpenAiCompatible {
+    OpenAiCompatible::new(OpenAiConfig::new(
+        format!("{}/v1", server.uri()),
+        SecretString::from(KEY),
+    ))
+    .expect("client")
+}
+
+#[tokio::test]
+async fn a_streamed_reasoning_arrives_before_the_answer_under_either_name() {
+    // DeepSeek, GLM and LiteLLM say `reasoning_content`; OpenRouter, Ollama and current vLLM `reasoning`.
+    for name in ["reasoning_content", "reasoning"] {
+        let server = MockServer::start().await;
+        let thought =
+            |text: &str| json!({"choices": [{"index": 0, "delta": {name: text}}]}).to_string();
+        let thought_1 = thought("The user asks ");
+        let thought_2 = thought("for the weather.");
+        mount(
+            &server,
+            sse(&[
+                &thought_1,
+                &thought_2,
+                r#"{"choices":[{"index":0,"delta":{"content":"Sunny."}}]}"#,
+                r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+                "[DONE]",
+            ]),
+        )
+        .await;
+        let items = collect(plain_client(&server).stream(request()).await.unwrap()).await;
+        let items: Vec<_> = items.into_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            items[..3],
+            [
+                ModelDelta::Reasoning("The user asks ".into()),
+                ModelDelta::Reasoning("for the weather.".into()),
+                ModelDelta::Text("Sunny.".into()),
+            ],
+            "{name}"
+        );
+        let ModelDelta::Finished(response) = items.last().unwrap() else {
+            panic!("{items:?}")
+        };
+        assert_eq!(
+            response.reasoning.as_deref(),
+            Some("The user asks for the weather.")
+        );
+        // The answer is the answer; the history does not keep the reasoning.
+        assert_eq!(response.message.text(), "Sunny.");
+        assert_eq!(response.message.reasoning(), None);
+    }
+}
+
+#[tokio::test]
+async fn a_completions_reasoning_is_the_responses_not_the_messages() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"role": "assistant", "content": "Sunny.",
+                                     "reasoning_content": "Look it up."}, "finish_reason": "stop"}]
+        })),
+    )
+    .await;
+    let response = plain_client(&server).complete(request()).await.unwrap();
+    assert_eq!(response.reasoning.as_deref(), Some("Look it up."));
+    assert_eq!(response.message.text(), "Sunny.");
+    assert_eq!(response.message.reasoning(), None);
+}
+
+/// A history that holds reasoning (a client that echoes it kept it) is sent without it by a client that
+/// does not, and with it, under the chosen name, by one that does.
+#[tokio::test]
+async fn reasoning_goes_back_only_through_a_client_set_to_echo_it() {
+    let history = || {
+        let mut req = request();
+        req.messages.push(Message::Assistant {
+            content: vec![],
+            tool_calls: vec![adam_model::ToolCall {
+                id: "call_1".into(),
+                name: "weather".into(),
+                arguments: json!({}),
+            }],
+            reasoning: Some("I should call the tool.".into()),
+        });
+        req.messages.push(Message::tool_result("call_1", "18C"));
+        req
+    };
+    let ok = || {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "18C"}, "finish_reason": "stop"}]
+        }))
+    };
+
+    let server = MockServer::start().await;
+    mount(&server, ok()).await;
+    plain_client(&server).complete(history()).await.unwrap();
+    let body = sent_body(&server).await.to_string();
+    assert!(
+        !body.contains("reasoning") && !body.contains("I should call"),
+        "{body}"
+    );
+
+    for (field, name) in [
+        (ReasoningField::ReasoningContent, "reasoning_content"),
+        (ReasoningField::Reasoning, "reasoning"),
+    ] {
+        let server = MockServer::start().await;
+        mount(&server, ok()).await;
+        plain_client(&server)
+            .with_echo_reasoning(Some(field))
+            .complete(history())
+            .await
+            .unwrap();
+        let body = sent_body(&server).await;
+        assert_eq!(
+            body["messages"][2][name], "I should call the tool.",
+            "{name}"
+        );
+        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call_1");
+    }
+}
+
+/// An echoing client keeps what the model thought in the message it returns, so that the next request
+/// carries it; a client that does not, returns the message without it.
+#[tokio::test]
+async fn an_echoing_client_keeps_the_reasoning_in_the_message_it_returns() {
+    let sse_body = || {
+        sse(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"Think."}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"Done."},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ])
+    };
+    let server = MockServer::start().await;
+    mount(&server, sse_body()).await;
+    let client = plain_client(&server).with_echo_reasoning(Some(ReasoningField::ReasoningContent));
+    let items = collect(client.stream(request()).await.unwrap()).await;
+    let Some(Ok(ModelDelta::Finished(response))) = items.into_iter().last() else {
+        panic!("a final message")
+    };
+    assert_eq!(response.message.reasoning(), Some("Think."));
+    assert_eq!(response.message.text(), "Done.");
+    assert_eq!(response.reasoning.as_deref(), Some("Think."));
+}
+
+#[tokio::test]
+async fn the_extra_body_is_sent_with_every_request_streamed_or_not() {
+    let extra = json!({"reasoning_effort": "medium", "thinking": {"type": "enabled"}});
+    let extra = extra.as_object().unwrap().clone();
+    for streaming in [false, true] {
+        let server = MockServer::start().await;
+        if streaming {
+            mount(
+                &server,
+                sse(&[
+                    r#"{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":"stop"}]}"#,
+                    "[DONE]",
+                ]),
+            )
+            .await;
+        } else {
+            mount(
+                &server,
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}]
+                })),
+            )
+            .await;
+        }
+        let client = plain_client(&server)
+            .with_extra_body(extra.clone())
+            .unwrap();
+        if streaming {
+            collect(client.stream(request()).await.unwrap()).await;
+        } else {
+            client.complete(request()).await.unwrap();
+        }
+        let body = sent_body(&server).await;
+        assert_eq!(body["reasoning_effort"], "medium", "streaming {streaming}");
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+        assert_eq!(body["model"], "gw-model");
+        assert_eq!(body["messages"][1]["content"], "weather in Paris?");
+    }
+}
+
+#[test]
+fn an_extra_body_may_not_set_what_the_client_owns() {
+    for key in ["model", "messages", "tools", "tool_choice", "stream"] {
+        let extra = json!({ key: 1, "ok": true }).as_object().unwrap().clone();
+        let client = OpenAiCompatible::new(OpenAiConfig::new(
+            "https://gw.example/v1",
+            SecretString::from(KEY),
+        ))
+        .unwrap();
+        let error = client.with_extra_body(extra).unwrap_err();
+        assert!(
+            matches!(&error, OpenAiConfigError::ReservedBodyKey(k) if k == key),
+            "{key}"
+        );
+        assert_eq!(error.class(), ErrorClass::Invalid);
+    }
 }

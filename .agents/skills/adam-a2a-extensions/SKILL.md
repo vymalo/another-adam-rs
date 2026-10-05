@@ -36,7 +36,7 @@ siblings (`ui-catalog-v1.md`, `thread-tools-v1.md`, `steps-v1.md`, `text-stream-
 | `mentions/v1` | `MENTIONS_EXTENSION` | the agent reads the agents a person mentioned and asks them | `adam_ui::card_extensions()` |
 | `steer/v1` | `STEER_EXTENSION` | a message naming a `submitted` or `working` task is added to its input and read at its next step | `adam_ui::card_extensions()` |
 | `steps/v1` | `STEPS_EXTENSION` | tool calls and sub-agents' work as nested steps | `adam-agent` and `adam-coder` add it (`ExtensionConfig::steps()`) |
-| `text-stream/v1` | `TEXT_STREAM_EXTENSION` | the reply streamed as the model writes it, then the whole text once | `adam-agent` and `adam-coder` add it (`ExtensionConfig::text_stream()`) |
+| `text-stream/v1` | `TEXT_STREAM_EXTENSION` | the reply streamed as the model writes it, then the whole text once; since 2026-10-05 also the model's **reasoning**, as chunks with `kind: "reasoning"` (`TEXT_STREAM_KIND_REASONING`), its own `artifactId`, never stated whole (ADR 0020) | `adam-agent` and `adam-coder` add it (`ExtensionConfig::text_stream()`) |
 
 The URIs are `https://agents.vymalo.com/a2a/extensions/<name>/v1` (A2UI has its own URI);
 read the exact strings in the file at your rev.
@@ -89,6 +89,8 @@ read the exact strings in the file at your rev.
 * An extension not named by the client is off: `steps/v1` and `text-stream/v1` send plain text
   and the whole reply to a client that did not activate them.
 * A URI with another case, version or trailing slash does not match: copy it from the card.
+* A `text-stream/v1` chunk with `kind: "reasoning"` is the model's reasoning, not the reply: a reader that does not read `kind`
+  shows it as a reply, so update the reader before the agents (ADR 0020).
 * `steer/v1` without activation on a working task is refused as plain A2A leaves it undefined.
 * `AgentCardConfig.extensions` only advertises; the behaviour is in the runtime and the tools.
 * The contracts live in another repository: read them at a rev that matches your adam-rs rev.

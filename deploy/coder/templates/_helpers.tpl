@@ -79,6 +79,19 @@ the chart accepts an empty value or this one, and refuses anything else. Keep it
 {{- define "coder.modelBaseUrlPlaceholder" -}}https://gateway.example.invalid/v1{{- end -}}
 
 {{/*
+config.modelExtraBody as the JSON text MODEL_EXTRA_BODY holds: a map is rendered as compact JSON, a
+string is used as written, and empty (or an empty map) is nothing at all.
+*/}}
+{{- define "coder.modelExtraBody" -}}
+{{- $v := .Values.config.modelExtraBody -}}
+{{- if kindIs "string" $v -}}
+{{- trim $v -}}
+{{- else if $v -}}
+{{- toJson $v -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Whether config.modelBaseUrl holds a URL somebody chose: not empty and not the placeholder above.
 Renders "true" or nothing.
 */}}

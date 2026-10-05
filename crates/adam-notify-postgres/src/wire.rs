@@ -230,6 +230,13 @@ mod tests {
                 last: false,
                 abandoned: false,
             },
+            RunEvent::ReasoningDelta {
+                stream: "run-r0-a1b2c3d4".into(),
+                offset: 0,
+                text: "The user asks".into(),
+                last: false,
+                abandoned: false,
+            },
         ];
         for event in events {
             let Encoded::Fits(json) = encode_event(origin, run, "agent", &event) else {
@@ -352,6 +359,30 @@ mod tests {
             encode_event(Uuid::new_v4(), RunId::new(), "a", &wide),
             Encoded::Fits(_)
         ));
+    }
+
+    /// Reasoning has a text delta's bounds, so its largest piece crosses whole too; and a process that
+    /// predates the variant cannot read it (it is not text: it is dropped, never shown as the answer).
+    #[test]
+    fn the_largest_reasoning_delta_fits_a_payload_and_is_not_a_text_delta() {
+        for character in ['\u{0}', '\u{1f}', '"', 'a'] {
+            let delta = RunEvent::ReasoningDelta {
+                stream: "s".repeat(MAX_STREAM_ID_BYTES),
+                offset: u64::MAX,
+                text: character.to_string().repeat(MAX_TEXT_DELTA_BYTES),
+                last: true,
+                abandoned: true,
+            };
+            let Encoded::Fits(json) =
+                encode_event(Uuid::new_v4(), RunId::new(), &"a".repeat(64), &delta)
+            else {
+                panic!("the largest reasoning delta of {character:?} fits");
+            };
+            assert!(json.len() < MAX_PAYLOAD_BYTES, "{} bytes", json.len());
+            assert_eq!(decode(&json).event, delta);
+            assert!(json.contains("\"reasoning_delta\""), "{json}");
+            assert!(!json.contains("\"text_delta\""), "{json}");
+        }
     }
 
     #[test]

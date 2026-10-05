@@ -141,6 +141,15 @@ spec:
               {{- end }}
             - name: MODEL
               value: {{ .Values.config.model | quote }}
+            {{- with include "coder.modelExtraBody" . }}
+            {{- /* config.modelExtraBody: a JSON object merged into every model request (not a secret). */}}
+            - name: MODEL_EXTRA_BODY
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.config.modelEchoReasoning }}
+            - name: MODEL_ECHO_REASONING
+              value: {{ . | quote }}
+            {{- end }}
             - name: OPENCODE_MODEL
               value: {{ .Values.config.opencodeModel | quote }}
             - name: WORKERS

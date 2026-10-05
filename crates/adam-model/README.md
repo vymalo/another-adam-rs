@@ -39,6 +39,18 @@ let resp = model.complete(req).await.unwrap();
 assert_eq!(resp.message.text(), "hello");
 ```
 
+### Reasoning
+
+A model in thinking mode writes its reasoning before the answer: it arrives as `ModelDelta::Reasoning`
+pieces and, whole, as `ModelResponse.reasoning` (`Option<String>`). It is for people to read and **not part of
+the answer**: `Message::text()` never holds it and `Message` does not carry it, with one exception chosen by the
+client: `Message::Assistant.reasoning` is `Some` only for a client set to **echo** reasoning (a provider that
+requires it back, DeepSeek's thinking mode with tools; [`adam-model-openai`](../adam-model-openai/README.md#reasoning)).
+It is written only when present, so a history stored before it existed and one of a client that does not echo are
+the same bytes. **Breaking for code that builds these types with struct literals:** `ModelResponse` and
+`Message::Assistant` have a new field, and `ModelDelta` a new variant (`match`es over it need an arm).
+`MockModel::stream` replays `ModelResponse.reasoning` as a `Reasoning` delta before the text.
+
 The persisted JSON shapes of `Message` are shown in the crate docs
 (`src/lib.rs`) and are meant to stay stable.
 

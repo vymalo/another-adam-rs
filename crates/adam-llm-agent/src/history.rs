@@ -43,11 +43,14 @@ fn message_chars(m: &Message) -> usize {
         Message::Assistant {
             content,
             tool_calls,
+            reasoning,
         } => {
-            content
-                .iter()
-                .map(|p| p.as_text().chars().count())
-                .sum::<usize>()
+            // The reasoning a client echoes is sent, so it counts.
+            reasoning.as_deref().map_or(0, |r| r.chars().count())
+                + content
+                    .iter()
+                    .map(|p| p.as_text().chars().count())
+                    .sum::<usize>()
                 + tool_calls
                     .iter()
                     .map(|c| c.name.chars().count() + c.arguments.to_string().chars().count())
@@ -126,6 +129,7 @@ mod tests {
                 name: "t".into(),
                 arguments: json!({}),
             }],
+            reasoning: None,
         }
     }
 
@@ -250,6 +254,7 @@ mod tests {
                             arguments: json!({ "x": args }),
                         })
                         .collect(),
+                    reasoning: None,
                 }),
                 ("[a-z]{1,3}", "\\PC{0,700}", any::<bool>()).prop_map(|(id, out, err)| {
                     if err {
