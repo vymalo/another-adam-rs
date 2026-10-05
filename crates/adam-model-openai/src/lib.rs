@@ -50,6 +50,14 @@
 //!   `max_completion_tokens`; use [`OpenAiCompatible::with_max_tokens_field`].
 //! * **`metadata`** is sent as the request's `metadata` object only when
 //!   non-empty.
+//! * **Reasoning** (*sources and dates in the crate README*): `delta.reasoning_content` (DeepSeek, GLM,
+//!   LiteLLM) and `delta.reasoning` (OpenRouter, Ollama, current vLLM) of a stream arrive as
+//!   [`ModelDelta::Reasoning`], and `message.reasoning_content` / `message.reasoning` of a
+//!   completion as [`ModelResponse::reasoning`]; a value that is not a string is ignored. It is
+//!   never the answer's text and, unless [`with_echo_reasoning`](OpenAiCompatible::with_echo_reasoning)
+//!   is set, never in the history and never sent back.
+//! * **[`with_extra_body`](OpenAiCompatible::with_extra_body)** merges a JSON object into every
+//!   request, for a flag that makes a model emit reasoning.
 
 #![warn(missing_docs)]
 
@@ -62,7 +70,7 @@ use std::fmt;
 use std::time::{Duration, SystemTime};
 
 use adam_error::{BoxError, Classify, ErrorClass};
-use adam_model::{ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse};
+use adam_model::{Message, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse};
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -144,6 +152,26 @@ pub enum MaxTokensField {
     MaxCompletionTokens,
 }
 
+/// The name of the member that carries a model's reasoning when a client sends it back
+/// ([`OpenAiCompatible::with_echo_reasoning`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningField {
+    /// `reasoning_content`: DeepSeek, GLM (Z.ai), LiteLLM.
+    ReasoningContent,
+    /// `reasoning`: OpenRouter, current vLLM.
+    Reasoning,
+}
+
+impl ReasoningField {
+    /// The JSON member name.
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::ReasoningContent => "reasoning_content",
+            Self::Reasoning => "reasoning",
+        }
+    }
+}
+
 /// The configuration could not be turned into a client.
 ///
 /// Classified as [`ErrorClass::Invalid`] (the configuration is wrong), except
@@ -167,6 +195,9 @@ pub enum OpenAiConfigError {
     /// The API key contains characters that cannot appear in a header.
     #[error("api_key is not a valid bearer token")]
     InvalidApiKey,
+    /// The extra request body sets a member the runtime owns.
+    #[error("the extra request body may not set `{0}`: the runtime owns it")]
+    ReservedBodyKey(String),
     /// The HTTP client could not be built (for example, no TLS backend).
     #[error("could not build the HTTP client")]
     Client(#[source] BoxError),
@@ -175,9 +206,10 @@ pub enum OpenAiConfigError {
 impl Classify for OpenAiConfigError {
     fn class(&self) -> ErrorClass {
         match self {
-            Self::InvalidBaseUrl { .. } | Self::InvalidHeader(_) | Self::InvalidApiKey => {
-                ErrorClass::Invalid
-            }
+            Self::InvalidBaseUrl { .. }
+            | Self::InvalidHeader(_)
+            | Self::InvalidApiKey
+            | Self::ReservedBodyKey(_) => ErrorClass::Invalid,
             Self::Client(_) => ErrorClass::Internal,
         }
     }
@@ -192,6 +224,8 @@ pub struct OpenAiCompatible {
     url: String,
     timeout: Duration,
     max_tokens_field: MaxTokensField,
+    extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    echo_reasoning: Option<ReasoningField>,
 }
 
 impl fmt::Debug for OpenAiCompatible {
@@ -200,6 +234,15 @@ impl fmt::Debug for OpenAiCompatible {
             .field("url", &endpoint_for_logs(&self.url))
             .field("timeout", &self.timeout)
             .field("max_tokens_field", &self.max_tokens_field)
+            // Which members, not their values: an extra body is not a secret, but it is not a log line.
+            .field(
+                "extra_body",
+                &self
+                    .extra_body
+                    .as_ref()
+                    .map(|m| m.keys().collect::<Vec<_>>()),
+            )
+            .field("echo_reasoning", &self.echo_reasoning)
             .finish_non_exhaustive()
     }
 }
@@ -250,7 +293,65 @@ impl OpenAiCompatible {
             url: format!("{base}/chat/completions"),
             timeout: config.timeout,
             max_tokens_field: MaxTokensField::default(),
+            extra_body: None,
+            echo_reasoning: None,
         })
+    }
+
+    /// Members merged into the body of **every** request, at its top level (they win over what
+    /// the client wrote): a flag that makes a gateway or a model emit its reasoning, for example
+    /// `{"reasoning_effort": "medium"}`, `{"thinking": {"type": "enabled"}}` or
+    /// `{"chat_template_kwargs": {"enable_thinking": true}}`. Not secret: it is sent as written
+    /// and is not hidden from `Debug` beyond its member names. An empty object is no extra body.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenAiConfigError::ReservedBodyKey`] for a member the client owns: `model`, `messages`,
+    /// `tools`, `tool_choice` and `stream`.
+    pub fn with_extra_body(
+        mut self,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, OpenAiConfigError> {
+        if let Some(key) = wire::RESERVED_BODY_KEYS
+            .iter()
+            .find(|key| extra.contains_key(**key))
+        {
+            return Err(OpenAiConfigError::ReservedBodyKey((*key).to_owned()));
+        }
+        self.extra_body = Some(extra).filter(|extra| !extra.is_empty());
+        Ok(self)
+    }
+
+    /// Send the reasoning back: a model's reasoning is kept in the history
+    /// ([`Message::Assistant::reasoning`](adam_model::Message)) and goes out on its assistant
+    /// message under `field`'s name. **Off by default**, which is what almost every provider wants
+    /// (the reasoning of an earlier turn is not part of the conversation); on, for a provider that
+    /// requires it: DeepSeek's thinking mode with tools answers a request without the reasoning of
+    /// its earlier turns with a 400 (*verified 2026-10-05*,
+    /// <https://api-docs.deepseek.com/guides/thinking_mode>). On, the reasoning is also in the
+    /// run's stored history, and so in every later request.
+    pub fn with_echo_reasoning(mut self, field: Option<ReasoningField>) -> Self {
+        self.echo_reasoning = field;
+        self
+    }
+
+    fn options(&self) -> wire::RequestOptions<'_> {
+        wire::RequestOptions {
+            max_tokens_field: self.max_tokens_field,
+            extra_body: self.extra_body.as_ref(),
+            echo_reasoning: self.echo_reasoning,
+        }
+    }
+
+    /// `response` as this client reports it: the reasoning is kept in the message only when the
+    /// client echoes it.
+    fn echoed(&self, mut response: ModelResponse) -> ModelResponse {
+        if self.echo_reasoning.is_some()
+            && let Message::Assistant { reasoning, .. } = &mut response.message
+        {
+            reasoning.clone_from(&response.reasoning);
+        }
+        response
     }
 
     /// Choose the JSON field used for `max_output_tokens`.
@@ -314,10 +415,10 @@ fn transport_error(e: reqwest::Error) -> ModelError {
 impl ModelClient for OpenAiCompatible {
     #[tracing::instrument(name = "model.complete", skip_all, fields(model = %req.model, url = %self.url))]
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
-        let body = wire::build_request(&req, false, self.max_tokens_field)?;
+        let body = wire::build_request(&req, false, self.options())?;
         let response = self.send(body, false).await?;
         let bytes = response.bytes().await.map_err(transport_error)?;
-        let parsed = wire::parse_completion(&bytes);
+        let parsed = wire::parse_completion(&bytes).map(|r| self.echoed(r));
         match &parsed {
             Ok(r) => tracing::debug!(
                 finish = ?r.finish,
@@ -335,9 +436,17 @@ impl ModelClient for OpenAiCompatible {
         &self,
         req: ModelRequest,
     ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
-        let body = wire::build_request(&req, true, self.max_tokens_field)?;
+        let body = wire::build_request(&req, true, self.options())?;
         let response = self.send(body, true).await?;
-        Ok(sse::deltas(response.bytes_stream(), self.timeout).boxed())
+        let this = self.clone();
+        Ok(sse::deltas(response.bytes_stream(), self.timeout)
+            .map(move |item| {
+                item.map(|delta| match delta {
+                    ModelDelta::Finished(response) => ModelDelta::Finished(this.echoed(response)),
+                    other => other,
+                })
+            })
+            .boxed())
     }
 }
 
@@ -419,6 +528,7 @@ mod tests {
             OpenAiConfigError::InvalidBaseUrl { .. } => ErrorClass::Invalid,
             OpenAiConfigError::InvalidHeader(_) => ErrorClass::Invalid,
             OpenAiConfigError::InvalidApiKey => ErrorClass::Invalid,
+            OpenAiConfigError::ReservedBodyKey(_) => ErrorClass::Invalid,
             OpenAiConfigError::Client(_) => ErrorClass::Internal,
         };
         for e in [
@@ -428,6 +538,7 @@ mod tests {
             },
             OpenAiConfigError::InvalidHeader("x".into()),
             OpenAiConfigError::InvalidApiKey,
+            OpenAiConfigError::ReservedBodyKey("model".into()),
             OpenAiConfigError::Client(Box::new(Build)),
         ] {
             assert_eq!(e.class(), expected(&e), "{e}");

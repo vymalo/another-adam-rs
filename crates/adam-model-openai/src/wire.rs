@@ -10,8 +10,23 @@ use adam_model::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::MaxTokensField;
 use crate::errors::from_error_object;
+use crate::{MaxTokensField, ReasoningField};
+
+/// The members of a body that the runtime owns: `MODEL_EXTRA_BODY` may not set them.
+pub(crate) const RESERVED_BODY_KEYS: [&str; 5] =
+    ["model", "messages", "tools", "tool_choice", "stream"];
+
+/// What a client adds to every request beside the [`ModelRequest`] itself.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RequestOptions<'a> {
+    pub(crate) max_tokens_field: MaxTokensField,
+    /// Members merged into the body (they win over what the runtime wrote, except
+    /// [`RESERVED_BODY_KEYS`], which are refused when the client is built).
+    pub(crate) extra_body: Option<&'a serde_json::Map<String, Value>>,
+    /// Send the reasoning an assistant message keeps, under this name; `None` sends none.
+    pub(crate) echo_reasoning: Option<ReasoningField>,
+}
 
 // ---------------------------------------------------------------- request --
 
@@ -47,14 +62,19 @@ struct WireMessage<'a> {
     tool_calls: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<&'a str>,
+    /// The assistant's reasoning, under the name the provider wants (`reasoning_content` or
+    /// `reasoning`), only for a client set to echo it.
+    #[serde(flatten)]
+    reasoning: Option<BTreeMap<&'static str, &'a str>>,
 }
 
 /// Serialize `req` as a chat-completions body.
 pub(crate) fn build_request(
     req: &ModelRequest,
     stream: bool,
-    max_tokens_field: MaxTokensField,
+    options: RequestOptions<'_>,
 ) -> Result<Vec<u8>, ModelError> {
+    let max_tokens_field = options.max_tokens_field;
     if let Some(t) = req.temperature
         && !t.is_finite()
     {
@@ -72,7 +92,7 @@ pub(crate) fn build_request(
         messages.push(text_message("system", system));
     }
     for message in &req.messages {
-        messages.push(wire_message(message)?);
+        messages.push(wire_message(message, options.echo_reasoning)?);
     }
 
     let tools: Vec<Value> = req
@@ -121,8 +141,20 @@ pub(crate) fn build_request(
         stream_options: stream.then(|| json!({"include_usage": true})),
         metadata: (!req.metadata.is_empty()).then_some(&req.metadata),
     };
-    serde_json::to_vec(&wire)
-        .map_err(|e| ModelError::invalid_request("request is not serializable").with_source(e))
+    let not_serializable =
+        |e| ModelError::invalid_request("request is not serializable").with_source(e);
+    let Some(extra) = options.extra_body.filter(|extra| !extra.is_empty()) else {
+        return serde_json::to_vec(&wire).map_err(not_serializable);
+    };
+    // The deployment's own members (a flag that makes a gateway emit reasoning) are merged over
+    // the body, at its top level.
+    let mut body = serde_json::to_value(&wire).map_err(not_serializable)?;
+    if let Value::Object(members) = &mut body {
+        for (key, value) in extra {
+            members.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::to_vec(&body).map_err(not_serializable)
 }
 
 fn text_message<'a>(role: &'static str, text: &str) -> WireMessage<'a> {
@@ -131,6 +163,7 @@ fn text_message<'a>(role: &'static str, text: &str) -> WireMessage<'a> {
         content: Some(Value::String(text.to_owned())),
         tool_calls: Vec::new(),
         tool_call_id: None,
+        reasoning: None,
     }
 }
 
@@ -159,7 +192,10 @@ fn content_value(parts: &[ContentPart]) -> Option<Value> {
     Some(Value::String(text))
 }
 
-fn wire_message(message: &Message) -> Result<WireMessage<'_>, ModelError> {
+fn wire_message(
+    message: &Message,
+    echo: Option<ReasoningField>,
+) -> Result<WireMessage<'_>, ModelError> {
     Ok(match message {
         Message::User { content } => WireMessage {
             role: "user",
@@ -167,10 +203,12 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, ModelError> {
             content: Some(content_value(content).unwrap_or_else(|| Value::String(String::new()))),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning: None,
         },
         Message::Assistant {
             content,
             tool_calls,
+            reasoning,
         } => {
             let mut wire_calls = Vec::with_capacity(tool_calls.len());
             for call in tool_calls {
@@ -196,6 +234,13 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, ModelError> {
                     .or_else(|| tool_calls.is_empty().then(|| Value::String(String::new()))),
                 tool_calls: wire_calls,
                 tool_call_id: None,
+                // Reasoning goes back only when the client was set to send it (a provider that
+                // requires it); otherwise it is never in a request, whatever the message holds.
+                reasoning: echo.and_then(|field| {
+                    reasoning
+                        .as_deref()
+                        .map(|text| BTreeMap::from([(field.wire_name(), text)]))
+                }),
             }
         }
         // The chat-completions format has no error flag on tool messages, so
@@ -207,6 +252,7 @@ fn wire_message(message: &Message) -> Result<WireMessage<'_>, ModelError> {
             content: Some(Value::String(content.clone())),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id),
+            reasoning: None,
         },
     })
 }
@@ -261,12 +307,26 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         });
     }
 
-    Ok(build_response(
+    let mut response = build_response(
         content_text(message.content),
         tool_calls,
         &finish,
         completion.usage.map(Usage::from).unwrap_or_default(),
-    ))
+    );
+    response.reasoning = reasoning_text(&[message.reasoning_content, message.reasoning]);
+    Ok(response)
+}
+
+/// The reasoning a provider sent, under whichever of the names it uses: the first that is a string
+/// that is not empty. A provider that sends the same text under two names is read once, and a
+/// value that is not a string (a structured `reasoning` some gateways add) is not reasoning text.
+fn reasoning_text(candidates: &[Option<Value>]) -> Option<String> {
+    candidates
+        .iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 #[derive(Deserialize)]
@@ -286,6 +346,10 @@ struct Choice {
 struct ChoiceMessage {
     content: Option<Value>,
     tool_calls: Option<Vec<WireToolCall>>,
+    /// DeepSeek, GLM, vLLM before 0.12, LiteLLM.
+    reasoning_content: Option<Value>,
+    /// OpenRouter, Ollama, current vLLM.
+    reasoning: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -385,9 +449,11 @@ fn build_response(
         message: Message::Assistant {
             content,
             tool_calls,
+            reasoning: None,
         },
         finish,
         usage,
+        reasoning: None,
     }
 }
 
@@ -413,6 +479,11 @@ struct ChunkChoice {
 struct Delta {
     content: Option<String>,
     tool_calls: Option<Vec<DeltaToolCall>>,
+    /// DeepSeek, GLM, vLLM before 0.12, LiteLLM. A `Value`, not a `String`: a chunk whose reasoning
+    /// is some other shape is still a chunk (its content and calls count).
+    reasoning_content: Option<Value>,
+    /// OpenRouter, Ollama, current vLLM.
+    reasoning: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -444,6 +515,7 @@ struct PartialCall {
 #[derive(Default)]
 pub(crate) struct Assembler {
     text: String,
+    reasoning: String,
     calls: BTreeMap<usize, PartialCall>,
     finish_reason: Option<String>,
     usage: Option<Usage>,
@@ -469,6 +541,10 @@ impl Assembler {
         // Only the first choice is used (`n` is never requested).
         for choice in chunk.choices.into_iter().filter(|c| c.index == 0) {
             if let Some(delta) = choice.delta {
+                if let Some(thought) = reasoning_text(&[delta.reasoning_content, delta.reasoning]) {
+                    self.reasoning.push_str(&thought);
+                    out.push(ModelDelta::Reasoning(thought));
+                }
                 if let Some(text) = delta.content.filter(|t| !t.is_empty()) {
                     self.text.push_str(&text);
                     out.push(ModelDelta::Text(text));
@@ -529,12 +605,14 @@ impl Assembler {
                 arguments,
             });
         }
-        Ok(build_response(
+        let mut response = build_response(
             self.text,
             tool_calls,
             &reason,
             self.usage.unwrap_or_default(),
-        ))
+        );
+        response.reasoning = Some(self.reasoning).filter(|r| !r.is_empty());
+        Ok(response)
     }
 }
 
@@ -556,6 +634,7 @@ mod tests {
                     name: "weather".into(),
                     arguments: json!({"city": "Paris"}),
                 }],
+                reasoning: None,
             },
             Message::tool_result("c1", "sunny"),
         ];
@@ -567,8 +646,15 @@ mod tests {
         req
     }
 
+    fn options(max_tokens_field: MaxTokensField) -> RequestOptions<'static> {
+        RequestOptions {
+            max_tokens_field,
+            ..RequestOptions::default()
+        }
+    }
+
     fn body(req: &ModelRequest, stream: bool, f: MaxTokensField) -> Value {
-        serde_json::from_slice(&build_request(req, stream, f).unwrap()).unwrap()
+        serde_json::from_slice(&build_request(req, stream, options(f)).unwrap()).unwrap()
     }
 
     #[test]
@@ -614,6 +700,149 @@ mod tests {
         assert!(v.get("stream").is_none() && v.get("stream_options").is_none());
     }
 
+    fn with(extra: Option<Value>, echo: Option<ReasoningField>) -> RequestOptions<'static> {
+        let extra = extra.map(|v| match v {
+            Value::Object(map) => &*Box::leak(Box::new(map)),
+            other => panic!("not an object: {other}"),
+        });
+        RequestOptions {
+            extra_body: extra,
+            echo_reasoning: echo,
+            ..RequestOptions::default()
+        }
+    }
+
+    #[test]
+    fn an_extra_body_is_merged_over_every_request_at_its_top_level() {
+        let req = request();
+        let extra = json!({"reasoning_effort": "medium", "chat_template_kwargs": {"enable_thinking": true}});
+        for stream in [false, true] {
+            let sent: Value = serde_json::from_slice(
+                &build_request(&req, stream, with(Some(extra.clone()), None)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sent["reasoning_effort"], "medium");
+            assert_eq!(
+                sent["chat_template_kwargs"],
+                json!({"enable_thinking": true})
+            );
+            // The rest of the body is what it was.
+            assert_eq!(sent["model"], "gw-model");
+            assert_eq!(sent["messages"].as_array().map(Vec::len), Some(4));
+        }
+        // It wins over what the client wrote (`max_tokens` here), and an empty one changes nothing.
+        let mut req = request();
+        req.max_output_tokens = Some(10);
+        let sent: Value = serde_json::from_slice(
+            &build_request(&req, false, with(Some(json!({"max_tokens": 99})), None)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sent["max_tokens"], 99);
+        assert_eq!(
+            build_request(&req, false, with(Some(json!({})), None)).unwrap(),
+            build_request(&req, false, with(None, None)).unwrap()
+        );
+    }
+
+    fn thinking_history() -> ModelRequest {
+        let mut req = request();
+        req.messages[1] = Message::Assistant {
+            content: vec![],
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "weather".into(),
+                arguments: json!({"city": "Paris"}),
+            }],
+            reasoning: Some("I should look it up".into()),
+        };
+        req
+    }
+
+    #[test]
+    fn reasoning_in_a_history_is_never_sent_unless_the_client_echoes_it() {
+        let req = thinking_history();
+        let plain = String::from_utf8(
+            build_request(&req, false, options(MaxTokensField::MaxTokens)).unwrap(),
+        )
+        .unwrap();
+        assert!(!plain.contains("reasoning"), "{plain}");
+        assert!(!plain.contains("I should look it up"), "{plain}");
+
+        for (field, name) in [
+            (ReasoningField::ReasoningContent, "reasoning_content"),
+            (ReasoningField::Reasoning, "reasoning"),
+        ] {
+            let sent: Value = serde_json::from_slice(
+                &build_request(&req, false, with(None, Some(field))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sent["messages"][2][name], "I should look it up");
+            // Only on the assistant message that holds it.
+            assert!(sent["messages"][1].get(name).is_none());
+            assert!(sent["messages"][3].get(name).is_none());
+        }
+    }
+
+    #[test]
+    fn a_completion_carries_its_reasoning_under_either_name_and_not_in_the_text() {
+        let parse = |message: Value| {
+            parse_completion(
+                json!({"choices": [{"message": message, "finish_reason": "stop"}]})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap()
+        };
+        let r = parse(json!({"content": "42", "reasoning_content": "6 times 7"}));
+        assert_eq!(r.reasoning.as_deref(), Some("6 times 7"));
+        assert_eq!(r.message.text(), "42");
+        assert_eq!(r.message.reasoning(), None);
+        let r = parse(json!({"content": "42", "reasoning": "six sevens"}));
+        assert_eq!(r.reasoning.as_deref(), Some("six sevens"));
+        // The same text under both names is read once; empty and null are none; a structure is not text.
+        let r = parse(json!({"content": "42", "reasoning_content": "t", "reasoning": "t"}));
+        assert_eq!(r.reasoning.as_deref(), Some("t"));
+        for none in [
+            json!({"content": "42"}),
+            json!({"content": "42", "reasoning_content": null, "reasoning": ""}),
+            json!({"content": "42", "reasoning": {"summary": []}}),
+        ] {
+            assert_eq!(parse(none).reasoning, None);
+        }
+    }
+
+    #[test]
+    fn streamed_reasoning_arrives_before_the_answer_and_is_not_the_answer() {
+        let mut asm = Assembler::default();
+        let mut deltas = Vec::new();
+        for chunk in [
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_content":"The user "}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"says hi."}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning":" Then greet."}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":null,"content":"Hello"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning":{"x":1},"content":"!"},"finish_reason":"stop"}]}"#,
+        ] {
+            deltas.extend(asm.push(chunk).unwrap());
+        }
+        assert_eq!(
+            deltas,
+            vec![
+                ModelDelta::Reasoning("The user ".into()),
+                ModelDelta::Reasoning("says hi.".into()),
+                ModelDelta::Reasoning(" Then greet.".into()),
+                ModelDelta::Text("Hello".into()),
+                ModelDelta::Text("!".into()),
+            ]
+        );
+        let response = asm.finish().unwrap();
+        assert_eq!(response.message.text(), "Hello!");
+        assert_eq!(response.message.reasoning(), None);
+        assert_eq!(
+            response.reasoning.as_deref(),
+            Some("The user says hi. Then greet.")
+        );
+    }
+
     #[test]
     fn optional_fields_are_omitted() {
         let v = body(&ModelRequest::new("m"), false, MaxTokensField::MaxTokens);
@@ -644,13 +873,13 @@ mod tests {
         let mut req = ModelRequest::new("m");
         req.tool_choice = ToolChoice::Required;
         assert!(matches!(
-            build_request(&req, false, MaxTokensField::MaxTokens),
+            build_request(&req, false, options(MaxTokensField::MaxTokens)),
             Err(ModelError::InvalidRequest { .. })
         ));
         let mut req = ModelRequest::new("m");
         req.temperature = Some(f32::NAN);
         assert!(matches!(
-            build_request(&req, false, MaxTokensField::MaxTokens),
+            build_request(&req, false, options(MaxTokensField::MaxTokens)),
             Err(ModelError::InvalidRequest { .. })
         ));
     }

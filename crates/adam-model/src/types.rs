@@ -72,6 +72,12 @@ pub enum Message {
         /// Tools the model asked to run.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        /// What the model thought before it wrote the above, **kept only when the model's client
+        /// is set to send it back** (a provider in thinking mode that requires it, DeepSeek's with
+        /// tools). `None` otherwise: a client that does not echo reasoning never puts it here, so
+        /// it is never in the stored history and never sent. It is not [`Message::text`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
     },
     /// The result of running a tool the model asked for.
     Tool {
@@ -98,6 +104,7 @@ impl Message {
         Self::Assistant {
             content: vec![ContentPart::text(text)],
             tool_calls: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -127,6 +134,15 @@ impl Message {
                 content.iter().map(ContentPart::as_text).collect()
             }
             Self::Tool { content, .. } => content.clone(),
+        }
+    }
+
+    /// The reasoning an assistant message keeps for the model (see [`Message::Assistant`]);
+    /// `None` for other roles and for a client that does not echo it.
+    pub fn reasoning(&self) -> Option<&str> {
+        match self {
+            Self::Assistant { reasoning, .. } => reasoning.as_deref(),
+            _ => None,
         }
     }
 
@@ -195,6 +211,12 @@ pub struct ModelResponse {
     pub finish: FinishReason,
     /// Token accounting.
     pub usage: Usage,
+    /// What the model thought on the way to `message`, when the provider says it
+    /// (`reasoning_content` or `reasoning`): for people to read, **not** part of the answer and not
+    /// of the history. An agent shows it and drops it; it reaches the history only through
+    /// [`Message::Assistant::reasoning`], and only for a client set to echo it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl ModelResponse {
@@ -204,6 +226,7 @@ impl ModelResponse {
             message: Message::assistant_text(text),
             finish: FinishReason::Stop,
             usage: Usage::default(),
+            reasoning: None,
         }
     }
 
@@ -214,9 +237,11 @@ impl ModelResponse {
             message: Message::Assistant {
                 content: Vec::new(),
                 tool_calls,
+                reasoning: None,
             },
             finish: FinishReason::ToolCalls,
             usage: Usage::default(),
+            reasoning: None,
         }
     }
 }
@@ -252,6 +277,10 @@ pub struct Usage {
 pub enum ModelDelta {
     /// A piece of generated text.
     Text(String),
+    /// A piece of the model's reasoning (`reasoning_content`, `reasoning`), which a provider in
+    /// thinking mode sends before the answer. Not part of the answer: see
+    /// [`ModelResponse::reasoning`]. The pieces concatenate to it.
+    Reasoning(String),
     /// The model started a tool call. Arguments arrive only in
     /// [`ModelDelta::Finished`], once they parse as JSON.
     ToolCallStarted {
@@ -290,12 +319,14 @@ mod tests {
             message: Message::Assistant {
                 content: vec![ContentPart::text("checking")],
                 tool_calls: vec![tool_call()],
+                reasoning: None,
             },
             finish: FinishReason::ToolCalls,
             usage: Usage {
                 input_tokens: 12,
                 output_tokens: 34,
             },
+            reasoning: Some("the user wants the weather".into()),
         }
     }
 
@@ -328,6 +359,12 @@ mod tests {
         roundtrip(Message::Assistant {
             content: vec![],
             tool_calls: vec![tool_call()],
+            reasoning: None,
+        });
+        roundtrip(Message::Assistant {
+            content: vec![],
+            tool_calls: vec![tool_call()],
+            reasoning: Some("thinking".into()),
         });
         roundtrip(Message::tool_result("c", "out"));
         roundtrip(Message::tool_error("c", "boom"));
@@ -346,6 +383,26 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Message::tool_error("c1", "bad")).unwrap(),
             json!({"role": "tool", "call_id": "c1", "content": "bad", "is_error": true})
+        );
+        // Reasoning is written only when there is some: a history stored before it existed, and
+        // one from a client that does not echo it, are the same bytes.
+        assert_eq!(
+            serde_json::to_value(Message::assistant_text("yo")).unwrap(),
+            serde_json::to_value(Message::Assistant {
+                content: vec![ContentPart::text("yo")],
+                tool_calls: Vec::new(),
+                reasoning: None,
+            })
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(Message::Assistant {
+                content: vec![],
+                tool_calls: Vec::new(),
+                reasoning: Some("r".into()),
+            })
+            .unwrap(),
+            json!({"role": "assistant", "content": [], "reasoning": "r"})
         );
         // History persisted without optional fields still loads.
         let m: Message = serde_json::from_value(
@@ -412,6 +469,7 @@ mod tests {
     #[test]
     fn delta_roundtrip() {
         roundtrip(ModelDelta::Text("hi".into()));
+        roundtrip(ModelDelta::Reasoning("hm".into()));
         roundtrip(ModelDelta::ToolCallStarted {
             id: "c".into(),
             name: "n".into(),
@@ -424,8 +482,12 @@ mod tests {
         let m = Message::Assistant {
             content: vec![ContentPart::text("a"), ContentPart::text("b")],
             tool_calls: vec![tool_call()],
+            reasoning: Some("why".into()),
         };
+        // Reasoning is never part of the text.
         assert_eq!(m.text(), "ab");
+        assert_eq!(m.reasoning(), Some("why"));
+        assert_eq!(Message::user_text("u").reasoning(), None);
         assert_eq!(m.tool_calls().len(), 1);
         assert_eq!(Message::user_text("u").tool_calls(), &[]);
         assert_eq!(Message::tool_result("c", "out").text(), "out");

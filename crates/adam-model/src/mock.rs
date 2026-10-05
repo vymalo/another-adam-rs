@@ -32,7 +32,8 @@ struct Inner {
 /// the call fails with [`ModelError::InvalidRequest`] (a script that is too
 /// short is a bug in the test, and this keeps it non-retryable).
 ///
-/// `stream` replays the queued response as deltas: one [`ModelDelta::Text`]
+/// `stream` replays the queued response as deltas: one [`ModelDelta::Reasoning`] (if the response
+/// has [`ModelResponse::reasoning`]), one [`ModelDelta::Text`]
 /// (if there is any text), one [`ModelDelta::ToolCallStarted`] per tool call,
 /// then [`ModelDelta::Finished`]. A queued error fails the call before the
 /// stream starts.
@@ -166,8 +167,12 @@ impl ModelClient for MockModel {
         if let Message::Assistant {
             content,
             tool_calls,
+            ..
         } = &response.message
         {
+            if let Some(reasoning) = response.reasoning.as_ref().filter(|r| !r.is_empty()) {
+                deltas.push(ModelDelta::Reasoning(reasoning.clone()));
+            }
             let text: String = content.iter().map(ContentPart::as_text).collect();
             if !text.is_empty() {
                 deltas.push(ModelDelta::Text(text));
@@ -236,9 +241,11 @@ mod tests {
                     name: "search".into(),
                     arguments: json!({"q": "x"}),
                 }],
+                reasoning: None,
             },
             finish: FinishReason::ToolCalls,
             usage: Default::default(),
+            reasoning: Some("the user wants a search".into()),
         };
         mock.push_response(response.clone());
 
@@ -252,6 +259,7 @@ mod tests {
         assert_eq!(
             deltas,
             vec![
+                ModelDelta::Reasoning("the user wants a search".into()),
                 ModelDelta::Text("let me look".into()),
                 ModelDelta::ToolCallStarted {
                     id: "c1".into(),

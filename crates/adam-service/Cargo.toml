@@ -29,6 +29,7 @@ adam-store-postgres.workspace = true
 axum.workspace = true
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
 secrecy.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tokio-util.workspace = true

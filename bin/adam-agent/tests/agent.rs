@@ -1175,6 +1175,8 @@ async fn each_failure_maps_to_the_exit_code_of_its_cause() {
         base_url: "not a url".into(),
         api_key: String::new().into(),
         alias: "m".into(),
+        extra_body: None,
+        echo_reasoning: None,
     };
     let error = AgentError::Model(model.client().err().expect("not a URL"));
     assert_eq!(exit_code(&error), 78);
