@@ -273,7 +273,7 @@ impl ToolEnv {
 
     /// Wait up to `wait` for an environment that is not available now, instead of failing at the
     /// first [`EnvError::Unavailable`] (`RUN_POD_WAIT_SECS`: a run waits for a slot, it does not fall
-    /// back to this container and does not fail at once). See [`ToolEnv::session`].
+    /// back to this container and does not fail at once). The wait is where a tool asks for its run's session.
     #[must_use]
     pub fn with_unavailable_wait(mut self, wait: Duration) -> Self {
         self.unavailable_wait = Some(wait);

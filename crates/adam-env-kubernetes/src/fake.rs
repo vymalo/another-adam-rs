@@ -867,7 +867,11 @@ mod tests {
         let prepared = session.prepare(&spec).unwrap();
 
         assert_eq!(prepared.program, Path::new("adam-kube-exec"));
-        assert_eq!(prepared.cwd, cwd);
+        assert_eq!(
+            prepared.cwd,
+            Path::new("/"),
+            "the client runs from /; the cwd is the pod's"
+        );
         assert!(
             prepared.env_clear,
             "the client starts with nothing of the coder's"

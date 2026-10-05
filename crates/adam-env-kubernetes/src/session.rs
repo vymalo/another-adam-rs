@@ -156,7 +156,10 @@ impl EnvSession for KubeSession {
                 .into_iter()
                 .map(OsString::from)
                 .collect(),
-            cwd: spec.cwd.clone(),
+            // The client's own directory, not the command's: the command's is `--cwd`, in the pod.
+            // The coder has the run's directory on its volume too, but the client never needs it, and
+            // a process started somewhere it does not exist (a test runner) would fail to spawn.
+            cwd: PathBuf::from("/"),
             env: settings
                 .client_env
                 .iter()
