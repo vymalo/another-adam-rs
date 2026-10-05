@@ -144,6 +144,10 @@ bind-mounted directory stay 10001's outside), `--network=none` and the shared ne
    what it started: `adam-exec kill` (the process, its descendants and, when it leads a group, its group), then the container's
    removal.
 9. **Kubernetes stays `Local`** until the platform has a sandbox provider.
+   *Amended 2026-10-05: [ADR 0019](0019-a-runs-processes-in-a-pod-of-their-own.md) gives Kubernetes its own environment, a pod per run
+   (`RUN_ENVIRONMENT=kubernetes`, the crate `adam-env-kubernetes`), which is not this one: a repository's `devcontainer.json` is not
+   used in a run pod, and the two are never on together (`DEVCONTAINER_RUNTIME=podman` with it is refused). Without that opt-in,
+   Kubernetes stays `Local` as decided here.*
 
 ### The sequence
 
