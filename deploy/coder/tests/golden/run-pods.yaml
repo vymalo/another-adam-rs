@@ -1,0 +1,644 @@
+---
+# Source: coder/templates/run-pods-quota.yaml
+# runPods.enabled: the priority class of run pods. It exists to be scoped by: a ResourceQuota cannot select pods by
+# label, but it can by priority class. Value 0 and preemptionPolicy Never: it ranks nothing and evicts nobody.
+# Cluster-scoped, so two releases of one name in two namespaces would share it.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: coder-run
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+value: 0
+preemptionPolicy: Never
+globalDefault: false
+description: "Run pods of coder (adam-coder): scoped by a ResourceQuota, ranks nothing."
+---
+# Source: coder/templates/networkpolicy.yaml
+# Ingress only from the orchestrator's namespace. Egress is not restricted: the
+# agent needs git hosts, the model gateway and package registries.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: coder
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: coder
+      app.kubernetes.io/instance: coder
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: another-agentic-system
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Source: coder/templates/run-pods-networkpolicy.yaml
+# runPods.enabled: what a run pod may reach. No ingress at all (nothing connects to a run pod: the coder execs in it
+# through the API server). Egress to DNS and to the internet, but not to private ranges, so a build reaches the
+# registries and the model gateway and not the services of the cluster. Only as real as the CNI that enforces it
+# (*unverified* for the owner's cluster). IPv4 only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: coder-run-pods
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: adam-coder
+      app.kubernetes.io/instance: coder
+    matchExpressions:
+      - key: adam.vymalo.com/run
+        operator: Exists
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+---
+# Source: coder/templates/run-pods-quota.yaml
+# What the run pods may use in all. A pod beyond it is refused with 403 "exceeded quota", which the coder waits out.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: coder-run-pods
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+spec:
+  hard:
+    limits.memory: "8Gi"
+    pods: "4"
+  scopeSelector:
+    matchExpressions:
+      - scopeName: PriorityClass
+        operator: In
+        values:
+          - coder-run
+---
+# Source: coder/templates/run-pods-rbac.yaml
+# runPods.enabled: the coder pod's ServiceAccount. Its token is mounted in the coder pod alone (the front Deployment
+# of topology=split and the run pods mount none).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coder
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+automountServiceAccountToken: false
+---
+# Source: coder/templates/run-pods-configmap.yaml
+# runPods.enabled: the pod every run pod is made from (ADR 0019). The coder reads it at startup
+# (RUN_POD_TEMPLATE_FILE); a change is a deploy (the pod's checksum annotation).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coder-run-pod
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+data:
+  pod.yaml: |
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      labels:
+        app.kubernetes.io/name: coder-run
+        app.kubernetes.io/component: run
+    spec:
+      priorityClassName: coder-run
+      # A run pod holds no credential for the cluster.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: coder
+                  app.kubernetes.io/instance: coder
+      initContainers:
+        - name: tools
+          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+          imagePullPolicy: IfNotPresent
+          # adam-exec and the native OpenCode, out of the coder's image, into the directory the run container mounts
+          # read-only: the layout of a devcontainer's tools directory.
+          command: ["sh", "-c", "cp -L /opt/adam/bin/adam-exec /opt/adam/bin/opencode /tools/ && chmod 0755 /tools/adam-exec /tools/opencode"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: tools
+              mountPath: /tools
+      containers:
+        - name: run
+          image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a"
+          imagePullPolicy: IfNotPresent
+          workingDir: /work
+          # tini reaps what a killed command leaves; the commands are exec'd into the container by adam-kube-exec.
+          command: ["tini", "--", "sleep", "infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          env:
+            - name: CARGO_BUILD_JOBS
+              value: "2"
+            - name: MODEL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: coder
+                  key: MODEL_API_KEY
+          resources:
+            limits:
+              memory: 2Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: tools
+              mountPath: /opt/adam/bin
+              readOnly: true
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: work-coder-0
+        - name: tools
+          emptyDir: {}
+---
+# Source: coder/templates/run-pods-rbac.yaml
+# What the coder does with run pods: make, find, watch and delete them, and exec in them. Nothing else: no Secret,
+# no ConfigMap, no other kind. `get` on pods/exec as well as `create`: kube's exec is a WebSocket, which the API
+# server authorizes as a GET (and, from Kubernetes 1.35, as a create too; *unverified*).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coder-run-pods
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+---
+# Source: coder/templates/run-pods-rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coder-run-pods
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: coder-run-pods
+subjects:
+  - kind: ServiceAccount
+    name: coder
+    namespace: coder-ns
+---
+# Source: coder/templates/service.yaml
+# ClusterIP only, never exposed: the orchestrator reaches it in-cluster over A2A
+# with a bearer token. This is also the StatefulSet's governing service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: coder
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+# Source: coder/templates/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: coder
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+spec:
+  replicas: 1
+  serviceName: coder
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coder
+      app.kubernetes.io/instance: coder
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: coder
+        app.kubernetes.io/instance: coder
+      annotations:
+        checksum/run-pod: 9d2474b647a08036c552d37ed4f85c1adb7e6809250e68faad991b86fe595220
+    spec:
+      serviceAccountName: coder
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: github-mcp
+          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          command: ["tini", "--", "github-mcp-server"]
+          args:
+            - http
+            - --read-only
+            - --toolsets
+            - context,repos,issues,pull_requests
+            - --listen-host
+            - 127.0.0.1
+            - --port
+            - "8082"
+          startupProbe:
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8082"]
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      containers:
+        - name: coder
+          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            - name: WORKSPACE_ROOT
+              value: /work
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PUBLIC_URL
+              value: "http://coder.coder-ns.svc.cluster.local:8080/"
+            - name: MODEL_BASE_URL
+              value: "https://gateway.example.invalid/v1"
+            - name: MODEL
+              value: "coder"
+            - name: OPENCODE_MODEL
+              value: "coder"
+            - name: WORKERS
+              value: "4"
+            - name: MAX_CHECK_CYCLES
+              value: "3"
+            - name: CHECK_TIMEOUT_SECS
+              value: "900"
+            - name: WORKSPACE_SWEEP_SECS
+              value: "300"
+            - name: MCP_ALLOW_STDIO
+              value: "true"
+            - name: GITHUB_MCP_URL
+              value: "http://127.0.0.1:8082"
+            - name: ALLOWED_REPO_HOSTS
+              value: "github.com"
+            - name: GITHUB_API_URL
+              value: "https://api.github.com"
+            - name: PR_DRAFT
+              value: "false"
+            - name: GIT_AUTHOR_NAME
+              value: "adam-coder"
+            - name: GIT_AUTHOR_EMAIL
+              value: "adam-coder@users.noreply.github.com"
+            - name: RUN_ENVIRONMENT
+              value: kubernetes
+            - name: RUN_POD_TEMPLATE_FILE
+              value: "/etc/adam/run-pod/pod.yaml"
+            - name: RUN_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUN_POD_INSTANCE
+              value: "coder"
+            - name: RUN_POD_CONTAINER
+              value: "run"
+            - name: RUN_POD_READY_TIMEOUT_SECS
+              value: "600"
+            - name: RUN_POD_IDLE_SECS
+              value: "900"
+            - name: RUN_POD_WAIT_SECS
+              value: "600"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  # Created by CloudNativePG for the app database and owner.
+                  name: coder-db-app
+                  key: uri
+            - name: MODEL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: coder
+                  key: MODEL_API_KEY
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: coder
+                  key: GITHUB_TOKEN
+            - name: A2A_BEARER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: coder
+                  key: A2A_BEARER_TOKENS
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: run-pod
+              mountPath: /etc/adam/run-pod
+              readOnly: true
+      volumes:
+        - name: run-pod
+          configMap:
+            name: coder-run-pod
+            # The pod template: no secret in it.
+            defaultMode: 0444
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+        labels:
+          app.kubernetes.io/name: coder
+          app.kubernetes.io/instance: coder
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: "longhorn"
+        resources:
+          requests:
+            storage: "20Gi"
+---
+# Source: coder/templates/cnpg-cluster.yaml
+# The coder's own Postgres. CloudNativePG creates the database, its owner and
+# the Secret `<name>-app` (key `uri` is the connection string the pod uses).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: coder-db
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+spec:
+  instances: 1
+  storage:
+    size: "5Gi"
+    storageClass: "longhorn"
+  bootstrap:
+    initdb:
+      database: adam
+      owner: adam
+---
+# Source: coder/templates/externalsecret.yaml
+# Secret values live in AWS Secrets Manager (`prod/meta/test-app`)
+# and are copied into a Secret by External Secrets; none is in this chart.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: coder
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: ssegning-aws
+    kind: ClusterSecretStore
+  target:
+    name: coder
+    creationPolicy: Owner
+  data:
+    - secretKey: MODEL_API_KEY
+      remoteRef:
+        key: prod/meta/test-app
+        property: adam_coder_model_api_key
+    - secretKey: GITHUB_TOKEN
+      remoteRef:
+        key: prod/meta/test-app
+        property: adam_coder_github_token
+    - secretKey: A2A_BEARER_TOKENS
+      remoteRef:
+        key: prod/meta/test-app
+        property: adam_coder_a2a_bearer_tokens
+---
+# Source: coder/templates/run-pods-admission.yaml
+# runPods.enabled: the guard that lets the coder make pods without being able to read the namespace's other Secrets,
+# mount the host, or run anything privileged. It applies to pods CREATED BY the coder's ServiceAccount (the match
+# condition) in this namespace (the binding), and refuses any that is not the intended run pod. Without it the RBAC
+# alone would let the coder create any pod in its namespace. Needs Kubernetes 1.30 or later (admissionregistration.k8s.io/v1).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: coder-coder-ns-run-pods
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: made-by-the-coder
+      expression: "request.userInfo.username == 'system:serviceaccount:coder-ns:coder'"
+  variables:
+    - name: containers
+      expression: "object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])"
+  validations:
+    - expression: "has(object.metadata.labels) && 'adam.vymalo.com/run' in object.metadata.labels && 'app.kubernetes.io/managed-by' in object.metadata.labels && object.metadata.labels['app.kubernetes.io/managed-by'] == 'adam-coder'"
+      message: "a run pod carries the labels app.kubernetes.io/managed-by=adam-coder and adam.vymalo.com/run"
+    - expression: "has(object.spec.priorityClassName) && object.spec.priorityClassName == 'coder-run'"
+      message: "a run pod has the priority class coder-run, which the quota is scoped to"
+    - expression: "variables.containers.all(c, c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234'])"
+      message: "a run pod uses only the images the chart allows"
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0') || (has(v.secret) && v.secret.secretName == 'coder'))"
+      message: "a run pod mounts only emptyDir volumes, the claim work-coder-0 and the Secret coder: no hostPath, no other Secret or claim"
+    - expression: "variables.containers.all(c, (!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || e.valueFrom.secretKeyRef.name == 'coder')) && (!has(c.envFrom) || c.envFrom.all(f, !has(f.secretRef))))"
+      message: "a run pod reads no Secret but coder, and only by key"
+    - expression: "variables.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && (!has(c.securityContext.privileged) || c.securityContext.privileged == false))"
+      message: "a run pod is not privileged and sets allowPrivilegeEscalation: false on every container"
+    - expression: "variables.containers.all(c, (has(c.securityContext) && has(c.securityContext.runAsUser) ? c.securityContext.runAsUser : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser) ? object.spec.securityContext.runAsUser : 0)) != 0 && (has(c.securityContext) && has(c.securityContext.runAsNonRoot) ? c.securityContext.runAsNonRoot : (has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) ? object.spec.securityContext.runAsNonRoot : false)))"
+      message: "a run pod does not run as root: a runAsUser other than 0 and runAsNonRoot: true on every container"
+    - expression: "(!has(object.spec.hostNetwork) || !object.spec.hostNetwork) && (!has(object.spec.hostPID) || !object.spec.hostPID) && (!has(object.spec.hostIPC) || !object.spec.hostIPC)"
+      message: "a run pod uses its own network, PID and IPC namespaces"
+    - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
+      message: "a run pod sets automountServiceAccountToken: false: it holds no credential for the cluster"
+---
+# Source: coder/templates/run-pods-admission.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: coder-coder-ns-run-pods
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.3.0
+spec:
+  policyName: coder-coder-ns-run-pods
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: coder-ns

@@ -905,4 +905,246 @@ check "database on with an existing Secret named fails (one or the other)" \
   fails helm_db --set database.existingSecret.name=coder-db-uri
 check "... the error names both values" says "$message" 'database.enabled=true and database.existingSecret.name'
 
+# ---------------------------------------------------------------------------------------------------------------
+# Run pods (runPods, ADR 0019): a pod of its own for each active run. Off by default and then invisible (the golden
+# above); on, the chart renders the pod template, the priority class and the quota scoped to it, the RBAC, the
+# admission policy that is the guard, and the network policy, and refuses what would leave the coder able to make any pod.
+# ---------------------------------------------------------------------------------------------------------------
+# rdoc <Kind> <name> [file]: the one document of that kind and metadata name.
+rdoc() {
+  awk -v k="$1" -v n="$2" '
+    function flush() { if (buf ~ ("(^|\n)kind: " k "\n") && buf ~ ("\n  name: " n "\n")) printf "%s", buf; buf = "" }
+    /^---$/ { flush(); next }
+    { buf = buf $0 "\n" } END { flush() }' "${3:-$out}"
+}
+rhas() { rdoc "$1" "$2" | grep -Eq -- "$3"; }
+rlacks() { ! rdoc "$1" "$2" | grep -Eq -- "$3"; }
+helm_rp() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set runPods.enabled=true "$@"; }
+run_pod_template() { doc ConfigMap | awk '/^  pod.yaml: \|$/ { on = 1; next } on { sub(/^    /, ""); print }'; }
+tpl() { run_pod_template | grep -Eq -- "$1"; }
+notpl() { ! run_pod_template | grep -Eq -- "$1"; }
+sts_of() { doc StatefulSet | grep -Eq -- "$1"; }
+nosts() { ! doc StatefulSet | grep -Eq -- "$1"; }
+policy_has() { rdoc ValidatingAdmissionPolicy "$1" | grep -Fq -- "$2"; }
+
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 > "$out"
+check "run pods off: no run pod template, ServiceAccount, Role, PriorityClass, quota or admission policy" \
+  lacks '^kind: (ConfigMap|ServiceAccount|Role|RoleBinding|PriorityClass|ResourceQuota|ValidatingAdmissionPolicy|ValidatingAdmissionPolicyBinding)$'
+check "run pods off: none of RUN_ENVIRONMENT, RUN_POD_*, a service account or a mounted token" \
+  lacks 'RUN_ENVIRONMENT|RUN_POD_|serviceAccountName|automountServiceAccountToken: true'
+check "run pods off: the coder keeps its 6Gi limit" has 'memory: 6Gi'
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set runPods.enabled=false > "$out"
+check "run pods off, set explicitly: the render equals the golden" cmp -s "$out" "$golden"
+
+helm_rp > "$out"
+rp_golden="$chart/tests/golden/run-pods.yaml"
+check "run pods on: the render equals tests/golden/run-pods.yaml" cmp -s "$out" "$rp_golden"
+
+# Each object, once.
+check "run pods: one PriorityClass" count '^kind: PriorityClass$' 1
+check "run pods: one ResourceQuota" count '^kind: ResourceQuota$' 1
+check "run pods: one Role and one RoleBinding" count '^kind: (Role|RoleBinding)$' 2
+check "run pods: one ServiceAccount" count '^kind: ServiceAccount$' 1
+check "run pods: one ConfigMap (the pod template)" count '^kind: ConfigMap$' 1
+check "run pods: one ValidatingAdmissionPolicy and its binding" count '^kind: ValidatingAdmissionPolicy(Binding)?$' 2
+check "run pods: two NetworkPolicies, the coder's and the run pods'" count '^kind: NetworkPolicy$' 2
+check "run pods: no Secret object (the model key stays in the ExternalSecret's Secret)" lacks '^kind: Secret$'
+
+# The pod template: what a run pod is.
+check "template: apiVersion v1 kind Pod" tpl '^kind: Pod$'
+check "template: no metadata name, generateName or ownerReferences" notpl '^  (name|generateName|ownerReferences|namespace):'
+check "template: its own name label, not the coder's (the StatefulSet and its NetworkPolicy must never match a run pod)" \
+  tpl '^    app.kubernetes.io/name: coder-run$'
+check "template: the run container is named run" tpl '^    - name: run$'
+check "template: the workspace image by tag AND digest" \
+  tpl 'image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a"'
+check "template: the memory limit is 2Gi" tpl '^        limits:$'
+check "template: memory: 2Gi" tpl '^          memory: 2Gi$'
+check "template: requests 250m and 512Mi" tpl '^          cpu: 250m$'
+check "template: requests memory 512Mi" tpl '^          memory: 512Mi$'
+check "template: CARGO_BUILD_JOBS=2" tpl 'name: CARGO_BUILD_JOBS'
+check "template: ... with the value 2" tpl 'value: "2"'
+check "template: the priority class is the chart's own, <release>-run" tpl '^  priorityClassName: coder-run$'
+check "template: no service account token" tpl '^  automountServiceAccountToken: false$'
+check "template: runs as uid 10001, non-root" tpl 'runAsUser: 10001'
+check "template: allowPrivilegeEscalation false and every capability dropped" tpl 'allowPrivilegeEscalation: false'
+check "template: tini holds the container open" tpl 'command: \["tini", "--", "sleep", "infinity"\]'
+check "template: the tools directory is mounted read-only at /opt/adam/bin" tpl 'mountPath: /opt/adam/bin'
+check "template: an init container copies adam-exec and OpenCode out of the coder image" \
+  tpl 'cp -L /opt/adam/bin/adam-exec /opt/adam/bin/opencode /tools/'
+check "template: the init container is the coder's image" tpl 'image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"'
+check "template: /work is the coder's claim, the per-pod one" tpl 'claimName: work-coder-0'
+check "template: required pod affinity to the coder pod, by hostname (a ReadWriteOnce volume is attached to one node)" \
+  tpl 'requiredDuringSchedulingIgnoredDuringExecution'
+check "template: ... topologyKey kubernetes.io/hostname" tpl 'topologyKey: kubernetes.io/hostname'
+check "template: ... selecting the coder pods" tpl 'app.kubernetes.io/instance: coder'
+check "template: the model key comes from the ExternalSecret's Secret, by key" tpl 'name: MODEL_API_KEY'
+check "template: ... as secretKeyRef coder / MODEL_API_KEY" tpl 'key: MODEL_API_KEY'
+check "template: no GitHub token, database URL or bearer token" notpl 'GITHUB_TOKEN|GITHUB_APP|DATABASE_URL|A2A_BEARER|SEARCH_MCP_TOKEN|CONTEXT7'
+check "template: no hostPath, hostNetwork, hostPID, hostIPC, privileged" notpl 'hostPath|hostNetwork|hostPID|hostIPC|privileged: true'
+check "template: no Secret volume" notpl '^      secret:'
+
+# The coder pod.
+check "coder: its own ServiceAccount, with the token mounted" sts_of '^      serviceAccountName: coder$'
+check "coder: ... automountServiceAccountToken true (for the coder pod alone)" sts_of '^      automountServiceAccountToken: true$'
+check "coder: RUN_ENVIRONMENT=kubernetes" sts_of 'value: kubernetes'
+check "coder: the template file is the mounted one" sts_of 'value: "/etc/adam/run-pod/pod.yaml"'
+check "coder: the namespace is the pod's own (downward API)" sts_of 'fieldPath: metadata.namespace'
+check "coder: RUN_POD_INSTANCE is the release" sts_of 'name: RUN_POD_INSTANCE'
+check "coder: RUN_POD_IDLE_SECS is 900" sts_of 'name: RUN_POD_IDLE_SECS'
+check "coder: RUN_POD_WAIT_SECS is 600 and RUN_POD_READY_TIMEOUT_SECS is 600" sts_of 'name: RUN_POD_WAIT_SECS'
+check "coder: WORKER_ID is the pod name (the idle sweep is a worker's own)" sts_of 'name: WORKER_ID'
+check "coder: the template is mounted read-only" sts_of 'name: run-pod'
+check "coder: a changed template is a deploy (checksum annotation)" sts_of 'checksum/run-pod:'
+check "coder: shrinks to a 1Gi limit while run pods are on" sts_of '^              memory: 1Gi$'
+check "coder: ... and the 6Gi of resources is not rendered" nosts 'memory: 6Gi'
+check "coder: the DATABASE_URL and the secrets stay in the coder" sts_of 'name: GITHUB_TOKEN'
+
+# The ServiceAccount, the Role and the binding.
+check "rbac: the Role may make, find, watch and delete pods" rhas Role coder-run-pods 'resources: \["pods"\]'
+check "rbac: ... verbs create, delete, get, list, watch" rhas Role coder-run-pods 'verbs: \["create", "delete", "get", "list", "watch"\]'
+check "rbac: ... and exec in them" rhas Role coder-run-pods 'resources: \["pods/exec"\]'
+check "rbac: ... the exec verbs" rhas Role coder-run-pods 'verbs: \["create", "get"\]'
+check "rbac: ... and nothing else: no secrets, configmaps or other kind" rlacks Role coder-run-pods 'secrets|configmaps|deployments|"\*"'
+check "rbac: the binding is to the coder's ServiceAccount in the release namespace" rhas RoleBinding coder-run-pods 'name: coder$'
+check "rbac: ... in coder-ns" rhas RoleBinding coder-run-pods 'namespace: coder-ns'
+check "rbac: the ServiceAccount mounts no token itself (the coder pod asks for it)" rhas ServiceAccount coder 'automountServiceAccountToken: false'
+
+# The quota is scoped by priority class, because a quota cannot select pods by label.
+check "quota: the PriorityClass is value 0, preemptionPolicy Never, not the default" rhas PriorityClass coder-run '^value: 0$'
+check "quota: ... preemptionPolicy Never" rhas PriorityClass coder-run '^preemptionPolicy: Never$'
+check "quota: ... globalDefault false" rhas PriorityClass coder-run '^globalDefault: false$'
+check "quota: limits.memory 8Gi" rhas ResourceQuota coder-run-pods 'limits.memory: "8Gi"'
+check "quota: pods 4" rhas ResourceQuota coder-run-pods 'pods: "4"'
+check "quota: scoped by PriorityClass In [coder-run]" rhas ResourceQuota coder-run-pods 'scopeName: PriorityClass'
+check "quota: ... to the chart's class" rhas ResourceQuota coder-run-pods '^          - coder-run$'
+
+# The admission policy: the guard that lets the coder make pods.
+pn=coder-coder-ns-run-pods
+check "policy: matched to pods created by the coder's ServiceAccount" policy_has "$pn" "request.userInfo.username == 'system:serviceaccount:coder-ns:coder'"
+check "policy: fails closed" rhas ValidatingAdmissionPolicy "$pn" 'failurePolicy: Fail'
+check "policy: only CREATE of pods" rhas ValidatingAdmissionPolicy "$pn" 'operations: \["CREATE"\]'
+check "policy: refuses a pod without the run label and the managed-by label" policy_has "$pn" "'adam.vymalo.com/run' in object.metadata.labels"
+check "policy: ... or without the priority class" policy_has "$pn" "object.spec.priorityClassName == 'coder-run'"
+check "policy: ... or with another image (the run image by digest and the coder's)" \
+  policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
+check "policy: ... or a hostPath: only emptyDir, the work claim and the one Secret" \
+  policy_has "$pn" "has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0') || (has(v.secret) && v.secret.secretName == 'coder')"
+check "policy: ... or a Secret other than the allowed one, by key" policy_has "$pn" "e.valueFrom.secretKeyRef.name == 'coder'"
+check "policy: ... or envFrom a Secret" policy_has "$pn" '!has(f.secretRef)'
+check "policy: ... or a privileged container or one that may escalate" policy_has "$pn" 'c.securityContext.allowPrivilegeEscalation == false'
+check "policy: ... or root" policy_has "$pn" ') != 0 &&'
+check "policy: ... or hostNetwork, hostPID, hostIPC" policy_has "$pn" '!object.spec.hostNetwork'
+check "policy: ... or a service account token" policy_has "$pn" 'object.spec.automountServiceAccountToken == false'
+check "policy: nine rules" [ "$(rdoc ValidatingAdmissionPolicy "$pn" | grep -c -- '^    - expression:')" -eq 9 ]
+check "policy: the binding denies" rhas ValidatingAdmissionPolicyBinding "$pn" 'validationActions: \["Deny"\]'
+check "policy: ... for this namespace only" rhas ValidatingAdmissionPolicyBinding "$pn" 'kubernetes.io/metadata.name: coder-ns'
+
+# The network policy of the run pods.
+rn=coder-run-pods
+check "netpol: selects the coder's run pods by label" rhas NetworkPolicy "$rn" 'app.kubernetes.io/managed-by: adam-coder'
+check "netpol: ... of this release" rhas NetworkPolicy "$rn" 'app.kubernetes.io/instance: coder'
+check "netpol: restricts ingress and egress" rhas NetworkPolicy "$rn" '^    - Egress$'
+check "netpol: no ingress at all" rhas NetworkPolicy "$rn" '^  ingress: \[\]$'
+check "netpol: DNS on 53, UDP and TCP" rhas NetworkPolicy "$rn" 'port: 53'
+check "netpol: the internet, 0.0.0.0/0 ..." rhas NetworkPolicy "$rn" 'cidr: 0.0.0.0/0'
+check "netpol: ... except RFC 1918" rhas NetworkPolicy "$rn" '^              - 10.0.0.0/8$'
+check "netpol: ... and link-local (cloud metadata)" rhas NetworkPolicy "$rn" '^              - 169.254.0.0/16$'
+check "the coder's own NetworkPolicy still restricts ingress only" rlacks NetworkPolicy coder '^    - Egress$'
+
+# Values drive it.
+helm_rp --set 'runPods.networkPolicy.clusterCIDRs={10.42.0.0/16,10.43.0.0/16}' > "$out"
+check "netpol: the pod and service CIDRs are values-driven" rhas NetworkPolicy "$rn" '^              - 10.43.0.0/16$'
+helm_rp --set runPods.networkPolicy.enabled=false > "$out"
+check "netpol: off: only the coder's own NetworkPolicy" count '^kind: NetworkPolicy$' 1
+helm_rp --set 'runPods.networkPolicy.extraEgress[0].to[0].ipBlock.cidr=10.9.9.9/32' > "$out"
+check "netpol: extra egress rules are appended (a model gateway in the cluster)" rhas NetworkPolicy "$rn" 'cidr: 10.9.9.9/32'
+
+helm_rp --set runPods.resources.limits.memory=3Gi --set runPods.resources.requests.memory=1Gi \
+  --set runPods.cargoBuildJobs=4 --set runPods.extraEnv.RUSTFLAGS=-Cdebuginfo=0 > "$out"
+check "values: the run pod's memory limit" tpl '^          memory: 3Gi$'
+check "values: ... its request" tpl '^          memory: 1Gi$'
+check "values: ... CARGO_BUILD_JOBS" tpl 'value: "4"'
+check "values: ... extra environment" tpl 'name: RUSTFLAGS'
+helm_rp --set runPods.quota.pods=2 --set runPods.quota.limitsMemory=4Gi --set runPods.idleSecs=60 \
+  --set runPods.waitSecs=30 --set runPods.readyTimeoutSecs=900 > "$out"
+check "values: the quota" rhas ResourceQuota coder-run-pods 'pods: "2"'
+check "values: ... its memory" rhas ResourceQuota coder-run-pods 'limits.memory: "4Gi"'
+check "values: the idle timeout" sts_of 'name: RUN_POD_IDLE_SECS'
+helm_rp --set runPods.coderResources=null > "$out"
+check "values: no coderResources: the coder keeps its resources" sts_of '^              memory: 6Gi$'
+helm_rp --set runPods.coderResources.limits.memory=2Gi > "$out"
+check "values: coderResources is values-driven" sts_of '^              memory: 2Gi$'
+helm_rp --set runPods.priorityClassName=my-class > "$out"
+check "priority class named: the chart renders none" lacks '^kind: PriorityClass$'
+check "priority class named: the template" tpl '^  priorityClassName: my-class$'
+check "priority class named: the quota" rhas ResourceQuota coder-run-pods '^          - my-class$'
+check "priority class named: the policy" policy_has "$pn" "object.spec.priorityClassName == 'my-class'"
+helm_rp --set runPods.serviceAccount.name=my-sa > "$out"
+check "service account named: the chart renders none" lacks '^kind: ServiceAccount$'
+check "service account named: the coder pod uses it" sts_of '^      serviceAccountName: my-sa$'
+check "service account named: the binding is to it" rhas RoleBinding coder-run-pods 'name: my-sa$'
+check "service account named: the policy is matched to it" policy_has "$pn" "system:serviceaccount:coder-ns:my-sa"
+helm_rp --set 'runPods.admissionPolicy.extraAllowedImages={registry.example/extra:1}' > "$out"
+check "policy: extra allowed images are values-driven" policy_has "$pn" "'registry.example/extra:1'"
+helm_rp --set runPods.toolsImage.repository=registry.example/tools --set runPods.toolsImage.tag=9 > "$out"
+check "values: the tools image" tpl 'image: "registry.example/tools:9"'
+check "values: ... and the policy allows it" policy_has "$pn" "'registry.example/tools:9'"
+helm_rp --set runPods.nodeSelector.pool=builds --set 'runPods.tolerations[0].key=builds' \
+  --set 'runPods.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=pool' \
+  --set 'runPods.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=Exists' > "$out"
+check "values: node selector, tolerations and node affinity are in the template" tpl 'pool: builds'
+check "values: ... node affinity" tpl 'nodeAffinity:'
+check "values: ... together with the pod affinity to the coder" tpl 'podAffinity:'
+
+# The shared volume: no pod affinity, the shared claim.
+shared='--set workspace.placement=shared --set workspace.sharedVolume.storageClass=rwx'
+# shellcheck disable=SC2086
+helm_rp $shared --set replicaCount=3 > "$out"
+check "shared volume: the run pod mounts the shared claim" tpl 'claimName: coder-work'
+check "shared volume: no pod affinity (every node can mount a ReadWriteMany volume)" notpl 'podAffinity'
+check "shared volume: the policy allows that claim" policy_has "$pn" "v.persistentVolumeClaim.claimName == 'coder-work'"
+# shellcheck disable=SC2086
+helm_rp --set workspace.placement=affinity --set workspace.sharedVolume.storageClass=rwx --set replicaCount=2 > "$out"
+check "affinity placement: two replicas are fine with run pods" count '^  replicas: 2$' 1
+helm_rp --set workspace.placement=shared --set workspace.sharedVolume.existingClaim=mine > "$out"
+check "an existing claim is the one the run pod mounts" tpl 'claimName: mine'
+
+# A control plane starts no commands: nothing of it.
+helm_rp --set config.role=control-plane > "$out"
+check "control plane: no run pod objects" lacks '^kind: (ConfigMap|ServiceAccount|Role|RoleBinding|PriorityClass|ResourceQuota|ValidatingAdmissionPolicy|ValidatingAdmissionPolicyBinding)$'
+check "control plane: no RUN_ENVIRONMENT and no service account" lacks 'RUN_ENVIRONMENT|serviceAccountName'
+helm_rp --set topology=split > "$out"
+check "split: the worker has the service account" sts_of '^      serviceAccountName: coder$'
+check "split: the front has none and mounts no token" [ "$(doc Deployment | grep -c 'serviceAccountName')" -eq 0 ]
+check "split: ... automountServiceAccountToken false on the front" dhas Deployment 'automountServiceAccountToken: false'
+
+# Refusals.
+check "refused: runPods.enabled that is not a boolean" fails helm_rp --set-string runPods.enabled=maybe
+message=$(helm_rp --set runPods.admissionPolicy.enabled=false 2>&1 || true)
+check "refused: no admission policy unless acknowledged" fails helm_rp --set runPods.admissionPolicy.enabled=false
+check "... the error says why" says "$message" 'disableAcknowledged'
+helm_rp --set runPods.admissionPolicy.enabled=false --set runPods.admissionPolicy.disableAcknowledged=true > "$out"
+check "acknowledged: no admission policy is rendered" lacks '^kind: ValidatingAdmissionPolicy'
+check "acknowledged: the rest is" has '^kind: ResourceQuota$'
+message=$(helm_rp --kube-version 1.29.0 2>&1 || true)
+check "refused: Kubernetes before 1.30 (no ValidatingAdmissionPolicy)" fails helm_rp --kube-version 1.29.0
+check "... the error names 1.30" says "$message" '1.30'
+check "Kubernetes 1.30 is enough" helm_rp --kube-version 1.30.0
+message=$(helm_rp --set replicaCount=2 2>&1 || true)
+check "refused: two workers on per-pod ReadWriteOnce volumes" fails helm_rp --set replicaCount=2
+check "... the error says a run pod mounts one claim" says "$message" 'mounts one claim'
+check "refused: isolated placement with two workers" fails helm_rp --set workspace.placement=isolated --set replicaCount=2
+message=$(helm_rp --set externalSecrets.enabled=false 2>&1 || true)
+check "refused: no ExternalSecret (the model key reaches a run pod only from it)" fails helm_rp --set externalSecrets.enabled=false
+check "... the error names externalSecrets.enabled" says "$message" 'externalSecrets.enabled'
+check "refused: a model key in extraEnv" fails helm_rp --set runPods.extraEnv.MODEL_API_KEY=x
+check "refused: a bad image digest" fails helm_rp --set runPods.image.digest=sha256:abc
+check "refused: no memory limit (the quota would refuse every pod)" fails helm_rp --set runPods.resources.limits.memory=null
+check "refused: a quota that is not a quantity" fails helm_rp --set runPods.quota.limitsMemory=lots
+check "refused: no pods in the quota" fails helm_rp --set runPods.quota.pods=0
+check "refused: an idle timeout that is not a number" fails helm_rp --set-string runPods.idleSecs=soon
+check "refused: a bad container name" fails helm_rp --set runPods.container=Run_Container
+check "refused: a CIDR that is not one" fails helm_rp --set 'runPods.networkPolicy.clusterCIDRs={everything}'
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

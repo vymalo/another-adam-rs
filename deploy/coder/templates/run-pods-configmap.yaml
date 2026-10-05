@@ -1,0 +1,13 @@
+{{- if include "coder.runPods" . }}
+# runPods.enabled: the pod every run pod is made from (ADR 0019). The coder reads it at startup
+# (RUN_POD_TEMPLATE_FILE); a change is a deploy (the pod's checksum annotation).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coder.runPodTemplateConfigMapName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+data:
+  pod.yaml: |
+    {{- include "coder.runPodTemplate" . | nindent 4 }}
+{{- end }}

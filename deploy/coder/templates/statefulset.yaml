@@ -22,7 +22,7 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- if or .Values.podAnnotations (include "coder.extraMcp" .) }}
+      {{- if or .Values.podAnnotations (include "coder.extraMcp" .) (include "coder.runPods" .) }}
       annotations:
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -31,13 +31,23 @@ spec:
         {{- /* A changed servers file is a deploy: the file is read at startup only. */}}
         checksum/extra-mcp: {{ include (print $.Template.BasePath "/extra-mcp-configmap.yaml") . | sha256sum }}
         {{- end }}
+        {{- if include "coder.runPods" . }}
+        {{- /* The same for the run pod template. */}}
+        checksum/run-pod: {{ include (print $.Template.BasePath "/run-pods-configmap.yaml") . | sha256sum }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if include "coder.runPods" . }}
+      {{- /* Run pods: the coder pod alone holds the token of the ServiceAccount that may make them (and nothing else). */}}
+      serviceAccountName: {{ include "coder.serviceAccountName" . }}
+      automountServiceAccountToken: true
+      {{- else }}
       automountServiceAccountToken: false
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
@@ -101,8 +111,8 @@ spec:
             - name: WORKSPACE_PLACEMENT
               value: {{ . | quote }}
             {{- end }}
-            {{- if include "coder.pinsRuns" . }}
-            {{- /* A pinned run stays with the worker of that name: the pod name is stable per StatefulSet ordinal. */}}
+            {{- if or (include "coder.pinsRuns" .) (include "coder.runPods" .) }}
+            {{- /* A pinned run stays with the worker of that name: the pod name is stable per StatefulSet ordinal. Run pods are annotated with it, and a worker sweeps only its own. */}}
             - name: WORKER_ID
               valueFrom:
                 fieldRef:
@@ -190,6 +200,27 @@ spec:
               value: {{ .Values.config.gitAuthorName | quote }}
             - name: GIT_AUTHOR_EMAIL
               value: {{ .Values.config.gitAuthorEmail | quote }}
+            {{- if include "coder.runPods" . }}
+            {{- /* runPods.enabled (ADR 0019): a run's processes run in a pod of their own, made from the template below. */}}
+            - name: RUN_ENVIRONMENT
+              value: kubernetes
+            - name: RUN_POD_TEMPLATE_FILE
+              value: {{ include "coder.runPodTemplateFile" . | quote }}
+            - name: RUN_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUN_POD_INSTANCE
+              value: {{ .Release.Name | quote }}
+            - name: RUN_POD_CONTAINER
+              value: {{ .Values.runPods.container | quote }}
+            - name: RUN_POD_READY_TIMEOUT_SECS
+              value: {{ .Values.runPods.readyTimeoutSecs | quote }}
+            - name: RUN_POD_IDLE_SECS
+              value: {{ .Values.runPods.idleSecs | quote }}
+            - name: RUN_POD_WAIT_SECS
+              value: {{ .Values.runPods.waitSecs | quote }}
+            {{- end }}
             {{- end }}
             {{- range $name, $value := .Values.config.extraEnv }}
             - name: {{ $name }}
@@ -253,7 +284,12 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
           resources:
+            {{- if and (include "coder.runPods" .) .Values.runPods.coderResources }}
+            {{- /* No build runs here while run pods are on: see runPods.coderResources. */}}
+            {{- toYaml .Values.runPods.coderResources | nindent 12 }}
+            {{- else }}
             {{- toYaml .Values.resources | nindent 12 }}
+            {{- end }}
           volumeMounts:
             - name: work
               mountPath: /work
@@ -267,7 +303,12 @@ spec:
               mountPath: {{ include "coder.extraMcpDir" . }}
               readOnly: true
             {{- end }}
-      {{- if or (include "coder.sharedWork" .) $githubApp (include "coder.extraMcp" .) }}
+            {{- if include "coder.runPods" . }}
+            - name: run-pod
+              mountPath: {{ include "coder.runPodTemplateDir" . }}
+              readOnly: true
+            {{- end }}
+      {{- if or (include "coder.sharedWork" .) $githubApp (include "coder.extraMcp" .) (include "coder.runPods" .) }}
       volumes:
         {{- if include "coder.sharedWork" . }}
         - name: work
@@ -289,6 +330,13 @@ spec:
           configMap:
             name: {{ include "coder.extraMcpConfigMapName" . }}
             # Readable by the runtime user whatever fsGroup does: a mcp.json of ${VAR} references, no secret.
+            defaultMode: 0444
+        {{- end }}
+        {{- if include "coder.runPods" . }}
+        - name: run-pod
+          configMap:
+            name: {{ include "coder.runPodTemplateConfigMapName" . }}
+            # The pod template: no secret in it.
             defaultMode: 0444
         {{- end }}
       {{- end }}

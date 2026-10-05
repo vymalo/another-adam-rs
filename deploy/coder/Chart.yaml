@@ -2,7 +2,7 @@ apiVersion: v2
 name: coder
 description: "The adam-rs coder agent (A2A): coding task to verified pull request. One StatefulSet (topology=combined), or a front Deployment plus a worker StatefulSet (topology=split), its own CNPG Postgres, cluster-internal only."
 type: application
-version: 0.2.0
+version: 0.3.0
 appVersion: "0.1.0"
 kubeVersion: ">=1.27.0-0"
 sources:

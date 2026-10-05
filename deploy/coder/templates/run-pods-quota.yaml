@@ -1,0 +1,35 @@
+{{- if include "coder.runPods" . }}
+{{- if include "coder.runPodsOwnPriorityClass" . }}
+# runPods.enabled: the priority class of run pods. It exists to be scoped by: a ResourceQuota cannot select pods by
+# label, but it can by priority class. Value 0 and preemptionPolicy Never: it ranks nothing and evicts nobody.
+# Cluster-scoped, so two releases of one name in two namespaces would share it.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: {{ include "coder.runPodsPriorityClass" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+value: 0
+preemptionPolicy: Never
+globalDefault: false
+description: "Run pods of {{ include "coder.fullname" . }} (adam-coder): scoped by a ResourceQuota, ranks nothing."
+---
+{{- end }}
+# What the run pods may use in all. A pod beyond it is refused with 403 "exceeded quota", which the coder waits out.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "coder.runPodsName" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+spec:
+  hard:
+    limits.memory: {{ .Values.runPods.quota.limitsMemory | quote }}
+    pods: {{ .Values.runPods.quota.pods | quote }}
+  scopeSelector:
+    matchExpressions:
+      - scopeName: PriorityClass
+        operator: In
+        values:
+          - {{ include "coder.runPodsPriorityClass" . }}
+{{- end }}
