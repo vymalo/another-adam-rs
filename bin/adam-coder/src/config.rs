@@ -50,6 +50,15 @@
 //! | `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | how long pulling, building and creating the container may take, and how long the repository's lifecycle commands may take | `1200`, `900` |
 //! | `DEVCONTAINER_PREPULL` | pull the default image at startup | `true` |
 //! | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN` | the devcontainer CLI and Podman's remote client (set by the image) | `devcontainer`, `podman-remote` |
+//! | `RUN_ENVIRONMENT` | where a run's commands and OpenCode run: `local` (this container, or the repository's devcontainer with `DEVCONTAINER_RUNTIME=podman`) or `kubernetes` (a pod of its own for each run, [ADR 0019](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)); `kubernetes` with `DEVCONTAINER_RUNTIME=podman` is refused (exit 78) | `local` |
+//! | `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod (YAML or JSON) every run pod is made from: image, resources, priority class, security context, volumes, variables from Secrets, node affinity; the chart mounts it; an existing file | required with `kubernetes` |
+//! | `RUN_POD_NAMESPACE` | the namespace of the run pods: the coder's own | the ServiceAccount's namespace file; required when there is none |
+//! | `RUN_POD_INSTANCE` | the release's `app.kubernetes.io/instance`: the label that finds this deployment's pods; a label value | required with `kubernetes` |
+//! | `RUN_POD_CONTAINER` | the container of the template the commands run in | `run` |
+//! | `RUN_POD_EXEC_BINARY` | the program that runs one command in a pod (shipped in the image) | `adam-kube-exec` |
+//! | `RUN_POD_READY_TIMEOUT_SECS` | how long a pod may take to be ready: scheduling, pulling the image, starting | `300` |
+//! | `RUN_POD_IDLE_SECS` | how long no command may have used a pod before it is deleted (the next command makes another; the files are on the volume); `0` keeps it until the run ends | `900` |
+//! | `RUN_POD_WAIT_SECS` | how long a run waits, trying again with a growing pause, for a pod the cluster cannot give now (the quota is used up, no node has room), before the tool fails | `600` |
 //! | `OPENCODE_BINARY` | with `podman`: the OpenCode that is mounted into every devcontainer; a native executable (an ELF file) | `OPENCODE_COMMAND`'s program, found on `PATH` and resolved to its real file |
 //! | `ADAM_EXTRA_MCP_FILE` | roles that run workers: a file of extra MCP servers, in the shape of `mcp.json`, added to the agent's own (the folder's, or the embedded copy's) before they connect; it must be an existing file, and a server name the agent already has is refused at startup (exit 78). A variable it names as `${VAR}` is hidden from every process the coder starts and its value is redacted from tool output, like the `mcp.json`'s own | unset: only the agent's own servers |
 //! | `ADAM_AGENT_DIR` | the folder that holds `agent/` (or `agent/` itself): the coder's instructions, card, skills and subagents, read once at startup by every role ([`AgentFiles`](crate::AgentFiles)); it must exist | unset: the copy embedded in the binary |
@@ -190,6 +199,167 @@ pub struct WorkerConfig {
     pub extra_mcp_file: Option<PathBuf>,
     /// `DEVCONTAINER_*`: where the run's commands and OpenCode run.
     pub devcontainer: DevcontainerConfig,
+    /// `RUN_ENVIRONMENT` and `RUN_POD_*`: this container (with the devcontainers above), or a pod of
+    /// its own for each run.
+    pub run_environment: RunEnvironment,
+}
+
+/// Where the commands of a run run (`RUN_ENVIRONMENT`). A closed enum on purpose: a new place must
+/// fail to compile wherever the environment is composed.
+#[derive(Debug, Clone)]
+pub enum RunEnvironment {
+    /// In this container, or in the repository's devcontainer: [`DevcontainerConfig`] says which.
+    Local,
+    /// In a pod of the run's own ([ADR 0019](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)).
+    Kubernetes(RunPodsConfig),
+}
+
+/// The run pod variables of a worker: see the table at the top of this module.
+#[derive(Debug, Clone)]
+pub struct RunPodsConfig {
+    /// `RUN_POD_TEMPLATE_FILE`: an existing file.
+    pub template_file: PathBuf,
+    /// `RUN_POD_NAMESPACE`, or the namespace of the ServiceAccount.
+    pub namespace: String,
+    /// `RUN_POD_INSTANCE`: a label value.
+    pub instance: String,
+    /// `RUN_POD_CONTAINER`.
+    pub container: String,
+    /// `RUN_POD_EXEC_BINARY`.
+    pub exec_binary: PathBuf,
+    /// `RUN_POD_READY_TIMEOUT_SECS`.
+    pub ready_timeout: Duration,
+    /// `RUN_POD_IDLE_SECS`; `None` when it is `0`.
+    pub idle: Option<Duration>,
+    /// `RUN_POD_WAIT_SECS`.
+    pub wait: Duration,
+}
+
+/// Where a pod finds the namespace it runs in.
+const NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+
+impl RunPodsConfig {
+    /// The settings of [`adam_env_kubernetes::KubeEnvironment`] for the worker `worker`; `model_key`
+    /// says whether the gateway has a key (the template then gives it as `MODEL_API_KEY`).
+    pub fn settings(&self, worker: &str, model_key: bool) -> adam_env_kubernetes::Settings {
+        let mut settings = adam_env_kubernetes::Settings::new(
+            self.namespace.clone(),
+            self.instance.clone(),
+            worker,
+        );
+        settings.container.clone_from(&self.container);
+        settings.exec_client.clone_from(&self.exec_binary);
+        settings.ready_timeout = self.ready_timeout;
+        settings.idle = self.idle;
+        settings.model_key = model_key;
+        settings
+    }
+
+    fn parse(
+        get: &impl Fn(&str) -> Option<String>,
+        devcontainer: &DevcontainerConfig,
+        problems: &mut Vec<String>,
+    ) -> Option<Self> {
+        if devcontainer.runtime == Runtime::Podman {
+            problems.push(
+                "RUN_ENVIRONMENT=kubernetes and DEVCONTAINER_RUNTIME=podman are both set: a run's commands run in a pod of its own or in the repository's devcontainer, not both; set DEVCONTAINER_RUNTIME=off"
+                    .into(),
+            );
+        }
+        let before = problems.len();
+        let template_file = match get("RUN_POD_TEMPLATE_FILE").map(|v| v.trim().to_owned()) {
+            None => {
+                problems.push(
+                    "RUN_POD_TEMPLATE_FILE is required with RUN_ENVIRONMENT=kubernetes: the Pod every run pod is made from"
+                        .into(),
+                );
+                None
+            }
+            Some(path) if !std::path::Path::new(&path).is_file() => {
+                problems.push(format!(
+                    "RUN_POD_TEMPLATE_FILE {path:?} is not an existing file"
+                ));
+                None
+            }
+            Some(path) => Some(PathBuf::from(path)),
+        };
+        let namespace = get("RUN_POD_NAMESPACE")
+            .map(|v| v.trim().to_owned())
+            .or_else(|| {
+                std::fs::read_to_string(NAMESPACE_FILE)
+                    .ok()
+                    .map(|v| v.trim().to_owned())
+            })
+            .filter(|v| !v.is_empty());
+        if namespace.is_none() {
+            problems.push(
+                "RUN_POD_NAMESPACE is required with RUN_ENVIRONMENT=kubernetes outside a pod: the namespace the run pods are made in"
+                    .into(),
+            );
+        }
+        let instance = get("RUN_POD_INSTANCE")
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty());
+        match instance.as_deref() {
+            None => problems.push(
+                "RUN_POD_INSTANCE is required with RUN_ENVIRONMENT=kubernetes: the release's app.kubernetes.io/instance label, which finds this deployment's pods"
+                    .into(),
+            ),
+            Some(value) if !adam_env_kubernetes::is_label_value(value) => problems.push(format!(
+                "RUN_POD_INSTANCE {value:?} is not a label value (letters, digits, `-`, `_` and `.`, up to 63, starting and ending with a letter or a digit)"
+            )),
+            Some(_) => {}
+        }
+        let container = get("RUN_POD_CONTAINER")
+            .map(|v| v.trim().to_owned())
+            .unwrap_or_else(|| adam_env_kubernetes::DEFAULT_CONTAINER.to_owned());
+        if container.is_empty() || container.chars().any(char::is_whitespace) {
+            problems.push(format!(
+                "RUN_POD_CONTAINER {container:?} is not a container name"
+            ));
+        }
+        let ready = parse_or(get, "RUN_POD_READY_TIMEOUT_SECS", 300u64, problems).max(1);
+        let idle = parse_or(get, "RUN_POD_IDLE_SECS", 900u64, problems);
+        let wait = parse_or(get, "RUN_POD_WAIT_SECS", 600u64, problems);
+        if problems.len() > before {
+            return None;
+        }
+        Some(Self {
+            template_file: template_file?,
+            namespace: namespace?,
+            instance: instance?,
+            container,
+            exec_binary: PathBuf::from(
+                get("RUN_POD_EXEC_BINARY").unwrap_or_else(|| "adam-kube-exec".to_owned()),
+            ),
+            ready_timeout: Duration::from_secs(ready),
+            idle: (idle > 0).then(|| Duration::from_secs(idle)),
+            wait: Duration::from_secs(wait),
+        })
+    }
+}
+
+impl RunEnvironment {
+    fn parse(
+        get: &impl Fn(&str) -> Option<String>,
+        devcontainer: &DevcontainerConfig,
+        problems: &mut Vec<String>,
+    ) -> Self {
+        match get("RUN_ENVIRONMENT")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("local") => Self::Local,
+            Some("kubernetes") => RunPodsConfig::parse(get, devcontainer, problems)
+                .map_or(Self::Local, Self::Kubernetes),
+            Some(other) => {
+                problems.push(format!(
+                    "RUN_ENVIRONMENT must be local or kubernetes, got {other:?}"
+                ));
+                Self::Local
+            }
+        }
+    }
 }
 
 /// The image of a repository that has no `devcontainer.json` when `DEVCONTAINER_DEFAULT_IMAGE` is not
@@ -727,6 +897,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("mcp", &self.mcp)
             .field("extra_mcp_file", &self.extra_mcp_file)
             .field("devcontainer", &self.devcontainer)
+            .field("run_environment", &self.run_environment)
             .finish_non_exhaustive()
     }
 }
@@ -940,6 +1111,14 @@ impl WorkerConfig {
             .map(str::to_owned)
             .collect();
 
+        let devcontainer = DevcontainerConfig::parse(
+            get,
+            settings.worker_id.as_deref(),
+            &opencode_command,
+            problems,
+        );
+        let run_environment = RunEnvironment::parse(get, &devcontainer, problems);
+
         // `github`, `github_api_url` and `github_mcp_url` are `None` only after a problem was
         // recorded above.
         let github = github?;
@@ -967,12 +1146,8 @@ impl WorkerConfig {
             git_author_email: get("GIT_AUTHOR_EMAIL")
                 .unwrap_or_else(|| "adam-coder@users.noreply.github.com".to_owned()),
             pr_draft,
-            devcontainer: DevcontainerConfig::parse(
-                get,
-                settings.worker_id.as_deref(),
-                &opencode_command,
-                problems,
-            ),
+            devcontainer,
+            run_environment,
             opencode_command,
             mcp,
             extra_mcp_file,
@@ -2447,6 +2622,159 @@ mod tests {
         assert_eq!(settings.network, Network::None);
         assert_eq!(settings.opencode, dc.opencode_binary);
         assert!(settings.model_key.is_none());
+    }
+
+    // ----- RUN_ENVIRONMENT=kubernetes ------------------------------------------------------------
+
+    fn kubernetes_vars(dir: &std::path::Path) -> HashMap<&'static str, String> {
+        let template = dir.join("pod.yaml");
+        std::fs::write(&template, "spec: {containers: []}\n").unwrap();
+        let mut vars = owned_full();
+        vars.insert("RUN_ENVIRONMENT", "kubernetes".into());
+        vars.insert(
+            "RUN_POD_TEMPLATE_FILE",
+            template.to_string_lossy().into_owned(),
+        );
+        vars.insert("RUN_POD_NAMESPACE", "coder-ns".into());
+        vars.insert("RUN_POD_INSTANCE", "coder".into());
+        vars
+    }
+
+    fn kube_problems(vars: &HashMap<&'static str, String>) -> Vec<String> {
+        parse_dc(vars).expect_err("invalid").problems
+    }
+
+    #[test]
+    fn the_run_environment_is_local_unless_kubernetes_is_asked_for() {
+        let worker = parse_dc(&owned_full()).unwrap().worker.unwrap();
+        assert!(matches!(worker.run_environment, RunEnvironment::Local));
+        let mut vars = owned_full();
+        vars.insert("RUN_ENVIRONMENT", " Local ".into());
+        // The run pod variables of a local deployment are not read, so not validated.
+        vars.insert("RUN_POD_IDLE_SECS", "not a number".into());
+        assert!(matches!(
+            parse_dc(&vars).unwrap().worker.unwrap().run_environment,
+            RunEnvironment::Local
+        ));
+    }
+
+    #[test]
+    fn kubernetes_reads_the_run_pod_variables_with_their_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = parse_dc(&kubernetes_vars(dir.path()))
+            .unwrap()
+            .worker
+            .unwrap();
+        let RunEnvironment::Kubernetes(pods) = worker.run_environment else {
+            panic!("kubernetes was asked for");
+        };
+        assert_eq!(pods.template_file, dir.path().join("pod.yaml"));
+        assert_eq!(pods.namespace, "coder-ns");
+        assert_eq!(pods.instance, "coder");
+        assert_eq!(pods.container, "run");
+        assert_eq!(pods.exec_binary, PathBuf::from("adam-kube-exec"));
+        assert_eq!(pods.ready_timeout, Duration::from_secs(300));
+        assert_eq!(pods.idle, Some(Duration::from_secs(900)));
+        assert_eq!(pods.wait, Duration::from_secs(600));
+        // The settings of the environment.
+        let settings = pods.settings("coder-0", true);
+        assert_eq!(settings.namespace, "coder-ns");
+        assert_eq!(settings.instance, "coder");
+        assert_eq!(settings.worker, "coder-0");
+        assert!(settings.model_key);
+        assert_eq!(settings.idle, Some(Duration::from_secs(900)));
+        assert!(!pods.settings("coder-0", false).model_key);
+    }
+
+    #[test]
+    fn every_run_pod_variable_can_be_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = kubernetes_vars(dir.path());
+        vars.insert("RUN_POD_CONTAINER", "work".into());
+        vars.insert("RUN_POD_EXEC_BINARY", "/usr/local/bin/kx".into());
+        vars.insert("RUN_POD_READY_TIMEOUT_SECS", "600".into());
+        vars.insert("RUN_POD_IDLE_SECS", "0".into());
+        vars.insert("RUN_POD_WAIT_SECS", "30".into());
+        let RunEnvironment::Kubernetes(pods) =
+            parse_dc(&vars).unwrap().worker.unwrap().run_environment
+        else {
+            panic!("kubernetes was asked for");
+        };
+        assert_eq!(pods.container, "work");
+        assert_eq!(pods.exec_binary, PathBuf::from("/usr/local/bin/kx"));
+        assert_eq!(pods.ready_timeout, Duration::from_secs(600));
+        assert_eq!(pods.idle, None, "0 keeps a pod until its run ends");
+        assert_eq!(pods.wait, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn kubernetes_with_the_podman_devcontainers_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = kubernetes_vars(dir.path());
+        vars.insert("DEVCONTAINER_RUNTIME", "podman".into());
+        vars.insert("CONTAINER_HOST", "unix:///run/podman/podman.sock".into());
+        vars.insert("OPENCODE_BINARY", elf_in(dir.path(), "opencode"));
+        let problems = kube_problems(&vars);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("RUN_ENVIRONMENT=kubernetes")
+                    && p.contains("DEVCONTAINER_RUNTIME=podman")),
+            "{problems:?}"
+        );
+        // A configuration error is exit code 78, with the other problems of the file.
+        let error = parse_dc(&vars).unwrap_err();
+        assert_eq!(
+            crate::exit_code(&anyhow::Error::from(error)),
+            crate::exit::EX_CONFIG
+        );
+    }
+
+    #[test]
+    fn the_run_pod_variables_that_are_wrong_are_problems_naming_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, Option<&str>, &str); 8] = [
+            (
+                "RUN_POD_TEMPLATE_FILE",
+                None,
+                "RUN_POD_TEMPLATE_FILE is required",
+            ),
+            (
+                "RUN_POD_TEMPLATE_FILE",
+                Some("/no/such/pod.yaml"),
+                "not an existing file",
+            ),
+            (
+                "RUN_POD_NAMESPACE",
+                Some(" "),
+                "RUN_POD_NAMESPACE is required",
+            ),
+            ("RUN_POD_INSTANCE", None, "RUN_POD_INSTANCE is required"),
+            ("RUN_POD_INSTANCE", Some("-bad-"), "not a label value"),
+            (
+                "RUN_POD_CONTAINER",
+                Some("two words"),
+                "not a container name",
+            ),
+            ("RUN_POD_IDLE_SECS", Some("soon"), "RUN_POD_IDLE_SECS"),
+            (
+                "RUN_ENVIRONMENT",
+                Some("docker"),
+                "must be local or kubernetes",
+            ),
+        ];
+        for (name, value, expected) in cases {
+            let mut vars = kubernetes_vars(dir.path());
+            match value {
+                Some(value) => vars.insert(name, value.to_owned()),
+                None => vars.remove(name),
+            };
+            let problems = kube_problems(&vars);
+            assert!(
+                problems.iter().any(|p| p.contains(expected)),
+                "{name}={value:?}: {problems:?}"
+            );
+        }
     }
 
     #[test]

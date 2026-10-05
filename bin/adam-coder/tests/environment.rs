@@ -402,6 +402,141 @@ async fn an_environment_that_cannot_be_made_is_a_result_for_the_model_and_nothin
     );
 }
 
+// ------------------------------------------------------------------- waiting for a slot (run pods)
+
+fn slot_steps(rig: &Rig) -> Vec<(StepState, Option<String>)> {
+    rig.steps()
+        .into_iter()
+        .filter(|s| s.id.ends_with(":slot"))
+        .map(|s| (s.state, s.detail))
+        .collect()
+}
+
+/// A quota that is used up is not a failure and not a reason to run in the coder's own container:
+/// the run waits for a slot, with a step that says so, and the command runs once one is free.
+#[tokio::test]
+async fn an_environment_that_is_not_available_now_is_waited_for_when_the_deployment_says_to() {
+    let fx = Fixture::new("hello\n")
+        .await
+        .waiting_for_slots(Duration::from_secs(60));
+    let rig = Rig::from(fx).await;
+    rig.prepare().await;
+    rig.fake.unavailable_for.store(1, Ordering::SeqCst);
+
+    let started = std::time::Instant::now();
+    let out = RunCommand
+        .call(&rig.ctx, json!({"command": "echo got-a-slot"}))
+        .await
+        .unwrap();
+    assert!(
+        !out.is_error && out.content.contains("got-a-slot"),
+        "{}",
+        out.content
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "it waited the first pause before it tried again"
+    );
+    assert_eq!(rig.fake.ensured.lock().unwrap().len(), 2, "tried twice");
+    let steps = slot_steps(&rig);
+    assert_eq!(steps.first().unwrap().0, StepState::Running);
+    assert!(
+        steps
+            .first()
+            .unwrap()
+            .1
+            .as_deref()
+            .unwrap()
+            .contains("quota of run pods is used up"),
+        "{steps:?}"
+    );
+    assert_eq!(steps.last().unwrap().0, StepState::Completed, "{steps:?}");
+}
+
+#[tokio::test]
+async fn a_wait_that_runs_out_is_the_tools_transient_result() {
+    let fx = Fixture::new("hello\n")
+        .await
+        .waiting_for_slots(Duration::from_secs(3));
+    let rig = Rig::from(fx).await;
+    rig.prepare().await;
+    rig.fake.unavailable_for.store(1_000, Ordering::SeqCst);
+
+    let started = std::time::Instant::now();
+    let out = RunCommand.call(&rig.ctx, json!({"command": "true"})).await;
+    let Err(ToolError::Transient(message)) = out else {
+        panic!("a transient error was expected: {out:?}");
+    };
+    assert!(
+        message.contains("quota of run pods is used up"),
+        "{message}"
+    );
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(3) && took < Duration::from_secs(15),
+        "bounded by the wait: {took:?}"
+    );
+    assert!(
+        rig.fake.session.specs.lock().unwrap().is_empty(),
+        "nothing ran, and nothing ran in the coder's own container instead"
+    );
+    assert_eq!(slot_steps(&rig).last().unwrap().0, StepState::Failed);
+}
+
+#[tokio::test]
+async fn a_cancel_ends_the_wait_for_a_slot() {
+    let fx = Fixture::new("hello\n")
+        .await
+        .waiting_for_slots(Duration::from_secs(600));
+    let (rig, token) = Rig::from(fx).await.cancellable();
+    rig.prepare().await;
+    rig.fake.unavailable_for.store(1_000, Ordering::SeqCst);
+
+    let cancel = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        token.cancel();
+    };
+    let (out, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(
+            RunCommand.call(&rig.ctx, json!({"command": "true"})),
+            cancel
+        )
+    })
+    .await
+    .expect("the tool stops waiting after a cancel");
+    assert!(
+        matches!(&out, Err(ToolError::Permanent(m)) if m.contains("cancelled")),
+        "{out:?}"
+    );
+}
+
+/// Only `Unavailable` is waited for, and only where the deployment says so: a broken environment is
+/// the model's to hear at once, and the default (the devcontainer's behaviour) is not to wait.
+#[tokio::test]
+async fn only_unavailable_is_waited_for_and_by_default_nothing_is() {
+    let fx = Fixture::new("hello\n")
+        .await
+        .waiting_for_slots(Duration::from_secs(60));
+    let rig = Rig::from(fx).await;
+    rig.prepare().await;
+    *rig.fake.ensure_fails.lock().unwrap() = Some(|| EnvError::Refused("not allowed".to_owned()));
+    let started = std::time::Instant::now();
+    let out = RunCommand.call(&rig.ctx, json!({"command": "true"})).await;
+    assert!(matches!(out, Err(ToolError::Permanent(_))), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(2), "no wait");
+    assert!(slot_steps(&rig).is_empty());
+
+    // With no wait set, the first Unavailable is the result at once.
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    rig.fake.unavailable_for.store(1, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let out = RunCommand.call(&rig.ctx, json!({"command": "true"})).await;
+    assert!(matches!(out, Err(ToolError::Transient(_))), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(slot_steps(&rig).is_empty());
+}
+
 #[tokio::test]
 async fn a_cancel_stops_the_wait_for_an_environment() {
     let (rig, token) = Rig::new().await.cancellable();

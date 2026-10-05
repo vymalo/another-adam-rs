@@ -10,7 +10,7 @@ The decision, the facts it rests on, and the lifecycle of a run pod are
 An **implementation** of the `Environment` port, swapped at build time (a binary composes it, no plugin), next to
 [`adam-devcontainer`](../adam-devcontainer/README.md) (a Podman service). It depends on `adam-workspace` for the port and on
 `kube` for the cluster: it speaks to the API server itself and runs no command to do it. The coder composes it when
-`RUN_ENVIRONMENT=kubernetes` (see [its README](../../bin/adam-coder/README.md#where-a-runs-processes-run)); the default is the
+`RUN_ENVIRONMENT=kubernetes` (see [its README](../../bin/adam-coder/README.md#a-pod-of-its-own-for-each-run)); the default is the
 coder's own container, so nothing changes for a deployment that does not opt in.
 
 A run's commands (`run_command`, `run_checks`, OpenCode and everything OpenCode starts) go through the run's `EnvSession`: the

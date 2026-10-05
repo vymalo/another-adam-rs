@@ -25,6 +25,7 @@ adam-a2a-runtime.workspace = true
 adam-acp.workspace = true
 adam-core.workspace = true
 adam-devcontainer.workspace = true
+adam-env-kubernetes.workspace = true
 adam-error.workspace = true
 adam-host.workspace = true
 adam-llm-agent.workspace = true

@@ -919,12 +919,49 @@ stateDiagram-v2
   can the model key anywhere OpenCode runs; the key is the model gateway's and not GitHub's. The untrusted file is checked three times against a
   [policy](../../crates/adam-devcontainer/README.md#the-file-is-untrusted).
 * **Kubernetes.** The Helm chart keeps `DEVCONTAINER_RUNTIME` off ([`deploy/coder/README.md`](../../deploy/coder/README.md)): the Podman service
-  needs the same workspace volume at the same path and relaxed seccomp, which a pod does not give; the platform's sandbox provider is the way
-  there.
+  needs the same workspace volume at the same path and relaxed seccomp, which a pod does not give. A cluster has its own environment instead,
+  [a pod for each run](#a-pod-of-its-own-for-each-run) (`RUN_ENVIRONMENT=kubernetes`), which does not use the repository's `devcontainer.json`
+  and is never on together with this one.
 * **At startup** (`serve`, through `environment_for`) with `podman`: the tools directory every container mounts (`<root>/environments/.tools/`: `adam-exec` and
   OpenCode) is written (a failure stops the start), the service is probed (a service that does not answer is a warning: runs fall back to
   this container until it does), and the default image is pulled in the background (`DEVCONTAINER_PREPULL`). The janitor releases the
   environment of a run **before** it removes the run's workspace, and releases what `held_runs()` finds for runs that are over (a crash left it).
+
+### A pod of its own for each run
+
+With `RUN_ENVIRONMENT=kubernetes` the commands of a run (`run_command`, `run_checks`), OpenCode and everything OpenCode starts run in **a pod of
+the run's own** ([ADR 0019](../../docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)), made by
+[`adam-env-kubernetes`](../../crates/adam-env-kubernetes/README.md)'s `KubeEnvironment`, so that a Rust build, an `npm install` or a Flutter build is
+bounded by the pod's memory limit (2Gi in the chart) and an out-of-memory kill takes one run's command and not the coder. The coder pod holds the files,
+git and every credential and can be small (about 1Gi). `RUN_ENVIRONMENT` is `local` (this container, or the repository's devcontainer) unless it says
+otherwise, so nothing changes for a deployment that does not opt in; `kubernetes` with `DEVCONTAINER_RUNTIME=podman` is refused at startup, with
+every other problem of the configuration (exit 78).
+
+* **Where the pod comes from.** `RUN_POD_TEMPLATE_FILE`, a Pod the chart mounts: the image (the `workspace` image, by tag and digest), the resources,
+  the priority class, the security context, the volumes, `MODEL_API_KEY` from the deployment's Secret and the node affinity are the deployment's; the
+  coder only adds a name (`adam-run-<hash of the run id>`), the namespace, labels and annotations. The file is read and checked at startup (a template
+  the cluster's admission policy would refuse, or without the container the commands run in, is exit 78). The pod mounts the coder's workspace volume
+  at the **same path**, so a path means the same in both.
+* **A command** is the program `adam-kube-exec` (in the image: `RUN_POD_EXEC_BINARY`), which the tools spawn as any command, in a process group of its
+  own, with an empty environment but the variables it needs to reach the cluster. It runs `adam-exec run|shell` in the pod over `pods/exec` and exits
+  with the command's code. A timeout or a cancel kills the client **and** runs `adam-exec kill` in the pod. **No GitHub credential, `DATABASE_URL` or
+  bearer token is ever in a run pod**; the model key is `MODEL_API_KEY` there, which `secret_ref("model-key")` names, so OpenCode reads it with
+  `{env:MODEL_API_KEY}`.
+* **First command, and idle pods.** The pod is made on the first command of a run and waited for (`RUN_POD_READY_TIMEOUT_SECS`), with a step
+  (`env:<run>:run-pod`). A pod no command used for `RUN_POD_IDLE_SECS` and that runs nothing is deleted, and the next command makes another: a run that
+  waits hours for a person holds no pod. The janitor deletes the pod of a run that is over before it removes the workspace, and sweeps the pods it finds
+  by label (`held_runs`) after a crash.
+* **A slot is waited for.** A pod the namespace's quota refuses (HTTP 403 `exceeded quota`), a cluster that does not answer and a pod no node has
+  room for are `EnvError::Unavailable`. Where this environment is on, the tool does **not** fail at once and does **not** run in this container instead:
+  it tries again after 2, 4, 8, ... up to 30 seconds, for `RUN_POD_WAIT_SECS`, with a step `env:<run>:slot` ("Waiting for a slot for the run's
+  environment", with the reason and what is left) that ends completed or failed, and a cancel of the run ends the wait (`ToolEnv::with_unavailable_wait`).
+  After the wait the tool's result is the transient error. The devcontainer's behaviour is unchanged: without the setting the first `Unavailable` is the
+  result at once.
+* **OpenCode** is the coder's own native binary, copied by the pod's init container to `/opt/adam/bin/opencode` (`EnvSession::tool_path`), and is checked
+  once per run with `opencode --version` in the pod, like in a devcontainer. `EnvKind::Kubernetes` is what the `checks` artifact's `environment` says
+  (`kind: "kubernetes"`, the image).
+* **The repository's own `devcontainer.json` is not used** in a run pod: the template's image is the environment, and a tool that image lacks is
+  reported to the person like any missing tool.
 
 ### Looking around, and what it may not do
 
@@ -1434,6 +1471,15 @@ way; every problem is reported at once at startup):
 | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (`localhost` and loopback never need it). **Development only**: requests and headers cross the network in the clear | `false` |
 | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url`. Off because the MCP client library logs the URL it dials (credentials belong in `headers`, where `${VAR}` always works); turn it on only if that log is filtered | `false` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
+| `RUN_ENVIRONMENT` | where a run's commands and OpenCode run: `local` (this container, or the repository's devcontainer with `DEVCONTAINER_RUNTIME=podman`) or `kubernetes` ([a pod for each run](#a-pod-of-its-own-for-each-run)). With `kubernetes`, `DEVCONTAINER_RUNTIME=podman` is refused. Anything else: exit 78 | `local` |
+| `RUN_POD_TEMPLATE_FILE` | with `kubernetes`: the Pod (YAML or JSON) every run pod is made from; an existing file, read and checked at startup (the chart's `runPods` ConfigMap) | required with `kubernetes` |
+| `RUN_POD_NAMESPACE` | with `kubernetes`: the namespace the run pods are made in | the ServiceAccount's namespace file; required when there is none |
+| `RUN_POD_INSTANCE` | with `kubernetes`: the release's `app.kubernetes.io/instance`, which finds this deployment's pods; a label value | required with `kubernetes` |
+| `RUN_POD_CONTAINER` | with `kubernetes`: the container of the template the commands run in | `run` |
+| `RUN_POD_EXEC_BINARY` | with `kubernetes`: the program that runs a command in a pod (the image ships `adam-kube-exec`) | `adam-kube-exec` |
+| `RUN_POD_READY_TIMEOUT_SECS` | with `kubernetes`: how long a pod may take to be ready (scheduling, the first pull of the image on a node) | `300` (the chart: `600`) |
+| `RUN_POD_IDLE_SECS` | with `kubernetes`: how long no command may have used a pod (and none runs in it) before it is deleted; the next command makes another. `0` keeps it until its run ends | `900` |
+| `RUN_POD_WAIT_SECS` | with `kubernetes`: how long a run waits, trying again with a growing pause, for a pod the cluster cannot give now, before the tool fails | `600` |
 | `DEVCONTAINER_RUNTIME` | where a run's commands and OpenCode run: `off` (this container) or `podman` (the repository's devcontainer, on a rootless Podman service; see [The work environment](#the-work-environment-the-repositorys-devcontainer)). Anything else: exit 78 | `off` |
 | `CONTAINER_HOST` | Podman's own variable: where the service is, e.g. `unix:///run/podman/podman.sock`; **required** with `podman` | unset |
 | `DEVCONTAINER_DEFAULT_IMAGE` | the image of a repository that has no `devcontainer.json`. **Name it by digest only** (`registry/name@sha256:...`): the devcontainer CLI (0.89.0) cannot parse a reference that has both a tag and a digest ("Could not parse image name"), and then skips the image's details, the metadata that sets the remote user | the `workspace` image of `another-agentic-images` the coder is built on, by digest (`DEFAULT_DEVCONTAINER_IMAGE`; its tag, `DEFAULT_DEVCONTAINER_IMAGE_TAG`, is kept equal to the Dockerfile's `WORKSPACE_TAG` by a test) |
@@ -2169,6 +2215,14 @@ exists only inside `adam-acp`): `tests/common/mod.rs` runs
 `cargo build -p adam-acp --bin adam-acp-fake-agent` with the same profile and
 target directory as the running test executable (derived from
 `current_exe()`), through `$CARGO`.
+
+* **Run pods, in `src/config.rs` and `tests/environment.rs`.** The configuration: `RUN_ENVIRONMENT` is `local` unless it says `kubernetes` (and the
+  run pod variables of a local deployment are not read), the defaults and every variable, `kubernetes` together with `DEVCONTAINER_RUNTIME=podman`
+  refused with exit 78, and each wrong run pod variable a problem naming it. The wait for a slot (`ToolEnv::with_unavailable_wait`): an environment that
+  is unavailable for one call is waited for and then works, with the step `env:<run>:slot` running and then completed; a wait that runs out is the tool's
+  transient result, bounded by the wait, with nothing run in this container; a cancel ends the wait; only `Unavailable` is waited for, and where the
+  setting is absent the first `Unavailable` is the result at once. The pods themselves are tested in
+  [`adam-env-kubernetes`](../../crates/adam-env-kubernetes/README.md#tests).
 
 ## Live smoke test (manual, not run in CI)
 

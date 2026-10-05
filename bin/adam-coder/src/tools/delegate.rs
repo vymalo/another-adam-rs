@@ -67,7 +67,10 @@ async fn opencode_refusal(
 ) -> Result<Option<String>, ToolError> {
     let description = session.describe();
     if !env.settings.opencode.is_opencode()
-        || !matches!(description.kind, EnvKind::DevContainer { .. })
+        || !matches!(
+            description.kind,
+            EnvKind::DevContainer { .. } | EnvKind::Kubernetes { .. }
+        )
     {
         return Ok(None);
     }

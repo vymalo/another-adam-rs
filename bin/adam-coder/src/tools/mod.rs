@@ -131,6 +131,20 @@ pub(crate) fn cancelled(what: &str) -> ToolError {
     ToolError::Permanent(format!("cancelled: the run was cancelled; {what}"))
 }
 
+/// The first pause between two tries for an environment that is not available now, doubled each time.
+const SLOT_PAUSE_START: Duration = Duration::from_secs(2);
+
+/// The longest pause between two such tries.
+const SLOT_PAUSE_MAX: Duration = Duration::from_secs(30);
+
+/// Why [`ToolEnv::session`] did not get a session from one `ensure`.
+enum Ensure {
+    /// The run was cancelled while it waited.
+    Cancelled(ToolError),
+    /// The environment said no.
+    Failed(EnvError),
+}
+
 /// Tunables of the tools.
 #[derive(Debug, Clone)]
 pub struct CoderSettings {
@@ -212,6 +226,11 @@ pub struct ToolEnv {
     /// OpenCode. [`Local`], this container, until [`ToolEnv::with_environment`]. The file tools and
     /// everything git does stay in this process whatever it is: they act on the shared files.
     pub environment: DynEnvironment,
+    /// How long a run waits for an environment that is **not available now** (the namespace's quota of
+    /// run pods is used up, no node has room, the API does not answer), trying again with a growing
+    /// pause and saying so as a step, before the tool fails. `None` (the default, and every
+    /// environment but run pods): the first `EnvError::Unavailable` is the tool's result at once.
+    pub unavailable_wait: Option<Duration>,
     /// What a run that ends on rejected GitHub credentials says to check: the variables of the kind
     /// of credentials the process has (a token, or a GitHub App). `GITHUB_TOKEN` until
     /// [`ToolEnv::with_credentials_hint`].
@@ -230,6 +249,7 @@ impl ToolEnv {
             redactor: Redactor::default(),
             ui: Ui::new(McpPolicy::default()).with_ask_lead(ASK_LEAD),
             environment: Arc::new(Local),
+            unavailable_wait: None,
             credentials_hint: "GITHUB_TOKEN is valid and may push and open pull requests for the repository",
         }
     }
@@ -248,6 +268,15 @@ impl ToolEnv {
     #[must_use]
     pub fn with_environment(mut self, environment: DynEnvironment) -> Self {
         self.environment = environment;
+        self
+    }
+
+    /// Wait up to `wait` for an environment that is not available now, instead of failing at the
+    /// first [`EnvError::Unavailable`] (`RUN_POD_WAIT_SECS`: a run waits for a slot, it does not fall
+    /// back to this container and does not fail at once). See [`ToolEnv::session`].
+    #[must_use]
+    pub fn with_unavailable_wait(mut self, wait: Duration) -> Self {
+        self.unavailable_wait = Some(wait);
         self
     }
 
@@ -298,27 +327,104 @@ impl ToolEnv {
     /// steps under the tool call, `env:<run>:<step>`, scrubbed like everything else the coder
     /// shows. A cancel of the run stops the wait. Needs no workspace: it is the run's, whether or
     /// not a slot is there yet.
+    ///
+    /// An environment that is **not available now** ([`EnvError::Unavailable`]) is waited for when
+    /// [`ToolEnv::unavailable_wait`] is set (run pods: the quota is used up): the call is tried again
+    /// after 2, 4, 8, ... up to 30 seconds, until the wait is over, and the step `env:<run>:slot` says
+    /// the run waits for a slot. Without it the first such error is the tool's result, as it always
+    /// was (the devcontainer's behaviour is unchanged).
     pub(crate) async fn session(&self, ctx: &ToolCtx) -> Result<Arc<dyn EnvSession>, ToolError> {
         let run = ctx.run_id().to_string();
         let workspace = self.workspaces.run(&run).map_err(|e| workspace_error(&e))?;
+        let started = std::time::Instant::now();
+        let mut pause = SLOT_PAUSE_START;
+        let mut waiting = false;
+        loop {
+            match self.ensure_once(ctx, &run, &workspace).await {
+                Ok(session) => {
+                    if waiting {
+                        self.show_slot(ctx, &run, StepState::Completed, "a slot is free")
+                            .await;
+                    }
+                    return Ok(session);
+                }
+                Err(Ensure::Cancelled(e)) => return Err(e),
+                // Not available now, and this deployment says to wait for it: the run is not lost
+                // and does not go on elsewhere, it waits for a slot, with a step that says so.
+                Err(Ensure::Failed(EnvError::Unavailable(why)))
+                    if self
+                        .unavailable_wait
+                        .is_some_and(|limit| started.elapsed() < limit) =>
+                {
+                    let limit = self.unavailable_wait.unwrap_or_default();
+                    let left = limit.saturating_sub(started.elapsed());
+                    let detail = format!(
+                        "{why}; trying again in {} s, for up to {} s more",
+                        pause.as_secs(),
+                        left.as_secs()
+                    );
+                    waiting = true;
+                    self.show_slot(ctx, &run, StepState::Running, &detail).await;
+                    tokio::select! {
+                        biased;
+                        () = ctx.cancelled() => {
+                            return Err(cancelled("the environment of the run was not made"));
+                        }
+                        () = tokio::time::sleep(pause.min(left)) => {}
+                    }
+                    pause = (pause * 2).min(SLOT_PAUSE_MAX);
+                }
+                Err(Ensure::Failed(e)) => {
+                    if waiting {
+                        let detail = format!("no slot after {} s", started.elapsed().as_secs());
+                        self.show_slot(ctx, &run, StepState::Failed, &detail).await;
+                    }
+                    return Err(session_error(&self.redactor, &e));
+                }
+            }
+        }
+    }
+
+    /// One `ensure`, with the steps it reports shown as it goes. A cancel of the run stops the wait.
+    async fn ensure_once(
+        &self,
+        ctx: &ToolCtx,
+        run: &str,
+        workspace: &adam_workspace::RunWorkspace,
+    ) -> Result<Arc<dyn EnvSession>, Ensure> {
         let (steps, mut reported) = tokio::sync::mpsc::unbounded_channel();
         let progress = StepChannel(steps);
-        let ensure = self.environment.ensure(&workspace, &progress);
+        let ensure = self.environment.ensure(workspace, &progress);
         tokio::pin!(ensure);
         let made = loop {
             tokio::select! {
                 biased;
                 () = ctx.cancelled() => {
-                    return Err(cancelled("the environment of the run was not made"));
+                    return Err(Ensure::Cancelled(cancelled(
+                        "the environment of the run was not made",
+                    )));
                 }
-                Some(step) = reported.recv() => self.show_step(ctx, &run, step).await,
+                Some(step) = reported.recv() => self.show_step(ctx, run, step).await,
                 made = &mut ensure => break made,
             }
         };
         while let Ok(step) = reported.try_recv() {
-            self.show_step(ctx, &run, step).await;
+            self.show_step(ctx, run, step).await;
         }
-        made.map_err(|e| session_error(&self.redactor, &e))
+        made.map_err(Ensure::Failed)
+    }
+
+    /// The step that says the run waits for a slot for its environment.
+    async fn show_slot(&self, ctx: &ToolCtx, run: &str, state: StepState, detail: &str) {
+        let event = StepEvent::new(
+            format!("env:{run}:slot"),
+            StepKind::Command,
+            "Waiting for a slot for the run's environment".to_owned(),
+            state,
+        )
+        .with_icon(StepIcon::Execute)
+        .with_detail(self.redactor.scrub(detail));
+        ctx.report_step(event).await;
     }
 
     /// A step of making the environment, as a step of the tool call.
