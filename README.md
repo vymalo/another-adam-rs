@@ -649,6 +649,12 @@ CI runs the tests with [cargo-nextest](https://nexte.st) (`cargo nextest run
 --workspace`, profile `ci` in `.config/nextest.toml`) plus `cargo test --doc`,
 and gates line coverage (`cargo llvm-cov nextest --workspace`).
 
+Two more suites need a service of their own and are gated apart, so that `ADAM_TEST_REQUIRE_DB=1` does not turn them on: the devcontainer
+test (`ADAM_TEST_DEVCONTAINER=1`, with `ADAM_TEST_REQUIRE_DEVCONTAINER=1` to fail instead of skip) and the **cluster test** of
+`adam-env-kubernetes` (`ADAM_TEST_KUBECONFIG`, the kubeconfig of the coder's ServiceAccount, with `ADAM_TEST_REQUIRE_KUBERNETES=1` to fail
+instead of skip; its other variables are in the header of `crates/adam-env-kubernetes/tests/cluster.rs`). CI's `run-pods` job sets up a `kind`
+cluster for the second with `deploy/coder/tests/kind-run-pods.sh`, which a developer with `kind` can run too.
+
 The compile tests of `#[tool]` (`cargo test -p adam --test ui`, trybuild) split in two: the
 errors the macro produces itself always run, and the ones rustc words itself run only with
 `ADAM_TRYBUILD=1`, in the CI job `ui` pinned to one toolchain (see the
