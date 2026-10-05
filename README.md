@@ -30,6 +30,7 @@ table below links each README, wherever it is.
 | [`adam-notify-testkit`](crates/adam-notify-testkit/README.md) | Conformance suite every `Notifier` (and its event transport) must pass (`notifier_conformance!`) |
 | [`adam-a2a`](crates/adam-a2a/README.md) | Expose an agent as an A2A 1.0 server (axum): `TaskBackend` seam, bearer auth (fail closed), `InMemoryBackend` under feature `test-util` |
 | [`adam-devcontainer`](crates/adam-devcontainer/README.md) | A run's commands in its repository's devcontainer, on a rootless Podman service, through the official devcontainer CLI: the container-backed `Environment` of `adam-workspace` ([ADR 0010](docs/decisions/0010-a-run-works-in-its-repositorys-devcontainer.md)); the stack is `dev/compose.devcontainer.yaml` |
+| [`adam-env-kubernetes`](crates/adam-env-kubernetes/README.md) | A run's commands in a Kubernetes pod of its own, from a pod template the chart mounts, through `pods/exec` and the client `adam-kube-exec`: the cluster-backed `Environment` of `adam-workspace` ([ADR 0019](docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)); the chart's `runPods` block makes the objects it needs |
 | [`adam-acp`](crates/adam-acp/README.md) | ACP client that drives a coding agent (`opencode acp`) over stdio; ships a scripted fake agent for tests |
 | [`adam-llm-agent`](crates/adam-llm-agent/README.md) | `LlmAgent`: the durable model/tool-calling loop (`Tool` trait and typed tool helpers, `NeedsInput` parking, limits, history truncation) on top of `adam-runtime` |
 | [`adam-macros`](crates/adam-macros/README.md) | The `#[tool]` attribute macro: an `async fn` becomes a `Tool` (name, description and argument schema from the function and its doc comments; `State<T>` and `&ToolCtx` parameters). A proc-macro crate over `syn`; the expansion is a pure, unit-tested function |
@@ -647,6 +648,12 @@ provides the databases). Gate new database tests with
 CI runs the tests with [cargo-nextest](https://nexte.st) (`cargo nextest run
 --workspace`, profile `ci` in `.config/nextest.toml`) plus `cargo test --doc`,
 and gates line coverage (`cargo llvm-cov nextest --workspace`).
+
+Two more suites need a service of their own and are gated apart, so that `ADAM_TEST_REQUIRE_DB=1` does not turn them on: the devcontainer
+test (`ADAM_TEST_DEVCONTAINER=1`, with `ADAM_TEST_REQUIRE_DEVCONTAINER=1` to fail instead of skip) and the **cluster test** of
+`adam-env-kubernetes` (`ADAM_TEST_KUBECONFIG`, the kubeconfig of the coder's ServiceAccount, with `ADAM_TEST_REQUIRE_KUBERNETES=1` to fail
+instead of skip; its other variables are in the header of `crates/adam-env-kubernetes/tests/cluster.rs`). CI's `run-pods` job sets up a `kind`
+cluster for the second with `deploy/coder/tests/kind-run-pods.sh`, which a developer with `kind` can run too.
 
 The compile tests of `#[tool]` (`cargo test -p adam --test ui`, trybuild) split in two: the
 errors the macro produces itself always run, and the ones rustc words itself run only with

@@ -85,7 +85,16 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      `config.extraEnv.MCP_ALLOW_INSECURE`). Put the AWS properties in place before turning one on (chart
      README, "Extra MCP servers").
    * No Ingress: the service is cluster-internal and reached over A2A with a bearer token.
-   * Devcontainers are off on Kubernetes (README "Devcontainers are off here").
+   * Devcontainers are off on Kubernetes (README "Devcontainers are off here"). Its own answer is
+     `runPods.enabled` (off by default and then invisible): each active run's processes run in a pod of its own
+     (`RUN_ENVIRONMENT=kubernetes`, ADR 0019, `docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md`). The
+     chart renders the pod template (a ConfigMap; image, resources and volumes are values), a `PriorityClass` and a
+     `ResourceQuota` scoped to it (a quota cannot select pods by label), a ServiceAccount with a Role for `pods` and
+     `pods/exec`, a `ValidatingAdmissionPolicy` that refuses every pod of that ServiceAccount but the intended one,
+     and a `NetworkPolicy`; the coder pod gets a 1Gi limit (`runPods.coderResources`). It needs Kubernetes 1.30+
+     and an ExternalSecret, and refuses `replicaCount` above 1 on per-pod `ReadWriteOnce` volumes and a policy
+     switched off without `runPods.admissionPolicy.disableAcknowledged`. The image ships `adam-kube-exec` and
+     `/opt/adam/bin/{adam-exec,opencode}` for the pod's init container (chart README, "Run pods").
 5. **Change the chart with its guards.** Render-time validation is in
    `deploy/coder/templates/_validate.tpl`; the default render is pinned by
    `deploy/coder/tests/golden/combined.yaml`; `deploy/coder/tests/render-check.sh` asserts the

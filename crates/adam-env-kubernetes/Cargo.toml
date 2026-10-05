@@ -1,0 +1,34 @@
+[package]
+name = "adam-env-kubernetes"
+description = "A run's processes in a Kubernetes pod of its own: the cluster-backed Environment of adam-workspace, and adam-kube-exec, the client that runs one command in it"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-error.workspace = true
+adam-workspace.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde-saphyr.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "rt-multi-thread", "signal", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+http.workspace = true
+tempfile.workspace = true
+tower-test.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "process", "signal", "sync", "time", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

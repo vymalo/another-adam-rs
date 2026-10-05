@@ -251,6 +251,111 @@ persistence:
   accessModes:
     - ReadWriteOnce
 
+# A pod of its own for each active run (ADR 0019). Off by default: with it off the render is exactly what it was.
+# On, the coder runs the processes of a run (the project's checks, the commands that look around, OpenCode and
+# everything it starts) in a pod made from the template below, and only the files, git and the credentials stay
+# in the coder pod, which can then be small: see `coderResources`. The chart renders, for the roles that run
+# workers: the pod template (a ConfigMap the coder reads at startup), a ServiceAccount, a Role and a RoleBinding
+# that let the coder make, list and delete pods and `exec` in them, a PriorityClass and a ResourceQuota scoped to
+# it (a quota cannot select pods by label; a priority class is what it can select by), a ValidatingAdmissionPolicy
+# and its binding that refuse every pod of the coder's ServiceAccount but the intended one (this is what lets the
+# coder make pods without being able to read the namespace's other Secrets, mount the host or run privileged), and
+# a NetworkPolicy for the run pods. Needs Kubernetes 1.30 or later for the admission policy (*unverified* for the
+# owner's cluster); the render refuses an older one (`helm template --kube-version`).
+runPods:
+  enabled: false
+  # The run container's image: the workspace image of another-agentic-images (the toolchains, user 10001, /work),
+  # by tag AND digest. *Verified 2026-10-05*: an anonymous ghcr.io token and a manifest request for the tag
+  # returned this digest (a single linux/amd64 manifest of 2.85 GB compressed, config `User: agent`,
+  # `Entrypoint: [tini, --]`). It is the image the coder is built on. A node pulls it once: `readyTimeoutSecs`.
+  image:
+    repository: ghcr.io/vymalo/another-agentic-images/workspace
+    tag: 1.98.1-ee2273e
+    digest: sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a
+    pullPolicy: IfNotPresent
+  # The init container copies adam-exec and the native OpenCode out of the coder's image (/opt/adam/bin) into the
+  # pod: empty is `image.repository:image.tag` of the coder above.
+  toolsImage:
+    repository: ""
+    tag: ""
+  # The container of the template the commands run in (RUN_POD_CONTAINER).
+  container: run
+  # What a run pod may use. The memory limit is the 2Gi the owner approved on 2026-10-05; it is also what the quota
+  # counts. A Rust build is limited to two jobs (cargoBuildJobs) so that it stays inside it.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  cargoBuildJobs: 2
+  # More variables of the run container, a name -> value map (never a secret: the model key is the only
+  # one, and it comes from the ExternalSecret).
+  extraEnv: {}
+  # Empty: the chart renders a PriorityClass <release>-run (value 0, preemptionPolicy Never) and the quota and the
+  # admission policy use it. A name: a class you manage (the chart renders none and the quota and the policy use it).
+  priorityClassName: ""
+  # The ServiceAccount of the coder pod, the only one that may make run pods. Empty: the chart makes one named after
+  # the release and mounts its token in the coder pod alone (the run pods mount none). A name: one you manage (the
+  # chart makes none; it still binds the Role to it).
+  serviceAccount:
+    name: ""
+  # What the namespace allows the run pods in all: a ResourceQuota scoped to the priority class. A pod beyond it is
+  # refused (HTTP 403 "exceeded quota") and the coder waits for a slot (waitSecs); it does not fall back and does not
+  # fail at once.
+  quota:
+    limitsMemory: 8Gi
+    pods: 4
+  # A pod that no command used for this long is deleted, and the next command makes another (the files are on the
+  # volume): a run that waits hours for a person holds nothing. 0 keeps the pod until its run ends.
+  idleSecs: 900
+  # How long a pod may take to be ready (scheduling, the first pull of the image on a node).
+  readyTimeoutSecs: 600
+  # How long a run waits for a slot when the quota (or the nodes) cannot give one now.
+  waitSecs: 600
+  # The coder pod's own resources while run pods are on, instead of `resources` above (which is untouched when they
+  # are off): it holds no build. Empty uses `resources`.
+  coderResources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  # Where run pods may be scheduled, on top of what the volume needs (see the README, "Run pods").
+  nodeSelector: {}
+  tolerations: []
+  # An affinity.nodeAffinity (the chart adds the pod affinity to the coder pod itself when the volume is a
+  # ReadWriteOnce claim of the coder pod).
+  nodeAffinity: {}
+  # The admission policy. It is the guard that lets the coder make pods, so the chart refuses to turn it off unless
+  # you say you know (disableAcknowledged).
+  admissionPolicy:
+    enabled: true
+    disableAcknowledged: false
+    # Images a run pod may use besides runPods.image and the tools image (references as the pod spells them).
+    extraAllowedImages: []
+  # No ingress; egress to DNS and to the internet, but not to private ranges, so builds reach registries and the
+  # model gateway but not the services of the cluster. The pod and service CIDRs of the cluster are the owner's to
+  # name (*unverified* here): the private ranges below already cover most clusters.
+  networkPolicy:
+    enabled: true
+    # The pod and service CIDRs of the cluster, besides the ranges below.
+    clusterCIDRs: []
+    # Never reachable: RFC 1918, the link-local range (cloud metadata) and the shared address space.
+    blockedCIDRs:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+      - 169.254.0.0/16
+      - 100.64.0.0/10
+    # Where DNS is.
+    dnsNamespace: kube-system
+    dnsPodLabels:
+      k8s-app: kube-dns
+    # More egress rules, as NetworkPolicy `egress` entries (for example the model gateway when it is in the
+    # cluster, which the blocked ranges would otherwise cut off).
+    extraEgress: []
+
 # The coder's Postgres: its own CloudNativePG Cluster (enabled: true, the default), or an
 # existing database (enabled: false and existingSecret.name, see the README, "Database").
 database:

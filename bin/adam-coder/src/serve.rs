@@ -41,8 +41,8 @@ use crate::opencode::OpenCodeLaunch;
 use crate::redact::Redactor;
 use crate::repos::workspaces_for;
 use crate::{
-    AGENT_NAME, AgentFiles, CoderAgent, CoderSettings, Config, ToolEnv, WorkerConfig,
-    agent_card_from, coder_tools,
+    AGENT_NAME, AgentFiles, CoderAgent, CoderSettings, Config, RunEnvironment, RunPodsConfig,
+    ToolEnv, WorkerConfig, agent_card_from, coder_tools,
 };
 
 /// The complete coder agent for a role that runs workers: the model client, the GitHub client and
@@ -126,9 +126,14 @@ async fn build_agent(
     );
     let environment =
         crate::mcp_secrets::hiding(environment_for(worker, &root).await?, &protected.hidden);
+    let mut tool_env = ToolEnv::new(workspaces, code_host, settings).with_environment(environment);
+    // A run pod the cluster cannot give now (the quota is used up) is waited for, not failed at once
+    // and not replaced by this container (ADR 0019, decision 6).
+    if let RunEnvironment::Kubernetes(pods) = &worker.run_environment {
+        tool_env = tool_env.with_unavailable_wait(pods.wait);
+    }
     let env = Arc::new(
-        ToolEnv::new(workspaces, code_host, settings)
-            .with_environment(environment)
+        tool_env
             .with_redactor(redactor)
             // What a rejected credential tells the model to check depends on which kind they are.
             .with_credentials_hint(worker.github.check_hint())
@@ -203,6 +208,60 @@ async fn build_agent(
 /// The tools directory cannot be written (an `OPENCODE_BINARY` that cannot be read, a volume that
 /// refuses): the process does not start. Nothing else here fails it.
 pub async fn environment_for(
+    worker: &WorkerConfig,
+    root: &std::path::Path,
+) -> anyhow::Result<DynEnvironment> {
+    match &worker.run_environment {
+        RunEnvironment::Local => local_environment(worker, root).await,
+        RunEnvironment::Kubernetes(pods) => kubernetes_environment(worker, pods).await,
+    }
+}
+
+/// `RUN_ENVIRONMENT=kubernetes`: a pod of its own for each run ([ADR 0019](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)).
+///
+/// 1. the pod template is read and checked, which fails the start (exit 78): a template the cluster
+///    would refuse is a mistake of the deployment, not of a run;
+/// 2. the client is made from the pod's ServiceAccount (`KUBERNETES_SERVICE_HOST` and its token), and
+///    the process does not start without one (exit 69). **No call is made to the API yet**: the first
+///    command of a run makes its pod;
+/// 3. the sweep of idle pods runs in the background, and the janitor releases the pods of runs that
+///    are over (the pods are found by label, so a crash leaves nothing it cannot find).
+///
+/// # Errors
+///
+/// A template that cannot be read or is not usable ([`EnvError::Config`](adam_workspace::EnvError), 78),
+/// no cluster to talk to (69).
+async fn kubernetes_environment(
+    worker: &WorkerConfig,
+    pods: &RunPodsConfig,
+) -> anyhow::Result<DynEnvironment> {
+    let template =
+        adam_env_kubernetes::PodTemplate::from_file(&pods.template_file, &pods.container)
+            .context("reading the run pod template (RUN_POD_TEMPLATE_FILE)")?;
+    let image = template.image().map(str::to_owned);
+    let key = &worker.model.api_key;
+    let settings = pods.settings(
+        worker.worker_id.as_deref().unwrap_or("adam-coder"),
+        !key.expose_secret().is_empty(),
+    );
+    let environment = adam_env_kubernetes::KubeEnvironment::connect(settings, template)
+        .await
+        .context("connecting to the Kubernetes API for the run pods")?;
+    tracing::info!(
+        namespace = %pods.namespace,
+        instance = %pods.instance,
+        image = ?image,
+        idle_secs = pods.idle.map(|d| d.as_secs()),
+        wait_secs = pods.wait.as_secs(),
+        "a run's commands run in a pod of its own"
+    );
+    // Lives as long as the process: the runtime ends it.
+    drop(environment.spawn_reaper());
+    Ok(Arc::new(environment))
+}
+
+/// The coder's own container, or the repository's devcontainer (`DEVCONTAINER_RUNTIME`).
+async fn local_environment(
     worker: &WorkerConfig,
     root: &std::path::Path,
 ) -> anyhow::Result<DynEnvironment> {

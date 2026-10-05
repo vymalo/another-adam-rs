@@ -9,6 +9,11 @@
 #   adam-exec shell <id> <cwd> :<command line>           run a command line in a login shell
 #   adam-exec kill  <id>                                 stop what `run` or `shell` started
 #   adam-exec chown <uid> <gid> <dir>                    give a directory tree to <uid>:<gid> (as the host sees them)
+#   adam-exec active                                     print how many commands started by `run` or `shell` are alive
+#
+# `active` is for adam-env-kubernetes, which deletes a run's pod when no command used it for a while
+# and must not do so under a build that is still running (a devcontainer is removed with its run, and
+# never asks).
 #
 # Every word of the command after <cwd> carries a leading ":" that is removed here. The devcontainer
 # CLI reads its command line with an option parser, which would take an argument such as "--version"
@@ -164,6 +169,25 @@ kill)
     done
     exit 0
     ;;
+active)
+    [ $# -eq 1 ] || fail "usage: adam-exec active"
+    n=0
+    for record in "$dir"/*.pid; do
+        [ -f "$record" ] || continue
+        pid=
+        started=
+        read -r pid started <"$record" || true
+        case $pid in
+        '' | *[!0-9]*) continue ;;
+        esac
+        # Alive: the pid exists and is the same process (a pid that was reused has another start time).
+        if [ -n "$started" ] && [ "$(start_time "$pid")" = "$started" ]; then
+            n=$((n + 1))
+        fi
+    done
+    echo "$n"
+    exit 0
+    ;;
 chown)
     [ $# -eq 4 ] || fail "usage: adam-exec chown <uid> <gid> <dir>"
     for n in "$2" "$3"; do
@@ -185,6 +209,6 @@ chown)
     exec chown -hR "$inner_uid:$inner_gid" "$4"
     ;;
 *)
-    fail "usage: adam-exec run|shell|kill|chown ..."
+    fail "usage: adam-exec run|shell|kill|chown|active ..."
     ;;
 esac

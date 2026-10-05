@@ -253,6 +253,45 @@ fn kill_never_touches_a_process_that_only_has_the_same_pid() {
 }
 
 #[test]
+fn active_counts_the_commands_that_are_alive_and_only_those() {
+    let state = tempfile::tempdir().unwrap();
+    // Nothing recorded, and no directory at all: none.
+    assert_eq!(
+        output(&mut adam_exec(&state.path().join("absent"), &["active"])),
+        (0, "0\n".to_owned(), String::new())
+    );
+    assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "0\n");
+
+    let (mut one, _) = start(state.path(), "act-1", "sleep 33", false);
+    let (mut two, _) = start(state.path(), "act-2", "sleep 33", false);
+    assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "2\n");
+
+    // A command that ended leaves its record behind; it is not counted.
+    let (code, _, _) = output(&mut adam_exec(
+        state.path(),
+        &["run", "act-3", "/", ":true"],
+    ));
+    assert_eq!(code, 0);
+    assert!(state.path().join("act-3.pid").exists());
+    assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "2\n");
+
+    // A record of a pid that was reused (another start time) is not counted either.
+    std::fs::write(state.path().join("act-4.pid"), "1 1\n").unwrap();
+    // Nor a record that is not one.
+    std::fs::write(state.path().join("act-5.pid"), "garbage\n").unwrap();
+    assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "2\n");
+
+    for id in ["act-1", "act-2"] {
+        assert_eq!(output(&mut adam_exec(state.path(), &["kill", id])).0, 0);
+    }
+    one.wait().unwrap();
+    two.wait().unwrap();
+    assert_eq!(output(&mut adam_exec(state.path(), &["active"])).1, "0\n");
+    // It takes no arguments.
+    assert_eq!(output(&mut adam_exec(state.path(), &["active", "x"])).0, 2);
+}
+
+#[test]
 fn chown_validates_its_arguments_and_leaves_a_missing_directory_alone() {
     let state = tempfile::tempdir().unwrap();
     for args in [
