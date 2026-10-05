@@ -24,6 +24,7 @@ adam-assembly = { path = "crates/adam-assembly", version = "0.1.0" }
 adam-agent-fs = { path = "crates/adam-agent-fs", version = "0.1.0" }
 adam-core = { path = "crates/adam-core", version = "0.1.0" }
 adam-devcontainer = { path = "crates/adam-devcontainer", version = "0.1.0" }
+adam-env-kubernetes = { path = "crates/adam-env-kubernetes", version = "0.1.0" }
 adam-error = { path = "crates/adam-error", version = "0.1.0" }
 adam-host = { path = "crates/adam-host", version = "0.1.0" }
 adam-llm-agent = { path = "crates/adam-llm-agent", version = "0.1.0" }
@@ -55,12 +56,17 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
 futures = "0.3"
+http = "1"
 httpdate = "1"
 # Reads a repository's devcontainer.json (JSON with comments and trailing commas), as serde_json values
 # (adam-devcontainer).
 jsonc-parser = { version = "0.34", features = ["serde"] }
 # Catalog components are JSON Schema; no network resolution, so none of the default features.
 jsonschema = { version = "0.58", default-features = false }
+# The Kubernetes API (adam-env-kubernetes): the typed objects, at the oldest API version the pods use, and
+# the client with `ws` for pods/exec, TLS through rustls on aws-lc-rs as the rest of the tree has it.
+k8s-openapi = { version = "0.28", default-features = false, features = ["v1_32"] }
+kube = { version = "4.2", default-features = false, features = ["client", "rustls-tls", "aws-lc-rs", "ws"] }
 notify = "8"
 proc-macro2 = "1"
 proptest = "1"
@@ -83,6 +89,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["compat"] }
+tower-test = "0.4"
 trybuild = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter"] }

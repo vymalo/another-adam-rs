@@ -142,7 +142,9 @@ stateDiagram-v2
   container's own `/proc`, and the members of its process group when it leads one. Killing the `devcontainer exec` client
   does **not** stop what it started inside (verified 2026-10-01 by the slice 7b planning), so `kill` is the backstop, and
   the container's removal the last one: a daemon that left its parent and its group stays until then. `chown` gives the tree
-  back to the coder's own ids, mapped through the container's id map.
+  back to the coder's own ids, mapped through the container's id map. `active` prints how many commands `run` or `shell` started are still alive; the devcontainer never asks, it is for
+  [`adam-env-kubernetes`](../adam-env-kubernetes/README.md), which ships this same script as a file of the coder's image and
+  calls it in a run's pod (ADR 0019).
 * **`Broken` is kept** in `state.json` (the error, and the digest of the file): a retry gets the same error at once until
   the file changes or `rebuild` is called. `rebuild(run, use_default: true)` ignores the repository's file for the run.
   A coder that restarts finds its containers again by their labels.
