@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 
 use crate::conversation::{
     ArtifactRef, Conversation, PendingQuestion, PendingRemote, PendingRun, PendingWait,
-    parse_context, parse_user_text,
+    parse_context, parse_root_run, parse_user_text,
 };
 use crate::history::fit_history;
 use crate::source::{DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined};
@@ -1010,7 +1010,14 @@ impl LlmAgent {
             }
             let used = files_kept(&state.artifacts);
             let (message, artifacts) = match self
-                .run_tool(ctx, &state.context, &state.source_notes, &call, used)
+                .run_tool(
+                    ctx,
+                    &state.context,
+                    state.root_run,
+                    &state.source_notes,
+                    &call,
+                    used,
+                )
                 .await?
             {
                 ToolResult::Answered {
@@ -1107,6 +1114,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         context: &Map<String, Value>,
+        root_run: Option<RunId>,
         notes: &[ToolNote],
         call: &ToolCall,
         files_used: u64,
@@ -1128,7 +1136,7 @@ impl LlmAgent {
         say(ctx, silent, RunEvent::Step(start)).await;
 
         let tool_ctx = self
-            .tool_ctx(ctx, context, &call.id, &call.name)
+            .tool_ctx(ctx, context, root_run, &call.id, &call.name)
             .with_note(note.cloned());
         let args = call.arguments.clone();
         let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
@@ -1261,6 +1269,7 @@ impl LlmAgent {
         &self,
         ctx: &Ctx,
         context: &Map<String, Value>,
+        root_run: Option<RunId>,
         call_id: &str,
         tool: &str,
     ) -> ToolCtx {
@@ -1274,6 +1283,7 @@ impl LlmAgent {
             Arc::clone(&self.extensions),
             Some(ctx.child_starter()),
             Arc::new(context.clone()),
+            root_run,
             self.style_of(tool).event(tool, call_id, StepState::Running),
         )
     }
@@ -1389,7 +1399,13 @@ impl LlmAgent {
             );
             return Ok(Some(StepState::Failed));
         };
-        let tool_ctx = self.tool_ctx(ctx, &state.context, &wait.call_id, &wait.tool);
+        let tool_ctx = self.tool_ctx(
+            ctx,
+            &state.context,
+            state.root_run,
+            &wait.call_id,
+            &wait.tool,
+        );
         let task = wait.task.clone();
         let polled: Result<RemotePoll, ToolError> = ctx
             .step(&format!("poll:{}", wait.call_id), move || async move {
@@ -1511,6 +1527,7 @@ async fn output_message(
 fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
     let text = start_text(&input)?;
     let mut conversation = Conversation::new(text);
+    conversation.root_run = parse_root_run(&input.payload);
     if let Some(context) = parse_context(&input.payload) {
         conversation.merge_context(context);
     }

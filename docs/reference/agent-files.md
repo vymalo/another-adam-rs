@@ -529,6 +529,10 @@ sees the parent's history. The sequence and the states of the wait are in
   the parent. A process that does not know the child's agent gets a permanent error result naming it.
 * **Least privilege.** A subagent's tools are those its own `tools:` lists, from the same registered set, and
   none when it lists none. It gets nothing of its parent's.
+* **The root run.** A tool in a child run can ask `ToolCtx::root_run_id()` for the run whose work the child serves
+  (the top of the chain of parents; the run itself when it is nobody's child). The id travels in the child's first
+  message and its stored state, so it survives a restart. A tool that keeps something for the whole task, such as
+  `adam-coder`'s workspace and its check budget, keys it by the root: its subagents then share the worktree.
 * **Limits per child.** Its own `limits:` apply to its run; it does not count against the parent.
 * **Name clashes are build errors** (`Error::SubagentToolClash`): a subagent named like a tool of its parent, a
   skill tool, or another subagent.

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::conversation::user_message;
+use crate::conversation::{ROOT_RUN_KEY, user_message};
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
 
@@ -421,6 +421,7 @@ pub struct ToolCtx {
     extensions: Arc<Extensions>,
     children: Option<ChildStarter>,
     context: Arc<Map<String, Value>>,
+    root_run: RunId,
     /// The step of this call (id, kind, label, icon): what [`emit_progress`](Self::emit_progress)
     /// updates and [`report_step`](Self::report_step) nests under.
     step: StepEvent,
@@ -441,10 +442,12 @@ impl ToolCtx {
         extensions: Arc<Extensions>,
         children: Option<ChildStarter>,
         context: Arc<Map<String, Value>>,
+        root_run: Option<RunId>,
         step: StepEvent,
     ) -> Self {
+        let run_id = emitter.run_id();
         Self {
-            run_id: emitter.run_id(),
+            run_id,
             conversation_id,
             attempt,
             call_id,
@@ -454,6 +457,7 @@ impl ToolCtx {
             extensions,
             children,
             context,
+            root_run: root_run.unwrap_or(run_id),
             step,
             note: None,
         }
@@ -511,8 +515,17 @@ impl ToolCtx {
             Arc::default(),
             None,
             Arc::default(),
+            None,
             step,
         )
+    }
+
+    /// Make the context the one of a child run that works for `root`, as a run started with
+    /// [`start_child`](Self::start_child) is.
+    #[must_use]
+    pub fn with_root_run(mut self, root: RunId) -> Self {
+        self.root_run = root;
+        self
     }
 
     /// Give the tool under test the inbound context of a run
@@ -543,6 +556,17 @@ impl ToolCtx {
     /// The run this call belongs to.
     pub fn run_id(&self) -> RunId {
         self.run_id
+    }
+
+    /// The run whose work this one serves: the top of the chain of parents when this run is a child
+    /// started with [`start_child`](Self::start_child) (a subagent), this run itself when it is
+    /// nobody's child. A tool that keeps something for the whole task, such as a workspace or a
+    /// budget, keys it by this id, so that a subagent shares what its root run made.
+    ///
+    /// The id travels in the child's first message and its stored state, so it is the same after a
+    /// restart and costs no store read.
+    pub fn root_run_id(&self) -> RunId {
+        self.root_run
     }
 
     /// The conversation the run belongs to, if any.
@@ -589,8 +613,15 @@ impl ToolCtx {
             ));
         };
         let child = self.child_run_id();
+        let mut first = user_message(message);
+        if let Some(payload) = first.payload.as_object_mut() {
+            payload.insert(
+                ROOT_RUN_KEY.to_owned(),
+                Value::String(self.root_run.to_string()),
+            );
+        }
         children
-            .start(child, agent, user_message(message))
+            .start(child, agent, first)
             .await
             .map_err(|e| ToolError::from_classified(&e))?;
         Ok(child)
