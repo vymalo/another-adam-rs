@@ -41,11 +41,32 @@ or a plan was steered into a pull request. The owner chose the name **Adam**.
   step without one (the contract: a screen ignores an icon it does not know). Consumers must add the word to their
   vocabulary, and `another-agentic-system` will (that it sanitises icons to its own list is *unverified*: another
   repository). `StepIcon` is `#[non_exhaustive]`, so the new variant breaks no match outside this repository.
+* When the model stops with nothing to say before any workspace exists, the question the run asks is "What can I help with?", as the greeting.
 * The prompt snapshot (`bin/adam-coder/tests/fixtures/agent/prompt.txt`) and the card golden change with the files; the
   greeting mock (`dev/wiremock/mock-openai`) answers "What can I help with?".
-* **Deferred: two read-only subagents, `explorer` and `reviewer`.** The owner asked for them as files of the agent folder.
-  They are not shipped: the coder's tools find the worktree by the run's id (`ToolEnv::slot` and `ToolEnv::session` use
-  `ToolCtx::run_id()`, and `Workspaces::run` is `<root>/workspaces/<run>`), and a subagent is a child run with an id of its own
-  (`child_run_id`), so `read_file` and `run_command` in a subagent would answer "there is no workspace yet" for a worktree that
-  exists. Nothing in a `ToolCtx` names the parent run. The two subagents need the tools to resolve the root run first
-  (`ToolCtx` exposing it, or the workspace being shared by the child's parent), a change to `adam-runtime`.
+* **Two read-only subagents, `explorer` and `reviewer`**, are files of Adam's folder
+  (`bin/adam-coder/agent/subagents/`), with the tools `read_file` and `run_command` and nothing else: no write, no
+  checks, no delegation, no publishing, no asking. The prompt says when to use them (a large or unfamiliar repository,
+  and once before `open_pull_request`); their findings are advice and the gates still decide.
+
+## Amended 2026-10-06: a subagent works for its root run
+
+The first version of this decision left the two subagents out: the coder's tools found the worktree by the id of the
+run that called them (`ToolCtx::run_id()`), a subagent is a child run with an id of its own, and nothing in a
+`ToolCtx` named the parent, so `read_file` in a subagent answered "there is no workspace yet" for a worktree that
+existed. Now:
+
+* **`ToolCtx::root_run_id()`** (`adam-llm-agent`) is the top of the chain of parents, and the run itself for a run that
+  is nobody's child. `ToolCtx::start_child` puts the caller's root in the child's first message
+  (`root_run`), and the child keeps it in its stored state (`Conversation::root_run`). A restart or another worker reads
+  the same id, no store is read per call, a child of a child gets the top run and not its parent, and a run that
+  continues another does not inherit it. Only code in the process writes the key: the A2A front builds payloads of
+  `text` and `context`, so a client cannot name a run it does not own. The API is additive (no required trait method).
+* **The coder keys by the root** the workspace and the environment (`ToolEnv::slot`, `ToolEnv::session`, `prepare_workspace`,
+  `start_scratch`, `rebuild_environment`) and every run note that is a gate or a budget (the check cycles, the
+  repositories the person named and agreed to, the created repositories, the credentials blocker, OpenCode's version
+  check), so a subagent gets no fresh budget and cannot pass a gate its root has not passed. The two places that stay on
+  the run itself are the steps the environment shows (`env:<run>:...`: a step belongs to the run that emits it) and
+  `share_file`'s "delivered" note and 6 MiB budget, because a file shared by a subagent stays on the subagent's run and
+  never reaches the person, so it delivers nothing for the root. A call id in the notes is made unique per run for a
+  subagent (`ToolEnv::call_key`).

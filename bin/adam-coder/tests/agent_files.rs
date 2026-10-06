@@ -70,8 +70,9 @@ fn expected_prompt(cycles: u32) -> String {
     rendered.trim_end().to_owned()
 }
 
-/// The tools in the order the model is offered them.
-const TOOLS: [&str; 20] = [
+/// The tools in the order the model is offered them: the coder's own, the screen's, and one per
+/// subagent of the shipped folder.
+const TOOLS: [&str; 22] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -92,6 +93,8 @@ const TOOLS: [&str; 20] = [
     "ask_user",
     "show",
     "ui_catalog",
+    "explorer",
+    "reviewer",
 ];
 
 async fn coder(cycles: u32) -> (Fixture, CoderAgent) {
@@ -269,7 +272,11 @@ async fn the_assembled_agent_is_what_the_hand_written_one_was() {
             max_history_tokens: 100_000,
         }
     );
-    assert_eq!(agent.assembly().agents().len(), 1, "no subagents");
+    assert_eq!(
+        agent.assembly().agents().len(),
+        3,
+        "the coder and its two helpers"
+    );
     assert!(agent.assembly().remotes().is_empty());
 }
 
@@ -457,7 +464,7 @@ async fn a_copy_of_the_shipped_folder_is_the_embedded_agent() {
     let from_folder = coder_from(&files, &fx, &mock);
     let embedded = coder_from(&AgentFiles::Embedded, &fx, &mock);
     assert_eq!(from_folder.assembly().info(), embedded.assembly().info());
-    assert!(from_folder.subagents().is_empty());
+    assert_eq!(from_folder.subagents().len(), 2);
 
     let url: url::Url = "https://agents.example.com/coder/".parse().unwrap();
     assert_eq!(
@@ -590,11 +597,90 @@ async fn a_folder_may_narrow_the_tools() {
     let agent = coder_from(&files_of(&tmp), &fx, &mock);
     assert_eq!(
         agent.assembly().info()[0].tools,
-        ["run_command", "ask_user"]
+        ["run_command", "ask_user", "explorer", "reviewer"],
+        "the tools of the folder's `tools:`, then one per subagent"
     );
 }
 
-/// The subagents of a folder are registered beside the coder: the model calls the subagent's tool,
+/// The shipped folder has two read-only helpers: each is a subagent whose tools are exactly the
+/// two that look at a worktree, with nothing that writes, runs checks, delegates, publishes or asks.
+#[tokio::test]
+async fn the_shipped_folder_has_a_read_only_explorer_and_reviewer() {
+    let (_fx, agent) = coder(3).await;
+    let info = agent.assembly().info();
+    for name in ["coder/explorer", "coder/reviewer"] {
+        let sub = info
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| panic!("{name} is missing: {info:#?}"));
+        assert_eq!(sub.parent.as_deref(), Some(AGENT_NAME), "{name}");
+        assert_eq!(sub.tools, ["read_file", "run_command"], "{name}");
+        assert!(sub.skills.is_empty(), "{name}");
+    }
+    assert_eq!(agent.subagents().len(), 2);
+}
+
+/// A subagent's `read_file` reads a file of the worktree that the root run prepared: the coder's
+/// tools work for the root of a child run.
+#[tokio::test]
+async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    let url = fx.remote_url();
+    mock.push_tool_calls(vec![ToolCall {
+        id: "c1".into(),
+        name: "prepare_workspace".into(),
+        arguments: json!({"repo_url": url, "base_branch": "main"}),
+    }])
+    .push_tool_calls(vec![ToolCall {
+        id: "c2".into(),
+        name: "explorer".into(),
+        arguments: json!({"message": "what does README.md say?"}),
+    }])
+    // The explorer's own turns.
+    .push_tool_calls(vec![ToolCall {
+        id: "e1".into(),
+        name: "read_file".into(),
+        arguments: json!({"path": "README.md"}),
+    }])
+    .push_text("README.md:1 says widgets.")
+    // The coder, back from the explorer.
+    .push_text("The README says widgets.");
+    let agent = coder_from(&AgentFiles::Embedded, &fx, &mock);
+    let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
+    run_to_a_question(&coder, &format!("In {url}, what does the README say?")).await;
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 5, "{requests:#?}");
+    // The explorer saw its own prompt and the read of the file the coder's worktree has.
+    assert!(
+        requests[2]
+            .system
+            .as_deref()
+            .is_some_and(|s| s.starts_with("You are the explorer")),
+        "{:?}",
+        requests[2].system
+    );
+    match requests[3].messages.last().unwrap() {
+        Message::Tool {
+            call_id,
+            content,
+            is_error,
+        } => {
+            assert_eq!(call_id, "e1");
+            assert!(!is_error, "{content}");
+            assert_eq!(content, "widgets\n");
+        }
+        other => panic!("{other:?}"),
+    }
+    // And the coder got the explorer's answer.
+    match requests[4].messages.last().unwrap() {
+        Message::Tool { content, .. } => assert_eq!(content, "README.md:1 says widgets."),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The subagents of a folder are registered beside the coder and the shipped ones: the model calls the subagent's tool,
 /// a child run answers, and the coder goes on with the child's text.
 #[tokio::test]
 async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
@@ -602,8 +688,8 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
     let tmp = folder();
     std::fs::create_dir_all(tmp.path().join("agent/subagents")).unwrap();
     std::fs::write(
-        tmp.path().join("agent/subagents/reviewer.md"),
-        "---\ndescription: Reviews a diff.\ntools: [run_command]\n---\nYou review diffs.\n",
+        tmp.path().join("agent/subagents/summariser.md"),
+        "---\ndescription: Summarises a diff.\ntools: [run_command]\n---\nYou summarise diffs.\n",
     )
     .unwrap();
     let files = files_of(&tmp);
@@ -611,30 +697,35 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![ToolCall {
         id: "c1".into(),
-        name: "reviewer".into(),
-        arguments: json!({"message": "review the diff"}),
+        name: "summariser".into(),
+        arguments: json!({"message": "summarise the diff"}),
     }])
     .push_text("LGTM, nothing to fix.")
-    .push_text("The reviewer is happy.");
+    .push_text("The summariser is happy.");
     let agent = coder_from(&files, &fx, &mock);
     let info = agent.assembly().info();
     assert_eq!(
         info.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
-        ["coder", "coder/reviewer"]
+        [
+            "coder",
+            "coder/explorer",
+            "coder/reviewer",
+            "coder/summariser"
+        ]
     );
-    assert_eq!(agent.subagents().len(), 1);
-    assert_eq!(info[0].tools.last().map(String::as_str), Some("reviewer"));
+    assert_eq!(agent.subagents().len(), 3);
+    assert_eq!(info[0].tools.last().map(String::as_str), Some("summariser"));
 
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-    run_to_a_question(&coder, "have it reviewed").await;
+    run_to_a_question(&coder, "have it summarised").await;
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
     let offered =
         |r: &ModelRequest| -> Vec<String> { r.tools.iter().map(|t| t.name.clone()).collect() };
-    assert!(offered(&requests[0]).contains(&"reviewer".to_owned()));
+    assert!(offered(&requests[0]).contains(&"summariser".to_owned()));
     // The child: its own prompt and the one tool it picked from the coder's.
-    assert_eq!(requests[1].system.as_deref(), Some("You review diffs."));
+    assert_eq!(requests[1].system.as_deref(), Some("You summarise diffs."));
     assert_eq!(offered(&requests[1]), ["run_command"]);
     // The coder goes on with what the child said.
     match requests[2].messages.last().unwrap() {
@@ -861,9 +952,12 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
     )
     .expect("the folder assembles with its MCP tools");
     let tools = &agent.assembly().info()[0].tools;
+    // The coder's own tools, the server's, then one per subagent.
+    let own = TOOLS.len() - 2;
     assert_eq!(tools.len(), TOOLS.len() + 1, "{tools:?}");
-    assert_eq!(&tools[..TOOLS.len()], TOOLS);
-    assert_eq!(tools.last().map(String::as_str), Some("test__echo"));
+    assert_eq!(&tools[..own], &TOOLS[..own]);
+    assert_eq!(tools[own], "test__echo");
+    assert_eq!(&tools[own + 1..], &TOOLS[own..]);
 
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
     run_to_a_question(&coder, "echo ping").await;

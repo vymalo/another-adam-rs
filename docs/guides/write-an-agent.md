@@ -62,6 +62,8 @@ Rules worth knowing:
   `model` is an alias. `${VAR}` exists only in `mcp.json`.
 * **A subagent inherits nothing**, and without `tools:` it has none. It cannot use a tool that asks the person.
   A file copied from `.claude/agents/` parses unchanged, but its `tools` must name adam's tools.
+* **A subagent of Adam shares its root run's workspace**: `bin/adam-coder/agent/subagents/` has two read-only ones
+  (`explorer`, `reviewer`) that read the worktree the calling run prepared.
 * **The agent already has** `ask_user`, `show` and `ui_catalog` (the person's screen), the tools of its MCP
   servers (`<server>__<tool>`), `load_skill` and `read_skill_file` when it has skills, and one tool per subagent.
 * **MCP**: credentials go in `headers` as `${VAR}`; `tools` is an allow-list; `"optional": true` lets a server be

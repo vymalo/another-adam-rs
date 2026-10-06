@@ -570,6 +570,27 @@ stateDiagram-v2
   Swept --> [*]: the notes and the branches stay
 ```
 
+### Subagents: `explorer` and `reviewer`
+
+`agent/subagents/` has two read-only helpers, each a child run with its own prompt and the tools `read_file` and
+`run_command` only (no write, no checks, no `delegate_to_opencode`, no publishing, nothing that asks the person).
+`explorer` answers where and how questions about a repository with file paths and line numbers; `reviewer` reads
+`git diff origin/<base>...HEAD` and returns findings by severity with file and line. The prompt says when to use them
+(a large or unfamiliar repository; once before `open_pull_request`), and what they say is advice: the gates decide.
+
+A child run has an id of its own, so the tools key by the **root run** (`ToolCtx::root_run_id()`, carried down by
+`ToolCtx::start_child`: [ADR 0021](../../docs/decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)). Per place:
+
+| What | Keyed by | Why |
+|---|---|---|
+| the workspace's slots, the environment session, `prepare_workspace`, `start_scratch`, `rebuild_environment` | root | a subagent works in its parent's worktree and environment |
+| the run notes: check cycles and results, the repositories named and agreed to, created repositories, the credentials blocker, OpenCode's version check | root | a budget or a gate that protects the pull request is counted once, on the root: a subagent has no fresh budget and passes no gate the root has not |
+| a call id in the notes (`record_missing_tool`) | the subagent's run plus the call id | model call ids are unique only within the run that made them |
+| the steps the environment shows (`env:<run>:...`) | the run that makes the call | a step belongs to the run that emits it |
+| `share_file`'s "delivered" note, and its 6 MiB budget | the run that shares | the artifact stays on the subagent's run and never reaches the person, so it delivers nothing for the root |
+
+The janitor and the run pods look at the root's directory and run only: a child never has a workspace of its own.
+
 ### Scratch projects
 
 A task that names no repository ("write a script that prints the first seven Fibonacci numbers; I'll give you the
@@ -2161,6 +2182,10 @@ database of its own, so the role needs `CREATEDB`):
   over, the task is `Completed` with the file as an A2A artifact, no pull request and no check),
   `a_scratch_file_that_was_not_shared_does_not_complete_the_run` and
   `a_run_in_a_repository_that_shared_a_file_but_opened_no_pull_request_still_waits`.
+* Subagents (ADR 0021): `tests/agent_files.rs` has the manifest test (`explorer` and `reviewer`, each with exactly `read_file` and
+  `run_command`) and a run where the coder prepares a workspace and the explorer's `read_file` reads a file of it;
+  `tests/tools.rs` `a_subagent_works_in_the_worktree_and_on_the_budget_of_its_root_run` (a child context reads the root's
+  worktree, a stranger finds none, a failed check of the subagent is a cycle of the root).
 * `run_command`, the shell and the missing toolchain are tested in `tests/tools.rs`
   (`run_command_looks_around_without_reporting_checks_or_using_cycles`: no artifact, no cycle, `cat` of a
   missing file five times with a budget of three; `run_command_undoes_a_change_and_says_where_changes_go`: a new

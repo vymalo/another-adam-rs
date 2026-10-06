@@ -6,6 +6,10 @@ and opens a pull request. It is an `LlmAgent` with 17 tools of its own plus the 
 `show` and `ui_catalog`, one extra completion rule, running on the durable runtime and served over A2A.
 Crate README with every detail: [`bin/adam-coder`](../../bin/adam-coder/README.md).
 
+Two read-only subagents, `explorer` and `reviewer` (`bin/adam-coder/agent/subagents/`), look at the same worktree
+for it: tools find the workspace and the budgets of the **root run** (`ToolCtx::root_run_id`), so a child run shares them
+([ADR 0021](../decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)).
+
 The model decides the order of the tools. **The tools enforce the rules**, so they hold even if the model
 ignores its prompt.
 
