@@ -68,7 +68,7 @@ pub async fn start_scratch(
     name: Option<String>,
 ) -> Outcome {
     let name = name.as_deref().and_then(non_empty).unwrap_or(DEFAULT_NAME);
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let workspace = env.workspaces.run(&run).map_err(|e| workspace_error(&e))?;
     let slot = match workspace.add_scratch(name, &env.settings.identity).await {
         Ok(slot) => slot,
@@ -144,7 +144,7 @@ pub async fn publish_scratch(
     let Some(url) = non_empty(&repo_url) else {
         return Ok(ToolOutput::error("repo_url is required"));
     };
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
 
     // The grant comes before anything that talks to a remote, as in prepare_workspace: a
     // repository nobody named costs no request, no credential and no mirror. An argument the

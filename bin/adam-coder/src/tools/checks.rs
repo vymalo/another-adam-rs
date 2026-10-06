@@ -395,9 +395,9 @@ pub(crate) async fn missing_tool_answer(
     dirs: &[&std::path::Path],
     environment: &EnvKind,
 ) -> Result<String, ToolError> {
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-    let earlier = notes.record_missing_tool(ctx.call_id(), &missing.name);
+    let earlier = notes.record_missing_tool(&ToolEnv::call_key(ctx), &missing.name);
     env.notes
         .save(&run, &notes)
         .await
@@ -544,7 +544,7 @@ pub async fn run_checks(
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
     };
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
 
     // A repository's worktree or a scratch project: the checks run on either.

@@ -303,7 +303,7 @@ impl ToolEnv {
     /// pull request after this must fail rather than complete.
     pub(crate) async fn delivery_error(&self, ctx: &ToolCtx, e: &WorkspaceError) -> ToolError {
         if matches!(e, WorkspaceError::Auth(_)) {
-            let run = ctx.run_id().to_string();
+            let run = ctx.root_run_id().to_string();
             let recorded = async {
                 let mut notes = self.notes.load(&run).await?;
                 notes.blocker = Some(format!(
@@ -334,8 +334,13 @@ impl ToolEnv {
     /// the run waits for a slot. Without it the first such error is the tool's result, as it always
     /// was (the devcontainer's behaviour is unchanged).
     pub(crate) async fn session(&self, ctx: &ToolCtx) -> Result<Arc<dyn EnvSession>, ToolError> {
+        // The workspace is the root run's, so a subagent works in its parent's environment; the
+        // steps it shows are the call's own, under the id of the run that makes them.
+        let workspace = self
+            .workspaces
+            .run(&ctx.root_run_id().to_string())
+            .map_err(|e| workspace_error(&e))?;
         let run = ctx.run_id().to_string();
-        let workspace = self.workspaces.run(&run).map_err(|e| workspace_error(&e))?;
         let started = std::time::Instant::now();
         let mut pause = SLOT_PAUSE_START;
         let mut waiting = false;
@@ -448,13 +453,23 @@ impl ToolEnv {
         ctx.report_step(event).await;
     }
 
+    /// What a call is called in the run notes (`record_missing_tool`): the model's call id, which is
+    /// only unique within the run that made it, so a subagent's carries its own run.
+    pub(crate) fn call_key(ctx: &ToolCtx) -> String {
+        if ctx.run_id() == ctx.root_run_id() {
+            ctx.call_id().to_owned()
+        } else {
+            format!("{}/{}", ctx.run_id(), ctx.call_id())
+        }
+    }
+
     /// The slot of the run's workspace that a tool acts in, or the message to give the model: it
     /// has no workspace yet, or it did not say which of several slots (see [`resolve_slot`]).
     ///
     /// `repo` is what the model passed: the slot's directory (`sandbox`) or the address of the
     /// repository the slot holds. It may be left out when the workspace has one slot.
     pub(crate) async fn slot(&self, ctx: &ToolCtx, repo: Option<&str>) -> Result<Slot, Outcome> {
-        let run = ctx.run_id().to_string();
+        let run = ctx.root_run_id().to_string();
         let workspace = self
             .workspaces
             .run(&run)

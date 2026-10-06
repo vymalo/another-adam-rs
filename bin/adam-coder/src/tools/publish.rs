@@ -75,7 +75,7 @@ pub async fn commit_and_push(
         Ok(slot) => slot,
         Err(outcome) => return outcome,
     };
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     if notes.cycles_exhausted(
         slot.worktree().is_none(),
@@ -299,7 +299,7 @@ pub async fn open_pull_request(
             slot.dir()
         )));
     };
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     let max = env.settings.max_check_cycles;
 

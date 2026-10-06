@@ -5560,3 +5560,62 @@ async fn scratch_work_gets_five_check_cycles_and_a_repository_three() {
         commit.content
     );
 }
+
+/// A subagent is a child run with an id of its own, and it works for its root run: the worktree is
+/// the root's, and what the gates count (the check cycles) is counted in the root's notes, so a
+/// subagent neither starts with a fresh budget nor loses the workspace.
+#[tokio::test]
+async fn a_subagent_works_in_the_worktree_and_on_the_budget_of_its_root_run() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let root = rig.ctx.run_id();
+    let child = ToolCtx::detached("tool", "call-1", Arc::new(CollectingSink::new()))
+        .with_state(rig.fx.env.clone())
+        .with_root_run(root);
+    assert_ne!(child.run_id(), root);
+
+    let read = ReadFile
+        .call(&child, json!({"path": "README.md"}))
+        .await
+        .unwrap();
+    assert_eq!(read.content, "widgets\n", "the root's worktree");
+    let listed = RunCommand
+        .call(&child, json!({"command": "cat README.md"}))
+        .await
+        .unwrap();
+    assert!(
+        !listed.is_error && listed.content.contains("widgets"),
+        "{}",
+        listed.content
+    );
+
+    // A run that is nobody's child has no workspace of its own yet.
+    let stranger = ToolCtx::detached("tool", "call-1", Arc::new(CollectingSink::new()))
+        .with_state(rig.fx.env.clone());
+    let none = ReadFile
+        .call(&stranger, json!({"path": "README.md"}))
+        .await
+        .unwrap();
+    assert!(
+        none.is_error && none.content.contains("no workspace yet"),
+        "{}",
+        none.content
+    );
+
+    // A failed check of the subagent is one of the root's cycles.
+    let failed = RunChecks
+        .call(&child, json!({"command": "false"}))
+        .await
+        .unwrap();
+    assert!(failed.is_error, "{}", failed.content);
+    let root_notes = rig.fx.env.notes.load(&root.to_string()).await.unwrap();
+    assert_eq!(root_notes.checks.failures, 1, "counted on the root");
+    let own = rig
+        .fx
+        .env
+        .notes
+        .load(&child.run_id().to_string())
+        .await
+        .unwrap();
+    assert_eq!(own.checks.failures, 0, "nothing on the subagent's own run");
+}

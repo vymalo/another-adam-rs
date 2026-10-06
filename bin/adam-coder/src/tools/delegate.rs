@@ -80,7 +80,7 @@ async fn opencode_refusal(
     {
         return Ok(Some(NO_NETWORK.to_owned()));
     }
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     let check = match notes.environment.opencode.clone() {
         Some(check) => check,
