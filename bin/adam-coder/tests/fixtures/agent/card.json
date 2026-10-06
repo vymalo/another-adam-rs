@@ -1,9 +1,48 @@
 {
-  "name": "Coder",
-  "description": "Coder agent: turns a coding task into a verified pull request.",
+  "name": "Adam",
+  "description": "Adam: answers, researches, writes documents and turns coding tasks into verified pull requests.",
   "url": "https://agents.example.com/coder/",
   "version": "0.1.0",
   "skills": [
+    {
+      "id": "explain",
+      "name": "Answer and explain",
+      "description": "Answers a question or explains code, a repository or a concept in plain words, with no change and no pull request. Reads a repository the person names to ground the answer.",
+      "tags": [
+        "explain",
+        "questions"
+      ],
+      "examples": [
+        "What does the retry logic in https://github.com/acme/widgets do?",
+        "Explain how an OAuth device flow works."
+      ]
+    },
+    {
+      "id": "research",
+      "name": "Research",
+      "description": "Searches the web and reads pages with the research tools the deployment gives it, and answers with what it found. Says so when it has none.",
+      "tags": [
+        "research",
+        "web"
+      ],
+      "examples": [
+        "Compare three Rust crates for parsing TOML and say which to use."
+      ]
+    },
+    {
+      "id": "documents",
+      "name": "Documents and files",
+      "description": "Writes a report, a plan, a chart or an export in a scratch project, with no repository, and shares it as a file.",
+      "tags": [
+        "documents",
+        "files",
+        "charts"
+      ],
+      "examples": [
+        "Write a one-page plan for migrating our CI, as a Markdown file.",
+        "Draw a chart of these numbers as an SVG."
+      ]
+    },
     {
       "id": "coding-task",
       "name": "Coding task to pull request",

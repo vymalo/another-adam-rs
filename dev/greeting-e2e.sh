@@ -17,7 +17,7 @@
 #   1. SendStreamingMessage "Hi": the task ends TASK_STATE_INPUT_REQUIRED (it waits for the
 #      person), and the question it asks is a greeting that says the agent's name and the
 #      one-sentence summary, both read here from the folder the stack mounts (bin/adam-coder/agent),
-#      and asks which repository and what to change. No tool ran: there is no artifact. The greeting
+#      and asks what it can help with. No tool ran: there is no artifact. The greeting
 #      was written as it arrived (`text-stream/v1`, which the script activates): at least two `reply`
 #      chunks that add up to the question, and the question names the stream of the chunks. The
 #      `reply` chunks are the answer's words, not a tool's artifact: they do not count as one.
@@ -153,8 +153,8 @@ greets() {
     *) bad "the greeting does not say \"$2\": $said" ;;
   esac
   case "$said" in
-    *"Which repository"*) ok "the greeting asks which repository and what to change" ;;
-    *) bad "the greeting does not ask which repository: $said" ;;
+    *"What can I help with"*) ok "the greeting asks what it can help with" ;;
+    *) bad "the greeting does not ask what it can help with: $said" ;;
   esac
   names=$(artifact_names)
   if [ -z "$names" ]; then ok "no tool ran: no artifact"; else bad "a greeting produced artifacts: $names"; fi

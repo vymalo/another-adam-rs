@@ -791,7 +791,7 @@ Slots, the environments' sequences and states, and the mirror lock are in
 
 | | [`adam-coder`](../bin/adam-coder/README.md) | [`adam-agent`](../bin/adam-agent/README.md) |
 |---|---|---|
-| Does | a coding task to a verified pull request | serves **any agent folder** |
+| Does | Adam: answers, researches, writes documents, and takes a coding task to a verified pull request | serves **any agent folder** |
 | Tools | the coder's 17 own tools (workspace, files, checks, git, pull request) plus the screen's `ask_user`, `show`, `ui_catalog` | the folder's MCP and skill tools, the screen's tools, one per subagent |
 | Needs | model, GitHub, a workspace | a model; no workspace, no GitHub |
 | State | Postgres, plus files under `WORKSPACE_ROOT` | Postgres |

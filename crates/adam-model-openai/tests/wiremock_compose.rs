@@ -239,7 +239,8 @@ async fn error_scenarios_map_onto_model_errors() {
 // ---------------------------------------------------------------------------------------------
 
 /// The persona lines of an agent's system prompt, which the scripts read their name and summary from.
-const PERSONA: &str = "Your name is Coder.\nIn one sentence: I take a repository you name.\n";
+const PERSONA: &str =
+    "Your name is Adam.\nIn one sentence: I answer questions, research and write documents.\n";
 
 /// What a person says when asked the three questions of `[mock:choices]`.
 const ANSWERS: &str =

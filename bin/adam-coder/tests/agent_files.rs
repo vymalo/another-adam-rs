@@ -62,7 +62,7 @@ fn expected_prompt(cycles: u32) -> String {
         .replace("{{max_check_cycles}}", &cycles.to_string())
         .replace("{{scratch_check_cycles}}", &SCRATCH_CYCLES.to_string())
         .replace("{{repository_creation}}", CREATION_ON)
-        .replace("{{display_name}}", "Coder");
+        .replace("{{display_name}}", "Adam");
     assert!(
         rendered.ends_with(".\n"),
         "the snapshot ends with one newline"
@@ -155,7 +155,7 @@ async fn the_prompt_gives_the_agent_a_name_and_asks_for_plain_words() {
     let text = prompt_of(&agent);
     for needle in [
         // The two persona lines the mocks read, first.
-        "Your name is Coder.\nIn one sentence: I take a repository you name,",
+        "Your name is Adam.\nIn one sentence: I answer questions, research,",
         "and never say",
         "A greeting gets a greeting.",
         "\"list your tools\".**",
@@ -167,7 +167,7 @@ async fn the_prompt_gives_the_agent_a_name_and_asks_for_plain_words() {
     ] {
         assert!(text.contains(needle), "prompt lost: {needle}\n{text}");
     }
-    assert!(text.starts_with("Your name is Coder."), "{text}");
+    assert!(text.starts_with("Your name is Adam."), "{text}");
     assert!(!text.contains("{{"), "unreplaced placeholder");
     // The old instruction that made a greeting a task with something missing is gone.
     assert!(!text.contains("A greeting or a\n   vague request is not a task"));
@@ -508,7 +508,7 @@ async fn editing_the_folder_changes_what_the_model_is_sent() {
 async fn the_card_comes_from_the_folder() {
     let tmp = folder();
     edit_instructions(&tmp, |text| {
-        text.replacen("  name: Coder", "  name: Cody", 1)
+        text.replacen("  name: Adam", "  name: Cody", 1)
     });
     let url: url::Url = "https://agents.example.com/coder/".parse().unwrap();
     let card = agent_card_from(&files_of(&tmp), &url).unwrap();
@@ -680,7 +680,7 @@ impl ModelClient for PersonaModel {
                 .ok_or_else(|| ModelError::invalid_request(format!("no `{prefix}` line")))
         };
         let answer = format!(
-            "Hi! I'm {}. {}. Which repository should I work on, and what should I change?",
+            "Hi! I'm {}. {}. What can I help with?",
             line("Your name is ")?,
             line("In one sentence: ")?
         );
@@ -754,16 +754,16 @@ async fn a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says() {
 
     let shipped = greet(AgentFiles::Embedded).await;
     assert!(
-        shipped.starts_with("Hi! I'm Coder. I take a repository you name"),
+        shipped.starts_with("Hi! I'm Adam. I answer questions"),
         "{shipped}"
     );
-    assert!(shipped.ends_with("Which repository should I work on, and what should I change?"));
+    assert!(shipped.ends_with("What can I help with?"));
 
     let tmp = folder();
     edit_instructions(&tmp, |text| {
-        text.replacen("display_name: Coder", "display_name: Cody", 1)
+        text.replacen("display_name: Adam", "display_name: Cody", 1)
             .replacen(
-                "In one sentence: I take a repository you name, make the change you ask for, run the project's own checks and open a pull request.",
+                "In one sentence: I answer questions, research, write documents and turn coding tasks into verified pull requests.",
                 "In one sentence: I only fix typos.",
                 1,
             )
@@ -771,7 +771,7 @@ async fn a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says() {
     let edited = greet(files_of(&tmp)).await;
     assert_eq!(
         edited,
-        "Hi! I'm Cody. I only fix typos. Which repository should I work on, and what should I change?"
+        "Hi! I'm Cody. I only fix typos. What can I help with?"
     );
     assert!(
         fx.agent_branches().is_empty(),
@@ -786,7 +786,7 @@ async fn the_display_name_var_is_the_name_in_the_prompt() {
     let mock = Arc::new(MockModel::new());
     let tmp = folder();
     edit_instructions(&tmp, |text| {
-        text.replacen("display_name: Coder", "display_name: Cody", 1)
+        text.replacen("display_name: Adam", "display_name: Cody", 1)
     });
     let agent = coder_from(&files_of(&tmp), &fx, &mock);
     let prompt = &agent.assembly().info()[0].prompt;
@@ -795,7 +795,7 @@ async fn the_display_name_var_is_the_name_in_the_prompt() {
         "{prompt}"
     );
     assert!(prompt.contains("You are Cody."), "{prompt}");
-    assert!(!prompt.contains("Coder"), "{prompt}");
+    assert!(!prompt.contains("Adam"), "{prompt}");
 }
 
 // ------------------------------------------------------------------ mcp.json tools
