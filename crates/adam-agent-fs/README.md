@@ -4,7 +4,7 @@ Parse and validate agent directories. An agent is a directory of Markdown and JS
 (`agent/instructions.md`, `skills/`, `subagents/`, `mcp.json`, `schedules/`); this crate reads
 it into an owned `AgentManifest` and reports every mistake as a `Diagnostic` with the file and
 the line. The layout, the file formats and the reasons are in
-[`docs/authoring.md`](../../docs/authoring.md).
+[`docs/reference/agent-files.md`](../../docs/reference/agent-files.md).
 
 ## Where it sits
 

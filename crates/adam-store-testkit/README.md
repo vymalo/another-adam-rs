@@ -67,4 +67,4 @@ The Postgres and MongoDB adapters run the suite from their own
 [`adam-core`](../adam-core/README.md),
 [`adam-store-postgres`](../adam-store-postgres/README.md),
 [`adam-store-mongodb`](../adam-store-mongodb/README.md), and
-"To add a backend" in the [root README](../../README.md#testing).
+"To add a backend" in the [testing guide](../../docs/guides/testing.md#adding-a-backend).

@@ -6,8 +6,8 @@
 #   docker compose --profile app up -d --build --wait   # ... and the coder and the agent
 #   docker compose down -v               # stop and forget all state
 #
-# See "Local development" in README.md for the endpoints, the environment
-# variables that point the code at the mocks, and the scenario switches.
+# See docs/guides/run-locally.md to use it and docs/reference/dev-stack.md for the endpoints,
+# the mocks, their scenario switches and the scripted models.
 
 name: adam-rs
 

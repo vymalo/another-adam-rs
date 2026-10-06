@@ -51,7 +51,7 @@ let runtime = Runtime::builder(store)   // store: adam_core::DynStore
 A recorded step outcome is never re-executed, but a side effect is
 at-least-once (a crash between the effect and its journal write runs it
 again): keep effects idempotent. The lifecycle and guarantees are in the crate
-docs (`src/lib.rs`) and the [root README](../../README.md#the-model).
+docs (`src/lib.rs`) and the [architecture](../../docs/architecture.md#the-mental-model).
 
 ## A message that arrives while a run finishes
 
@@ -159,7 +159,7 @@ be registered on that runtime, as an agent or as a starter.
 Cancelling a parent does not cancel its children. Take the inbox in every step that can park, including the
 step that starts the child: a message already in the inbox when a step starts is not "arrived during the step",
 and an agent that parks without reading it sleeps until its timer. The design, the failure interleavings and
-the tests that make each happen are in [`docs/architecture.md`](../../docs/architecture.md#child-runs).
+the tests that make each happen are in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#failure-interleavings).
 `adam-llm-agent` does all of this for a tool that returns `ToolError::AwaitRun`.
 
 ## A late subscriber

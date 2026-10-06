@@ -105,7 +105,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    (`adam-agent-folder`). The chart deploys the coder only; for a folder agent write your own
    manifest, using the chart's StatefulSet as a model for the variables.
 7. **Local stack**: `docker compose --profile app up -d --build --wait` (see `compose.yaml` and
-   "Local development" in the root `README.md`).
+   `docs/guides/run-locally.md` and `docs/reference/dev-stack.md`).
 
 ## Verify
 
@@ -149,6 +149,6 @@ Then the compose scenarios of the `image` job in `.github/workflows/coder.yml`
 ## See also
 
 * `deploy/coder/README.md`, `bin/adam-coder/README.md`, `bin/adam-agent/README.md`
-  ("Image and compose"), `docs/architecture.md` ("How it is deployed").
+  ("Image and compose"), `docs/guides/deploy-the-coder.md`.
 * `adam-agent-folder`, `adam-upgrade`.
 * https://github.com/vymalo/another-adam-rs/blob/main/.github/workflows/coder.yml

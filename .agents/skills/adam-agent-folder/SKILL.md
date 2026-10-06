@@ -41,11 +41,11 @@ before you rely on a detail here.
      declared without a value, a var the body does not use, or a placeholder not declared, stops
      the process at startup.
    * Secrets and endpoints never go in the file: the validator rejects `api_key`, `apiKey`,
-     `token`, `secret`, `password` and `base_url` (`docs/authoring.md`, "File formats").
+     `token`, `secret`, `password` and `base_url` (`docs/reference/agent-files.md`, "File formats").
 3. **Body**: the system prompt. Optional `skills/<name>/SKILL.md` (Agent Skills format, loaded on
    demand by `load_skill` and `read_skill_file`) and `subagents/` (each one tool of the parent, a
    child run with only the tools it lists and never `ask_user`; registered as `<name>/<subagent>`).
-   Formats: `docs/authoring.md`.
+   Formats: `docs/reference/agent-files.md`; the short version is `docs/guides/write-an-agent.md`.
 4. **Built-in tools** the agent has without writing any: `ask_user`, `show`, `ui_catalog`
    (`crates/adam-ui/README.md`). Everything else comes from the folder, mainly MCP.
 5. **MCP servers**: `agent/mcp.json` with `{"mcpServers": {...}}`; tools are named
@@ -107,7 +107,7 @@ before you rely on a detail here.
 
 * `ADAM_AGENT_DIR` has no default and the binary has no embedded agent: unset is exit 78.
 * The folder's `name` is the key of the runs: a rename is a new agent with no history.
-* A subagent inherits nothing and, without `tools:`, has no tools (`docs/authoring.md`).
+* A subagent inherits nothing and, without `tools:`, has no tools (`docs/reference/agent-files.md`).
 * `${VAR}` in agent frontmatter does not exist; it is only for `mcp.json`.
 * One agent per process. Several agents share one database by running several processes with
   different folders (runs are scoped by the agent's name).
@@ -119,7 +119,7 @@ before you rely on a detail here.
 
 ## See also
 
-* `bin/adam-agent/README.md`, `docs/authoring.md`, `crates/adam-mcp/README.md` (MCP rules),
+* `bin/adam-agent/README.md`, `docs/guides/write-an-agent.md`, `docs/reference/agent-files.md`, `crates/adam-mcp/README.md` (MCP rules),
   `crates/adam-ui/README.md` (the built-in tools).
 * `adam-embed` (agents with Rust tools), `adam-a2a-extensions` (what the card announces),
   `adam-upgrade` (changing the image pin).

@@ -1209,7 +1209,7 @@ greets from the persona lines gets the run to wait without any tool, editing the
 ### Where the prompt and the card live
 
 One file, [`agent/instructions.md`](agent/instructions.md), holds what describes the agent, in the format of
-[`docs/authoring.md`](../../docs/authoring.md): the frontmatter has `name` (`coder`, which must equal
+[`docs/reference/agent-files.md`](../../docs/reference/agent-files.md): the frontmatter has `name` (`coder`, which must equal
 `AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 8192 output tokens, 100000 tokens of history),
 `vars.max_check_cycles` (the default, 3), `vars.scratch_check_cycles` (5), `vars.display_name` (`Coder`: the name the agent says), `vars.repository_creation` (what the prompt says about making a repository for the person: the default is the sentence for a deployment that allows it, and **when `CREATE_REPO_OWNERS` is empty `CoderAgent` replaces it with a note that there is no such tool**, that the person must create the repository and name it, and that "a new repository" is never an option of a question; a folder that does not declare the var keeps its own text) and `card:` (the A2A
 card: name `Coder`, the `coding-task` skill with its tags and example); the body is the system prompt.
@@ -1289,7 +1289,7 @@ The contract of a folder:
 | `subagents/` | assembled and **registered beside the coder** (`coder/<name>`, `CoderAgent::subagents`). A subagent runs as a child run with its own run id, so the tools that work on the worktree of the run that calls them find none in it: give it tools that need no worktree |
 | `mcp.json` | optional: the MCP servers whose tools the agent gets, named `<server>__<tool>` after its own (see [MCP tools](#mcp-tools-from-the-folder)). Connected by the **workers** at startup |
 | `schedules/` | read, not run: a warning says so |
-| the rest | skills, `limits`, `model:` and the card follow the [authoring layer](../../docs/authoring.md) |
+| the rest | skills, `limits`, `model:` and the card follow the [agent files](../../docs/reference/agent-files.md) |
 
 What a folder cannot change is what the tools do (the policy, the checks, the redaction): it changes what the agent
 says and offers. Any mistake in the files (not found, a YAML error, an unknown tool, another agent's name, several
@@ -1307,7 +1307,7 @@ connects them once at startup, before it serves, and gives the agent their tools
 `<server>__<tool>` (`tools:` in the frontmatter selects among all of them: `linear__*` takes a server's tools).
 Servers are streamable HTTP (`type: http`) or local processes (`command`); `type: sse` is refused. The format and the
 rules are those of [`adam-mcp`](../../crates/adam-mcp/README.md) and
-[MCP tools at run time](../../docs/authoring.md#mcp-tools-at-run-time-built-feature-mcp).
+[MCP tools at run time](../../docs/reference/agent-files.md#mcp-tools-at-run-time-feature-mcp).
 
 ```json
 {
@@ -2278,8 +2278,8 @@ That is what the instructions ask for; that a live model follows them is *unveri
   opens nothing.
 
 For a run without a real gateway or GitHub, `compose.yaml` provides a mock
-model, a mock GitHub API and a local git remote; see "Local development" in the
-repository README. The models are scripted: a task ends in a branch on the git
+model, a mock GitHub API and a local git remote; see [Run it locally](../../docs/guides/run-locally.md)
+and [the local stack](../../docs/reference/dev-stack.md). The models are scripted: a task ends in a branch on the git
 remote and one pull request on the mock GitHub, and `dev/coder-e2e.sh` (run by
 `.github/workflows/coder.yml` on the image it builds) checks exactly that.
 

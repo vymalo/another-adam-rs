@@ -1,7 +1,7 @@
 # adam-assembly
 
 Bind an agent manifest to [`LlmAgent`](../adam-llm-agent/README.md)s. An agent written as files
-(`agent/instructions.md`, subagents, skills, `mcp.json`; see [`docs/authoring.md`](../../docs/authoring.md))
+(`agent/instructions.md`, subagents, skills, `mcp.json`; see [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md))
 is read into a manifest by [`adam-agent-fs`](../adam-agent-fs/README.md). This crate gives the
 manifest its meaning at run time: the tools it names, the `{{placeholders}}` of its prompt, the model
 it talks to and the state its tools need. Every mistake in that is found **when the process starts**,
@@ -168,7 +168,7 @@ An agent's skills are the ones under its **own** `skills/` (a subagent inherits 
 `skills:` (`all`, the default, or a list, kept in the order given) and turned into the three tiers of
 [Agent Skills](https://agentskills.io/specification) progressive disclosure at `bind`. Nothing is added
 for an agent with no selected skill: no catalog, no tool. The design and the reasons are in
-[`docs/authoring.md`](../../docs/authoring.md#skills-at-run-time-built-s7-adam-assembly); the contract is
+[`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#skills-at-run-time); the contract is
 here.
 
 **Tier 1, the catalog.** After the instructions and a blank line, in this format (pinned by
@@ -494,8 +494,8 @@ auth: bearer:BILLING_AGENT_TOKEN
   the agent calls `Tool::poll_remote` (a `GetTask`) in a journaled step, until the task is final or the wait
   passes `AgentDef::remote_timeout` (default one hour: an error result, the remote task is left running).
   Set `BoundDef::wait_poll` for the remote (default 60 s). See "Remote subagents" in
-  [`docs/authoring.md`](../../docs/authoring.md#remote-subagents-a2a-s9b) and the diagrams in
-  [`docs/architecture.md`](../../docs/architecture.md#remote-tasks-the-same-wait-without-a-message).
+  [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#remote-subagents-a2a) and the diagrams in
+  [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#remote-tasks-the-same-wait-without-a-message).
 * **The result:** `completed` gives the text of the artifacts (else of the status message), cut at 64 KiB;
   `failed`, `canceled` and `rejected` are error results with the remote's message; **`input-required` and
   `auth-required` are error results too**, because nobody can answer a subagent (the message says so and tells

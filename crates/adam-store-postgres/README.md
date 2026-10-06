@@ -34,7 +34,7 @@ Tables are `<prefix>runs` (state as `JSONB`), `<prefix>journal` (primary key
 see [`adam-core`](../adam-core/README.md#runs-the-caller-is-stepping)); one open run per conversation is a partial unique
 index. No transaction is held open while agent code runs. `JSONB` cannot hold
 `\u0000`: such state is rejected with `StoreError::InvalidInput`. The guarantee
-table is in the [root README](../../README.md#how-each-adapter-guarantees-the-contract).
+table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
 
 ## Schema version and the owner column
 

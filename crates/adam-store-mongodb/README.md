@@ -43,7 +43,7 @@ let store: DynStore = Arc::new(store);
 Every operation is a single-document atomic write, so a standalone `mongod`
 is enough (no multi-document transactions). Integers above `i64::MAX` are
 rejected with `StoreError::InvalidInput`. Time is truncated to milliseconds.
-The guarantee table is in the [root README](../../README.md#how-each-adapter-guarantees-the-contract).
+The guarantee table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
 
 *Unverified:* the "MongoDB 5.0+" floor is the oldest server CI runs against
 (`conformance` job), not a documented driver guarantee. The `mongodb` driver

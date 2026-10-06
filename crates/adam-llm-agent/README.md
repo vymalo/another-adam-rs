@@ -69,7 +69,7 @@ steps the runs (see *Starting without stepping* in
 A complete `Tool` implementation, and one using the typed helpers, are in the crate docs
 (`src/lib.rs`). The `#[tool]` macro that generates such a tool from a function is in
 [`adam-macros`](../adam-macros/README.md), used through the [`adam`](../adam/README.md) facade (part of
-[the authoring layer](../../docs/authoring.md)).
+[the authoring layer](../../docs/reference/agent-files.md)).
 
 ### Shared state
 
@@ -370,7 +370,7 @@ result (`the run failed: ..`) and the run goes on. The message is matched to the
 copies and strays are dropped; user messages that arrive meanwhile queue behind the result. Cancelling the parent
 does not cancel the child. Events: `awaiting_run`, the call's step `waiting`, then the step's end
 (`completed` or `failed`). The design and the failure interleavings are in
-[`docs/architecture.md`](../../docs/architecture.md#child-runs).
+[`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#failure-interleavings).
 
 The tool needs no `Runtime` of its own: `ToolCtx::start_child(agent, message)` starts the child on the runtime
 that is stepping the run (through `Ctx::child_starter()`, whose only possible parent is this run), under
@@ -409,7 +409,7 @@ put no secret in it. The tool is looked up by the name in the wait, so a definit
 the call with an error result. A user message that arrives meanwhile wakes the run for one look and queues
 behind the result. Events: `awaiting_remote`, the call's step `waiting`, then the step's end (`completed` or `failed`).
 Cancelling the run does not cancel the remote task. This is what `adam-assembly`'s remote subagents do; the
-design is in [`docs/architecture.md`](../../docs/architecture.md#remote-tasks-the-same-wait-without-a-message).
+design is in [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#remote-tasks-the-same-wait-without-a-message).
 
 ## Errors
 
