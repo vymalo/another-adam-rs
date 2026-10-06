@@ -280,11 +280,12 @@ impl CoderAgent {
     }
 
     /// The subagents of the folder the agent was assembled from, registered as `coder/<name>`
-    /// (none for the embedded copy, which has none). A process that steps runs registers them
+    /// (`explorer` and `reviewer` for the embedded copy). A process that steps runs registers them
     /// beside the agent ([`Coder::new_with`](crate::Coder::new_with) does): a subagent tool starts
-    /// its child as a run of its own, found by that name. A subagent is a run with its own id, so
-    /// the tools of the coder that work on a run's worktree find none there: give a subagent
-    /// tools that need no worktree.
+    /// its child as a run of its own, found by that name. The tools of the coder find the
+    /// workspace, the notes and the budgets of the run's **root** (`ToolCtx::root_run_id`), so a
+    /// subagent that is given `read_file` or `run_command` works in the worktree of the run that
+    /// called it.
     pub fn subagents(&self) -> &[adam_llm_agent::LlmAgent] {
         self.assembly.agents().get(1..).unwrap_or_default()
     }
@@ -641,7 +642,7 @@ fn pushed_branches(state: &Conversation) -> Vec<PushedBranch> {
 }
 
 /// What the run asks when the model stopped with nothing to say and no workspace exists yet.
-const EMPTY_STOP_QUESTION: &str = "I stopped without delivering anything. Which repository should I work on, and what should I do?";
+const EMPTY_STOP_QUESTION: &str = "I stopped without delivering anything. What can I help with?";
 
 /// What it asks when the model stopped with nothing to say after a workspace was prepared: the
 /// repository is known.

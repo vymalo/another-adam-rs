@@ -514,7 +514,9 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "open_pull_request",
             "ask_user",
             "show",
-            "ui_catalog"
+            "ui_catalog",
+            "explorer",
+            "reviewer"
         ]
     );
 }
@@ -1328,7 +1330,7 @@ async fn a_stop_without_text_asks_what_to_do(store: DynStore) {
         seen.labels
     );
     assert!(
-        seen.saw_message("Which repository should I work on"),
+        seen.saw_message("What can I help with?"),
         "{:#?}",
         seen.messages
     );
@@ -3824,8 +3826,8 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 3..],
-        ["ask_user", "show", "ui_catalog"],
+        offered[offered.len() - 5..],
+        ["ask_user", "show", "ui_catalog", "explorer", "reviewer"],
         "{offered:?}"
     );
 
@@ -3925,9 +3927,9 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 2..],
-        ["ui_catalog", "relay__search"],
-        "the endpoint's tools come after the coder's own: {offered:?}"
+        offered[offered.len() - 3..],
+        ["explorer", "reviewer", "relay__search"],
+        "the endpoint's tools come after the coder's own and its subagents': {offered:?}"
     );
     assert!(
         !offered.iter().any(|name| name == "get_ui_catalog"),
