@@ -20,7 +20,7 @@
 //! let tools = tools![AskUser];
 //! ```
 //!
-//! See the `adam` crate for the full contract, and `docs/authoring.md`.
+//! See the `adam` crate for the full contract, and `docs/reference/agent-files.md`.
 
 use proc_macro::TokenStream;
 

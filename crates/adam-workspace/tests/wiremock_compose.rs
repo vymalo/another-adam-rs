@@ -3,8 +3,8 @@
 //! Runs only when `ADAM_TEST_MOCK_GITHUB_URL` is set (the mock's root, for
 //! example `http://127.0.0.1:8082`); otherwise it passes without doing
 //! anything. Start the mock with `docker compose up -d --wait mock-github`;
-//! the scenario switches used here are documented in the README ("Local
-//! development").
+//! the scenario switches used here are documented in
+//! `docs/reference/dev-stack.md`.
 //!
 //! One test, run in order: the `already-exists` scenario is a state machine
 //! inside the mock, so parallel tests would see each other's state.

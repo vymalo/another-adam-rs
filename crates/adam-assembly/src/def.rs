@@ -391,7 +391,7 @@ impl AgentDef {
     /// * a value supplied for an agent the definition does not contain.
     ///
     /// The root agent gets every registered tool when it has no `tools:`; a subagent gets none
-    /// (decision D3 of `docs/authoring.md`), whatever its parent has. Each agent then gets a
+    /// (decision D3 of `docs/reference/agent-files.md`), whatever its parent has. Each agent then gets a
     /// tool per local subagent, named after it ([`SubagentTool`]), after its own tools and its
     /// skills' tools. Two more things are refused here:
     ///

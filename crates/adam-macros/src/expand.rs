@@ -5,7 +5,7 @@
 //! the user should see. Everything the macro decides is therefore testable
 //! here with `proc_macro2` alone.
 //!
-//! What it generates is the contract of `docs/authoring.md`: the function is
+//! What it generates is the contract of `docs/reference/agent-files.md`: the function is
 //! kept (so it can be unit-tested directly), a unit struct implements `Tool`,
 //! and the arguments become one struct that derives `Deserialize` and
 //! `JsonSchema` through the `__private` paths of the crate named by
