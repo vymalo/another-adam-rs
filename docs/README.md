@@ -61,6 +61,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0018](decisions/0018-extra-mcp-servers-are-a-file-merged-over-the-agents-own.md) | extra MCP servers are a file merged over the agent's own, optional servers |
 | [0019](decisions/0019-a-runs-processes-in-a-pod-of-their-own.md) | a run's processes in a Kubernetes pod of its own |
 | [0020](decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md) | reasoning streamed beside the answer and never stored |
+| [0021](decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md) | the coder is Adam, a general agent that can code |
 
 ## Keeping these docs short and true
 
