@@ -1164,7 +1164,7 @@ async fn delegate_to_opencode_streams_updates_and_returns_the_summary() {
     let style = DelegateToOpenCode.step_style();
     assert_eq!(style.kind, StepKind::Subagent);
     assert_eq!(style.label.as_deref(), Some("OpenCode"));
-    assert_eq!(style.icon, Some(StepIcon::Agent));
+    assert_eq!(style.icon, Some(StepIcon::OpenCode));
     let call = rig.ctx.step_id().to_owned();
     let child_id = format!("acp:{}:tc-1", rig.ctx.call_id());
     let steps: Vec<StepEvent> = rig

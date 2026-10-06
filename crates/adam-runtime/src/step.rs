@@ -146,11 +146,14 @@ pub enum StepIcon {
     File,
     /// A generic tool.
     Tool,
+    /// OpenCode, the coding agent reached over ACP.
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 impl StepIcon {
     /// Every icon, in the contract's order.
-    pub const ALL: [StepIcon; 14] = [
+    pub const ALL: [StepIcon; 15] = [
         Self::Agent,
         Self::Read,
         Self::Edit,
@@ -165,6 +168,7 @@ impl StepIcon {
         Self::Test,
         Self::File,
         Self::Tool,
+        Self::OpenCode,
     ];
 
     /// The word on the wire.
@@ -184,6 +188,7 @@ impl StepIcon {
             Self::Test => "test",
             Self::File => "file",
             Self::Tool => "tool",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -492,7 +497,7 @@ mod tests {
             icons,
             [
                 "agent", "read", "edit", "delete", "move", "search", "execute", "think", "fetch",
-                "web", "git", "test", "file", "tool"
+                "web", "git", "test", "file", "tool", "opencode"
             ]
         );
         for icon in StepIcon::ALL {

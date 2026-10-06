@@ -58,7 +58,7 @@ const STEP_KINDS: &[&str] = &["subagent", "tool", "command", "message"];
 /// The icons a step may have (`steps/v1`): `adam_runtime::StepIcon`, in the same order.
 const STEP_ICONS: &[&str] = &[
     "agent", "read", "edit", "delete", "move", "search", "execute", "think", "fetch", "web", "git",
-    "test", "file", "tool",
+    "test", "file", "tool", "opencode",
 ];
 
 impl Parse for Options {
@@ -220,6 +220,10 @@ fn variant(option: &str, word: &LitStr, known: &[&str]) -> Result<Ident> {
         } else {
             name.push(c);
         }
+    }
+    // The one word whose variant is not its capitalised self.
+    if name == "Opencode" {
+        name = "OpenCode".to_owned();
     }
     Ok(Ident::new(&name, word.span()))
 }
@@ -1194,10 +1198,12 @@ mod tests {
                     async fn f() -> String { todo!() }
                 },
             );
-            has(
-                &out,
-                &format!("StepIcon::{}", icon[..1].to_uppercase() + &icon[1..]),
-            );
+            let variant = if *icon == "opencode" {
+                "OpenCode".to_owned()
+            } else {
+                icon[..1].to_uppercase() + &icon[1..]
+            };
+            has(&out, &format!("StepIcon::{variant}"));
         }
         let item = quote! {
             /// D.
@@ -1212,7 +1218,7 @@ mod tests {
         assert!(
             msg.starts_with(
                 "unknown `icon` `rocket` in `#[tool]`; expected one of: agent, read, edit,"
-            ) && msg.ends_with("file, tool"),
+            ) && msg.ends_with("file, tool, opencode"),
             "{msg}"
         );
         // The mistakes of both options are in one error, and so is an empty label.

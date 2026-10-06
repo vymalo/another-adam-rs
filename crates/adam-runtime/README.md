@@ -208,7 +208,7 @@ The first report of an `id` starts the step, later ones update it, and a state t
 `canceled`: `StepState::is_end`) ends it; a report after the end starts it again (a retry). The constructors keep the
 contract's bounds: an id of at most 128 bytes (control characters become `_`), a one-line label of at most 200
 characters, a detail of at most 1000 (`…` marks a cut). Kinds, states and icons are closed enums
-(`#[non_exhaustive]`); `as_str()` is the word on the wire and `parse(..)` reads it. A step is best effort and not
+(`#[non_exhaustive]`; the icons are `agent`, `read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `web`, `git`, `test`, `file`, `tool` and `opencode`, OpenCode's own, [ADR 0021](../../docs/decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md): a consumer that does not know a word drops the icon); `as_str()` is the word on the wire and `parse(..)` reads it. A step is best effort and not
 durable, like every event; `adam-llm-agent` reports every tool call as one.
 
 A tool call's step can also say **what the call was given and what it answered** ([ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)):
