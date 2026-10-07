@@ -102,14 +102,15 @@ into a wait by class and a log line; the status is not rewritten, because the pa
 | `Listed` | `Listed` | `RegistryDisabled` (no registry served: no token), `A2ADisabled`, `ServiceBlocked`, `RegistryFull` | `NoEndpoint` |
 | `Ready` | `Reconciled` | the reason of the first of the first three that is not true | the same |
 
-`RegistryFull` is the registry's (S7): `Options::registry_full`, a flag the registry sets while its document would pass a limit, is read at each pass, and a service that would be listed then says `Listed: False`, reason `RegistryFull` (one that is not listable anyway keeps `A2ADisabled` or `ServiceBlocked`). A change of the flag reaches a service at its next pass, at most one resync later. `Listed` informs and never gates `Ready`. The runtime reason is the most actionable of the issues
+`RegistryFull` is the registry's (S7): `Options::registry_full`, a flag the registry sets while its document would pass a limit, is read at each pass, and a service that would be listed then says `Listed: False`, reason `RegistryFull` (one that is not listable anyway keeps `A2ADisabled` or `ServiceBlocked`). A change of the flag reaches a service at its next pass, at most one resync later. A service is `Listed: True` whenever A2A is on, it is not `Blocked`, the registry is not full and the runtime has an agent card URL, so a `Degraded` or `Suspended` service is listed as well as a `Ready` one. `Listed` informs and never gates `Ready`. The runtime reason is the most actionable of the issues
 the provider reports (`NameConflict`, `MissingSecret`, `ConfigRejected`, `DependencyUnavailable`, `ImagePull`,
 `CrashLoop`, in that order). A condition keeps its `lastTransitionTime` until its status changes, so a pass that finds
 nothing new writes nothing.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Blocked: created, nothing resolved yet
+    [*] --> Blocked: the config or the store does not resolve
+    [*] --> Degraded: objects applied, not rolled out
     Blocked --> Degraded: config and store resolved, runtime applied but not ready
     Blocked --> Ready: config and store resolved, the runtime already runs this digest
     Degraded --> Ready: runtime.phase is Ready
@@ -126,7 +127,8 @@ stateDiagram-v2
     Suspended --> [*]: deleted, finalizer removed
 ```
 
-The rule, as `derive::state` has it: a false or unknown `ConfigResolved` or `StoreReady`, or a `NameConflict` issue, is
+A new service has no `status.state` until its second pass: the first only adds the finalizer (`reconcile_service`), and the second
+resolves, applies and derives, so it enters `Blocked` or `Degraded` (or `Ready`, when the runtime already runs this digest). The rule, as `derive::state` has it: a false or unknown `ConfigResolved` or `StoreReady`, or a `NameConflict` issue, is
 `Blocked` (**the operator does not apply the desired state and leaves what runs untouched**: it asks the provider for
 its `status`, never `ensure`); `spec.suspend` with phase `Suspended` is `Suspended`; phase `Ready` is `Ready`; anything
 else is `Degraded`. While blocked, `status.config` and `status.endpoints` stay as they were (what runs was resolved
@@ -197,7 +199,7 @@ operator has not applied.
 |---|---|---|
 | "The `AgentService` controller … `RuntimeProvider::status`" | `ensure`'s returned status is the runtime's status after a pass that applied something; `status(id)` is read in every pass that did **not** (blocked ones) | `ensure` returns the status computed right after the apply, which is what `status` would say; asking again is a second list of pods. A blocked pass has no `ensure`, and it is the status of what runs untouched |
 | (the brief) the controller uses `owner_handle` of `adam-operator-runtime-kubernetes` | The controller takes an `OwnerOf` function from the composition root, which builds it with `adam_operator_runtime_kubernetes::owner_handle` | The encoding of an owner is the provider's. A controller that imported it would no longer be generic over the provider (AD-020), and a second provider would need a second controller |
-| `Controller::reconcile_on` | kube's `unstable-runtime` feature | It is the only way kube-rs 4.0.0 takes a trigger that is a stream of ids (`RuntimeProvider::watch`). *Verified 2026-10-05*, `kube-runtime-4.0.0/src/controller/mod.rs`: `reconcile_on` is behind `unstable-runtime-reconcile-on`. The version is pinned by `Cargo.lock`; the call is one line in `operator.rs`, and a stable replacement (a `watches_stream` over a stream of objects, which is also unstable) would not be simpler |
+| `Controller::reconcile_on` | kube's `unstable-runtime` feature | It is the only way kube-rs takes a trigger that is a stream of ids (`RuntimeProvider::watch`). *Verified 2026-10-05* in `kube-runtime-4.0.0` and again *2026-10-07* in `kube-runtime-4.2.0` (the version `Cargo.lock` pins), `src/controller/mod.rs` and `Cargo.toml`: `reconcile_on` is behind `unstable-runtime-reconcile-on`, which `unstable-runtime` turns on. The version is pinned by `Cargo.lock`; the call is one line in `operator.rs`, and a stable replacement (a `watches_stream` over a stream of objects, which is also unstable) would not be simpler |
 | `Listed`: `RegistryDisabled` | Every service gets `Listed: False`, reason `RegistryDisabled`, from `RegistryMode::Disabled`, which `adam-operator run` sets when it has no registry token or no `registry` feature | Fail closed: the condition says so instead of staying absent |
 | `Listed`: `RegistryFull` on "every service" | On every service that would otherwise be listed, from a flag the registry sets; a service that is not listable keeps its own reason; it follows the flag at the service's next pass | The controller cannot know the registry's byte size, and §59a gives no mechanism. The flag is the smallest one that keeps the controller free of a registry crate (AD-020) |
 | the reason tables of "Status" | A provider that refuses a spec the domain accepted (`RuntimeError::InvalidSpec`/`Unsupported`, for example Kubernetes refusing a changed StatefulSet claim template) is `ConfigResolved: False`, reason `ConfigInvalid`, with the provider's words: `Blocked`, nothing applied. A store provisioner that does not serve a kind (or whose backend is absent) is `StoreReady: False`, reason `CNPGNotInstalled` | The tables have no better reason for a spec nobody can apply, and "someone has to change the objects" is what `ConfigInvalid` says |

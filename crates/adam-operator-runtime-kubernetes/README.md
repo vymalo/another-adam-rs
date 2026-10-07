@@ -233,10 +233,9 @@ connection is `Transient`.
 
 ### What is not tested
 
-* **The cluster tests have not been run.** No cluster, kind or docker exists where this slice was written. They compile,
-  their skip path was run, and the logic they check is covered by `tests/api.rs` against the fake; what the fake cannot say
-  (the API server's refusals, the StatefulSet controller, the kubelet's words, the garbage collector, a watch) is theirs,
-  and is *unverified* until the `runtime-kubernetes` job of `.github/workflows/operator.yml` has run them.
+* **The cluster tests ran green in CI** (the `runtime-kubernetes` job of `.github/workflows/operator.yml`, *verified 2026-10-07*: `operator` workflow run 37595241571 on `main` at `2644008`, every job `success`, read through the GitHub Actions API): the API server's
+  refusals, the StatefulSet controller, the kubelet's words, the garbage collector and a watch are what that job checks beyond
+  `tests/api.rs`'s fake. What stays unproven is anything that job's cases do not name below, and any production cluster.
 * **A race in the adoption guard**: the guard's read and the apply are two requests, so an object that appears between them
   is adopted (the apply would add our labels to it). Closing it needs an apply that fails if the object exists and is not
   ours; Kubernetes has no such precondition for a server-side apply.

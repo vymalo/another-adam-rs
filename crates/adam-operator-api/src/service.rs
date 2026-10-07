@@ -45,8 +45,9 @@ pub struct AgentServiceSpec {
     /// The AgentConfig, in the same namespace, this service runs.
     pub config_ref: NameRef,
 
-    /// The protocol surfaces the service serves. Nothing is exposed by default.
-    #[serde(default)]
+    /// The protocol surfaces the service serves. Required: A2A is the only one in v0, and it needs its token.
+    // No default object: the API server checks a default against the CEL rule of `A2aInterface`, and a default
+    // without a token would make the CRD itself invalid.
     pub interfaces: Interfaces,
 
     /// How many processes run, and in which topology.
@@ -74,11 +75,10 @@ pub struct AgentServiceSpec {
 }
 
 /// The protocol surfaces of a service. Only A2A is served in v0.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Interfaces {
-    /// The A2A surface.
-    #[serde(default)]
+    /// The A2A surface. Required.
     pub a2a: A2aInterface,
     /// The Responses surface. Exists for the target design; v0 refuses `true`.
     #[serde(default)]
@@ -88,12 +88,15 @@ pub struct Interfaces {
     pub mcp: UnsupportedInterface,
 }
 
-/// The A2A surface of a service.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// The A2A surface of a service. On unless `enabled` says otherwise: it is the only surface of v0, and the adam binaries
+/// serve nothing else.
+// A missing `enabled` is true, so the rule counts it as true; the API server applies the scalar default first.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, KubeSchema)]
 #[serde(rename_all = "camelCase")]
+#[x_kube(validation = Rule::new("(has(self.enabled) && !self.enabled) || has(self.bearerTokensSecretRef)").message("interfaces.a2a needs bearerTokensSecretRef: no token, no server"))]
 pub struct A2aInterface {
-    /// Serve A2A. Without it the agent is not listed in the registry.
-    #[serde(default)]
+    /// Serve A2A. The default is true; v0 refuses false (the agent would not start), and without A2A the agent is not listed.
+    #[serde(default = "enabled")]
     pub enabled: bool,
 
     /// The Secret key that holds the bearer tokens (`A2A_BEARER_TOKENS`). No token, no server:
@@ -104,6 +107,10 @@ pub struct A2aInterface {
     /// The URL clients reach the agent at (`PUBLIC_URL`). Empty: `http://<name>.<ns>.svc:8080/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,
+}
+
+fn enabled() -> bool {
+    true
 }
 
 /// A surface the v0 operator does not serve.

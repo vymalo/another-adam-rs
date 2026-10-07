@@ -34,7 +34,7 @@ let crds: Vec<CustomResourceDefinition> = adam_operator_api::crds(); // AgentCon
 Optional settings of `adam-coder` are `Option`s: a field left out is not set, and the binary's own
 default applies (the operator does not copy adam's defaults). The defaults the schema does apply
 are the platform's own: `scaling` (`combined`, 1 worker), `suspend: false`, `deletionPolicy:
-Retain`, `interfaces` (nothing exposed), `githubMcp` (`sidecar: true`, `port: 8082`).
+Retain`, `interfaces.a2a.enabled` (true) and, inside `interfaces`, `responses` and `mcp` (off); `interfaces` and `a2a` themselves are required, `githubMcp` (`sidecar: true`, `port: 8082`).
 
 ## CEL rules (`x-kubernetes-validations`)
 
@@ -45,6 +45,7 @@ object. Each has an invalid example in [`examples/invalid`](../../deploy/operato
 | Rule | Where |
 |---|---|
 | `interfaces.responses.enabled` and `interfaces.mcp.enabled` are `false` | on the field |
+| `interfaces` and `interfaces.a2a` are required (no object default: the API server checks a default against the CEL rules, and one without a token made the CRD invalid); `a2a.enabled` defaults to true; unless it is `false`, `bearerTokensSecretRef` is required (no token, no server) | `A2aInterface` |
 | exactly one of `store.postgres.secretRef` and `store.postgres.cnpg` | `PostgresStore` |
 | exactly one of `github.app` and `github.token` | `Github` |
 | exactly one of `app.installationId` and `app.owners` | `GithubApp` |
@@ -73,7 +74,7 @@ the `githubMcp` port beyond its 1 to 65535 range (the range is also in the schem
 
 The CEL rules are evaluated with `kube-cel` (the `cel` feature of `kube`, a dev-dependency), a
 client-side implementation. **It is a proxy for an API server, not one**, and it does not check
-the OpenAPI schema (types, `required`, `enum`). The `kind` job of
+the OpenAPI schema (types, `required`, `enum`). The `kind-crds` job of
 [`.github/workflows/operator.yml`](../../.github/workflows/operator.yml) applies the CRDs, the
 examples and the invalid examples to a real API server.
 
@@ -82,6 +83,6 @@ tested by `adam-operator`.
 
 ## Versions
 
-`kube` 4.0.0 (`derive`; the lock pins it, `cargo update` would take 4.2.0), `k8s-openapi` 0.28.0
+`kube` 4.2.0 (`derive`; `Cargo.lock` pins it), `k8s-openapi` 0.28.0
 (`v1_32`, `schemars`), `schemars` 1.2.2. Resource requirements, the label selectors of `allowFrom`
 and `Quantity` are `k8s-openapi` types, so the schema embeds their upstream descriptions.

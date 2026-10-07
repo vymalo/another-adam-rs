@@ -10,6 +10,7 @@ Start with the [root README](../README.md), then the guide for what you are doin
 | [Run it locally](guides/run-locally.md) | you want the coder and the general agent running on your machine in minutes |
 | [Write an agent](guides/write-an-agent.md) | you want an agent that is a folder of Markdown, or one with `#[tool]` functions |
 | [Deploy the coder](guides/deploy-the-coder.md) | you are installing the image and the Helm chart on Kubernetes |
+| [Run agents with the operator](guides/run-agents-with-the-operator.md) | you run the coder or a folder agent on Kubernetes from `AgentService` and `AgentConfig` resources |
 | [Embed adam](guides/embed-adam.md) | you host adam agents inside your own Rust program |
 | [Testing](guides/testing.md) | you want to run or add tests, the end-to-end scripts, or check the chart |
 

@@ -176,6 +176,7 @@ The same image carries `adam-agent`. The chart deploys the coder only. For a fol
 the entrypoint `tini -- adam-agent`, the folder mounted read-only at `ADAM_AGENT_DIR` and readable by uid 10001,
 and write your own manifest using the chart's StatefulSet as a model for the variables
 ([Write an agent](write-an-agent.md), [`bin/adam-agent`](../../bin/adam-agent/README.md#image-and-compose)).
+Or let the operator make it from an `AgentService`: [Run agents with the operator](run-agents-with-the-operator.md).
 
 ## How a change reaches the chart
 

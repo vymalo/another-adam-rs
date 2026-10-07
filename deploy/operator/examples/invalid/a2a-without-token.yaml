@@ -1,0 +1,20 @@
+# Refused: interfaces.a2a is on (enabled defaults to true) and names no bearerTokensSecretRef; no token, no server.
+# expect: interfaces.a2a needs bearerTokensSecretRef: no token, no server
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentService
+metadata:
+  name: invalid-a2a-without-token
+  namespace: another-agentic-system
+spec:
+  configRef:
+    name: chat
+  interfaces:
+    a2a: {}
+  scaling:
+    topology: combined
+    workers: 1
+  store:
+    postgres:
+      secretRef:
+        name: db
+        key: uri

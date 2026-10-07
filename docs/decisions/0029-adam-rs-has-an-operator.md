@@ -15,6 +15,14 @@ environment contract, held equal by *parity goldens* rendered from `deploy/coder
 goldens pinned `0391809` while this repository went on (`MODEL_EXTRA_BODY`, run pods, Adam). No `AgentService` exists on
 any cluster yet.
 
+*Amended 2026-10-07:* that last sentence was true when this ADR was written. Since then (1) CI proved the operator on kind: the `operator`
+workflow run 37595241571 on `main` at `2644008` passed `kind-crds`, `operator-e2e`, `coder-e2e`, `runtime-kubernetes` and `store-cnpg`
+(*verified 2026-10-07*, GitHub Actions API), and (2) the netcup deployment declares its coder as an `AgentService` and an `AgentConfig`
+(`WhyThatFunction/home-os` pull request 182, "run the coder from an AgentService and AgentConfig (hard cutover)", merged
+2026-10-07T09:15Z, *verified* through the GitHub API; that the cluster has synced and runs it was not checked from this repository, which holds no
+production evidence). Decision 1 says the platform repository is archived: on 2026-10-07 the GitHub API still reported
+`archived: false` for `vymalo/another-agentic-platform`, so the archival is **pending the owner**.
+
 ## Decision
 
 The owner, 2026-10-07:

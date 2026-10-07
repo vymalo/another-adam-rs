@@ -104,6 +104,11 @@ card before you call (`capabilities.pushNotifications`, `capabilities.extendedAg
 
 Decision: `docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md`.
 
+**The registry** is not an A2A extension either: it is a list of agent cards, `agent-registry/v1`, that a platform
+serves so an orchestrator finds its agents. The adam-rs operator serves one for the `AgentService`s it runs
+(`crates/adam-operator-registry/README.md`; how to read it and what it lists: `adam-operator`). It lists the
+card URL of each agent and nothing of its extensions: read the card for those.
+
 ## Pitfalls
 
 * An extension not named by the client is off: `steps/v1` and `text-stream/v1` send plain text
@@ -121,5 +126,5 @@ Decision: `docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-s
   `docs/decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md`,
   `docs/decisions/0007-progress-as-steps-and-streamed-text.md`,
   `docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md`.
-* `adam-agent-folder`, `adam-embed`.
+* `adam-agent-folder`, `adam-embed`, `adam-operator`.
 * https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-a2a/src/extensions.rs

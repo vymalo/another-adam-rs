@@ -750,19 +750,10 @@ spec:
                 nullable: true
                 type: string
               interfaces:
-                default:
-                  a2a:
-                    enabled: false
-                  mcp:
-                    enabled: false
-                  responses:
-                    enabled: false
-                description: The protocol surfaces the service serves. Nothing is exposed by default.
+                description: 'The protocol surfaces the service serves. Required: A2A is the only one in v0, and it needs its token.'
                 properties:
                   a2a:
-                    default:
-                      enabled: false
-                    description: The A2A surface.
+                    description: The A2A surface. Required.
                     properties:
                       bearerTokensSecretRef:
                         description: |-
@@ -783,14 +774,17 @@ spec:
                         - name
                         type: object
                       enabled:
-                        default: false
-                        description: Serve A2A. Without it the agent is not listed in the registry.
+                        default: true
+                        description: Serve A2A. The default is true; v0 refuses false (the agent would not start), and without A2A the agent is not listed.
                         type: boolean
                       publicUrl:
                         description: 'The URL clients reach the agent at (`PUBLIC_URL`). Empty: `http://<name>.<ns>.svc:8080/`.'
                         nullable: true
                         type: string
                     type: object
+                    x-kubernetes-validations:
+                    - message: 'interfaces.a2a needs bearerTokensSecretRef: no token, no server'
+                      rule: (has(self.enabled) && !self.enabled) || has(self.bearerTokensSecretRef)
                   mcp:
                     default:
                       enabled: false
@@ -817,6 +811,8 @@ spec:
                         - message: 'v0 serves A2A only: this interface cannot be enabled'
                           rule: self == false
                     type: object
+                required:
+                - a2a
                 type: object
               registry:
                 default:
@@ -929,6 +925,7 @@ spec:
                 type: boolean
             required:
             - configRef
+            - interfaces
             - store
             type: object
           status:
