@@ -136,6 +136,138 @@ async fn an_inline_config_is_refused_when_push_is_off_and_no_task_is_created() {
     assert!(server.backend.task_ids().is_empty(), "nothing was started");
 }
 
+/// An inline config that breaks the policy fails the call before the message is submitted.
+#[tokio::test]
+async fn an_inline_config_the_policy_refuses_creates_no_task() {
+    let store = adam_a2a::push::InMemoryPushStore::new();
+    let policy = PushPolicy::new(["hooks.example.com"]).unwrap();
+    let server = started(Some(PushSupport::new(Arc::new(store.clone()), policy))).await;
+    let client = server.client(Some(TOKEN)).await;
+    let mut request = send("hi", None);
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: Some(config("", "https://evil.example.org/hook")),
+        history_length: None,
+        return_immediately: Some(true),
+    });
+    let err = client.send_message(&request).await.unwrap_err();
+    assert_eq!(err.code, error_code::INVALID_PARAMS);
+    assert!(server.backend.task_ids().is_empty(), "nothing was started");
+    assert!(store.records().is_empty());
+}
+
+/// The cap of a task that already has its sixteen is known before the message is submitted.
+#[tokio::test]
+async fn an_inline_config_over_the_cap_of_the_task_it_continues_is_refused_before_the_message() {
+    let hook = Webhook::start().await;
+    let (push, store) = local_push(&[&hook]);
+    let server = started(Some(push)).await;
+    let client = server.client(Some(TOKEN)).await;
+    let task = task_of(client.send_message(&send("[hold] go", None)).await.unwrap());
+    for i in 0..16 {
+        let mut c = config(&task.id, &hook.url());
+        c.id = Some(format!("c{i}"));
+        client.create_push_config(&c).await.unwrap();
+    }
+    let before = history_len(&client, &task.id).await;
+    let mut follow_up = send("more", None);
+    follow_up.message.task_id = Some(task.id.clone());
+    follow_up.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: Some(config("", &hook.url())),
+        history_length: None,
+        return_immediately: Some(true),
+    });
+    let err = client.send_message(&follow_up).await.unwrap_err();
+    assert_eq!(err.code, error_code::INVALID_PARAMS);
+    assert_eq!(
+        history_len(&client, &task.id).await,
+        before,
+        "the message was not submitted"
+    );
+    assert_eq!(store.records().len(), 16);
+}
+
+async fn history_len(client: &Client, id: &str) -> usize {
+    let mut request = get(id);
+    request.history_length = Some(100);
+    let task = client.get_task(&request).await.unwrap();
+    task.history.map_or(0, |h| h.len())
+}
+
+/// A push store whose `put` fails, over a real one.
+struct PutFails(adam_a2a::push::InMemoryPushStore);
+
+#[async_trait::async_trait]
+impl PushStore for PutFails {
+    async fn put(
+        &self,
+        _new: NewPushConfig,
+    ) -> Result<adam_a2a::push::PushRecord, adam_a2a::push::PushStoreError> {
+        Err(adam_a2a::push::PushStoreError::Unavailable(
+            "the database went away".into(),
+        ))
+    }
+    async fn list(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<adam_a2a::push::PushRecord>, adam_a2a::push::PushStoreError> {
+        self.0.list(task_id).await
+    }
+    async fn delete(
+        &self,
+        task_id: &str,
+        id: &str,
+    ) -> Result<bool, adam_a2a::push::PushStoreError> {
+        self.0.delete(task_id, id).await
+    }
+    async fn claim_due(
+        &self,
+        worker: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> Result<Vec<adam_a2a::push::PushRecord>, adam_a2a::push::PushStoreError> {
+        self.0.claim_due(worker, now, ttl, limit).await
+    }
+    async fn commit(
+        &self,
+        task_id: &str,
+        id: &str,
+        expected_version: u64,
+        progress: adam_a2a::push::PushProgress,
+    ) -> Result<adam_a2a::push::PushRecord, adam_a2a::push::PushStoreError> {
+        self.0.commit(task_id, id, expected_version, progress).await
+    }
+}
+
+/// The task exists once the message is submitted: a store that fails after that does not fail the
+/// call, or the client would send the message again.
+#[tokio::test]
+async fn a_store_that_fails_after_the_task_exists_still_returns_the_task() {
+    let hook = Webhook::start().await;
+    let inner = adam_a2a::push::InMemoryPushStore::new();
+    let push = PushSupport::new(Arc::new(PutFails(inner.clone())), local_policy(&[&hook]));
+    let server = started(Some(push)).await;
+    let client = server.client(Some(TOKEN)).await;
+    let mut request = send("[hold] go", None);
+    request.configuration = Some(SendMessageConfiguration {
+        accepted_output_modes: None,
+        task_push_notification_config: Some(config("", &hook.url())),
+        history_length: None,
+        return_immediately: Some(true),
+    });
+    let task = task_of(client.send_message(&request).await.unwrap());
+    assert_eq!(server.backend.task_ids().len(), 1, "one task");
+    assert!(inner.records().is_empty(), "and no config");
+    // The client can register the webhook itself.
+    let err = client
+        .create_push_config(&config(&task.id, &hook.url()))
+        .await
+        .unwrap_err();
+    assert_ne!(err.code, error_code::INVALID_PARAMS, "{err:?}");
+}
+
 // ------------------------------------------------------------ configurations
 
 #[tokio::test]

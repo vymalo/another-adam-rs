@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::{StreamExt, future};
 
+use adam_error::{Classify, ErrorClass};
+
 use crate::activation::{self, HEADER};
 use crate::auth::CALLER_HEADER;
 use crate::backend::{BackendError, Caller, DynTaskBackend, TaskEvent};
@@ -141,9 +143,14 @@ fn validate(request: &SendMessageRequest) -> Result<(), A2AError> {
 impl BackendHandler {
     /// Submit the message, and register the push configuration it carries, if any.
     ///
-    /// The configuration is checked **before** the task is created, so a refused webhook leaves
-    /// nothing behind; it is registered **after**, against the task that came back, with what the
-    /// task says now as the baseline (a message that was just sent is news to the webhook).
+    /// Everything that can be checked without writing is checked **before** the task is created
+    /// (the webhook against the policy, the header values, the cap of configs of a task the message
+    /// continues), so a refused configuration fails the call and leaves no task behind. The
+    /// configuration is registered **after**, against the task that came back, with what the task
+    /// says now as the baseline (a message that was just sent is news to the webhook). If that
+    /// write fails, the call still succeeds with the task: failing it would make the client send
+    /// the message again. The failure is logged (task id and error class, no URL or secret) and the
+    /// client can register the webhook with `CreateTaskPushNotificationConfig`.
     async fn submit(&self, caller: Caller, request: SendMessageRequest) -> Result<Task, A2AError> {
         validate(&request)?;
         let inline = request
@@ -152,6 +159,9 @@ impl BackendHandler {
             .and_then(|c| c.task_push_notification_config.clone());
         if let Some(config) = &inline {
             self.validate_push_config(self.push_support()?, config)?;
+            if let Some(task_id) = request.message.task_id.as_deref().filter(|t| !t.is_empty()) {
+                self.check_config_cap(task_id, config).await?;
+            }
         }
         let message = request.message;
         let task_id = message.task_id.clone();
@@ -160,10 +170,35 @@ impl BackendHandler {
             .backend
             .submit(caller.clone(), message, task_id, context_id)
             .await?;
-        if let Some(config) = inline {
-            self.register_inline(&caller, &task, config).await?;
+        if let Some(config) = inline
+            && let Err(failure) = self.register_inline(&caller, &task, config).await
+        {
+            tracing::warn!(
+                task_id = %task.id,
+                class = ?failure.class(),
+                "the push notification config of a message could not be registered; the task was created"
+            );
         }
         Ok(task)
+    }
+
+    /// Refuse an inline config that would be the seventeenth of the task the message continues.
+    async fn check_config_cap(
+        &self,
+        task_id: &str,
+        config: &TaskPushNotificationConfig,
+    ) -> Result<(), A2AError> {
+        let id = inline_config_id(config);
+        let existing = self
+            .push_support()?
+            .store()
+            .list(task_id)
+            .await
+            .map_err(|e| push_error(e, task_id))?;
+        if existing.len() >= MAX_CONFIGS_PER_TASK && !existing.iter().any(|r| r.id == id) {
+            return Err(cap_error());
+        }
+        Ok(())
     }
 
     fn push_support(&self) -> Result<&PushSupport, A2AError> {
@@ -245,8 +280,8 @@ impl BackendHandler {
         mut config: TaskPushNotificationConfig,
         cursor: PushCursor,
         replace: bool,
-    ) -> Result<Option<TaskPushNotificationConfig>, A2AError> {
-        let support = self.push_support()?;
+    ) -> Result<Option<TaskPushNotificationConfig>, PushFailure> {
+        let support = self.push_support().map_err(PushFailure::Refused)?;
         let id = config
             .id
             .clone()
@@ -256,15 +291,13 @@ impl BackendHandler {
             .store()
             .list(&task.id)
             .await
-            .map_err(|e| push_error(e, &task.id))?;
+            .map_err(PushFailure::Store)?;
         let present = existing.iter().any(|r| r.id == id);
         if present && !replace {
             return Ok(None);
         }
         if !present && existing.len() >= MAX_CONFIGS_PER_TASK {
-            return Err(A2AError::invalid_params(format!(
-                "a task may have at most {MAX_CONFIGS_PER_TASK} push notification configs"
-            )));
+            return Err(PushFailure::Refused(cap_error()));
         }
         config.id = Some(id.clone());
         config.task_id.clone_from(&task.id);
@@ -279,7 +312,7 @@ impl BackendHandler {
                 cursor,
             })
             .await
-            .map_err(|e| push_error(e, &task.id))?;
+            .map_err(PushFailure::Store)?;
         // A hint: the deliverer looks at the config now instead of at its next poll.
         support.nudge.notify_one();
         Ok(Some(redacted(record.config)))
@@ -295,10 +328,8 @@ impl BackendHandler {
         caller: &Caller,
         task: &Task,
         mut config: TaskPushNotificationConfig,
-    ) -> Result<(), A2AError> {
-        if config.id.as_deref().is_none_or(str::is_empty) {
-            config.id = Some(inline_id(&config.url));
-        }
+    ) -> Result<(), PushFailure> {
+        config.id = Some(inline_config_id(&config));
         self.store_push_config(caller, task, config, PushCursor::baseline(task), false)
             .await
             .map(|_| ())
@@ -321,6 +352,44 @@ fn inline_id(url: &str) -> String {
     let digest = sha2::Sha256::digest(url.as_bytes());
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     format!("inline-{hex}")
+}
+
+/// The id an inline config is stored under: the one it names, else one derived from its URL.
+fn inline_config_id(config: &TaskPushNotificationConfig) -> String {
+    match config.id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_owned(),
+        _ => inline_id(&config.url),
+    }
+}
+
+fn cap_error() -> A2AError {
+    A2AError::invalid_params(format!(
+        "a task may have at most {MAX_CONFIGS_PER_TASK} push notification configs"
+    ))
+}
+
+/// Why a config was not stored.
+enum PushFailure {
+    /// The request was refused (the cap, push switched off).
+    Refused(A2AError),
+    /// The store failed.
+    Store(PushStoreError),
+}
+
+impl PushFailure {
+    fn class(&self) -> ErrorClass {
+        match self {
+            Self::Refused(_) => ErrorClass::Invalid,
+            Self::Store(e) => e.class(),
+        }
+    }
+
+    fn into_a2a(self, task_id: &str) -> A2AError {
+        match self {
+            Self::Refused(e) => e,
+            Self::Store(e) => push_error(e, task_id),
+        }
+    }
 }
 
 /// A push-store failure, as the A2A error the client is told (the cause goes to the log).
@@ -491,7 +560,8 @@ impl RequestHandler for BackendHandler {
         // What the webhook already knows is what the task is now: only later changes are news.
         let cursor = PushCursor::baseline(&task);
         self.store_push_config(&caller, &task, req, cursor, true)
-            .await?
+            .await
+            .map_err(|f| f.into_a2a(&task.id))?
             .ok_or_else(|| A2AError::internal("internal error"))
     }
 

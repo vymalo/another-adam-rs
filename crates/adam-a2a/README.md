@@ -96,6 +96,11 @@ Protocol notes (details in the crate docs, `src/lib.rs`; the SDK's `RequestHandl
 * A send whose configuration names the push config the way earlier drafts did (`pushNotificationConfig`) is refused with
   `InvalidParams` before any task starts: the SDK reads requests as proto3 JSON, which has no such member, so the config
   would be dropped silently (*observed 2026-10-07*). The 1.0 name is `taskPushNotificationConfig`.
+* **A config in a send** is checked before the message is submitted (policy, header values, the cap of configs of the
+  task the message continues): a refused one fails the call and creates no task. It is stored after the task exists, and
+  if the store then fails the call **still returns the task** (a failure would make the client send the message again):
+  a `warn` with the task id and the error class is logged, and the client registers the webhook with
+  `CreateTaskPushNotificationConfig`.
 * **ListTasks**: `TaskBackend::list` returns the caller's own tasks, most recently updated first, by cursor
   (`PageToken`, never an offset; bound by a digest to the caller and the filters; another caller's or a tampered token is
   `InvalidParams` "invalid page token"). The handler resolves `pageSize` (50, 1 to 100), omits `artifacts` unless
