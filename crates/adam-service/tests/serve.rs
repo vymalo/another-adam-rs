@@ -596,5 +596,28 @@ async fn nothing_optional_is_on_unless_the_environment_says_so() {
     assert_eq!(card.capabilities.extended_agent_card, Some(false));
     assert!(card.signatures.is_none());
     assert_eq!(status_of(addr, "/.well-known/jwks.json").await, Some(401));
+    // The docs are the exception: on, and public, unless `A2A_DOCS=false`.
+    assert_eq!(status_of(addr, "/openapi.json").await, Some(200));
+    assert_eq!(status_of(addr, "/docs").await, Some(303));
+    running.finish().await;
+}
+
+/// `A2A_DOCS=false`: no Swagger UI and no OpenAPI document; the routes are closed like any other.
+#[tokio::test]
+async fn a2a_docs_false_turns_the_docs_off() {
+    let Some(url) = database() else { return };
+    let name = unique("serve-nodocs");
+    let port = free_port().await;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let more = [("A2A_DOCS", "false".to_owned())];
+    let cfg = config_with(&url, "control-plane", port, &more);
+    let running = Running::start(
+        config_with(&url, "control-plane", port, &more),
+        agents(&name, &cfg),
+    );
+    until_ok(addr, "/healthz", &running.handle).await;
+    for path in ["/openapi.json", "/docs", "/docs/"] {
+        assert_eq!(status_of(addr, path).await, Some(401), "{path}");
+    }
     running.finish().await;
 }
