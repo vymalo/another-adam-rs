@@ -1060,7 +1060,12 @@ impl LlmAgent {
                         say(
                             ctx,
                             silent_call(self, state, &call.name),
-                            self.step_event(&call.name, &call.id, StepState::Waiting),
+                            self.step_event(
+                                &call.name,
+                                &call.id,
+                                StepState::Waiting,
+                                &state.source_notes,
+                            ),
                         )
                         .await;
                         state.pending_wait = Some(PendingWait::Run(wait));
@@ -1090,7 +1095,12 @@ impl LlmAgent {
                     say(
                         ctx,
                         silent_call(self, state, &call.name),
-                        self.step_event(&call.name, &call.id, StepState::Waiting),
+                        self.step_event(
+                            &call.name,
+                            &call.id,
+                            StepState::Waiting,
+                            &state.source_notes,
+                        ),
                     )
                     .await;
                     state.pending_wait = Some(PendingWait::Remote(PendingRemote {
@@ -1119,7 +1129,7 @@ impl LlmAgent {
         call: &ToolCall,
         files_used: u64,
     ) -> Result<ToolResult, AgentError> {
-        let end = |state: StepState| self.step_event(&call.name, &call.id, state);
+        let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
         // What the listing that offered this tool said about it. Only a source's tool has a note: the
         // agent's own tools win a name clash.
         let note = self.source_note(notes, &call.name);
@@ -1127,16 +1137,16 @@ impl LlmAgent {
         let silent = note.is_some_and(|n| n.reports_step);
         // The report that starts the step says what the call was given (and, with a title the tool
         // has for itself, what to call it: `Tool::step_style`).
-        let mut start = self
-            .style_of(&call.name)
-            .event(&call.name, &call.id, StepState::Running);
+        let mut start =
+            self.style_of(&call.name, notes)
+                .event(&call.name, &call.id, StepState::Running);
         if let Some((input, max)) = self.step_io.input(&call.arguments) {
             start = start.with_input_within(input, max);
         }
         say(ctx, silent, RunEvent::Step(start)).await;
 
         let tool_ctx = self
-            .tool_ctx(ctx, context, root_run, &call.id, &call.name)
+            .tool_ctx(ctx, context, root_run, notes, &call.id, &call.name)
             .with_note(note.cloned());
         let args = call.arguments.clone();
         let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
@@ -1158,6 +1168,7 @@ impl LlmAgent {
                         &call.id,
                         StepState::Failed,
                         Some((&unknown, true)),
+                        notes,
                     ),
                 )
                 .await;
@@ -1197,7 +1208,7 @@ impl LlmAgent {
                 say(
                     ctx,
                     silent,
-                    self.step_end(&call.name, &call.id, outcome, said),
+                    self.step_end(&call.name, &call.id, outcome, said, notes),
                 )
                 .await;
                 Ok(ToolResult::Answered {
@@ -1215,6 +1226,7 @@ impl LlmAgent {
                         &call.id,
                         StepState::Failed,
                         Some((&reason, true)),
+                        notes,
                     ),
                 )
                 .await;
@@ -1233,6 +1245,7 @@ impl LlmAgent {
                         &call.id,
                         StepState::Failed,
                         Some((&reason, true)),
+                        notes,
                     ),
                 )
                 .await;
@@ -1270,6 +1283,7 @@ impl LlmAgent {
         ctx: &Ctx,
         context: &Map<String, Value>,
         root_run: Option<RunId>,
+        notes: &[ToolNote],
         call_id: &str,
         tool: &str,
     ) -> ToolCtx {
@@ -1284,19 +1298,36 @@ impl LlmAgent {
             Some(ctx.child_starter()),
             Arc::new(context.clone()),
             root_run,
-            self.style_of(tool).event(tool, call_id, StepState::Running),
+            self.style_of(tool, notes)
+                .event(tool, call_id, StepState::Running),
         )
     }
 
-    /// How a call of the tool `name` is drawn as a step: the tool's own [`Tool::step_style`], or the
-    /// default for a name that is none of the agent's own tools (a source's tool, one nobody has).
-    fn style_of(&self, name: &str) -> StepStyle {
-        self.tool(name).map(|t| t.step_style()).unwrap_or_default()
+    /// How a call of the tool `name` is drawn as a step: the tool's own [`Tool::step_style`]; for a
+    /// source's tool, the default with the label its listing gave (`notes`, [`ToolNote::label`]); for
+    /// a name nobody has, the default.
+    fn style_of(&self, name: &str, notes: &[ToolNote]) -> StepStyle {
+        match self.tool(name) {
+            Some(tool) => tool.step_style(),
+            None => match self
+                .source_note(notes, name)
+                .and_then(|n| n.label.as_deref())
+            {
+                Some(label) => StepStyle::default().with_label(label),
+                None => StepStyle::default(),
+            },
+        }
     }
 
     /// The report that the call `call_id` of the tool `tool` is in `state`.
-    fn step_event(&self, tool: &str, call_id: &str, state: StepState) -> RunEvent {
-        RunEvent::Step(self.style_of(tool).event(tool, call_id, state))
+    fn step_event(
+        &self,
+        tool: &str,
+        call_id: &str,
+        state: StepState,
+        notes: &[ToolNote],
+    ) -> RunEvent {
+        RunEvent::Step(self.style_of(tool, notes).event(tool, call_id, state))
     }
 
     /// The report that ends the step of the call `call_id` of the tool `tool` in `state`, with what
@@ -1308,8 +1339,9 @@ impl LlmAgent {
         call_id: &str,
         state: StepState,
         result: Option<(&str, bool)>,
+        notes: &[ToolNote],
     ) -> RunEvent {
-        let mut step = self.style_of(tool).event(tool, call_id, state);
+        let mut step = self.style_of(tool, notes).event(tool, call_id, state);
         if let Some((text, error)) = result
             && let Some(output) = self.step_io.output(text, error)
         {
@@ -1336,7 +1368,7 @@ impl LlmAgent {
             } if id == call_id => Some((content.as_str(), *is_error)),
             _ => None,
         });
-        self.step_end(tool, call_id, state, result)
+        self.step_end(tool, call_id, state, result, &conversation.source_notes)
     }
 
     /// What the model is told when it calls a tool nobody has.
@@ -1403,6 +1435,7 @@ impl LlmAgent {
             ctx,
             &state.context,
             state.root_run,
+            &state.source_notes,
             &wait.call_id,
             &wait.tool,
         );

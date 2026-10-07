@@ -62,6 +62,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0019](decisions/0019-a-runs-processes-in-a-pod-of-their-own.md) | a run's processes in a Kubernetes pod of its own |
 | [0020](decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md) | reasoning streamed beside the answer and never stored |
 | [0021](decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md) | the coder is Adam, a general agent that can code |
+| [0027](decisions/0027-every-tool-has-a-title-for-its-step.md) | every tool has a title for its step |
 
 ## Keeping these docs short and true
 

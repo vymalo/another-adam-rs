@@ -56,7 +56,7 @@ const MAX_LISTED: usize = 20;
 /// git: a command that changes HEAD, the branch, a ref, .git or the git configuration is undone
 /// completely and refused, so commit with commit_and_push. After it changes the files, run the
 /// project's checks again before you commit. Show the person a file it made with share_file.
-#[tool]
+#[tool(label = "Make files with a command")]
 pub async fn run(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

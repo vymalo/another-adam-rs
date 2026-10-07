@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use adam_a2a::A2UI_MEDIA_TYPE;
-use adam_llm_agent::{Artifact, Tool, ToolCtx, ToolError, ToolOutput, parse_args};
+use adam_llm_agent::{Artifact, StepStyle, Tool, ToolCtx, ToolError, ToolOutput, parse_args};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -243,6 +243,11 @@ impl Show {
 
 #[async_trait]
 impl Tool for Show {
+    /// The step of a call is called "Show on your screen".
+    fn step_style(&self) -> StepStyle {
+        StepStyle::default().with_label("Show on your screen")
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: SHOW.to_owned(),
@@ -314,6 +319,11 @@ impl UiCatalogTool {
 
 #[async_trait]
 impl Tool for UiCatalogTool {
+    /// The step of a call is called "List what the screen can draw".
+    fn step_style(&self) -> StepStyle {
+        StepStyle::default().with_label("List what the screen can draw")
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: UI_CATALOG.to_owned(),

@@ -81,6 +81,9 @@ pub const GET_UI_CATALOG: &str = "get_ui_catalog";
 /// answer and the end of the turn ([`ToolOutput::final_answer`]).
 pub const TURN_OUTPUT: &str = "turn_output";
 
+/// What the step of a `turn_output` call is called.
+pub const TURN_OUTPUT_TITLE: &str = "Send the answer";
+
 /// What the model is told when `turn_output` delivered its answer. The endpoint's own `{"delivered":
 /// true}` says nothing to a model about what to do next. The turn ends with the call (the run is
 /// finished without another model call), so the model normally never reads this; it does when a
@@ -296,8 +299,13 @@ fn fetched_from(body: &Value) -> Result<Fetched, String> {
 /// (`timeoutSecs`, a positive whole number). `None` when it says neither, or says something that is not
 /// that shape (nothing is assumed from a malformed entry).
 fn note_of(tool: &RemoteTool) -> Option<ToolNote> {
-    let meta = tool.meta.get(META_KEY)?.as_object()?;
     let mut note = ToolNote::new(tool.name.clone());
+    if let Some(label) = tool.title.as_deref().or_else(|| built_in_title(&tool.name)) {
+        note = note.with_label(label);
+    }
+    let Some(meta) = tool.meta.get(META_KEY).and_then(Value::as_object) else {
+        return note.is_meaningful().then_some(note);
+    };
     if meta.get("reportsStep").and_then(Value::as_bool) == Some(true) {
         note = note.reporting_steps();
     }
@@ -311,7 +319,12 @@ fn note_of(tool: &RemoteTool) -> Option<ToolNote> {
     if let Some(secs) = secs.filter(|s| *s >= 1) {
         note = note.with_timeout(Duration::from_secs(secs));
     }
-    (note.reports_step || note.timeout_ms.is_some()).then_some(note)
+    note.is_meaningful().then_some(note)
+}
+
+/// The step label of a tool this crate knows by name, for an endpoint that lists no title for it.
+fn built_in_title(name: &str) -> Option<&'static str> {
+    (name == TURN_OUTPUT).then_some(TURN_OUTPUT_TITLE)
 }
 
 /// The `callId` of a call: stable across a retry of the journaled step, and different for every call of

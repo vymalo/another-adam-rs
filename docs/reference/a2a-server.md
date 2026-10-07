@@ -84,6 +84,11 @@ carries the report; any other client reads a line of text. A tool call's report 
 `output`, redacted by the agent and cut to 4 KiB and 8 KiB ([ADR 0011](../decisions/0011-a-tool-calls-step-carries-its-input-and-output.md));
 a step too big for a `NOTIFY` crosses between processes without them.
 
+A step's **label** is a title a person reads ("Edit a file", "Run the checks"), never the tool's name: the tool says it with
+`Tool::step_style` (`#[tool(label = "...")]`), an MCP tool with its `title`, a tool of a source with `ToolNote::label`, a subagent
+with its own name capitalised. The model keeps calling the tool by its name. A client that did not activate `steps/v1` reads
+the same label in its plain line (`Edit a file: done`) ([ADR 0027](../decisions/0027-every-tool-has-a-title-for-its-step.md)).
+
 ```mermaid
 sequenceDiagram
     participant C as Client

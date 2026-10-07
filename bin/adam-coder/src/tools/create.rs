@@ -119,7 +119,7 @@ fn created_text(created: &CreatedRepo) -> String {
 /// If it was a yes, call create_repository again with the same arguments and it creates the
 /// repository; if it was a no, do not ask again and do not look for another way. The new repository
 /// is empty: put a scratch project in it with publish_scratch.
-#[tool(asks_user)]
+#[tool(asks_user, label = "Create a repository")]
 pub async fn create_repository(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

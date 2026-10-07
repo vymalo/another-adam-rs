@@ -530,7 +530,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 /// check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A
 /// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
 /// cycle, and is for the person to decide.
-#[tool]
+#[tool(label = "Run the checks")]
 pub async fn run_checks(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

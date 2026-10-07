@@ -39,7 +39,7 @@ use super::{Outcome, ToolEnv, non_empty, run_error};
 /// HEAD, the branch and the working tree are undone and refused (to make a file or change the
 /// worktree with a command, use run; to change code, write_file, edit_file, apply_patch or
 /// delegate_to_opencode). Use it to look; use run_checks only for the project's real checks.
-#[tool]
+#[tool(label = "Run a command")]
 pub async fn run_command(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

@@ -216,7 +216,7 @@ pub(crate) async fn ask(env: &ToolEnv, ctx: &ToolCtx, args: Value) -> Outcome {
 /// is asked a yes or no question that this tool writes, with your reason, and only a yes adds the
 /// repository: then call prepare_workspace with it. A no is final for this task: do not ask again
 /// for the same repository and do not look for another way to change it.
-#[tool(asks_user)]
+#[tool(asks_user, label = "Ask to use a repository")]
 pub async fn request_repository(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

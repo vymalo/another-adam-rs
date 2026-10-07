@@ -87,9 +87,26 @@ journal's `tool:<call id>` step names are unchanged, so a run started before the
 
 The card lists `steps/v1` ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md); the contract is
 the orchestration layer's `docs/api/steps-v1.md`), and every tool call is a step to a client that activates it. Most are
-plain steps labelled with the tool's name (`prepare_workspace`, `run_checks`, ...), whose progress lines
-(`running checks: ...`) are updates of their own step. **`delegate_to_opencode` is a `subagent` step labelled
-OpenCode** with its own icon, `opencode` (`#[tool(step = "subagent", label = "OpenCode", icon = "opencode")]`), and what OpenCode reports over ACP is the
+plain steps **labelled with a title a person reads**, not the tool's name (`#[tool(label = "...")]`; the model still calls the tool
+by its name; [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its-step.md)), whose progress lines
+(`running checks: ...`) are updates of their own step:
+
+| Tool | Title | Tool | Title |
+|---|---|---|---|
+| `prepare_workspace` | Prepare the workspace | `run_command` | Run a command |
+| `request_repository` | Ask to use a repository | `run` | Make files with a command |
+| `create_repository` | Create a repository | `read_file` | Read a file |
+| `start_scratch` | Start a scratch project | `write_file` | Write a file |
+| `publish_scratch` | Publish a scratch project | `apply_patch` | Apply a patch |
+| `edit_file` | Edit a file | `share_file` | Share a file |
+| `run_checks` | Run the checks | `rebuild_environment` | Rebuild the environment |
+| `commit_and_push` | Commit and push | `open_pull_request` | Open a pull request |
+| `ask_user` | Ask you | `show`, `ui_catalog` | Show on your screen, List what the screen can draw |
+| `turn_output` (the endpoint's) | Send the answer | a subagent (`explorer`) | its name capitalised (Explorer) |
+
+`tests/agent_files.rs` (`every_tool_of_the_coder_has_a_title_for_its_step`) fails for a tool with none, so a new tool must
+bring its title. **`delegate_to_opencode` is a `subagent` step titled "Hand to OpenCode"** with its own icon, `opencode`
+(`#[tool(step = "subagent", label = "Hand to OpenCode", icon = "opencode")]`), and what OpenCode reports over ACP is the
 tree under it:
 
 | OpenCode reports | The step |
@@ -113,7 +130,7 @@ installation token as soon as it is minted, never reaches the steps; `tests/e2e.
 (`a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_holds`) pins it. The orchestration layer redacts patterns
 on top and has a switch to drop both. A client that did not activate steps reads the same work as lines of text: the title of
 a tool call when it starts, `<title>: done` or `<title>: failed: <output>` when it ends, the lines of OpenCode's reply
-and its plan as they are, and `OpenCode: done` when the call ends (`tests/e2e.rs`, `tests/tools.rs`).
+and its plan as they are, and `Hand to OpenCode: done` when the call ends (`tests/e2e.rs`, `tests/tools.rs`).
 
 ### Streamed answers: the words as the model writes them
 

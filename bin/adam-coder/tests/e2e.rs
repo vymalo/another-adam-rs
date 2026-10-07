@@ -313,7 +313,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
         seen.messages
     );
     assert!(
-        seen.saw_message("OpenCode: done"),
+        seen.saw_message("Hand to OpenCode: done"),
         "the call's own step ends: {:#?}",
         seen.messages
     );
@@ -2641,7 +2641,7 @@ async fn opencode_crashing_every_time_fails_the_run_with_its_stderr(store: DynSt
     let transient = |seen: &Seen| {
         seen.messages
             .iter()
-            .filter(|m| m.as_str() == "OpenCode: failed")
+            .filter(|m| m.as_str() == "Hand to OpenCode: failed")
             .count()
     };
     assert_eq!(
@@ -2718,7 +2718,7 @@ async fn opencode_crashing_once_is_retried_and_completes(store: DynStore) {
     assert_eq!(
         seen.messages
             .iter()
-            .filter(|m| m.as_str() == "OpenCode: failed")
+            .filter(|m| m.as_str() == "Hand to OpenCode: failed")
             .count(),
         1,
         "the client sees the first attempt fail: {:#?}",
