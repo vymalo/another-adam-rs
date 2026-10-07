@@ -56,7 +56,7 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
    (`mcpServers`, `allowInsecureHttp`, `githubMcp`), `environment` (`resources`, `volumes`), `security`,
    `extraEnv`, `model.extraBody`.
 4. **Write the `AgentService`.** Required: `configRef.name` (same namespace) and `store.postgres`;
-   `interfaces.a2a` is on by default and needs its token (a CEL rule refuses it without `bearerTokensSecretRef`). A folder agent, trimmed from `deploy/operator/examples/chat.yaml`:
+   `interfaces.a2a` is required (so is `interfaces`), is on unless `enabled: false`, and needs its token: a CEL rule refuses it without `bearerTokensSecretRef`. A folder agent, trimmed from `deploy/operator/examples/chat.yaml`:
 
    ```yaml
    apiVersion: agents.vymalo.com/v1alpha1
@@ -173,8 +173,8 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
 ## Pitfalls
 
 * Installing the operator before the CRDs, or pruning the CRDs release.
-* Setting `interfaces.a2a.enabled: false` (`ConfigInvalid`), or expecting an empty `access.allowFrom` to deny. Revisions before
-  `interfaces.a2a.enabled` defaulted to true made an omitted `interfaces` mean false: write `enabled: true` there.
+* Setting `interfaces.a2a.enabled: false` (`ConfigInvalid`), or expecting an empty `access.allowFrom` to deny. Older revisions
+  accepted an omitted `interfaces` and then `Blocked` it; now `kubectl apply` refuses it.
 * Editing `deploy/crds/agents.vymalo.com.yaml` by hand: `adam-operator crdgen` writes it, and
   `deploy/operator-crds/files/` holds a checked copy. Setting the operator chart's `image.tag` by hand: CI writes it.
 * Rotating the registry token's Secret without restarting the operator: it reads the file once.

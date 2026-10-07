@@ -750,19 +750,10 @@ spec:
                 nullable: true
                 type: string
               interfaces:
-                default:
-                  a2a:
-                    enabled: true
-                  mcp:
-                    enabled: false
-                  responses:
-                    enabled: false
-                description: The protocol surfaces the service serves. A2A is the only one in v0, and it is on unless said otherwise.
+                description: 'The protocol surfaces the service serves. Required: A2A is the only one in v0, and it needs its token.'
                 properties:
                   a2a:
-                    default:
-                      enabled: true
-                    description: The A2A surface.
+                    description: The A2A surface. Required.
                     properties:
                       bearerTokensSecretRef:
                         description: |-
@@ -820,6 +811,8 @@ spec:
                         - message: 'v0 serves A2A only: this interface cannot be enabled'
                           rule: self == false
                     type: object
+                required:
+                - a2a
                 type: object
               registry:
                 default:
@@ -932,6 +925,7 @@ spec:
                 type: boolean
             required:
             - configRef
+            - interfaces
             - store
             type: object
           status:

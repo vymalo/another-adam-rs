@@ -194,24 +194,46 @@ fn a_secret_is_never_a_value() {
 }
 
 #[test]
-fn a2a_is_on_unless_said_otherwise() {
-    // The schema's default, which the API server applies, and the type's serde default agree: true.
+fn a2a_is_on_unless_said_otherwise_and_interfaces_are_required() {
     let service = schema_of(&AgentService::crd());
-    let interfaces = &service["properties"]["spec"]["properties"]["interfaces"];
-    assert_eq!(
-        interfaces["default"]["a2a"]["enabled"], true,
-        "{interfaces}"
+    let spec = &service["properties"]["spec"];
+    let interfaces = &spec["properties"]["interfaces"];
+    let a2a = &interfaces["properties"]["a2a"];
+    // The scalar default is true. No OBJECT default exists: the API server checks a default against the CEL
+    // rules, and `{a2a: {enabled: true}}` has no token, which would make the CRD itself invalid.
+    assert_eq!(a2a["properties"]["enabled"]["default"], true, "{a2a}");
+    assert!(
+        a2a.get("default").is_none(),
+        "an object default on a2a: {a2a}"
     );
-    assert_eq!(
-        interfaces["properties"]["a2a"]["properties"]["enabled"]["default"], true,
-        "{interfaces}"
+    assert!(
+        interfaces.get("default").is_none(),
+        "an object default on interfaces: {interfaces}"
     );
-    let spec: adam_operator_api::AgentServiceSpec = serde_json::from_value(serde_json::json!({
+    // So both are required, and a service that omits them is refused as required.
+    let required = |v: &Value, name: &str| {
+        v["required"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == name))
+    };
+    assert!(required(spec, "interfaces"), "{spec}");
+    assert!(required(interfaces, "a2a"), "{interfaces}");
+    // In Rust too: a missing `interfaces` is an error, and an `a2a` with nothing in it is on, with no token.
+    let without = serde_json::json!({
         "configRef": {"name": "c"},
         "store": {"postgres": {"secretRef": {"name": "db", "key": "uri"}}}
-    }))
-    .expect("a spec with no interfaces");
+    });
+    assert!(serde_json::from_value::<adam_operator_api::AgentServiceSpec>(without).is_err());
+    let mut with = serde_json::json!({
+        "configRef": {"name": "c"},
+        "interfaces": {"a2a": {}},
+        "store": {"postgres": {"secretRef": {"name": "db", "key": "uri"}}}
+    });
+    let spec: adam_operator_api::AgentServiceSpec =
+        serde_json::from_value(with.clone()).expect("a spec with an empty a2a");
     assert!(spec.interfaces.a2a.enabled);
     assert!(spec.interfaces.a2a.bearer_tokens_secret_ref.is_none());
     assert!(!spec.interfaces.mcp.enabled && !spec.interfaces.responses.enabled);
+    with["interfaces"] = serde_json::json!({});
+    assert!(serde_json::from_value::<adam_operator_api::AgentServiceSpec>(with).is_err());
 }

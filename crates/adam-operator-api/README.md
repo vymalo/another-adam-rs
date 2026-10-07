@@ -34,7 +34,7 @@ let crds: Vec<CustomResourceDefinition> = adam_operator_api::crds(); // AgentCon
 Optional settings of `adam-coder` are `Option`s: a field left out is not set, and the binary's own
 default applies (the operator does not copy adam's defaults). The defaults the schema does apply
 are the platform's own: `scaling` (`combined`, 1 worker), `suspend: false`, `deletionPolicy:
-Retain`, `interfaces` (A2A on, `responses` and `mcp` off), `githubMcp` (`sidecar: true`, `port: 8082`).
+Retain`, `interfaces.a2a.enabled` (true) and, inside `interfaces`, `responses` and `mcp` (off); `interfaces` and `a2a` themselves are required, `githubMcp` (`sidecar: true`, `port: 8082`).
 
 ## CEL rules (`x-kubernetes-validations`)
 
@@ -45,7 +45,7 @@ object. Each has an invalid example in [`examples/invalid`](../../deploy/operato
 | Rule | Where |
 |---|---|
 | `interfaces.responses.enabled` and `interfaces.mcp.enabled` are `false` | on the field |
-| `interfaces.a2a` is on by default; unless `enabled` is `false`, `bearerTokensSecretRef` is required (no token, no server) | `A2aInterface` |
+| `interfaces` and `interfaces.a2a` are required (no object default: the API server checks a default against the CEL rules, and one without a token made the CRD invalid); `a2a.enabled` defaults to true; unless it is `false`, `bearerTokensSecretRef` is required (no token, no server) | `A2aInterface` |
 | exactly one of `store.postgres.secretRef` and `store.postgres.cnpg` | `PostgresStore` |
 | exactly one of `github.app` and `github.token` | `Github` |
 | exactly one of `app.installationId` and `app.owners` | `GithubApp` |

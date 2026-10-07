@@ -1,4 +1,4 @@
-# Refused: interfaces.a2a is on (the default) and names no bearerTokensSecretRef; no token, no server.
+# Refused: interfaces.a2a is on (enabled defaults to true) and names no bearerTokensSecretRef; no token, no server.
 # expect: interfaces.a2a needs bearerTokensSecretRef: no token, no server
 apiVersion: agents.vymalo.com/v1alpha1
 kind: AgentService
@@ -8,6 +8,8 @@ metadata:
 spec:
   configRef:
     name: chat
+  interfaces:
+    a2a: {}
   scaling:
     topology: combined
     workers: 1
