@@ -1,0 +1,8 @@
+{{- /*
+The CRDs as the operator's own `crdgen` prints them, byte for byte (files/agents.vymalo.com.yaml is a copy of
+deploy/crds/agents.vymalo.com.yaml, and tests/render-check.sh of deploy/operator fails when they differ). Read as a file,
+not as a template, so nothing in it is ever expanded. No `helm.sh/resource-policy: keep` and no hook: removing this release
+removes the CRDs, and with them every AgentService and AgentConfig, which is what the Argo CD Application's own prune
+setting is for.
+*/ -}}
+{{ .Files.Get "files/agents.vymalo.com.yaml" }}

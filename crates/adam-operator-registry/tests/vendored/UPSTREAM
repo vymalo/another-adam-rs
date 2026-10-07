@@ -1,0 +1,10 @@
+consumer_linkset.rs   another-agentic-system  orchestrator/crates/registry-platform/src/linkset.rs
+                      commit e5da0a42d089835a390c57ddbcce37b02c95d76b (2026-10-05)
+                      one change: orch_core::is_valid_agent_id is defined in the file
+../fixtures/consumer-mock-registry-agents.json
+                      another-agentic-system  dev/wiremock/registry/__files/agents.json, same commit
+                      the document its compose stack's mock registry serves
+
+To update: copy the files again from the commit you want, reapply the one change, and put the new commit
+here and in the header of consumer_linkset.rs. The other repository's tests/platform.rs holds the HTTP half of
+the consumer (cache headers, ETag, fail closed); crates/adam-operator-registry/tests/router.rs holds this repository's half.

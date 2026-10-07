@@ -65,6 +65,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0026](decisions/0026-a-failure-the-base-has-too-is-not-the-runs.md) | a failing check is also run on the base: a failure it has too is pre-existing and costs no cycle |
 | [0027](decisions/0027-every-tool-has-a-title-for-its-step.md) | every tool has a title for its step |
 | [0028](decisions/0028-the-card-says-which-build-answers.md) | the card says which build and which agent files answer |
+| [0029](decisions/0029-adam-rs-has-an-operator.md) | adam-rs ships the Kubernetes operator of `AgentService` and `AgentConfig`, moved from the platform repository |
 
 ## Keeping these docs short and true
 

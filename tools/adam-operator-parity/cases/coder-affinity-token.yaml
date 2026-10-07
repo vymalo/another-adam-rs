@@ -1,0 +1,65 @@
+# examples/coder.yaml changed to: two workers with workspacePlacement: affinity on one shared
+# ReadWriteMany volume, a GitHub token instead of the App, createRepoOwners, a GitHub Enterprise host
+# for the sidecar on port 9090, a literal gateway URL, a model extra body and echoed reasoning, extraEnv,
+# and no extra MCP servers.
+fullnameOverride: coder
+image:
+  tag: sha-4363924
+topology: combined
+replicaCount: 2
+config:
+  modelBaseUrlFromSecret: false
+  modelBaseUrl: https://gateway.example.com/v1
+  model: coding-model
+  opencodeModel: coding-model
+  modelExtraBody:
+    reasoning_effort: medium
+    chat_template_kwargs:
+      enable_thinking: true
+  modelEchoReasoning: reasoning_content
+  publicUrl: https://coder.example.com/
+  workers: 4
+  maxCheckCycles: 3
+  checkTimeoutSecs: 900
+  workspaceSweepSecs: 300
+  allowedRepoHosts: [github.com, ghe.example.com]
+  githubApiUrl: https://ghe.example.com/api/v3
+  prDraft: false
+  gitAuthorName: "bored-giant-panda[bot]"
+  gitAuthorEmail: "337696346+bored-giant-panda[bot]@users.noreply.github.com"
+  extraEnv:
+    FOO: bar
+    RUST_LOG: debug
+github:
+  auth: token
+  createRepoOwners: [vymalo, acme]
+githubMcp:
+  enabled: true
+  port: 9090
+  host: ghe.example.com
+database:
+  enabled: false
+  existingSecret:
+    name: coder-db-uri
+    key: uri
+externalSecrets:
+  enabled: true
+  targetSecretName: coder-secrets
+workspace:
+  placement: affinity
+  sharedVolume:
+    storageClass: longhorn-rwx
+    size: 20Gi
+persistence:
+  size: 20Gi
+  storageClass: longhorn
+terminationGracePeriodSeconds: 120
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 6Gi
+networkPolicy:
+  enabled: true
+  allowedNamespace: another-agentic-system

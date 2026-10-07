@@ -1,0 +1,51 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy -}}
+# Ingress is closed except what is listed: the registry to the peers of networkPolicy.registry.allowFrom, /metrics to those of
+# networkPolicy.metrics.allowFrom. Probes come from the node, which a NetworkPolicy never blocks. Egress goes to the API server
+# and nothing else: the operator reads and writes the API and calls no other service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "adam-operator.fullname" . }}
+  labels:
+    {{- include "adam-operator.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "adam-operator.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  {{- if or (include "adam-operator.registrySecretName" .) $np.metrics.allowFrom }}
+  ingress:
+    {{- if include "adam-operator.registrySecretName" . }}
+    - from:
+        {{- toYaml $np.registry.allowFrom | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+    {{- if $np.metrics.allowFrom }}
+    - from:
+        {{- toYaml $np.metrics.allowFrom | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 9090
+    {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+  egress:
+    - ports:
+        {{- range $np.apiServer.ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+      {{- with $np.apiServer.cidrs }}
+      to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      {{- end }}
+{{- end }}

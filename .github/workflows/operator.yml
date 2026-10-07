@@ -1,0 +1,579 @@
+name: operator
+
+# The operator (bin/adam-operator and the crates/adam-operator-* libraries), its image and its two charts. The Rust
+# checks (fmt, clippy, the unit and doc tests, MSRV, the CRD drift tests of adam-operator-api) run for every pull
+# request in ci.yml; this workflow covers what only a chart, an image or a cluster can show.
+#
+# chart:       helm lint of both charts, the render checks of deploy/operator (goldens, RBAC, refusals, the CRDs chart
+#              against deploy/crds), kubeconform in strict mode over the renders, and the parity goldens of
+#              adam-operator-domain against what deploy/coder renders now (tools/adam-operator-parity/regen.sh --check).
+# crds:        `adam-operator crdgen` prints deploy/crds/agents.vymalo.com.yaml and the copy in the CRDs chart, byte for byte.
+# kind-crds:   the CRDs, the examples (accepted) and examples/invalid (each refused for the reason it states) against a
+#              real API server: the CEL rules and the schema. No Rust.
+# runtime-kubernetes, store-cnpg: the provider and the CloudNativePG provisioner against a real API server (the
+#              conformance suites of adam-operator-ports and the cases of their tests/cluster.rs), nothing may skip.
+# operator-e2e: the operator binary against a kind cluster with pods that run a stand-in image
+#              (bin/adam-operator/tests/cluster.rs), including the registry it serves.
+# image:       built on pull requests too (no push) and smoke-tested; kept as an artifact, so the job after it runs THE
+#              image that passed.
+# coder-e2e:   a kind cluster, the two charts installed with that image, and the real adam-rs coder image
+#              (ghcr.io/vymalo/another-adam-rs/coder, by tag and digest) run by the operator: Ready, the card, the registry,
+#              a deletion that keeps the claim. deploy/operator/tests/e2e/README.md says what it proves and what it does not.
+# push, bump:  main only, after everything above. `sha-<7>` and `latest`, then `chore(deploy): bump operator to sha-<7>` to
+#              main as github-actions[bot], the pattern of coder.yml. The bump is made with GITHUB_TOKEN, which does not
+#              trigger workflows, so it cannot loop; it is a no-op when the tag is current and it does not put an older tag
+#              back when a newer commit has moved main (jobs can finish out of order). Pull requests get a dry run.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/adam-operator-*/**
+      - bin/adam-operator/**
+      - Cargo.toml
+      - Cargo.lock
+      - deploy/crds/**
+      - deploy/operator/**
+      - deploy/operator-crds/**
+      - docker/operator/**
+      - tools/adam-operator-parity/**
+      - deploy/coder/**
+      - .github/workflows/operator.yml
+  pull_request:
+    paths:
+      - crates/adam-operator-*/**
+      - bin/adam-operator/**
+      - Cargo.toml
+      - Cargo.lock
+      - deploy/crds/**
+      - deploy/operator/**
+      - deploy/operator-crds/**
+      - docker/operator/**
+      - tools/adam-operator-parity/**
+      - deploy/coder/**
+      - .github/workflows/operator.yml
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/vymalo/another-adam-rs/operator
+  HELM_VERSION: v3.19.0
+  KUBECONFORM_VERSION: v0.7.0
+  # The Kubernetes version the rendered manifests are validated against.
+  KUBERNETES_VERSION: 1.31.0
+  # The node image of every kind cluster below: Kubernetes v1.35.8, the digest of the index of the tag (read from
+  # Docker Hub on 2026-10-05). The runner's preinstalled `kind` is used, as ci.yml's run-pods job does.
+  KIND_NODE_IMAGE: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+
+concurrency:
+  group: operator-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    name: helm lint, render checks, kubeconform and parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: helm lint
+        run: |
+          helm lint deploy/operator
+          helm lint deploy/operator -f deploy/operator/examples/netcup.values.yaml
+          helm lint deploy/operator -f deploy/operator/tests/secret.values.yaml
+          helm lint deploy/operator-crds
+      - name: helm template (the values of the netcup Application)
+        run: |
+          helm template adam-operator deploy/operator --namespace another-agentic-system -f deploy/operator/examples/netcup.values.yaml > /dev/null
+          helm template adam-operator-crds deploy/operator-crds > /dev/null
+      - name: The rendered chart keeps its guarantees
+        run: sh deploy/operator/tests/render-check.sh
+      # What the operator derives for a coder is what deploy/coder renders: the goldens of adam-operator-domain are
+      # regenerated from the chart and compared. A change of the coder chart that changes what the pods run fails here
+      # until the goldens are regenerated and adam-operator-domain agrees with them (cargo test, in ci.yml).
+      - name: The parity goldens are what deploy/coder renders now
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || sudo apt-get install -y python3-yaml
+          sh tools/adam-operator-parity/regen.sh --check
+      # Core kinds against the Kubernetes schemas, the ExternalSecret against the CRD schema vendored in
+      # deploy/operator/tests/schemas (a pinned copy of the datreeio catalog: a live catalog 500 once skipped an image job).
+      # A kind without a schema fails (no -ignore-missing-schemas). The core schemas are still downloaded; a download
+      # failure (not a validation failure) is retried. The CRDs themselves are skipped: no schema set has one for
+      # CustomResourceDefinition, and the kind-crds job applies them to a real API server.
+      - name: kubeconform
+        env:
+          KUBECONFORM_SHA256: c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+        run: |
+          set -eu
+          curl -sSfL -o "$RUNNER_TEMP/kubeconform.tgz" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "$KUBECONFORM_SHA256  $RUNNER_TEMP/kubeconform.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/kubeconform.tgz" -C "$RUNNER_TEMP" kubeconform
+          # The defaults (no registry), netcup (an ExternalSecret), tests/secret.values.yaml (an existing Secret, another
+          # watched namespace, no CloudNativePG), and the CRDs chart.
+          helm template adam-operator deploy/operator --namespace another-agentic-system > "$RUNNER_TEMP/rendered-default.yaml"
+          helm template adam-operator deploy/operator --namespace another-agentic-system \
+            -f deploy/operator/examples/netcup.values.yaml > "$RUNNER_TEMP/rendered-netcup.yaml"
+          helm template adam-operator deploy/operator --namespace another-agentic-system \
+            -f deploy/operator/tests/secret.values.yaml > "$RUNNER_TEMP/rendered-secret.yaml"
+          helm template adam-operator-crds deploy/operator-crds > "$RUNNER_TEMP/rendered-crds.yaml"
+          for attempt in 1 2 3; do
+            status=0
+            "$RUNNER_TEMP/kubeconform" -strict -summary -skip CustomResourceDefinition -kubernetes-version "$KUBERNETES_VERSION" \
+                -schema-location default \
+                -schema-location 'deploy/operator/tests/schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                "$RUNNER_TEMP/rendered-default.yaml" "$RUNNER_TEMP/rendered-netcup.yaml" "$RUNNER_TEMP/rendered-secret.yaml" \
+                "$RUNNER_TEMP/rendered-crds.yaml" \
+                > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
+            cat "$RUNNER_TEMP/kubeconform.out"
+            if [ "$status" -eq 0 ]; then exit 0; fi
+            if ! grep -q 'failed downloading schema' "$RUNNER_TEMP/kubeconform.out"; then exit "$status"; fi
+            echo "schema download failed (attempt $attempt of 3); retrying in 20 s"
+            sleep 20
+          done
+          exit 1
+
+  crds:
+    name: crdgen prints the checked-in CRDs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: crdgen output equals the checked-in CRDs
+        run: |
+          cargo run --locked -q -p adam-operator -- crdgen > "$RUNNER_TEMP/crds.yaml"
+          if ! diff -u deploy/crds/agents.vymalo.com.yaml "$RUNNER_TEMP/crds.yaml"; then
+            echo "::error file=deploy/crds/agents.vymalo.com.yaml::stale. Run: cargo run -q -p adam-operator -- crdgen > deploy/crds/agents.vymalo.com.yaml"
+            exit 1
+          fi
+      - name: the CRDs chart holds the same file
+        run: |
+          # deploy/operator-crds reads its own copy (a Helm chart reads only its directory).
+          if ! diff -u deploy/crds/agents.vymalo.com.yaml deploy/operator-crds/files/agents.vymalo.com.yaml; then
+            echo "::error file=deploy/operator-crds/files/agents.vymalo.com.yaml::differs from deploy/crds. Run: cp deploy/crds/agents.vymalo.com.yaml deploy/operator-crds/files/"
+            exit 1
+          fi
+
+  kind-crds:
+    name: the CRDs and the examples on a real API server
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: A kind cluster
+        run: |
+          set -eu
+          kind version
+          kind create cluster --name adam-crds --image "$KIND_NODE_IMAGE" --wait 180s
+          kubectl version
+      - name: Apply the CRDs
+        run: |
+          # Server-side: a client-side apply keeps the manifest in an annotation, which has a size limit.
+          kubectl apply --server-side -f deploy/crds/agents.vymalo.com.yaml
+          kubectl wait --for=condition=Established --timeout=60s \
+            crd/agentconfigs.agents.vymalo.com crd/agentservices.agents.vymalo.com
+          kubectl create namespace another-agentic-system
+      - name: The examples are accepted
+        run: |
+          for f in deploy/operator/examples/*.yaml; do
+            case "$f" in *.values.yaml) continue ;; esac
+            echo "::group::apply $f"
+            kubectl apply -f "$f"
+            echo "::endgroup::"
+          done
+          kubectl -n another-agentic-system get agentservices,agentconfigs
+          # Defaulting works: `chat` leaves these out.
+          test "$(kubectl -n another-agentic-system get agentservice chat -o jsonpath='{.spec.deletionPolicy}')" = Retain
+          test "$(kubectl -n another-agentic-system get agentservice chat -o jsonpath='{.spec.interfaces.mcp.enabled}')" = false
+      - name: Each invalid example is refused, for the reason it states
+        run: |
+          failed=0
+          for f in deploy/operator/examples/invalid/*.yaml; do
+            expect=$(sed -n 's/^# expect: //p' "$f")
+            if [ -z "$expect" ]; then echo "::error file=$f::no '# expect:' line"; failed=1; continue; fi
+            if out=$(kubectl apply -f "$f" 2>&1); then
+              echo "::error file=$f::was accepted: $out"; failed=1
+            elif ! printf '%s' "$out" | grep -qF -- "$expect"; then
+              echo "::error file=$f::refused, but not for '$expect': $out"; failed=1
+            else
+              echo "refused as expected: $f"
+            fi
+          done
+          exit "$failed"
+
+  runtime-kubernetes:
+    name: the Kubernetes runtime provider on a real API server
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: A kind cluster
+        run: |
+          set -eu
+          kind create cluster --name adam-runtime --image "$KIND_NODE_IMAGE" --wait 180s
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # With the REQUIRE variable an unset cluster is a failure, not a green run that proved nothing.
+      - name: The provider against the cluster
+        env:
+          ADAM_OPERATOR_TEST_REQUIRE_CLUSTER: "1"
+        run: |
+          # The kubeconfig kind wrote; a file, so the tests never fall back to some default context.
+          export ADAM_OPERATOR_TEST_KUBECONFIG="$HOME/.kube/config"
+          kubectl --kubeconfig "$ADAM_OPERATOR_TEST_KUBECONFIG" get nodes
+          cargo test -p adam-operator-runtime-kubernetes --test cluster --locked -- --test-threads=4
+      - name: What the cluster says, when a case failed
+        if: failure()
+        run: |
+          kubectl -n adam-operator-test get statefulsets,deployments,services,networkpolicies,pdb,configmaps,pvc,pods -o wide || true
+          kubectl -n adam-operator-test get events --sort-by=.lastTimestamp | tail -80 || true
+          kubectl -n adam-operator-test describe pods | tail -200 || true
+
+  store-cnpg:
+    name: the CloudNativePG store provisioner on a real API server
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: A kind cluster
+        run: |
+          set -eu
+          kind create cluster --name adam-cnpg --image "$KIND_NODE_IMAGE" --wait 180s
+      - name: Install CloudNativePG
+        env:
+          # The release manifest of CloudNativePG 1.30.1 (1.30.x supports Kubernetes 1.34 to 1.36: verified 2026-10-05,
+          # https://cloudnative-pg.io/docs/devel/supported_releases). The checksum is that of the file read on
+          # 2026-10-05, identical from the release asset and from the release-1.30 branch. The manifest names its
+          # operator image by tag (ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1), not by digest.
+          CNPG_URL: https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml
+          CNPG_SHA256: 37237f145d8138256ea25ae830f87759255665ff08f8d552fdd8224a5ec032fb
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cnpg.yaml" "$CNPG_URL"
+          echo "$CNPG_SHA256  $RUNNER_TEMP/cnpg.yaml" | sha256sum -c -
+          # Server-side: the CRDs are too large for a client-side apply's annotation.
+          kubectl apply --server-side -f "$RUNNER_TEMP/cnpg.yaml"
+          kubectl -n cnpg-system rollout status deployment/cnpg-controller-manager --timeout=180s
+          kubectl wait --for=condition=Established --timeout=60s crd/clusters.postgresql.cnpg.io
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: The provisioner against the cluster
+        env:
+          ADAM_OPERATOR_TEST_REQUIRE_CLUSTER: "1"
+        run: |
+          export ADAM_OPERATOR_TEST_KUBECONFIG="$HOME/.kube/config"
+          kubectl --kubeconfig "$ADAM_OPERATOR_TEST_KUBECONFIG" get nodes
+          # Every case names its Clusters itself; each makes a Postgres pod, so not too many at once.
+          cargo test -p adam-operator-store-cnpg --test cluster --locked -- --test-threads=3
+      - name: What the cluster says, when a case failed
+        if: failure()
+        run: |
+          kubectl -n adam-operator-test get clusters.postgresql.cnpg.io,pods,pvc,secrets -o wide || true
+          kubectl -n adam-operator-test describe clusters.postgresql.cnpg.io | tail -200 || true
+          kubectl -n adam-operator-test get events --sort-by=.lastTimestamp | tail -80 || true
+          kubectl -n cnpg-system logs deployment/cnpg-controller-manager --tail=100 || true
+
+  operator-e2e:
+    name: the operator binary against a cluster, with real pods
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: A kind cluster
+        run: |
+          set -eu
+          kind create cluster --name adam-operator --image "$KIND_NODE_IMAGE" --wait 180s
+      - name: Install the CRDs
+        run: |
+          # The checked-in file, as a deployment installs it. Server-side: a client-side apply keeps the
+          # manifest in an annotation, which has a size limit.
+          kubectl apply --server-side -f deploy/crds/agents.vymalo.com.yaml
+          kubectl wait --for=condition=Established --timeout=60s \
+            crd/agentconfigs.agents.vymalo.com crd/agentservices.agents.vymalo.com
+      - name: Build the stand-in for the adam image and load it into kind
+        run: |
+          # busybox, pinned by digest, that answers /healthz on 8080 as adam-agent and adam-coder would.
+          docker build -t adam-operator-stub:ci bin/adam-operator/tests/stub
+          kind load docker-image adam-operator-stub:ci --name adam-operator
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the operator
+        run: cargo build --locked -p adam-operator
+      - name: The operator against the cluster
+        env:
+          ADAM_OPERATOR_TEST_REQUIRE_CLUSTER: "1"
+          ADAM_OPERATOR_TEST_STUB_IMAGE: adam-operator-stub:ci
+        run: |
+          export ADAM_OPERATOR_TEST_KUBECONFIG="$HOME/.kube/config"
+          kubectl --kubeconfig "$ADAM_OPERATOR_TEST_KUBECONFIG" get nodes
+          # The registry case reads the registry, and the card it lists, from a pod. The operator runs on this
+          # machine, which the pods of kind reach at the IPv4 gateway of the docker network `kind`.
+          ADAM_OPERATOR_TEST_HOST_ADDR="$(docker network inspect kind --format '{{range .IPAM.Config}}{{println .Gateway}}{{end}}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+          test -n "$ADAM_OPERATOR_TEST_HOST_ADDR" || { echo "::error::no IPv4 gateway found for the docker network kind"; exit 1; }
+          echo "pods reach this machine at $ADAM_OPERATOR_TEST_HOST_ADDR"
+          export ADAM_OPERATOR_TEST_HOST_ADDR
+          # Every case has a namespace, Secrets and object names of its own, so they run side by side.
+          cargo test -p adam-operator --test cluster --locked -- --test-threads=4
+      - name: What the cluster says, when a case failed
+        if: failure()
+        run: |
+          kubectl get agentservices,agentconfigs -A -o yaml | tail -400 || true
+          kubectl get deployments,statefulsets,services,pvc,pods -A -o wide | grep adam-operator-e2e || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true
+          for f in /tmp/adam-operator-e2e-*.log; do echo "== $f"; tail -60 "$f"; done || true
+
+  dockerfile:
+    name: lint Dockerfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/operator/Dockerfile
+
+  scripts:
+    name: shell scripts and the bump
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck deploy/operator/bump-tag.sh deploy/operator/tests/*.sh deploy/operator/tests/e2e/*.sh tools/adam-operator-parity/regen.sh
+      - name: bump-tag.sh is idempotent and edits only image.tag
+        run: sh deploy/operator/tests/bump-tag-test.sh
+
+  bump-dry-run:
+    name: show the tag bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: What the bump would change on main
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          tag="sha-$(printf '%s' "$SHA" | cut -c1-7)"
+          sh deploy/operator/bump-tag.sh deploy/operator/values.yaml "$tag"
+          {
+            echo "### Tag bump dry run"
+            echo
+            echo "On main this pull request would set \`image.tag\` to \`$tag\`:"
+            echo
+            echo '```diff'
+            git diff --unified=1 -- deploy/operator/values.yaml
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  image:
+    name: build and smoke-test the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      # Built here, once, and loaded into the local daemon: the smoke test below and the jobs after this one run what is
+      # pushed. Fork pull requests cannot write the cache: ignore-error keeps them green.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/operator/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          provenance: false
+          tags: operator:smoke
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=operator
+          cache-to: type=gha,mode=max,scope=operator,ignore-error=true
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          # Numeric, so Kubernetes can verify runAsNonRoot: the chart's runAsUser is the same number.
+          user=$(docker inspect -f '{{.Config.User}}' operator:smoke)
+          [ "$user" = 65532:65532 ] || { echo "::error::image user is '$user', expected 65532:65532"; exit 1; }
+          # The binary starts as that user, and says what it does.
+          # (Read whole first: `docker run | grep -q` under pipefail fails when grep exits on its match while docker still writes.)
+          help=$(docker run --rm operator:smoke --help)
+          grep -q crdgen <<<"$help"
+          run_help=$(docker run --rm operator:smoke run --help)
+          grep -q REGISTRY_TOKEN_FILE <<<"$run_help"
+          # `crdgen` prints the CRDs of the repository, byte for byte: the image's binary is this commit's.
+          docker run --rm operator:smoke crdgen > "$RUNNER_TEMP/crds.yaml"
+          cmp "$RUNNER_TEMP/crds.yaml" deploy/crds/agents.vymalo.com.yaml
+          cmp "$RUNNER_TEMP/crds.yaml" deploy/operator-crds/files/agents.vymalo.com.yaml
+          # `run` with no cluster to reach fails, and says so (never a panic, never a hang).
+          if out=$(docker run --rm -e KUBECONFIG=/nonexistent operator:smoke run 2>&1); then
+            echo "::error::run succeeded with no cluster"; exit 1
+          fi
+          grep -q 'connecting to the cluster' <<<"$out" || { echo "::error::run did not say it was connecting: $out"; exit 1; }
+          # Only the operator: no shell, no package manager in the image (a read of the whole file system).
+          cid=$(docker create operator:smoke)
+          files=$(docker export "$cid" | tar -t)
+          docker rm "$cid" > /dev/null
+          grep -qx 'adam-operator' <<<"$files" || { echo "::error::no /adam-operator in the image"; exit 1; }
+          if grep -Eq '(^|/)s?bin/(sh|bash|dash|busybox|apt|apt-get|dpkg)$' <<<"$files"; then
+            echo "::error::the image has a shell or a package manager"; grep -E '(^|/)s?bin/(sh|bash|dash|busybox|apt|apt-get|dpkg)$' <<<"$files"; exit 1
+          fi
+          size=$(docker image inspect -f '{{.Size}}' operator:smoke)
+          echo "image size: $size bytes" | tee -a "$GITHUB_STEP_SUMMARY"
+      # The image that passed travels to the jobs after this one as a file.
+      - name: Save the image
+        run: docker save operator:smoke -o "$RUNNER_TEMP/operator.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: operator-image
+          path: ${{ runner.temp }}/operator.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  coder-e2e:
+    name: the operator runs the coder
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # The coder image is 2.9 GB compressed and a good 8 GB on disk once kind has it: make room first.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: A kind cluster
+        run: |
+          set -eu
+          kind create cluster --name adam-coder --image "$KIND_NODE_IMAGE" --wait 180s
+      # The image that passed the smoke test, loaded into the cluster: the chart runs it with pullPolicy Never.
+      - uses: actions/download-artifact@v4
+        with:
+          name: operator-image
+          path: ${{ runner.temp }}
+      - name: Load the image into kind
+        run: |
+          docker load -i "$RUNNER_TEMP/operator.tar"
+          kind load docker-image operator:smoke --name adam-coder
+      - name: The operator runs the coder
+        env:
+          OPERATOR_IMAGE_REPOSITORY: operator
+          OPERATOR_IMAGE_TAG: smoke
+          OPERATOR_PULL_POLICY: Never
+        run: sh deploy/operator/tests/e2e/coder-e2e.sh
+
+  push:
+    name: push the image that passed
+    # Main only, and only after everything above.
+    needs: [chart, crds, kind-crds, runtime-kubernetes, store-cnpg, operator-e2e, dockerfile, scripts, image, coder-e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # One push at a time, so the check below and the push of `latest` are not interleaved with another run's.
+    concurrency:
+      group: operator-push
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: operator-image
+          path: ${{ runner.temp }}
+      - name: Load the image that passed
+        run: docker load -i "$RUNNER_TEMP/operator.tar"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The tags: `sha-<7>` is what the chart pins (never `latest`), `latest` is for people.
+      - name: Push
+        run: |
+          set -eu
+          tag="sha-$(printf '%s' "$GITHUB_SHA" | cut -c1-7)"
+          docker tag operator:smoke "$IMAGE:$tag"
+          docker push "$IMAGE:$tag"
+          # `latest` follows the newest build only: image jobs can finish out of order, and an older run must not move it
+          # back (the same rule as the bump below; the bump commits themselves do not count).
+          newer="$(git log --format=%s "$GITHUB_SHA..origin/main" -- crates/adam-operator-* bin/adam-operator Cargo.toml Cargo.lock docker/operator deploy/operator deploy/operator-crds deploy/crds deploy/coder .github/workflows/operator.yml | grep -v '^chore(deploy): bump operator to ' || true)"
+          if [ -n "$newer" ]; then
+            pushed="\`$IMAGE:$tag\` (not \`latest\`: main has moved on since this commit, the newer build pushes it)."
+          else
+            docker tag operator:smoke "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+            pushed="\`$IMAGE:$tag\` and \`$IMAGE:latest\`."
+          fi
+          {
+            echo "### Pushed"
+            echo
+            echo "$pushed"
+            echo
+            echo "A new GHCR package is private until it is made public (deploy/operator/README.md, \"The image\")."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The image that was just pushed is the one the chart deploys: set `image.tag` in deploy/operator/values.yaml to
+  # `sha-<first 7 of the commit>` and push `chore(deploy): bump operator to sha-xxxxxxx` to main as github-actions.
+  bump:
+    name: bump the tag in the chart
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: operator-bump
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Set image.tag and push
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          tag="sha-$(printf '%s' "$SHA" | cut -c1-7)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            # A newer commit that changes what this workflow builds makes its own image and bumps for itself; do not put the
+            # tag back to this older one (image jobs can finish out of order). The bump commits themselves do not count.
+            newer="$(git log --format=%s "$SHA..origin/main" -- crates/adam-operator-* bin/adam-operator Cargo.toml Cargo.lock docker/operator deploy/operator deploy/operator-crds deploy/crds deploy/coder .github/workflows/operator.yml | grep -v '^chore(deploy): bump operator to ' || true)"
+            if [ -n "$newer" ]; then
+              echo "main has moved on since $SHA; the newer build will bump"
+              exit 0
+            fi
+            result="$(sh deploy/operator/bump-tag.sh deploy/operator/values.yaml "$tag")"
+            echo "$result"
+            case "$result" in
+              unchanged*) exit 0 ;;
+            esac
+            git add deploy/operator/values.yaml
+            git commit -m "chore(deploy): bump operator to $tag"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "push raced with another commit (attempt $attempt); retrying"
+            sleep $((attempt * 3))
+          done
+          echo "could not push the bump" >&2
+          exit 1

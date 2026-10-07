@@ -1,0 +1,45 @@
+{{- /*
+The rights of `adam-operator run`, namespaced: what the READMEs of the crates list, nothing more (bin/adam-operator/README.md,
+"Cluster rights"). No right on Secrets, no ClusterRole, no wildcard. `patch` and `create` both, where the provider applies
+an object that may not be there yet (server-side apply is authorised by both).
+*/ -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "adam-operator.fullname" . }}
+  namespace: {{ include "adam-operator.watchNamespace" . }}
+  labels:
+    {{- include "adam-operator.labels" . | nindent 4 }}
+rules:
+  # adam-operator-controller: the two kinds (patch also writes metadata.finalizers), their status, and Events.
+  - apiGroups: [agents.vymalo.com]
+    resources: [agentservices, agentconfigs]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [agents.vymalo.com]
+    resources: [agentservices/status, agentconfigs/status]
+    verbs: [patch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
+  # adam-operator-runtime-kubernetes: the objects an agent is made of.
+  - apiGroups: [apps]
+    resources: [statefulsets, deployments]
+    verbs: [get, list, watch, patch, create, delete]
+  - apiGroups: [""]
+    resources: [services, configmaps, persistentvolumeclaims]
+    verbs: [get, list, patch, create, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, patch, create, delete]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, patch, create, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, watch]
+  {{- if .Values.storeCnpg }}
+  # adam-operator-store-cnpg: the Cluster of a service that asks for one. None on databases, poolers or clusters/status.
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters]
+    verbs: [get, patch, create, delete]
+  {{- end }}

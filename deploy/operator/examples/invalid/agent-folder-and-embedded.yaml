@@ -1,0 +1,34 @@
+# Refused: agent has both folder and embedded.
+# expect: exactly one of agent.folder and agent.embedded
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: invalid-agent-both
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-coder
+      agent:
+        embedded: {}
+        folder:
+          files:
+            instructions.md: |
+              Hello.
+      coder:
+        github:
+          token:
+            secretRef:
+              name: gh
+              key: GITHUB_TOKEN
+  model:
+    model: m
+    baseUrl:
+      value: https://gateway.example.invalid/v1
+    apiKeySecretRef:
+      name: s
+      key: MODEL_API_KEY
+  environment:
+    image:
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924

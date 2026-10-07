@@ -1,0 +1,31 @@
+[package]
+name = "adam-operator-ports"
+description = "The provider seams of the v0 operator: RuntimeProvider, StoreProvisioner, AgentDirectory, their neutral types, and a conformance testkit"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# The conformance macros and the `Memory` implementations. Off by default: the controller and the
+# providers depend on the traits; their tests turn it on.
+testkit = ["dep:tokio"]
+
+[dependencies]
+adam-error.workspace = true
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+# Only for the `Memory` implementations (a broadcast channel) and the timeouts of the conformance cases.
+tokio = { workspace = true, features = ["sync", "time"], optional = true }
+
+[dev-dependencies]
+# The tests of this crate run the testkit it ships, so `cargo test -p adam-operator-ports` works on its own.
+adam-operator-ports = { workspace = true, features = ["testkit"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: adam-operator
+description: "The adam-rs operator: one replica that reconciles AgentService and AgentConfig in one namespace, and serves the agent registry. The CRDs are the chart deploy/operator-crds; the agents are custom resources, not part of this chart."
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+# The agents' pod template uses a native sidecar (the GitHub MCP server of the coder), on by default from 1.29.
+kubeVersion: ">=1.29.0-0"
+sources:
+  - https://github.com/vymalo/another-adam-rs
