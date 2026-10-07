@@ -285,15 +285,23 @@ jobs:
           tags: coder:smoke
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
+          # The commit, baked into both binaries: the card's version is `<crate>+<first 7>` and `build/v1`
+          # says it whole (ADR 0028). The smoke tests below check it.
+          build-args: |
+            ADAM_BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
       - name: Container smoke test
         if: steps.guard.outputs.ready == 'true'
+        env:
+          EXPECT_REVISION: ${{ github.sha }}
         run: sh docker/coder/test/container-smoke.sh coder:smoke
       # The same image, the other binary: no agent folder, no agent (exit 78); with the example
       # folder mounted it serves that card, completes a task and stops on SIGTERM.
       - name: Container smoke test of adam-agent
         if: steps.guard.outputs.ready == 'true'
+        env:
+          EXPECT_REVISION: ${{ github.sha }}
         run: sh docker/coder/test/agent-smoke.sh coder:smoke
       # The image that just passed, in the compose stack: the coder gets a task
       # over A2A, its scripted model drives prepare -> OpenCode (also scripted)

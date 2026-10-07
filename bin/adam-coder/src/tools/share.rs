@@ -73,7 +73,7 @@ struct Shared {
 /// your reply, and say in a sentence what it is. The file may be at most 4 MiB, and a task may share
 /// at most 6 MiB in all. Nothing inside `.git`, and nothing that a symlink leads out of the worktree
 /// to, can be shared. Share a file again after you change it.
-#[tool]
+#[tool(label = "Share a file")]
 pub async fn share_file(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

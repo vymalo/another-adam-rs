@@ -97,6 +97,45 @@ const TOOLS: [&str; 22] = [
     "reviewer",
 ];
 
+/// A step of the person's activity panel says "Run the checks", never `run_checks`: every tool of
+/// the coder, and the screen's three, carries a title that is not its name (the model keeps calling
+/// them by name). The titles are words, so no underscore is left in them.
+#[tokio::test]
+async fn every_tool_of_the_coder_has_a_title_for_its_step() {
+    let fx = Fixture::with("hello\n", |s| {
+        s.create_repo_owners = vec!["acme".to_owned()];
+    })
+    .await;
+    let tools = coder_tools(&fx.env);
+    assert_eq!(tools.len(), TOOLS.len() - 2, "the coder's and the screen's");
+    let mut titles = Vec::new();
+    for tool in tools.iter() {
+        let name = tool.spec().name;
+        let label = tool
+            .step_style()
+            .label
+            .unwrap_or_else(|| panic!("`{name}` has no title"));
+        assert!(!label.contains('_') && label != name, "{name}: {label}");
+        titles.push((name, label));
+    }
+    let title = |name: &str| {
+        titles
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, l)| l.as_str())
+    };
+    assert_eq!(title("edit_file"), Some("Edit a file"));
+    assert_eq!(title("run_command"), Some("Run a command"));
+    assert_eq!(title("run_checks"), Some("Run the checks"));
+    assert_eq!(title("start_scratch"), Some("Start a scratch project"));
+    assert_eq!(title("ask_user"), Some("Ask you"));
+    assert_eq!(title("delegate_to_opencode"), Some("Hand to OpenCode"));
+    let mut unique: Vec<&str> = titles.iter().map(|(_, l)| l.as_str()).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), titles.len(), "two tools share a title");
+}
+
 async fn coder(cycles: u32) -> (Fixture, CoderAgent) {
     // A deployment that allows creating repositories: the tool is offered and the prompt describes it.
     let fx = Fixture::with("hello\n", |s| {
@@ -306,11 +345,15 @@ async fn the_assemblys_card_is_the_card_a_control_plane_serves() {
     let assembled = adam_ui::with_card_extensions(
         agent
             .assembly()
-            .card(url.clone(), env!("CARGO_PKG_VERSION"))
+            .card(url.clone(), adam_coder::build_version())
             .unwrap(),
     )
     .with_extension(adam_a2a::ExtensionConfig::steps())
-    .with_extension(adam_a2a::ExtensionConfig::text_stream());
+    .with_extension(adam_a2a::ExtensionConfig::text_stream())
+    .with_extension(adam_a2a::ExtensionConfig::build(
+        adam_coder::BUILD_REVISION,
+        AgentFiles::Embedded.describe().digest,
+    ));
     assert_eq!(format!("{assembled:?}"), format!("{:?}", agent_card(&url)));
 }
 

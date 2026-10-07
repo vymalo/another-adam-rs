@@ -433,10 +433,10 @@ fn verdict_of(notes: &RunNotes, max: u32, scratch_max: u32) -> Option<String> {
         let last = notes.last_in(scratch)?;
         Some(format!(
             "checks are failing and {not_delivered} ({} of {max} check cycles used). \
-             Findings from `{}` (exit code {:?}):\n{}",
+             Findings from `{}`, which ended with {}:\n{}",
             notes.failures_in(scratch),
             last.command,
-            last.exit_code,
+            crate::tools::notes::exit_phrase(last.exit_code),
             last.tail
         ))
     }
@@ -1692,6 +1692,8 @@ mod tests {
                 report: None,
                 slot: None,
                 scratch: false,
+                preexisting: false,
+                base_commit: None,
             });
         };
 
@@ -1707,6 +1709,30 @@ mod tests {
         assert!(
             own.contains("test a ... FAILED") && own.contains("2 of 2"),
             "{own}"
+        );
+        assert!(own.contains("which ended with exit code 101"), "{own}");
+        assert!(!own.contains("Some("), "{own}");
+        let mut killed = RunNotes::default();
+        for call in ["k1", "k2"] {
+            killed.record_check(CheckRecord {
+                call_id: call.to_owned(),
+                command: "sleep 9".into(),
+                passed: false,
+                exit_code: None,
+                tail: String::new(),
+                tree: None,
+                report: None,
+                slot: None,
+                scratch: false,
+                preexisting: false,
+                base_commit: None,
+            });
+        }
+        let said = verdict_of(&killed, 2, 9).unwrap();
+        assert!(
+            said.contains("which ended with no exit code (killed or timed out)")
+                && !said.contains("None"),
+            "{said}"
         );
         // On a continued branch, where an open pull request exists: that one was not updated.
         notes.continues = Some("agent/abc".into());
@@ -1760,6 +1786,8 @@ mod tests {
                 report: None,
                 slot: None,
                 scratch,
+                preexisting: false,
+                base_commit: None,
             });
         };
         let mut notes = RunNotes::default();

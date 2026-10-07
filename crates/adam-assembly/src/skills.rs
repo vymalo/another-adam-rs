@@ -24,7 +24,7 @@ use adam_agent_fs::{
     SkillSelection, Subagent,
 };
 use adam_error::{Classify, ErrorClass};
-use adam_llm_agent::{DynTool, Tool, ToolCtx, ToolError, ToolOutput};
+use adam_llm_agent::{DynTool, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -654,6 +654,11 @@ struct LoadSkill {
 
 #[async_trait]
 impl Tool for LoadSkill {
+    /// The step of a call is called "Load a skill".
+    fn step_style(&self) -> StepStyle {
+        StepStyle::default().with_label("Load a skill")
+    }
+
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
     }
@@ -676,6 +681,11 @@ struct ReadSkillFile {
 
 #[async_trait]
 impl Tool for ReadSkillFile {
+    /// The step of a call is called "Read a skill file".
+    fn step_style(&self) -> StepStyle {
+        StepStyle::default().with_label("Read a skill file")
+    }
+
     fn spec(&self) -> ToolSpec {
         self.spec.clone()
     }

@@ -104,7 +104,9 @@ inbound function reads a screen's action as JSON text.
 * **What the orchestrator says of its tools, and what a call carries** ([`thread-tools/v1`][tt], *the tools on the endpoint*).
   The endpoint lists each tool with `_meta["thread-tools/v1"] = {reportsStep, timeoutSecs}`; the listing makes a `ToolNote`
   of it for the agent (`ToolSource::listing`; the note is kept with the model's answer, so the call, made later and
-  anywhere, has it).
+  anywhere, has it). The same note carries the tool's **step label**: the endpoint's `title` for the tool, else, for
+  `turn_output`, "Send the answer" (`TURN_OUTPUT_TITLE`), so the step of the answer is not called `turn_output`.
+  The three tools of `Ui::tools()` are "Ask you", "Show on your screen" and "List what the screen can draw".
   * **`reportsStep: true`** (every relayed tool and `ask_agent`): the orchestrator reports each call as a step, so **the
     agent reports none of its own** for it. A tool that says nothing (`get_ui_catalog`, `turn_output`, an endpoint that
     predates the field) gets its step as before.

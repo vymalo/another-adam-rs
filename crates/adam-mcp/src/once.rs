@@ -86,6 +86,8 @@ pub struct RemoteTool {
     pub description: String,
     /// The JSON Schema of its arguments (an object schema).
     pub input_schema: Value,
+    /// The tool's human title (MCP's `title`), when the endpoint gave a non-blank one.
+    pub title: Option<String>,
     /// The tool's own `_meta`, as the endpoint listed it (empty when it listed none). Where a key
     /// of it means something to the caller (`thread-tools/v1`) the caller reads it.
     pub meta: Map<String, Value>,
@@ -368,8 +370,15 @@ fn remote_tool(tool: ListedTool) -> RemoteTool {
         .entry("type")
         .or_insert_with(|| Value::String("object".to_owned()));
     let meta = tool.meta.map(|m| (*m).clone()).unwrap_or_default();
+    let title = tool
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned);
     RemoteTool {
         name,
+        title,
         description: cap_text(description, MAX_DESCRIPTION_BYTES),
         input_schema: Value::Object(schema),
         meta,

@@ -198,7 +198,7 @@ fn tail(text: &str, cap: usize) -> &str {
 /// verified. One concern per call. It reads and edits files itself; do not ask
 /// it to commit, push or open pull requests. Returns its summary and the files
 /// that changed.
-#[tool(type = DelegateToOpenCode, step = "subagent", label = "OpenCode", icon = "opencode")]
+#[tool(type = DelegateToOpenCode, step = "subagent", label = "Hand to OpenCode", icon = "opencode")]
 pub async fn delegate_to_opencode(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -355,7 +355,7 @@ pub async fn delegate_to_opencode(
     } else {
         text.push_str(&format!("\nChanged files ({}):\n", changed.len()));
         for file in changed.iter().take(MAX_LISTED_FILES) {
-            text.push_str(&format!("- {} ({:?})\n", file.path, file.status));
+            text.push_str(&format!("- {} ({})\n", file.path, file.status));
         }
         if changed.len() > MAX_LISTED_FILES {
             text.push_str(&format!(

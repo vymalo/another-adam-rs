@@ -56,7 +56,7 @@ pub(crate) fn pushed_in(text: &str) -> Option<(String, String)> {
 /// Make small, focused commits: call it after each coherent piece of work. With several
 /// repositories in the workspace, say which with `repo`. In a scratch project it only commits,
 /// locally: nothing is pushed.
-#[tool]
+#[tool(label = "Commit and push")]
 pub async fn commit_and_push(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -226,6 +226,8 @@ fn checks_for_pushed(
                 tree: Some(tree.to_owned()),
                 repository: None,
                 environment: None,
+                preexisting: record.preexisting,
+                base_commit: record.base_commit.clone(),
                 summary: Some(format!(
                     "`{}` {}; checked on the identical tree before it was committed",
                     record.command,
@@ -266,7 +268,7 @@ fn checks_for_pushed(
 /// results. If you continue a branch that already has an open pull request, this
 /// updates it with your commits (after the same check) instead of opening another. With several
 /// repositories in the workspace, say which one with `repo`.
-#[tool]
+#[tool(label = "Open a pull request")]
 pub async fn open_pull_request(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -327,18 +329,26 @@ pub async fn open_pull_request(
     // passed, committed or not, is not verified.
     let tree = head_tree(wt.path()).await;
     let verified = notes.verified_tree(tree.as_deref());
-    let red = !verified;
+    // A check that fails on the base commit too is the repository's: it does not stop the pull
+    // request, which says so (ADR 0026).
+    let preexisting = tree
+        .as_deref()
+        .and_then(|tree| notes.preexisting_on(tree))
+        .cloned();
+    let red = !verified && preexisting.is_none();
     if red && !accept_red {
         let on_this_code = tree.as_deref().and_then(|tree| notes.checked(tree));
         let why = match (on_this_code, &notes.checks.last) {
             (Some(record), _) => format!(
-                "the last check run (`{}`) failed (exit code {:?})",
-                record.command, record.exit_code
+                "the last check run (`{}`) failed with {}",
+                record.command,
+                super::notes::exit_phrase(record.exit_code)
             ),
             (None, None) => "no check was run".to_owned(),
             (None, Some(last)) if !last.passed => format!(
-                "the last check run (`{}`) failed (exit code {:?})",
-                last.command, last.exit_code
+                "the last check run (`{}`) failed with {}",
+                last.command,
+                super::notes::exit_phrase(last.exit_code)
             ),
             (None, Some(last)) => format!(
                 "the code changed since the last passing check run (`{}`): the branch is not \
@@ -386,6 +396,9 @@ pub async fn open_pull_request(
     let mut body = body.to_owned();
     if red {
         body.push_str(RED_NOTE_IN_BODY);
+    }
+    if let (false, Some(record)) = (verified, &preexisting) {
+        body.push_str(&preexisting_note(record, &wt.repo().base_branch));
     }
     // A pull request that already exists for the branch (the run continues a branch an earlier
     // task opened it for) is what this call reports: the branch now carries this run's commits,
@@ -492,6 +505,14 @@ pub async fn open_pull_request(
     } else {
         format!("Pull request #{} is open: {}", pr.number, pr.url)
     };
+    if let (false, Some(record)) = (verified, &preexisting) {
+        text.push_str(&format!(
+            "\nThe last check run (`{}`) fails on origin/{} too, so it did not stop the pull \
+             request; it says so in its body.",
+            record.command,
+            wt.repo().base_branch
+        ));
+    }
     if let Ok(dirty) = wt.status().await
         && !dirty.is_empty()
     {
@@ -519,6 +540,17 @@ pub async fn open_pull_request(
 const RED_NOTE_IN_BODY: &str = "\n\n> **Note:** the checks were not green for this exact code (failing, not run, or run \
      before the last change) when this pull request was opened. The requester \
      explicitly accepted that.\n";
+
+/// What a pull request whose last check fails on the base commit too says in its body.
+fn preexisting_note(record: &super::notes::CheckRecord, base_branch: &str) -> String {
+    let base = record.base_commit.as_deref().unwrap_or_default();
+    format!(
+        "\n\n> **Note:** `{}` fails on `{base_branch}` too (`{}`), before this change. It is not \
+         caused by this pull request, which does not fix it.\n",
+        record.command,
+        &base[..base.len().min(10)]
+    )
+}
 
 /// What an update of an open pull request with unverified code says in a comment.
 const RED_NOTE_IN_COMMENT: &str = "> **Note:** this update was added with checks that were not green for this exact code \

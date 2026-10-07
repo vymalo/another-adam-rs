@@ -434,7 +434,17 @@ async fn serves_the_card_of_its_folder_and_stops_cleanly_on_sigterm() {
     let card_json = common::json_of(&card);
     assert_eq!(card_json["name"], "Assistant", "{card}");
     assert_eq!(card_json["skills"][0]["id"], "conversation", "{card}");
-    assert_eq!(card_json["version"], env!("CARGO_PKG_VERSION"), "{card}");
+    assert_eq!(card_json["version"], adam_agent::build_version(), "{card}");
+    let build = card_json["capabilities"]["extensions"]
+        .as_array()
+        .and_then(|all| all.iter().find(|e| e["uri"] == adam_a2a::BUILD_EXTENSION))
+        .unwrap_or_else(|| panic!("the card declares build/v1: {card}"));
+    assert!(
+        build["params"]["folderDigest"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("sha256:")),
+        "{card}"
+    );
     assert!(card.contains(PUBLIC_URL), "{card}");
     let (status, _) = common::raw(addr, "POST", "/", None).await;
     assert_eq!(status, 401, "an unauthenticated call is refused");

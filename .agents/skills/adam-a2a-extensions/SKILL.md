@@ -5,7 +5,7 @@ description: "Which A2A extensions an adam-rs agent declares and supports (A2UI 
 
 # A2A extensions of an adam agent
 
-An adam agent is a plain A2A 1.0 agent. On top of that it can declare seven optional extensions
+An adam agent is a plain A2A 1.0 agent. On top of that it can declare eight optional extensions
 on its card. A client that does not know one ignores it; every extension is removable without
 breaking plain A2A. The contracts are written in `vymalo/another-agentic-system`
 (its docs/api directory, the `*-v1.md` files); adam-rs holds the agent side.
@@ -36,6 +36,7 @@ siblings (`ui-catalog-v1.md`, `thread-tools-v1.md`, `steps-v1.md`, `text-stream-
 | `mentions/v1` | `MENTIONS_EXTENSION` | the agent reads the agents a person mentioned and asks them | `adam_ui::card_extensions()` |
 | `steer/v1` | `STEER_EXTENSION` | a message naming a `submitted` or `working` task is added to its input and read at its next step | `adam_ui::card_extensions()` |
 | `steps/v1` | `STEPS_EXTENSION` | tool calls and sub-agents' work as nested steps | `adam-agent` and `adam-coder` add it (`ExtensionConfig::steps()`) |
+| `build/v1` | `BUILD_EXTENSION` | information only, nothing to activate: `params` `{revision, folderDigest}` say which build and which agent files answer (ADR 0028) | `adam-agent` (`card_of_folder`) and `adam-coder` (`agent_card_from`) add it (`ExtensionConfig::build(..)`) |
 | `text-stream/v1` | `TEXT_STREAM_EXTENSION` | the reply streamed as the model writes it, then the whole text once; since 2026-10-05 also the model's **reasoning**, as chunks with `kind: "reasoning"` (`TEXT_STREAM_KIND_REASONING`), its own `artifactId`, never stated whole (ADR 0020) | `adam-agent` and `adam-coder` add it (`ExtensionConfig::text_stream()`) |
 
 The URIs are `https://agents.vymalo.com/a2a/extensions/<name>/v1` (A2UI has its own URI);

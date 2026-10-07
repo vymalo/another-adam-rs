@@ -83,6 +83,12 @@ listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is `ti
 SIGTERM and reaps children). Tags are `sha-<7>` of the commit. Both agents' binaries are smoke-tested in CI
 (`docker/coder/test/`).
 
+The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into both binaries. The agent card then says
+which build answers: `version` is `<crate version>+<first 7>` and the `build/v1` extension carries the whole revision
+and a digest of the agent's files ([ADR 0028](../decisions/0028-the-card-says-which-build-answers.md), contract in
+[A2A server](../reference/a2a-server.md)). A build without the argument says `unknown`. The smoke tests check the card
+against `EXPECT_REVISION`, which CI sets to the commit.
+
 ## Before you start
 
 | You need | Why |

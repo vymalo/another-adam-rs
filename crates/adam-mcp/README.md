@@ -39,7 +39,7 @@ own.
 | `Error` | closed enum, every variant names the server and none carries a value from a variable: `Var`, `StdioNotAllowed`, `SseUnsupported`, `Url`, `UrlSecret` (names the variable), `Header`, `Name`, `Spawn`, `Connect`, `ListTools`, `UnknownTool`, `BearerBinding` (a bearer-per-call binding the file or the bearer does not fit) |
 | `VarProblem`, `UrlProblem` | closed enums inside `Error::Var` and `Error::Url` |
 | `MAX_RESULT_BYTES` | 64 KiB: the most of an answer that reaches the model |
-| `Endpoint::new(url, &SecretString, &McpPolicy)`, `list_tools()`, `call_tool(name, args)`, `call_tool_with(name, args, CallOptions)`, `CallOptions`, `EndpointError`, `RemoteTool` (with the tool's own `meta`), `RemoteResult` | one MCP endpoint a **message** announced, with a bearer token known only at run time, one connection per request: see *An endpoint a message announces* |
+| `Endpoint::new(url, &SecretString, &McpPolicy)`, `list_tools()`, `call_tool(name, args)`, `call_tool_with(name, args, CallOptions)`, `CallOptions`, `EndpointError`, `RemoteTool` (with the tool's own `title` and `meta`), `RemoteResult` | one MCP endpoint a **message** announced, with a bearer token known only at run time, one connection per request: see *An endpoint a message announces* |
 
 `Connect`, `Spawn` and `ListTools` are `ErrorClass::Transient` (the server may be up later); every other variant is
 `Invalid` (the same files and policy never succeed).

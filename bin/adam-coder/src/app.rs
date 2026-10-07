@@ -147,17 +147,45 @@ pub fn agent_card_from(
     files: &AgentFiles,
     public_url: &Url,
 ) -> Result<AgentCardConfig, Box<AssemblyError>> {
+    card_for_build(files, public_url, BUILD_REVISION)
+}
+
+/// The revision this binary was built from: the build argument `ADAM_BUILD_REVISION` of the image
+/// (the commit), `None` for a build that was not given one (a local `cargo build`).
+pub const BUILD_REVISION: Option<&str> = option_env!("ADAM_BUILD_REVISION");
+
+/// The card's `version`: the crate's version and the build's revision as semver build metadata,
+/// `0.1.0+6478fbc`, or `0.1.0+unknown` when the build was not given one.
+pub fn build_version() -> String {
+    adam_a2a::build_version(env!("CARGO_PKG_VERSION"), BUILD_REVISION)
+}
+
+/// [`agent_card_from`] for a build of revision `revision`: the version carries it, and the
+/// `build/v1` extension says it with the digest of `files`.
+fn card_for_build(
+    files: &AgentFiles,
+    public_url: &Url,
+    revision: Option<&str>,
+) -> Result<AgentCardConfig, Box<AssemblyError>> {
+    let version = adam_a2a::build_version(env!("CARGO_PKG_VERSION"), revision);
     files
         .def()?
-        .card(public_url.clone(), env!("CARGO_PKG_VERSION"))
+        .card(public_url.clone(), version)
         .map(with_extensions)
+        .map(|card| {
+            card.with_extension(adam_a2a::ExtensionConfig::build(
+                revision,
+                files.describe().digest,
+            ))
+        })
         .map_err(Box::new)
 }
 
 /// `card` with the extensions the coder speaks: the screen's (A2UI, `ui-catalog/v1`,
 /// `thread-tools/v1`, `mentions/v1`, `steer/v1`), `steps/v1` (every tool call, and OpenCode's, is reported as a step to a
 /// client that activates it) and `text-stream/v1` (its answers are sent as the model writes them to a
-/// client that activates it: the agent streams its model calls).
+/// client that activates it: the agent streams its model calls). `build/v1`, which says the build and the
+/// files, is added by [`card_for_build`].
 fn with_extensions(card: AgentCardConfig) -> AgentCardConfig {
     adam_ui::with_card_extensions(card)
         .with_extension(adam_a2a::ExtensionConfig::steps())
@@ -194,14 +222,59 @@ mod tests {
 
     /// The card is the golden `tests/fixtures/agent/card.json`: the one the Rust literal used to
     /// build, with the name `Adam` (the golden changes in the same commit as the file);
-    /// only the version follows the crate's.
+    /// only what a build decides follows it: the version (the crate's and the revision's), and the
+    /// revision and the files' digest of `build/v1`.
     #[test]
     fn the_card_from_the_agent_file_equals_the_golden() {
         let mut golden: Value =
             serde_json::from_str(include_str!("../tests/fixtures/agent/card.json"))
                 .expect("the golden card is JSON");
-        golden["version"] = json!(env!("CARGO_PKG_VERSION"));
+        golden["version"] = json!(build_version());
+        let build = golden["extensions"]
+            .as_array_mut()
+            .and_then(|all| all.last_mut())
+            .expect("the card lists extensions");
+        build["params"]["revision"] = json!(adam_a2a::revision_of(BUILD_REVISION));
+        build["params"]["folderDigest"] = json!(crate::agent::AGENT.digest);
         let url: Url = "https://agents.example.com/coder/".parse().expect("a URL");
         assert_eq!(render(&agent_card(&url)), golden);
+    }
+
+    /// A build with a revision says it twice: as semver build metadata of the card's version, and,
+    /// whole, with the digest of the agent files, in `build/v1`. Without one it says `unknown`.
+    #[test]
+    fn the_card_says_which_build_and_which_files_answer() {
+        let url: Url = "https://agents.example.com/coder/".parse().expect("a URL");
+        let sha = "6478fbc1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7";
+        let card = card_for_build(&AgentFiles::Embedded, &url, Some(sha)).expect("a card");
+        assert_eq!(
+            card.version,
+            format!("{}+6478fbc", env!("CARGO_PKG_VERSION"))
+        );
+        let build = card
+            .extensions
+            .iter()
+            .find(|e| e.uri == adam_a2a::BUILD_EXTENSION)
+            .expect("the card declares build/v1");
+        assert!(!build.required);
+        assert_eq!(build.params["revision"], sha);
+        assert_eq!(build.params["folderDigest"], crate::agent::AGENT.digest);
+        assert!(
+            build.params["folderDigest"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("sha256:"))
+        );
+
+        let card = card_for_build(&AgentFiles::Embedded, &url, None).expect("a card");
+        assert_eq!(
+            card.version,
+            format!("{}+unknown", env!("CARGO_PKG_VERSION"))
+        );
+        let revision = card
+            .extensions
+            .iter()
+            .find(|e| e.uri == adam_a2a::BUILD_EXTENSION)
+            .map(|e| e.params["revision"].clone());
+        assert_eq!(revision, Some(json!("unknown")));
     }
 }

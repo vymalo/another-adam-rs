@@ -110,6 +110,7 @@ Put these in a `.env` next to `compose.yaml`.
 | `POSTGRES_PORT`, `MONGODB_PORT` | host ports of the databases | `5432`, `27017` |
 | `MOCK_OPENAI_PORT`, `MOCK_GITHUB_PORT`, `MOCK_GITHUB_MCP_PORT`, `GIT_SERVER_PORT` | host ports of the mocks | `8081`, `8082`, `8085`, `8083` |
 | `CODER_PORT`, `AGENT_PORT` | host ports of the coder and the general agent | `8080`, `8084` |
+| `ADAM_BUILD_REVISION` | build argument, not a runtime variable: the commit baked into both binaries, shown on the card as the version's `+<sha7>` and in `build/v1` ([ADR 0028](../decisions/0028-the-card-says-which-build-answers.md)). Unset says `unknown` | unset |
 | `CODER_IMAGE` | image of both agents; with `--no-build` runs a prebuilt one | `adam-rs/coder:dev` |
 | `CODER_MODEL`, `CODER_OPENCODE_MODEL`, `AGENT_MODEL` | the scripted models | `mock-coder`, `mock-opencode`, `mock-assistant` |
 | `CODER_AGENT_DIR`, `AGENT_FOLDER` | the agent folders mounted at `/etc/adam/agent` | `./bin/adam-coder/agent`, `./dev/agents/assistant/agent` |

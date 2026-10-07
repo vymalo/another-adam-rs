@@ -2,7 +2,7 @@
 //! tools, the model, and the registration `adam_service::serve` hands to the runtime.
 
 use adam::mcp::McpPolicy;
-use adam::{AgentDef, Assembly};
+use adam::{AgentDef, AgentFolder, Assembly};
 use adam_a2a::AgentCardConfig;
 use adam_llm_agent::{LlmStarter, StepIo};
 use adam_model::DynModel;
@@ -12,27 +12,74 @@ use url::Url;
 
 use crate::error::AgentError;
 
-/// The version a card advertises: this crate's.
+/// This crate's version, the base of the version a card advertises ([`build_version`]).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The revision this binary was built from: the build argument `ADAM_BUILD_REVISION` of the image
+/// (the commit), `None` for a build that was not given one (a local `cargo build`).
+pub const BUILD_REVISION: Option<&str> = option_env!("ADAM_BUILD_REVISION");
+
+/// The version a card advertises: [`VERSION`] and the build's revision as semver build metadata,
+/// `0.1.0+6478fbc`, or `0.1.0+unknown` when the build was not given one.
+pub fn build_version() -> String {
+    adam_a2a::build_version(VERSION, BUILD_REVISION)
+}
 
 /// The A2A card the files declare, with `public_url` where clients POST JSON-RPC: the card
 /// [`Assembly::card`](adam::Assembly::card) gives for the agent assembled from them, with no model
-/// or tools.
+/// or tools. Its `version` carries the build's revision ([`build_version`]); the `build/v1`
+/// extension, which also says the digest of the files, is [`card_of_folder`]'s, because a
+/// definition does not know the digest of the folder it came from.
 ///
 /// # Errors
 ///
 /// [`AgentError::Card`] when the folder declares neither `description` nor `card.description`.
 pub fn card_of(def: &AgentDef, public_url: &Url) -> Result<AgentCardConfig, AgentError> {
-    def.card(public_url.clone(), VERSION)
-        .map(|card| {
-            // The screen's extensions, `steps/v1` (every tool call is reported as a step to a client
-            // that activates it) and `text-stream/v1` (the model's answers are sent as it writes
-            // them, to a client that activates it).
-            adam_ui::with_card_extensions(card)
-                .with_extension(adam_a2a::ExtensionConfig::steps())
-                .with_extension(adam_a2a::ExtensionConfig::text_stream())
-        })
+    def.card(public_url.clone(), build_version())
+        .map(with_extensions)
         .map_err(|e| AgentError::Card(Box::new(e)))
+}
+
+/// The screen's extensions, `steps/v1` (every tool call is reported as a step to a client that
+/// activates it) and `text-stream/v1` (the model's answers are sent as it writes them, to a client
+/// that activates it).
+fn with_extensions(card: AgentCardConfig) -> AgentCardConfig {
+    adam_ui::with_card_extensions(card)
+        .with_extension(adam_a2a::ExtensionConfig::steps())
+        .with_extension(adam_a2a::ExtensionConfig::text_stream())
+}
+
+/// [`card_of`] for the folder the process was started with: the same card, and `build/v1` saying
+/// the build's revision and the folder's digest, so that an export of a thread can tell which build
+/// and which files answered.
+///
+/// # Errors
+///
+/// As [`card_of`].
+pub fn card_of_folder(
+    folder: &AgentFolder,
+    public_url: &Url,
+) -> Result<AgentCardConfig, AgentError> {
+    card_for_build(folder, public_url, BUILD_REVISION)
+}
+
+/// [`card_of_folder`] for a build of revision `revision`.
+fn card_for_build(
+    folder: &AgentFolder,
+    public_url: &Url,
+    revision: Option<&str>,
+) -> Result<AgentCardConfig, AgentError> {
+    let version = adam_a2a::build_version(VERSION, revision);
+    let card = folder
+        .def
+        .card(public_url.clone(), version)
+        .map_err(|e| AgentError::Card(Box::new(e)))?;
+    Ok(
+        with_extensions(card).with_extension(adam_a2a::ExtensionConfig::build(
+            revision,
+            folder.digest.as_str(),
+        )),
+    )
 }
 
 /// What a role that runs workers needs besides the files.
@@ -138,4 +185,56 @@ pub async fn agents(
     Ok(agents
         .card_if(card)
         .inbound(adam_a2a_runtime::vymalo_inbound))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_card_says_which_build_and_which_folder_answer() {
+        let tmp = tempfile::tempdir().expect("a temporary directory");
+        std::fs::create_dir_all(tmp.path().join("agent")).expect("the agent directory");
+        std::fs::write(
+            tmp.path().join("agent/instructions.md"),
+            "---\nname: chat\ndescription: Chats.\n---\nHello.\n",
+        )
+        .expect("the instructions");
+        let folder = AgentFolder::load(tmp.path()).expect("the folder loads");
+        let url: Url = "https://agents.example.com/chat/".parse().expect("a URL");
+
+        let sha = "6478fbc1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7";
+        let card = card_for_build(&folder, &url, Some(sha)).expect("a card");
+        assert_eq!(card.version, format!("{VERSION}+6478fbc"));
+        let build = card
+            .extensions
+            .iter()
+            .find(|e| e.uri == adam_a2a::BUILD_EXTENSION)
+            .expect("the card declares build/v1");
+        assert!(!build.required);
+        assert_eq!(build.params["revision"], sha);
+        assert_eq!(build.params["folderDigest"], folder.digest.as_str());
+
+        let card = card_for_build(&folder, &url, None).expect("a card");
+        assert_eq!(card.version, format!("{VERSION}+unknown"));
+
+        // Another prompt is another folder digest on the same build.
+        std::fs::write(
+            tmp.path().join("agent/instructions.md"),
+            "---\nname: chat\ndescription: Chats.\n---\nHello again.\n",
+        )
+        .expect("the instructions");
+        let edited = AgentFolder::load(tmp.path()).expect("the folder loads");
+        let again = card_for_build(&edited, &url, Some(sha)).expect("a card");
+        let digest = |card: &AgentCardConfig| {
+            card.extensions
+                .iter()
+                .find(|e| e.uri == adam_a2a::BUILD_EXTENSION)
+                .map(|e| e.params["folderDigest"].clone())
+        };
+        assert_ne!(
+            digest(&again),
+            digest(&card_for_build(&folder, &url, Some(sha)).expect("a card"))
+        );
+    }
 }

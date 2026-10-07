@@ -34,6 +34,11 @@ pub struct ToolNote {
     /// the source should wait for it, within its own limits. `None`: the source's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// What the step of a call of this tool is called, when the listing gave the tool a human title
+    /// (`Search the web` for `search__web_search`). `None`: the tool's name. An agent's own tool
+    /// says it with [`Tool::step_style`](crate::Tool::step_style); this is for a source's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -47,7 +52,15 @@ impl ToolNote {
             tool: tool.into(),
             reports_step: false,
             timeout_ms: None,
+            label: None,
         }
+    }
+
+    /// Call the step of this tool's calls `label` instead of its name.
+    #[must_use]
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
     }
 
     /// The system behind the source reports this tool's calls as steps.
@@ -70,8 +83,8 @@ impl ToolNote {
     }
 
     /// Whether the note says anything (a note that does not is not kept).
-    pub(crate) fn is_meaningful(&self) -> bool {
-        self.reports_step || self.timeout_ms.is_some()
+    pub fn is_meaningful(&self) -> bool {
+        self.reports_step || self.timeout_ms.is_some() || self.label.is_some()
     }
 }
 

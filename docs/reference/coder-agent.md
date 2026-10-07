@@ -59,7 +59,14 @@ sequenceDiagram
     loop until green, or the check cycles are used up
         A->>Sh: run_checks(command), with a time limit
         Sh-->>A: exit code and output tail
-        A-->>C: artifact "checks"
+        opt exit code is not 0, in a repository (not a scratch project, not a timeout)
+            A->>G: add_base_checkout: origin/base, detached, beside the worktree
+            A->>Sh: the same command on the base, once per command and base commit
+            Sh-->>A: exit code and output tail
+            G->>G: remove_base_checkout
+            Note over A,Sh: it fails there too: pre-existing, no check cycle is used
+        end
+        A-->>C: artifact "checks" (with preexisting and base_commit when it fails on the base too)
         opt exit code is not 0
             A->>W: apply_patch or write_file (or delegate_to_opencode) to fix the failure
         end
@@ -87,8 +94,8 @@ Artifacts:
 
 * `pull_request`: a data part (`url`, `number`, `branch`, `repository`) and an A2A `url` part, so a chat
   surface shows a link (`adam_a2a_runtime::artifact_of`).
-* `checks` (`passed`, `commit`, `tree`, optional `summary` and `findings`): reported by every `run_checks`
-  that ran; `commit_and_push` emits one bound to the pushed commit (the last run's report if it ran on the
+* `checks` (`passed`, `commit`, `tree`, optional `summary`, `findings`, and `preexisting` with `base_commit` when the
+  command fails on the base too): reported by every `run_checks` that ran; `commit_and_push` emits one bound to the pushed commit (the last run's report if it ran on the
   pushed tree, else `passed: false`). An orchestrator gates on the last `checks` whose `commit` is the
   pushed SHA. Schema: [coder README](../../bin/adam-coder/README.md#artifacts).
 * `branch`.
@@ -112,14 +119,18 @@ stateDiagram-v2
     WorktreeReady --> WorktreeReady: prepare_workspace on another repository the person named, a new slot
     WorktreeReady --> Edited: write_file, apply_patch or delegate_to_opencode
     Edited --> ChecksGreen: run_checks passes
-    Edited --> ChecksRed: run_checks fails, one cycle used
+    Edited --> ChecksRed: run_checks fails, and passes on the base, one cycle used
+    Edited --> ChecksPreexisting: run_checks fails, and fails on the base too, no cycle used
     Edited --> Pushed: commit_and_push without a green check, unless the budget is used up
     ChecksRed --> Edited: the file tools or delegate_to_opencode to fix, cycles left
     ChecksRed --> Exhausted: failed runs reach MAX_CHECK_CYCLES
     ChecksRed --> Pushed: commit_and_push, unless the budget is used up
     ChecksGreen --> Pushed: commit_and_push
+    ChecksPreexisting --> Edited: the file tools or delegate_to_opencode, the change must not make it worse
+    ChecksPreexisting --> Pushed: commit_and_push
     Pushed --> Edited: more changes, the green run no longer covers the tree
     Pushed --> PullRequest: open_pull_request, checks green on the pushed tree
+    Pushed --> PullRequest: open_pull_request, the last check fails on the base too, a note in the body
     Pushed --> PullRequest: accept_red_checks after the user agreed through ask_user
     PullRequest --> Completed: the model ends its turn
     Exhausted --> FailedRun: the model reports the findings and stops, the run fails
@@ -147,6 +158,7 @@ run ends only with a pull request, a failure, `CancelTask` or `max_turns`.
 |---|---|
 | `prepare_workspace` and `publish_scratch` accept only a **granted** repository: one the person named in their own messages (recorded from the conversation, never from the model's argument; text in `untrusted` fences does not count), or one they agreed to add when `request_repository` asked. An explicit no is remembered. | [coder README](../../bin/adam-coder/README.md#another-repository-only-with-the-persons-yes), [ADR 0008](../decisions/0008-a-workspace-holds-several-repositories.md) |
 | `create_repository` makes a new **empty**, private-by-default repository for an owner in `CREATE_REPO_OWNERS`, only after the person says yes to a question the tool writes. A GitHub App creates for organisations only. | [coder README](../../bin/adam-coder/README.md#a-repository-of-its-own-on-request) |
+| A check that fails in a repository is run once on `origin/<base>`: when it fails there too it is **pre-existing**, spends no cycle, is told to the model and carries `preexisting` in the `checks` artifact, and does not stop `open_pull_request` (the body says so). Not for a scratch project or a timeout. | [ADR 0026](../decisions/0026-a-failure-the-base-has-too-is-not-the-runs.md) |
 | After `MAX_CHECK_CYCLES` (3) failed check runs in a repository, `run_checks`, `commit_and_push` and `open_pull_request` refuse there. A scratch project has `SCRATCH_CHECK_CYCLES` (5), counted apart. | ADR 0013 |
 | `open_pull_request` refuses unless the pushed `HEAD` is the current commit **and** the last check passed on exactly that tree. A continued branch is fast-forwarded only after this gate (never forced). | |
 | The shell has three tools of one job each: `run_command` looks (its changes are undone), `run` makes (file changes kept, git untouched), `run_checks` checks and is the only one the gate sees. | [ADR 0013](../decisions/0013-run-keeps-changes-edit-file-and-scratch-completion.md) |

@@ -131,6 +131,8 @@ services:
     build:
       context: .
       dockerfile: docker/coder/Dockerfile
+      args:
+        ADAM_BUILD_REVISION: ${ADAM_BUILD_REVISION:-}
     restart: unless-stopped
     depends_on:
       postgres:
@@ -247,6 +249,8 @@ services:
     build:
       context: .
       dockerfile: docker/coder/Dockerfile
+      args:
+        ADAM_BUILD_REVISION: ${ADAM_BUILD_REVISION:-}
     entrypoint: ["tini", "--", "adam-agent"]
     restart: unless-stopped
     depends_on:
