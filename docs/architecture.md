@@ -154,6 +154,9 @@ classDiagram
     class TaskBackend { <<interface>> }
     TaskBackend <|.. RuntimeTaskBackend
     TaskBackend <|.. InMemoryBackend
+    class PushStore { <<interface>> }
+    PushStore <|.. StorePushStore
+    PushStore <|.. InMemoryPushStore
     class Notifier { <<interface>> }
     Notifier <|.. PgNotifier
     Notifier <|.. LocalNotifier
@@ -180,6 +183,7 @@ classDiagram
 | `Store` | `adam-core` | `PgStore`, `MongoStore` | `MemoryStore` (reference), `FaultyStore` (testkit) |
 | `ModelClient` | `adam-model` | `OpenAiCompatible` (`adam-model-openai`) | `MockModel` |
 | `TaskBackend` | `adam-a2a` | `RuntimeTaskBackend` (`adam-a2a-runtime`) | `InMemoryBackend` (feature `test-util`) |
+| `PushStore` | `adam-a2a` | `StorePushStore` (`adam-a2a-runtime`, over the `Store`) | `InMemoryPushStore` (feature `test-util`) |
 | `Notifier`, `EventSink` | `adam-runtime` | `PgNotifier`, `PgEventSink` (`adam-notify-postgres`), `BroadcastSink` (in process) | `LocalNotifier`, `NoopSink`, `CollectingSink` |
 | `Clock` | `adam-runtime` | `SystemClock` | `ManualClock` |
 | `Agent`, `AgentStarter` | `adam-runtime` | `LlmAgent`/`LlmStarter`, `CoderAgent`/`CoderStarter` | test agents |
@@ -361,6 +365,92 @@ Rules this diagram cannot show:
 Follow-ups, `referenceTaskIds`, steering, steps and streamed text are in the
 [A2A server reference](reference/a2a-server.md).
 
+### Push notification delivery
+
+Off unless `A2A_PUSH_ALLOWED_URLS` names the webhooks a deployment allows
+([ADR 0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md)). A client registers a
+webhook for a task (`CreateTaskPushNotificationConfig`, or in `SendMessage`); the config and how far its delivery got are
+kept in the run store, so a restart or another replica loses nothing. A deliverer in the control plane reads the task as
+its owner and tells the webhook what it has not heard.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as A2A client
+    participant H as BackendHandler<br/>adam-a2a
+    participant P as PushPolicy
+    participant S as StorePushStore<br/>adam-a2a-runtime
+    participant DB as Store<br/>Postgres
+    participant D as PushDeliverer<br/>adam-a2a
+    participant B as RuntimeTaskBackend
+    participant W as webhook
+
+    C->>H: CreateTaskPushNotificationConfig(taskId, url, token, authentication)
+    H->>B: get(caller, taskId)
+    alt not the caller's task
+        H-->>C: TaskNotFound
+    end
+    H->>P: check(url)
+    alt not allowed (list, https, private address)
+        H-->>C: InvalidParams
+    end
+    H->>S: put(config, cursor = what the task says now)
+    S->>DB: push_put (Active, version 1, due now)
+    H-->>C: the config (token and credentials left out)
+    loop a round: when nudged or every poll interval
+        D->>S: claim_due(worker, now, ttl)
+        S->>DB: push_claim_due (lease, earliest due first)
+        D->>B: get(owner, taskId)
+        D->>D: PushCursor.next_event(task): pending, then a new artifact, then a changed status
+        alt the webhook has heard everything
+            D->>S: commit(idle, due after the poll interval, Done when the task is terminal)
+        else an event to send
+            D->>P: check(url) again, resolve the host (private addresses dropped)
+            D->>W: POST application/a2a+json, Authorization, A2A-Notification-Token
+            alt 2xx
+                W-->>D: acknowledged
+                D->>S: commit(cursor advanced, due now)
+            else error status, timeout or refused connection
+                D->>S: commit(event kept pending, attempts + 1, backoff)
+            end
+        end
+        S->>DB: push_commit (compare-and-swap on the version, lease dropped)
+    end
+```
+
+Rules this diagram cannot show:
+
+* **A notification is a hint; `GetTask` is the truth.** What a deliverer never saw (a state between two polls, or while every
+  replica was down) is not sent, the next event is the state the task is in, and a webhook may hear one event twice.
+* **A failed event is kept whole in the cursor** (`PushCursor.pending`) and sent again as it was, before any later one, so a
+  webhook that was down still hears each state the deliverer saw, in order.
+* **Fail closed.** The policy is judged at create time and again at delivery; the client resolves names itself, drops private
+  addresses, never follows a redirect and ignores `HTTP(S)_PROXY`. A `token` and `credentials` are write-only
+  (`crates/adam-a2a/src/push/sender.rs`).
+* **Replicas share the work through leases**, and the version compare-and-swap, not the lease, keeps a cursor from going
+  backwards. A replaced or deleted config makes the commit of a delivery in flight lose; that request may still have reached
+  the webhook once.
+
+The lifecycle of one config (`PushState`, `crates/adam-core/src/store/push.rs`):
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: push_put (new or replaced)
+    Active --> Active: event acknowledged, due at once
+    Active --> Active: heard everything, polled every 2 s
+    Active --> Active: failure, retry after a capped backoff
+    Active --> Done: the task is terminal and everything was heard
+    Active --> GaveUp: failing for the whole give-up bound
+    Active --> GaveUp: 410 Gone, or an address the policy refuses
+    Done --> [*]: deleted, or the run is purged
+    GaveUp --> [*]: deleted, or the run is purged
+    Active --> [*]: push_delete, or the run is purged
+```
+
+`ListTasks` is one indexed read per page of the run store (`Store::list_runs`) scoped to the caller's conversations, read as
+tasks; the extended card and the card's signature are built once when the router is built
+(`crates/adam-a2a/src/server.rs`). All of it is in the [A2A server reference](reference/a2a-server.md).
+
 ### The worker: claim, step, journal, commit
 
 `Runtime::run_worker` (`crates/adam-runtime/src/worker.rs`) runs in the same process as the server
@@ -528,12 +618,13 @@ never shown as `submitted` again. A front that holds only the starter claims not
 
 ## Data: the run store
 
-Two tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
-the schema version. `state` is JSONB in Postgres and a real BSON document in MongoDB.
+Three tables (PostgreSQL) or collections (MongoDB), prefixed `adam_` by default, plus a `meta` table with
+the schema version (`push` holds A2A push-notification configurations, schema version 3). `state` is JSONB in Postgres and a real BSON document in MongoDB.
 
 ```mermaid
 erDiagram
     RUNS ||--o{ JOURNAL : "one entry per step (cascade delete)"
+    RUNS ||--o{ PUSH : "one per webhook of a task (cascade delete)"
     RUNS |o--o{ RUNS : "parent_id: a child run"
     RUNS {
         uuid id PK
@@ -559,6 +650,23 @@ erDiagram
         jsonb payload "the output or the error"
         timestamptz recorded_at
     }
+    PUSH {
+        uuid run_id PK
+        text id PK "the config's id"
+        text agent
+        text owner "the subject that created it"
+        jsonb config "the webhook, credentials as given"
+        jsonb cursor "what the webhook has heard"
+        text state "active, done, gave_up"
+        integer attempts
+        text last_error "no URL, no credential"
+        timestamptz next_attempt_at "when it is due"
+        bigint version "compare-and-swap"
+        text lease_owner
+        timestamptz lease_until
+        timestamptz created_at
+        timestamptz updated_at
+    }
     META {
         text key PK
         text value "schema_version"
@@ -571,10 +679,12 @@ erDiagram
 | unique `runs (agent, conversation_id)` where the run is open | one open run per conversation |
 | `runs (agent, updated_at)` where finished | retention sweeps |
 | `runs (parent_id)` where set | children of a run |
+| `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC)` where set | `ListTasks`: an owner's runs, newest first, by keyset |
+| `push (agent, next_attempt_at, run_id, id)` where active | claiming due push configs |
 
 MongoDB keeps the same fields in `adam_runs` (`_id` is the run's UUID) plus `open_key` (a plain unique
 index; closed runs get `~<run id>`) and `lease_token`, and the journal in `adam_journal` with
-`_id = "<run>:<seq>"`. How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
+`_id = "<run>:<seq>"`, and the push configs in `adam_push` with `_id = "<run>:<config id>"`. How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
 
 What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 `crates/adam-runtime/src/envelope.rs`):

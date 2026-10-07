@@ -1,16 +1,94 @@
 # The A2A server: what a client sees
 
-How a task looks from outside: follow-ups, continuing a finished task, and the three live streams
-(steps, text, reasoning). The request path itself is in
+How a task looks from outside: the methods, follow-ups, continuing a finished task, push notifications, listing,
+the extended card, the card's signature, and the three live streams (steps, text, reasoning). The request path itself is in
 [Architecture](../architecture.md#request-in-events-out). Code: `crates/adam-a2a` (server),
 `crates/adam-a2a-runtime` (backend over the runtime). Extensions: the `adam-a2a-extensions` skill and
 [ADR 0006](../decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md).
 
 ## Methods
 
-`SendMessage` (blocking), `SendStreamingMessage`, `GetTask`, `CancelTask` and `SubscribeToTask` are
-served. `ListTasks` is unsupported, push-notification methods return `PushNotificationNotSupported`, and
-there is no extended agent card (`crates/adam-a2a/src/handler.rs`).
+All of A2A 1.0's JSON-RPC methods are served (`crates/adam-a2a/src/handler.rs`); what is optional is off
+until a deployment turns it on, and says so in the card (*verified 2026-10-07* against
+<https://a2a-protocol.org/latest/specification/>, §3.3.4: a capability that is false or absent makes its operations
+answer with the matching error).
+
+| Method | Needs | Off or missing |
+|---|---|---|
+| `SendMessage` (blocking), `SendStreamingMessage`, `GetTask`, `CancelTask`, `SubscribeToTask` | | |
+| `ListTasks` | | |
+| `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig`, and `configuration.taskPushNotificationConfig` of a send | `A2A_PUSH_ALLOWED_URLS` | `PushNotificationNotSupported`; `capabilities.pushNotifications` is false |
+| `GetExtendedAgentCard` | an extended card (`card.extended` of the agent folder) **and** bearer authentication | `UnsupportedOperation`; `capabilities.extendedAgentCard` is false |
+| the card's `signatures` and `GET /.well-known/jwks.json` | `A2A_CARD_SIGNING_KEY_FILE` | no signature, no key set |
+
+## Push notifications
+
+A client names a webhook for a task and is told when the task changes, without holding a stream open. **A notification
+is a hint; `GetTask` is the truth** (the specification itself says duplicates may occur and delivery may stop). Design and
+reasons: [ADR 0030](../decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md); the delivery sequence and
+a config's lifecycle: [Architecture](../architecture.md#push-notification-delivery).
+
+| What | Behaviour |
+|---|---|
+| **Who may register what** | the deployment's allow-list (`A2A_PUSH_ALLOWED_URLS`: URL prefixes or hosts). A webhook that is not on it, is not `https`, has credentials in its URL or is a private, loopback or link-local address is `InvalidParams`. Delivery judges again and never connects to a private address or follows a redirect |
+| **Whose** | a config belongs to its task and its caller: another caller's task is `TaskNotFound` for every method, as for `GetTask`. At most 16 configs per task |
+| **Secrets** | `token` and `authentication.credentials` are write-only: create, get and list never return them. The server stores them as given, in clear, in its database |
+| **What a webhook receives** | `POST` with `Content-Type: application/a2a+json`, `Authorization: <scheme> <credentials>` when `authentication` was given, `A2A-Notification-Token: <token>` when `token` was; the body is a `StreamResponse`: a `statusUpdate` when the task's status (state or message) changed, an `artifactUpdate` for each new artifact, artifacts first. Answer 2xx to acknowledge |
+| **The header of `token`** | the specification does not name one; `A2A-Notification-Token` is what the official Rust SDK sends (*verified 2026-10-07*, `a2a-server-lf` 0.4.4 `src/push/sender.rs`) |
+| **Signed notifications** | the specification does not ask for them (no JWT, no JWKS for notifications, *verified 2026-10-07*), so there are none: authenticate a notification by the credentials you chose |
+| **Order and loss** | events the deliverer saw are delivered in order and a failed one is sent again before any later one. A state the task passed through between two polls (2 s) or while no replica ran is not delivered: the next event is the state the task is in. A webhook may hear one event twice |
+| **Retry and give-up** | a non-2xx answer, a timeout (15 s) or a refused connection is retried with a capped exponential backoff (1 s to 5 min); after `A2A_PUSH_GIVE_UP_AFTER_SECS` (1 hour) of failures delivery to that webhook stops and the reason is recorded (`410 Gone` or a refused address stops it at once). Nothing more arrives after that: poll `GetTask` |
+| **In a send** | `configuration.taskPushNotificationConfig` (the 1.0 name). The earlier drafts' `pushNotificationConfig` is refused with `InvalidParams` and starts nothing: the SDK's JSON-RPC layer would drop it silently (*observed 2026-10-07*) and the client would wait for notifications nobody registered |
+| **A new config** | starts from what the task says when it is created: only later changes are sent, and a config for a task that is already terminal receives nothing. In a `SendMessage` the baseline is the task as the message created it |
+| **When it ends** | once the task is terminal and everything was sent. The config stays readable until it is deleted (delete is idempotent) or the run is purged |
+
+```text
+POST /hook HTTP/1.1
+Content-Type: application/a2a+json
+Authorization: Bearer <credentials>
+A2A-Notification-Token: <token>
+
+{"statusUpdate":{"taskId":"…","contextId":"…","status":{"state":"TASK_STATE_COMPLETED","timestamp":"…"}}}
+```
+
+## ListTasks
+
+The caller's own tasks (never another's, whatever the filters say), most recently updated first, by cursor.
+
+| Field | Behaviour |
+|---|---|
+| `contextId` | only that context |
+| `status` | only that state. `completed` is exact in the store; `failed`/`canceled`, `submitted`/`working` and `input-required` are told apart by reading each candidate (at most 500 runs per page: a rare filter returns a short page and a token to continue) |
+| `statusTimestampAfter` | the last change at or after it (inclusive) |
+| `pageSize` | 50 by default, 1 to 100 (a larger value is clamped, zero and negative mean the default) |
+| `pageToken` | the `nextPageToken` of a page of **the same caller and filters**; anything else, forged or not, is `InvalidParams` ("invalid page token") |
+| `historyLength`, `includeArtifacts` | as in the specification: `artifacts` is omitted entirely unless asked |
+| response | `tasks`, `nextPageToken` (empty on the last page), `pageSize`, `totalSize`: **exact without a status filter and for `completed`, an upper bound for the other states** (counting them exactly would read every run) |
+
+The token is a cursor (the position of the last task), not an offset, and bound to the caller and the filters by a digest;
+it is not signed, and a forged position can only move within the forger's own tasks.
+
+## The extended card
+
+`GetExtendedAgentCard` returns the public card plus what the agent adds for authenticated callers: in an agent folder,
+`card.extended` with a `description` (replaces the public one) and `skills` (added; the id of a public skill replaces it);
+in code, `AgentCardConfig::with_extended_card` (which can add extensions too, and an extension only the extended card declares
+can be activated by an authenticated caller). Only with bearer authentication: an anonymous server has none, the card says
+`extendedAgentCard: false`, and the method answers `UnsupportedOperation`. The extended card holds no secret: put nothing
+in it that you would not give every holder of a token.
+
+## The card's signature
+
+With `A2A_CARD_SIGNING_KEY_FILE` the public and the extended card carry one JWS in `signatures` (RFC 7515 over the RFC 8785
+canonical card, *verified 2026-10-07*, specification §8.4): `alg` `ES256` (a P-256 key) or `EdDSA` (Ed25519), `typ: JOSE`,
+`kid` (the key's RFC 7638 thumbprint unless `A2A_CARD_SIGNING_KEY_ID`), `jku` only if `A2A_CARD_SIGNING_JKU`. The public key
+set is served at `GET /.well-known/jwks.json`. To verify: take the card as you received it (either JSON form parses to the
+same card), remove `signatures`, remove `null`s and empty arrays and objects except `capabilities`, `defaultInputModes`,
+`defaultOutputModes`, `skills`, `supportedInterfaces` and a skill's `tags`, remove an extension's `required: false`, leave
+`securityRequirements` and extension `params` as they are, canonicalize with RFC 8785, and verify
+`BASE64URL(protected) + "." + BASE64URL(payload)`. In Rust: `adam_a2a::VerifyingKey::from_jwk(&jwks, kid)` and
+`verify_card(&card)`. *Unverified:* that the payload equals another SDK's byte for byte (the specification has no test
+vector); generate a key with `openssl genpkey -algorithm ed25519` (or `-algorithm EC -pkeyopt ec_paramgen_curve:P-256`).
 
 ## Follow-ups
 

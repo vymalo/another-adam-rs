@@ -51,6 +51,7 @@ flowchart LR
         end
         subgraph a2a_e["adam-a2a"]
             BackendError
+            PushStoreError
         end
         subgraph llm_e["adam-llm-agent"]
             ToolError
@@ -126,6 +127,10 @@ flowchart LR
     BackendError -->|InvalidParams| Invalid
     BackendError -->|Unavailable| Transient
     BackendError -->|Internal| Internal
+    PushStoreError -->|NotFound| NotFound
+    PushStoreError -->|Conflict| Conflict
+    PushStoreError -->|Unavailable| Transient
+    PushStoreError -->|Internal| Internal
 
     ToolError -->|Transient| Transient
     ToolError -->|Permanent| Invalid
@@ -186,7 +191,10 @@ Where each decision is made:
   retryable classes to `Unavailable`, the rest to `Internal`. Then `adam-a2a`
   maps each `BackendError` to a code (`crates/adam-a2a/src/backend.rs`). The
   client gets a fixed sentence. The cause chain goes to the log, never to the
-  client. `-32002` (task cannot be canceled) comes from
+  client. A `PushStoreError` (the push-notification configs) takes the same road in
+  `crates/adam-a2a/src/handler.rs` (`push_error`): `NotFound` is `TaskNotFound`, the rest a `BackendError`
+  `Unavailable` or `Internal`; the deliverer decides from the class and never tells a client.
+  `-32002` (task cannot be canceled) comes from
   `BackendError::NotCancelable`, which the backend raises when `CancelTask`
   targets a task that is finished and not already canceled.
 * **The exit code** is chosen by `adam_coder::exit_code`
@@ -219,7 +227,7 @@ the coder's own errors in `bin/adam-coder/src/exit.rs`):
 | Code | Meaning |
 |---|---|
 | 0 | clean shutdown after SIGTERM |
-| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, any other `Invalid` error) |
+| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, `ServeError::Push`: push notifications are on and cannot be set up, any other `Invalid` error). A bad `A2A_PUSH_*` or `A2A_CARD_SIGNING_*` value is a `ConfigError` |
 | 69 | a dependency unreachable at boot (Postgres) |
 | 71 | an OS error (a port that cannot bind, a directory that cannot be created) |
 | 70 | a half of the process stopped, a panic or an internal error |
