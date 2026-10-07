@@ -6,6 +6,7 @@ The Helm chart of the operator: **one replica**
 of the `adam-operator` binary ([`bin/adam-operator`](../../bin/adam-operator/README.md)), which reconciles `AgentService` and `AgentConfig` in
 **one namespace** and serves the agent registry. The CRDs are another chart, [`deploy/operator-crds`](../operator-crds/README.md)
 (a separate Argo CD app); the agents are custom resources of their own ([`examples/`](examples)), not part of this chart.
+To run an agent with it, see the guide [Run agents with the operator](../../docs/guides/run-agents-with-the-operator.md).
 
 ```mermaid
 flowchart LR

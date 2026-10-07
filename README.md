@@ -77,7 +77,7 @@ the agent registry. Image `ghcr.io/vymalo/another-adam-rs/operator`, charts [`de
 |---|---|
 | [`docs/`](docs/README.md) | the index |
 | [Architecture](docs/architecture.md) | the crate map, the path of a task, the run lifecycle, the data schema |
-| [Guides](docs/guides/) | [run locally](docs/guides/run-locally.md), [write an agent](docs/guides/write-an-agent.md), [deploy the coder](docs/guides/deploy-the-coder.md), [embed adam](docs/guides/embed-adam.md), [testing](docs/guides/testing.md) |
+| [Guides](docs/guides/) | [run locally](docs/guides/run-locally.md), [write an agent](docs/guides/write-an-agent.md), [deploy the coder](docs/guides/deploy-the-coder.md), [run agents with the operator](docs/guides/run-agents-with-the-operator.md), [embed adam](docs/guides/embed-adam.md), [testing](docs/guides/testing.md) |
 | [Reference](docs/reference/) | [environment variables](docs/reference/environment.md), [agent files](docs/reference/agent-files.md), [errors](docs/reference/errors.md), [store adapters](docs/reference/store-adapters.md), [the local stack](docs/reference/dev-stack.md) |
 | [Decisions](docs/decisions/) | ADRs: why it is the way it is |
 | [Crates](docs/architecture.md#the-crate-map) | every crate has a `README.md` next to its `Cargo.toml` |
