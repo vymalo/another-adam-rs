@@ -555,6 +555,23 @@ control plane that runs for as long as a task does: delivery is a loop in the po
 leases. `extraEnv` may not set `A2A_PUSH_ALLOWED_URLS` or `A2A_CARD_SIGNING_KEY_FILE` while the value that sets it is on. The
 extended agent card needs no value: it is `card.extended` in the agent's folder.
 
+## Swagger UI
+
+Every A2A server serves Swagger UI at `/docs` and its OpenAPI document at `/openapi.json`, both public, both bindings
+(JSON-RPC and HTTP+JSON) behind the bearer token
+([ADR 0031](../../docs/decisions/0031-swagger-ui-and-the-a2a-rest-binding.md)). The chart adds **no route** to them: the
+Service stays ClusterIP and in-cluster. Reach them with a port-forward to the Service (the pods that serve A2A):
+
+```sh
+kubectl -n another-agentic-system port-forward svc/coder 8080:8080
+# then open http://127.0.0.1:8080/docs, press Authorize and paste a token from A2A_BEARER_TOKENS
+```
+
+Try it out calls the address the page was opened from, so it works through the port-forward; the `curl` a streaming
+operation shows uses the card's URL (`PUBLIC_URL`), replace it with `http://127.0.0.1:8080`. To turn the docs off set
+`config.extraEnv.A2A_DOCS: "false"`. *Unverified:* that the chart's ingress-only `NetworkPolicy` lets a port-forward
+through (it reaches the pod through the kubelet, not from another namespace); this was not tried on the cluster.
+
 ## Run pods
 
 `runPods.enabled: true` ([ADR 0019](../../docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)) runs the processes of each active

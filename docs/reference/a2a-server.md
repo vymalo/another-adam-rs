@@ -1,6 +1,6 @@
 # The A2A server: what a client sees
 
-How a task looks from outside: the methods, follow-ups, continuing a finished task, push notifications, listing,
+How a task looks from outside: the methods and the two bindings, Swagger UI, follow-ups, continuing a finished task, push notifications, listing,
 the extended card, the card's signature, and the three live streams (steps, text, reasoning). The request path itself is in
 [Architecture](../architecture.md#request-in-events-out). Code: `crates/adam-a2a` (server),
 `crates/adam-a2a-runtime` (backend over the runtime). Extensions: the `adam-a2a-extensions` skill and
@@ -20,6 +20,32 @@ answer with the matching error).
 | `CreateTaskPushNotificationConfig`, `GetTaskPushNotificationConfig`, `ListTaskPushNotificationConfigs`, `DeleteTaskPushNotificationConfig`, and `configuration.taskPushNotificationConfig` of a send | `A2A_PUSH_ALLOWED_URLS` | `PushNotificationNotSupported`; `capabilities.pushNotifications` is false |
 | `GetExtendedAgentCard` | an extended card (`card.extended` of the agent folder) **and** bearer authentication | `UnsupportedOperation`; `capabilities.extendedAgentCard` is false |
 | the card's `signatures` and `GET /.well-known/jwks.json` | `A2A_CARD_SIGNING_KEY_FILE` | no signature, no key set |
+| Swagger UI at `GET /docs` and the OpenAPI document at `GET /openapi.json`, both public | on unless `A2A_DOCS=false` | `401` without a token, `404` with one |
+
+## Two bindings, one handler
+
+Every method is served over JSON-RPC (`POST /`, the method in the body) and over HTTP+JSON (A2A 1.0 §11, *verified
+2026-10-07* against <https://a2a-protocol.org/latest/specification/>), by the SDK's `rest_router` over the same handler
+([ADR 0031](../decisions/0031-swagger-ui-and-the-a2a-rest-binding.md)). The card lists `JSONRPC` first, then `HTTP+JSON`,
+at the same URL (`PUBLIC_URL`): the REST paths are relative to it.
+
+| Method | HTTP+JSON |
+|---|---|
+| `SendMessage`, `SendStreamingMessage` | `POST /message:send`, `POST /message:stream` (SSE) |
+| `GetTask`, `ListTasks` | `GET /tasks/{id}?historyLength=`, `GET /tasks?contextId=&status=&pageSize=&pageToken=&...` |
+| `CancelTask`, `SubscribeToTask` | `POST /tasks/{id}:cancel`, `POST /tasks/{id}:subscribe` (SSE) |
+| the four push-config methods | `POST` and `GET /tasks/{id}/pushNotificationConfigs`, `GET` and `DELETE /tasks/{id}/pushNotificationConfigs/{configId}` |
+| `GetExtendedAgentCard` | `GET /extendedAgentCard` |
+
+* **Errors** are the HTTP status of the A2A error with a `google.rpc.Status` body whose `details` end with an `ErrorInfo`
+  naming it (`TASK_NOT_FOUND` is 404, `TASK_NOT_CANCELABLE`, `UNSUPPORTED_OPERATION`, `PUSH_NOTIFICATION_NOT_SUPPORTED` and
+  `INVALID_PARAMS` are 400, a backend failure 500). A missing token is `401` `UNAUTHENTICATED`.
+* Requests may be `application/json` or `application/a2a+json`; answers are `application/json`. The SDK also answers the
+  paths of earlier drafts (`/message/send`, `/tasks/{id}/cancel`, `/tasks/{id}/push-configs`, `/agent-card/extended`,
+  `GET /tasks/{id}:subscribe`): Swagger UI lists them as deprecated.
+* **Swagger UI** (`/docs`) documents both bindings: press **Authorize**, paste a token, then **Try it out**. For JSON-RPC,
+  pick a method in the example dropdown. Swagger UI cannot show a stream as it arrives: a streaming operation's description
+  gives the `curl`. The page loads nothing from another origin and the document holds no secret.
 
 ## Push notifications
 

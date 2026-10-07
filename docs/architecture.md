@@ -289,7 +289,8 @@ flowchart LR
 
 ## The path of a task
 
-A task is a run. A client talks JSON-RPC over HTTP to the server in `adam-a2a`, which hands the request
+A task is a run. A client talks JSON-RPC (or HTTP+JSON: the same handler, [below](#swagger-ui-and-the-rest-binding))
+over HTTP to the server in `adam-a2a`, which hands the request
 to a `TaskBackend` (`adam-a2a-runtime`); that starts or feeds a run in the `Runtime`. A worker advances
 the run one step at a time and commits each step. The client sees progress as events on an SSE stream.
 
@@ -350,8 +351,9 @@ sequenceDiagram
 
 Rules this diagram cannot show:
 
-* **Fail closed.** Only `GET /.well-known/agent-card.json` and `GET /healthz` are public; an empty token
-  list rejects everything (`crates/adam-a2a/src/auth.rs`).
+* **Fail closed.** Only `GET /.well-known/agent-card.json`, `GET /healthz`, the docs (`GET /docs`, its files and
+  `GET /openapi.json`, unless `A2A_DOCS=false`) and, when the card is signed, `GET /.well-known/jwks.json` are public; an
+  empty token list rejects everything (`crates/adam-a2a/src/auth.rs`).
 * **Errors are HTTP 200** with a JSON-RPC error object; the mapping is in [Errors](#errors).
 * **Ownership needs no side table**: the caller's subject is part of the run's conversation id
   (`subject:context id`). Someone else's task looks like one that does not exist.
@@ -365,6 +367,57 @@ Rules this diagram cannot show:
 
 Follow-ups, `referenceTaskIds`, steering, steps and streamed text are in the
 [A2A server reference](reference/a2a-server.md).
+
+### Swagger UI and the REST binding
+
+Every agent serves A2A 1.0 twice over the same `BackendHandler`: JSON-RPC at `POST /` and HTTP+JSON at the paths of
+§11 of the specification (`POST /message:send`, `GET /tasks/{id}`, ...; `crates/adam-a2a/src/rest.rs`). The card lists
+`JSONRPC` first and `HTTP+JSON` second, at the same URL. Swagger UI at `/docs` documents both from one OpenAPI document
+([ADR 0031](decisions/0031-swagger-ui-and-the-a2a-rest-binding.md)). A person opens it and sends a message over REST:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Person (browser)
+    participant A as auth::authenticate<br/>adam-a2a
+    participant D as docs::router<br/>adam-a2a
+    participant L as rest::rejections and<br/>echo_extensions
+    participant R as rest_router<br/>a2a-server-lf
+    participant H as BackendHandler
+    participant B as TaskBackend
+
+    P->>A: GET /docs
+    A->>D: public: Authenticator::is_open
+    D-->>P: 303 Location docs/
+    P->>A: GET /docs/, its scripts and styles, /openapi.json
+    A->>D: public
+    D-->>P: Swagger UI (CSP: this origin only) and the document, built once by openapi::document
+    Note over P: Authorize: the token stays in the page's memory
+    P->>A: POST /message:send<br/>Authorization: Bearer token, A2A-Extensions
+    alt missing or wrong token
+        A-->>P: 401 google.rpc.Status UNAUTHENTICATED
+    end
+    A->>L: request + trusted caller header (token-N)
+    L->>L: bounded body, refuse configuration.pushNotificationConfig,<br/>activated = header and message.extensions the card declares
+    L->>R: request
+    R->>H: send_message(ServiceParams, SendMessageRequest)
+    H->>B: submit(caller, message, task_id, context_id)
+    B-->>H: Task
+    H-->>R: SendMessageResponse
+    R-->>L: 200 and the task, or an A2AError as google.rpc.Status
+    L-->>P: the response + A2A-Extensions: the activated ones
+```
+
+* **One handler.** `R->>H` is the call the JSON-RPC route makes too, with the same `ServiceParams`: identity, extensions,
+  push configs, `ListTasks` and the extended card behave the same on both bindings. A malformed REST request (not JSON,
+  a query string that does not parse, over 10 MiB) gets the binding's envelope (`PARSE_ERROR`, `INVALID_PARAMS`,
+  `INVALID_REQUEST`), never the extractor's plain text.
+* **The document is public and the same for everyone**: built once from the public card and the switches it shows
+  (push, the extended card, bearer), with no token and nothing of the extended card. Try it out calls the server the
+  page came from (the document's server is `.`).
+* **Streams** (`/message:stream`, `/tasks/{id}:subscribe`, and their JSON-RPC methods) cannot be watched in Swagger UI,
+  which waits for the whole response; their descriptions give the `curl`.
+* There is no state diagram: nothing here has a lifecycle (the document and the assets never change while the router runs).
 
 ### Push notification delivery
 
@@ -923,6 +976,10 @@ The Mermaid syntax of every diagram is checked in CI by `tools/docs-check`.
 **Verified 2026-09-29, executed:** the cross-process fan-out and the listener lifecycle
 (`crates/adam-notify-postgres/tests/two_runtimes.rs`, PostgreSQL 16) and the `NOTIFY` payload limit of
 8000 bytes (16.13 server); the continuation of a finished task (ADR 0003).
+
+**Verified 2026-10-07, executed:** Swagger UI at `/docs` of `adam-agent` (PostgreSQL 16, a stub model) in headless
+Chromium: rendered under its CSP with no error and no request to another origin, Authorize then Try it out over both
+bindings ([ADR 0031](decisions/0031-swagger-ui-and-the-a2a-rest-binding.md)).
 
 **Unverified:**
 

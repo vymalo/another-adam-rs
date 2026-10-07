@@ -22,7 +22,10 @@ forces a class decision.
 | `Internal` | a bug, or unclassified | no | **yes** | `-32603` "internal error" | 70 |
 
 The A2A server answers every JSON-RPC error with HTTP 200 and an error object. A body that is not JSON
-gets `-32700`, JSON that is not a request `-32600`, both with a null id.
+gets `-32700`, JSON that is not a request `-32600`, both with a null id. Over HTTP+JSON the same error is the HTTP status of
+the A2A error (`-32001` is 404, `-32002`, `-32004` and `-32602` are 400, `-32603` is 500) with a `google.rpc.Status` body
+whose `ErrorInfo` names it (`TASK_NOT_FOUND`, ...); a body that is not JSON is `PARSE_ERROR`, a query string that does not
+parse `INVALID_PARAMS` ([the two bindings](a2a-server.md#two-bindings-one-handler)).
 
 ## Which variant maps to which class
 

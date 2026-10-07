@@ -180,6 +180,7 @@ same way; every problem is reported at once at startup):
 | `A2A_PUSH_ALLOW_PRIVATE` | also allow loopback, private and link-local webhooks and `http` to loopback: development only | `false` |
 | `A2A_PUSH_GIVE_UP_AFTER_SECS`, `A2A_PUSH_REQUEST_TIMEOUT_SECS` | how long a notification may keep failing before delivery to that webhook is abandoned (1 to 604800), and how long one request may take (1 to 120) | `3600`, `15` |
 | `A2A_CARD_SIGNING_KEY_FILE`, `A2A_CARD_SIGNING_KEY_ID`, `A2A_CARD_SIGNING_JKU` | a PKCS#8 PEM key (ECDSA P-256 or Ed25519) that signs the agent card, its `kid` (default: the key's thumbprint) and its `jku` ; the server serves the key set at `/.well-known/jwks.json` | unset: unsigned |
+| `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, public; `false` turns them off ([`adam-service`](../../crates/adam-service/README.md#environment)) | `true` |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `WORKER_ID` | lease identity of this worker: 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process |
