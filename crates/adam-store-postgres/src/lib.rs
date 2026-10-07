@@ -38,8 +38,9 @@ use std::time::Duration;
 
 use adam_core::store::{add_ttl, now, sched_at, truncate_ms};
 use adam_core::{
-    ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord, PushState,
-    RunId, RunRecord, RunStatus, RunUpdate, Store, StoreError, StoreResult,
+    ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
+    PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreError,
+    StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -54,7 +55,8 @@ use uuid::Uuid;
 ///
 /// * 1: the first schema.
 /// * 2: `runs.owner`, the worker a pinned claim ties a run to (see [`ClaimScope`]).
-/// * 3: the `push` table (A2A push-notification configurations and their delivery progress).
+/// * 3: the `push` table (A2A push-notification configurations and their delivery progress) and
+///   the index `ListTasks` reads runs by (`runs_list`).
 pub const SCHEMA_VERSION: i32 = 3;
 
 /// Purge deletes in batches of this many runs (plus their journals).
@@ -210,6 +212,10 @@ struct Sql {
     release_lease: Arc<str>,
     lease_until: Arc<str>,
     purge: Arc<str>,
+    list_prefix: Arc<str>,
+    list_exact: Arc<str>,
+    count_prefix: Arc<str>,
+    count_exact: Arc<str>,
     push_put: Arc<str>,
     push_list: Arc<str>,
     push_delete: Arc<str>,
@@ -301,6 +307,13 @@ impl Sql {
                  WHERE status IN ('done', 'failed')"
             ),
             format!("CREATE INDEX IF NOT EXISTS {p}runs_parent ON {runs} (parent_id) WHERE parent_id IS NOT NULL"),
+            // Listing an owner's runs, newest first (`ListTasks`): the conversation id is compared
+            // in the "C" collation, so that a prefix is a range the index can serve.
+            format!(
+                "CREATE INDEX IF NOT EXISTS {p}runs_list
+                 ON {runs} (agent, (conversation_id COLLATE \"C\"), updated_at DESC, id DESC)
+                 WHERE conversation_id IS NOT NULL"
+            ),
             format!(
                 "CREATE TABLE IF NOT EXISTS {journal} (
                     run_id      UUID        NOT NULL REFERENCES {runs} (id) ON DELETE CASCADE,
@@ -378,6 +391,10 @@ impl Sql {
                      FOR UPDATE SKIP LOCKED
                   )"
             )),
+            list_prefix: Arc::from(list_sql(&runs, Scope::Prefix)),
+            list_exact: Arc::from(list_sql(&runs, Scope::Exact)),
+            count_prefix: Arc::from(count_sql(&runs, Scope::Prefix)),
+            count_exact: Arc::from(count_sql(&runs, Scope::Exact)),
             push_put: Arc::from(format!(
                 "INSERT INTO {push} (run_id, id, agent, owner, config, cursor, state, attempts,
                                     last_error, next_attempt_at, version, created_at, updated_at)
@@ -459,11 +476,68 @@ fn claim_due_sql(runs: &str, scope: ClaimScope) -> String {
     )
 }
 
+#[derive(Clone, Copy)]
+enum Scope {
+    Prefix,
+    Exact,
+}
+
+/// The listing statement. `$1` agent, `$2` statuses (or `NULL`), `$3` updated since (or `NULL`),
+/// `$4` and `$5` the position to continue after (or `NULL`), `$6` the limit, `$7` the scope (the
+/// prefix, or the conversation) and `$8` the first text above every text that starts with the
+/// prefix (`NULL` for an exact scope). The prefix is a range over the index **and** an exact
+/// `starts_with`, so the range may be wide but never wrong.
+fn list_sql(runs: &str, scope: Scope) -> String {
+    format!(
+        "SELECT {RUN_COLUMNS} FROM {runs}
+          WHERE agent = $1
+            AND {}
+            AND ($2::text[] IS NULL OR status = ANY($2))
+            AND ($3::timestamptz IS NULL OR updated_at >= $3)
+            AND ($4::timestamptz IS NULL OR (updated_at, id) < ($4, $5::uuid))
+          ORDER BY updated_at DESC, id DESC
+          LIMIT $6",
+        scope_sql(scope, "$7", "$8")
+    )
+}
+
+/// The counting statement: `$1` agent, `$2` statuses, `$3` updated since, `$4` the scope, `$5` the
+/// bound of a prefix (as in [`list_sql`], without the position and the limit).
+fn count_sql(runs: &str, scope: Scope) -> String {
+    format!(
+        "SELECT count(*) FROM {runs}
+          WHERE agent = $1
+            AND {}
+            AND ($2::text[] IS NULL OR status = ANY($2))
+            AND ($3::timestamptz IS NULL OR updated_at >= $3)",
+        scope_sql(scope, "$4", "$5")
+    )
+}
+
+fn scope_sql(scope: Scope, text: &str, bound: &str) -> String {
+    match scope {
+        Scope::Prefix => format!(
+            "conversation_id COLLATE \"C\" >= {text} AND conversation_id COLLATE \"C\" < {bound}
+             AND starts_with(conversation_id, {text})"
+        ),
+        Scope::Exact => format!("conversation_id COLLATE \"C\" = {text} AND {bound}::text IS NULL"),
+    }
+}
+
 /// Every statement is built once in [`Sql::new`] from constant text plus the
 /// table prefix, which [`PgStore::with_table_prefix`] restricts to
 /// `[a-z0-9_]`. Values always go through bind parameters.
 fn safe(sql: &Arc<str>) -> AssertSqlSafe<Arc<str>> {
     AssertSqlSafe(Arc::clone(sql))
+}
+
+/// The first text above every text that starts with `prefix` in the "C" collation (byte order):
+/// the prefix and the highest code point. Any text with the prefix is below it, and the
+/// `starts_with` of the statement makes the bound's looseness harmless.
+fn prefix_end(prefix: &str) -> String {
+    let mut end = prefix.to_owned();
+    end.push(char::MAX);
+    end
 }
 
 fn to_i64(n: u64, what: &str) -> StoreResult<i64> {
@@ -786,6 +860,53 @@ impl Store for PgStore {
             .transpose()
             .map_err(classify)?;
         Ok(until.flatten())
+    }
+
+    async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
+        let (statement, scope, upper) = match &query.scope {
+            ConversationScope::Prefix(p) => (&self.sql.list_prefix, p.clone(), Some(prefix_end(p))),
+            ConversationScope::Exact(e) => (&self.sql.list_exact, e.clone(), None),
+        };
+        let statuses: Option<Vec<String>> = query
+            .statuses
+            .as_ref()
+            .map(|s| s.iter().map(|s| s.as_str().to_owned()).collect());
+        let rows = sqlx::query(safe(statement))
+            .bind(&query.agent)
+            .bind(statuses)
+            .bind(query.updated_since.map(truncate_ms))
+            .bind(query.after.map(|(at, _)| truncate_ms(at)))
+            .bind(query.after.map(|(_, id)| id.0))
+            .bind(i64::try_from(query.limit).unwrap_or(i64::MAX))
+            .bind(scope)
+            .bind(upper)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(classify)?;
+        rows.iter().map(run_from_row).collect()
+    }
+
+    async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
+        let (statement, scope, upper) = match &query.scope {
+            ConversationScope::Prefix(p) => {
+                (&self.sql.count_prefix, p.clone(), Some(prefix_end(p)))
+            }
+            ConversationScope::Exact(e) => (&self.sql.count_exact, e.clone(), None),
+        };
+        let statuses: Option<Vec<String>> = query
+            .statuses
+            .as_ref()
+            .map(|s| s.iter().map(|s| s.as_str().to_owned()).collect());
+        let count: i64 = sqlx::query_scalar(safe(statement))
+            .bind(&query.agent)
+            .bind(statuses)
+            .bind(query.updated_since.map(truncate_ms))
+            .bind(scope)
+            .bind(upper)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(classify)?;
+        u64::try_from(count).map_err(|_| StoreError::Corrupt(format!("negative count {count}")))
     }
 
     async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {

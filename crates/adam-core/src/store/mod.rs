@@ -42,6 +42,7 @@
 
 pub mod memory;
 pub mod push;
+pub mod query;
 
 use std::fmt;
 use std::sync::Arc;
@@ -55,6 +56,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub use push::{NewPushConfig, PushProgress, PushRecord, PushState};
+pub use query::{ConversationScope, RunQuery};
 
 /// Identifier of a run. UUIDv7 by default, so ids sort roughly by creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -497,6 +499,17 @@ pub trait Store: Send + Sync + 'static {
     /// how a reader that is not a worker (the A2A server, which may run in another process) learns
     /// that a worker is stepping a run: see `RunView::claimed` in `adam-runtime`.
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>>;
+
+    /// The runs `query` selects, ordered by `updated_at` descending and then `id` descending, one
+    /// page of at most `query.limit`: the keyset page that starts strictly after `query.after`.
+    ///
+    /// The scope is required, so a listing is always one owner's (or one conversation's) runs.
+    /// Every adapter indexes it: a page is one indexed read, however deep.
+    async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>>;
+
+    /// How many runs match `query`'s filters (its `after` and `limit` are ignored): the total
+    /// before pagination.
+    async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64>;
 
     /// Create or replace the push configuration `(new.run, new.id)` and return it.
     ///

@@ -41,7 +41,7 @@ table is in the [store adapters reference](../../docs/reference/store-adapters.m
 
 ## Schema version 3: the push table
 
-`migrate()` creates `<prefix>push` and its index **before** the statements that lock `runs`
+`migrate()` also creates the index `ListTasks` reads runs by (`<prefix>runs_list`: `(agent, conversation_id COLLATE "C", updated_at DESC, id DESC)`; a conversation prefix is a range over it plus an exact `starts_with`). It creates `<prefix>push` and its index **before** the statements that lock `runs`
 exclusively, so a migration takes its locks in the order a `push_put` does and the two cannot
 deadlock (found by the conformance suite, whose cases all migrate). Claiming push configs is
 `FOR UPDATE SKIP LOCKED` in one statement, progress is `UPDATE .. WHERE version = $expected`, and

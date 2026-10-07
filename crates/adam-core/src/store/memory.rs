@@ -10,7 +10,8 @@ use tokio::sync::Mutex;
 
 use super::{
     ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord, PushState,
-    RunId, RunRecord, RunUpdate, Store, StoreError, StoreResult, add_ttl, now, truncate_ms,
+    RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult, add_ttl, now,
+    truncate_ms,
 };
 
 #[derive(Default)]
@@ -283,6 +284,34 @@ impl Store for MemoryStore {
             .get(&id)
             .and_then(|slot| slot.lease.as_ref())
             .map(|(_, until)| *until))
+    }
+
+    async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
+        let inner = self.inner.lock().await;
+        let mut found: Vec<RunRecord> = inner
+            .runs
+            .values()
+            .map(|s| &s.run)
+            .filter(|r| query.matches(r))
+            .filter(|r| {
+                query
+                    .after
+                    .is_none_or(|(at, id)| (r.updated_at, r.id) < (at, id))
+            })
+            .cloned()
+            .collect();
+        found.sort_by(|a, b| (b.updated_at, b.id).cmp(&(a.updated_at, a.id)));
+        found.truncate(query.limit);
+        Ok(found)
+    }
+
+    async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .runs
+            .values()
+            .filter(|s| query.matches(&s.run))
+            .count() as u64)
     }
 
     async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {

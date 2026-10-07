@@ -13,11 +13,11 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (39
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (43
   cases: create/load, state round trip, CAS conflicts, concurrent commits,
   journal ordering and first-writer-wins, claim rules and exclusivity, busy runs
   that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
-  run owner, one open run per conversation, purge, and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
+  run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes, `count_runs`), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.

@@ -54,7 +54,9 @@ requirement is `3.9` (verified 2026-09-29, `Cargo.toml`).
 `<prefix>push` holds the A2A push-notification configs: `_id` is `"<run id>:<config id>"`, with
 `run_id`, `agent`, `owner`, `config` (the webhook credentials as the client gave them) and
 `cursor` as BSON, the scheduling fields (`state`, `next_attempt_at`, `lease_until`) and `version`.
-Indexes: `(agent, state, next_attempt_at)` for claiming and `(run_id, id)` for listing. Claiming is
+Indexes: `(agent, state, next_attempt_at)` for claiming and `(run_id, id)` for listing. Runs get `adam_list`
+(`agent, conversation_id, updated_at -1, _id -1`) for `list_runs`, which matches a conversation prefix with an anchored,
+escaped regular expression and leaves out runs a purge has tombstoned. Claiming is
 a loop of `findOneAndUpdate` (each atomic on its document, so two workers never lease one config),
 progress is `findOneAndUpdate({_id, version: expected})`, and the purge deletes a purged run's
 configs after its journal. Still single-document writes only, so a standalone `mongod` is enough.

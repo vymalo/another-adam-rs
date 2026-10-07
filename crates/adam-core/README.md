@@ -16,12 +16,13 @@ database driver.
 
 | Item | What |
 |---|---|
-| `Store` (trait) | `migrate`, `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs of the runs it purges), and the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*) |
+| `Store` (trait) | `migrate`, `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs of the runs it purges), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), and the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*) |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
 | `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
 | `ClaimScope` | `Any` (default) or `Pinned`, the scope of a `claim_due`. Closed: no `#[non_exhaustive]` |
 | `Lease` | a run claimed by a worker until a deadline |
+| `RunQuery`, `ConversationScope` | what `list_runs` and `count_runs` select: always scoped (`Prefix` of an owner's conversations, or `Exact`), optionally by run statuses and last update, one page after a `(updated_at, id)` position |
 | `NewPushConfig`, `PushRecord`, `PushProgress`, `PushState` | an A2A push-notification configuration and how far its delivery got; `PushState` (`Active`, `Done`, `GaveUp`) is closed on purpose |
 | `StoreError`, `StoreResult` | `AlreadyExists`, `NotFound`, `Conflict`, `ConversationBusy`, `NonDeterminism`, `InvalidInput`, `Corrupt`, `Backend { class, source }`; `#[non_exhaustive]`, see *Errors* |
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
@@ -62,6 +63,16 @@ about `Placement`; the host maps `Placement::pins_runs()` to `ClaimScope::Pinned
 ([`adam-host`](../adam-host/README.md)). The signature change is breaking for anyone who
 implements `Store`; the conformance cases in
 [`adam-store-testkit`](../adam-store-testkit/README.md) prove an implementation.
+
+## Listing runs
+
+`Store::list_runs(&RunQuery)` returns one page of runs ordered by `updated_at` descending and then `id` descending (what A2A's
+`ListTasks` needs: most recently updated first, made total by the id), starting strictly after `query.after`, and
+`Store::count_runs` how many match the filters (ignoring `after` and `limit`). The scope is required, so a listing cannot leak
+another owner's runs by leaving a filter out: `ConversationScope::Prefix` for everything of an owner (the A2A server uses
+`<subject>:`), `Exact` for one conversation. Every adapter serves a page from an index (Postgres compares the conversation id
+in the `"C"` collation so a prefix is a range, MongoDB uses an anchored escaped prefix). Two more **required** `Store` methods:
+breaking for implementers, proved by the `list_runs_*` and `count_runs_*` conformance cases.
 
 ## Push configurations
 

@@ -29,8 +29,8 @@ use std::time::Duration;
 
 use adam_core::store::{now, truncate_ms};
 use adam_core::{
-    ClaimScope, DynStore, JournalEntry, NewPushConfig, NewRun, PushProgress, PushState, RunId,
-    RunStatus, RunUpdate, StoreError,
+    ClaimScope, ConversationScope, DynStore, JournalEntry, NewPushConfig, NewRun, PushProgress,
+    PushState, RunId, RunQuery, RunStatus, RunUpdate, StoreError,
 };
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
@@ -66,6 +66,8 @@ macro_rules! store_conformance {
             push_claim_is_exclusive_under_concurrency, push_commit_advances_and_releases,
             push_commit_detects_stale_versions_and_missing_configs,
             push_configs_go_with_their_run,
+            list_runs_is_scoped_ordered_and_pages_by_keyset, list_runs_filters_by_status_and_time,
+            list_runs_scopes_match_exactly, count_runs_ignores_the_page,
         );
     };
     (@cases $make:path; $($case:ident),* $(,)?) => {
@@ -1520,19 +1522,19 @@ pub mod cases {
         );
         assert!(
             store
-                .push_claim_due(&[agent.clone()], "w", at, ttl, 0)
+                .push_claim_due(std::slice::from_ref(&agent), "w", at, ttl, 0)
                 .await
                 .unwrap()
                 .is_empty()
         );
         let two = store
-            .push_claim_due(&[agent.clone()], "w", at, ttl, 2)
+            .push_claim_due(std::slice::from_ref(&agent), "w", at, ttl, 2)
             .await
             .unwrap();
         assert_eq!(two.len(), 2);
         assert!(two.iter().all(|r| r.agent == agent));
         let rest = store
-            .push_claim_due(&[agent.clone()], "w", at, ttl, 10)
+            .push_claim_due(std::slice::from_ref(&agent), "w", at, ttl, 10)
             .await
             .unwrap();
         assert_eq!(
@@ -1541,7 +1543,7 @@ pub mod cases {
             "the third; the foreign agent's is never taken"
         );
         let theirs = store
-            .push_claim_due(&[other.clone()], "w", at, ttl, 10)
+            .push_claim_due(std::slice::from_ref(&other), "w", at, ttl, 10)
             .await
             .unwrap();
         assert_eq!(theirs.len(), 1);
@@ -1759,11 +1761,237 @@ pub mod cases {
         // Nothing of the purged run is claimable either.
         let at = now() + chrono::Duration::seconds(1);
         let claimed = store
-            .push_claim_due(&[agent.clone()], "w", at, Duration::from_secs(60), 10)
+            .push_claim_due(
+                std::slice::from_ref(&agent),
+                "w",
+                at,
+                Duration::from_secs(60),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].run, open.id);
+    }
+
+    /// Runs in two owners' conversations (`a:` and `b:`, with a decoy whose prefix differs only by
+    /// a wildcard character), each committed at a distinct time, plus a foreign agent's run.
+    async fn listing_fixture(store: &DynStore, agent: &str) -> Vec<adam_core::RunRecord> {
+        let mut made = Vec::new();
+        for (i, conversation) in ["a:1", "b:1", "a:2", "a:3", "b:2", "a:4"]
+            .into_iter()
+            .enumerate()
+        {
+            let status = if i % 2 == 0 {
+                RunStatus::Parked
+            } else {
+                RunStatus::Runnable
+            };
+            let run = store
+                .create_run(
+                    NewRun::new(agent, json!(i))
+                        .conversation(conversation)
+                        .status(status),
+                )
+                .await
+                .unwrap();
+            // Distinct, increasing update times (milliseconds are the store's resolution).
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            made.push(run);
+        }
+        // Commits move `updated_at`: the first run becomes the most recently updated.
+        let first = made[0].clone();
+        made[0] = store
+            .commit_run(
+                first.id,
+                first.version,
+                RunUpdate::new(RunStatus::Done, json!("done")),
+            )
+            .await
+            .unwrap();
+        made
+    }
+
+    pub async fn list_runs_is_scoped_ordered_and_pages_by_keyset(store: DynStore) {
+        let agent = agent();
+        let made = listing_fixture(&store, &agent).await;
+        // A foreign agent's run in the same conversation namespace is never listed.
+        store
+            .create_run(NewRun::new(super::agent(), json!(0)).conversation("a:9"))
+            .await
+            .unwrap();
+        let query = |limit| RunQuery::new(&agent, ConversationScope::Prefix("a:".into()), limit);
+        let all = store.list_runs(&query(100)).await.unwrap();
+        let mut want: Vec<_> = made
+            .iter()
+            .filter(|r| {
+                r.conversation_id
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("a:"))
+            })
+            .cloned()
+            .collect();
+        want.sort_by(|x, y| (y.updated_at, y.id).cmp(&(x.updated_at, x.id)));
+        assert_eq!(
+            all, want,
+            "the owner's runs, newest update first, id breaking ties"
+        );
+        assert_eq!(all[0].id, made[0].id, "the run committed last is first");
+        assert!(all.iter().all(|r| r.agent == agent));
+
+        // Keyset pages of 3 cover the same list, once each, and the last page is short.
+        let mut seen: Vec<RunId> = Vec::new();
+        let mut after = None;
+        loop {
+            let mut q = query(3);
+            q.after = after;
+            let page = store.list_runs(&q).await.unwrap();
+            assert!(page.len() <= 3);
+            seen.extend(page.iter().map(|r| r.id));
+            match page.last() {
+                Some(last) if page.len() == 3 => after = Some((last.updated_at, last.id)),
+                _ => break,
+            }
+        }
+        assert_eq!(seen, want.iter().map(|r| r.id).collect::<Vec<_>>());
+        // A position past the end is empty; a limit of zero returns nothing.
+        let mut q = query(10);
+        let oldest = want.last().unwrap();
+        q.after = Some((oldest.updated_at, oldest.id));
+        assert!(store.list_runs(&q).await.unwrap().is_empty());
+        assert!(store.list_runs(&query(0)).await.unwrap().is_empty());
+        // Another owner's namespace is its own list.
+        let b = store
+            .list_runs(&RunQuery::new(
+                &agent,
+                ConversationScope::Prefix("b:".into()),
+                100,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(b.len(), 2);
+        assert!(
+            b.iter()
+                .all(|r| r.conversation_id.as_deref().unwrap().starts_with("b:"))
+        );
+    }
+
+    pub async fn list_runs_filters_by_status_and_time(store: DynStore) {
+        let agent = agent();
+        let made = listing_fixture(&store, &agent).await;
+        let scope = || ConversationScope::Prefix("a:".into());
+        let mut q = RunQuery::new(&agent, scope(), 100);
+        q.statuses = Some(vec![RunStatus::Done]);
+        let done = store.list_runs(&q).await.unwrap();
+        assert_eq!(
+            done.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![made[0].id]
+        );
+        q.statuses = Some(vec![RunStatus::Runnable, RunStatus::Parked]);
+        let open = store.list_runs(&q).await.unwrap();
+        assert_eq!(open.len(), 3, "a:2 a:3 a:4 are open; a:1 is done");
+        q.statuses = Some(vec![]);
+        assert!(
+            store.list_runs(&q).await.unwrap().is_empty(),
+            "no status at all matches nothing"
+        );
+        // Updated at or after an instant: the boundary run is included.
+        let mut q = RunQuery::new(&agent, scope(), 100);
+        let all = store.list_runs(&q).await.unwrap();
+        let cut = all[1].updated_at;
+        q.updated_since = Some(cut);
+        let since = store.list_runs(&q).await.unwrap();
+        assert!(since.iter().all(|r| r.updated_at >= cut));
+        assert!(since.iter().any(|r| r.id == all[1].id), "at or after");
+        q.updated_since = Some(all[0].updated_at + chrono::Duration::seconds(1));
+        assert!(store.list_runs(&q).await.unwrap().is_empty());
+    }
+
+    pub async fn list_runs_scopes_match_exactly(store: DynStore) {
+        let agent = agent();
+        // Prefixes with characters that are special in a pattern or a regular expression must
+        // match literally, and an exact scope is one conversation only.
+        for conversation in [
+            "a.b*c:1", "aXbbc:1", "a.b*c:2", "100%_x:1", "100Zzx:1", "(x|y):1", "xy:1", "ü:1",
+            "u:1",
+        ] {
+            store
+                .create_run(NewRun::new(&agent, json!({})).conversation(conversation))
+                .await
+                .unwrap();
+        }
+        let count = |scope: ConversationScope| {
+            let store = store.clone();
+            let agent = agent.clone();
+            async move {
+                store
+                    .list_runs(&RunQuery::new(&agent, scope, 100))
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+        assert_eq!(count(ConversationScope::Prefix("a.b*c:".into())).await, 2);
+        assert_eq!(count(ConversationScope::Prefix("100%_x:".into())).await, 1);
+        assert_eq!(count(ConversationScope::Prefix("(x|y):".into())).await, 1);
+        assert_eq!(count(ConversationScope::Prefix("ü:".into())).await, 1);
+        assert_eq!(
+            count(ConversationScope::Prefix("".into())).await,
+            9,
+            "the empty prefix is everything of the agent"
+        );
+        assert_eq!(count(ConversationScope::Exact("a.b*c:1".into())).await, 1);
+        assert_eq!(count(ConversationScope::Exact("a.b*c".into())).await, 0);
+        assert_eq!(count(ConversationScope::Exact("nope".into())).await, 0);
+    }
+
+    pub async fn count_runs_ignores_the_page(store: DynStore) {
+        let agent = agent();
+        let made = listing_fixture(&store, &agent).await;
+        let mut q = RunQuery::new(&agent, ConversationScope::Prefix("a:".into()), 1);
+        assert_eq!(
+            store.count_runs(&q).await.unwrap(),
+            4,
+            "the limit is not the count"
+        );
+        q.after = Some((made[0].updated_at, made[0].id));
+        assert_eq!(
+            store.count_runs(&q).await.unwrap(),
+            4,
+            "neither is the position"
+        );
+        q.statuses = Some(vec![RunStatus::Parked]);
+        let listed = store
+            .list_runs(&RunQuery {
+                limit: 100,
+                after: None,
+                ..q.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(store.count_runs(&q).await.unwrap(), listed.len() as u64);
+        assert_eq!(
+            store
+                .count_runs(&RunQuery::new(
+                    &agent,
+                    ConversationScope::Exact("b:1".into()),
+                    1
+                ))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .count_runs(&RunQuery::new(
+                    super::agent(),
+                    ConversationScope::Prefix("a:".into()),
+                    1
+                ))
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     async fn claim_ids(

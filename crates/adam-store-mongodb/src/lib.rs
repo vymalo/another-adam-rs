@@ -46,8 +46,9 @@ use std::time::Duration;
 
 use adam_core::store::{add_ttl, now, open_conversation_key, sched_at, truncate_ms};
 use adam_core::{
-    ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord, PushState,
-    RunId, RunRecord, RunStatus, RunUpdate, Store, StoreError, StoreResult,
+    ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
+    PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreError,
+    StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -68,7 +69,8 @@ use codec::{bson_to_json, json_to_bson};
 /// * 1: the first schema.
 /// * 2: `owner` on runs (see [`ClaimScope`]). A missing field reads as no owner, so nothing
 ///   is rewritten; the number only says which release last migrated.
-/// * 3: the `push` collection (A2A push-notification configurations and their delivery progress).
+/// * 3: the `push` collection (A2A push-notification configurations and their delivery progress)
+///   and the index `ListTasks` reads runs by (`adam_list`).
 pub const SCHEMA_VERSION: i32 = 3;
 
 const DUPLICATE_KEY: i32 = 11000;
@@ -202,6 +204,47 @@ fn opt_date(t: Option<DateTime<Utc>>) -> Bson {
 
 fn journal_id(run: RunId, seq: u64) -> String {
     format!("{run}:{seq}")
+}
+
+/// The filters of a [`RunQuery`] (not its position or its limit), without runs a purge has
+/// tombstoned.
+fn run_query_filter(query: &RunQuery) -> Document {
+    let mut filter = doc! { "agent": &query.agent, "purging": { "$ne": true } };
+    match &query.scope {
+        // An anchored, escaped prefix is a range over the index `(agent, conversation_id, ..)`.
+        ConversationScope::Prefix(prefix) => {
+            filter.insert(
+                "conversation_id",
+                doc! { "$regex": format!("^{}", regex_escape(prefix)) },
+            );
+        }
+        ConversationScope::Exact(conversation) => {
+            filter.insert("conversation_id", conversation);
+        }
+    }
+    if let Some(statuses) = &query.statuses {
+        let statuses: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+        filter.insert("status", doc! { "$in": statuses });
+    }
+    if let Some(since) = query.updated_since {
+        filter.insert("updated_at", doc! { "$gte": date(truncate_ms(since)) });
+    }
+    filter
+}
+
+/// `text` as a regular expression that matches exactly that text: every character that is not a
+/// letter, a digit or `_` is escaped.
+fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('\\');
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn push_key(run: RunId, id: &str) -> String {
@@ -386,6 +429,12 @@ impl Store for MongoStore {
             IndexModel::builder()
                 .keys(doc! { "parent_id": 1 })
                 .options(named("adam_parent"))
+                .build(),
+            // Listing an owner's runs, newest first (`ListTasks`): an anchored prefix on
+            // `conversation_id` is a range over this index.
+            IndexModel::builder()
+                .keys(doc! { "agent": 1, "conversation_id": 1, "updated_at": -1, "_id": -1 })
+                .options(named("adam_list"))
                 .build(),
         ];
         let journal_indexes = [IndexModel::builder()
@@ -749,6 +798,38 @@ impl Store for MongoStore {
             .await
             .map_err(classify)?;
         found.map_or(Ok(None), |d| get_date(&d, "lease_until"))
+    }
+
+    async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
+        let mut filter = run_query_filter(query);
+        if let Some((at, id)) = query.after {
+            let at = date(truncate_ms(at));
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "updated_at": { "$lt": at.clone() } },
+                    doc! { "updated_at": at, "_id": { "$lt": uuid(id) } },
+                ],
+            );
+        }
+        let docs: Vec<Document> = self
+            .runs
+            .find(filter)
+            .sort(doc! { "updated_at": -1, "_id": -1 })
+            .limit(i64::try_from(query.limit).unwrap_or(i64::MAX))
+            .await
+            .map_err(classify)?
+            .try_collect()
+            .await
+            .map_err(classify)?;
+        docs.iter().map(run_from_doc).collect()
+    }
+
+    async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
+        self.runs
+            .count_documents(run_query_filter(query))
+            .await
+            .map_err(classify)
     }
 
     async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {

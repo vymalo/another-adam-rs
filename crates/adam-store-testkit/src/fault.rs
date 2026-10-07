@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use adam_core::{
     ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
-    RunId, RunRecord, RunUpdate, Store, StoreError, StoreResult,
+    RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -64,6 +64,10 @@ pub enum Method {
     LeaseUntil,
     /// [`Store::purge_finished`].
     PurgeFinished,
+    /// [`Store::list_runs`].
+    ListRuns,
+    /// [`Store::count_runs`].
+    CountRuns,
     /// [`Store::push_put`].
     PushPut,
     /// [`Store::push_list`].
@@ -393,6 +397,16 @@ impl Store for FaultyStore {
 
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
         self.run(Method::LeaseUntil, Some(id), self.inner.lease_until(id))
+            .await
+    }
+
+    async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
+        self.run(Method::ListRuns, None, self.inner.list_runs(query))
+            .await
+    }
+
+    async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
+        self.run(Method::CountRuns, None, self.inner.count_runs(query))
             .await
     }
 
