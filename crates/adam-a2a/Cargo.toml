@@ -40,6 +40,8 @@ tokio = { workspace = true, features = ["time", "sync", "rt", "net"] }
 tokio-stream = { workspace = true, optional = true }
 tracing.workspace = true
 url.workspace = true
+# Swagger UI's assets, bundled in the binary (no CDN, nothing downloaded at build time).
+utoipa-swagger-ui.workspace = true
 
 [dev-dependencies]
 # Turns on `test-util` for this crate's own tests.
@@ -47,6 +49,9 @@ adam-a2a = { path = ".", features = ["test-util"] }
 a2a-client-lf.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
 wiremock.workspace = true
+# Checks the OpenAPI document against the OpenAPI 3.1 JSON Schema, compiles its schemas, and
+# validates the examples and real responses against them.
+jsonschema.workspace = true
 
 [lints]
 workspace = true

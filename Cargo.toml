@@ -113,5 +113,8 @@ trybuild = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter"] }
 url = "2"
+# Swagger UI at `/docs` of every A2A server (adam-a2a). `vendored`: the assets come from the
+# `utoipa-swagger-ui-vendored` crate, so the build downloads nothing; `minified`: no source maps.
+utoipa-swagger-ui = { version = "10.0.1", default-features = false, features = ["vendored", "minified"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 wiremock = "0.6"

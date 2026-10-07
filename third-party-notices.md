@@ -10,4 +10,9 @@ This repository vendors agent skills from third-party projects under
 | [leonardomso/rust-skills](https://github.com/leonardomso/rust-skills) | MIT | [`rust-skills/LICENSE`](.agents/skills/rust-skills/LICENSE) — Copyright (c) 2025 Leonardo Maldonado | `rust-skills` |
 | [docker/skills](https://github.com/docker/skills) | Apache-2.0 (declared in each skill's `SKILL.md` front matter as `license: Apache-2.0`, checked 2026-09-29) | each skill's `SKILL.md` | `docker-agent-config`, `docker-agent-deploy`, `docker-agent-run`, `docker-build-strategies`, `docker-compose-patterns`, `docker-destructive-guardrails`, `docker-project-foundations`, `docker-sandboxes-env`, `docker-sandboxes-kits`, `docker-sandboxes-lifecycle`, `docker-sandboxes-network-credentials` |
 
+One test fixture is third-party too: `crates/adam-a2a/tests/fixtures/openapi-3.1-schema-2022-10-07.json` is the JSON
+Schema of OpenAPI 3.1 documents, unchanged, from <https://spec.openapis.org/oas/3.1/schema/2022-10-07> (the
+[OpenAPI Initiative](https://github.com/OAI/OpenAPI-Specification), Apache-2.0, checked 2026-10-07). It is used by a test
+only and is not part of any binary.
+
 Everything else in this repository is the project's own work.

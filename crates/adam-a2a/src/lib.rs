@@ -54,11 +54,13 @@
 //! `agent_card_router`, so JSON-RPC and HTTP+JSON parsing, ProtoJSON and SSE
 //! framing stay the SDK's job. Nothing in this crate holds task state.
 //!
-//! # Two bindings, one handler
+//! # Two bindings, one handler, and the docs
 //!
 //! The JSON-RPC endpoint (`POST /`) and the HTTP+JSON binding (`POST /message:send`,
 //! `GET /tasks/{id}`, ...) are the same handler behind the same layers; the card lists
-//! JSON-RPC first and HTTP+JSON second, at the same URL.
+//! JSON-RPC first and HTTP+JSON second, at the same URL. `GET /docs` serves Swagger UI and
+//! `GET /openapi.json` the OpenAPI 3.1 document of both, publicly (the calls need the token);
+//! [`ServerOptions::with_docs`] turns them off.
 //!
 //! # Streaming
 //!
@@ -77,8 +79,8 @@
 //! token length is hidden too) and answers 401 with `WWW-Authenticate: Bearer`
 //! and an error body (a JSON-RPC error with code `-32000` at `POST /`, since A2A
 //! defines no "unauthorized" code; a `google.rpc.Status` `UNAUTHENTICATED` on the
-//! HTTP+JSON paths) on every route but the agent card, `/healthz` and, when the
-//! card is signed, its key set.
+//! HTTP+JSON paths) on every route but the agent card, `/healthz`, the docs and,
+//! when the card is signed, its key set.
 //! The middleware strips any client-sent identity header and injects the
 //! trusted [`Caller`] (`token-<index>` or `anonymous`); the SDK gives request
 //! handlers nothing but headers, so that is the channel.
@@ -103,10 +105,12 @@ mod activation;
 mod auth;
 mod backend;
 mod card;
+mod docs;
 mod extensions;
 mod handler;
 #[cfg(feature = "test-util")]
 mod memory;
+mod openapi;
 mod page;
 pub mod push;
 mod rest;

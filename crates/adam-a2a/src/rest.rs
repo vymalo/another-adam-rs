@@ -31,8 +31,8 @@ use a2a_server::jsonrpc::MAX_REQUEST_BODY_BYTES;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -55,6 +55,26 @@ pub(crate) enum RestMethod {
     Get,
     Post,
     Delete,
+}
+
+impl RestMethod {
+    /// The method's name in an OpenAPI path item (`get`, `post`, `delete`).
+    pub(crate) fn openapi_key(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Post => "post",
+            Self::Delete => "delete",
+        }
+    }
+
+    /// The `http` method.
+    pub(crate) fn http(self) -> Method {
+        match self {
+            Self::Get => Method::GET,
+            Self::Post => Method::POST,
+            Self::Delete => Method::DELETE,
+        }
+    }
 }
 
 const fn route(

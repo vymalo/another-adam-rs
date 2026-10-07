@@ -50,6 +50,8 @@ pub struct Setup {
     pub signer: Option<CardSigner>,
     pub extended: Option<ExtendedCardConfig>,
     pub backend: InMemoryBackend,
+    /// Swagger UI and the OpenAPI document (on by default, as in `ServerOptions`).
+    pub docs: bool,
     /// Extensions the public card declares.
     pub extensions: Vec<ExtensionConfig>,
 }
@@ -64,6 +66,7 @@ impl Default for Setup {
             backend: InMemoryBackend::with_config(InMemoryConfig {
                 step_delay: Duration::from_millis(15),
             }),
+            docs: true,
             extensions: Vec::new(),
         }
     }
@@ -98,7 +101,7 @@ impl TestServer {
         for extension in setup.extensions {
             card = card.with_extension(extension);
         }
-        let mut options = ServerOptions::default();
+        let mut options = ServerOptions::default().with_docs(setup.docs);
         if let Some(push) = setup.push {
             options = options.with_push(push);
         }

@@ -25,8 +25,8 @@ use crate::backend::DynTaskBackend;
 use crate::card::{AgentCardConfig, Flags, build_card, build_extended_card};
 use crate::handler::BackendHandler;
 use crate::push::PushSupport;
-use crate::rest;
 use crate::signing::CardSigner;
+use crate::{docs, openapi, rest};
 
 /// The SSE comment frame (ignored by clients) used as a keepalive.
 const KEEPALIVE_FRAME: &[u8] = b":\n\n";
@@ -36,7 +36,7 @@ const KEEPALIVE_FRAME: &[u8] = b":\n\n";
 pub const SDK_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Optional knobs for [`A2aServer::router_with_options`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ServerOptions {
     /// Send an SSE comment frame whenever a stream has been idle this long,
@@ -49,6 +49,20 @@ pub struct ServerOptions {
     pub push: Option<PushSupport>,
     /// Signs the public card and the extended card (see [`CardSigner`]). `None`: unsigned.
     pub card_signer: Option<CardSigner>,
+    /// Serve Swagger UI at `GET /docs` and the OpenAPI document at `GET /openapi.json`, both
+    /// public. **On by default.**
+    pub docs: bool,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            keepalive_interval: None,
+            push: None,
+            card_signer: None,
+            docs: true,
+        }
+    }
 }
 
 impl ServerOptions {
@@ -75,6 +89,15 @@ impl ServerOptions {
         self.card_signer = Some(signer);
         self
     }
+
+    /// Serve Swagger UI and the OpenAPI document (`true`, the default) or not (`false`: both
+    /// routes are then behind authentication like any unknown route, and answer 404 to a caller
+    /// with a token).
+    #[must_use]
+    pub fn with_docs(mut self, docs: bool) -> Self {
+        self.docs = docs;
+        self
+    }
 }
 
 /// Exposes an agent, through a [`TaskBackend`](crate::TaskBackend), as an A2A
@@ -87,6 +110,7 @@ impl ServerOptions {
 /// | `GET /.well-known/agent-card.json` | public |
 /// | `GET /healthz` | public |
 /// | `GET /.well-known/jwks.json` (only when the card is signed) | public |
+/// | `GET /docs` (Swagger UI) and `GET /openapi.json` (unless [`ServerOptions::with_docs`] turned them off) | public |
 /// | `POST /` JSON-RPC: `SendMessage`, `SendStreamingMessage` (SSE), `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask` (SSE), the four push-notification methods (when push is on), `GetExtendedAgentCard` (when configured) | required |
 /// | HTTP+JSON, the same methods: `POST /message:send`, `POST /message:stream` (SSE), `GET /tasks/{id}`, `GET /tasks`, `POST /tasks/{id}:cancel`, `POST /tasks/{id}:subscribe` (SSE), `/tasks/{id}/pushNotificationConfigs[/{configId}]`, `GET /extendedAgentCard`, and the SDK's aliases of earlier drafts | required |
 ///
@@ -101,8 +125,8 @@ impl A2aServer {
     /// (`SendMessage`, `SendStreamingMessage` (SSE), `GetTask`, `CancelTask`,
     /// `SubscribeToTask` (SSE); the A2A 1.0 names for the issue's
     /// `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`,
-    /// `tasks/resubscribe`), the same methods over HTTP+JSON, and
-    /// `GET /healthz` (see [`A2aServer`]).
+    /// `tasks/resubscribe`), the same methods over HTTP+JSON, `GET /docs`,
+    /// `GET /openapi.json` and `GET /healthz` (see [`A2aServer`]).
     pub fn router(card: AgentCardConfig, backend: DynTaskBackend, auth: AuthConfig) -> Router {
         Self::router_with_options(card, backend, auth, ServerOptions::default())
     }
@@ -145,6 +169,9 @@ impl A2aServer {
             agent_card = sign_or_warn(signer, agent_card, "public");
             extended_card = extended_card.map(|c| sign_or_warn(signer, c, "extended"));
             authenticator = authenticator.with_public_jwks();
+        }
+        if options.docs {
+            authenticator = authenticator.with_public_docs();
         }
         let authenticator = Arc::new(authenticator);
 
@@ -190,6 +217,15 @@ impl A2aServer {
                     async move { Json((*jwks).clone()) }
                 }),
             );
+        }
+        if options.docs {
+            let document = openapi::document(&card, flags, options.card_signer.is_some());
+            match serde_json::to_vec(&document) {
+                Ok(bytes) => router = router.merge(docs::router(bytes.into())),
+                Err(error) => {
+                    tracing::error!(%error, "the OpenAPI document cannot be serialized; /docs is off");
+                }
+            }
         }
         router
             // Outermost, and over everything (including the fallback), so a

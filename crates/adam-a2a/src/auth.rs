@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 use crate::backend::Caller;
+use crate::docs;
 
 /// Header the auth layer uses to hand the authenticated subject to the
 /// request handler. Stripped from every inbound request first, so a client can
@@ -60,6 +61,9 @@ pub(crate) struct Authenticator {
     /// Whether `GET /.well-known/jwks.json` needs no credential (it exists only when the card
     /// is signed, and then it is the public half of the key that signs it).
     public_jwks: bool,
+    /// Whether Swagger UI and the OpenAPI document need no credential (they exist only when the
+    /// docs are on).
+    public_docs: bool,
 }
 
 /// Where the public key set of the card signature is served, when there is one.
@@ -109,6 +113,7 @@ impl Authenticator {
         Self {
             mode,
             public_jwks: false,
+            public_docs: false,
         }
     }
 
@@ -119,9 +124,20 @@ impl Authenticator {
         self
     }
 
-    /// Whether `method path` needs no credential: [`is_public`], and the key set when it is served.
+    /// Serve Swagger UI and the OpenAPI document ([`docs::is_docs_path`]) without a credential.
+    #[must_use]
+    pub(crate) fn with_public_docs(mut self) -> Self {
+        self.public_docs = true;
+        self
+    }
+
+    /// Whether `method path` needs no credential: [`is_public`], and the key set and the docs when
+    /// they are served.
     fn is_open(&self, method: &Method, path: &str) -> bool {
-        is_public(method, path) || (self.public_jwks && method == Method::GET && path == JWKS_PATH)
+        is_public(method, path)
+            || (method == Method::GET
+                && ((self.public_jwks && path == JWKS_PATH)
+                    || (self.public_docs && docs::is_docs_path(path))))
     }
 
     /// Whether requests carry credentials (drives the card's security scheme).
@@ -184,8 +200,8 @@ fn bearer_token(value: &HeaderValue) -> Option<&str> {
 }
 
 /// Routes that need no credential: the public card (discovery must work before
-/// a client has credentials) and the liveness probe. The card's key set joins them when it is
-/// served ([`Authenticator::with_public_jwks`]).
+/// a client has credentials) and the liveness probe. The card's key set and the docs join them when
+/// they are served ([`Authenticator::with_public_jwks`], [`Authenticator::with_public_docs`]).
 pub(crate) fn is_public(method: &Method, path: &str) -> bool {
     method == Method::GET && (path == a2a_server::WELL_KNOWN_AGENT_CARD_PATH || path == "/healthz")
 }
@@ -317,6 +333,25 @@ mod tests {
     fn debug_never_prints_tokens() {
         let config = AuthConfig::BearerTokens(vec![SecretString::from("super-secret")]);
         assert!(!format!("{config:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn the_docs_are_open_only_when_on_and_only_to_get() {
+        let off = bearer(&["alpha"]);
+        let on = bearer(&["alpha"]).with_public_docs();
+        for path in [
+            "/docs",
+            "/docs/",
+            "/docs/swagger-ui-bundle.js",
+            "/openapi.json",
+        ] {
+            assert!(!off.is_open(&Method::GET, path), "{path} with the docs off");
+            assert!(on.is_open(&Method::GET, path), "{path}");
+            assert!(!on.is_open(&Method::POST, path), "POST {path}");
+        }
+        for path in ["/", "/tasks", "/message:send", "/docs/x", JWKS_PATH] {
+            assert!(!on.is_open(&Method::GET, path), "{path}");
+        }
     }
 
     #[test]
