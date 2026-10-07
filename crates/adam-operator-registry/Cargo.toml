@@ -1,0 +1,28 @@
+[package]
+name = "adam-operator-registry"
+description = "The agent-registry/v1 document builder and an axum router for it: a linkset of agent cards from an AgentDirectory, behind one static bearer, with an ETag and 304"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-operator-ports.workspace = true
+axum.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+adam-operator-ports = { workspace = true, features = ["testkit"] }
+proptest.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
+tower.workspace = true
+
+[lints]
+workspace = true

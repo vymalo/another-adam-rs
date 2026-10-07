@@ -1,0 +1,34 @@
+{
+  "linkset": [
+    {
+      "anchor": "https://platform.example.com/registry/v1/agents",
+      "profile": [
+        {
+          "href": "https://agents.vymalo.com/registry/v1"
+        }
+      ],
+      "item": [
+        {
+          "href": "https://coder.agents.example.com/.well-known/agent-card.json",
+          "type": "application/json",
+          "title": "Coder",
+          "service": [
+            "coder"
+          ],
+          "tags": [
+            "coding",
+            "git"
+          ]
+        },
+        {
+          "href": "https://researcher.agents.example.com/.well-known/agent-card.json",
+          "type": "application/json",
+          "title": "Researcher",
+          "service": [
+            "researcher"
+          ]
+        }
+      ]
+    }
+  ]
+}
