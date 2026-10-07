@@ -1,0 +1,340 @@
+apiVersion: v1
+data:
+  mcp.json: |
+    {
+      "mcpServers": {
+        "context7": {
+          "headers": {
+            "Authorization": "Bearer ${CONTEXT7_API_KEY}"
+          },
+          "optional": true,
+          "type": "http",
+          "url": "https://mcp.context7.com/mcp"
+        },
+        "websearch": {
+          "headers": {
+            "Authorization": "Bearer ${SEARCH_MCP_TOKEN}"
+          },
+          "optional": true,
+          "type": "http",
+          "url": "http://another-agentic-websearch.another-agentic-system.svc:8080/mcp"
+        }
+      }
+    }
+kind: ConfigMap
+metadata:
+  annotations:
+    agents.vymalo.com/config-digest: sha256:6518a3dd4c7b33c086cb44ef042a385fb378e56b75fb58b281124a9039695e95
+  labels:
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/managed-by: adam-operator
+    app.kubernetes.io/name: coder
+  name: coder-mcp
+  namespace: another-agentic-system
+  ownerReferences:
+  - apiVersion: agents.vymalo.com/v1alpha1
+    controller: true
+    kind: AgentService
+    name: coder
+    uid: 0b1f3c5e-1111-4222-8333-444455556666
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    agents.vymalo.com/config-digest: sha256:6518a3dd4c7b33c086cb44ef042a385fb378e56b75fb58b281124a9039695e95
+  labels:
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/managed-by: adam-operator
+    app.kubernetes.io/name: coder
+  name: coder
+  namespace: another-agentic-system
+  ownerReferences:
+  - apiVersion: agents.vymalo.com/v1alpha1
+    controller: true
+    kind: AgentService
+    name: coder
+    uid: 0b1f3c5e-1111-4222-8333-444455556666
+spec:
+  ports:
+  - name: http
+    port: 8080
+    protocol: TCP
+    targetPort: http
+  selector:
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/name: coder
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  annotations:
+    agents.vymalo.com/config-digest: sha256:6518a3dd4c7b33c086cb44ef042a385fb378e56b75fb58b281124a9039695e95
+    agents.vymalo.com/deletion-policy: Retain
+  labels:
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/managed-by: adam-operator
+    app.kubernetes.io/name: coder
+  name: coder
+  namespace: another-agentic-system
+  ownerReferences:
+  - apiVersion: agents.vymalo.com/v1alpha1
+    controller: true
+    kind: AgentService
+    name: coder
+    uid: 0b1f3c5e-1111-4222-8333-444455556666
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  podManagementPolicy: OrderedReady
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: coder
+      app.kubernetes.io/name: coder
+  serviceName: coder
+  template:
+    metadata:
+      annotations:
+        agents.vymalo.com/config-digest: sha256:6518a3dd4c7b33c086cb44ef042a385fb378e56b75fb58b281124a9039695e95
+      labels:
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/instance: coder
+        app.kubernetes.io/managed-by: adam-operator
+        app.kubernetes.io/name: coder
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - env:
+        - name: LISTEN_ADDR
+          value: 0.0.0.0:8080
+        - name: WORKSPACE_ROOT
+          value: /work
+        - name: PUBLIC_URL
+          value: http://coder.another-agentic-system.svc:8080/
+        - name: MODEL_BASE_URL
+          valueFrom:
+            secretKeyRef:
+              key: MODEL_BASE_URL
+              name: coder-secrets
+        - name: MODEL
+          value: coding-model
+        - name: OPENCODE_MODEL
+          value: coding-model
+        - name: WORKERS
+          value: '4'
+        - name: MAX_CHECK_CYCLES
+          value: '3'
+        - name: CHECK_TIMEOUT_SECS
+          value: '900'
+        - name: WORKSPACE_SWEEP_SECS
+          value: '300'
+        - name: MCP_ALLOW_STDIO
+          value: 'true'
+        - name: ADAM_EXTRA_MCP_FILE
+          value: /etc/adam/extra-mcp/mcp.json
+        - name: MCP_ALLOW_INSECURE
+          value: 'true'
+        - name: GITHUB_MCP_URL
+          value: http://127.0.0.1:8082
+        - name: ALLOWED_REPO_HOSTS
+          value: github.com
+        - name: GITHUB_API_URL
+          value: https://api.github.com
+        - name: GITHUB_APP_ID
+          value: Iv23li4m1ZrQ8wdwjnQH
+        - name: GITHUB_APP_OWNERS
+          value: vymalo
+        - name: GITHUB_APP_PRIVATE_KEY_PATH
+          value: /var/run/secrets/github-app/private-key.pem
+        - name: PR_DRAFT
+          value: 'true'
+        - name: GIT_AUTHOR_NAME
+          value: bored-giant-panda[bot]
+        - name: GIT_AUTHOR_EMAIL
+          value: 337696346+bored-giant-panda[bot]@users.noreply.github.com
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              key: uri
+              name: coder-db-uri
+        - name: MODEL_API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: MODEL_API_KEY
+              name: coder-secrets
+        - name: CONTEXT7_API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: CONTEXT7_API_KEY
+              name: coder-secrets
+        - name: SEARCH_MCP_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: SEARCH_MCP_TOKEN
+              name: coder-secrets
+        - name: A2A_BEARER_TOKENS
+          valueFrom:
+            secretKeyRef:
+              key: A2A_BEARER_TOKENS
+              name: coder-secrets
+        image: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924@sha256:1eb43882cc1a94663f03212f4df8999084b11e4f55a9d935041239fe60962c38
+        livenessProbe:
+          failureThreshold: 4
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 15
+          timeoutSeconds: 3
+        name: agent
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 3
+        resources:
+          limits:
+            memory: 6Gi
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        startupProbe:
+          failureThreshold: 40
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 3
+        volumeMounts:
+        - mountPath: /work
+          name: work
+        - mountPath: /etc/adam/extra-mcp
+          name: extra-mcp
+          readOnly: true
+        - mountPath: /var/run/secrets/github-app
+          name: github-app
+          readOnly: true
+      initContainers:
+      - args:
+        - http
+        - --read-only
+        - --toolsets
+        - context,repos,issues,pull_requests
+        - --listen-host
+        - 127.0.0.1
+        - --port
+        - '8082'
+        command:
+        - tini
+        - --
+        - github-mcp-server
+        image: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924@sha256:1eb43882cc1a94663f03212f4df8999084b11e4f55a9d935041239fe60962c38
+        name: github-mcp
+        resources:
+          limits:
+            memory: 256Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        restartPolicy: Always
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        startupProbe:
+          exec:
+            command:
+            - bash
+            - -c
+            - exec 3<>/dev/tcp/127.0.0.1/8082
+          failureThreshold: 30
+          periodSeconds: 2
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 120
+      volumes:
+      - configMap:
+          defaultMode: 292
+          items:
+          - key: mcp.json
+            path: mcp.json
+          name: coder-mcp
+        name: extra-mcp
+      - name: github-app
+        secret:
+          defaultMode: 288
+          items:
+          - key: private-key.pem
+            path: private-key.pem
+          secretName: coder-github-app
+  updateStrategy:
+    type: RollingUpdate
+  volumeClaimTemplates:
+  - apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      labels:
+        agents.vymalo.com/volume: work
+        app.kubernetes.io/instance: coder
+        app.kubernetes.io/managed-by: adam-operator
+        app.kubernetes.io/name: coder
+      name: work
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 20Gi
+      storageClassName: longhorn
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  annotations:
+    agents.vymalo.com/config-digest: sha256:6518a3dd4c7b33c086cb44ef042a385fb378e56b75fb58b281124a9039695e95
+  labels:
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/managed-by: adam-operator
+    app.kubernetes.io/name: coder
+  name: coder
+  namespace: another-agentic-system
+  ownerReferences:
+  - apiVersion: agents.vymalo.com/v1alpha1
+    controller: true
+    kind: AgentService
+    name: coder
+    uid: 0b1f3c5e-1111-4222-8333-444455556666
+spec:
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: another-agentic-system
+    ports:
+    - port: 8080
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: coder
+      app.kubernetes.io/managed-by: adam-operator
+  policyTypes:
+  - Ingress
