@@ -50,6 +50,10 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY bin bin
+# The commit the image is built from (CI passes the commit sha): `option_env!` bakes it into both binaries, which say
+# it on their card as the version's build metadata (`0.1.0+<first 7>`) and in `build/v1` (ADR 0028). A build
+# without it says `unknown`. Declared after the COPYs so that it never invalidates them.
+ARG ADAM_BUILD_REVISION=
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p adam-coder --bin adam-coder -p adam-agent --bin adam-agent \

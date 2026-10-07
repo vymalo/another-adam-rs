@@ -61,7 +61,7 @@ commit `d411249`:*
    before the tool runs and, after it, `completed` (a result), `failed` (an error result, or a failure it retries),
    or `waiting` (the tool asked the person, or the run parked on a child run or a remote task), which ends with the
    answer or the outcome. `Tool::step_style() -> StepStyle` (kind, label, icon; the default is a plain `tool` labelled
-   with the tool's name) and `#[tool(step = "subagent", label = "OpenCode", icon = "agent")]` set it; subagent tools
+   with the tool's name) *(Amended 2026-10-07: the default stays, but every tool that a person sees has a title, [ADR 0027](0027-every-tool-has-a-title-for-its-step.md).)* and `#[tool(step = "subagent", label = "OpenCode", icon = "agent")]` set it; subagent tools
    of `adam-assembly` are `subagent` steps drawn as agents. `ToolCtx::step_id()`, `ToolCtx::report_step(..)` (a step
    that runs under the call's, or under another one the call reported) and `ToolCtx::emit_progress(..)` (an update of
    the call's own step, the text in its detail) are how a tool says more. **The agent never puts a tool's output in a

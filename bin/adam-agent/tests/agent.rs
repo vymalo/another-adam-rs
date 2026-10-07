@@ -13,7 +13,9 @@ use adam::AgentDef;
 use adam::mcp::McpPolicy;
 use adam_a2a::{Caller, TaskBackend as _, TaskEvent};
 use adam_agent::agents as build;
-use adam_agent::{AgentError, VERSION, WorkerParts, card_of, exit_code, folder};
+use adam_agent::{
+    AgentError, WorkerParts, build_version, card_of, card_of_folder, exit_code, folder,
+};
 use adam_core::{DynStore, MemoryStore};
 use adam_mcp_testkit::TestHttpServer;
 use adam_model::{DynModel, MockModel, ToolCall};
@@ -152,8 +154,13 @@ async fn the_card_is_the_one_the_folder_declares() {
     let card = card_of(&def_of(&assistant()), &url()).unwrap();
     assert_eq!(card.name, "Assistant");
     assert_eq!(card.url, url());
-    assert_eq!(card.version, VERSION);
-    assert_eq!(card.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(card.version, build_version());
+    assert!(
+        card.version
+            .starts_with(&format!("{}+", env!("CARGO_PKG_VERSION"))),
+        "the revision is semver build metadata: {}",
+        card.version
+    );
     assert!(
         card.description.contains("general-purpose assistant"),
         "{card:?}"
@@ -180,6 +187,32 @@ async fn the_card_is_the_one_the_folder_declares() {
     // A folder that renames itself changes the card, with no code involved.
     let card = card_of(&def_of(&chat()), &url()).unwrap();
     assert_eq!(card.name, "Chat");
+}
+
+/// The card of a folder says which build answers and which files it runs, in `build/v1`: the digest
+/// is the folder's own (the one the startup line logs), and the extension is optional.
+#[tokio::test]
+async fn the_card_of_a_folder_says_its_build_and_its_digest() {
+    let tmp = assistant();
+    let loaded = folder::load(tmp.path()).unwrap();
+    let card = card_of_folder(&loaded, &url()).unwrap();
+    assert_eq!(card.version, build_version());
+    let build = card
+        .extensions
+        .iter()
+        .find(|e| e.uri == adam_a2a::BUILD_EXTENSION)
+        .expect("build/v1 is on the card");
+    assert!(!build.required);
+    assert_eq!(build.params["folderDigest"], loaded.digest.as_str());
+    assert_eq!(
+        build.params["revision"],
+        adam_a2a::revision_of(adam_agent::BUILD_REVISION)
+    );
+    assert!(
+        loaded.digest.as_str().starts_with("sha256:"),
+        "{}",
+        loaded.digest
+    );
 }
 
 /// A card needs a description; a folder without one is refused, as the deployment's mistake.

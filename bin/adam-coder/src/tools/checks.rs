@@ -29,6 +29,7 @@ use serde_json::Value;
 use crate::redact::Redactor;
 
 use super::notes::CheckRecord;
+use super::preexisting::{self, OnBase};
 use super::shell::{
     MissingTool, ShellOutcome, missing_tool, project_dependency_hint, resolve_cwd, run_in,
     shell_spec,
@@ -109,6 +110,8 @@ impl EnvironmentReport {
 /// | `tree` | the git tree id (40 hex) of the code the check ran on, as `git add -A` would commit it; absent when it could not be computed |
 /// | `repository` | the URL of the repository of the slot the check ran in (for the verdict on a pushed commit, the repository it was pushed to); absent for a scratch project and in reports of an older coder |
 /// | `environment` | where the check ran, when that was a devcontainer or the run's own pod: `{kind, source?, image}`; absent for a run in the coder's own container and in reports of an older coder |
+/// | `preexisting` | `true` when the command also fails on the base commit (`base_commit`), before the run changed anything: the failure is the repository's and the run's change did not cause it. Absent otherwise, and in reports of an older coder. `passed` is still `false`: a consumer that gates on the checks reads this to accept the failure |
+/// | `base_commit` | with `preexisting`: the commit `origin/<base>` was at when the command failed there too (40 hex) |
 /// | `summary` | one line |
 /// | `findings` | the failing checks; at most [`MAX_FINDINGS`] and [`MAX_FINDINGS_BYTES`] in total, the cut marked |
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +129,12 @@ pub struct ChecksReport {
     /// Where it ran, if not in the coder's own container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentReport>,
+    /// The command also fails on [`base_commit`](Self::base_commit): the failure is not the run's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preexisting: bool,
+    /// The commit `origin/<base>` was at when the command failed there too; with `preexisting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
     /// One line about the run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -153,6 +162,8 @@ struct Run<'a> {
     repository: Option<&'a str>,
     /// Where the command ran.
     environment: Option<EnvironmentReport>,
+    /// The base commit the command also failed on: a pre-existing failure.
+    preexisting: Option<&'a str>,
 }
 
 impl ChecksReport {
@@ -192,12 +203,21 @@ impl ChecksReport {
         if let (true, Some(sha)) = (run.dirty, commit) {
             summary.push_str(&format!("{DIRTY_NOTE}{})", &sha[..sha.len().min(10)]));
         }
+        let preexisting = run.preexisting.filter(|base| is_sha(base));
+        if let Some(base) = preexisting {
+            summary.push_str(&format!(
+                "; it fails on the base ({}) too: a pre-existing failure",
+                &base[..base.len().min(10)]
+            ));
+        }
         Self {
             passed: passed && commit.is_some(),
             commit: commit.unwrap_or_default().to_owned(),
             tree: run.tree.filter(|t| is_sha(t)).map(str::to_owned),
             repository: run.repository.map(str::to_owned),
             environment: run.environment.clone(),
+            preexisting: preexisting.is_some(),
+            base_commit: preexisting.map(str::to_owned),
             summary: Some(summary),
             findings: cap_findings(findings),
         }
@@ -234,6 +254,11 @@ impl ChecksReport {
             tree: Some(tree.to_owned()),
             repository: None,
             environment: self.environment.clone(),
+            preexisting: self.preexisting && !command_passed,
+            base_commit: self
+                .base_commit
+                .clone()
+                .filter(|_| self.preexisting && !command_passed),
             summary: Some(format!(
                 "{core}; checked on the identical tree before it was committed as {}",
                 &commit[..commit.len().min(10)]
@@ -263,6 +288,8 @@ impl ChecksReport {
             tree: tree.filter(|t| is_sha(t)).map(str::to_owned),
             repository: None,
             environment: None,
+            preexisting: false,
+            base_commit: None,
             summary: Some(format!(
                 "the pushed commit {} was not checked",
                 &commit[..commit.len().min(10)]
@@ -301,7 +328,7 @@ fn one_line(text: &str, max: usize) -> String {
 }
 
 /// `text` without its start, at most `max` bytes, cut on a character boundary.
-fn cut_tail(text: &str, max: usize) -> &str {
+pub(super) fn cut_tail(text: &str, max: usize) -> &str {
     let mut start = text.len().saturating_sub(max);
     while !text.is_char_boundary(start) {
         start += 1;
@@ -530,7 +557,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
 /// check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A
 /// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
 /// cycle, and is for the person to decide.
-#[tool]
+#[tool(label = "Run the checks")]
 pub async fn run_checks(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -615,6 +642,31 @@ pub async fn run_checks(
         return Ok(ToolOutput::error(said));
     }
 
+    // A failure in a repository that is there on the base too is not the run's (ADR 0026).
+    let on_base = match slot.worktree() {
+        Some(wt) if !outcome.passed() && !outcome.timed_out && outcome.exit_code.is_some() => {
+            preexisting::on_base(
+                preexisting::Failing {
+                    env: &env,
+                    ctx,
+                    session: &*environment,
+                    run: &run,
+                    wt,
+                    shown: &shown,
+                    command,
+                    cwd: cwd.as_deref(),
+                },
+                &mut notes,
+            )
+            .await?
+        }
+        _ => OnBase::Unknown,
+    };
+    let base_commit = match &on_base {
+        OnBase::Fails(result) => Some(result.commit.clone()),
+        _ => None,
+    };
+
     // The code the command just ran on, so a pull request can be tied to
     // the exact tree that was verified.
     let tree = super::gitcli::working_tree_id(slot.path()).await;
@@ -634,6 +686,7 @@ pub async fn run_checks(
         // A scratch project has no repository (yet).
         repository: slot.worktree().map(|wt| wt.repo().url.as_str()),
         environment: EnvironmentReport::of(&environment.describe()),
+        preexisting: base_commit.as_deref(),
     })
     .scrubbed(redactor);
     let artifact = report.clone().into_artifact(redactor);
@@ -648,6 +701,8 @@ pub async fn run_checks(
         report: Some(report),
         slot: Some(slot.dir().to_owned()),
         scratch,
+        preexisting: base_commit.is_some(),
+        base_commit: base_commit.clone(),
     });
     env.notes
         .save(&run, &notes)
@@ -655,6 +710,8 @@ pub async fn run_checks(
         .map_err(|e| notes_error(&e))?;
     ctx.emit_progress(if passed {
         format!("checks passed: {shown}")
+    } else if base_commit.is_some() {
+        format!("checks failed, and fail on the base too (no cycle used): {shown}")
     } else {
         format!("checks failed ({failures} of {max} cycles used): {shown}")
     })
@@ -664,6 +721,22 @@ pub async fn run_checks(
         return Ok(ToolOutput::text(text).with_artifact(artifact));
     }
     let mut text = text;
+    if let OnBase::Fails(result) = &on_base {
+        let branch = slot
+            .worktree()
+            .map_or("", |wt| wt.repo().base_branch.as_str());
+        text.push_str(&preexisting::fails_text(
+            result,
+            branch,
+            &outcome.tail,
+            failures,
+            max,
+        ));
+        return Ok(ToolOutput::error(text).with_artifact(artifact));
+    }
+    if let (OnBase::Passes(result), Some(wt)) = (&on_base, slot.worktree()) {
+        text.push_str(&preexisting::passes_text(result, &wt.repo().base_branch));
+    }
     if failures >= max {
         text.push_str(&format!(
             "\nCheck-cycle limit reached ({failures} of {max}). Do not run checks, commit, \
@@ -710,6 +783,7 @@ mod tests {
             tree: Some(TREE),
             repository: None,
             environment: None,
+            preexisting: None,
         })
     }
 
@@ -813,6 +887,7 @@ mod tests {
             tree: None,
             repository: None,
             environment: None,
+            preexisting: None,
         });
         let summary = r.summary.unwrap();
         assert!(!summary.contains('\n'));
@@ -892,6 +967,7 @@ mod tests {
             tree: None,
             repository: None,
             environment: None,
+            preexisting: None,
         })
     }
 

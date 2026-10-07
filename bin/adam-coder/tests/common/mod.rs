@@ -26,6 +26,13 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 pub mod pg;
 
+/// A check command that fails in a run's worktree and passes on the checkout of the base
+/// (`.adam-base`), so that its failure is the run's and costs a check cycle: `then` is what it
+/// does when it fails. A plain `exit 1` fails on the base too, which is a pre-existing failure.
+pub fn red(then: &str) -> String {
+    format!("case \"$PWD\" in */.adam-base/*) exit 0;; esac; {then}")
+}
+
 /// The first pull request the mock GitHub creates.
 pub const PR_URL: &str = "https://github.com/octo/widgets/pull/7";
 

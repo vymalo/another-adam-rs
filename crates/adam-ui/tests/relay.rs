@@ -133,6 +133,27 @@ async fn the_listing_reads_what_each_tool_says_about_itself() {
     );
 }
 
+/// The step of `turn_output` is called "Send the answer", not the tool's name; a tool the endpoint
+/// lists with no title keeps its own name.
+#[tokio::test]
+async fn the_answer_tool_is_drawn_under_a_title() {
+    let server = ThreadToolsServer::start(&[TOKEN]).await;
+    server.enable_turn_output();
+    server.add_tool("plain__tool", "Plain.", json!({"type": "object"}), "plain");
+    let listing = source(McpPolicy::default())
+        .listing(&SourceCtx::detached(grant(&server)))
+        .await;
+    let labels: Vec<(String, Option<String>)> = listing
+        .notes
+        .iter()
+        .map(|n| (n.tool.clone(), n.label.clone()))
+        .collect();
+    assert_eq!(
+        labels,
+        [("turn_output".to_owned(), Some("Send the answer".to_owned()))]
+    );
+}
+
 #[tokio::test]
 async fn a_long_call_waits_as_long_as_its_tool_says_not_as_long_as_the_default() {
     let server = ThreadToolsServer::start(&[TOKEN]).await;

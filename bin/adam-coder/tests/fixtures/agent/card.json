@@ -105,6 +105,15 @@
       "description": "Streams its replies as they are written",
       "required": false,
       "params": {}
+    },
+    {
+      "uri": "https://agents.vymalo.com/a2a/extensions/build/v1",
+      "description": "Says which build answers and which agent files it runs",
+      "required": false,
+      "params": {
+        "revision": "<the build's revision>",
+        "folderDigest": "<the digest of the embedded agent files>"
+      }
     }
   ]
 }

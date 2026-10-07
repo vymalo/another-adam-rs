@@ -31,7 +31,7 @@ applies at the next start, and a restart is a deploy.
 |---|---|
 | `agent/instructions.md` frontmatter `name` | the registered name of the agent, which is the key of its stored runs: **renaming strands the runs of the old name**. Required |
 | `description` or `card.description` | the A2A card needs one of them (exit 78 for a role that serves A2A otherwise) |
-| `card:` | the card: `name`, `skills` (`id`, `name`, `description`, `tags`, `examples`). The URL is `PUBLIC_URL`, the version is this binary's |
+| `card:` | the card: `name`, `skills` (`id`, `name`, `description`, `tags`, `examples`). The URL is `PUBLIC_URL`, the version is this binary's with the build's revision as build metadata (`0.1.0+6478fbc`, `+unknown` without one: the build argument `ADAM_BUILD_REVISION` of the image) |
 | `limits:` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens` |
 | `model:` | the model alias of the agent, when it should not be `MODEL` |
 | `vars:` | `{{placeholders}}` of the prompt. **Every var needs a value in the file**: nothing in this binary supplies one, so a var declared without a value (or one the prompt does not use, or a placeholder `vars` does not declare) stops the process at startup, naming it |
@@ -72,9 +72,9 @@ activation the message is refused as before ([`adam-a2a-runtime`](../../crates/a
 [ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)).
 
 The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`, `steps/v1` and
-`text-stream/v1` (`card_of`), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
-whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with the
-tool's name or, for an MCP tool whose server gave it a `title`, the title; running, then completed, failed or waiting for the person; with the
+`text-stream/v1` (`card_of`), and `build/v1` (`card_of_folder`: the build's revision and the folder's digest, [ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
+whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with a
+title a person reads (`Ask you`, an MCP tool's own `title`, a subagent's name capitalised, [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its-step.md)); running, then completed, failed or waiting for the person; with the
 call's arguments as `input` and its result as `output`, cut to 4 KiB and 8 KiB and **scrubbed of this process's secrets first**: the model's
 key, the A2A tokens, the password of `DATABASE_URL` and the value of every environment variable whose name says it is a secret, which is
 where the `${VAR}` values of an `mcp.json` come from; `redact::step_io`, [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md))
@@ -260,7 +260,7 @@ The binary is `main.rs` over a small library, so everything it does is testable 
 | `Config::from_env()`, `from_lookup` | the environment as above; `Config { service: ServiceConfig, agent_dir, worker: Option<WorkerConfig { model, mcp }> }` |
 | `serve(config, shutdown)` | the process: folder, card, assembly, then `adam_service::serve` |
 | `folder::load(path)`, `folder::log(&folder)` | read the folder (every diagnostic in the error), say which files run |
-| `card_of(&def, &public_url)` | the A2A card the files declare |
+| `card_of(&def, &public_url)`, `card_of_folder(&folder, &public_url)` | the A2A card the files declare; the second also declares `build/v1` (the revision and the folder's digest). `build_version()`, `BUILD_REVISION`, `VERSION` |
 | `assemble(def, model, alias, &policy)` | connect the MCP servers, bind `ask_user`, `show` and `ui_catalog` and the thread-tools source (the `policy` is also the one for the thread-tools URL), give the root and each subagent the model: the `Assembly`. `assemble_with(.., step_io)` also says how the tool-call steps report their input and output |
 | `redact::step_io_named(&config, vars, &names)`, `redact::secret_values_named` | the same, and also the variables in `names` whatever their names look like (`AgentDef::mcp_env_references`: what the folder's and the extra file's servers read as `${VAR}`); `serve` uses it |
 | `redact::step_io(&config, vars)`, `redact::secret_values` | the `StepIo` that scrubs the secrets of the configuration and of the environment variables `vars` (`redact::process_vars()` in `serve`: the process's, without what is not text) from the input and output of every tool-call step; `WorkerParts::step_io` carries it |

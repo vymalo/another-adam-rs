@@ -296,6 +296,52 @@ async fn an_agents_own_tool_wins_the_name_and_keeps_its_step() {
     assert!(seen.lock().unwrap().is_empty());
 }
 
+/// A source's tool with a title in its note is drawn under that title, from the first report to the
+/// last; the model still calls it by its name.
+#[tokio::test]
+async fn a_source_tool_with_a_titled_note_is_drawn_under_its_title() {
+    struct Titled;
+    #[async_trait]
+    impl ToolSource for Titled {
+        async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
+            vec![spec("turn_output")]
+        }
+        async fn listing(&self, ctx: &SourceCtx) -> Listing {
+            Listing::new(self.specs(ctx).await)
+                .with_note(ToolNote::new("turn_output").with_label("Send the answer"))
+        }
+        async fn call(
+            &self,
+            _ctx: &ToolCtx,
+            name: &str,
+            _args: Value,
+        ) -> Option<Result<ToolOutput, ToolError>> {
+            (name == "turn_output").then(|| Ok(ToolOutput::text("out")))
+        }
+    }
+    let rig = Rig::new();
+    let agent = rig.agent().tool_source(Titled).build();
+    rig.mock
+        .push_tool_calls(vec![call("c1", "turn_output", json!({}))])
+        .push_text("done");
+    let (run, view) = rig.run(&agent, "go").await;
+    let labels: Vec<String> = rig
+        .sink
+        .events_for(run)
+        .into_iter()
+        .filter_map(|e| match e {
+            RunEvent::Step(step) => Some(step.label),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels, ["Send the answer", "Send the answer"]);
+    assert_eq!(
+        view.state["source_notes"],
+        json!([{"tool": "turn_output", "label": "Send the answer"}]),
+        "a title alone is a note worth keeping"
+    );
+}
+
 #[tokio::test]
 async fn a_source_without_notes_leaves_every_call_a_step_as_before() {
     struct Plain;

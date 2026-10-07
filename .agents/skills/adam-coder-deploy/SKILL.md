@@ -30,7 +30,8 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    an immutable `<rust toolchain>-<sha7>` tag) with the binaries, the pinned
    `github-mcp-server`, the devcontainer CLI and Podman's remote client added. Runtime user is
    uid 10001, `/work` is the workspace volume, `EXPOSE 8080`, entrypoint
-   `tini -- adam-coder`. Tool pins carry a "verified <date>" comment: move a tag, its digest and
+   `tini -- adam-coder`. The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into both
+   binaries and shows on the card as the version's `+<sha7>` and in `build/v1` (ADR 0028). Tool pins carry a "verified <date>" comment: move a tag, its digest and
    the claims next to it together (the GitHub MCP server's are also in
    `docs/decisions/0009-github-per-installation-read-through-mcp.md` and in
    `.github/workflows/ci.yml`, job `conformance`).
@@ -116,7 +117,7 @@ sh deploy/coder/tests/render-check.sh        # from the repository root
 sh deploy/coder/tests/bump-tag-test.sh
 shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh
 docker buildx build -f docker/coder/Dockerfile -t coder:smoke --load .
-sh docker/coder/test/container-smoke.sh coder:smoke   # needs a reachable Postgres, see the script header
+sh docker/coder/test/container-smoke.sh coder:smoke   # needs a reachable Postgres, see the script header; EXPECT_REVISION=<sha> checks the build argument
 sh docker/coder/test/agent-smoke.sh coder:smoke
 ```
 

@@ -59,7 +59,7 @@ sequenceDiagram
 | `edit_file { path, old, new, replace_all?, repo? }` | replaces **exact text** in a file of the worktree, confined like `write_file` ([below](#reading-and-changing-files-itself)): `old` (blanks and line breaks included) must be in the file, once unless `replace_all`. A file that is not there, a directory, binary or non-UTF-8 content, one over 1 MiB, an empty `old`, and `old == new` are results that say so. **When `old` is not found it changes nothing and shows the closest region**: its line numbers, two lines of context around it, the first line where it and `old` differ, and a hint when only blanks differ or the file has CRLF endings. **When `old` is in the file several times and `replace_all` is not set** it says how many times and at which lines. Written like `write_file` (a new file renamed over the old, the mode kept). Progress line: `edited <path> (<slot>)` |
 | `share_file { path, repo?, name? }` | shows the person **a file of the workspace**: the file is read in this process (confined like `read_file`: relative to the slot, no `..`, nothing inside `.git`, a symlink only while it stays inside the worktree), must be a regular file of at most 4 MiB, and comes back as a **file artifact** with its media type and filename; the model's result is one line, `Shared chart.svg (1.2 KiB, image/svg+xml).`, never the bytes. It works on what a command made inside the repository's devcontainer too (the workspace is one directory). See [Sharing a file](#sharing-a-file) and [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md). Progress line: `sharing <path> (<slot>)` |
 | `delegate_to_opencode { instructions, repo? }` | spawns the ACP agent in the worktree of the slot, as the run's environment prepared the command ([below](#where-the-processes-of-a-run-run); `ClientPolicy { fs_root: worktree }`), reports what OpenCode does as steps (see [Steps](#steps-what-the-person-sees-of-the-work)), returns its summary and the changed files |
-| `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check |
+| `run_checks { command, cwd?, repo? }` | **the project's real checks only** (what its CI, README or Makefile run). `bash -lc <command>` in the worktree (`sh -lc` where the image has no bash; a login shell keeps the toolchain `PATH` from `/etc/profile.d`, and bash-isms such as `${PIPESTATUS[0]}` work), a `cwd` must stay inside it, timeout kills the process group (and tells the run's environment), output tail capped, secrets hidden from the child; artifact `checks` (see [Artifacts](#artifacts)). A command the shell cannot find is a **missing toolchain** (below), not a failed check; a failure the base commit has too is **pre-existing** (below), not a cycle |
 | `rebuild_environment { use_default? }` | the way out of a **broken work environment**, once the person has decided ([below](#the-work-environment-the-repositorys-devcontainer)): the run's environment is thrown away and made again now (its steps are shown under this call, and a failure is this call's result), from the repository's file as it is (`{}`) or, with `use_default: true`, from the default image for the rest of the run. The decision is the person's, so the tool is for the model to call only after it has asked (`ask_user`); the choice is kept in the run's notes (`environment.use_default`) and in the environment's own state. With no container runtime there is nothing to rebuild and it says so. Where the commands run in this container it changes nothing |
 | `commit_and_push { message, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository). In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
 | `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
@@ -87,9 +87,26 @@ journal's `tool:<call id>` step names are unchanged, so a run started before the
 
 The card lists `steps/v1` ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md); the contract is
 the orchestration layer's `docs/api/steps-v1.md`), and every tool call is a step to a client that activates it. Most are
-plain steps labelled with the tool's name (`prepare_workspace`, `run_checks`, ...), whose progress lines
-(`running checks: ...`) are updates of their own step. **`delegate_to_opencode` is a `subagent` step labelled
-OpenCode** with its own icon, `opencode` (`#[tool(step = "subagent", label = "OpenCode", icon = "opencode")]`), and what OpenCode reports over ACP is the
+plain steps **labelled with a title a person reads**, not the tool's name (`#[tool(label = "...")]`; the model still calls the tool
+by its name; [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its-step.md)), whose progress lines
+(`running checks: ...`) are updates of their own step:
+
+| Tool | Title | Tool | Title |
+|---|---|---|---|
+| `prepare_workspace` | Prepare the workspace | `run_command` | Run a command |
+| `request_repository` | Ask to use a repository | `run` | Make files with a command |
+| `create_repository` | Create a repository | `read_file` | Read a file |
+| `start_scratch` | Start a scratch project | `write_file` | Write a file |
+| `publish_scratch` | Publish a scratch project | `apply_patch` | Apply a patch |
+| `edit_file` | Edit a file | `share_file` | Share a file |
+| `run_checks` | Run the checks | `rebuild_environment` | Rebuild the environment |
+| `commit_and_push` | Commit and push | `open_pull_request` | Open a pull request |
+| `ask_user` | Ask you | `show`, `ui_catalog` | Show on your screen, List what the screen can draw |
+| `turn_output` (the endpoint's) | Send the answer | a subagent (`explorer`) | its name capitalised (Explorer) |
+
+`tests/agent_files.rs` (`every_tool_of_the_coder_has_a_title_for_its_step`) fails for a tool with none, so a new tool must
+bring its title. **`delegate_to_opencode` is a `subagent` step titled "Hand to OpenCode"** with its own icon, `opencode`
+(`#[tool(step = "subagent", label = "Hand to OpenCode", icon = "opencode")]`), and what OpenCode reports over ACP is the
 tree under it:
 
 | OpenCode reports | The step |
@@ -113,7 +130,7 @@ installation token as soon as it is minted, never reaches the steps; `tests/e2e.
 (`a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_holds`) pins it. The orchestration layer redacts patterns
 on top and has a switch to drop both. A client that did not activate steps reads the same work as lines of text: the title of
 a tool call when it starts, `<title>: done` or `<title>: failed: <output>` when it ends, the lines of OpenCode's reply
-and its plan as they are, and `OpenCode: done` when the call ends (`tests/e2e.rs`, `tests/tools.rs`).
+and its plan as they are, and `Hand to OpenCode: done` when the call ends (`tests/e2e.rs`, `tests/tools.rs`).
 
 ### Streamed answers: the words as the model writes them
 
@@ -139,7 +156,7 @@ activation the message is refused as before ([`adam-a2a-runtime`](../../crates/a
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
 (`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
-`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1` and `text-stream/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
+`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1` and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, choices? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, and the
 person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
@@ -203,6 +220,8 @@ subscriber sees it once. The exception is a file the coder shares with `share_fi
 | `repository` | string, optional | the URL of the repository of the slot the command ran in; for the verdict `commit_and_push` binds to a pushed commit, the repository it was pushed to. Absent for a check that ran in a scratch project (it has none), and from a report of an older coder |
 | `tree` | string, optional | the 40-hex git tree id of the code that was checked: the worktree as `commit_and_push` would commit it (`git add -A`: tracked changes and untracked files, minus what `.gitignore` excludes), computed in a temporary index. Absent when it could not be computed |
 | `summary` | string, optional | one line: `` `cmd` passed ``, or `` `cmd` failed: exit code 2 `` / `timed out after 900s` / `killed by a signal`. Says so when the worktree had uncommitted changes on top of `commit`, or that the tree was checked before it was committed |
+| `preexisting` | bool, optional | `true` when the command failed **and also fails on the base commit** (`base_commit`), before the run changed anything: the failure is the repository's. `passed` is still `false`; a gate that accepts such a failure reads this. Absent otherwise, and from a report of an older coder |
+| `base_commit` | string, optional | with `preexisting`: the 40-hex commit `origin/<base>` was at when the command failed there too |
 | `findings` | `[{check, message}]`, optional | one entry per failing check: `check` is the command, `message` is how it ended, then the tail of its output |
 
 * **From `run_checks`: one artifact per call that ran**, reflecting that run and bound to `HEAD`, with `tree`.
@@ -248,7 +267,18 @@ The system prompt (`agent/instructions.md`, with `{{max_check_cycles}}`; see
 [Where the prompt and the card live](#where-the-prompt-and-the-card-live)) tells the model the rules. The tools
 make them hold:
 
-* **Cycle limit.** Every failed `run_checks` costs a cycle, counted per tool call
+* **Pre-existing failures.** In a repository's worktree (not a scratch project), the first time a command fails with an
+  exit code, it is run once on `origin/<base>`: a detached checkout beside the slot (`Worktree::add_base_checkout`, the
+  slot's installed `node_modules` and `target` linked in) in the run's own environment session, removed afterwards.
+  If it fails there too the failure is **pre-existing** ([ADR 0026](../../docs/decisions/0026-a-failure-the-base-has-too-is-not-the-runs.md)):
+  it costs no cycle, the answer says so with the base's output and tells the model the change must not make it
+  worse, `CheckRecord::preexisting` and `base_commit` and the `checks` artifact's `preexisting` and `base_commit` say so,
+  and `open_pull_request` lets the code through when the last check on its tree is such a failure, with a note in the
+  body (and no `accept_red_checks`). The result is kept in the run notes per command, directory and base commit
+  (`ChecksNotes::base`, 16 at most), so the base runs once; a command that passes on the base is the change's failure every
+  time, and says so. A timeout, a missing tool, a signal or an environment that cannot run it is not conclusive: the
+  failure is the change's, as before. It does not prove the change adds no error: the model is shown both outputs.
+* **Cycle limit.** Every failed `run_checks` that is the change's costs a cycle, counted per tool call
   id (a replay never counts twice). At `MAX_CHECK_CYCLES` the tool tells the
   model to stop and refuses to run anything; `commit_and_push` and
   `open_pull_request` refuse too. The run then ends `failed` with the findings

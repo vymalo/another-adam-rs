@@ -341,7 +341,7 @@ of `adam-llm-agent`.
   schema), `classify` (the error is `adam_error::Classify`: retryable becomes `ToolError::Transient`,
   the rest `Permanent`), `asks_user` (the tool can end a call with `ToolError::NeedsInput`: the
   generated `Tool::asks_user` says `true`, and `bind` refuses it on a subagent), `step`, `label` and
-  `icon` (how a call is drawn as a step, `Tool::step_style`: the kind, a label instead of the tool's name, and an
+  `icon` (how a call is drawn as a step, `Tool::step_style`: the kind, a label instead of the tool's name (give one: it is what the person reads), and an
   icon from the closed vocabulary of the orchestration layer's `steps/v1` (`opencode` is OpenCode's own); [ADR 0007](../decisions/0007-progress-as-steps-and-streamed-text.md)) and
   `crate = path` (default `::adam`; `::adam_llm_agent` for a crate that does not use the facade).
   Reserved for later: `approval` (roadmap 5).

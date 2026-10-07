@@ -32,7 +32,8 @@ impl Assembly {
     /// The frontmatter holds what describes the agent: `card.name` (default: the agent's name),
     /// `card.description` (default: the frontmatter `description`) and `card.skills`. What
     /// belongs to the deployment is not in a file: `url` is where clients reach the server and
-    /// `version` is the agent's own version (usually `env!("CARGO_PKG_VERSION")`). A2A card
+    /// `version` is the agent's own version (`env!("CARGO_PKG_VERSION")`, or
+    /// `adam_a2a::build_version(..)` of it to carry the build's revision as build metadata: ADR 0028). A2A card
     /// skills are what the agent offers to callers; they are unrelated to Agent Skills.
     ///
     /// # Errors

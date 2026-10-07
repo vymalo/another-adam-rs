@@ -15,6 +15,10 @@
 #   EXPECT_NAME   Adam                         the name on the agent card
 #   EXPECT_SKILL  coding-task                  a skill id the card lists
 #   EXPECT_STATE  TASK_STATE_INPUT_REQUIRED    the state the task reaches
+#   EXPECT_REVISION  (unset)                   the commit the image was built from (its build argument
+#                                              ADAM_BUILD_REVISION): the card's version must end with
+#                                              +<its first 7 characters> and `build/v1` must say it whole.
+#                                              Unset, the version only has to carry build metadata (+...).
 # Needs curl and jq.
 set -eu
 
@@ -64,6 +68,29 @@ if jq -e '(.securitySchemes // .security_schemes // {}) | length > 0' "$body" >/
   ok "the agent card declares a security scheme"
 else
   bad "the agent card declares no security scheme"
+fi
+
+# The card says which build answers (the version's build metadata) and which agent files it runs
+# (`build/v1`, ADR 0028): a thread export can then tell which build produced an answer.
+version=$(jq -r '.version // empty' "$body" 2>/dev/null || true)
+if [ -n "${EXPECT_REVISION:-}" ]; then
+  short=$(printf '%s' "$EXPECT_REVISION" | cut -c1-7)
+  case "$version" in
+    *+"$short") ok "the card's version $version ends with the build's revision +$short" ;;
+    *) bad "the card's version is '$version', want build metadata +$short" ;;
+  esac
+  got=$(jq -r '.capabilities.extensions[]? | select(.uri == "https://agents.vymalo.com/a2a/extensions/build/v1") | .params.revision' "$body" 2>/dev/null || true)
+  if [ "$got" = "$EXPECT_REVISION" ]; then ok "build/v1 says the revision $got"; else bad "build/v1 says revision '$got', want $EXPECT_REVISION"; fi
+else
+  case "$version" in
+    *+?*) ok "the card's version $version carries build metadata" ;;
+    *) bad "the card's version is '$version', want semver build metadata (+<revision> or +unknown)" ;;
+  esac
+fi
+if jq -e '.capabilities.extensions[]? | select(.uri == "https://agents.vymalo.com/a2a/extensions/build/v1") | .params.folderDigest | startswith("sha256:")' "$body" >/dev/null 2>&1; then
+  ok "build/v1 says the digest of the agent files"
+else
+  bad "build/v1 does not say a sha256 folderDigest"
 fi
 
 rpc='{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"smoke-1","role":"ROLE_USER","parts":[{"text":"Say nothing."}]}}}'

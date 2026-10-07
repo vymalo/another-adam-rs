@@ -26,7 +26,7 @@ use super::{Outcome, ToolEnv, cancelled, environment_error, notes_error};
 /// Without `use_default` the environment is built again from the repository's file as it is now (after
 /// the person fixed it, or after the file was changed to add a tool). Your files are not touched. It
 /// builds the environment before it returns, which can take minutes.
-#[tool]
+#[tool(label = "Rebuild the environment")]
 pub async fn rebuild_environment(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Seven extensions, each optional (a client that does not know one ignores it), detected by the
+//! Eight extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -12,6 +12,7 @@
 //! | `text-stream/v1` | [`TEXT_STREAM_EXTENSION`] | the agent sends its reply as the model writes it (chunks, transient) and says the whole text once, to a client whose request activated it |
 //! | `mentions/v1` | [`MENTIONS_EXTENSION`] | the agent reads the agents a person mentioned in a message, and asks them (with the tool `ask_agent` of `thread-tools/v1`) |
 //! | `steer/v1` | [`STEER_EXTENSION`] | a message that names a running task and activates the extension is added to that task's input, and the agent reads it at its next step |
+//! | `build/v1` | [`BUILD_EXTENSION`] | the card says which build of the agent answers (`revision`) and which agent files it runs (`folderDigest`); nothing to activate |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
@@ -63,7 +64,71 @@ pub const MENTIONS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/m
 /// Without the activation such a message is refused, as plain A2A leaves it undefined.
 pub const STEER_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/steer/v1";
 
+/// The URI of the `build/v1` extension: the card's `params` say which build answers and which agent
+/// files it runs, so that a thread export or a monitor can tell what produced an answer. It is
+/// information only: no request activates it, and a client that does not know it ignores it.
+/// Written here first (ADR 0028); the orchestration layer's contract page follows.
+pub const BUILD_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/build/v1";
+
+/// What a build's revision, and the `+<revision>` of its card version, say when none was baked in.
+pub const UNKNOWN_REVISION: &str = "unknown";
+
+/// The longest revision the card repeats. A commit id is 40 (SHA-1) or 64 (SHA-256) hexadecimal digits.
+const MAX_REVISION: usize = 64;
+
+/// How many characters of the revision the card's version carries after `+`.
+const SHORT_REVISION: usize = 7;
+
+/// `revision`, as a build baked it in (`option_env!("ADAM_BUILD_REVISION")`), made safe to print on a
+/// card and in a version: only letters, digits and `-` stay (semver's build metadata), at most 64
+/// of them, and [`UNKNOWN_REVISION`] for none, blank or nothing usable.
+pub fn revision_of(revision: Option<&str>) -> String {
+    let kept: String = revision
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(MAX_REVISION)
+        .collect();
+    if kept.is_empty() {
+        UNKNOWN_REVISION.to_owned()
+    } else {
+        kept
+    }
+}
+
+/// The card's `version` for a build: the package's version and, as semver build metadata, the first
+/// seven characters of the revision: `0.1.0+6478fbc`, `0.1.0+unknown` for a build without one.
+///
+/// A package version that already carries build metadata gets the revision as one more identifier
+/// (`0.1.0+local.6478fbc`).
+pub fn build_version(package_version: &str, revision: Option<&str>) -> String {
+    let revision = revision_of(revision);
+    let short: String = revision.chars().take(SHORT_REVISION).collect();
+    let joiner = if package_version.contains('+') {
+        '.'
+    } else {
+        '+'
+    };
+    format!("{package_version}{joiner}{short}")
+}
+
 impl ExtensionConfig {
+    /// The `build/v1` extension: `params` are `{"revision": <the build's revision, or "unknown">,
+    /// "folderDigest": <the digest of the agent files>}`. Optional; the revision is [`revision_of`]
+    /// of `revision`, so an agent that was built without one says `unknown` instead of nothing.
+    pub fn build(revision: Option<&str>, folder_digest: &str) -> Self {
+        let mut extension = Self::new(BUILD_EXTENSION);
+        extension.description =
+            Some("Says which build answers and which agent files it runs".into());
+        extension
+            .params
+            .insert("revision".into(), json!(revision_of(revision)));
+        extension
+            .params
+            .insert("folderDigest".into(), json!(folder_digest));
+        extension
+    }
+
     /// The A2UI v0.9.1 extension, as the card of an agent that takes the screen's catalog inline
     /// declares it: `supportedCatalogIds` lists the basic catalog, and `acceptsInlineCatalogs` is
     /// `true` (A2UI's default is `false`, so without it a renderer never sends one).
@@ -140,6 +205,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_version_carries_the_short_revision_as_build_metadata() {
+        let sha = "6478fbc1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7";
+        assert_eq!(build_version("0.1.0", Some(sha)), "0.1.0+6478fbc");
+        assert_eq!(build_version("0.1.0", None), "0.1.0+unknown");
+        assert_eq!(build_version("0.1.0", Some("  ")), "0.1.0+unknown");
+        assert_eq!(build_version("0.1.0", Some("abc")), "0.1.0+abc");
+        assert_eq!(
+            build_version("0.1.0+local", Some(sha)),
+            "0.1.0+local.6478fbc"
+        );
+    }
+
+    #[test]
+    fn a_revision_is_cleaned_before_it_reaches_a_card() {
+        assert_eq!(revision_of(Some(" 6478fbc\n")), "6478fbc");
+        assert_eq!(revision_of(Some("a b/c.d_e")), "abcde");
+        assert_eq!(revision_of(Some("***")), "unknown");
+        assert_eq!(revision_of(Some(&"a".repeat(200))).len(), 64);
+    }
+
+    #[test]
+    fn the_build_extension_says_the_revision_and_the_folder() {
+        let extension = ExtensionConfig::build(Some("6478fbc1"), "sha256:abc");
+        assert_eq!(extension.uri, BUILD_EXTENSION);
+        assert!(!extension.required);
+        assert_eq!(extension.params["revision"], "6478fbc1");
+        assert_eq!(extension.params["folderDigest"], "sha256:abc");
+        assert_eq!(
+            ExtensionConfig::build(None, "sha256:abc").params["revision"],
+            "unknown"
+        );
+    }
+
+    #[test]
     fn the_uris_are_the_ones_of_the_contracts() {
         assert_eq!(
             UI_CATALOG_EXTENSION,
@@ -164,6 +263,10 @@ mod tests {
         assert_eq!(
             STEER_EXTENSION,
             "https://agents.vymalo.com/a2a/extensions/steer/v1"
+        );
+        assert_eq!(
+            BUILD_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/build/v1"
         );
         assert_eq!(
             A2UI_EXTENSION_V0_9_1,

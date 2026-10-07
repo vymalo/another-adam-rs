@@ -51,6 +51,15 @@ pub enum ExitStatus {
     Failed(String),
 }
 
+impl std::fmt::Display for ExitStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(code) => write!(f, "exit code {code}"),
+            Self::Failed(message) => write!(f, "failed: {message}"),
+        }
+    }
+}
+
 /// What the end of a command says, from the stream's last message.
 ///
 /// A success is `0`; a failure with a cause of reason `ExitCode` carries the code in its message
@@ -296,6 +305,15 @@ mod tests {
             }),
             ..Status::default()
         }
+    }
+
+    #[test]
+    fn an_exit_status_is_said_in_words() {
+        assert_eq!(ExitStatus::Code(2).to_string(), "exit code 2");
+        assert_eq!(
+            ExitStatus::Failed("no pod".into()).to_string(),
+            "failed: no pod"
+        );
     }
 
     #[test]

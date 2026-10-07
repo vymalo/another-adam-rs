@@ -34,6 +34,18 @@ pub(crate) fn subagent_spec(tool_name: &str, description: &str) -> ToolSpec {
     }
 }
 
+/// A subagent's tool name as the label of its step: the name with its separators as spaces and the
+/// first letter capitalised (`explorer` is "Explorer", `code_reviewer` is "Code reviewer"). The
+/// description is free text for the model, so its first words make a poor title.
+pub(crate) fn title_of(tool_name: &str) -> String {
+    let spaced = tool_name.replace(['_', '-'], " ");
+    let mut chars = spaced.trim().chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => tool_name.to_owned(),
+    }
+}
+
 /// The tool that runs a subagent, one per subagent, named after it.
 ///
 /// `AgentDef::bind` adds one to the parent of every local subagent, so a user of this crate
@@ -85,9 +97,12 @@ impl Tool for SubagentTool {
         self.spec.clone()
     }
 
-    /// A call is an agent working for this one: a `subagent` step, drawn as an agent.
+    /// A call is an agent working for this one: a `subagent` step, drawn as an agent and called by
+    /// the tool's name as a person reads it (`explorer` is "Explorer").
     fn step_style(&self) -> StepStyle {
-        StepStyle::new(StepKind::Subagent).with_icon(StepIcon::Agent)
+        StepStyle::new(StepKind::Subagent)
+            .with_label(title_of(&self.spec.name))
+            .with_icon(StepIcon::Agent)
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
@@ -141,7 +156,15 @@ mod tests {
         let style = tool().step_style();
         assert_eq!(style.kind, StepKind::Subagent);
         assert_eq!(style.icon, Some(StepIcon::Agent));
-        assert_eq!(style.label, None, "the tool's name labels it");
+        assert_eq!(style.label.as_deref(), Some("Reviewer"));
+    }
+
+    #[test]
+    fn a_title_is_the_tool_name_as_a_person_reads_it() {
+        assert_eq!(title_of("explorer"), "Explorer");
+        assert_eq!(title_of("code_reviewer"), "Code reviewer");
+        assert_eq!(title_of("billing-agent"), "Billing agent");
+        assert_eq!(title_of("x"), "X");
     }
 
     #[tokio::test]

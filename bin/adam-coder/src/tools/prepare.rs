@@ -43,7 +43,7 @@ use super::{Outcome, ToolEnv, non_empty, notes_error, workspace_error};
 /// you ask the person which one with ask_user. To carry on with work an earlier
 /// task of this conversation pushed (a rework, a follow-up), pass that branch as
 /// `branch`: the worktree starts from it and open_pull_request updates its pull request.
-#[tool]
+#[tool(label = "Prepare the workspace")]
 pub async fn prepare_workspace(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

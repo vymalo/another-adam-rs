@@ -31,8 +31,8 @@ authentication behave like the real tool.
 | `confine_git_env(&mut tokio::process::Command)`, `GIT_INHERITED_ENV` | the environment of a `git` a caller starts itself: empty, plus only the variables of `GIT_INHERITED_ENV` (`PATH`, `HOME`, the locale and temp dirs, certificate and proxy settings, `GIT_CONFIG_GLOBAL`). Every `git` this crate runs starts this way, and the coder's own (`git apply`, the tree-id probes) too ([below](#git-starts-from-an-empty-environment)) |
 | `login_shell()` | `bash` where the image has one, else `sh` (the shell of a `Program::Shell`) |
 | `RepoRef`, `RepoLocation` | repository URL and base branch, parsed and validated (`RepoRef::new(url, base_branch)`, `locate()`) |
-| `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `mirror` (the bare mirror the worktree is linked to: an environment that runs `git` in the worktree has to read it), `dir` (the slot's name), `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` (the run's own branch), `publish` (moves the continued branch) |
-| `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files |
+| `Worktree` | `lock_mirror` (`MirrorLock`), `path`, `mirror` (the bare mirror the worktree is linked to: an environment that runs `git` in the worktree has to read it), `dir` (the slot's name), `branch` (the branch the work ends up on, see below), `local_branch` (the run's own), `continues`, `run`, `repo`, `status`, `diff_stat`, `commit_all(message, &GitIdentity)`, `push` (the run's own branch), `publish` (moves the continued branch), `base_commit` (what `origin/<base>` is at), `add_base_checkout` / `remove_base_checkout` (a temporary detached checkout of it, a `BaseCheckout`, below) |
+| `GitIdentity`, `ChangedFile`, `FileStatus` | commit author and changed files (`FileStatus` is `Display`: `modified`, `type changed`) |
 | `GitCredentials` (trait), `DynGitCredentials` | `token_for(&RepoRef) -> SecretString` |
 | `StaticToken`, `ScopedToken` | one token for any host, or bound to named hosts (`from_env(..)` for both) |
 | `HostScoped<C>` | any credentials, issued only for named hosts: `new(hosts, inner)` checks the host of the repository (and refuses a local one) **before** `inner` is asked, as `ScopedToken` does for its token |
@@ -113,6 +113,18 @@ secrets of the process (`GITHUB_TOKEN`, `MODEL_API_KEY`, the keys an MCP server 
 the one invocation that carries **the token** (fetch, ls-remote, push) has it in its environment, and the mirror guard above
 is a list of keys, not a proof that nothing in a repository's configuration runs there; a proxy URL with a password in
 `HTTPS_PROXY` is inherited. Test: `git_env::tests::a_filter_a_repository_configures_does_not_see_the_coders_environment`.
+
+### A check on the base: `BaseCheckout`
+
+`Worktree::add_base_checkout()` checks `origin/<base>` out **detached** in `<run's workspace>/.adam-base/<slot>`: a second
+worktree of the same repository, inside the directory the run's environment binds (so a command can be run there as in the
+slot), and not a slot (slots are listed from their metadata). What the slot has and git ignores (`node_modules`, `target`,
+installed dependencies) is **linked** into it, so the base's files are checked with the slot's installed tools; a command run
+there must not write to them. `None` for a worktree of the old layout (`<root>/worktrees/<run>`) and when the mirror has no
+`origin/<base>`. A checkout left by a process that died is replaced, and `remove_base_checkout` removes the links first (the
+slot's files are never touched), then the worktree, and prunes the mirror's list; it is idempotent. `adam-coder`'s
+`run_checks` uses it to tell a failure the run caused from one the repository already had
+([ADR 0026](../../docs/decisions/0026-a-failure-the-base-has-too-is-not-the-runs.md)).
 
 ## A run's workspace: slots, scratch projects, and the copy between them
 

@@ -32,7 +32,7 @@ or a plan was steered into a pull request. The owner chose the name **Adam**.
    `ghcr.io/vymalo/another-adam-rs/coder`, the chart `deploy/coder` and the environment variables move later, in one
    release, so that consumers change their pins once.
 6. **OpenCode's step has its own icon.** `StepIcon::OpenCode`, on the wire `"opencode"`, is the icon of the
-   `delegate_to_opencode` step (its children keep the icons of their ACP kinds). The label stays "OpenCode".
+   `delegate_to_opencode` step (its children keep the icons of their ACP kinds). The label stays "OpenCode". *Amended 2026-10-07:* it is "Hand to OpenCode", like every other tool's step ([ADR 0027](0027-every-tool-has-a-title-for-its-step.md)).
 
 ## Consequences
 

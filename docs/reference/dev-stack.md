@@ -59,7 +59,8 @@ The coder waits for `postgres`, `mock-openai`, `mock-github` and `git-server`. I
 `dev/coder-agent/mcp.json`, mounted over the folder's, with `GITHUB_MCP_URL=http://mock-github-mcp:8080` and
 `MCP_ALLOW_INSECURE=true` (plain `http` to another container; development only). `CREATE_REPO_OWNERS` is
 `scratch`. The coder authenticates with a dummy token unless `-f dev/compose.github-app.yaml` is added (below).
-Ports move with variables ([Environment](environment.md#local-stack-composeyaml)).
+Ports move with variables ([Environment](environment.md#local-stack-composeyaml)). Set `ADAM_BUILD_REVISION` in `.env` to see a
+revision on the cards (`0.1.0+<sha7>`); unset, they say `unknown`.
 
 ## Overrides
 

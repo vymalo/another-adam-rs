@@ -31,7 +31,7 @@ use tokio::sync::OnceCell;
 use url::{Host, Url};
 
 use crate::error::{Error, Origin, RemoteAuthProblem, RemoteUrlProblem};
-use crate::subagent::subagent_spec;
+use crate::subagent::{subagent_spec, title_of};
 
 /// How long a parent waits for a remote task before it answers the call with an error result
 /// (the default of [`AgentDef::remote_timeout`](crate::AgentDef::remote_timeout)).
@@ -499,7 +499,9 @@ impl Tool for RemoteSubagentTool {
     /// A call is an agent, on another system, working for this one: a `subagent` step drawn as an
     /// agent.
     fn step_style(&self) -> StepStyle {
-        StepStyle::new(StepKind::Subagent).with_icon(StepIcon::Agent)
+        StepStyle::new(StepKind::Subagent)
+            .with_label(title_of(&self.spec.name))
+            .with_icon(StepIcon::Agent)
     }
 
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {

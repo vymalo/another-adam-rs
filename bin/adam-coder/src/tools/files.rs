@@ -674,7 +674,7 @@ pub(super) fn push_published_note(text: &mut String, slot: &adam_workspace::Slot
 /// a range you get the whole file (cut at 256 KiB, and the cut is marked); with `start_line` and
 /// `end_line` you get just those lines, each behind its number. A binary file is not shown. Use it
 /// to read before you change something, and run_command (`ls`, `grep -rn`) to find where to look.
-#[tool]
+#[tool(label = "Read a file")]
 pub async fn read_file(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -710,7 +710,7 @@ pub async fn read_file(
 /// path is relative to the root of the worktree; nothing inside `.git` and nothing through a
 /// symlink can be written. For a change to part of a file use edit_file (exact text replaced) or
 /// apply_patch (a diff); for a broad, multi-file change use delegate_to_opencode.
-#[tool]
+#[tool(label = "Write a file")]
 pub async fn write_file(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -755,7 +755,7 @@ pub async fn write_file(
 /// and you are told why. Read the file first, so the context lines match it exactly. Use it for
 /// several changes at once, in one file or several; for one exact replacement edit_file is simpler.
 /// Delegate broad, multi-file changes to OpenCode.
-#[tool]
+#[tool(label = "Apply a patch")]
 pub async fn apply_patch(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -1090,7 +1090,7 @@ fn not_found(shown: &str, content: &str, old: &str) -> String {
 /// unique). The path is relative to the root of the worktree; nothing inside `.git` and nothing
 /// through a symlink can be edited. The file must be text of at most 1 MiB. To create a file or
 /// replace it whole use write_file, for several files at once apply_patch.
-#[tool]
+#[tool(label = "Edit a file")]
 pub async fn edit_file(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
