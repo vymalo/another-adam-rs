@@ -1,0 +1,38 @@
+[package]
+name = "adam-operator-controller"
+description = "The reconcilers of the v0 operator: AgentService and AgentConfig controllers over the RuntimeProvider and StoreProvisioner seams, and an AgentDirectory backed by a reflector"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-operator-api.workspace = true
+adam-operator-domain.workspace = true
+adam-error.workspace = true
+adam-operator-ports.workspace = true
+futures.workspace = true
+k8s-openapi.workspace = true
+# `unstable-runtime` is for `Controller::reconcile_on`: it is how the ids of `RuntimeProvider::watch()` reach the
+# reconciler. The version is pinned by Cargo.lock; see the README ("kube-rs").
+kube = { workspace = true, features = ["runtime", "unstable-runtime"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+adam-operator-ports = { workspace = true, features = ["testkit"] }
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tower.workspace = true
+
+[lints]
+workspace = true

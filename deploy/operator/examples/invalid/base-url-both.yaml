@@ -1,0 +1,30 @@
+# Refused: model.baseUrl has both value and secretRef (a rule beyond the CEL rules of the archived design, same shape).
+# expect: exactly one of model.baseUrl.value and model.baseUrl.secretRef
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: invalid-baseurl-both
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-agent
+      agent:
+        folder:
+          files:
+            instructions.md: |
+              Hello.
+  model:
+    model: m
+    baseUrl:
+      value: https://gateway.example.invalid/v1
+      secretRef:
+        name: s
+        key: MODEL_BASE_URL
+    apiKeySecretRef:
+      name: s
+      key: MODEL_API_KEY
+  environment:
+    image:
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924

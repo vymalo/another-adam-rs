@@ -1,0 +1,266 @@
+{
+  "claims": {
+    "coder-work": {
+      "accessModes": [
+        "ReadWriteMany"
+      ],
+      "storage": "20Gi",
+      "storageClass": "longhorn-rwx"
+    }
+  },
+  "configMaps": {},
+  "podDisruptionBudgets": {},
+  "service": {
+    "name": "coder",
+    "port": 8080,
+    "selects": "coder"
+  },
+  "source": {
+    "chart": "deploy/coder",
+    "generatedBy": "tools/adam-operator-parity/regen.sh",
+    "helm": "v3.19.0+g3d8990f",
+    "namespace": "another-agentic-system",
+    "release": "coder",
+    "values": "tools/adam-operator-parity/cases/coder-affinity-token.yaml"
+  },
+  "workloads": {
+    "coder": {
+      "agent": {
+        "args": [],
+        "command": [],
+        "env": [
+          {
+            "literal": "0.0.0.0:8080",
+            "name": "LISTEN_ADDR"
+          },
+          {
+            "literal": "/work",
+            "name": "WORKSPACE_ROOT"
+          },
+          {
+            "literal": "affinity",
+            "name": "WORKSPACE_PLACEMENT"
+          },
+          {
+            "field": "metadata.name",
+            "name": "WORKER_ID"
+          },
+          {
+            "literal": "https://coder.example.com/",
+            "name": "PUBLIC_URL"
+          },
+          {
+            "literal": "https://gateway.example.com/v1",
+            "name": "MODEL_BASE_URL"
+          },
+          {
+            "literal": "coding-model",
+            "name": "MODEL"
+          },
+          {
+            "literal": "{\"chat_template_kwargs\":{\"enable_thinking\":true},\"reasoning_effort\":\"medium\"}",
+            "name": "MODEL_EXTRA_BODY"
+          },
+          {
+            "literal": "reasoning_content",
+            "name": "MODEL_ECHO_REASONING"
+          },
+          {
+            "literal": "coding-model",
+            "name": "OPENCODE_MODEL"
+          },
+          {
+            "literal": "4",
+            "name": "WORKERS"
+          },
+          {
+            "literal": "3",
+            "name": "MAX_CHECK_CYCLES"
+          },
+          {
+            "literal": "900",
+            "name": "CHECK_TIMEOUT_SECS"
+          },
+          {
+            "literal": "300",
+            "name": "WORKSPACE_SWEEP_SECS"
+          },
+          {
+            "literal": "true",
+            "name": "MCP_ALLOW_STDIO"
+          },
+          {
+            "literal": "http://127.0.0.1:9090",
+            "name": "GITHUB_MCP_URL"
+          },
+          {
+            "literal": "github.com,ghe.example.com",
+            "name": "ALLOWED_REPO_HOSTS"
+          },
+          {
+            "literal": "https://ghe.example.com/api/v3",
+            "name": "GITHUB_API_URL"
+          },
+          {
+            "literal": "vymalo,acme",
+            "name": "CREATE_REPO_OWNERS"
+          },
+          {
+            "literal": "false",
+            "name": "PR_DRAFT"
+          },
+          {
+            "literal": "bored-giant-panda[bot]",
+            "name": "GIT_AUTHOR_NAME"
+          },
+          {
+            "literal": "337696346+bored-giant-panda[bot]@users.noreply.github.com",
+            "name": "GIT_AUTHOR_EMAIL"
+          },
+          {
+            "literal": "bar",
+            "name": "FOO"
+          },
+          {
+            "literal": "debug",
+            "name": "RUST_LOG"
+          },
+          {
+            "name": "DATABASE_URL",
+            "secret": {
+              "key": "uri",
+              "name": "coder-db-uri"
+            }
+          },
+          {
+            "name": "MODEL_API_KEY",
+            "secret": {
+              "key": "MODEL_API_KEY",
+              "name": "coder-secrets"
+            }
+          },
+          {
+            "name": "GITHUB_TOKEN",
+            "secret": {
+              "key": "GITHUB_TOKEN",
+              "name": "coder-secrets"
+            }
+          },
+          {
+            "name": "A2A_BEARER_TOKENS",
+            "secret": {
+              "key": "A2A_BEARER_TOKENS",
+              "name": "coder-secrets"
+            }
+          }
+        ],
+        "image": "ghcr.io/vymalo/another-adam-rs/coder:sha-4363924",
+        "mounts": [
+          {
+            "name": "work",
+            "path": "/work",
+            "readOnly": false
+          }
+        ],
+        "port": 8080,
+        "probes": {
+          "liveness": {
+            "failureThreshold": 4,
+            "http": "/healthz",
+            "period": 15,
+            "timeout": 3
+          },
+          "readiness": {
+            "failureThreshold": null,
+            "http": "/healthz",
+            "period": 5,
+            "timeout": 3
+          },
+          "startup": {
+            "failureThreshold": 40,
+            "http": "/healthz",
+            "period": 3,
+            "timeout": null
+          }
+        },
+        "resources": {
+          "limits": {
+            "memory": "6Gi"
+          },
+          "requests": {
+            "cpu": "500m",
+            "memory": "1Gi"
+          }
+        }
+      },
+      "claimTemplates": [],
+      "kind": "StatefulSet",
+      "replicas": 2,
+      "securityContext": {
+        "fsGroup": 10001,
+        "fsGroupChangePolicy": "OnRootMismatch",
+        "runAsGroup": 10001,
+        "runAsUser": 10001
+      },
+      "sidecars": {
+        "github-mcp": {
+          "args": [
+            "http",
+            "--read-only",
+            "--toolsets",
+            "context,repos,issues,pull_requests",
+            "--listen-host",
+            "127.0.0.1",
+            "--port",
+            "9090"
+          ],
+          "command": [
+            "tini",
+            "--",
+            "github-mcp-server"
+          ],
+          "env": [
+            {
+              "literal": "ghe.example.com",
+              "name": "GITHUB_HOST"
+            }
+          ],
+          "image": "ghcr.io/vymalo/another-adam-rs/coder:sha-4363924",
+          "mounts": [],
+          "port": null,
+          "probes": {
+            "liveness": null,
+            "readiness": null,
+            "startup": {
+              "exec": [
+                "bash",
+                "-c",
+                "exec 3<>/dev/tcp/127.0.0.1/9090"
+              ],
+              "failureThreshold": 30,
+              "period": 2,
+              "timeout": null
+            }
+          },
+          "resources": {
+            "limits": {
+              "memory": "256Mi"
+            },
+            "requests": {
+              "cpu": "50m",
+              "memory": "64Mi"
+            }
+          }
+        }
+      },
+      "terminationGracePeriodSeconds": 120,
+      "volumes": [
+        {
+          "claim": "coder-work",
+          "kind": "persistentVolumeClaim",
+          "name": "work"
+        }
+      ]
+    }
+  }
+}

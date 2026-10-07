@@ -1,0 +1,26 @@
+# Refused: scaling.front is set with topology combined.
+# expect: scaling.front is only allowed with topology: split
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentService
+metadata:
+  name: invalid-front
+  namespace: another-agentic-system
+spec:
+  configRef:
+    name: chat
+  interfaces:
+    a2a:
+      enabled: true
+      bearerTokensSecretRef:
+        name: tokens
+        key: A2A_BEARER_TOKENS
+  scaling:
+    topology: combined
+    workers: 1
+    front:
+      replicas: 2
+  store:
+    postgres:
+      secretRef:
+        name: db
+        key: uri

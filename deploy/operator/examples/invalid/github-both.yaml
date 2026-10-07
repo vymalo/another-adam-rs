@@ -1,0 +1,36 @@
+# Refused: github has both app and token.
+# expect: exactly one of github.app and github.token
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: invalid-github-both
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-coder
+      agent:
+        embedded: {}
+      coder:
+        github:
+          app:
+            id: Iv1.example
+            owners: [vymalo]
+            privateKeySecretRef:
+              name: gh
+              key: key.pem
+          token:
+            secretRef:
+              name: gh
+              key: GITHUB_TOKEN
+  model:
+    model: m
+    baseUrl:
+      value: https://gateway.example.invalid/v1
+    apiKeySecretRef:
+      name: s
+      key: MODEL_API_KEY
+  environment:
+    image:
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924

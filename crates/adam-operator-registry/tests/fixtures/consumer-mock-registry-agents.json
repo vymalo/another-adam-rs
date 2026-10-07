@@ -1,0 +1,19 @@
+{
+  "linkset": [
+    {
+      "anchor": "http://mock-registry:8080/registry/v1/agents",
+      "profile": [
+        { "href": "https://agents.vymalo.com/registry/v1" }
+      ],
+      "item": [
+        {
+          "href": "http://mock-agent-releases:8080/.well-known/agent-card.json",
+          "type": "application/json",
+          "title": "Platform coder",
+          "service": ["platform-coder"],
+          "tags": ["coding", "git"]
+        }
+      ]
+    }
+  ]
+}

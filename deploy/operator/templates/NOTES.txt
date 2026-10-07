@@ -1,0 +1,7 @@
+The operator watches the namespace {{ include "adam-operator.watchNamespace" . }} and reconciles AgentService and AgentConfig there.
+{{- if include "adam-operator.registrySecretName" . }}
+The agent registry is served at http://{{ include "adam-operator.fullname" . }}-registry.{{ .Release.Namespace }}.svc:8080/registry/v1/agents (bearer token from the Secret {{ include "adam-operator.registrySecretName" . }}).
+{{- else }}
+No registry token is set, so no registry is served and every service says Listed: False, reason RegistryDisabled.
+{{- end }}
+The CRDs are not part of this chart: install deploy/operator-crds (or kubectl apply --server-side -f deploy/crds/agents.vymalo.com.yaml) first.

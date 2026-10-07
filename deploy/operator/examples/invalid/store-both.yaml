@@ -1,0 +1,27 @@
+# Refused: store.postgres has both secretRef and cnpg.
+# expect: exactly one of store.postgres.secretRef and store.postgres.cnpg
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentService
+metadata:
+  name: invalid-store-both
+  namespace: another-agentic-system
+spec:
+  configRef:
+    name: chat
+  interfaces:
+    a2a:
+      enabled: true
+      bearerTokensSecretRef:
+        name: tokens
+        key: A2A_BEARER_TOKENS
+  scaling:
+    topology: combined
+    workers: 1
+  store:
+    postgres:
+      secretRef:
+        name: db
+        key: uri
+      cnpg:
+        storage:
+          size: 5Gi

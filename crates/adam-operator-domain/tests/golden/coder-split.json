@@ -1,0 +1,393 @@
+{
+  "claims": {},
+  "configMaps": {
+    "coder-mcp": {
+      "mcp.json": {
+        "mcpServers": {
+          "context7": {
+            "headers": {
+              "Authorization": "Bearer ${CONTEXT7_API_KEY}"
+            },
+            "optional": true,
+            "type": "http",
+            "url": "https://mcp.context7.com/mcp"
+          },
+          "websearch": {
+            "headers": {
+              "Authorization": "Bearer ${SEARCH_MCP_TOKEN}"
+            },
+            "optional": true,
+            "type": "http",
+            "url": "http://another-agentic-websearch.another-agentic-system.svc:8080/mcp"
+          }
+        }
+      }
+    }
+  },
+  "podDisruptionBudgets": {
+    "coder-front": {
+      "minAvailable": 1
+    }
+  },
+  "service": {
+    "name": "coder",
+    "port": 8080,
+    "selects": "coder-front"
+  },
+  "source": {
+    "chart": "deploy/coder",
+    "generatedBy": "tools/adam-operator-parity/regen.sh",
+    "helm": "v3.19.0+g3d8990f",
+    "namespace": "another-agentic-system",
+    "release": "coder",
+    "values": "tools/adam-operator-parity/cases/coder-split.yaml"
+  },
+  "workloads": {
+    "coder": {
+      "agent": {
+        "args": [],
+        "command": [],
+        "env": [
+          {
+            "literal": "0.0.0.0:8080",
+            "name": "LISTEN_ADDR"
+          },
+          {
+            "literal": "/work",
+            "name": "WORKSPACE_ROOT"
+          },
+          {
+            "literal": "isolated",
+            "name": "WORKSPACE_PLACEMENT"
+          },
+          {
+            "field": "metadata.name",
+            "name": "WORKER_ID"
+          },
+          {
+            "literal": "worker",
+            "name": "ROLE"
+          },
+          {
+            "name": "MODEL_BASE_URL",
+            "secret": {
+              "key": "MODEL_BASE_URL",
+              "name": "coder-secrets"
+            }
+          },
+          {
+            "literal": "coding-model",
+            "name": "MODEL"
+          },
+          {
+            "literal": "coding-model",
+            "name": "OPENCODE_MODEL"
+          },
+          {
+            "literal": "4",
+            "name": "WORKERS"
+          },
+          {
+            "literal": "3",
+            "name": "MAX_CHECK_CYCLES"
+          },
+          {
+            "literal": "900",
+            "name": "CHECK_TIMEOUT_SECS"
+          },
+          {
+            "literal": "300",
+            "name": "WORKSPACE_SWEEP_SECS"
+          },
+          {
+            "literal": "true",
+            "name": "MCP_ALLOW_STDIO"
+          },
+          {
+            "literal": "/etc/adam/extra-mcp/mcp.json",
+            "name": "ADAM_EXTRA_MCP_FILE"
+          },
+          {
+            "literal": "true",
+            "name": "MCP_ALLOW_INSECURE"
+          },
+          {
+            "literal": "http://127.0.0.1:8082",
+            "name": "GITHUB_MCP_URL"
+          },
+          {
+            "literal": "github.com",
+            "name": "ALLOWED_REPO_HOSTS"
+          },
+          {
+            "literal": "https://api.github.com",
+            "name": "GITHUB_API_URL"
+          },
+          {
+            "literal": "Iv23li4m1ZrQ8wdwjnQH",
+            "name": "GITHUB_APP_ID"
+          },
+          {
+            "literal": "vymalo",
+            "name": "GITHUB_APP_OWNERS"
+          },
+          {
+            "literal": "/var/run/secrets/github-app/private-key.pem",
+            "name": "GITHUB_APP_PRIVATE_KEY_PATH"
+          },
+          {
+            "literal": "true",
+            "name": "PR_DRAFT"
+          },
+          {
+            "literal": "bored-giant-panda[bot]",
+            "name": "GIT_AUTHOR_NAME"
+          },
+          {
+            "literal": "337696346+bored-giant-panda[bot]@users.noreply.github.com",
+            "name": "GIT_AUTHOR_EMAIL"
+          },
+          {
+            "name": "DATABASE_URL",
+            "secret": {
+              "key": "uri",
+              "name": "coder-db-uri"
+            }
+          },
+          {
+            "name": "MODEL_API_KEY",
+            "secret": {
+              "key": "MODEL_API_KEY",
+              "name": "coder-secrets"
+            }
+          },
+          {
+            "name": "SEARCH_MCP_TOKEN",
+            "secret": {
+              "key": "SEARCH_MCP_TOKEN",
+              "name": "coder-secrets"
+            }
+          },
+          {
+            "name": "CONTEXT7_API_KEY",
+            "secret": {
+              "key": "CONTEXT7_API_KEY",
+              "name": "coder-secrets"
+            }
+          }
+        ],
+        "image": "ghcr.io/vymalo/another-adam-rs/coder:sha-4363924",
+        "mounts": [
+          {
+            "name": "work",
+            "path": "/work",
+            "readOnly": false
+          },
+          {
+            "name": "github-app",
+            "path": "/var/run/secrets/github-app",
+            "readOnly": true
+          },
+          {
+            "name": "extra-mcp",
+            "path": "/etc/adam/extra-mcp",
+            "readOnly": true
+          }
+        ],
+        "port": 8080,
+        "probes": {
+          "liveness": {
+            "failureThreshold": 4,
+            "http": "/healthz",
+            "period": 15,
+            "timeout": 3
+          },
+          "readiness": {
+            "failureThreshold": null,
+            "http": "/healthz",
+            "period": 5,
+            "timeout": 3
+          },
+          "startup": {
+            "failureThreshold": 40,
+            "http": "/healthz",
+            "period": 3,
+            "timeout": null
+          }
+        },
+        "resources": {
+          "limits": {
+            "memory": "6Gi"
+          },
+          "requests": {
+            "cpu": "500m",
+            "memory": "1Gi"
+          }
+        }
+      },
+      "claimTemplates": [
+        {
+          "accessModes": [
+            "ReadWriteOnce"
+          ],
+          "name": "work",
+          "storage": "20Gi",
+          "storageClass": "longhorn"
+        }
+      ],
+      "kind": "StatefulSet",
+      "replicas": 2,
+      "securityContext": {
+        "fsGroup": 10001,
+        "fsGroupChangePolicy": "OnRootMismatch",
+        "runAsGroup": 10001,
+        "runAsUser": 10001
+      },
+      "sidecars": {
+        "github-mcp": {
+          "args": [
+            "http",
+            "--read-only",
+            "--toolsets",
+            "context,repos,issues,pull_requests",
+            "--listen-host",
+            "127.0.0.1",
+            "--port",
+            "8082"
+          ],
+          "command": [
+            "tini",
+            "--",
+            "github-mcp-server"
+          ],
+          "env": [],
+          "image": "ghcr.io/vymalo/another-adam-rs/coder:sha-4363924",
+          "mounts": [],
+          "port": null,
+          "probes": {
+            "liveness": null,
+            "readiness": null,
+            "startup": {
+              "exec": [
+                "bash",
+                "-c",
+                "exec 3<>/dev/tcp/127.0.0.1/8082"
+              ],
+              "failureThreshold": 30,
+              "period": 2,
+              "timeout": null
+            }
+          },
+          "resources": {
+            "limits": {
+              "memory": "256Mi"
+            },
+            "requests": {
+              "cpu": "50m",
+              "memory": "64Mi"
+            }
+          }
+        }
+      },
+      "terminationGracePeriodSeconds": 120,
+      "volumes": [
+        {
+          "items": [
+            {
+              "key": "private-key.pem",
+              "path": "private-key.pem"
+            }
+          ],
+          "kind": "secret",
+          "mode": 288,
+          "name": "github-app",
+          "secret": "coder-github-app"
+        },
+        {
+          "configMap": "coder-mcp",
+          "kind": "configMap",
+          "mode": 292,
+          "name": "extra-mcp"
+        }
+      ]
+    },
+    "coder-front": {
+      "agent": {
+        "args": [],
+        "command": [],
+        "env": [
+          {
+            "literal": "0.0.0.0:8080",
+            "name": "LISTEN_ADDR"
+          },
+          {
+            "literal": "control-plane",
+            "name": "ROLE"
+          },
+          {
+            "literal": "http://coder.another-agentic-system.svc.cluster.local:8080/",
+            "name": "PUBLIC_URL"
+          },
+          {
+            "name": "DATABASE_URL",
+            "secret": {
+              "key": "uri",
+              "name": "coder-db-uri"
+            }
+          },
+          {
+            "name": "A2A_BEARER_TOKENS",
+            "secret": {
+              "key": "A2A_BEARER_TOKENS",
+              "name": "coder-secrets"
+            }
+          }
+        ],
+        "image": "ghcr.io/vymalo/another-adam-rs/coder:sha-4363924",
+        "mounts": [],
+        "port": 8080,
+        "probes": {
+          "liveness": {
+            "failureThreshold": 4,
+            "http": "/healthz",
+            "period": 15,
+            "timeout": 3
+          },
+          "readiness": {
+            "failureThreshold": null,
+            "http": "/healthz",
+            "period": 5,
+            "timeout": 3
+          },
+          "startup": {
+            "failureThreshold": 40,
+            "http": "/healthz",
+            "period": 3,
+            "timeout": null
+          }
+        },
+        "resources": {
+          "limits": {
+            "memory": "512Mi"
+          },
+          "requests": {
+            "cpu": "100m",
+            "memory": "256Mi"
+          }
+        }
+      },
+      "claimTemplates": [],
+      "kind": "Deployment",
+      "replicas": 2,
+      "securityContext": {
+        "fsGroup": 10001,
+        "fsGroupChangePolicy": "OnRootMismatch",
+        "runAsGroup": 10001,
+        "runAsUser": 10001
+      },
+      "sidecars": {},
+      "terminationGracePeriodSeconds": 30,
+      "volumes": []
+    }
+  }
+}
