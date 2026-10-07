@@ -167,6 +167,9 @@ pub const MAX_REFERENCES: usize = 8;
 /// cancels runs, and never steps one. Workers are run by the caller
 /// (`Runtime::run_worker`); a process that registered only the starter has
 /// nothing to step, so a worker with the full agent has to run elsewhere.
+///
+/// `ListTasks` reports `total_size` exactly without a `status` filter and for `completed`, and as
+/// an upper bound for the other states (see the `list` module).
 #[derive(Clone)]
 pub struct RuntimeTaskBackend {
     pub(crate) runtime: Runtime,

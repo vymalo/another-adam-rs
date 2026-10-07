@@ -8,6 +8,12 @@
 //! statuses the state can come from, and each candidate is read as a task and kept only if its
 //! state is the one asked for.
 //!
+//! `total_size` comes from [`Store::count_runs`](adam_core::Store::count_runs) over those statuses,
+//! so it is **exact** with no `status` filter, for `completed` (one status, one state) and for the
+//! states this backend never produces (`0`), and an **upper bound** for `failed`, `canceled`,
+//! `input-required`, `working` and `submitted`, whose statuses also hold runs in another state.
+//! An exact count would read every run. The tasks of a page are always exactly the ones asked for.
+//!
 //! The scan is bounded ([`MAX_SCAN`]): a page that cannot be filled within it is returned short
 //! with a token that continues from where the scan stopped.
 

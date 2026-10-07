@@ -63,7 +63,7 @@ The caller's own tasks (never another's, whatever the filters say), most recentl
 | `pageSize` | 50 by default, 1 to 100 (a larger value is clamped, zero and negative mean the default) |
 | `pageToken` | the `nextPageToken` of a page of **the same caller and filters**; anything else, forged or not, is `InvalidParams` ("invalid page token") |
 | `historyLength`, `includeArtifacts` | as in the specification: `artifacts` is omitted entirely unless asked |
-| response | `tasks`, `nextPageToken` (empty on the last page), `pageSize`, `totalSize`: **exact without a status filter and for `completed`, an upper bound for the other states** (counting them exactly would read every run) |
+| response | `tasks`, `nextPageToken` (empty on the last page), `pageSize`, `totalSize`: **exact without a status filter and for `completed`, an upper bound for the other states** (counting them exactly would read every run; the in-memory backend of `adam-a2a` counts exactly) |
 
 The token is a cursor (the position of the last task), not an offset, and bound to the caller and the filters by a digest;
 it is not signed, and a forged position can only move within the forger's own tasks.

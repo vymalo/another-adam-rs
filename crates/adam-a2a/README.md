@@ -100,7 +100,8 @@ Protocol notes (details in the crate docs, `src/lib.rs`; the SDK's `RequestHandl
   (`PageToken`, never an offset; bound by a digest to the caller and the filters; another caller's or a tampered token is
   `InvalidParams` "invalid page token"). The handler resolves `pageSize` (50, 1 to 100), omits `artifacts` unless
   `includeArtifacts`, applies `historyLength`, and always sends `nextPageToken` (empty on the last page). `totalSize` is
-  whatever the backend counts: see `RuntimeTaskBackend`.
+  whatever the backend counts: `InMemoryBackend` counts exactly; `RuntimeTaskBackend` is exact without a `status`
+  filter and for `completed`, and an upper bound for the other states (see its README).
 * **GetExtendedAgentCard**: the public card plus `ExtendedCardConfig` (a description, skills, extensions); only when
   configured **and** the server authenticates with bearer tokens (`AllowAnonymous` has no "authenticated": it is off and a
   warning is logged).
