@@ -412,7 +412,9 @@ jobs:
           cmp "$RUNNER_TEMP/crds.yaml" deploy/crds/agents.vymalo.com.yaml
           cmp "$RUNNER_TEMP/crds.yaml" deploy/operator-crds/files/agents.vymalo.com.yaml
           # `run` with no cluster to reach fails, and says so (never a panic, never a hang).
-          out=$(docker run --rm -e KUBECONFIG=/nonexistent operator:smoke run 2>&1) && { echo "::error::run succeeded with no cluster"; exit 1; } || true
+          if out=$(docker run --rm -e KUBECONFIG=/nonexistent operator:smoke run 2>&1); then
+            echo "::error::run succeeded with no cluster"; exit 1
+          fi
           grep -q 'connecting to the cluster' <<<"$out" || { echo "::error::run did not say it was connecting: $out"; exit 1; }
           # Only the operator: no shell, no package manager in the image (a read of the whole file system).
           cid=$(docker create operator:smoke)
