@@ -747,7 +747,7 @@ fn the_shape_rules_of_the_crd_hold_without_an_api_server() {
         covered += 1;
     }
     assert!(
-        covered >= 18,
+        covered >= 19,
         "the invalid examples are all there: {covered}"
     );
 }

@@ -56,7 +56,7 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
    (`mcpServers`, `allowInsecureHttp`, `githubMcp`), `environment` (`resources`, `volumes`), `security`,
    `extraEnv`, `model.extraBody`.
 4. **Write the `AgentService`.** Required: `configRef.name` (same namespace) and `store.postgres`;
-   `interfaces.a2a` must be enabled with a token. A folder agent, trimmed from `deploy/operator/examples/chat.yaml`:
+   `interfaces.a2a` is on by default and needs its token (a CEL rule refuses it without `bearerTokensSecretRef`). A folder agent, trimmed from `deploy/operator/examples/chat.yaml`:
 
    ```yaml
    apiVersion: agents.vymalo.com/v1alpha1
@@ -66,7 +66,7 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
      configRef: { name: helper }
      interfaces:
        a2a:
-         enabled: true                                  # the default is false, and false is refused
+         enabled: true                                  # the default; false is refused by the operator
          bearerTokensSecretRef: { name: helper-secrets, key: A2A_BEARER_TOKENS }
      store:
        postgres:
@@ -136,7 +136,7 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
 
    | Reason | Meaning and fix |
    |---|---|
-   | `ConfigNotFound`, `ConfigInvalid` | no such `configRef`, or a rule the schema cannot state (a2a off, a long name, a header, a path); the message lists every issue |
+   | `ConfigNotFound`, `ConfigInvalid` | no such `configRef`, or a rule the schema cannot state (`a2a.enabled: false`, a long name, a header, a path); the message lists every issue |
    | `NameConflict` | an object it needs (a Helm release's StatefulSet, say) is not its own. Nothing is written; it looks again every 15 s. Remove or rename that object |
    | `MissingSecret` | a Secret or key does not exist; the reason names the Secret. Create it: the pod recovers |
    | `ImagePull` | wrong tag, or a private package: the CRD has no `imagePullSecrets`, so make the package public |
@@ -173,7 +173,8 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
 ## Pitfalls
 
 * Installing the operator before the CRDs, or pruning the CRDs release.
-* Leaving `interfaces.a2a.enabled` at its default (`ConfigInvalid`), or expecting an empty `access.allowFrom` to deny.
+* Setting `interfaces.a2a.enabled: false` (`ConfigInvalid`), or expecting an empty `access.allowFrom` to deny. Revisions before
+  `interfaces.a2a.enabled` defaulted to true made an omitted `interfaces` mean false: write `enabled: true` there.
 * Editing `deploy/crds/agents.vymalo.com.yaml` by hand: `adam-operator crdgen` writes it, and
   `deploy/operator-crds/files/` holds a checked copy. Setting the operator chart's `image.tag` by hand: CI writes it.
 * Rotating the registry token's Secret without restarting the operator: it reads the file once.

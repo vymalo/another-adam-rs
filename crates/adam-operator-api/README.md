@@ -34,7 +34,7 @@ let crds: Vec<CustomResourceDefinition> = adam_operator_api::crds(); // AgentCon
 Optional settings of `adam-coder` are `Option`s: a field left out is not set, and the binary's own
 default applies (the operator does not copy adam's defaults). The defaults the schema does apply
 are the platform's own: `scaling` (`combined`, 1 worker), `suspend: false`, `deletionPolicy:
-Retain`, `interfaces` (nothing exposed), `githubMcp` (`sidecar: true`, `port: 8082`).
+Retain`, `interfaces` (A2A on, `responses` and `mcp` off), `githubMcp` (`sidecar: true`, `port: 8082`).
 
 ## CEL rules (`x-kubernetes-validations`)
 
@@ -45,6 +45,7 @@ object. Each has an invalid example in [`examples/invalid`](../../deploy/operato
 | Rule | Where |
 |---|---|
 | `interfaces.responses.enabled` and `interfaces.mcp.enabled` are `false` | on the field |
+| `interfaces.a2a` is on by default; unless `enabled` is `false`, `bearerTokensSecretRef` is required (no token, no server) | `A2aInterface` |
 | exactly one of `store.postgres.secretRef` and `store.postgres.cnpg` | `PostgresStore` |
 | exactly one of `github.app` and `github.token` | `Github` |
 | exactly one of `app.installationId` and `app.owners` | `GithubApp` |

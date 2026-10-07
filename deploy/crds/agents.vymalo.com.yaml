@@ -752,16 +752,16 @@ spec:
               interfaces:
                 default:
                   a2a:
-                    enabled: false
+                    enabled: true
                   mcp:
                     enabled: false
                   responses:
                     enabled: false
-                description: The protocol surfaces the service serves. Nothing is exposed by default.
+                description: The protocol surfaces the service serves. A2A is the only one in v0, and it is on unless said otherwise.
                 properties:
                   a2a:
                     default:
-                      enabled: false
+                      enabled: true
                     description: The A2A surface.
                     properties:
                       bearerTokensSecretRef:
@@ -783,14 +783,17 @@ spec:
                         - name
                         type: object
                       enabled:
-                        default: false
-                        description: Serve A2A. Without it the agent is not listed in the registry.
+                        default: true
+                        description: Serve A2A. The default is true; v0 refuses false (the agent would not start), and without A2A the agent is not listed.
                         type: boolean
                       publicUrl:
                         description: 'The URL clients reach the agent at (`PUBLIC_URL`). Empty: `http://<name>.<ns>.svc:8080/`.'
                         nullable: true
                         type: string
                     type: object
+                    x-kubernetes-validations:
+                    - message: 'interfaces.a2a needs bearerTokensSecretRef: no token, no server'
+                      rule: (has(self.enabled) && !self.enabled) || has(self.bearerTokensSecretRef)
                   mcp:
                     default:
                       enabled: false

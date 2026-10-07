@@ -82,6 +82,11 @@ const SPEC_RULES: &[(&str, &str)] = &[
         "self == false",
         "v0 serves A2A only: this interface cannot be enabled",
     ),
+    // interfaces.a2a is on unless said otherwise, and then it needs its token (no token, no server)
+    (
+        "(has(self.enabled) && !self.enabled) || has(self.bearerTokensSecretRef)",
+        "interfaces.a2a needs bearerTokensSecretRef: no token, no server",
+    ),
     // exactly one of store.postgres.secretRef and store.postgres.cnpg
     (
         "has(self.secretRef) != has(self.cnpg)",
@@ -186,4 +191,27 @@ fn a_secret_is_never_a_value() {
         found.is_empty(),
         "string fields that look like secret values: {found:?}"
     );
+}
+
+#[test]
+fn a2a_is_on_unless_said_otherwise() {
+    // The schema's default, which the API server applies, and the type's serde default agree: true.
+    let service = schema_of(&AgentService::crd());
+    let interfaces = &service["properties"]["spec"]["properties"]["interfaces"];
+    assert_eq!(
+        interfaces["default"]["a2a"]["enabled"], true,
+        "{interfaces}"
+    );
+    assert_eq!(
+        interfaces["properties"]["a2a"]["properties"]["enabled"]["default"], true,
+        "{interfaces}"
+    );
+    let spec: adam_operator_api::AgentServiceSpec = serde_json::from_value(serde_json::json!({
+        "configRef": {"name": "c"},
+        "store": {"postgres": {"secretRef": {"name": "db", "key": "uri"}}}
+    }))
+    .expect("a spec with no interfaces");
+    assert!(spec.interfaces.a2a.enabled);
+    assert!(spec.interfaces.a2a.bearer_tokens_secret_ref.is_none());
+    assert!(!spec.interfaces.mcp.enabled && !spec.interfaces.responses.enabled);
 }

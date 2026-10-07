@@ -32,7 +32,7 @@ kubectl describe agentservice chat -n <namespace>    # the conditions and the Ev
 
 An object the schema refuses fails at `kubectl apply`; each rule has an invalid example in
 [`examples/invalid`](../../deploy/operator/examples/invalid). A pair the schema accepts but the operator cannot
-resolve (A2A left off, a name over 52 characters) is `Blocked`, reason `ConfigInvalid`.
+resolve (`a2a.enabled: false`, a name over 52 characters) is `Blocked`, reason `ConfigInvalid`.
 
 ## What happens
 
