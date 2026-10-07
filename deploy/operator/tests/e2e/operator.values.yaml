@@ -1,0 +1,16 @@
+# The values the kind end-to-end installs the operator chart with (coder-e2e.sh adds the image: the one built in the job, loaded
+# into kind, never pulled). The registry's token is an existing Secret, `adam-operator-registry-token`, which the script makes. Only the
+# pods labelled `adam-operator-e2e/client: "true"` may read the registry: the script's curl pod, and nothing else.
+registry:
+  tokenSecret:
+    name: adam-operator-registry-token
+    key: token
+networkPolicy:
+  registry:
+    allowFrom:
+      - podSelector:
+          matchLabels:
+            adam-operator-e2e/client: "true"
+tuning:
+  # A pending service is looked at again every 5 s instead of 15: the job waits for a pod, not for a timer.
+  resyncPendingSecs: 5

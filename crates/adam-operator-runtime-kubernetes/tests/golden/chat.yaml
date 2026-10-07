@@ -1,0 +1,181 @@
+apiVersion: v1
+data:
+  instructions.md: |
+    ---
+    name: chat
+    description: A chat assistant.
+    card:
+      name: Chat
+    ---
+    Your name is Chat.
+    In one sentence: I talk things through with you.
+immutable: true
+kind: ConfigMap
+metadata:
+  annotations:
+    agents.vymalo.com/config-digest: sha256:ca49a20335d6e0f51edee0f2146f73a9596f1da028c2f2d6a70b56f033e42d0d
+  labels:
+    app.kubernetes.io/instance: chat
+    app.kubernetes.io/managed-by: adam-operator
+    app.kubernetes.io/name: chat
+  name: chat-agent-9188c8e6
+  namespace: another-agentic-system
+  ownerReferences:
+  - apiVersion: agents.vymalo.com/v1alpha1
+    controller: true
+    kind: AgentService
+    name: chat
+    uid: 0b1f3c5e-1111-4222-8333-444455556666
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    agents.vymalo.com/config-digest: sha256:ca49a20335d6e0f51edee0f2146f73a9596f1da028c2f2d6a70b56f033e42d0d
+  labels:
+    app.kubernetes.io/instance: chat
+    app.kubernetes.io/managed-by: adam-operator
+    app.kubernetes.io/name: chat
+  name: chat
+  namespace: another-agentic-system
+  ownerReferences:
+  - apiVersion: agents.vymalo.com/v1alpha1
+    controller: true
+    kind: AgentService
+    name: chat
+    uid: 0b1f3c5e-1111-4222-8333-444455556666
+spec:
+  ports:
+  - name: http
+    port: 8080
+    protocol: TCP
+    targetPort: http
+  selector:
+    app.kubernetes.io/instance: chat
+    app.kubernetes.io/name: chat
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    agents.vymalo.com/config-digest: sha256:ca49a20335d6e0f51edee0f2146f73a9596f1da028c2f2d6a70b56f033e42d0d
+    agents.vymalo.com/deletion-policy: Retain
+  labels:
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/instance: chat
+    app.kubernetes.io/managed-by: adam-operator
+    app.kubernetes.io/name: chat
+  name: chat
+  namespace: another-agentic-system
+  ownerReferences:
+  - apiVersion: agents.vymalo.com/v1alpha1
+    controller: true
+    kind: AgentService
+    name: chat
+    uid: 0b1f3c5e-1111-4222-8333-444455556666
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: chat
+      app.kubernetes.io/name: chat
+  template:
+    metadata:
+      annotations:
+        agents.vymalo.com/config-digest: sha256:ca49a20335d6e0f51edee0f2146f73a9596f1da028c2f2d6a70b56f033e42d0d
+      labels:
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/instance: chat
+        app.kubernetes.io/managed-by: adam-operator
+        app.kubernetes.io/name: chat
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - command:
+        - tini
+        - --
+        - adam-agent
+        env:
+        - name: LISTEN_ADDR
+          value: 0.0.0.0:8080
+        - name: PUBLIC_URL
+          value: http://chat.another-agentic-system.svc:8080/
+        - name: ADAM_AGENT_DIR
+          value: /etc/adam/agent
+        - name: MODEL_BASE_URL
+          value: https://gateway.example.invalid/v1
+        - name: MODEL
+          value: chat-model
+        - name: MCP_ALLOW_INSECURE
+          value: 'true'
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              key: uri
+              name: chat-db-app
+        - name: MODEL_API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: MODEL_API_KEY
+              name: chat-secrets
+        - name: A2A_BEARER_TOKENS
+          valueFrom:
+            secretKeyRef:
+              key: A2A_BEARER_TOKENS
+              name: chat-secrets
+        image: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924@sha256:1eb43882cc1a94663f03212f4df8999084b11e4f55a9d935041239fe60962c38
+        livenessProbe:
+          failureThreshold: 4
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 15
+          timeoutSeconds: 3
+        name: agent
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 5
+          timeoutSeconds: 3
+        resources:
+          limits:
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        startupProbe:
+          failureThreshold: 40
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 3
+        volumeMounts:
+        - mountPath: /etc/adam/agent
+          name: agent-folder
+          readOnly: true
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+      - configMap:
+          defaultMode: 292
+          items:
+          - key: instructions.md
+            path: instructions.md
+          name: chat-agent-9188c8e6
+        name: agent-folder

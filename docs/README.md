@@ -62,6 +62,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0019](decisions/0019-a-runs-processes-in-a-pod-of-their-own.md) | a run's processes in a Kubernetes pod of its own |
 | [0020](decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md) | reasoning streamed beside the answer and never stored |
 | [0021](decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md) | the coder is Adam, a general agent that can code |
+| [0029](decisions/0029-adam-rs-has-an-operator.md) | adam-rs ships the Kubernetes operator of `AgentService` and `AgentConfig`, moved from the platform repository |
 | [0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md) | A2A push notifications, `ListTasks`, the extended card and card signatures |
 
 ## Keeping these docs short and true

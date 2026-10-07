@@ -1,0 +1,9 @@
+# The build context of docker/operator/Dockerfile is the repository root; only the workspace is needed.
+**
+!Cargo.toml
+!Cargo.lock
+!crates
+!bin
+# Never the host's build output or dependencies, wherever they are.
+**/target
+**/node_modules

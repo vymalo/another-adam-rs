@@ -1,0 +1,33 @@
+# Refused: github.app has both owners and installationId.
+# expect: exactly one of github.app.installationId and github.app.owners
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: invalid-app-both
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-coder
+      agent:
+        embedded: {}
+      coder:
+        github:
+          app:
+            id: Iv1.example
+            owners: [vymalo]
+            privateKeySecretRef:
+              name: gh
+              key: key.pem
+            installationId: 12345
+  model:
+    model: m
+    baseUrl:
+      value: https://gateway.example.invalid/v1
+    apiKeySecretRef:
+      name: s
+      key: MODEL_API_KEY
+  environment:
+    image:
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924

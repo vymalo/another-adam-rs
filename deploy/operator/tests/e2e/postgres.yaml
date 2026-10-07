@@ -1,0 +1,54 @@
+# The coder's run store for the kind end-to-end of the coder (coder-e2e.sh): a throwaway Postgres, no volume, a password that
+# is public (it guards nothing). The image is Docker Official Images' postgres 17.9 on Alpine 3.23 from the public ECR mirror of Docker
+# Hub, pinned by the digest of the index (verified 2026-10-05: the Docker-Content-Digest of
+# registry-1.docker.io/v2/library/postgres/manifests/17.9-alpine3.23, and the sha256 of the index public.ecr.aws serves for the same tag).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coder-postgres
+  namespace: another-agentic-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coder-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: coder-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: public.ecr.aws/docker/library/postgres:17.9-alpine3.23@sha256:c7526c0f6c3f30260a563d7bcf8ad778effac59a44f8ffa86678c35418338609
+          env:
+            - name: POSTGRES_PASSWORD
+              value: e2e-throwaway
+            - name: POSTGRES_DB
+              value: coder
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, postgres, -d, coder]
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coder-postgres
+  namespace: another-agentic-system
+spec:
+  selector:
+    app.kubernetes.io/name: coder-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

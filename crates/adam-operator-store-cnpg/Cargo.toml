@@ -1,0 +1,36 @@
+[package]
+name = "adam-operator-store-cnpg"
+description = "StoreProvisioner for an operator-owned CloudNativePG Cluster: server-side apply of postgresql.cnpg.io/v1 Cluster <service>-db, the reference to its <cluster>-app Secret, readiness from its status"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# `impl StoreUnderTest for CnpgStore`, so a composition root can run the conformance suite of `adam-operator-ports`
+# against its own cluster. Off by default.
+testkit = ["adam-operator-ports/testkit"]
+
+[dependencies]
+adam-operator-ports.workspace = true
+adam-operator-store-secret.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+adam-operator-api.workspace = true
+adam-operator-domain.workspace = true
+adam-operator-ports = { workspace = true, features = ["testkit"] }
+adam-operator-runtime-kubernetes.workspace = true
+adam-operator-store-cnpg = { workspace = true, features = ["testkit"] }
+# The fake API server of tests/api.rs: a tower service in place of the HTTP client.
+http.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tower.workspace = true
+
+[lints]
+workspace = true

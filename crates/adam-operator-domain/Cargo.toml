@@ -1,0 +1,27 @@
+[package]
+name = "adam-operator-domain"
+description = "The pure core of the v0 operator: validate, resolve into a RuntimeSpec with a digest, and the env contract of adam-coder and adam-agent"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-operator-api.workspace = true
+adam-operator-ports.workspace = true
+# Named inside the crate only (to read the types `adam-operator-api` embeds); none is in a public signature.
+k8s-openapi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+adam-operator-ports = { workspace = true, features = ["testkit"] }
+proptest.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[lints]
+workspace = true

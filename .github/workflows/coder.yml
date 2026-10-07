@@ -433,7 +433,7 @@ jobs:
             git reset --hard origin/main
             # A newer commit on main builds and bumps for itself; do not put
             # its tag back to this older one (image jobs can finish out of order).
-            newer="$(git log --format=%s "$SHA..origin/main" | grep -v '^chore(deploy): bump coder to ' || true)"
+            newer="$(git log --format=%s "$SHA..origin/main" | grep -v -e '^chore(deploy): bump coder to ' -e '^chore(deploy): bump operator to ' || true)"
             if [ -n "$newer" ]; then
               echo "main has moved on since $SHA; the newer build will bump"
               exit 0

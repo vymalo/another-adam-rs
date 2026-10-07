@@ -1,0 +1,24 @@
+[package]
+name = "adam-operator-store-secret"
+description = "StoreProvisioner for a referenced Secret: it reports the reference and never reads a Secret"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# `impl StoreUnderTest for SecretStore`, so a composition root can run the conformance suite of `adam-operator-ports`.
+testkit = ["adam-operator-ports/testkit"]
+
+[dependencies]
+adam-operator-ports.workspace = true
+
+[dev-dependencies]
+adam-operator-store-secret = { workspace = true, features = ["testkit"] }
+adam-operator-ports = { workspace = true, features = ["testkit"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true

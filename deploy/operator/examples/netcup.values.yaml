@@ -1,0 +1,27 @@
+# The values of the Argo CD Application of the operator on netcup (rollout step M0 of the archived design): the namespace of
+# the system chart, and the registry's token from the AWS secret that holds the other secrets of the another-agentic family.
+# The Application sets the same values as `helm.valuesObject`; image.tag is bumped on main by CI and is not set there.
+#
+# Prerequisites, in order: the CRDs (deploy/operator-crds, its own Application), the AWS property `agent_registry_token`
+# (random, at least 32 bytes: `openssl rand -hex 32`), and CloudNativePG when an agent asks for `store.postgres.cnpg`.
+
+# Empty: the release's namespace, `another-agentic-system`.
+watchNamespace: ""
+
+externalSecrets:
+  enabled: true
+  # secretStoreRef, key and properties.registryToken keep their defaults: ssegning-aws, prod/another-agentic/env, agent_registry_token.
+
+registry:
+  # The registry document's own URL, sent as its anchor.
+  publicUrl: http://adam-operator-registry.another-agentic-system.svc:8080/registry/v1/agents
+
+networkPolicy:
+  registry:
+    # The orchestrator reads the registry (the system chart's `AGENT_REGISTRY_URL`, S12). Its pods are in this namespace, and a
+    # peer with only a podSelector means the pods of the watched namespace.
+    allowFrom:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: another-agentic-system
+            app.kubernetes.io/component: orchestrator

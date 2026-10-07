@@ -1,0 +1,38 @@
+[package]
+name = "adam-operator-runtime-kubernetes"
+description = "RuntimeProvider on native Kubernetes: server-side apply of a StatefulSet or Deployment, a Service, a NetworkPolicy and ConfigMaps, and the status read back from pods"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# `impl RuntimeUnderTest for KubernetesRuntime`, so a composition root can run the conformance suite of
+# `adam-operator-ports` against its own cluster. Off by default.
+testkit = ["adam-operator-ports/testkit"]
+
+[dependencies]
+adam-error.workspace = true
+adam-operator-ports.workspace = true
+futures.workspace = true
+k8s-openapi.workspace = true
+kube = { workspace = true, features = ["runtime"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+adam-operator-api.workspace = true
+adam-operator-domain.workspace = true
+adam-operator-ports = { workspace = true, features = ["testkit"] }
+# The fake API server of tests/api.rs: a tower service in place of the HTTP client.
+http.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
+tower.workspace = true
+
+[lints]
+workspace = true

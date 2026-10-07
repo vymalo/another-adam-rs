@@ -1,0 +1,73 @@
+# An agent that is only a folder (the adam-agent-folder case): `chat`, served by adam-agent.
+# No volume, so the operator renders a Deployment. Every secret is a Secret reference.
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentService
+metadata:
+  name: chat
+  namespace: another-agentic-system
+spec:
+  description: A chat assistant.
+  configRef:
+    name: chat
+  interfaces:
+    a2a:
+      enabled: true
+      bearerTokensSecretRef:
+        name: chat-secrets
+        key: A2A_BEARER_TOKENS
+  scaling:
+    topology: combined
+    workers: 1
+  store:
+    postgres:
+      secretRef: # the system chart's CNPG Secret of the `agent` database
+        name: chat-db-app
+        key: uri
+  registry:
+    title: Chat
+    tags: [chat]
+---
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: chat
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-agent
+      agent:
+        folder:
+          # relative path -> content; mounted at /etc/adam/agent (ADAM_AGENT_DIR)
+          files:
+            instructions.md: |
+              ---
+              name: chat
+              description: A chat assistant.
+              card:
+                name: Chat
+              ---
+              Your name is Chat.
+              In one sentence: I talk things through with you.
+          # or: configMapRef: { name: chat-agent } (exactly one of files and configMapRef)
+  model:
+    model: chat-model
+    baseUrl:
+      value: https://gateway.example.invalid/v1
+    apiKeySecretRef:
+      name: chat-secrets
+      key: MODEL_API_KEY
+  tools:
+    # the orchestrator's thread tools are plain http on another host, inside the cluster
+    allowInsecureHttp: true
+  environment:
+    # tag and digest (digest of the tag read from ghcr.io on 2026-10-05)
+    image:
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924@sha256:1eb43882cc1a94663f03212f4df8999084b11e4f55a9d935041239fe60962c38
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 512Mi

@@ -1,0 +1,98 @@
+# The adam-rs operator, for one namespace. Nothing here is a secret: the registry's bearer token is an existing Secret
+# (registry.tokenSecret) or a property of an AWS Secrets Manager secret read by External Secrets (externalSecrets).
+# The CRDs are NOT in this chart (a separate Argo CD app): install deploy/operator-crds first.
+# templates/_validate.tpl refuses what would deploy something other than what it says.
+
+nameOverride: ""
+# Every object is named <fullname>[-<part>]. Fixed, so the registry's Service has a name that does not follow the release's
+# (the system's chart reads it as AGENT_REGISTRY_URL).
+fullnameOverride: adam-operator
+
+image:
+  repository: ghcr.io/vymalo/another-adam-rs/operator
+  # Bumped on every green build of main by .github/workflows/operator.yml (`sha-<7 hex>`; sha-0000000 is the placeholder before the first build), with
+  # deploy/operator/bump-tag.sh: a plain key, written by that script only. `latest` is refused.
+  tag: sha-2644008
+  # Optional `sha256:...`: when set the image is `repository:tag@digest`.
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The namespace the operator watches, and where its Role and RoleBinding are made. Empty: the release's namespace.
+# One namespace by design (a namespaced operator): there is no value that gives it a ClusterRole.
+watchNamespace: ""
+
+serviceAccount:
+  create: true
+  # Empty: the fullname. Required when `create` is false.
+  name: ""
+  annotations: {}
+
+# Rights on CloudNativePG `Cluster`s in the watched namespace (get, patch, create, delete). The image is built with the
+# `store-cnpg` feature, so a service with `store.postgres.cnpg` asks for one: off, such a service is refused by the API server,
+# and `false` is for a cluster that has no CloudNativePG at all.
+storeCnpg: true
+
+# The agent registry (crates/adam-operator-registry/README.md), served on 8080 only with a bearer token: no token, no registry. The
+# token comes from exactly one of the two below, and none of them is a value of this chart.
+registry:
+  # An existing Secret in the release's namespace that holds the token (the operator reads the file once, at start: after
+  # a change, restart the pod).
+  tokenSecret:
+    name: ""
+    key: token
+  # `REGISTRY_PUBLIC_URL`: the URL of the registry document itself, sent as its `anchor`. Optional.
+  publicUrl: ""
+
+# The token from AWS Secrets Manager through External Secrets (the ARC runner pools of home-os, and the system chart):
+# one ExternalSecret, `<fullname>-registry`, whose Secret has the key `token`. Off: an existing Secret, or no registry.
+externalSecrets:
+  enabled: false
+  apiVersion: external-secrets.io/v1
+  refreshInterval: 1h
+  secretStoreRef:
+    name: ssegning-aws
+    kind: ClusterSecretStore
+  key: prod/another-agentic/env
+  properties:
+    # The AWS property that holds the token: random, at least 32 bytes (`openssl rand -hex 32`). The consumer of the registry
+    # (the system's orchestrator) reads the same property as AGENT_REGISTRY_TOKEN, so the two sides cannot differ.
+    registryToken: agent_registry_token
+
+# What may reach the operator, and what it may reach. Ingress is closed except what is listed; egress goes to the API server only.
+networkPolicy:
+  enabled: true
+  registry:
+    # Who may read the registry (NetworkPolicyPeers: namespaceSelector, podSelector, ipBlock). REQUIRED while a registry token is
+    # set and networkPolicy is enabled: an empty list would make the registry unreachable, which is refused. A peer with only a
+    # podSelector means the pods of the watched namespace.
+    allowFrom: []
+  metrics:
+    # Who may scrape /metrics (9090). Empty: nobody.
+    allowFrom: []
+  apiServer:
+    # The ports of the API server as the pod reaches it (the Service is 443, the endpoint of most clusters 6443).
+    ports: [443, 6443]
+    # Optional: only these addresses (`kubectl get endpoints kubernetes`). Empty: any address on those ports.
+    cidrs: []
+
+# Settings of `adam-operator run` that have a default (bin/adam-operator/README.md, "run: settings"); a key left out keeps the default.
+logLevel: info
+tuning: {}
+  # concurrency: 4          # ADAM_OPERATOR_CONCURRENCY: services reconciled at once
+  # resyncSecs: 300         # ADAM_OPERATOR_RESYNC_SECS: timer of a service that is Ready or Suspended
+  # resyncPendingSecs: 15   # ADAM_OPERATOR_RESYNC_PENDING_SECS: timer of one that is rolling out, unwell or held by a foreign object
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}
