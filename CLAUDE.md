@@ -113,6 +113,7 @@ file's *Rules* → first-party skills (`adam-*`) → vendored skills. Start with
 | Implementing or changing a `Store` or `Notifier` | **`adam-store-adapter`** |
 | Touching A2A extensions (the card, activation) | **`adam-a2a-extensions`** |
 | Changing the image or the chart, releasing | **`adam-coder-deploy`** |
+| Running agents on Kubernetes as `AgentService` and `AgentConfig`, the operator's charts and CRDs | **`adam-operator`** |
 | Moving a consumer between adam-rs revisions | **`adam-upgrade`** |
 | Updating the vendored skills | **`update-vendored-skills`** (internal) |
 | A decision, a vague request, a claim to check | `documentation-and-adrs` (format: Rule 8), `idea-refine`, `spec-driven-development`, `planning-and-task-breakdown`, `source-driven-development` |
@@ -125,8 +126,8 @@ file's *Rules* → first-party skills (`adam-*`) → vendored skills. Start with
 Off-domain here: `domain-cli`, `domain-embedded`, `domain-fintech`, `domain-iot`, `domain-ml`. Not for direct
 use: the `core-*` helpers, `meta-cognition-parallel`, `rust-skill-creator`, `rust-daily`, `m14-mental-model`.
 
-**Skills this repo provides.** Other repositories install the six public ones (`adam-agent-folder`,
-`adam-embed`, `adam-store-adapter`, `adam-a2a-extensions`, `adam-coder-deploy`, `adam-upgrade`) with the CLI:
+**Skills this repo provides.** Other repositories install the seven public ones (`adam-agent-folder`,
+`adam-embed`, `adam-store-adapter`, `adam-a2a-extensions`, `adam-coder-deploy`, `adam-operator`, `adam-upgrade`) with the CLI:
 
 ```sh
 npx skills add vymalo/another-adam-rs --list

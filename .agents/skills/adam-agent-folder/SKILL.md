@@ -85,6 +85,8 @@ before you rely on a detail here.
    `app`: the folder mounted at `/etc/adam/agent`, `AGENT_FOLDER` to choose it, port from
    `AGENT_PORT`, the coder's database). A new agent is a folder and about a dozen lines of
    that service.
+   On Kubernetes the folder can be the `agent.folder` of an `AgentConfig`, served by an `AgentService` of the
+   adam-rs operator: no manifest to write by hand (`adam-operator`).
 8. **Edits apply at the next start** (ADR 0004,
    `docs/decisions/0004-agent-folders-at-run-time.md`): restart the service, no rebuild. There
    is no hot reload in release images.
@@ -122,5 +124,5 @@ before you rely on a detail here.
 * `bin/adam-agent/README.md`, `docs/guides/write-an-agent.md`, `docs/reference/agent-files.md`, `crates/adam-mcp/README.md` (MCP rules),
   `crates/adam-ui/README.md` (the built-in tools).
 * `adam-embed` (agents with Rust tools), `adam-a2a-extensions` (what the card announces),
-  `adam-upgrade` (changing the image pin).
+  `adam-upgrade` (changing the image pin), `adam-operator` (serving the folder on Kubernetes).
 * https://github.com/vymalo/another-adam-rs/blob/main/bin/adam-agent/README.md

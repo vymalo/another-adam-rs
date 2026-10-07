@@ -55,9 +55,11 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/README.md.
    | `7e5dcc3` | `Store::lease_until` is required | implement it: the end of the lease, `None` if none; an expired lease is still reported |
    | `82f8082` | the coder crate moved from the `crates` directory to `bin` (now `bin/adam-coder`) | fix paths in git dependencies, scripts and docs |
    | `a09da02` | a control plane needs no model or GitHub configuration | a control plane no longer reads the model, GitHub and workspace variables: they may be dropped there |
+   | `2644008` | the operator moved here from `vymalo/another-agentic-platform` (ADR 0029): crates `aap-*` are `adam-operator-*`, the binary `adam-operator`, `AAP_CONCURRENCY`, `AAP_RESYNC_SECS` and `AAP_RESYNC_PENDING_SECS` are `ADAM_OPERATOR_*`, the metrics `adam_operator_*`, the field manager and `managed-by` value `adam-operator`; the image is `ghcr.io/vymalo/another-adam-rs/operator`, the charts `adam-operator` and `adam-operator-crds`. The CRD group, kinds, finalizer and labels under `agents.vymalo.com` are unchanged | take the new image and charts (`adam-operator`); apply the new CRDs chart (two optional fields were added). Objects the old operator made carry its old `managed-by` value, so the new one should report them as `NameConflict`: delete them and let it recreate them (*unverified* on a cluster) |
+   | `13f484f` | ADR 0030 added push notifications and `ListTasks`: `Store` gained seven required methods (`push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit`, `list_runs`, `count_runs`), schema version 3 (Postgres `push` table and `runs_list` index, MongoDB `push` collection and `adam_list` index) | implement them and pass the new testkit cases (`adam-store-adapter`); the shipped adapters migrate at startup |
 
    A consumer that uses `DynStore` or `MemoryStore` and implements no `Store` is not affected by
-   the first three. Add the commits you find in step 2 to your own list when you handle them.
+   the `Store` rows. Add the commits you find in step 2 to your own list when you handle them.
 5. **Move every pin together**: all `rev =` lines of the adam crates to B (a mix gives two copies
    of the same traits), then `cargo update -p <each adam crate>` so `Cargo.lock` follows; the
    copied files (agent folders, mappings, scripts) re-copied from B; the image tag and digest
@@ -104,5 +106,5 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/README.md.
 ## See also
 
 * `docs/decisions/` (every behaviour decision, with a dated status), `docs/architecture.md`.
-* `adam-store-adapter`, `adam-embed`, `adam-coder-deploy`, `adam-a2a-extensions`.
+* `adam-store-adapter`, `adam-embed`, `adam-coder-deploy`, `adam-a2a-extensions`, `adam-operator`.
 * https://github.com/vymalo/another-adam-rs/tree/main/docs/decisions

@@ -90,7 +90,7 @@ are in [Testing](docs/guides/testing.md#the-commands-ci-runs). Update the matchi
 README in the same change as any change to behaviour. AI assistants: read [`CLAUDE.md`](CLAUDE.md); the skills
 for repositories that integrate adam-rs install with `npx skills add vymalo/another-adam-rs --list`
 (`adam-agent-folder`, `adam-embed`, `adam-store-adapter`, `adam-a2a-extensions`, `adam-coder-deploy`,
-`adam-upgrade`). Roadmap: [`docs/roadmap.md`](docs/roadmap.md).
+`adam-operator`, `adam-upgrade`). Roadmap: [`docs/roadmap.md`](docs/roadmap.md).
 
 ## License
 
