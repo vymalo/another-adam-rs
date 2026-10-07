@@ -68,5 +68,6 @@ existed. Now:
   check), so a subagent gets no fresh budget and cannot pass a gate its root has not passed. The two places that stay on
   the run itself are the steps the environment shows (`env:<run>:...`: a step belongs to the run that emits it) and
   `share_file`'s "delivered" note and 6 MiB budget, because a file shared by a subagent stays on the subagent's run and
-  never reaches the person, so it delivers nothing for the root. A call id in the notes is made unique per run for a
-  subagent (`ToolEnv::call_key`).
+  never reaches the person, so it delivers nothing for the root. Every call id kept in the root's notes (a missing tool,
+  a check's record and the replay list of counted checks) is made unique per run for a subagent (`ToolEnv::call_key`):
+  model call ids are unique only within the run that made them.

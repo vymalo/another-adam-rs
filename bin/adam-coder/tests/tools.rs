@@ -5619,3 +5619,38 @@ async fn a_subagent_works_in_the_worktree_and_on_the_budget_of_its_root_run() {
         .unwrap();
     assert_eq!(own.checks.failures, 0, "nothing on the subagent's own run");
 }
+
+/// Call ids are unique only within the run that made them: a subagent's call `call-1` is not the
+/// root's `call-1`, so its failed check is a cycle of its own on the root's budget, not a replay.
+#[tokio::test]
+async fn a_subagent_check_with_the_root_call_id_is_not_a_replay() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let root = rig.ctx.run_id();
+    let failed = RunChecks
+        .call(&rig.ctx, json!({"command": "false"}))
+        .await
+        .unwrap();
+    assert!(failed.is_error, "{}", failed.content);
+
+    let child = ToolCtx::detached("tool", rig.ctx.call_id(), Arc::new(CollectingSink::new()))
+        .with_state(rig.fx.env.clone())
+        .with_root_run(root);
+    assert_eq!(child.call_id(), rig.ctx.call_id());
+    let again = RunChecks
+        .call(&child, json!({"command": "false"}))
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+
+    let notes = rig.fx.env.notes.load(&root.to_string()).await.unwrap();
+    assert_eq!(
+        notes.checks.failures, 2,
+        "two calls of two runs, two cycles"
+    );
+    assert_eq!(
+        notes.checks.history.len(),
+        2,
+        "each call keeps its own record"
+    );
+}
