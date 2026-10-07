@@ -31,8 +31,8 @@ trait at your rev: its doc comments are the contract.
    Errors are `StoreError` (`crates/adam-core/README.md`, "Errors"): build a backend failure with
    `StoreError::unavailable(e)` (transient), `StoreError::internal(e)` or
    `StoreError::corrupt_source(e)`; callers decide from the error class, never from the variant.
-2. **Match what the existing adapters promise**: the table "How each adapter guarantees the
-   contract" in the root `README.md` lists, per guarantee, how Postgres and MongoDB do it
+2. **Match what the existing adapters promise**: the table "How each adapter keeps the
+   contract" in `docs/reference/store-adapters.md` lists, per guarantee, how Postgres and MongoDB do it
    (CAS commit, first-writer-wins journal, exclusive claiming, `busy` runs never claimed,
    pinned claims and the run `owner`, one open run per conversation, journal deleted with its
    run). Time is truncated to milliseconds in every store; lease expiry uses the `now` the caller
@@ -89,7 +89,7 @@ trait at your rev: its doc comments are the contract.
 * `migrate` must be idempotent and safe to call from every replica at once.
 * A run's state is JSON: a backend that cannot hold some values (a NUL in a Postgres `JSONB`
   string, an integer above `i64::MAX` in BSON) must reject them with `InvalidInput`, not a driver
-  error (root `README.md`, "Data caveats").
+  error (`docs/reference/store-adapters.md`, "Data caveats").
 * Claiming must be exclusive under concurrency (the suite races workers); a read-then-write claim
   without a conditional write fails it.
 * `release_lease` never clears the run's owner (pinned claims).
@@ -100,7 +100,7 @@ trait at your rev: its doc comments are the contract.
 ## See also
 
 * `crates/adam-core/README.md`, `crates/adam-store-testkit/README.md`,
-  `crates/adam-notify-testkit/README.md`, "To add a backend" in the root `README.md`
-  ("Testing").
+  `crates/adam-notify-testkit/README.md`, "Adding a backend" in `docs/reference/store-adapters.md`
+  and `docs/guides/testing.md`.
 * `adam-upgrade` (finding the trait change in the first place), `adam-embed`.
 * https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-store-testkit/README.md

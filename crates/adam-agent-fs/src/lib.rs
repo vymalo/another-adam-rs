@@ -1,6 +1,6 @@
 //! Parse and validate agent directories.
 //!
-//! An agent is a directory of Markdown and JSON (`docs/authoring.md`): `instructions.md`, skills,
+//! An agent is a directory of Markdown and JSON (`docs/reference/agent-files.md`): `instructions.md`, skills,
 //! subagents, `mcp.json`, schedules. This crate reads such a directory into an [`AgentManifest`]
 //! and reports every problem as a [`Diagnostic`], with the file and the line. It is the one
 //! parser and the one validator behind both the build-time and the run-time path. No async, no

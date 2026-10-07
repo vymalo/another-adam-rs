@@ -3,7 +3,7 @@
 Status: **Accepted** (2026-10-01), decided on the owner's delegation; the owner may revisit.
 Builds on [ADR 0004](0004-agent-folders-at-run-time.md) (a binary reads its agent folder at startup),
 [ADR 0001](0001-library-first-host-roles.md) (a binary is a composition of libraries, roles through
-`adam-host`) and the MCP tools of an agent folder (`mcp.json`, [`docs/authoring.md`](../authoring.md)). Built as
+`adam-host`) and the MCP tools of an agent folder (`mcp.json`, [`docs/reference/agent-files.md`](../reference/agent-files.md)). Built as
 `bin/adam-agent` over [`adam-service`](../../crates/adam-service/README.md).
 
 ## Context

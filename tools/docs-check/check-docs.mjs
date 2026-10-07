@@ -113,7 +113,7 @@ for (const file of markdownFiles(root)) {
 
 // Every crate documents itself: a directory under these roots with a Cargo.toml needs a
 // README.md, updated in the same change as any change to its public API, environment
-// variables or tests (see "Development" in README.md).
+// variables or tests (see the Rules in CLAUDE.md).
 const crateRoots = ['crates', 'bin'];
 let crates = 0;
 for (const crateRoot of crateRoots) {

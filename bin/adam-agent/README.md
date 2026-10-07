@@ -23,7 +23,7 @@ only tools it brings are the person's screen: `ask_user`, `show` and `ui_catalog
 
 `ADAM_AGENT_DIR` is **required by every role** (there is no default and no embedded copy: a silent persona
 would hide a missing mount). It names the directory that holds `agent/`, or `agent/` itself, in the format of
-[`docs/authoring.md`](../../docs/authoring.md). It holds exactly one agent (`agents/` with several is refused),
+[`docs/reference/agent-files.md`](../../docs/reference/agent-files.md). It holds exactly one agent (`agents/` with several is refused),
 and it is read once, at startup ([ADR 0004](../../docs/decisions/0004-agent-folders-at-run-time.md)): an edit
 applies at the next start, and a restart is a deploy.
 
@@ -121,7 +121,7 @@ exactly that with `ask_user`.
 An `agent/mcp.json` (and one next to each subagent's file) names the MCP servers whose tools the agent gets,
 named `<server>__<tool>`. Every worker connects them once at startup, before it serves. The format and the
 rules are [`adam-mcp`](../../crates/adam-mcp/README.md)'s and
-[MCP tools at run time](../../docs/authoring.md#mcp-tools-at-run-time-built-feature-mcp); this is how a folder
+[MCP tools at run time](../../docs/reference/agent-files.md#mcp-tools-at-run-time-feature-mcp); this is how a folder
 declares a web-search server for a researcher:
 
 ```json
@@ -292,7 +292,7 @@ brings the program). The coder image sets **no** `MCP_ALLOW_STDIO`: it belongs t
 at `/etc/adam/agent`, the model `mock-assistant` of the WireMock mock, the coder's database (runs are scoped by the
 agent's name), port 8084 (`AGENT_PORT`), `AGENT_FOLDER` to mount another folder. A fourth agent is a folder and the
 same dozen lines. `dev/agent-e2e.sh` runs "hi" through it and restarts it on an edited copy of the folder. See
-"A general agent from a folder" in the [root README](../../README.md#a-general-agent-from-a-folder). CI
+[Run it locally](../../docs/guides/run-locally.md). CI
 (`.github/workflows/coder.yml`) builds the image once and smoke-tests both binaries in it:
 `docker/coder/test/container-smoke.sh` for `adam-coder` and `docker/coder/test/agent-smoke.sh` for `adam-agent`
 (no folder: exit 78; the example folder mounted: the card, `401` without a token, a completed task against a stub

@@ -41,7 +41,7 @@ let run = store
 ```
 
 The semantics (CAS commits, first-writer-wins journal, leases, one open run
-per conversation) are described in the [root README](../../README.md#the-model).
+per conversation) are described in the [architecture](../../docs/architecture.md#the-mental-model).
 
 ## Claim scope and the run owner
 
@@ -112,7 +112,7 @@ live next to the code; those in `src/store/mod.rs` (`class_table`,
 `retryable_is_derived_from_the_class`,
 `backend_display_does_not_repeat_its_source`) pin the class of every
 `StoreError` variant with an exhaustive `match`. Database gating is described in the
-[root README](../../README.md#testing).
+[testing guide](../../docs/guides/testing.md).
 
 ## See also
 

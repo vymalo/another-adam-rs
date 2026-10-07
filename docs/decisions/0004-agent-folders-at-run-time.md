@@ -1,7 +1,7 @@
 # 0004. Agent folders are read at run time, at startup
 
 Status: **Accepted** (2026-10-01), decided on the owner's delegation; the owner may revisit.
-Builds on the authoring layer ([`docs/authoring.md`](../authoring.md), S4 to S6b) and on
+Builds on the authoring layer ([`docs/reference/agent-files.md`](../reference/agent-files.md), S4 to S6b) and on
 [ADR 0001](0001-library-first-host-roles.md) (a binary is a composition of libraries). Built as
 slice S12 of the authoring layer, in `adam-assembly` (`AgentFolder`) and `adam-coder` (`ADAM_AGENT_DIR`).
 
@@ -105,7 +105,7 @@ stateDiagram-v2
   `bin/adam-coder/tests/agent_files.rs` shows the model being sent the edited prompt; `tests/binary.rs`
   shows the card of a folder served by a control plane and every refusal; `dev/greeting-e2e.sh` does it
   through the stack (a restart on an edited copy of the folder, "hi" answered with the other name, the default
-  folder put back); the root README ("Changing what the coder says") has the compose way.
+  folder put back); the [run-locally guide](../guides/run-locally.md#change-what-an-agent-says) has the compose way.
 * **The embedded copy is the default and the fallback**, so an image that is run with no mount, and every
   existing deployment, behaves as before. The Helm chart is not changed and does not expose the variable
   yet: it has no volume for a folder, so mounting a ConfigMap at a path is a chart change of its own

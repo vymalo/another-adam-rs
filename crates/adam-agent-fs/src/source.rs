@@ -37,7 +37,7 @@ pub trait ManifestSource {
 /// A directory on disk.
 ///
 /// `root` is the directory that holds `agent/` (one agent) or `agents/<name>/` (several); it is
-/// usually the Cargo package root. The rules are those of `docs/authoring.md`:
+/// usually the Cargo package root. The rules are those of `docs/reference/agent-files.md`:
 ///
 /// * `agent/` and `agents/` together are an error; neither is an error unless
 ///   [`optional`](Self::optional).

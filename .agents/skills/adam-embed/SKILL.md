@@ -55,7 +55,7 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      (reload). `adam::include_agent!()` includes the agent directory a `build.rs` embedded with
      `adam_agent_fs::build("agent").emit()`; `AgentDef::from_manifest(AGENT)?.bind(tools![..])?
      .state(..).model(model, alias)?` binds it. Details and the tool rules:
-     `crates/adam/README.md` ("`#[tool]`", "Agent directories"), `docs/authoring.md`.
+     `crates/adam/README.md` ("`#[tool]`", "Agent directories"), `docs/reference/agent-files.md`.
    * **Only the process plumbing**: `adam-host` (`Role`, `Host`): register every component
      (`.control_plane(name, f)`, `.worker(name, f)`), `Host::run(shutdown)` starts the ones the
      role runs and stops the control plane before the workers (`crates/adam-host/README.md`).
@@ -92,7 +92,7 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
 
 ## See also
 
-* `docs/architecture.md`, `crates/adam-host/README.md`, `crates/adam-service/README.md`,
+* `docs/guides/embed-adam.md`, `docs/architecture.md`, `crates/adam-host/README.md`, `crates/adam-service/README.md`,
   `crates/adam/README.md`, `bin/adam-agent/README.md`.
 * `adam-agent-folder`, `adam-store-adapter`, `adam-upgrade`.
 * https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-service/README.md

@@ -4,7 +4,7 @@
 //! example `http://127.0.0.1:8081`, without `/v1`); otherwise every test
 //! passes without doing anything. Start the mock with
 //! `docker compose up -d --wait mock-openai`; the scenario switches these
-//! tests use are documented in the README ("Local development").
+//! tests use are documented in `docs/reference/dev-stack.md`.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::collections::BTreeMap;

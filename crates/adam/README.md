@@ -28,7 +28,7 @@ connecting the servers is the feature `mcp`. See
 has the field `optional` (`optional: true` in the file: a server that may be missing at startup).
 
 The authoring layer around it (agent directories, skills, subagents) is designed in
-[`docs/authoring.md`](../../docs/authoring.md). What exists: `#[tool]`, the agent directory
+[`docs/reference/agent-files.md`](../../docs/reference/agent-files.md). What exists: `#[tool]`, the agent directory
 embedded at build time (`adam::include_agent!()`, below), and `AgentDef`, which binds it to
 `LlmAgent`s ([`adam-assembly`](../adam-assembly/README.md), also `adam::assembly`), `adam::AgentFolder`, which
 reads one agent's folder when the process starts (`ADAM_AGENT_DIR`, no feature; see

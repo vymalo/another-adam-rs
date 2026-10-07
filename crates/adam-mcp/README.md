@@ -1,7 +1,7 @@
 # adam-mcp
 
 The servers of an agent's `mcp.json` as tools an [`LlmAgent`](../adam-llm-agent/README.md) can call. Slice S11
-of the authoring layer ([`docs/authoring.md`](../../docs/authoring.md)); the wiring into an agent (whose tools
+of the authoring layer ([`docs/reference/agent-files.md`](../../docs/reference/agent-files.md)); the wiring into an agent (whose tools
 they are, and the checks at `bind`) is [`adam-assembly`](../adam-assembly/README.md#mcp-tools-feature-mcp), behind
 its feature `mcp`.
 

@@ -8,7 +8,7 @@ this crate is only the macro, and the code it generates refers to `::adam::__pri
 argument descriptions from the parameters' doc comments, `State<T>` and `&ToolCtx` parameters resolved from
 the call's context, the arguments read and validated with `serde` and described with `schemars`. The
 contract, the options and the compile errors are documented in the [`adam` README](../adam/README.md#tool)
-and in [`docs/authoring.md`](../../docs/authoring.md).
+and in [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#the-tool-contract).
 
 ## Layout
 
