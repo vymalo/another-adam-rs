@@ -203,12 +203,10 @@ fn strip_digest(projection: &mut Value) {
         return;
     };
     for w in workloads.values_mut() {
-        for path in ["/agent/image"] {
-            if let Some(Value::String(s)) = w.pointer_mut(path)
-                && let Some((tag, _)) = s.split_once('@')
-            {
-                *s = tag.to_owned();
-            }
+        if let Some(Value::String(s)) = w.pointer_mut("/agent/image")
+            && let Some((tag, _)) = s.split_once('@')
+        {
+            *s = tag.to_owned();
         }
         if let Some(sidecars) = w["sidecars"].as_object_mut() {
             for c in sidecars.values_mut() {
