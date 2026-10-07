@@ -56,7 +56,7 @@ pub(crate) fn pushed_in(text: &str) -> Option<(String, String)> {
 /// Make small, focused commits: call it after each coherent piece of work. With several
 /// repositories in the workspace, say which with `repo`. In a scratch project it only commits,
 /// locally: nothing is pushed.
-#[tool]
+#[tool(label = "Commit and push")]
 pub async fn commit_and_push(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -266,7 +266,7 @@ fn checks_for_pushed(
 /// results. If you continue a branch that already has an open pull request, this
 /// updates it with your commits (after the same check) instead of opening another. With several
 /// repositories in the workspace, say which one with `repo`.
-#[tool]
+#[tool(label = "Open a pull request")]
 pub async fn open_pull_request(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -332,13 +332,15 @@ pub async fn open_pull_request(
         let on_this_code = tree.as_deref().and_then(|tree| notes.checked(tree));
         let why = match (on_this_code, &notes.checks.last) {
             (Some(record), _) => format!(
-                "the last check run (`{}`) failed (exit code {:?})",
-                record.command, record.exit_code
+                "the last check run (`{}`) failed with {}",
+                record.command,
+                super::notes::exit_phrase(record.exit_code)
             ),
             (None, None) => "no check was run".to_owned(),
             (None, Some(last)) if !last.passed => format!(
-                "the last check run (`{}`) failed (exit code {:?})",
-                last.command, last.exit_code
+                "the last check run (`{}`) failed with {}",
+                last.command,
+                super::notes::exit_phrase(last.exit_code)
             ),
             (None, Some(last)) => format!(
                 "the code changed since the last passing check run (`{}`): the branch is not \

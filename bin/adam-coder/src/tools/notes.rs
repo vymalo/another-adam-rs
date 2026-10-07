@@ -50,6 +50,15 @@ pub struct CheckRecord {
     pub scratch: bool,
 }
 
+/// How a check command ended, in words: `exit code 1`, or that there is no exit code because the
+/// command was killed or timed out.
+pub fn exit_phrase(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("exit code {code}"),
+        None => "no exit code (killed or timed out)".to_owned(),
+    }
+}
+
 /// Most check runs [`ChecksNotes::history`] keeps.
 pub const MAX_CHECK_HISTORY: usize = 32;
 
@@ -607,6 +616,12 @@ mod tests {
             slot: None,
             scratch: false,
         }
+    }
+
+    #[test]
+    fn an_exit_code_is_said_in_words() {
+        assert_eq!(exit_phrase(Some(1)), "exit code 1");
+        assert_eq!(exit_phrase(None), "no exit code (killed or timed out)");
     }
 
     #[test]

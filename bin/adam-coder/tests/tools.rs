@@ -1140,8 +1140,8 @@ async fn delegate_to_opencode_streams_updates_and_returns_the_summary() {
         out.content
     );
     assert!(
-        out.content.contains("hello.txt"),
-        "changed files: {}",
+        out.content.contains("- hello.txt (untracked)"),
+        "changed files, with their status in words: {}",
         out.content
     );
     assert_eq!(
@@ -3411,7 +3411,12 @@ async fn a_pull_request_needs_the_most_recent_check_of_its_code_whichever_slot_r
         is_error(&again),
         "red after green on the same tree: {again:?}"
     );
-    assert!(text(again).contains("the last check run (`false`) failed"));
+    let again = text(again);
+    assert!(
+        again.contains("the last check run (`false`) failed with exit code 1"),
+        "an exit code is said in words, not as an Option: {again}"
+    );
+    assert!(!again.contains("Some("), "{again}");
 }
 
 /// A run that began before workspaces had slots has one worktree in the old layout. It is a slot

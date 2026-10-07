@@ -460,7 +460,7 @@ impl KubeEnvironment {
         match (&answer.status, answer.stdout.trim().parse::<u64>()) {
             (ExitStatus::Code(0), Ok(n)) => Ok(n > 0),
             _ => Err(EnvError::Unavailable(format!(
-                "adam-exec active answered {:?} {}",
+                "adam-exec active answered ({}) {}",
                 answer.status,
                 clip(&answer.stderr)
             ))),

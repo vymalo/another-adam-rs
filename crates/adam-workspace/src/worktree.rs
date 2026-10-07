@@ -94,6 +94,22 @@ pub enum FileStatus {
     Conflicted,
 }
 
+impl std::fmt::Display for FileStatus {
+    /// The change in words a person reads: `modified`, `type changed`, ...
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+            Self::Copied => "copied",
+            Self::TypeChanged => "type changed",
+            Self::Untracked => "untracked",
+            Self::Conflicted => "conflicted",
+        })
+    }
+}
+
 /// One entry of [`Worktree::status`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangedFile {
@@ -540,6 +556,12 @@ mod tests {
         for (g, (path, status)) in got.iter().zip(want) {
             assert_eq!((g.path.as_str(), g.status), (path, status));
         }
+    }
+
+    #[test]
+    fn a_status_is_said_in_words() {
+        assert_eq!(FileStatus::Modified.to_string(), "modified");
+        assert_eq!(FileStatus::TypeChanged.to_string(), "type changed");
     }
 
     #[test]

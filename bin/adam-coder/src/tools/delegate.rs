@@ -355,7 +355,7 @@ pub async fn delegate_to_opencode(
     } else {
         text.push_str(&format!("\nChanged files ({}):\n", changed.len()));
         for file in changed.iter().take(MAX_LISTED_FILES) {
-            text.push_str(&format!("- {} ({:?})\n", file.path, file.status));
+            text.push_str(&format!("- {} ({})\n", file.path, file.status));
         }
         if changed.len() > MAX_LISTED_FILES {
             text.push_str(&format!(
