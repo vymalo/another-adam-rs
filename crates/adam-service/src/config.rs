@@ -13,6 +13,7 @@
 //! | `A2A_CARD_SIGNING_KEY_FILE` | a PKCS#8 PEM private key (ECDSA P-256 or Ed25519) that signs the agent card; mount it from a Secret ([`CardSigning`]) | unset: the card is unsigned |
 //! | `A2A_CARD_SIGNING_KEY_ID` | the `kid` of the signature | the key's RFC 7638 thumbprint |
 //! | `A2A_CARD_SIGNING_JKU` | the `jku` (URL of the key set) in the signature header; the server serves the key set at `/.well-known/jwks.json` | unset: no `jku` |
+//! | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, both public (the calls still need a token); `false` turns them off ([`A2aSettings::docs`]) | `true` |
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `WORKER_ID` | stable identity of this worker (the lease identity; the run owner for a binary that pins runs); letters, digits, `.`, `_`, `-` | random per process |
@@ -312,13 +313,26 @@ impl ServiceConfig {
     }
 }
 
-/// The optional features of the A2A server: **nothing is on by default**.
-#[derive(Clone, Debug, Default)]
+/// The optional features of the A2A server: **nothing is on by default** but the docs.
+#[derive(Clone, Debug)]
 pub struct A2aSettings {
     /// `A2A_PUSH_*`: push notifications. `None`: off.
     pub push: Option<PushSettings>,
     /// `A2A_CARD_SIGNING_*`: the signature of the agent card. `None`: unsigned.
     pub card_signing: Option<CardSigning>,
+    /// `A2A_DOCS`: Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, public.
+    /// **On** (`true`) unless the variable says `false`.
+    pub docs: bool,
+}
+
+impl Default for A2aSettings {
+    fn default() -> Self {
+        Self {
+            push: None,
+            card_signing: None,
+            docs: true,
+        }
+    }
 }
 
 /// Push notifications the deployment turned on (`A2A_PUSH_*`): which webhooks they may reach and
@@ -450,9 +464,12 @@ impl CardSigning {
 impl A2aSettings {
     /// Read the optional A2A variables, adding a problem for each unusable one.
     pub fn parse(lookup: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Self {
+        let get = |name: &str| not_blank(lookup, name);
+        let docs = get("A2A_DOCS").is_none() || parse_flag(&get, "A2A_DOCS", problems);
         Self {
             push: PushSettings::parse(lookup, problems),
             card_signing: CardSigning::parse(lookup, problems),
+            docs,
         }
     }
 }
@@ -961,6 +978,30 @@ mod tests {
         vars.insert("A2A_CARD_SIGNING_KEY_FILE", "/nonexistent");
         let config = parse(&vars).unwrap();
         assert!(config.a2a.push.is_none() && config.a2a.card_signing.is_none());
+    }
+
+    #[test]
+    fn the_docs_are_on_unless_a2a_docs_says_false() {
+        assert!(parse(&full()).unwrap().a2a.docs, "on by default");
+        for (value, on) in [
+            ("false", false),
+            ("0", false),
+            ("FALSE", false),
+            ("true", true),
+            ("1", true),
+            ("  ", true),
+        ] {
+            let mut vars = full();
+            vars.insert("A2A_DOCS", value);
+            assert_eq!(parse(&vars).unwrap().a2a.docs, on, "A2A_DOCS={value:?}");
+        }
+        let mut vars = full();
+        vars.insert("A2A_DOCS", "maybe");
+        assert!(mentions(&problems_of(&vars), "A2A_DOCS"));
+        // A role that serves no A2A reads none of it.
+        let mut vars = with_role("worker");
+        vars.insert("A2A_DOCS", "maybe");
+        assert!(parse(&vars).is_ok());
     }
 
     #[test]

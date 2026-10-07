@@ -8,7 +8,7 @@ files or logs; they are `SecretString`s and absent from `Debug`.
 
 The roles that run workers (`all`, `worker`) read everything below except where a row says otherwise.
 A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
-`ADAM_AGENT_DIR` and the optional `A2A_PUSH_*` and `A2A_CARD_SIGNING_*`, and a chart may set the rest for every role.
+`ADAM_AGENT_DIR` and the optional `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS`, and a chart may set the rest for every role.
 
 ## Both binaries (`adam-service`)
 
@@ -33,8 +33,9 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLI
 
 ### Optional A2A features (roles that serve A2A: `all`, `control-plane`)
 
-Nothing here is on by default; a role that does not serve A2A reads none of it. A bad value is a startup problem (exit 78).
-[ADR 0030](../decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md), [what a client sees](a2a-server.md).
+Nothing here is on by default but the docs; a role that does not serve A2A reads none of it. A bad value is a startup
+problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md),
+[ADR 0031](../decisions/0031-swagger-ui-and-the-a2a-rest-binding.md), [what a client sees](a2a-server.md).
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -45,6 +46,7 @@ Nothing here is on by default; a role that does not serve A2A reads none of it. 
 | `A2A_CARD_SIGNING_KEY_FILE` | a PKCS#8 PEM private key, ECDSA P-256 or Ed25519, that signs the public and the extended card; mount it from a Secret; must exist and be usable | unset: the card is unsigned |
 | `A2A_CARD_SIGNING_KEY_ID` | the signature's `kid`; needs the key file | the key's RFC 7638 thumbprint |
 | `A2A_CARD_SIGNING_JKU` | the `jku` in the signature's header (where clients fetch the key set; the server serves it at `/.well-known/jwks.json`); needs the key file | unset |
+| `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, both public (the calls still need a token); `false` (or `0`) turns them off | `true` |
 
 ## Agent folder (both binaries)
 

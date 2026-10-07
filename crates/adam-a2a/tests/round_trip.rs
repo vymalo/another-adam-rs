@@ -1003,6 +1003,54 @@ async fn a_request_activates_the_extensions_its_header_and_its_message_name_that
     assert_eq!(backend.subjects(), ["token-0"]);
 }
 
+/// The HTTP+JSON binding goes through the same handler: the backend sees the same caller and the
+/// same extensions as for the JSON-RPC request above, and the response echoes them.
+#[tokio::test]
+async fn http_json_gives_the_backend_the_same_caller_and_extensions() {
+    let (addr, backend) = start_declaring(&[EXT_A, EXT_B]).await;
+    let auth = bearer(TOKEN);
+    let named = format!("{EXT_A}, {EXT_UNDECLARED}");
+    let body = serde_json::json!({
+        "message": {
+            "messageId": "m-rest", "role": "ROLE_USER", "parts": [{"text": "hello"}],
+            "extensions": [EXT_B, EXT_A],
+        },
+        "configuration": {"returnImmediately": true}
+    });
+    let response = raw(
+        addr,
+        "POST",
+        "/message:send",
+        &[("Authorization", &auth), ("A2A-Extensions", &named)],
+        &body.to_string(),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(backend.last("submit"), [EXT_A, EXT_B]);
+    assert!(
+        response
+            .headers
+            .contains(&format!("a2a-extensions: {EXT_A}, {EXT_B}").to_lowercase()),
+        "{}",
+        response.headers
+    );
+    let id = serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let poll = raw(
+        addr,
+        "GET",
+        &format!("/tasks/{id}"),
+        &[("Authorization", &auth), ("A2A-Extensions", EXT_B)],
+        "",
+    )
+    .await;
+    assert_eq!(poll.status, 200, "{}", poll.body);
+    assert_eq!(backend.last("get"), [EXT_B]);
+    assert_eq!(backend.subjects(), ["token-0", "token-0"]);
+}
+
 #[tokio::test]
 async fn nothing_is_activated_unless_the_request_asks_and_the_card_declares() {
     let (addr, backend) = start_declaring(&[EXT_A]).await;

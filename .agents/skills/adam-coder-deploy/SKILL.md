@@ -126,6 +126,22 @@ sh docker/coder/test/container-smoke.sh coder:smoke   # needs a reachable Postgr
 sh docker/coder/test/agent-smoke.sh coder:smoke
 ```
 
+The smoke tests also check that `/docs` and `/openapi.json` are public and that `GET /tasks` (the HTTP+JSON binding) needs
+the token (`docker/coder/test/http-smoke.sh`,
+https://github.com/vymalo/another-adam-rs/blob/main/docker/coder/test/http-smoke.sh).
+
+**Swagger UI on the cluster.** The chart has no Ingress and adds no route to the docs; reach them with a port-forward
+to the Service (the release `coder` in `another-agentic-system` here):
+
+```sh
+kubectl -n another-agentic-system port-forward svc/coder 8080:8080
+# open http://127.0.0.1:8080/docs, press Authorize, paste a token of A2A_BEARER_TOKENS, then Try it out
+```
+
+Try it out calls the address the page was opened from, so it works through the port-forward. `config.extraEnv.A2A_DOCS:
+"false"` turns the docs off (chart README, "Swagger UI",
+https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md#swagger-ui).
+
 Then the compose scenarios of the `image` job in `.github/workflows/coder.yml`
 (`dev/coder-e2e.sh`, `dev/greeting-e2e.sh`, `dev/agent-e2e.sh`, `dev/coder-choices-e2e.sh`,
 `dev/agent-cards-e2e.sh`): read the job for the exact order and variables.

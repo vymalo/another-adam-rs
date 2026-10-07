@@ -256,7 +256,7 @@ fn a2a_features(
     config: &ServiceConfig,
     service: &Service,
 ) -> Result<(ServerOptions, Option<PushDeliverer>), ServeError> {
-    let mut options = ServerOptions::default();
+    let mut options = ServerOptions::default().with_docs(config.a2a.docs);
     let mut deliverer = None;
     if let Some(push) = &config.a2a.push {
         let policy = push.policy().map_err(|e| ServeError::Push(Box::new(e)))?;

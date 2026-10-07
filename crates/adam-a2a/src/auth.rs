@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 use crate::backend::Caller;
+use crate::docs;
 
 /// Header the auth layer uses to hand the authenticated subject to the
 /// request handler. Stripped from every inbound request first, so a client can
@@ -60,6 +61,9 @@ pub(crate) struct Authenticator {
     /// Whether `GET /.well-known/jwks.json` needs no credential (it exists only when the card
     /// is signed, and then it is the public half of the key that signs it).
     public_jwks: bool,
+    /// Whether Swagger UI and the OpenAPI document need no credential (they exist only when the
+    /// docs are on).
+    public_docs: bool,
 }
 
 /// Where the public key set of the card signature is served, when there is one.
@@ -109,6 +113,7 @@ impl Authenticator {
         Self {
             mode,
             public_jwks: false,
+            public_docs: false,
         }
     }
 
@@ -117,6 +122,22 @@ impl Authenticator {
     pub(crate) fn with_public_jwks(mut self) -> Self {
         self.public_jwks = true;
         self
+    }
+
+    /// Serve Swagger UI and the OpenAPI document ([`docs::is_docs_path`]) without a credential.
+    #[must_use]
+    pub(crate) fn with_public_docs(mut self) -> Self {
+        self.public_docs = true;
+        self
+    }
+
+    /// Whether `method path` needs no credential: [`is_public`], and the key set and the docs when
+    /// they are served.
+    fn is_open(&self, method: &Method, path: &str) -> bool {
+        is_public(method, path)
+            || (method == Method::GET
+                && ((self.public_jwks && path == JWKS_PATH)
+                    || (self.public_docs && docs::is_docs_path(path))))
     }
 
     /// Whether requests carry credentials (drives the card's security scheme).
@@ -179,7 +200,8 @@ fn bearer_token(value: &HeaderValue) -> Option<&str> {
 }
 
 /// Routes that need no credential: the public card (discovery must work before
-/// a client has credentials) and the liveness probe.
+/// a client has credentials) and the liveness probe. The card's key set and the docs join them when
+/// they are served ([`Authenticator::with_public_jwks`], [`Authenticator::with_public_docs`]).
 pub(crate) fn is_public(method: &Method, path: &str) -> bool {
     method == Method::GET && (path == a2a_server::WELL_KNOWN_AGENT_CARD_PATH || path == "/healthz")
 }
@@ -192,10 +214,7 @@ pub(crate) async fn authenticate(
 ) -> Response {
     request.headers_mut().remove(CALLER_HEADER);
 
-    let path = request.uri().path();
-    if is_public(request.method(), path)
-        || (authenticator.public_jwks && request.method() == Method::GET && path == JWKS_PATH)
-    {
+    if authenticator.is_open(request.method(), request.uri().path()) {
         return next.run(request).await;
     }
 
@@ -213,27 +232,32 @@ pub(crate) async fn authenticate(
             next.run(request).await
         }
         None => {
-            tracing::debug!(
-                path = request.uri().path(),
-                "rejected unauthenticated request"
-            );
-            unauthorized()
+            let path = request.uri().path();
+            tracing::debug!(path, "rejected unauthenticated request");
+            unauthorized(path)
         }
     }
 }
 
-/// 401 with `WWW-Authenticate: Bearer` and a JSON-RPC error envelope, so an
-/// A2A client surfaces a typed error instead of failing to parse the body.
-fn unauthorized() -> Response {
-    let body = JsonRpcResponse::error(
-        a2a::JsonRpcId::Null,
-        a2a::JsonRpcError {
-            code: UNAUTHORIZED_CODE,
-            message: "unauthorized: missing or invalid bearer token".to_owned(),
-            data: None,
-        },
-    );
-    let body = serde_json::to_vec(&body).unwrap_or_default();
+const UNAUTHORIZED_MESSAGE: &str = "unauthorized: missing or invalid bearer token";
+
+/// 401 with `WWW-Authenticate: Bearer` and the error envelope of the binding the path belongs to,
+/// so an A2A client surfaces a typed error instead of failing to parse the body: a JSON-RPC error
+/// object at `/` (the JSON-RPC endpoint), a `google.rpc.Status` anywhere else (HTTP+JSON).
+fn unauthorized(path: &str) -> Response {
+    let body = if path == "/" {
+        serde_json::to_vec(&JsonRpcResponse::error(
+            a2a::JsonRpcId::Null,
+            a2a::JsonRpcError {
+                code: UNAUTHORIZED_CODE,
+                message: UNAUTHORIZED_MESSAGE.to_owned(),
+                data: None,
+            },
+        ))
+    } else {
+        serde_json::to_vec(&crate::rest::unauthorized_body(UNAUTHORIZED_MESSAGE))
+    }
+    .unwrap_or_default();
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = StatusCode::UNAUTHORIZED;
     response
@@ -309,6 +333,25 @@ mod tests {
     fn debug_never_prints_tokens() {
         let config = AuthConfig::BearerTokens(vec![SecretString::from("super-secret")]);
         assert!(!format!("{config:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn the_docs_are_open_only_when_on_and_only_to_get() {
+        let off = bearer(&["alpha"]);
+        let on = bearer(&["alpha"]).with_public_docs();
+        for path in [
+            "/docs",
+            "/docs/",
+            "/docs/swagger-ui-bundle.js",
+            "/openapi.json",
+        ] {
+            assert!(!off.is_open(&Method::GET, path), "{path} with the docs off");
+            assert!(on.is_open(&Method::GET, path), "{path}");
+            assert!(!on.is_open(&Method::POST, path), "POST {path}");
+        }
+        for path in ["/", "/tasks", "/message:send", "/docs/x", JWKS_PATH] {
+            assert!(!on.is_open(&Method::GET, path), "{path}");
+        }
     }
 
     #[test]

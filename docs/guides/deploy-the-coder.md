@@ -149,8 +149,11 @@ Render-time guards stop a bad combination at `helm template`, not at rollout (`t
 ## Verify
 
 * The pods are `Ready` (probes hit `/healthz`; the GitHub MCP sidecar starts first).
-* `GET <PUBLIC_URL>.well-known/agent-card.json` is public and returns the card; any other route without a bearer
-  token is `401`.
+* `GET <PUBLIC_URL>.well-known/agent-card.json` is public and returns the card; so are Swagger UI and the OpenAPI
+  document; any other route without a bearer token is `401`.
+* Swagger UI has no Ingress either: `kubectl -n another-agentic-system port-forward svc/coder 8080:8080`, then open
+  `http://127.0.0.1:8080/docs`, **Authorize** with a token and **Try it out**
+  ([the chart](../../deploy/coder/README.md#swagger-ui)).
 * Send a task as in [Run it locally](run-locally.md#send-the-coder-a-task) with a real repository.
 * A pod that exits **78** has a configuration problem (the log names the variable); **69** means Postgres is not
   reachable; a missing `ExternalSecret` property leaves pods in `CreateContainerConfigError`.

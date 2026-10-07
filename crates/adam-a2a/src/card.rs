@@ -4,7 +4,8 @@ use std::collections::HashMap;
 
 use a2a::{
     AgentCapabilities, AgentCard, AgentExtension, AgentInterface, AgentSkill,
-    HttpAuthSecurityScheme, SecurityScheme, TRANSPORT_PROTOCOL_JSONRPC,
+    HttpAuthSecurityScheme, SecurityScheme, TRANSPORT_PROTOCOL_HTTP_JSON,
+    TRANSPORT_PROTOCOL_JSONRPC,
 };
 use url::Url;
 
@@ -24,7 +25,9 @@ pub struct AgentCardConfig {
     /// The public URL of this server's JSON-RPC endpoint, i.e. where the
     /// router returned by [`A2aServer::router`](crate::A2aServer::router) is
     /// reachable as seen by clients (include any path prefix you nest it
-    /// under). Clients POST to exactly this URL.
+    /// under). Clients POST to exactly this URL. The card lists it twice: for
+    /// JSON-RPC first, then for HTTP+JSON, whose paths (`/message:send`, ...)
+    /// are relative to it.
     pub url: Url,
     /// The agent's own version string (not the protocol version).
     pub version: String,
@@ -299,10 +302,12 @@ pub(crate) fn build_card(config: &AgentCardConfig, flags: Flags) -> AgentCard {
         name: config.name.clone(),
         description: config.description.clone(),
         version: config.version.clone(),
-        supported_interfaces: vec![AgentInterface::new(
-            config.url.as_str(),
-            TRANSPORT_PROTOCOL_JSONRPC,
-        )],
+        // JSON-RPC first: a client that takes the first interface (the specification's preferred
+        // one) is unchanged. HTTP+JSON is at the same base URL (its paths are relative to it).
+        supported_interfaces: vec![
+            AgentInterface::new(config.url.as_str(), TRANSPORT_PROTOCOL_JSONRPC),
+            AgentInterface::new(config.url.as_str(), TRANSPORT_PROTOCOL_HTTP_JSON),
+        ],
         capabilities: AgentCapabilities {
             streaming: Some(true),
             push_notifications: Some(flags.push),
@@ -341,8 +346,19 @@ mod tests {
         assert_eq!(card.capabilities.streaming, Some(true));
         assert_eq!(card.capabilities.push_notifications, Some(false));
         assert_eq!(card.capabilities.extended_agent_card, Some(false));
-        assert_eq!(card.supported_interfaces.len(), 1);
-        assert_eq!(card.supported_interfaces[0].url, "http://localhost:8080/");
+        let interfaces: Vec<_> = card
+            .supported_interfaces
+            .iter()
+            .map(|i| (i.protocol_binding.as_str(), i.url.as_str()))
+            .collect();
+        assert_eq!(
+            interfaces,
+            [
+                ("JSONRPC", "http://localhost:8080/"),
+                ("HTTP+JSON", "http://localhost:8080/")
+            ],
+            "JSON-RPC first, HTTP+JSON at the same base URL"
+        );
         assert_eq!(card.skills[0].id, "echo");
         assert!(card.security_schemes.is_none());
         assert!(card.security_requirements.is_none());

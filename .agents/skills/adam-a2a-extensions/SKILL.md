@@ -87,8 +87,8 @@ read the exact strings in the file at your rev.
 
 ## Beyond extensions: what the plain A2A 1.0 server supports
 
-Not extensions, so nothing to activate; each is **off until the deployment turns it on, and the card says so**. Read the
-card before you call (`capabilities.pushNotifications`, `capabilities.extendedAgentCard`, `signatures`):
+Not extensions, so nothing to activate; each optional feature is **off until the deployment turns it on, and the card says
+so** (the docs are the exception: on unless turned off). Read the card before you call (`capabilities.pushNotifications`, `capabilities.extendedAgentCard`, `signatures`):
 
 * **Push notifications** (`CreateTaskPushNotificationConfig`, `Get`, `List`, `Delete`, or `configuration.taskPushNotificationConfig`
   in a send): on when the deployment sets `A2A_PUSH_ALLOWED_URLS`; your webhook must be on its list and `https`. A
@@ -102,7 +102,23 @@ card before you call (`capabilities.pushNotifications`, `capabilities.extendedAg
   verify with `adam_a2a::VerifyingKey` (`crates/adam-a2a/src/signing.rs`). Agreement with other SDKs' canonical payloads is
   unverified.
 
-Decision: `docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md`.
+* **Two bindings.** Every method is served over JSON-RPC (`POST /`) and over HTTP+JSON (A2A 1.0 §11:
+  `POST /message:send`, `POST /message:stream`, `GET /tasks/{id}`, `GET /tasks`, `POST /tasks/{id}:cancel`,
+  `POST /tasks/{id}:subscribe`, `/tasks/{id}/pushNotificationConfigs[/{configId}]`, `GET /extendedAgentCard`), by one
+  handler: the caller, the extensions (the same `A2A-Extensions` header and `message.extensions`, echoed the same way), push
+  configs and errors behave the same. The card lists `JSONRPC` first and `HTTP+JSON` second, at the same URL; a client that
+  takes the first interface keeps JSON-RPC. REST errors are `google.rpc.Status` with an `ErrorInfo` reason
+  (`TASK_NOT_FOUND`, ...). Routes: `crates/adam-a2a/src/rest.rs`
+  (https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-a2a/src/rest.rs).
+* **Swagger UI** at `GET /docs` and the OpenAPI 3.1 document of both bindings at `GET /openapi.json`: public, the same for
+  every caller, no secret in it; the calls still need the bearer token (**Authorize** in the page). On unless the
+  deployment sets `A2A_DOCS=false`. Streams cannot be watched in Swagger UI; each streaming operation gives its `curl`.
+  The document: `crates/adam-a2a/src/openapi.rs`
+  (https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-a2a/src/openapi.rs).
+
+Decisions: `docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md`,
+`docs/decisions/0031-swagger-ui-and-the-a2a-rest-binding.md`
+(https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0031-swagger-ui-and-the-a2a-rest-binding.md).
 
 **The registry** is not an A2A extension either: it is a list of agent cards, `agent-registry/v1`, that a platform
 serves so an orchestrator finds its agents. The adam-rs operator serves one for the `AgentService`s it runs

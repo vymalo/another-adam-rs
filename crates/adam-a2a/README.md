@@ -9,10 +9,10 @@ The **server-side adapter for the A2A protocol**, independent of the agent
 runtime. It defines its own port, `TaskBackend`; the durable implementation is
 [`adam-a2a-runtime`](../adam-a2a-runtime/README.md), and
 [`adam-coder`](../../bin/adam-coder/README.md) mounts the result. This crate holds no
-task state. JSON-RPC parsing, ProtoJSON and SSE framing are the official SDK's
+task state. JSON-RPC and HTTP+JSON parsing, ProtoJSON and SSE framing are the official SDK's
 (`a2a-lf`, `a2a-server-lf`); this crate implements the SDK's `RequestHandler`
 on top of `TaskBackend` instead of using its `DefaultRequestHandler`, whose
-resubscribe only works inside one process.
+resubscribe only works inside one process, and mounts it behind both bindings.
 
 ## API at a glance
 
@@ -24,7 +24,7 @@ resubscribe only works inside one process.
 | `TaskEvent`, `BackendError`, `Caller` | events, errors (`#[non_exhaustive]`, see *Errors*), and the caller a request carries: the authenticated `subject` and the `extensions` the request activated (`Caller::new(subject)`, `with_extensions(..)`, `has_extension(uri)`; see *Extensions a request activates*) |
 | `AgentCardConfig::extension_uris()` | the URIs the card declares: what a request may activate |
 | `A2aServer::router(card, backend, auth)` | the `axum::Router`; `router_with_options(.., ServerOptions)` |
-| `ServerOptions` | `with_keepalive_interval(..)` (the SDK sends an SSE comment every `SDK_KEEPALIVE_INTERVAL`, 15 s), `with_push(PushSupport)`, `with_card_signer(CardSigner)` |
+| `ServerOptions` | `with_keepalive_interval(..)` (the SDK sends an SSE comment every `SDK_KEEPALIVE_INTERVAL`, 15 s), `with_push(PushSupport)`, `with_card_signer(CardSigner)`, `with_docs(bool)` (Swagger UI and the OpenAPI document, **on by default**; the field `docs` is new and `Default` sets it `true`) |
 | `push` (module) | **push notifications**, off unless a policy allows a webhook: `PushPolicy` (the allow-list and the SSRF rules), `PushStore` (the port the configs and their delivery progress live behind; `InMemoryPushStore` with `test-util`), `PushSupport` (store and policy together), `PushDeliverer` and `PushDeliveryOptions` (the loop), `PushSender` (one request), `PushCursor` (what a webhook has heard), `GuardedResolver` |
 | `AgentCardConfig::with_extended_card(ExtendedCardConfig)` | what an authenticated caller sees on top of the public card (`GetExtendedAgentCard`) |
 | `CardSigner`, `VerifyingKey`, `canonical_payload`, `canonicalize`, `SigningError`, `VerifyError` | the card's JWS (ES256 or EdDSA over the RFC 8785 canonical card); `generate_signing_key_pem` with `test-util` |
@@ -47,6 +47,43 @@ let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
 axum::serve(listener, app).await?;
 ```
 
+## Routes
+
+| Route | Auth |
+|---|---|
+| `GET /.well-known/agent-card.json`, `GET /healthz` | public |
+| `GET /.well-known/jwks.json` (only when the card is signed) | public |
+| `GET /docs` (303 to `docs/`), `GET /docs/` and the files it loads, `GET /openapi.json` (unless `with_docs(false)`) | public |
+| `POST /`: JSON-RPC, every A2A 1.0 method | bearer token |
+| HTTP+JSON (A2A 1.0 §11): `POST /message:send`, `POST /message:stream`, `GET /tasks/{id}`, `GET /tasks`, `POST /tasks/{id}:cancel`, `POST /tasks/{id}:subscribe`, `POST`/`GET /tasks/{id}/pushNotificationConfigs`, `GET`/`DELETE /tasks/{id}/pushNotificationConfigs/{configId}`, `GET /extendedAgentCard`, and the SDK's aliases of earlier drafts (`src/rest.rs`, `REST_ROUTES`) | bearer token |
+| anything else | bearer token, then 404 |
+
+The card lists two interfaces at `AgentCardConfig::url`: `JSONRPC` first, `HTTP+JSON` second (the REST paths are relative
+to it; *verified 2026-10-07*, <https://a2a-protocol.org/latest/specification/> §4.4.6, §11.3). Design:
+[ADR 0031](../../docs/decisions/0031-swagger-ui-and-the-a2a-rest-binding.md).
+
+**HTTP+JSON** is the SDK's `rest_router` (`a2a-server-lf` 0.4.4) over the same `BackendHandler` as JSON-RPC: the same
+caller, extensions (`A2A-Extensions` header and `message.extensions`, echoed in the response), push configs, `ListTasks`,
+extended card and error mapping. What the SDK's router does not do is added around it in `src/rest.rs`: the extractors'
+plain-text refusals become the binding's `google.rpc.Status` envelope (`PARSE_ERROR` for a body that is not JSON,
+`INVALID_PARAMS` with the extractor's text for a query string that does not parse, `INVALID_REQUEST` for a body over the
+limit or not declared as JSON), a send that names `configuration.pushNotificationConfig` is refused as on JSON-RPC, and a
+401 is `UNAUTHENTICATED` in that envelope (at `POST /` it stays the JSON-RPC `-32000`).
+
+**The docs** (`src/openapi.rs`, `src/docs.rs`): one OpenAPI 3.1 document of both bindings, **written by hand** (the SDK's
+types derive no schema) and held to the code by the tests below. JSON-RPC is `POST /` with a `oneOf` of one schema per
+method and a named example per method; streaming operations are `text/event-stream` and their descriptions give the
+`curl` (Swagger UI cannot show a stream as it arrives). The bearer scheme is declared exactly when the server requires
+one. The document is built once from the public card and the switches it shows: the same bytes for every caller, no
+token, nothing of the extended card. Swagger UI 5.32.6 (Apache-2.0) is bundled in the binary by `utoipa-swagger-ui` 10.0.1
+with `vendored` (*verified 2026-10-07* by reading its `build.rs`: with that feature the zip comes from the
+`utoipa-swagger-ui-vendored` 0.2.0 crate, which ships it in `res/`, and nothing is downloaded; `minified` leaves the source
+maps out). Only the eight files `index.html` loads are served, under
+`Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; …`;
+the page reads `../openapi.json` (relative, so a nested router works), the document's server is `.` (Try it out calls the
+address the page came from: Swagger UI resolves it against the document's URL, *verified 2026-10-07* in the bundled
+`swagger-ui-bundle.js` and in headless Chromium), the validator badge and `?url=` are off and the token is not persisted.
+
 Protocol notes (details in the crate docs, `src/lib.rs`; the SDK's `RequestHandler` is implemented in `src/handler.rs`):
 
 * Serves A2A **1.0** method names: `SendMessage`, `SendStreamingMessage`,
@@ -59,10 +96,10 @@ Protocol notes (details in the crate docs, `src/lib.rs`; the SDK's `RequestHandl
   <https://a2a-protocol.org/latest/specification/> §3.3.4).
 * `A2aServer::health_router()` is the `/healthz` route alone (200, `ok`), for a process that
   answers probes but serves no A2A, such as a worker.
-* Every route except the agent card and `/healthz` answers 401 without a valid
+* Every route except the agent card, `/healthz`, the docs and (when signed) the key set answers 401 without a valid
   token. The middleware strips any client-sent identity header and injects the
   trusted `Caller`.
-* A body that is not a JSON-RPC request gets HTTP 200 and a JSON-RPC error
+* A body sent to `POST /` that is not a JSON-RPC request gets HTTP 200 and a JSON-RPC error
   object with a null id, never the SDK extractor's plain-text 400/415/422/413:
   `-32700` when it is not JSON, `-32600` when it is JSON but not a request, is
   not declared as `application/json`, or is over the SDK's size limit. The
@@ -153,10 +190,24 @@ answered as described under *Protocol notes*, not through `BackendError`.
 |---|---|---|
 | `test-util` | no | ships `InMemoryBackend`, `InMemoryPushStore` and `generate_signing_key_pem` (pulls in `tokio-stream`); also useful to other repositories' tests |
 
-No environment variables (the binaries read `A2A_PUSH_*` and `A2A_CARD_SIGNING_*` in
+No environment variables (the binaries read `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` and `A2A_DOCS` in
 [`adam-service`](../adam-service/README.md) and pass them in `ServerOptions`).
 
 ## Tests
+
+`tests/rest.rs` (HTTP+JSON: the card's two interfaces in order; the official client over REST: send, get, list, cancel,
+streaming, resubscribe; a task private to its caller on both bindings; errors as status and `ErrorInfo` reason; malformed
+requests in the binding's envelope and never before authentication; extensions activated and echoed; push configs
+created, read, listed and deleted with secrets write-only; the extended card; an anonymous server), and
+`http_json_gives_the_backend_the_same_caller_and_extensions` in `tests/round_trip.rs`. `tests/docs.rs` (the page, its files
+and the document are public under the CSP while calls are 401; off, they are closed like any unknown route; the document
+validates against the official OpenAPI 3.1 JSON Schema, vendored in `tests/fixtures` (see `third-party-notices.md`), every
+`$ref` resolves, operation ids are unique and path parameters declared; every JSON-RPC method the handler dispatches is in
+the `oneOf` and the reverse, and each example reaches its method; every REST route is documented and routed and no other
+method is served on its paths; the examples and real responses, stream events and errors of both bindings validate against
+the document's schemas; the document is the same for every caller and names no token and nothing of the extended card; the
+bearer scheme only when bearer is on). `method_tripwire` fails when `Cargo.lock` moves `a2a-server-lf` off 0.4.4: axum
+cannot list a router's routes, so `RPC_METHODS` and `REST_ROUTES` mirror the SDK's source and must be re-read then.
 
 `tests/push.rs` (the official client and a local webhook: off by default and card flags, create/get/list/delete, secrets write-only,
 another caller refused, disallowed URLs refused, each state change delivered in order with the token and the credentials,
@@ -172,7 +223,8 @@ resubscribe, `input-required` follow-ups, a message to a finished task as `-3200
 `an_oversized_body_is_an_invalid_request`), authentication on every route,
 keepalive frames, caller isolation). Unit tests in `src/backend.rs`
 (`class_table`, `the_source_is_kept_and_not_repeated_in_the_message`,
-`a2a_errors_do_not_leak_the_cause`, and the extension entries of `src/extensions.rs`, `steer/v1` included). The crate's own
+`a2a_errors_do_not_leak_the_cause`, the extension entries of `src/extensions.rs`, `steer/v1` included, the send paths and
+the legacy push config of `src/rest.rs`, and which paths are public in `src/docs.rs` and `src/auth.rs`). The crate's own
 dev-dependency turns on `test-util`. Offline, no environment variables.
 
 ## See also

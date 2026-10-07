@@ -42,7 +42,8 @@ You get an SSE stream of status updates, steps and artifacts, ending in `TASK_ST
 `pull_request` artifact. The coder's model is scripted, so the run goes: prepare a worktree, ask the mock
 GitHub MCP for the branches, let OpenCode (also scripted) create `hello.txt`, run the repository's checks,
 push a branch to the git server, open a pull request on the mock GitHub. The agent card is at
-`http://127.0.0.1:8080/.well-known/agent-card.json`, public like `/healthz`.
+`http://127.0.0.1:8080/.well-known/agent-card.json`, public like `/healthz`; Swagger UI is at
+`http://127.0.0.1:8080/docs` (press **Authorize** and paste the bearer token to try the calls).
 
 Say "hi" to either agent and it greets you from its own instructions. The other scenarios (a scratch project,
 a second repository, a repository created on request, the devcontainer, a GitHub App) are scripts:

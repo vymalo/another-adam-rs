@@ -1,6 +1,7 @@
 #!/bin/sh
 # HTTP-level smoke test of a running adam-coder (or adam-agent): liveness, the public agent
-# card, fail-closed authentication and one task whose model answers in text. Works against the
+# card, Swagger UI and the OpenAPI document (public, ADR 0031), fail-closed authentication on
+# both bindings (JSON-RPC and HTTP+JSON) and one task whose model answers in text. Works against the
 # container (container-smoke.sh, agent-smoke.sh) or a locally started binary.
 #
 #   http-smoke.sh <base-url> <bearer-token>
@@ -93,6 +94,33 @@ else
   bad "build/v1 does not say a sha256 folderDigest"
 fi
 
+# Two interfaces at the same URL, JSON-RPC first (clients that take the first are unchanged).
+if [ "$(jq -r '[.supportedInterfaces[].protocolBinding] | join(",")' "$body" 2>/dev/null)" = "JSONRPC,HTTP+JSON" ] \
+  && [ "$(jq -r '[.supportedInterfaces[].url] | unique | length' "$body" 2>/dev/null)" = 1 ]; then
+  ok "the card lists JSONRPC then HTTP+JSON, at one URL"
+else
+  bad "the card's interfaces are $(jq -c '.supportedInterfaces' "$body" 2>/dev/null || echo '?'), want JSONRPC then HTTP+JSON at one URL"
+fi
+
+# Swagger UI and the OpenAPI document are public (no token) and the page loads nothing from elsewhere.
+headers=$(mktemp)
+code=$(status -D "$headers" "$base/docs/")
+if [ "$code" = 200 ] && grep -qi '^content-security-policy: default-src .none.' "$headers" && grep -q 'swagger-ui-bundle.js' "$body"; then
+  ok "GET /docs/ is public Swagger UI under a self-only CSP"
+else
+  bad "GET /docs/: status $code, headers: $(tr '\r\n' '  ' < "$headers" | head -c 400)"
+fi
+rm -f "$headers"
+code=$(status "$base/docs/swagger-ui-bundle.js")
+if [ "$code" = 200 ]; then ok "Swagger UI's script is served from the image"; else bad "GET /docs/swagger-ui-bundle.js is $code"; fi
+code=$(status "$base/openapi.json")
+if [ "$code" = 200 ] && [ "$(jq -r '.openapi' "$body" 2>/dev/null)" = 3.1.0 ] \
+  && jq -e '.paths["/message:send"].post and .paths["/"].post and .components.securitySchemes.bearer' "$body" >/dev/null 2>&1; then
+  ok "GET /openapi.json is public and documents both bindings and the bearer scheme"
+else
+  bad "GET /openapi.json: status $code, body: $(head -c 300 "$body")"
+fi
+
 rpc='{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"messageId":"smoke-1","role":"ROLE_USER","parts":[{"text":"Say nothing."}]}}}'
 
 # Fail closed: no token, a wrong token, a token that is a prefix of the real one.
@@ -102,6 +130,10 @@ code=$(status -X POST -H 'Content-Type: application/json' -H 'Authorization: Bea
 if [ "$code" = 401 ]; then ok "POST / with a wrong token is 401"; else bad "POST / with a wrong token is $code, want 401"; fi
 code=$(status -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $(printf '%s' "$token" | cut -c1-1)" -d "$rpc" "$base/")
 if [ "$code" = 401 ]; then ok "POST / with a token prefix is 401"; else bad "POST / with a token prefix is $code, want 401"; fi
+code=$(status "$base/tasks")
+if [ "$code" = 401 ]; then ok "GET /tasks (HTTP+JSON) without a token is 401"; else bad "GET /tasks without a token is $code, want 401"; fi
+code=$(status -H "Authorization: Bearer $token" "$base/tasks")
+if [ "$code" = 200 ]; then ok "GET /tasks (HTTP+JSON) with the token is 200"; else bad "GET /tasks with the token is $code, want 200"; fi
 code=$(status "$base/some/other/path")
 if [ "$code" = 401 ] || [ "$code" = 404 ]; then ok "an unknown route is not served ($code)"; else bad "an unknown route is $code"; fi
 
