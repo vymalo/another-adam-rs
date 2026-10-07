@@ -198,6 +198,9 @@ struct Sql {
     runs_pkey: String,
     open_conversation_index: String,
     migrate: Vec<Arc<str>>,
+    /// The meta table's name with the prefix, bound to `to_regclass` before it is read.
+    meta_table: String,
+    schema_version: Arc<str>,
     insert_run: Arc<str>,
     load_run: Arc<str>,
     load_version: Arc<str>,
@@ -338,6 +341,10 @@ impl Sql {
         .collect();
         Self {
             migrate,
+            meta_table: meta.clone(),
+            schema_version: Arc::from(format!(
+                "SELECT value FROM {meta} WHERE key = 'schema_version'"
+            )),
             insert_run: Arc::from(format!(
                 "INSERT INTO {runs} (id, agent, conversation_id, parent_id, status, state, wake_at,
                                      sched_at, version, created_at, updated_at)
@@ -616,6 +623,22 @@ impl Store for PgStore {
             .execute(&mut *tx)
             .await
             .map_err(classify)?;
+        // Steady-state starts take no table lock (even a no-op `ALTER TABLE` or `CREATE INDEX IF
+        // NOT EXISTS` does), which is why a start cannot deadlock with live traffic.
+        let meta_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(&self.sql.meta_table)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(classify)?;
+        if meta_exists {
+            let stored: Option<String> = sqlx::query_scalar(safe(&self.sql.schema_version))
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(classify)?;
+            if stored.and_then(|v| v.parse::<i32>().ok()) >= Some(SCHEMA_VERSION) {
+                return tx.commit().await.map_err(classify);
+            }
+        }
         for stmt in &self.sql.migrate {
             tx.execute(safe(stmt)).await.map_err(classify)?;
         }

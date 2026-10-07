@@ -17,7 +17,8 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
   only `[a-z0-9_]`, at most 40 characters).
 * `PgStore::pool()`, `SCHEMA_VERSION` (3).
 * The `Store` implementation: call `migrate()` once at boot (idempotent, safe
-  from every replica).
+  from every replica). On a schema that is already current it runs no DDL and takes no table
+  lock, so a start cannot deadlock with live traffic (see "Schema version 3").
 
 ```rust
 use std::sync::Arc;
@@ -46,6 +47,15 @@ exclusively, so a migration takes its locks in the order a `push_put` does and t
 deadlock (found by the conformance suite, whose cases all migrate). Claiming push configs is
 `FOR UPDATE SKIP LOCKED` in one statement, progress is `UPDATE .. WHERE version = $expected`, and
 putting an id again is `INSERT .. ON CONFLICT DO UPDATE` that bumps the version.
+
+A start on a current schema runs **no DDL**. After the advisory lock `migrate()` checks that the
+meta table exists (`to_regclass`) and reads `schema_version`; at `SCHEMA_VERSION` or above (an
+older binary on a newer database counts) it commits and returns. This matters because even a
+no-op `ALTER TABLE .. ADD COLUMN IF NOT EXISTS` takes `AccessExclusiveLock` and `CREATE INDEX IF
+NOT EXISTS` takes `ShareLock`, and clients lock `push` and `runs` in both orders (`push_put`:
+push, then the run; a purge: runs, then the cascaded push rows), so a start beside live traffic
+deadlocked, and every restart took an exclusive lock on `runs`. Only an older or missing schema
+runs the statements.
 
 ## Schema version and the owner column
 
@@ -96,7 +106,9 @@ PostgreSQL manual's error-code appendix, recalled from memory, not re-checked.
 retryable (needs the server), and an unreachable server is `Transient` (offline).
 `tests/migrate.rs` builds a version 1 schema by hand with a legacy run, migrates it and checks the
 column, the version row, that the run survived and that pinning works on it; it also checks that an
-older release does not lower the version.
+older release does not lower the version. A version 2 schema migrates to 3 and gets the push
+table, and a start on a current schema finishes while another connection holds `ROW EXCLUSIVE`
+locks on `runs` and `push` (it runs no DDL).
 Unit tests in `src/lib.rs` cover the driver-error table, and one of them
 (`sqlstates_are_classified_against_a_real_server`) provokes real SQLSTATEs
 when the server variable is set.

@@ -199,3 +199,106 @@ async fn an_older_release_migrating_does_not_lower_the_version() {
     assert_eq!(version(&pool, &p).await, "9");
     drop_tables(&pool, &p).await;
 }
+
+/// Schema version 2: version 1 plus the `owner` column, still no `push` table.
+async fn create_v2_schema(pool: &PgPool, p: &str) {
+    create_v1_schema(pool, p).await;
+    for stmt in [
+        format!("ALTER TABLE {p}runs ADD COLUMN owner TEXT"),
+        format!("UPDATE {p}meta SET value = '2' WHERE key = 'schema_version'"),
+    ] {
+        sqlx::query(AssertSqlSafe(stmt))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+async fn has_table(pool: &PgPool, name: &str) -> bool {
+    sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_version_2_schema_migrates_to_3_and_gets_the_push_table() {
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let p = format!(
+        "adam_mig_{}_",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    create_v2_schema(&pool, &p).await;
+    assert!(!has_table(&pool, &format!("{p}push")).await);
+
+    let store = PgStore::from_pool(pool.clone())
+        .with_table_prefix(&p)
+        .unwrap();
+    store.migrate().await.unwrap();
+    assert_eq!(version(&pool, &p).await, "3");
+    assert!(has_table(&pool, &format!("{p}push")).await);
+
+    drop_tables(&pool, &p).await;
+}
+
+/// A start on a current schema runs no DDL, so it takes no table lock and cannot deadlock with a
+/// process that is working on the same tables (a `push_put` locks push then runs, a purge locks
+/// runs then push; the migration's `ALTER TABLE` took `AccessExclusiveLock` on runs even as a
+/// no-op).
+#[tokio::test]
+async fn a_start_on_a_current_schema_takes_no_table_lock() {
+    let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let p = format!(
+        "adam_mig_{}_",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    PgStore::from_pool(pool.clone())
+        .with_table_prefix(&p)
+        .unwrap()
+        .migrate()
+        .await
+        .unwrap();
+
+    // A process in the middle of its work: row locks on both tables, held open.
+    let mut holder = pool.begin().await.unwrap();
+    for table in ["runs", "push"] {
+        sqlx::query(AssertSqlSafe(format!(
+            "LOCK TABLE {p}{table} IN ROW EXCLUSIVE MODE"
+        )))
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    }
+
+    // Another process starts: its own pool, the same prefix.
+    let other = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    let store = PgStore::from_pool(other.clone())
+        .with_table_prefix(&p)
+        .unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(5), store.migrate()).await;
+
+    holder.rollback().await.unwrap();
+    drop_tables(&pool, &p).await;
+    started
+        .expect("a start on a current schema waited for a table lock")
+        .unwrap();
+}
