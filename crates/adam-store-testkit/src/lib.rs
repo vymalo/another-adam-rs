@@ -1831,7 +1831,7 @@ pub mod cases {
             })
             .cloned()
             .collect();
-        want.sort_by(|x, y| (y.updated_at, y.id).cmp(&(x.updated_at, x.id)));
+        want.sort_by_key(|x| std::cmp::Reverse((x.updated_at, x.id)));
         assert_eq!(
             all, want,
             "the owner's runs, newest update first, id breaking ties"

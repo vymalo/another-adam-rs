@@ -300,7 +300,7 @@ impl Store for MemoryStore {
             })
             .cloned()
             .collect();
-        found.sort_by(|a, b| (b.updated_at, b.id).cmp(&(a.updated_at, a.id)));
+        found.sort_by_key(|a| std::cmp::Reverse((a.updated_at, a.id)));
         found.truncate(query.limit);
         Ok(found)
     }
