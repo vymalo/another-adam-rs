@@ -345,11 +345,15 @@ async fn the_assemblys_card_is_the_card_a_control_plane_serves() {
     let assembled = adam_ui::with_card_extensions(
         agent
             .assembly()
-            .card(url.clone(), env!("CARGO_PKG_VERSION"))
+            .card(url.clone(), adam_coder::build_version())
             .unwrap(),
     )
     .with_extension(adam_a2a::ExtensionConfig::steps())
-    .with_extension(adam_a2a::ExtensionConfig::text_stream());
+    .with_extension(adam_a2a::ExtensionConfig::text_stream())
+    .with_extension(adam_a2a::ExtensionConfig::build(
+        adam_coder::BUILD_REVISION,
+        AgentFiles::Embedded.describe().digest,
+    ));
     assert_eq!(format!("{assembled:?}"), format!("{:?}", agent_card(&url)));
 }
 

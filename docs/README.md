@@ -63,6 +63,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0020](decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md) | reasoning streamed beside the answer and never stored |
 | [0021](decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md) | the coder is Adam, a general agent that can code |
 | [0027](decisions/0027-every-tool-has-a-title-for-its-step.md) | every tool has a title for its step |
+| [0028](decisions/0028-the-card-says-which-build-answers.md) | the card says which build and which agent files answer |
 
 ## Keeping these docs short and true
 

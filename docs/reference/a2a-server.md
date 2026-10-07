@@ -127,6 +127,22 @@ resubscribe within 30 s may repeat a step (a snapshot by id) or a text piece (it
 process with no event sink replays nothing and sees only the durable record
 ([ADR 0007](../decisions/0007-progress-as-steps-and-streamed-text.md), `crates/adam-runtime/src/events.rs`).
 
+## Which build answers
+
+The card says which build of the agent answers, so that a thread export can be tied to a commit and to the agent's files
+([ADR 0028](../decisions/0028-the-card-says-which-build-answers.md)):
+
+* `version` is `<crate version>+<first 7 characters of the commit>` (`0.1.0+6478fbc`, `0.1.0+unknown` for a build that was
+  given no revision): semver build metadata, which does not take part in precedence. The commit is the build argument
+  `ADAM_BUILD_REVISION` of `docker/coder/Dockerfile` (CI passes `github.sha`), read with `option_env!` by `adam-coder` and
+  `adam-agent`.
+* `capabilities.extensions` lists `https://agents.vymalo.com/a2a/extensions/build/v1` with `params`
+  `{"revision": <the commit, whole, or "unknown">, "folderDigest": "sha256:..."}`. The digest is
+  `adam-agent-fs`'s over the agent's files (the one the `agent files` line of the startup log shows), so a prompt mounted
+  over the embedded copy changes it. The extension is optional and informational: `required: false`, nothing to
+  activate, ignored by a client that does not know it. `adam_a2a::ExtensionConfig::build(revision, folder_digest)` declares it,
+  `adam_agent::card_of_folder` and `adam_coder::agent_card_from` add it.
+
 ## Streamed text
 
 A model turn streams by default (`LlmAgentBuilder::stream_text`): the journaled step `model:<turn>` calls

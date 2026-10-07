@@ -9,7 +9,7 @@
 
 use std::future::Future;
 
-use crate::agent::{WorkerParts, agents, card_of};
+use crate::agent::{WorkerParts, agents, card_of_folder};
 use crate::config::Config;
 use crate::error::AgentError;
 use crate::folder;
@@ -60,7 +60,7 @@ pub async fn serve(
         .service
         .public_url
         .as_ref()
-        .map(|url| card_of(&folder.def, url))
+        .map(|url| card_of_folder(&folder, url))
         .transpose()?;
 
     // Only a role that runs workers builds the model client and connects the MCP servers.

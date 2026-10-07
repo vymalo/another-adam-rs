@@ -13,6 +13,8 @@
 # port the shipped mcp.json names, move them). A second container of the same image is the GitHub MCP
 # server, the sidecar of the chart's pod: the coder's shipped agent files read it over http at
 # 127.0.0.1:8082, with no credential in the file and none in the server.
+# EXPECT_REVISION, when set, is the commit the image was built from (its build argument
+# ADAM_BUILD_REVISION): http-smoke.sh then checks the card says it.
 # Verified by CI only: the authoring environment has no docker daemon.
 set -eu
 
