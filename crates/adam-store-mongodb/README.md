@@ -25,7 +25,7 @@ accept the poll latency.
 * `MongoStore::new(database)`: reuse your application's `Database` handle.
 * `MongoStore::with_collection_prefix(prefix)`: collection-name prefix
   (default `adam_`; alphanumerics, `_` and `-`, at most 40 characters).
-* `MongoStore::database()`, `SCHEMA_VERSION` (2).
+* `MongoStore::database()`, `SCHEMA_VERSION` (3).
 * `codec::{json_to_bson, bson_to_json, encode_key, decode_key}`: the reversible key escaping
   (`$ref`, dotted, empty keys, NUL) applied to run state. Ordinary keys are
   stored verbatim, so `state.messages.0.role` is still a valid query path.
@@ -48,6 +48,16 @@ The guarantee table is in the [store adapters reference](../../docs/reference/st
 *Unverified:* the "MongoDB 5.0+" floor is the oldest server CI runs against
 (`conformance` job), not a documented driver guarantee. The `mongodb` driver
 requirement is `3.9` (verified 2026-09-29, `Cargo.toml`).
+
+## Schema version 3: the push collection
+
+`<prefix>push` holds the A2A push-notification configs: `_id` is `"<run id>:<config id>"`, with
+`run_id`, `agent`, `owner`, `config` (the webhook credentials as the client gave them) and
+`cursor` as BSON, the scheduling fields (`state`, `next_attempt_at`, `lease_until`) and `version`.
+Indexes: `(agent, state, next_attempt_at)` for claiming and `(run_id, id)` for listing. Claiming is
+a loop of `findOneAndUpdate` (each atomic on its document, so two workers never lease one config),
+progress is `findOneAndUpdate({_id, version: expected})`, and the purge deletes a purged run's
+configs after its journal. Still single-document writes only, so a standalone `mongod` is enough.
 
 ## Schema version and the owner field
 

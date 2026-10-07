@@ -30,8 +30,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use adam_core::{
-    ClaimScope, DynStore, JournalEntry, Lease, NewRun, RunId, RunRecord, RunUpdate, Store,
-    StoreError, StoreResult,
+    ClaimScope, DynStore, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord,
+    RunId, RunRecord, RunUpdate, Store, StoreError, StoreResult,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -64,6 +64,16 @@ pub enum Method {
     LeaseUntil,
     /// [`Store::purge_finished`].
     PurgeFinished,
+    /// [`Store::push_put`].
+    PushPut,
+    /// [`Store::push_list`].
+    PushList,
+    /// [`Store::push_delete`].
+    PushDelete,
+    /// [`Store::push_claim_due`].
+    PushClaimDue,
+    /// [`Store::push_commit`].
+    PushCommit,
 }
 
 /// When, relative to the real operation, a fault strikes.
@@ -384,6 +394,57 @@ impl Store for FaultyStore {
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>> {
         self.run(Method::LeaseUntil, Some(id), self.inner.lease_until(id))
             .await
+    }
+
+    async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {
+        let run = new.run;
+        self.run(Method::PushPut, Some(run), self.inner.push_put(new))
+            .await
+    }
+
+    async fn push_list(&self, run: RunId) -> StoreResult<Vec<PushRecord>> {
+        self.run(Method::PushList, Some(run), self.inner.push_list(run))
+            .await
+    }
+
+    async fn push_delete(&self, run: RunId, id: &str) -> StoreResult<bool> {
+        self.run(
+            Method::PushDelete,
+            Some(run),
+            self.inner.push_delete(run, id),
+        )
+        .await
+    }
+
+    async fn push_claim_due(
+        &self,
+        agents: &[String],
+        worker: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> StoreResult<Vec<PushRecord>> {
+        self.run(
+            Method::PushClaimDue,
+            None,
+            self.inner.push_claim_due(agents, worker, now, ttl, limit),
+        )
+        .await
+    }
+
+    async fn push_commit(
+        &self,
+        run: RunId,
+        id: &str,
+        expected_version: u64,
+        progress: PushProgress,
+    ) -> StoreResult<PushRecord> {
+        self.run(
+            Method::PushCommit,
+            Some(run),
+            self.inner.push_commit(run, id, expected_version, progress),
+        )
+        .await
     }
 
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {

@@ -29,7 +29,8 @@ use std::time::Duration;
 
 use adam_core::store::{now, truncate_ms};
 use adam_core::{
-    ClaimScope, DynStore, JournalEntry, NewRun, RunId, RunStatus, RunUpdate, StoreError,
+    ClaimScope, DynStore, JournalEntry, NewPushConfig, NewRun, PushProgress, PushState, RunId,
+    RunStatus, RunUpdate, StoreError,
 };
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
@@ -59,6 +60,12 @@ macro_rules! store_conformance {
             pinned_claims_are_exclusive_and_stable_under_concurrency,
             conversation_single_open_run,
             conversation_race_single_winner, purge_finished_runs,
+            push_put_creates_and_replaces, push_put_requires_the_run, push_list_is_per_run_and_ordered,
+            push_config_and_cursor_roundtrip, push_delete_is_idempotent,
+            push_claim_respects_due_rules, push_claim_filters_agents_and_limit,
+            push_claim_is_exclusive_under_concurrency, push_commit_advances_and_releases,
+            push_commit_detects_stale_versions_and_missing_configs,
+            push_configs_go_with_their_run,
         );
     };
     (@cases $make:path; $($case:ident),* $(,)?) => {
@@ -1224,6 +1231,539 @@ pub mod cases {
         assert!(store.load_run(open.id).await.unwrap().is_some());
         assert_eq!(store.journal_list(open.id).await.unwrap().len(), 1);
         assert!(store.load_run(other_agent.id).await.unwrap().is_some());
+    }
+
+    fn new_push(run: RunId, agent: &str, id: &str) -> NewPushConfig {
+        NewPushConfig {
+            run,
+            id: id.to_owned(),
+            agent: agent.to_owned(),
+            owner: "owner-1".to_owned(),
+            config: json!({"url": "https://hooks.example/a2a", "token": "t"}),
+            cursor: json!({"status": null}),
+        }
+    }
+
+    fn progress(state: PushState, at: DateTime<Utc>) -> PushProgress {
+        PushProgress {
+            state,
+            cursor: json!({"status": "working"}),
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: at,
+        }
+    }
+
+    pub async fn push_put_creates_and_replaces(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let before = now();
+        let created = store
+            .push_put(new_push(run.id, &agent, "c1"))
+            .await
+            .unwrap();
+        assert_eq!(created.run, run.id);
+        assert_eq!(created.id, "c1");
+        assert_eq!(created.agent, agent);
+        assert_eq!(created.owner, "owner-1");
+        assert_eq!(created.state, PushState::Active);
+        assert_eq!(created.attempts, 0);
+        assert_eq!(created.last_error, None);
+        assert_eq!(created.version, 1);
+        assert!(
+            created.next_attempt_at >= before - chrono::Duration::seconds(5),
+            "a new config is due at once"
+        );
+        assert_eq!(created.created_at, created.updated_at);
+
+        // Progress, then a replacement: the config starts over, the version still only grows.
+        let committed = store
+            .push_commit(
+                run.id,
+                "c1",
+                1,
+                PushProgress {
+                    attempts: 3,
+                    last_error: Some("status 500".into()),
+                    ..progress(PushState::GaveUp, now())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.version, 2);
+        let mut again = new_push(run.id, &agent, "c1");
+        again.config = json!({"url": "https://other.example/hook"});
+        again.cursor = json!({"status": "fresh"});
+        let replaced = store.push_put(again).await.unwrap();
+        assert_eq!(replaced.version, 3, "a replacement bumps the version");
+        assert_eq!(replaced.state, PushState::Active);
+        assert_eq!(replaced.attempts, 0);
+        assert_eq!(replaced.last_error, None);
+        assert_eq!(
+            replaced.config,
+            json!({"url": "https://other.example/hook"})
+        );
+        assert_eq!(replaced.cursor, json!({"status": "fresh"}));
+        assert_eq!(
+            replaced.created_at, created.created_at,
+            "created_at is kept"
+        );
+        let listed = store.push_list(run.id).await.unwrap();
+        assert_eq!(listed, vec![replaced]);
+    }
+
+    pub async fn push_put_requires_the_run(store: DynStore) {
+        let agent = agent();
+        let ghost = RunId::new();
+        let err = store
+            .push_put(new_push(ghost, &agent, "c1"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotFound(id) if id == ghost),
+            "{err:?}"
+        );
+        assert!(store.push_list(ghost).await.unwrap().is_empty());
+    }
+
+    pub async fn push_list_is_per_run_and_ordered(store: DynStore) {
+        let agent = agent();
+        let a = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let b = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        for id in ["c", "a", "b"] {
+            store.push_put(new_push(a.id, &agent, id)).await.unwrap();
+        }
+        store.push_put(new_push(b.id, &agent, "z")).await.unwrap();
+        let ids = |records: Vec<adam_core::PushRecord>| -> Vec<String> {
+            records.into_iter().map(|r| r.id).collect()
+        };
+        assert_eq!(ids(store.push_list(a.id).await.unwrap()), ["a", "b", "c"]);
+        assert_eq!(ids(store.push_list(b.id).await.unwrap()), ["z"]);
+        assert!(store.push_list(RunId::new()).await.unwrap().is_empty());
+    }
+
+    pub async fn push_config_and_cursor_roundtrip(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let config = json!({
+            "url": "https://hooks.example/ü/你好?x=1&y=2",
+            "token": "tok-€",
+            "authentication": {"scheme": "Bearer", "credentials": "s3cr3t"},
+            "$ref": 1, "dotted.key": {"a.b": [1, 2, 3]},
+        });
+        let cursor = json!({"status": "TASK_STATE_WORKING|m1", "artifacts": ["x", "y"], "pending": null,
+                            "nested": {"$schema": "z"}});
+        let mut new = new_push(run.id, &agent, "c1");
+        new.config = config.clone();
+        new.cursor = cursor.clone();
+        let created = store.push_put(new).await.unwrap();
+        assert_eq!(created.config, config);
+        assert_eq!(created.cursor, cursor);
+        let listed = store.push_list(run.id).await.unwrap();
+        assert_eq!(listed[0].config, config);
+        assert_eq!(listed[0].cursor, cursor);
+    }
+
+    pub async fn push_delete_is_idempotent(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        store
+            .push_put(new_push(run.id, &agent, "c1"))
+            .await
+            .unwrap();
+        store
+            .push_put(new_push(run.id, &agent, "c2"))
+            .await
+            .unwrap();
+        assert!(store.push_delete(run.id, "c1").await.unwrap());
+        assert!(
+            !store.push_delete(run.id, "c1").await.unwrap(),
+            "second time"
+        );
+        assert!(!store.push_delete(run.id, "nope").await.unwrap());
+        assert!(!store.push_delete(RunId::new(), "c2").await.unwrap());
+        let left: Vec<_> = store
+            .push_list(run.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(left, ["c2"]);
+    }
+
+    pub async fn push_claim_respects_due_rules(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        for id in ["due", "later", "done", "gave-up"] {
+            store.push_put(new_push(run.id, &agent, id)).await.unwrap();
+        }
+        let t = now();
+        let soon = t + chrono::Duration::seconds(30);
+        let version_of = |id: &str| {
+            let store = store.clone();
+            let id = id.to_owned();
+            async move {
+                store
+                    .push_list(run.id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.id == id)
+                    .unwrap()
+                    .version
+            }
+        };
+        store
+            .push_commit(
+                run.id,
+                "later",
+                version_of("later").await,
+                progress(PushState::Active, soon),
+            )
+            .await
+            .unwrap();
+        store
+            .push_commit(
+                run.id,
+                "done",
+                version_of("done").await,
+                progress(PushState::Done, t),
+            )
+            .await
+            .unwrap();
+        store
+            .push_commit(
+                run.id,
+                "gave-up",
+                version_of("gave-up").await,
+                progress(PushState::GaveUp, t),
+            )
+            .await
+            .unwrap();
+
+        let ttl = Duration::from_secs(60);
+        let at = t + chrono::Duration::seconds(1);
+        let agents = [agent.clone()];
+        let first = store
+            .push_claim_due(&agents, "w1", at, ttl, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["due"],
+            "only an active, due config"
+        );
+        // The lease holds it.
+        assert!(
+            store
+                .push_claim_due(&agents, "w2", at, ttl, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Once the lease has run out it is claimable again; a later config becomes due in time.
+        let after = at + chrono::Duration::seconds(61);
+        let again = store
+            .push_claim_due(&agents, "w2", after, ttl, 10)
+            .await
+            .unwrap();
+        let mut ids: Vec<_> = again.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["due", "later"]);
+    }
+
+    pub async fn push_claim_filters_agents_and_limit(store: DynStore) {
+        let agent = agent();
+        let other = super::agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let foreign = store
+            .create_run(NewRun::new(&other, json!({})))
+            .await
+            .unwrap();
+        for id in ["a", "b", "c"] {
+            store.push_put(new_push(run.id, &agent, id)).await.unwrap();
+        }
+        store
+            .push_put(new_push(foreign.id, &other, "x"))
+            .await
+            .unwrap();
+        let at = now() + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(60);
+        assert!(
+            store
+                .push_claim_due(&[], "w", at, ttl, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .push_claim_due(&[agent.clone()], "w", at, ttl, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let two = store
+            .push_claim_due(&[agent.clone()], "w", at, ttl, 2)
+            .await
+            .unwrap();
+        assert_eq!(two.len(), 2);
+        assert!(two.iter().all(|r| r.agent == agent));
+        let rest = store
+            .push_claim_due(&[agent.clone()], "w", at, ttl, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            rest.len(),
+            1,
+            "the third; the foreign agent's is never taken"
+        );
+        let theirs = store
+            .push_claim_due(&[other.clone()], "w", at, ttl, 10)
+            .await
+            .unwrap();
+        assert_eq!(theirs.len(), 1);
+        assert_eq!(theirs[0].id, "x");
+    }
+
+    pub async fn push_claim_is_exclusive_under_concurrency(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        let total = 40;
+        for i in 0..total {
+            store
+                .push_put(new_push(run.id, &agent, &format!("c{i:03}")))
+                .await
+                .unwrap();
+        }
+        let at = now() + chrono::Duration::seconds(1);
+        let workers = (0..8).map(|w| {
+            let store = store.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                let mut mine = Vec::new();
+                loop {
+                    let got = store
+                        .push_claim_due(
+                            std::slice::from_ref(&agent),
+                            &format!("w{w}"),
+                            at,
+                            Duration::from_secs(60),
+                            3,
+                        )
+                        .await
+                        .unwrap();
+                    if got.is_empty() {
+                        return mine;
+                    }
+                    mine.extend(got.into_iter().map(|r| r.id));
+                }
+            })
+        });
+        let all: Vec<String> = join_all(workers)
+            .await
+            .into_iter()
+            .flat_map(|r| r.unwrap())
+            .collect();
+        let unique: HashSet<_> = all.iter().cloned().collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "a config was leased to two workers at once"
+        );
+        assert_eq!(
+            unique.len(),
+            total,
+            "every due config is claimed exactly once"
+        );
+    }
+
+    pub async fn push_commit_advances_and_releases(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        store
+            .push_put(new_push(run.id, &agent, "c1"))
+            .await
+            .unwrap();
+        let t = now();
+        let at = t + chrono::Duration::seconds(1);
+        let ttl = Duration::from_secs(60);
+        let agents = [agent.clone()];
+        let claimed = store
+            .push_claim_due(&agents, "w", at, ttl, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(claimed.version, 1);
+        let next = t + chrono::Duration::seconds(10);
+        let committed = store
+            .push_commit(
+                run.id,
+                "c1",
+                claimed.version,
+                PushProgress {
+                    state: PushState::Active,
+                    cursor: json!({"status": "working", "artifacts": ["a"]}),
+                    attempts: 2,
+                    last_error: Some("status 503".into()),
+                    next_attempt_at: next,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed.version, 2);
+        assert_eq!(committed.attempts, 2);
+        assert_eq!(committed.last_error.as_deref(), Some("status 503"));
+        assert_eq!(committed.next_attempt_at, truncate_ms(next));
+        assert_eq!(
+            committed.cursor,
+            json!({"status": "working", "artifacts": ["a"]})
+        );
+        assert!(committed.updated_at >= committed.created_at);
+        // The commit released the lease: due again from `next`, not before.
+        assert!(
+            store
+                .push_claim_due(&agents, "w", at, ttl, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let later = next + chrono::Duration::seconds(1);
+        let again = store
+            .push_claim_due(&agents, "w2", later, ttl, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.len(),
+            1,
+            "released by the commit, due at next_attempt_at"
+        );
+        assert_eq!(again[0].version, 2);
+        assert_eq!(again[0].cursor, committed.cursor);
+    }
+
+    pub async fn push_commit_detects_stale_versions_and_missing_configs(store: DynStore) {
+        let agent = agent();
+        let run = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        store
+            .push_put(new_push(run.id, &agent, "c1"))
+            .await
+            .unwrap();
+        let t = now();
+        // A stale version conflicts and changes nothing.
+        let err = store
+            .push_commit(run.id, "c1", 7, progress(PushState::Done, t))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict { run: r, expected: 7, actual: 1 } if r == run.id),
+            "{err:?}"
+        );
+        assert_eq!(
+            store.push_list(run.id).await.unwrap()[0].state,
+            PushState::Active
+        );
+        // A replacement beats a deliverer still holding the old version.
+        store
+            .push_put(new_push(run.id, &agent, "c1"))
+            .await
+            .unwrap();
+        let err = store
+            .push_commit(run.id, "c1", 1, progress(PushState::Done, t))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Conflict {
+                    expected: 1,
+                    actual: 2,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // A deleted config, and one that never existed, are not found.
+        store.push_delete(run.id, "c1").await.unwrap();
+        let err = store
+            .push_commit(run.id, "c1", 2, progress(PushState::Done, t))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotFound(id) if id == run.id),
+            "{err:?}"
+        );
+        let err = store
+            .push_commit(RunId::new(), "zz", 1, progress(PushState::Done, t))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+    }
+
+    pub async fn push_configs_go_with_their_run(store: DynStore) {
+        let agent = agent();
+        let finished = store
+            .create_run(NewRun::new(&agent, json!({})).status(RunStatus::Done))
+            .await
+            .unwrap();
+        let open = store
+            .create_run(NewRun::new(&agent, json!({})))
+            .await
+            .unwrap();
+        store
+            .push_put(new_push(finished.id, &agent, "c1"))
+            .await
+            .unwrap();
+        store
+            .push_put(new_push(open.id, &agent, "c1"))
+            .await
+            .unwrap();
+        let cutoff = now() + chrono::Duration::seconds(1);
+        assert_eq!(store.purge_finished(&agent, cutoff).await.unwrap(), 1);
+        assert!(
+            store.push_list(finished.id).await.unwrap().is_empty(),
+            "push configs go with the run"
+        );
+        assert_eq!(store.push_list(open.id).await.unwrap().len(), 1);
+        // Nothing of the purged run is claimable either.
+        let at = now() + chrono::Duration::seconds(1);
+        let claimed = store
+            .push_claim_due(&[agent.clone()], "w", at, Duration::from_secs(60), 10)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].run, open.id);
     }
 
     async fn claim_ids(

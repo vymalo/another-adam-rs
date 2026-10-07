@@ -15,7 +15,7 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::from_pool(pool)`: reuse your application's `PgPool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION` (2).
+* `PgStore::pool()`, `SCHEMA_VERSION` (3).
 * The `Store` implementation: call `migrate()` once at boot (idempotent, safe
   from every replica).
 
@@ -29,12 +29,23 @@ let store: DynStore = Arc::new(store);
 ```
 
 Tables are `<prefix>runs` (state as `JSONB`), `<prefix>journal` (primary key
-`(run_id, seq)`, `ON DELETE CASCADE`) and `<prefix>meta`. Claiming is
+`(run_id, seq)`, `ON DELETE CASCADE`), `<prefix>push` (the A2A push-notification configs, primary
+key `(run_id, id)`, `ON DELETE CASCADE`, schema version 3; a partial index on
+`(agent, next_attempt_at)` for active configs is the claim scan; `config` holds the webhook
+credentials as the client gave them) and `<prefix>meta`. Claiming is
 `FOR UPDATE SKIP LOCKED`, and it leaves out the runs the caller says it is stepping (`AND id <> ALL($busy)`,
 see [`adam-core`](../adam-core/README.md#runs-the-caller-is-stepping)); one open run per conversation is a partial unique
 index. No transaction is held open while agent code runs. `JSONB` cannot hold
 `\u0000`: such state is rejected with `StoreError::InvalidInput`. The guarantee
 table is in the [store adapters reference](../../docs/reference/store-adapters.md#how-each-adapter-keeps-the-contract).
+
+## Schema version 3: the push table
+
+`migrate()` creates `<prefix>push` and its index **before** the statements that lock `runs`
+exclusively, so a migration takes its locks in the order a `push_put` does and the two cannot
+deadlock (found by the conformance suite, whose cases all migrate). Claiming push configs is
+`FOR UPDATE SKIP LOCKED` in one statement, progress is `UPDATE .. WHERE version = $expected`, and
+putting an id again is `INSERT .. ON CONFLICT DO UPDATE` that bumps the version.
 
 ## Schema version and the owner column
 

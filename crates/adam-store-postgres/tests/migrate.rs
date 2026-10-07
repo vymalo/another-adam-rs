@@ -1,4 +1,4 @@
-//! Migrating a schema version 1 database (no `owner` column) to version 2. Gated on
+//! Migrating a schema version 1 database (no `owner` column, no `push` table) to the current one. Gated on
 //! `ADAM_TEST_POSTGRES_URL` like the conformance suite.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
@@ -51,7 +51,7 @@ async fn create_v1_schema(pool: &PgPool, p: &str) {
 }
 
 async fn drop_tables(pool: &PgPool, p: &str) {
-    for table in ["journal", "runs", "meta"] {
+    for table in ["push", "journal", "runs", "meta"] {
         let _ = sqlx::query(AssertSqlSafe(format!(
             "DROP TABLE IF EXISTS {p}{table} CASCADE"
         )))
@@ -81,7 +81,7 @@ async fn has_owner_column(pool: &PgPool, p: &str) -> bool {
 }
 
 #[tokio::test]
-async fn a_version_1_schema_migrates_to_2_and_keeps_its_runs() {
+async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
         return;
     };
@@ -117,11 +117,19 @@ async fn a_version_1_schema_migrates_to_2_and_keeps_its_runs() {
     store.migrate().await.unwrap();
     assert!(has_owner_column(&pool, &p).await, "the column was added");
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
-    assert_eq!(SCHEMA_VERSION, 2);
+    assert_eq!(SCHEMA_VERSION, 3);
+    // The push table exists now (a missing table would be a backend error).
+    assert!(
+        store
+            .push_list(adam_core::RunId(id))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // Nothing was lost, and migrating again changes nothing.
     store.migrate().await.unwrap();
-    assert_eq!(version(&pool, &p).await, "2");
+    assert_eq!(version(&pool, &p).await, "3");
     let run = store
         .load_run(adam_core::RunId(id))
         .await

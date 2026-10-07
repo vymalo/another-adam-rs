@@ -2,7 +2,7 @@
 //!
 //! # Schema
 //!
-//! Two tables (names prefixed, `adam_` by default):
+//! Three tables (names prefixed, `adam_` by default):
 //!
 //! * `adam_runs`: one row per run. `state` is `JSONB`, so runs are queryable
 //!   from SQL for dashboards and debugging. `sched_at` is the precomputed "due
@@ -11,6 +11,10 @@
 //!   never cleared, and `NULL` for a run no pinned claim has taken.
 //! * `adam_journal`: one row per recorded step, primary key `(run_id, seq)`,
 //!   deleted with its run through `ON DELETE CASCADE`.
+//! * `adam_push` (schema version 3): one row per A2A push-notification configuration, primary
+//!   key `(run_id, id)`, deleted with its run through `ON DELETE CASCADE`. `config` holds the
+//!   webhook **with its credentials, as the client gave them**; `cursor` is how far delivery
+//!   got. A partial index over `(agent, next_attempt_at)` for active configs is the claim scan.
 //!
 //! # Concurrency
 //!
@@ -22,6 +26,9 @@
 //!   even across processes.
 //! * Journal writes are `INSERT .. ON CONFLICT DO NOTHING`, then a read of the
 //!   winner.
+//! * Push configurations are claimed like runs (`FOR UPDATE SKIP LOCKED`, one statement) and
+//!   written with `UPDATE .. WHERE version = $expected`; putting an id again is one
+//!   `INSERT .. ON CONFLICT DO UPDATE` that bumps the version.
 //!
 //! Everything is single-statement; no multi-statement transactions are held
 //! open while agent code runs.
@@ -31,8 +38,8 @@ use std::time::Duration;
 
 use adam_core::store::{add_ttl, now, sched_at, truncate_ms};
 use adam_core::{
-    ClaimScope, JournalEntry, Lease, NewRun, RunId, RunRecord, RunStatus, RunUpdate, Store,
-    StoreError, StoreResult,
+    ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord, PushState,
+    RunId, RunRecord, RunStatus, RunUpdate, Store, StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -47,10 +54,13 @@ use uuid::Uuid;
 ///
 /// * 1: the first schema.
 /// * 2: `runs.owner`, the worker a pinned claim ties a run to (see [`ClaimScope`]).
-pub const SCHEMA_VERSION: i32 = 2;
+/// * 3: the `push` table (A2A push-notification configurations and their delivery progress).
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Purge deletes in batches of this many runs (plus their journals).
 const PURGE_BATCH: i64 = 500;
+
+const PUSH_COLUMNS: &str = "run_id, id, agent, owner, config, cursor, state, attempts, last_error, next_attempt_at, version, created_at, updated_at";
 
 const RUN_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, state, wake_at, version, created_at, updated_at";
 
@@ -200,6 +210,12 @@ struct Sql {
     release_lease: Arc<str>,
     lease_until: Arc<str>,
     purge: Arc<str>,
+    push_put: Arc<str>,
+    push_list: Arc<str>,
+    push_delete: Arc<str>,
+    push_claim: Arc<str>,
+    push_commit: Arc<str>,
+    push_version: Arc<str>,
 }
 
 impl Sql {
@@ -207,6 +223,7 @@ impl Sql {
         let runs = format!("{p}runs");
         let journal = format!("{p}journal");
         let meta = format!("{p}meta");
+        let push = format!("{p}push");
         let runs_pkey = format!("{p}runs_pkey");
         let open_conversation_index = format!("{p}runs_open_conversation");
         let statuses = "'runnable', 'parked', 'done', 'failed'";
@@ -235,6 +252,35 @@ impl Sql {
                     updated_at      TIMESTAMPTZ NOT NULL,
                     CONSTRAINT {runs_pkey} PRIMARY KEY (id)
                 )"
+            ),
+            // Schema version 2 -> 3: A2A push-notification configurations. Created before the
+            // statements below that lock `runs` exclusively, so a migration takes its locks in the
+            // order a `push_put` does (the push table, then the run it references) and the two
+            // cannot deadlock.
+            format!(
+                "CREATE TABLE IF NOT EXISTS {push} (
+                    run_id          UUID        NOT NULL REFERENCES {runs} (id) ON DELETE CASCADE,
+                    id              TEXT        NOT NULL,
+                    agent           TEXT        NOT NULL,
+                    owner           TEXT        NOT NULL,
+                    config          JSONB       NOT NULL,
+                    cursor          JSONB       NOT NULL,
+                    state           TEXT        NOT NULL CHECK (state IN ('active', 'done', 'gave_up')),
+                    attempts        INTEGER     NOT NULL CHECK (attempts >= 0),
+                    last_error      TEXT,
+                    next_attempt_at TIMESTAMPTZ NOT NULL,
+                    version         BIGINT      NOT NULL CHECK (version > 0),
+                    lease_owner     TEXT,
+                    lease_until     TIMESTAMPTZ,
+                    created_at      TIMESTAMPTZ NOT NULL,
+                    updated_at      TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (run_id, id)
+                )"
+            ),
+            // Claiming: due active configs per agent, earliest first.
+            format!(
+                "CREATE INDEX IF NOT EXISTS {p}push_due ON {push} (agent, next_attempt_at, run_id, id)
+                 WHERE state = 'active'"
             ),
             // Schema version 1 -> 2: tables made by version 1 have no owner column.
             format!("ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS owner TEXT"),
@@ -332,6 +378,49 @@ impl Sql {
                      FOR UPDATE SKIP LOCKED
                   )"
             )),
+            push_put: Arc::from(format!(
+                "INSERT INTO {push} (run_id, id, agent, owner, config, cursor, state, attempts,
+                                    last_error, next_attempt_at, version, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'active', 0, NULL, $7, 1, $7, $7)
+                 ON CONFLICT (run_id, id) DO UPDATE
+                    SET agent = EXCLUDED.agent, owner = EXCLUDED.owner, config = EXCLUDED.config,
+                        cursor = EXCLUDED.cursor, state = 'active', attempts = 0, last_error = NULL,
+                        next_attempt_at = EXCLUDED.next_attempt_at, lease_owner = NULL,
+                        lease_until = NULL, version = {push}.version + 1,
+                        updated_at = EXCLUDED.updated_at
+                 RETURNING {PUSH_COLUMNS}"
+            )),
+            push_list: Arc::from(format!(
+                "SELECT {PUSH_COLUMNS} FROM {push} WHERE run_id = $1 ORDER BY id"
+            )),
+            push_delete: Arc::from(format!("DELETE FROM {push} WHERE run_id = $1 AND id = $2")),
+            push_claim: Arc::from(format!(
+                "WITH due AS (
+                    SELECT run_id, id FROM {push}
+                     WHERE agent = ANY($1) AND state = 'active' AND next_attempt_at <= $2
+                       AND (lease_until IS NULL OR lease_until <= $2)
+                     ORDER BY next_attempt_at, run_id, id
+                     LIMIT $3
+                     FOR UPDATE SKIP LOCKED
+                 )
+                 UPDATE {push} p SET lease_owner = $4, lease_until = $5
+                   FROM due
+                  WHERE p.run_id = due.run_id AND p.id = due.id
+                 RETURNING p.run_id, p.id, p.agent, p.owner, p.config, p.cursor, p.state,
+                           p.attempts, p.last_error, p.next_attempt_at, p.version, p.created_at,
+                           p.updated_at"
+            )),
+            push_commit: Arc::from(format!(
+                "UPDATE {push}
+                    SET state = $4, cursor = $5, attempts = $6, last_error = $7,
+                        next_attempt_at = $8, version = version + 1, updated_at = $9,
+                        lease_owner = NULL, lease_until = NULL
+                  WHERE run_id = $1 AND id = $2 AND version = $3
+                 RETURNING {PUSH_COLUMNS}"
+            )),
+            push_version: Arc::from(format!(
+                "SELECT version FROM {push} WHERE run_id = $1 AND id = $2"
+            )),
             runs_pkey,
             open_conversation_index,
         }
@@ -397,6 +486,32 @@ fn run_from_row(row: &PgRow) -> StoreResult<RunRecord> {
             .ok_or_else(|| StoreError::Corrupt(format!("unknown run status {status:?}")))?,
         state,
         wake_at: row.try_get("wake_at").map_err(classify)?,
+        version: u64::try_from(version)
+            .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
+        created_at: row.try_get("created_at").map_err(classify)?,
+        updated_at: row.try_get("updated_at").map_err(classify)?,
+    })
+}
+
+fn push_from_row(row: &PgRow) -> StoreResult<PushRecord> {
+    let state: String = row.try_get("state").map_err(classify)?;
+    let version: i64 = row.try_get("version").map_err(classify)?;
+    let attempts: i32 = row.try_get("attempts").map_err(classify)?;
+    let Json(config): Json<Value> = row.try_get("config").map_err(classify)?;
+    let Json(cursor): Json<Value> = row.try_get("cursor").map_err(classify)?;
+    Ok(PushRecord {
+        run: RunId(row.try_get::<Uuid, _>("run_id").map_err(classify)?),
+        id: row.try_get("id").map_err(classify)?,
+        agent: row.try_get("agent").map_err(classify)?,
+        owner: row.try_get("owner").map_err(classify)?,
+        config,
+        cursor,
+        state: PushState::parse(&state)
+            .ok_or_else(|| StoreError::Corrupt(format!("unknown push state {state:?}")))?,
+        attempts: u32::try_from(attempts)
+            .map_err(|_| StoreError::Corrupt(format!("negative attempts {attempts}")))?,
+        last_error: row.try_get("last_error").map_err(classify)?,
+        next_attempt_at: row.try_get("next_attempt_at").map_err(classify)?,
         version: u64::try_from(version)
             .map_err(|_| StoreError::Corrupt(format!("negative version {version}")))?,
         created_at: row.try_get("created_at").map_err(classify)?,
@@ -671,6 +786,114 @@ impl Store for PgStore {
             .transpose()
             .map_err(classify)?;
         Ok(until.flatten())
+    }
+
+    async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {
+        let row = sqlx::query(safe(&self.sql.push_put))
+            .bind(new.run.0)
+            .bind(&new.id)
+            .bind(&new.agent)
+            .bind(&new.owner)
+            .bind(Json(&new.config))
+            .bind(Json(&new.cursor))
+            .bind(now())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| self.map_write_err(e, new.run, &new.agent, None))?;
+        push_from_row(&row)
+    }
+
+    async fn push_list(&self, run: RunId) -> StoreResult<Vec<PushRecord>> {
+        let rows = sqlx::query(safe(&self.sql.push_list))
+            .bind(run.0)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(classify)?;
+        rows.iter().map(push_from_row).collect()
+    }
+
+    async fn push_delete(&self, run: RunId, id: &str) -> StoreResult<bool> {
+        let done = sqlx::query(safe(&self.sql.push_delete))
+            .bind(run.0)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(classify)?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn push_claim_due(
+        &self,
+        agents: &[String],
+        worker: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> StoreResult<Vec<PushRecord>> {
+        if agents.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = truncate_ms(now);
+        let rows = sqlx::query(safe(&self.sql.push_claim))
+            .bind(agents)
+            .bind(now)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(worker)
+            .bind(add_ttl(now, ttl))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(classify)?;
+        // RETURNING order is unspecified; restore the claim order.
+        let mut claimed = rows
+            .iter()
+            .map(push_from_row)
+            .collect::<StoreResult<Vec<_>>>()?;
+        claimed.sort_by(|a, b| {
+            (a.next_attempt_at, a.run, &a.id).cmp(&(b.next_attempt_at, b.run, &b.id))
+        });
+        Ok(claimed)
+    }
+
+    async fn push_commit(
+        &self,
+        run: RunId,
+        id: &str,
+        expected: u64,
+        progress: PushProgress,
+    ) -> StoreResult<PushRecord> {
+        let attempts = i32::try_from(progress.attempts).map_err(|_| {
+            StoreError::InvalidInput(format!("attempts {} exceeds i32::MAX", progress.attempts))
+        })?;
+        let row = sqlx::query(safe(&self.sql.push_commit))
+            .bind(run.0)
+            .bind(id)
+            .bind(to_i64(expected, "version")?)
+            .bind(progress.state.as_str())
+            .bind(Json(&progress.cursor))
+            .bind(attempts)
+            .bind(&progress.last_error)
+            .bind(truncate_ms(progress.next_attempt_at))
+            .bind(now())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| self.map_write_err(e, run, "", None))?;
+        if let Some(row) = row {
+            return push_from_row(&row);
+        }
+        let actual: Option<i64> = sqlx::query_scalar(safe(&self.sql.push_version))
+            .bind(run.0)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(classify)?;
+        match actual {
+            None => Err(StoreError::NotFound(run)),
+            Some(actual) => Err(StoreError::Conflict {
+                run,
+                expected,
+                actual: actual as u64,
+            }),
+        }
     }
 
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
