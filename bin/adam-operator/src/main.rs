@@ -69,7 +69,11 @@ fn crdgen(out: &mut impl Write) -> Result<()> {
     out.write_all(HEADER.as_bytes())?;
     for crd in adam_operator_api::crds() {
         out.write_all(b"---\n")?;
-        let yaml = serde_yaml::to_string(&crd).context("serialising a CRD to YAML")?;
+        // Through a key-sorted value: the schema's maps keep their order only with serde_json's
+        // `preserve_order`, which another crate of a workspace build turns on.
+        let value = serde_json::to_value(&crd).context("serialising a CRD")?;
+        let yaml = serde_yaml::to_string(&adam_operator_domain::sorted(&value))
+            .context("serialising a CRD to YAML")?;
         out.write_all(yaml.as_bytes())?;
     }
     out.flush()?;

@@ -212,7 +212,8 @@ impl<'a> Cx<'a> {
             None
         } else {
             let set = format!("{}-mcp", self.name);
-            let mut text = serde_json::to_string_pretty(&self.mcp_json()).unwrap_or_default();
+            let mut text = serde_json::to_string_pretty(&crate::digest::sorted(&self.mcp_json()))
+                .unwrap_or_default();
             text.push('\n');
             file_sets.push(FileSet {
                 name: set.clone(),
@@ -539,7 +540,7 @@ impl<'a> Cx<'a> {
             {
                 e.push(lit(
                     env::MODEL_EXTRA_BODY,
-                    serde_json::Value::Object(body.clone()).to_string(),
+                    crate::digest::canonical_json(&serde_json::Value::Object(body.clone())),
                 ));
             }
             if let Some(echo) = spec.model.echo_reasoning {

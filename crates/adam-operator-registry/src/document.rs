@@ -179,9 +179,9 @@ pub fn build(entries: &[DirectoryEntry], anchor: Option<&str>) -> Result<Built, 
     if !items.is_empty() {
         context["item"] = Value::Array(items);
     }
-    // `serde_json` writes object members in key order and without spaces: the same entries give the
-    // same bytes, which is what an `ETag` over the body needs.
-    let body = serde_json::to_vec(&json!({"linkset": [context]})).unwrap_or_default();
+    // Members in key order (whatever serde_json's `preserve_order` is in this build) and no spaces:
+    // the same entries give the same bytes, which is what an `ETag` over the body needs.
+    let body = serde_json::to_vec(&sorted(&json!({"linkset": [context]}))).unwrap_or_default();
     if body.len() > MAX_BODY_BYTES {
         return Err(Overflow {
             items: listed.len(),
@@ -219,5 +219,21 @@ impl std::fmt::Display for Overflow {
                 self.items
             ),
         }
+    }
+}
+
+/// The value with every object's members in key order, in any build.
+fn sorted(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let keys: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
+            Value::Object(
+                keys.into_iter()
+                    .map(|(k, v)| (k.clone(), sorted(v)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
     }
 }

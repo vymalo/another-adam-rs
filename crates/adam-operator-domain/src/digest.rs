@@ -49,6 +49,24 @@ fn write(value: &Value, out: &mut String) {
     }
 }
 
+/// The same value with every object's members in key order, whether or not another crate of the
+/// build turned on `serde_json`'s `preserve_order`: what the operator writes out (a file, an
+/// environment variable) is then the same bytes in every build.
+pub fn sorted(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let keys: BTreeMap<&String, &Value> = map.iter().collect();
+            Value::Object(
+                keys.into_iter()
+                    .map(|(k, v)| (k.clone(), sorted(v)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
+    }
+}
+
 /// `sha256:<hex>` of a JSON value, canonically serialised.
 pub fn digest_json(value: &Value) -> String {
     format!(

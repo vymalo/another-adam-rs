@@ -16,6 +16,6 @@ mod resolve;
 mod syntax;
 mod validate;
 
-pub use digest::{canonical_json, digest_json, spec_digest};
+pub use digest::{canonical_json, digest_json, sorted, spec_digest};
 pub use resolve::{ResolvedAgent, resolve};
 pub use validate::{ConfigIssue, validate, validate_config};

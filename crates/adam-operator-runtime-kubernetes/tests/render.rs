@@ -29,7 +29,9 @@ fn golden_path(name: &str) -> PathBuf {
 fn yaml(r: &Rendered) -> String {
     r.documents()
         .iter()
-        .map(|d| serde_yaml::to_string(d).unwrap())
+        // Key-sorted, so the golden is the same whether or not a workspace build turned on serde_json's
+        // `preserve_order` (the API server does not care about member order).
+        .map(|d| serde_yaml::to_string(&adam_operator_domain::sorted(d)).unwrap())
         .collect::<Vec<_>>()
         .join("---\n")
 }
