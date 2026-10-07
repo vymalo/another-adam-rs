@@ -7,6 +7,7 @@ use a2a::error_code::{INVALID_REQUEST, PARSE_ERROR};
 use a2a_server::StaticAgentCard;
 use a2a_server::agent_card::agent_card_router;
 use a2a_server::jsonrpc::{MAX_REQUEST_BODY_BYTES, jsonrpc_router};
+use a2a_server::rest::rest_router;
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -24,6 +25,7 @@ use crate::backend::DynTaskBackend;
 use crate::card::{AgentCardConfig, Flags, build_card, build_extended_card};
 use crate::handler::BackendHandler;
 use crate::push::PushSupport;
+use crate::rest;
 use crate::signing::CardSigner;
 
 /// The SSE comment frame (ignored by clients) used as a keepalive.
@@ -86,6 +88,7 @@ impl ServerOptions {
 /// | `GET /healthz` | public |
 /// | `GET /.well-known/jwks.json` (only when the card is signed) | public |
 /// | `POST /` JSON-RPC: `SendMessage`, `SendStreamingMessage` (SSE), `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask` (SSE), the four push-notification methods (when push is on), `GetExtendedAgentCard` (when configured) | required |
+/// | HTTP+JSON, the same methods: `POST /message:send`, `POST /message:stream` (SSE), `GET /tasks/{id}`, `GET /tasks`, `POST /tasks/{id}:cancel`, `POST /tasks/{id}:subscribe` (SSE), `/tasks/{id}/pushNotificationConfigs[/{configId}]`, `GET /extendedAgentCard`, and the SDK's aliases of earlier drafts | required |
 ///
 /// Any other route is also behind authentication (fail closed). Mount the
 /// router at the root of a listener, or `nest` it and set
@@ -98,7 +101,8 @@ impl A2aServer {
     /// (`SendMessage`, `SendStreamingMessage` (SSE), `GetTask`, `CancelTask`,
     /// `SubscribeToTask` (SSE); the A2A 1.0 names for the issue's
     /// `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`,
-    /// `tasks/resubscribe`), and `GET /healthz`.
+    /// `tasks/resubscribe`), the same methods over HTTP+JSON, and
+    /// `GET /healthz` (see [`A2aServer`]).
     pub fn router(card: AgentCardConfig, backend: DynTaskBackend, auth: AuthConfig) -> Router {
         Self::router_with_options(card, backend, auth, ServerOptions::default())
     }
@@ -151,15 +155,28 @@ impl A2aServer {
             push,
             extended_card.map(Arc::new),
         );
-        let mut rpc = jsonrpc_router(handler)
-            .layer(middleware::from_fn_with_state(declared, echo_extensions))
+        // Both bindings over the same handler, each with the same layers: the extensions echoed,
+        // malformed requests answered in the binding's own envelope, idle streams kept alive.
+        let mut rpc = jsonrpc_router(handler.clone())
+            .layer(middleware::from_fn_with_state(
+                Echo::new(&declared, Binding::JsonRpc),
+                echo_extensions,
+            ))
             .layer(middleware::from_fn(json_rpc_rejections));
+        let mut rest = rest_router(handler)
+            .layer(middleware::from_fn_with_state(
+                Echo::new(&declared, Binding::Rest),
+                echo_extensions,
+            ))
+            .layer(middleware::from_fn(rest::rejections));
         if let Some(interval) = options.keepalive_interval {
             rpc = rpc.layer(middleware::from_fn_with_state(interval, keepalive));
+            rest = rest.layer(middleware::from_fn_with_state(interval, keepalive));
         }
 
         let mut router = Router::new()
             .merge(rpc)
+            .merge(rest)
             .merge(agent_card_router(Arc::new(StaticAgentCard::new(
                 agent_card,
             ))))
@@ -196,20 +213,41 @@ fn sign_or_warn(signer: &CardSigner, card: a2a::AgentCard, which: &str) -> a2a::
     }
 }
 
+/// Which binding a layer serves: where a request's message, and so its own extensions, is.
+#[derive(Clone, Copy, Debug)]
+enum Binding {
+    /// `params.message` of a `SendMessage` or `SendStreamingMessage` request.
+    JsonRpc,
+    /// `message` of a body sent to a send path ([`rest::is_send_path`]).
+    Rest,
+}
+
+/// The state of [`echo_extensions`].
+#[derive(Clone)]
+struct Echo {
+    declared: Arc<[String]>,
+    binding: Binding,
+}
+
+impl Echo {
+    fn new(declared: &Arc<[String]>, binding: Binding) -> Self {
+        Self {
+            declared: declared.clone(),
+            binding,
+        }
+    }
+}
+
 /// Say which extensions a request activated, as the A2A specification asks: the response carries
 /// an `A2A-Extensions` header that lists them (*verified* 2026-10-01,
 /// <https://a2a-protocol.org/latest/topics/extensions/>). The extensions are the ones the request
-/// named, in its header or, for a send, in `message.extensions`, that the card declares
+/// named, in its header or, for a send, in its message's `extensions`, that the card declares
 /// ([`activation::activated`], the rule the handler fills
 /// [`Caller::extensions`](crate::Caller::extensions) with). No header when there are none.
 ///
-/// Inside [`json_rpc_rejections`], so the body it reads is already bounded.
-async fn echo_extensions(
-    State(declared): State<Arc<[String]>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if declared.is_empty() {
+/// Inside the binding's rejection layer, so the body it reads is already bounded.
+async fn echo_extensions(State(echo): State<Echo>, request: Request, next: Next) -> Response {
+    if echo.declared.is_empty() {
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
@@ -221,11 +259,18 @@ async fn echo_extensions(
         .map(str::to_owned)
         .collect();
     let Ok(bytes) = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await else {
-        return rejection(INVALID_REQUEST, "invalid request: the body is too large");
+        let message = "invalid request: the body is too large";
+        return match echo.binding {
+            Binding::JsonRpc => rejection(INVALID_REQUEST, message),
+            Binding::Rest => rest::error_response(a2a::A2AError::invalid_request(message)),
+        };
     };
-    let message = message_extensions(&bytes);
+    let message = match echo.binding {
+        Binding::JsonRpc => message_extensions(&bytes),
+        Binding::Rest => rest::message_extensions(parts.uri.path(), &bytes),
+    };
     let activated = activation::activated(
-        &declared,
+        &echo.declared,
         header.iter().map(String::as_str),
         message.iter().map(String::as_str),
     );

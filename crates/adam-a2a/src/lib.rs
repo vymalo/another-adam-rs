@@ -50,9 +50,15 @@
 //! Its resubscribe only works for a task running in the same process, which
 //! contradicts stateless replicas over one durable log. This crate implements
 //! the SDK's public `RequestHandler` trait on top of [`TaskBackend`] instead
-//! and mounts it with the SDK's own `jsonrpc_router` and `agent_card_router`,
-//! so JSON-RPC parsing, ProtoJSON and SSE framing stay the SDK's job. Nothing
-//! in this crate holds task state.
+//! and mounts it with the SDK's own `jsonrpc_router`, `rest_router` and
+//! `agent_card_router`, so JSON-RPC and HTTP+JSON parsing, ProtoJSON and SSE
+//! framing stay the SDK's job. Nothing in this crate holds task state.
+//!
+//! # Two bindings, one handler
+//!
+//! The JSON-RPC endpoint (`POST /`) and the HTTP+JSON binding (`POST /message:send`,
+//! `GET /tasks/{id}`, ...) are the same handler behind the same layers; the card lists
+//! JSON-RPC first and HTTP+JSON second, at the same URL.
 //!
 //! # Streaming
 //!
@@ -69,8 +75,10 @@
 //!
 //! [`AuthConfig::BearerTokens`] compares in constant time (SHA-256 digests, so
 //! token length is hidden too) and answers 401 with `WWW-Authenticate: Bearer`
-//! and a JSON-RPC error body (code `-32000`, since A2A defines no
-//! "unauthorized" code) on every route but the agent card and `/healthz`.
+//! and an error body (a JSON-RPC error with code `-32000` at `POST /`, since A2A
+//! defines no "unauthorized" code; a `google.rpc.Status` `UNAUTHENTICATED` on the
+//! HTTP+JSON paths) on every route but the agent card, `/healthz` and, when the
+//! card is signed, its key set.
 //! The middleware strips any client-sent identity header and injects the
 //! trusted [`Caller`] (`token-<index>` or `anonymous`); the SDK gives request
 //! handlers nothing but headers, so that is the channel.
@@ -101,6 +109,7 @@ mod handler;
 mod memory;
 mod page;
 pub mod push;
+mod rest;
 mod server;
 mod signing;
 

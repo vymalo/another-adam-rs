@@ -119,6 +119,11 @@ impl Authenticator {
         self
     }
 
+    /// Whether `method path` needs no credential: [`is_public`], and the key set when it is served.
+    fn is_open(&self, method: &Method, path: &str) -> bool {
+        is_public(method, path) || (self.public_jwks && method == Method::GET && path == JWKS_PATH)
+    }
+
     /// Whether requests carry credentials (drives the card's security scheme).
     pub(crate) fn requires_bearer(&self) -> bool {
         matches!(self.mode, Mode::Bearer(_))
@@ -179,7 +184,8 @@ fn bearer_token(value: &HeaderValue) -> Option<&str> {
 }
 
 /// Routes that need no credential: the public card (discovery must work before
-/// a client has credentials) and the liveness probe.
+/// a client has credentials) and the liveness probe. The card's key set joins them when it is
+/// served ([`Authenticator::with_public_jwks`]).
 pub(crate) fn is_public(method: &Method, path: &str) -> bool {
     method == Method::GET && (path == a2a_server::WELL_KNOWN_AGENT_CARD_PATH || path == "/healthz")
 }
@@ -192,10 +198,7 @@ pub(crate) async fn authenticate(
 ) -> Response {
     request.headers_mut().remove(CALLER_HEADER);
 
-    let path = request.uri().path();
-    if is_public(request.method(), path)
-        || (authenticator.public_jwks && request.method() == Method::GET && path == JWKS_PATH)
-    {
+    if authenticator.is_open(request.method(), request.uri().path()) {
         return next.run(request).await;
     }
 
@@ -213,27 +216,32 @@ pub(crate) async fn authenticate(
             next.run(request).await
         }
         None => {
-            tracing::debug!(
-                path = request.uri().path(),
-                "rejected unauthenticated request"
-            );
-            unauthorized()
+            let path = request.uri().path();
+            tracing::debug!(path, "rejected unauthenticated request");
+            unauthorized(path)
         }
     }
 }
 
-/// 401 with `WWW-Authenticate: Bearer` and a JSON-RPC error envelope, so an
-/// A2A client surfaces a typed error instead of failing to parse the body.
-fn unauthorized() -> Response {
-    let body = JsonRpcResponse::error(
-        a2a::JsonRpcId::Null,
-        a2a::JsonRpcError {
-            code: UNAUTHORIZED_CODE,
-            message: "unauthorized: missing or invalid bearer token".to_owned(),
-            data: None,
-        },
-    );
-    let body = serde_json::to_vec(&body).unwrap_or_default();
+const UNAUTHORIZED_MESSAGE: &str = "unauthorized: missing or invalid bearer token";
+
+/// 401 with `WWW-Authenticate: Bearer` and the error envelope of the binding the path belongs to,
+/// so an A2A client surfaces a typed error instead of failing to parse the body: a JSON-RPC error
+/// object at `/` (the JSON-RPC endpoint), a `google.rpc.Status` anywhere else (HTTP+JSON).
+fn unauthorized(path: &str) -> Response {
+    let body = if path == "/" {
+        serde_json::to_vec(&JsonRpcResponse::error(
+            a2a::JsonRpcId::Null,
+            a2a::JsonRpcError {
+                code: UNAUTHORIZED_CODE,
+                message: UNAUTHORIZED_MESSAGE.to_owned(),
+                data: None,
+            },
+        ))
+    } else {
+        serde_json::to_vec(&crate::rest::unauthorized_body(UNAUTHORIZED_MESSAGE))
+    }
+    .unwrap_or_default();
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = StatusCode::UNAUTHORIZED;
     response

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use a2a::{
-    GetTaskRequest, Message, Part, Role, SendMessageConfiguration, SendMessageRequest,
-    SendMessageResponse, StreamResponse, Task, TaskState,
+    AgentInterface, GetTaskRequest, Message, Part, Role, SendMessageConfiguration,
+    SendMessageRequest, SendMessageResponse, StreamResponse, Task, TaskState,
 };
 use a2a_client::agent_card::AgentCardResolver;
 use a2a_client::auth::AuthInterceptor;
@@ -18,8 +18,8 @@ use adam_a2a::push::{
     InMemoryPushStore, PushDeliverer, PushDeliveryOptions, PushPolicy, PushSupport,
 };
 use adam_a2a::{
-    A2aServer, AgentCardConfig, AuthConfig, CardSigner, ExtendedCardConfig, InMemoryBackend,
-    InMemoryConfig, ServerOptions, SkillConfig,
+    A2aServer, AgentCardConfig, AuthConfig, CardSigner, ExtendedCardConfig, ExtensionConfig,
+    InMemoryBackend, InMemoryConfig, ServerOptions, SkillConfig,
 };
 use axum::Router;
 use axum::body::Bytes;
@@ -50,6 +50,8 @@ pub struct Setup {
     pub signer: Option<CardSigner>,
     pub extended: Option<ExtendedCardConfig>,
     pub backend: InMemoryBackend,
+    /// Extensions the public card declares.
+    pub extensions: Vec<ExtensionConfig>,
 }
 
 impl Default for Setup {
@@ -62,6 +64,7 @@ impl Default for Setup {
             backend: InMemoryBackend::with_config(InMemoryConfig {
                 step_delay: Duration::from_millis(15),
             }),
+            extensions: Vec::new(),
         }
     }
 }
@@ -91,6 +94,9 @@ impl TestServer {
         .with_skill(SkillConfig::new("echo", "Echo", "Repeats what it is told"));
         if let Some(extended) = setup.extended {
             card = card.with_extended_card(extended);
+        }
+        for extension in setup.extensions {
+            card = card.with_extension(extension);
         }
         let mut options = ServerOptions::default();
         if let Some(push) = setup.push {
@@ -129,6 +135,73 @@ impl TestServer {
             factory = factory.with_interceptor(Arc::new(AuthInterceptor::bearer(token)));
         }
         factory.build().create_from_card(&card).await.unwrap()
+    }
+
+    /// The official client, preferring the card's HTTP+JSON interface, and the interface it chose.
+    pub async fn rest_client(&self, token: Option<&str>) -> (Client, AgentInterface) {
+        let card = AgentCardResolver::new(None)
+            .resolve(&self.base())
+            .await
+            .unwrap();
+        let mut factory =
+            A2AClientFactory::builder().preferred_bindings(vec!["HTTP+JSON".to_owned()]);
+        if let Some(token) = token {
+            factory = factory.with_interceptor(Arc::new(AuthInterceptor::bearer(token)));
+        }
+        factory
+            .build()
+            .create_from_card_with_interface(&card)
+            .await
+            .unwrap()
+    }
+
+    /// A plain HTTP call: `(status, headers, body)`. `token` goes in `Authorization: Bearer`.
+    pub async fn http(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<&serde_json::Value>,
+    ) -> (u16, reqwest::header::HeaderMap, String) {
+        self.http_with(
+            method,
+            path,
+            token,
+            &[],
+            body.map(|b| ("application/json", b.to_string())),
+        )
+        .await
+    }
+
+    /// [`http`](Self::http) with extra headers and the body's content type under the test's control.
+    pub async fn http_with(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<(&str, String)>,
+    ) -> (u16, reqwest::header::HeaderMap, String) {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut request = client.request(method, format!("{}{path}", self.base()));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        if let Some((content_type, body)) = body {
+            request = request.header("content-type", content_type).body(body);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        (status, headers, response.text().await.unwrap())
     }
 }
 
