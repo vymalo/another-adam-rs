@@ -86,7 +86,7 @@ pub trait RuntimeUnderTest: RuntimeProvider + 'static {
     fn materialised(&self, id: &RuntimeId) -> impl Future<Output = Vec<String>> + Send;
 }
 
-/// A [`StoreProvisioner`](crate::StoreProvisioner) the suite can inspect.
+/// A [`StoreProvisioner`] the suite can inspect.
 pub trait StoreUnderTest: StoreProvisioner + 'static {
     /// Every plain-text value written to the backend for `id`, as for [`RuntimeUnderTest`].
     fn materialised(&self, id: &StoreId) -> impl Future<Output = Vec<String>> + Send;
