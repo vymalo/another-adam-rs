@@ -461,6 +461,176 @@ impl Worktree {
     }
 }
 
+/// A temporary detached checkout of the base branch next to a run's worktree, for running a check
+/// on the code the run started from ([`Worktree::add_base_checkout`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseCheckout {
+    path: PathBuf,
+    commit: String,
+    /// The symlinks made to the worktree's ignored files and directories.
+    links: Vec<PathBuf>,
+}
+
+impl BaseCheckout {
+    /// The directory of the checkout: `<run's workspace>/.adam-base/<slot>`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The commit it holds: the base branch's, `origin/<base_branch>`, as it was when it was made.
+    pub fn commit(&self) -> &str {
+        &self.commit
+    }
+}
+
+/// Where a run's [`BaseCheckout`]s are, in its workspace; not a slot (slots are listed from metadata).
+const BASE_CHECKOUTS_DIR: &str = ".adam-base";
+
+impl Worktree {
+    /// The commit `origin/<base_branch>` is at in the mirror, `None` without such a ref.
+    ///
+    /// # Errors
+    ///
+    /// A git failure other than a missing ref.
+    pub async fn base_commit(&self) -> WorkspaceResult<Option<String>> {
+        let rev = format!(
+            "{REMOTE_TRACKING_PREFIX}{}^{{commit}}",
+            self.repo.base_branch
+        );
+        let out = self
+            .git()
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(&rev)
+            .run_status()
+            .await?;
+        let sha = out.stdout_text();
+        Ok((out.success && !sha.is_empty()).then_some(sha))
+    }
+
+    /// Check out [`base_commit`](Self::base_commit) detached in `<run's workspace>/.adam-base/<slot>`,
+    /// where the run's environment can run a command as it does in the slot. What the slot has and
+    /// git ignores (`node_modules`, `target`) is linked in. A leftover is replaced. `None` for a
+    /// worktree of the old layout (`<root>/worktrees/<run>`) and without a base commit.
+    ///
+    /// # Errors
+    ///
+    /// A git or file system failure.
+    #[tracing::instrument(skip(self), fields(run = %self.run))]
+    pub async fn add_base_checkout(&self) -> WorkspaceResult<Option<BaseCheckout>> {
+        let run_dir = self.ws.run_dir(&self.run);
+        if self.path.parent() != Some(run_dir.as_path()) {
+            return Ok(None);
+        }
+        let Some(commit) = self.base_commit().await? else {
+            return Ok(None);
+        };
+        let path = run_dir.join(BASE_CHECKOUTS_DIR).join(&self.dir);
+        let leftover = BaseCheckout {
+            path: path.clone(),
+            commit: commit.clone(),
+            links: Vec::new(),
+        };
+        self.remove_base_checkout(&leftover).await?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| WorkspaceError::io(format!("cannot make {}", parent.display()), e))?;
+        }
+        {
+            let _guard = self.ws.lock_mirror(&self.mirror).await?;
+            self.git()
+                .args(["worktree", "add", "--quiet", "--detach"])
+                .arg(&path)
+                .arg(&commit)
+                .run()
+                .await?;
+        }
+        let mut checkout = BaseCheckout {
+            path,
+            commit,
+            links: Vec::new(),
+        };
+        match self.link_ignored(&mut checkout).await {
+            Ok(()) => Ok(Some(checkout)),
+            Err(e) => {
+                let _ = self.remove_base_checkout(&checkout).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Link what this worktree has and git ignores into `checkout`, where the base has nothing of
+    /// its own at that path.
+    async fn link_ignored(&self, checkout: &mut BaseCheckout) -> WorkspaceResult<()> {
+        let listed = self
+            .git()
+            .args([
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+                "-z",
+            ])
+            .run()
+            .await?;
+        for entry in listed.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+            let Ok(entry) = std::str::from_utf8(entry) else {
+                continue;
+            };
+            let relative = Path::new(entry.trim_end_matches('/'));
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let (from, to) = (self.path.join(relative), checkout.path.join(relative));
+            if tokio::fs::symlink_metadata(&to).await.is_ok() {
+                continue;
+            }
+            if let Some(parent) = to.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    WorkspaceError::io(format!("cannot make {}", parent.display()), e)
+                })?;
+            }
+            #[cfg(unix)]
+            tokio::fs::symlink(&from, &to)
+                .await
+                .map_err(|e| WorkspaceError::io(format!("cannot link {}", to.display()), e))?;
+            #[cfg(not(unix))]
+            let _ = from;
+            checkout.links.push(to);
+        }
+        Ok(())
+    }
+
+    /// Remove a checkout, its links first, and forget it in the mirror. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// A git or file system failure; the directory is removed whatever git says.
+    #[tracing::instrument(skip(self, checkout), fields(run = %self.run))]
+    pub async fn remove_base_checkout(&self, checkout: &BaseCheckout) -> WorkspaceResult<()> {
+        for link in &checkout.links {
+            let _ = tokio::fs::remove_file(link).await;
+        }
+        let _guard = self.ws.lock_mirror(&self.mirror).await?;
+        if tokio::fs::symlink_metadata(&checkout.path).await.is_ok() {
+            let _ = self
+                .git()
+                .args(["worktree", "remove", "--force"])
+                .arg(&checkout.path)
+                .run_status()
+                .await?;
+        }
+        crate::workspace::remove_dir_if_exists(&checkout.path).await?;
+        self.git().args(["worktree", "prune"]).run().await?;
+        Ok(())
+    }
+}
+
 /// Stage everything (`git add -A`) and commit as `author`, in the repository `git` runs in: the
 /// sha, or `None` when there was nothing to commit. What [`Worktree::commit_all`] and
 /// [`Scratch::commit_all`](crate::Scratch::commit_all) do.

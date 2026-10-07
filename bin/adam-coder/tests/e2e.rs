@@ -1552,7 +1552,7 @@ async fn red_checks_with_cycles_left_then_text_is_a_question(store: DynStore) {
     .push_tool_calls(vec![call(
         "c2",
         "run_checks",
-        json!({"command": "echo not yet; exit 1"}),
+        json!({"command": common::red("echo not yet; exit 1")}),
     )])
     .push_text("The check fails and I am not sure how to fix it. Which approach do you prefer?");
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -1865,7 +1865,7 @@ async fn a_continued_task_with_red_checks_leaves_the_branch_and_its_pull_request
     .push_tool_calls(vec![call(
         "d2",
         "run_checks",
-        json!({"command": "echo two > two.txt; echo 'two is unverified'; exit 1"}),
+        json!({"command": common::red("echo two > two.txt; echo 'two is unverified'; exit 1")}),
     )])
     // The model pushes anyway, and asks for the pull request: the cycle budget is spent.
     .push_tool_calls(vec![
@@ -2018,7 +2018,7 @@ async fn a_continued_task_refuses_what_only_the_model_or_a_fence_mentions(store:
 async fn red_checks_n_times_fail_the_run_with_the_findings_and_no_pr(store: DynStore) {
     let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 2).await;
     let mock = Arc::new(MockModel::new());
-    let failing = "echo 'assertion failed: hello.txt is not enough'; exit 1";
+    let failing = &common::red("echo 'assertion failed: hello.txt is not enough'; exit 1");
     mock.push_tool_calls(vec![call(
         "c1",
         "prepare_workspace",
@@ -2162,7 +2162,7 @@ async fn a_pull_request_with_red_checks_needs_explicit_acceptance(store: DynStor
     .push_tool_calls(vec![call(
         "c3",
         "run_checks",
-        json!({"command": "echo flaky; exit 1"}),
+        json!({"command": common::red("echo flaky; exit 1")}),
     )])
     .push_tool_calls(vec![call(
         "c4",
@@ -3590,7 +3590,7 @@ async fn secrets_in_check_output_never_reach_the_client(store: DynStore) {
     mock.push_tool_calls(vec![call(
         "c3",
         "run_checks",
-        json!({"command": "cat hello.txt; exit 1"}),
+        json!({"command": common::red("cat hello.txt; exit 1")}),
     )])
     .push_text("The checks fail.");
     let server = Server::start(coder_with(&fx, &mock, store)).await;

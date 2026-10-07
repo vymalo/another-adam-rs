@@ -2001,6 +2001,77 @@ async fn a_scratch_project_that_lost_its_root_commit_gets_one_again() {
     assert_eq!(git(again.path(), &["rev-list", "--count", "HEAD"]), "1");
 }
 
+/// A check can be run on the code the run started from: a detached checkout of `origin/<base>`
+/// next to the slot, with the installed (ignored) files of the slot linked in, and nothing of the
+/// run's changes. It is a worktree of the same repository, and removing it leaves the run alone.
+#[tokio::test]
+async fn the_base_can_be_checked_out_beside_the_slot_and_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, repo) = remote_with(
+        tmp.path(),
+        "acme",
+        "web",
+        &[("web.txt", "base\n"), (".gitignore", "node_modules/\n")],
+    );
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let slot = run.add_repository(&repo).await.unwrap();
+    let wt = slot.worktree().unwrap();
+    let base = wt.base_commit().await.unwrap().expect("the base is known");
+    assert_eq!(base, git(wt.path(), &["rev-parse", "origin/main"]));
+
+    // The run changes a file, adds one, and has installed dependencies git ignores.
+    std::fs::write(wt.path().join("web.txt"), "changed\n").unwrap();
+    std::fs::write(wt.path().join("new.txt"), "new\n").unwrap();
+    std::fs::create_dir_all(wt.path().join("node_modules/dep")).unwrap();
+    std::fs::write(wt.path().join("node_modules/dep/index.js"), "dep\n").unwrap();
+    wt.commit_all("change", &me()).await.unwrap();
+
+    let checkout = wt.add_base_checkout().await.unwrap().expect("a checkout");
+    assert_eq!(checkout.commit(), base);
+    assert_eq!(checkout.path(), run.path().join(".adam-base/web"));
+    assert_eq!(
+        std::fs::read_to_string(checkout.path().join("web.txt")).unwrap(),
+        "base\n",
+        "the base's files, not the run's"
+    );
+    assert!(!checkout.path().join("new.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(checkout.path().join("node_modules/dep/index.js")).unwrap(),
+        "dep\n",
+        "the installed dependencies are the slot's"
+    );
+    assert_eq!(git(checkout.path(), &["rev-parse", "HEAD"]), base);
+    assert_eq!(
+        git(checkout.path(), &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "HEAD",
+        "detached: no branch of the run moved"
+    );
+    assert!(
+        run.slots().await.unwrap().iter().all(|s| s.dir() == "web"),
+        "the checkout is not a slot"
+    );
+
+    // Made again over a leftover, and removed: the slot keeps its files and its dependencies.
+    let again = wt.add_base_checkout().await.unwrap().expect("a checkout");
+    wt.remove_base_checkout(&again).await.unwrap();
+    assert!(!again.path().exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("node_modules/dep/index.js")).unwrap(),
+        "dep\n",
+        "removing the links does not touch what they pointed at"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.path().join("web.txt")).unwrap(),
+        "changed\n"
+    );
+    assert!(
+        !git(wt.path(), &["worktree", "list"]).contains(".adam-base"),
+        "the mirror forgot it"
+    );
+    wt.remove_base_checkout(&again).await.unwrap();
+}
+
 #[tokio::test]
 async fn a_scratch_project_remembers_where_it_was_published_and_what_changed_since() {
     let tmp = tempfile::tempdir().unwrap();

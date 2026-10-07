@@ -48,6 +48,16 @@ pub struct CheckRecord {
     /// scratch budget of check cycles. Absent (false) in notes written before the two budgets.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scratch: bool,
+    /// The command failed here **and** on the base commit ([`base_commit`](Self::base_commit)),
+    /// before the run changed anything: the failure is the repository's, not the run's. It spends no
+    /// check cycle. Only ever set for a repository's worktree, never for a scratch project, which has
+    /// no base. Absent (false) in notes written before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preexisting: bool,
+    /// The commit `origin/<base>` was at when the command failed on it too: set with
+    /// [`preexisting`](Self::preexisting), absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
 }
 
 /// How a check command ended, in words: `exit code 1`, or that there is no exit code because the
@@ -61,6 +71,31 @@ pub fn exit_phrase(code: Option<i32>) -> String {
 
 /// Most check runs [`ChecksNotes::history`] keeps.
 pub const MAX_CHECK_HISTORY: usize = 32;
+
+/// Most base results [`ChecksNotes::base`] keeps.
+pub const MAX_BASE_RESULTS: usize = 16;
+
+/// What running a failing check command on the base commit found, kept so that it runs once for a
+/// command and a base commit, however often the command fails afterwards (or is replayed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaseResult {
+    /// The command, as `run_checks` recorded it (scrubbed).
+    pub command: String,
+    /// The directory it ran in, relative to the worktree (`""` for its root): the same command in
+    /// another directory is another check.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cwd: String,
+    /// The commit `origin/<base>` was at.
+    pub commit: String,
+    /// It failed there too: exit code `exit_code`, which is not zero.
+    pub failed: bool,
+    /// The exit code, `None` when it passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The end of its output (scrubbed, cut), what the model is shown beside the run's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tail: String,
+}
 
 /// State of the check/fix cycle.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +116,10 @@ pub struct ChecksNotes {
     /// the history existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<CheckRecord>,
+    /// What the failing commands did on the base commit, newest last, at most [`MAX_BASE_RESULTS`]:
+    /// the base is run once per command, directory and base commit ([`RunNotes::base_result`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base: Vec<BaseResult>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -501,10 +540,41 @@ impl RunNotes {
         true
     }
 
+    /// What running `command` (in `cwd`, relative to the worktree) on the base commit `commit` found,
+    /// if it was run: the base is run once for each, whatever happens to the command afterwards.
+    pub fn base_result(&self, command: &str, cwd: &str, commit: &str) -> Option<&BaseResult> {
+        self.checks
+            .base
+            .iter()
+            .find(|b| b.command == command && b.cwd == cwd && b.commit == commit)
+    }
+
+    /// Remember what a command did on the base commit; the oldest results beyond
+    /// [`MAX_BASE_RESULTS`] are forgotten. A result already held for the same command, directory and
+    /// commit is replaced.
+    pub fn record_base_result(&mut self, result: BaseResult) {
+        self.checks.base.retain(|b| {
+            !(b.command == result.command && b.cwd == result.cwd && b.commit == result.commit)
+        });
+        self.checks.base.push(result);
+        if self.checks.base.len() > MAX_BASE_RESULTS {
+            let extra = self.checks.base.len() - MAX_BASE_RESULTS;
+            self.checks.base.drain(..extra);
+        }
+    }
+
+    /// The check that decides for the code with tree id `tree` when it failed **and** fails on the
+    /// base too: a pre-existing failure, which the pull request gate lets through with a note.
+    pub fn preexisting_on(&self, tree: &str) -> Option<&CheckRecord> {
+        self.checked(tree)
+            .filter(|record| !record.passed && record.preexisting)
+    }
+
     /// Record a check run. A failed call counts once, however often it is
-    /// replayed. Returns the failure count of its kind of work afterwards.
+    /// replayed, **unless the failure is pre-existing** ([`CheckRecord::preexisting`]): that one
+    /// spends no cycle. Returns the failure count of its kind of work afterwards.
     pub fn record_check(&mut self, record: CheckRecord) -> u32 {
-        if !record.passed && !self.checks.counted.contains(&record.call_id) {
+        if !record.passed && !record.preexisting && !self.checks.counted.contains(&record.call_id) {
             self.checks.counted.push(record.call_id.clone());
             self.checks.failures += 1;
             if record.scratch {
@@ -615,6 +685,8 @@ mod tests {
             report: None,
             slot: None,
             scratch: false,
+            preexisting: false,
+            base_commit: None,
         }
     }
 

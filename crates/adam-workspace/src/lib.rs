@@ -93,4 +93,4 @@ pub use github_app::{AppKey, AppOwners, GitHubApp, Installation, MAX_CACHED_INST
 pub use repo::{RepoLocation, RepoRef};
 pub use run_workspace::{Collision, CopyReport, RunWorkspace, Scratch, Slot, SlotKind, copy_into};
 pub use workspace::Workspaces;
-pub use worktree::{ChangedFile, FileStatus, GitIdentity, MirrorLock, Worktree};
+pub use worktree::{BaseCheckout, ChangedFile, FileStatus, GitIdentity, MirrorLock, Worktree};

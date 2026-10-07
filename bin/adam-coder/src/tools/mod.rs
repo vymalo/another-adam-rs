@@ -109,6 +109,7 @@ pub mod inspect;
 pub mod make;
 pub mod named;
 pub mod notes;
+mod preexisting;
 pub mod prepare;
 pub mod publish;
 pub mod scratch;

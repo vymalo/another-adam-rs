@@ -632,7 +632,7 @@ async fn a_replayed_failing_check_counts_one_cycle() {
     let tool = RunChecks;
     for _ in 0..3 {
         let out = tool
-            .call(&rig.ctx, json!({"command": "exit 2"}))
+            .call(&rig.ctx, json!({"command": common::red("exit 2")}))
             .await
             .unwrap();
         assert!(out.is_error);
@@ -642,6 +642,261 @@ async fn a_replayed_failing_check_counts_one_cycle() {
             out.content
         );
     }
+}
+
+/// A context for another call of the same run: a new call id, the same root run.
+fn another_call(rig: &Rig, id: &str) -> ToolCtx {
+    ToolCtx::detached("tool", id, Arc::new(CollectingSink::new()))
+        .with_state(rig.fx.env.clone())
+        .with_root_run(rig.ctx.run_id())
+}
+
+/// How many lines a command that appends to `counter` wrote: how often it ran, in the worktree
+/// and on the base.
+fn runs_of(counter: &std::path::Path) -> usize {
+    std::fs::read_to_string(counter).map_or(0, |text| text.lines().count())
+}
+
+/// A failure the repository has too (ADR 0026): the command is run once on `origin/main`, fails
+/// there as well, and is not the run's: no cycle is spent, the record and the `checks` artifact say
+/// `preexisting` with the base commit, the model is told, and the base runs once however often the
+/// command fails again.
+#[tokio::test]
+async fn a_failure_the_base_has_too_is_preexisting_and_spends_no_cycle() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!(
+        "echo x >> {}; echo 'error TS2304'; exit 2",
+        counter.display()
+    );
+
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(out.is_error, "the check did fail: {}", out.content);
+    assert_eq!(runs_of(&counter), 2, "in the worktree, then on the base");
+    assert!(out.content.contains("PRE-EXISTING"), "{}", out.content);
+    assert!(
+        out.content.contains("`origin/main`")
+            && out.content.contains("used no check cycle (0 of 3 used)")
+            && out.content.contains("must not make it worse")
+            && out.content.contains("--- output on origin/main ---")
+            && out.content.contains("The two outputs are identical."),
+        "{}",
+        out.content
+    );
+    let base = common::git(&rig.worktree(), &["rev-parse", "origin/main"]);
+    let data = checks_of(&out);
+    assert_eq!(data["passed"], false, "it failed: a gate reads preexisting");
+    assert_eq!(data["preexisting"], true);
+    assert_eq!(data["base_commit"], base.as_str());
+    assert!(
+        data["summary"].as_str().unwrap().contains("pre-existing"),
+        "{data}"
+    );
+    let notes = notes_of(&rig).await;
+    assert_eq!(notes.checks.failures, 0, "no cycle");
+    let record = notes.checks.last.clone().unwrap();
+    assert!(!record.passed && record.preexisting);
+    assert_eq!(record.base_commit.as_deref(), Some(base.as_str()));
+    assert_eq!(notes.checks.base.len(), 1);
+    assert_eq!(notes.checks.base[0].commit, base);
+    assert!(!notes.cycles_exhausted(false, 3));
+
+    // The same command again, as other calls: the base is not run again, and nothing is spent.
+    for n in 2..=5 {
+        let again = RunChecks
+            .call(
+                &another_call(&rig, &format!("call-{n}")),
+                json!({"command": command}),
+            )
+            .await
+            .unwrap();
+        assert!(again.is_error && again.content.contains("PRE-EXISTING"));
+        assert_eq!(checks_of(&again)["preexisting"], true);
+    }
+    assert_eq!(
+        runs_of(&counter),
+        6,
+        "four more runs here, none on the base"
+    );
+    assert_eq!(notes_of(&rig).await.checks.failures, 0);
+
+    // Nothing is left of the checkout: not the directory, not the mirror's entry.
+    assert!(
+        !rig.worktree()
+            .parent()
+            .unwrap()
+            .join(".adam-base")
+            .join("remote")
+            .exists()
+    );
+    assert!(
+        !common::git(&rig.worktree(), &["worktree", "list", "--porcelain"]).contains(".adam-base"),
+        "the mirror forgot it"
+    );
+}
+
+/// A failure the change caused is as before: a cycle, no `preexisting`, and the model is told the
+/// base passes. The base result is kept too, so the base runs once for it as well.
+#[tokio::test]
+async fn a_failure_the_change_caused_costs_a_cycle_and_says_the_base_passes() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; test ! -f broken.flag", counter.display());
+
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    assert_eq!(runs_of(&counter), 2, "here, then on the base");
+    assert!(
+        out.content.contains("passes on `origin/main`")
+            && out.content.contains("caused by the change")
+            && out.content.contains("failed check run 1 of 3"),
+        "{}",
+        out.content
+    );
+    assert!(!out.content.contains("PRE-EXISTING"), "{}", out.content);
+    let data = checks_of(&out);
+    assert!(
+        data.get("preexisting").is_none() && data.get("base_commit").is_none(),
+        "{data}"
+    );
+    let notes = notes_of(&rig).await;
+    assert_eq!(notes.checks.failures, 1);
+    assert!(!notes.checks.last.as_ref().unwrap().preexisting);
+    assert!(!notes.checks.base[0].failed);
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(
+        again.content.contains("failed check run 2 of 3"),
+        "{}",
+        again.content
+    );
+    assert_eq!(
+        runs_of(&counter),
+        3,
+        "the base passed, and is not run again"
+    );
+}
+
+/// A scratch project has no base, and a command that times out is not asked again: both fail as
+/// they always did.
+#[tokio::test]
+async fn a_scratch_project_and_a_timeout_are_not_run_on_the_base() {
+    let fx = Fixture::with("hello\n", |s| {
+        s.check_timeout = std::time::Duration::from_millis(500);
+    })
+    .await;
+    let rig = Rig::from(fx);
+    rig.prepare().await;
+    start_scratch(&rig, "fib").await;
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+
+    let scratch = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"command": format!("echo x >> {}; exit 1", counter.display()), "repo": "fib"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        scratch.is_error && !scratch.content.contains("PRE-EXISTING"),
+        "{}",
+        scratch.content
+    );
+    assert_eq!(
+        runs_of(&counter),
+        1,
+        "no base for a scratch project: {}",
+        scratch.content
+    );
+    assert_eq!(notes_of(&rig).await.failures_in(true), 1);
+
+    let slow = RunChecks
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"command": format!("echo x >> {}; sleep 30", counter.display()), "repo": "remote"}),
+        )
+        .await;
+    assert!(is_error(&slow));
+    assert_eq!(
+        runs_of(&counter),
+        2,
+        "a timeout is not run again on the base"
+    );
+    let notes = notes_of(&rig).await;
+    assert_eq!(notes.failures_in(false), 1);
+    assert!(notes.checks.base.is_empty());
+}
+
+/// A pull request is opened for code whose last check fails on the base too, without the person's
+/// acceptance and with a note in its body; a failure the change caused still needs it.
+#[tokio::test]
+async fn a_pull_request_opens_for_a_failure_the_base_has_too() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("a.txt"), "a\n").unwrap();
+    RunChecks
+        .call(&rig.ctx, json!({"command": "echo old failure; exit 2"}))
+        .await
+        .unwrap();
+    CommitAndPush
+        .call(&rig.ctx, json!({"message": "feat: add a"}))
+        .await
+        .unwrap();
+    let pushed = RunChecks
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"command": "echo old failure; exit 2"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(checks_of(&pushed)["preexisting"], true);
+    let args =
+        json!({"title": "feat: a", "body": "Adds a.\n\n## Verification\n- `exit 2` fails on main"});
+    let opened = OpenPullRequest.call(&rig.ctx, args).await.unwrap();
+    assert!(!opened.is_error, "{}", opened.content);
+    assert!(
+        opened.content.contains("fails on origin/main too"),
+        "{}",
+        opened.content
+    );
+    let pulls = rig.fx.created_pulls().await;
+    let body = pulls[0]["body"].as_str().unwrap();
+    assert!(
+        body.contains("fails on `main` too") && body.contains("not caused by this pull request"),
+        "{body}"
+    );
+    let notes = notes_of(&rig).await;
+    assert!(
+        !notes.pull_request.unwrap().red_checks_accepted,
+        "nobody accepted red checks"
+    );
+
+    // The committed `checks` artifact says it too.
+    let again = CommitAndPush
+        .call(
+            &another_call(&rig, "call-3"),
+            json!({"message": "feat: nothing new"}),
+        )
+        .await
+        .unwrap();
+    let bound = checks_of(&again);
+    assert_eq!(bound["preexisting"], true);
+    assert_eq!(bound["passed"], false);
 }
 
 /// The `checks` artifact of a tool result: its data.
@@ -1876,7 +2131,10 @@ async fn a_missing_toolchain_is_reported_and_costs_nothing() {
 
     // A check that really fails still costs a cycle, and says it is a failed check.
     let red = RunChecks
-        .call(&rig.ctx, json!({"command": "echo nope; exit 3"}))
+        .call(
+            &rig.ctx,
+            json!({"command": common::red("echo nope; exit 3")}),
+        )
         .await
         .unwrap();
     assert!(
@@ -1966,7 +2224,7 @@ async fn a_project_dependency_is_to_be_installed_and_a_nested_not_found_is_a_fai
     let red = RunChecks
         .call(
             &rig.ctx,
-            json!({"command": "sh -c 'zzz-inner-tool'; echo tests failed; exit 101"}),
+            json!({"command": common::red("sh -c 'zzz-inner-tool'; echo tests failed; exit 101")}),
         )
         .await
         .unwrap();
@@ -2267,7 +2525,7 @@ async fn red_checks_on_a_continued_branch_never_touch_the_existing_pull_request(
 
     std::fs::write(worktree.join("two.txt"), "unverified\n").unwrap();
     let red = RunChecks
-        .call(&two, json!({"command": "echo broken; exit 1"}))
+        .call(&two, json!({"command": common::red("echo broken; exit 1")}))
         .await;
     assert!(is_error(&red));
     let pushed = CommitAndPush
@@ -2547,7 +2805,7 @@ async fn a_comment_that_fails_leaves_the_update_delivered_and_the_note_is_posted
     let (two, worktree, branch, tip) = rework_of_an_open_pull_request(&rig).await;
     std::fs::write(worktree.join("two.txt"), "unverified\n").unwrap();
     RunChecks
-        .call(&two, json!({"command": "exit 1"}))
+        .call(&two, json!({"command": common::red("exit 1")}))
         .await
         .ok();
     CommitAndPush
@@ -3398,7 +3656,10 @@ async fn a_pull_request_needs_the_most_recent_check_of_its_code_whichever_slot_r
     );
     // Red on the same code afterwards: the most recent check on it wins.
     RunChecks
-        .call(&rig.ctx, json!({"command": "false", "repo": "remote"}))
+        .call(
+            &rig.ctx,
+            json!({"command": common::red("false"), "repo": "remote"}),
+        )
         .await
         .unwrap();
     let again = OpenPullRequest
@@ -3413,7 +3674,10 @@ async fn a_pull_request_needs_the_most_recent_check_of_its_code_whichever_slot_r
     );
     let again = text(again);
     assert!(
-        again.contains("the last check run (`false`) failed with exit code 1"),
+        again.contains(&format!(
+            "the last check run (`{}`) failed with exit code 1",
+            common::red("false")
+        )),
         "an exit code is said in words, not as an Option: {again}"
     );
     assert!(!again.contains("Some("), "{again}");
@@ -5449,6 +5713,8 @@ fn failed(call: &str, scratch: bool) -> CheckRecord {
         report: None,
         slot: None,
         scratch,
+        preexisting: false,
+        base_commit: None,
     }
 }
 
@@ -5498,7 +5764,10 @@ async fn scratch_work_gets_five_check_cycles_and_a_repository_three() {
         repo.content
     );
     let scratch = RunChecks
-        .call(&rig.ctx, json!({"command": "exit 1", "repo": "fib"}))
+        .call(
+            &rig.ctx,
+            json!({"command": common::red("exit 1"), "repo": "fib"}),
+        )
         .await
         .unwrap();
     assert!(
@@ -5511,7 +5780,10 @@ async fn scratch_work_gets_five_check_cycles_and_a_repository_three() {
     // which has used none, runs with its own three.
     let rig = with_red_checks((0, 3)).await;
     let scratch = RunChecks
-        .call(&rig.ctx, json!({"command": "exit 1", "repo": "fib"}))
+        .call(
+            &rig.ctx,
+            json!({"command": common::red("exit 1"), "repo": "fib"}),
+        )
         .await
         .unwrap();
     assert!(
@@ -5533,7 +5805,10 @@ async fn scratch_work_gets_five_check_cycles_and_a_repository_three() {
         spent.content
     );
     let repo = RunChecks
-        .call(&rig.ctx, json!({"command": "exit 1", "repo": "remote"}))
+        .call(
+            &rig.ctx,
+            json!({"command": common::red("exit 1"), "repo": "remote"}),
+        )
         .await
         .unwrap();
     assert!(
@@ -5546,7 +5821,10 @@ async fn scratch_work_gets_five_check_cycles_and_a_repository_three() {
     // refused from then on.
     let rig = with_red_checks((0, 4)).await;
     let fifth = RunChecks
-        .call(&rig.ctx, json!({"command": "exit 1", "repo": "fib"}))
+        .call(
+            &rig.ctx,
+            json!({"command": common::red("exit 1"), "repo": "fib"}),
+        )
         .await
         .unwrap();
     assert!(
@@ -5609,7 +5887,7 @@ async fn a_subagent_works_in_the_worktree_and_on_the_budget_of_its_root_run() {
 
     // A failed check of the subagent is one of the root's cycles.
     let failed = RunChecks
-        .call(&child, json!({"command": "false"}))
+        .call(&child, json!({"command": common::red("false")}))
         .await
         .unwrap();
     assert!(failed.is_error, "{}", failed.content);
@@ -5633,7 +5911,7 @@ async fn a_subagent_check_with_the_root_call_id_is_not_a_replay() {
     rig.prepare().await;
     let root = rig.ctx.run_id();
     let failed = RunChecks
-        .call(&rig.ctx, json!({"command": "false"}))
+        .call(&rig.ctx, json!({"command": common::red("false")}))
         .await
         .unwrap();
     assert!(failed.is_error, "{}", failed.content);
@@ -5643,7 +5921,7 @@ async fn a_subagent_check_with_the_root_call_id_is_not_a_replay() {
         .with_root_run(root);
     assert_eq!(child.call_id(), rig.ctx.call_id());
     let again = RunChecks
-        .call(&child, json!({"command": "false"}))
+        .call(&child, json!({"command": common::red("false")}))
         .await
         .unwrap();
     assert!(again.is_error, "{}", again.content);

@@ -1692,6 +1692,8 @@ mod tests {
                 report: None,
                 slot: None,
                 scratch: false,
+                preexisting: false,
+                base_commit: None,
             });
         };
 
@@ -1722,6 +1724,8 @@ mod tests {
                 report: None,
                 slot: None,
                 scratch: false,
+                preexisting: false,
+                base_commit: None,
             });
         }
         let said = verdict_of(&killed, 2, 9).unwrap();
@@ -1782,6 +1786,8 @@ mod tests {
                 report: None,
                 slot: None,
                 scratch,
+                preexisting: false,
+                base_commit: None,
             });
         };
         let mut notes = RunNotes::default();

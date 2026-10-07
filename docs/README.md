@@ -62,6 +62,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0019](decisions/0019-a-runs-processes-in-a-pod-of-their-own.md) | a run's processes in a Kubernetes pod of its own |
 | [0020](decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md) | reasoning streamed beside the answer and never stored |
 | [0021](decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md) | the coder is Adam, a general agent that can code |
+| [0026](decisions/0026-a-failure-the-base-has-too-is-not-the-runs.md) | a failing check is also run on the base: a failure it has too is pre-existing and costs no cycle |
 | [0027](decisions/0027-every-tool-has-a-title-for-its-step.md) | every tool has a title for its step |
 | [0028](decisions/0028-the-card-says-which-build-answers.md) | the card says which build and which agent files answer |
 
