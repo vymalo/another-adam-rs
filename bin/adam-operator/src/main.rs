@@ -72,10 +72,26 @@ fn crdgen(out: &mut impl Write) -> Result<()> {
         // Through a key-sorted value: the schema's maps keep their order only with serde_json's
         // `preserve_order`, which another crate of a workspace build turns on.
         let value = serde_json::to_value(&crd).context("serialising a CRD")?;
-        let yaml = serde_yaml::to_string(&adam_operator_domain::sorted(&value))
-            .context("serialising a CRD to YAML")?;
+        let yaml = serde_yaml::to_string(&sorted(&value)).context("serialising a CRD to YAML")?;
         out.write_all(yaml.as_bytes())?;
     }
     out.flush()?;
     Ok(())
+}
+
+/// The value with every object's members in key order, in any build.
+fn sorted(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let keys: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
+            Value::Object(
+                keys.into_iter()
+                    .map(|(k, v)| (k.clone(), sorted(v)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
+    }
 }

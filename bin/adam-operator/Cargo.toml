@@ -24,6 +24,7 @@ registry = ["dep:adam-operator-registry"]
 
 [dependencies]
 adam-operator-api.workspace = true
+serde_json.workspace = true
 adam-operator-controller.workspace = true
 adam-operator-registry = { workspace = true, optional = true }
 adam-operator-runtime-kubernetes = { workspace = true, optional = true }
