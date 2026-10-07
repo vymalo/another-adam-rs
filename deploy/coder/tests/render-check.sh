@@ -1179,4 +1179,79 @@ check "refused: an idle timeout that is not a number" fails helm_rp --set-string
 check "refused: a bad container name" fails helm_rp --set runPods.container=Run_Container
 check "refused: a CIDR that is not one" fails helm_rp --set 'runPods.networkPolicy.clusterCIDRs={everything}'
 
+# Optional A2A features (a2a.*, ADR 0030 of adam-rs): push notifications and the signature of the agent card.
+# Both are off by default and then invisible (the golden above, byte for byte); each belongs to the pod that
+# serves A2A. The key is a Secret you manage, mounted, never a value of the chart.
+a2a_vars='A2A_PUSH_ALLOWED_URLS|A2A_PUSH_ALLOW_PRIVATE|A2A_PUSH_GIVE_UP_AFTER_SECS|A2A_PUSH_REQUEST_TIMEOUT_SECS|A2A_CARD_SIGNING_'
+helm_a2a() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }
+helm_a2a > "$out"
+check "a2a off: none of its variables, and no signing volume" lacks "$a2a_vars|card-signing"
+check "a2a off: the default render is still the golden" cmp -s "$out" "$golden"
+helm_a2a --set-json 'a2a.push.allowedUrls=[]' --set a2a.cardSigning.secretName= > "$out"
+check "a2a off, set explicitly (empty list, empty name): the render equals the golden" cmp -s "$out" "$golden"
+
+helm_a2a --set 'a2a.push.allowedUrls={https://hooks.example.com/a2a/,*.partner.io}' > "$out"
+check "push on: the allow-list is A2A_PUSH_ALLOWED_URLS, joined by commas, in the StatefulSet" \
+  dhas StatefulSet 'value: "https://hooks.example.com/a2a/,\*.partner.io"'
+check "push on: the delivery bounds are rendered, with their defaults" \
+  dhas StatefulSet 'name: A2A_PUSH_GIVE_UP_AFTER_SECS'
+check "push on: give up after an hour by default" dhas StatefulSet 'value: "3600"'
+check "push on: the request timeout is 15 s by default" dhas StatefulSet 'value: "15"'
+check "push on: private addresses stay off (no A2A_PUSH_ALLOW_PRIVATE)" lacks 'A2A_PUSH_ALLOW_PRIVATE'
+check "push on: no card-signing variable or volume" lacks 'A2A_CARD_SIGNING_|card-signing'
+check "push on: no Secret object and no webhook credential anywhere" lacks '^kind: Secret$'
+helm_a2a --set 'a2a.push.allowedUrls={hooks.example.com}' --set a2a.push.giveUpAfterSecs=60 --set a2a.push.requestTimeoutSecs=5 > "$out"
+check "push: the bounds are values" dhas StatefulSet 'value: "60"'
+helm_a2a --set 'a2a.push.allowedUrls={127.0.0.1:9000}' --set a2a.push.allowPrivateAddresses=true > "$out"
+check "push, development switch: A2A_PUSH_ALLOW_PRIVATE is rendered" dhas StatefulSet 'name: A2A_PUSH_ALLOW_PRIVATE'
+
+helm_a2a --set a2a.cardSigning.secretName=coder-card-key > "$out"
+check "signing on: A2A_CARD_SIGNING_KEY_FILE names the mounted file" \
+  dhas StatefulSet 'value: "/var/run/secrets/card-signing/private-key.pem"'
+check "signing on: the Secret is mounted read-only" dhas StatefulSet 'mountPath: /var/run/secrets/card-signing'
+check "signing on: ... from the Secret that was named, key private-key.pem" dhas StatefulSet 'secretName: coder-card-key'
+check "signing on: ... group-readable only (0440)" dhas StatefulSet 'defaultMode: 0440'
+check "signing on: no key id and no jku unless set" lacks 'A2A_CARD_SIGNING_KEY_ID|A2A_CARD_SIGNING_JKU'
+check "signing on: push stays off" lacks 'A2A_PUSH_'
+helm_a2a --set a2a.cardSigning.secretName=coder-card-key --set a2a.cardSigning.keyId=key-1 \
+  --set a2a.cardSigning.jku=https://coder.example.com/.well-known/jwks.json > "$out"
+check "signing: keyId and jku are rendered when set" \
+  dhas StatefulSet 'value: "https://coder.example.com/.well-known/jwks.json"'
+check "signing: ... the key id too" dhas StatefulSet 'name: A2A_CARD_SIGNING_KEY_ID'
+
+# topology=split: only the front serves A2A, so only the front has them; the worker has none of it.
+helm_a2a --set topology=split --set 'a2a.push.allowedUrls={hooks.example.com}' --set a2a.cardSigning.secretName=coder-card-key > "$out"
+check "split: the front has the allow-list" dhas Deployment 'name: A2A_PUSH_ALLOWED_URLS'
+check "split: the front has the signing key mounted" dhas Deployment 'mountPath: /var/run/secrets/card-signing'
+check "split: the worker has no A2A variable of these" dlacks StatefulSet "$a2a_vars"
+check "split: the worker does not mount the key" dlacks StatefulSet 'card-signing'
+check "split with a2a on: the render equals tests/golden/a2a-split.yaml" cmp -s "$out" "$chart/tests/golden/a2a-split.yaml"
+helm_a2a --set topology=split > "$out"
+check "split, a2a off: the front has none of it either" lacks "$a2a_vars|card-signing"
+
+# Refusals: a mistake stops the render, not a rollout.
+check "refused: allowedUrls that is not a list" fails helm_a2a --set a2a.push.allowedUrls=hooks.example.com
+check "refused: an entry with a space or a comma" fails helm_a2a --set 'a2a.push.allowedUrls={a.example.com b.example.com}'
+check "refused: an empty entry" fails helm_a2a --set-json 'a2a.push.allowedUrls=[""]'
+check "refused: plain http without the development switch" fails helm_a2a --set 'a2a.push.allowedUrls={http://hooks.example.com/}'
+helm_a2a --set 'a2a.push.allowedUrls={http://127.0.0.1:9000/}' --set a2a.push.allowPrivateAddresses=true > "$out"
+check "plain http is allowed beside the development switch" dhas StatefulSet 'name: A2A_PUSH_ALLOW_PRIVATE'
+message=$(helm_a2a --set a2a.push.allowPrivateAddresses=true 2>&1 || true)
+check "refused: the development switch without an allow-list" fails helm_a2a --set a2a.push.allowPrivateAddresses=true
+check "... the error says it has no effect" says "$message" 'no effect'
+check "refused: allowPrivateAddresses that is not a boolean" \
+  fails helm_a2a --set 'a2a.push.allowedUrls={hooks.example.com}' --set-string a2a.push.allowPrivateAddresses=maybe
+check "refused: a give-up bound of 0" fails helm_a2a --set 'a2a.push.allowedUrls={hooks.example.com}' --set a2a.push.giveUpAfterSecs=0
+check "refused: a give-up bound beyond a week" \
+  fails helm_a2a --set 'a2a.push.allowedUrls={hooks.example.com}' --set a2a.push.giveUpAfterSecs=604801
+check "refused: a request timeout beyond 120 s" \
+  fails helm_a2a --set 'a2a.push.allowedUrls={hooks.example.com}' --set a2a.push.requestTimeoutSecs=121
+message=$(helm_a2a --set a2a.cardSigning.keyId=key-1 2>&1 || true)
+check "refused: a key id without a key" fails helm_a2a --set a2a.cardSigning.keyId=key-1
+check "... the error names the Secret" says "$message" 'secretName'
+check "refused: a jku without a key" fails helm_a2a --set a2a.cardSigning.jku=https://x.example/jwks.json
+check "refused: a Secret name that is not one" fails helm_a2a --set a2a.cardSigning.secretName=Not_A_Secret
+check "refused: the allow-list in extraEnv beside the value" \
+  fails helm_a2a --set 'a2a.push.allowedUrls={hooks.example.com}' --set-string config.extraEnv.A2A_PUSH_ALLOWED_URLS=x
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

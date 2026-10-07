@@ -1,5 +1,7 @@
 {{- $split := eq .Values.topology "split" -}}
 {{- $githubApp := include "coder.githubApp" . -}}
+{{- /* The signing key is for the pod that serves A2A: the combined one, not the split worker. */ -}}
+{{- $cardSigning := and (not $split) (include "coder.a2aCardSigning" .) -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -273,6 +275,12 @@ spec:
                   key: A2A_BEARER_TOKENS
             {{- end }}
             {{- end }}
+            {{- if not $split }}
+            {{- /* a2a.*: the optional A2A features, off by default; the split worker serves no A2A. */}}
+            {{- with (include "coder.a2aEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- end }}
           startupProbe:
             httpGet:
               path: /healthz
@@ -317,7 +325,12 @@ spec:
               mountPath: {{ include "coder.runPodTemplateDir" . }}
               readOnly: true
             {{- end }}
-      {{- if or (include "coder.sharedWork" .) $githubApp (include "coder.extraMcp" .) (include "coder.runPods" .) }}
+            {{- if $cardSigning }}
+            - name: card-signing
+              mountPath: {{ include "coder.a2aCardSigningDir" . }}
+              readOnly: true
+            {{- end }}
+      {{- if or (include "coder.sharedWork" .) $githubApp (include "coder.extraMcp" .) (include "coder.runPods" .) $cardSigning }}
       volumes:
         {{- if include "coder.sharedWork" . }}
         - name: work
@@ -347,6 +360,16 @@ spec:
             name: {{ include "coder.runPodTemplateConfigMapName" . }}
             # The pod template: no secret in it.
             defaultMode: 0444
+        {{- end }}
+        {{- if $cardSigning }}
+        - name: card-signing
+          secret:
+            secretName: {{ .Values.a2a.cardSigning.secretName }}
+            # Group-readable by the runtime user (fsGroup); the key is for the coder alone.
+            defaultMode: 0440
+            items:
+              - key: private-key.pem
+                path: private-key.pem
         {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}

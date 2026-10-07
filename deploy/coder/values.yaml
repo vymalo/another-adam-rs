@@ -151,6 +151,43 @@ github:
     # GITHUB_APP_PRIVATE_KEY_PATH to the file. The chart never carries the key itself.
     privateKeySecret: ""
 
+# Optional features of the A2A server (ADR 0030 of adam-rs). Both are OFF by default, and with both off
+# the render is exactly what it was without this block. They belong to the roles that serve A2A: the
+# combined StatefulSet and, with topology=split, the front Deployment; the worker renders none of it.
+a2a:
+  # Push notifications: a client names a webhook for a task and is told when the task changes. On
+  # when allowedUrls is not empty. The list is the whole policy: a client's webhook that matches none
+  # of it is refused (InvalidParams), https is required, and a webhook that resolves to a private,
+  # loopback or link-local address is refused at delivery whatever this says. Entries are URL
+  # prefixes ("https://hooks.example.com/a2a/") or hosts ("hooks.example.com", "*.example.com",
+  # "hooks.example.com:8443"). Pods need egress to those hosts (the chart's NetworkPolicy leaves
+  # egress open). A notification is a hint: GetTask is the truth. The webhooks' credentials are the
+  # clients', held in the coder's database as the clients gave them.
+  push:
+    allowedUrls: []
+    # Development only: also allow webhooks on private and loopback addresses, and http to loopback
+    # (A2A_PUSH_ALLOW_PRIVATE). Needs allowedUrls; never set it on a cluster.
+    allowPrivateAddresses: false
+    # How long one notification may keep failing (capped exponential backoff) before delivery to
+    # that webhook is abandoned and the reason recorded, 1 to 604800 (A2A_PUSH_GIVE_UP_AFTER_SECS).
+    giveUpAfterSecs: 3600
+    # How long one request to a webhook may take, 1 to 120 (A2A_PUSH_REQUEST_TIMEOUT_SECS).
+    requestTimeoutSecs: 15
+  # The signature of the agent card (A2A 1.0, JWS over the RFC 8785 canonical card). On when
+  # secretName is set: the name of a Secret in this namespace that you (or another ExternalSecret)
+  # manage, with one key, `private-key.pem`: a PKCS#8 PEM private key, ECDSA P-256 (ES256) or Ed25519
+  # (EdDSA), for example `openssl genpkey -algorithm ed25519`. The chart mounts it read-only at
+  # /var/run/secrets/card-signing and sets A2A_CARD_SIGNING_KEY_FILE to the file; the key is read at
+  # startup, so a rotated key needs a restart. The server publishes the public key at
+  # /.well-known/jwks.json. The chart never carries the key itself.
+  cardSigning:
+    secretName: ""
+    # The `kid` of the signature (A2A_CARD_SIGNING_KEY_ID). Empty: the key's RFC 7638 thumbprint.
+    keyId: ""
+    # The `jku` in the signature's header (A2A_CARD_SIGNING_JKU): where clients fetch the key set, for
+    # example https://<public host>/.well-known/jwks.json. Empty: none.
+    jku: ""
+
 # The GitHub MCP server the coder reads GitHub through (ADR 0017, D4), as a native sidecar of every pod
 # that runs workers (an init container with restartPolicy: Always; Kubernetes 1.29 and later, GA in
 # 1.33). It is `github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests` from

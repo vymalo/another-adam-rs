@@ -45,6 +45,41 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "github.auth=app needs github.app.privateKeySecret: the name of a Secret with the App's private key under the key private-key.pem" -}}
 {{- end -}}
 {{- end -}}
+{{- /* The optional A2A features (values `a2a.*`). */ -}}
+{{- if not (kindIs "slice" .Values.a2a.push.allowedUrls) -}}
+{{- fail (printf "a2a.push.allowedUrls must be a list of URL prefixes or hosts, got %q" (toString .Values.a2a.push.allowedUrls)) -}}
+{{- end -}}
+{{- range .Values.a2a.push.allowedUrls -}}
+{{- if or (not (kindIs "string" .)) (not (regexMatch "^[^,[:space:]]+$" .)) -}}
+{{- fail (printf "a2a.push.allowedUrls entries must be non-empty text with no comma or space (a URL prefix such as https://hooks.example.com/a2a/, or a host such as hooks.example.com), got %q" (toString .)) -}}
+{{- end -}}
+{{- if and (hasPrefix "http://" .) (not $.Values.a2a.push.allowPrivateAddresses) -}}
+{{- fail (printf "a2a.push.allowedUrls entry %q is plain http, which push notifications accept only for a loopback webhook with a2a.push.allowPrivateAddresses (development): use https" .) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (kindIs "bool" .Values.a2a.push.allowPrivateAddresses) -}}
+{{- fail (printf "a2a.push.allowPrivateAddresses must be true or false, got %q" (toString .Values.a2a.push.allowPrivateAddresses)) -}}
+{{- end -}}
+{{- if and .Values.a2a.push.allowPrivateAddresses (not .Values.a2a.push.allowedUrls) -}}
+{{- fail "a2a.push.allowPrivateAddresses has no effect without a2a.push.allowedUrls (push notifications are off while the allow-list is empty)" -}}
+{{- end -}}
+{{- range $path, $limit := dict "a2a.push.giveUpAfterSecs" (list .Values.a2a.push.giveUpAfterSecs 604800) "a2a.push.requestTimeoutSecs" (list .Values.a2a.push.requestTimeoutSecs 120) -}}
+{{- $value := int64 (index $limit 0) -}}
+{{- if or (lt $value 1) (gt $value (int64 (index $limit 1))) -}}
+{{- fail (printf "%s must be a whole number of seconds from 1 to %d, got %q" $path (int64 (index $limit 1)) (toString (index $limit 0))) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (not .Values.a2a.cardSigning.secretName) (or .Values.a2a.cardSigning.keyId .Values.a2a.cardSigning.jku) -}}
+{{- fail "a2a.cardSigning.keyId and a2a.cardSigning.jku need a2a.cardSigning.secretName: the signature is off without a key" -}}
+{{- end -}}
+{{- if and .Values.a2a.cardSigning.secretName (not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" (toString .Values.a2a.cardSigning.secretName))) -}}
+{{- fail (printf "a2a.cardSigning.secretName must be the name of a Secret, got %q" (toString .Values.a2a.cardSigning.secretName)) -}}
+{{- end -}}
+{{- range $path, $name := dict "A2A_PUSH_ALLOWED_URLS" (include "coder.a2aPush" .) "A2A_CARD_SIGNING_KEY_FILE" (include "coder.a2aCardSigning" .) -}}
+{{- if and $name (hasKey $.Values.config.extraEnv $path) -}}
+{{- fail (printf "config.extraEnv.%s is set while the a2a.* value that sets it is on: the chart sets it itself" $path) -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.githubMcp.enabled -}}
 {{- $port := int64 .Values.githubMcp.port -}}
 {{- if or (lt $port 1) (gt $port 65535) -}}

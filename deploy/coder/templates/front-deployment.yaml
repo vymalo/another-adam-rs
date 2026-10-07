@@ -62,6 +62,10 @@ spec:
                   name: {{ include "coder.secretName" . }}
                   key: A2A_BEARER_TOKENS
             {{- end }}
+            {{- /* a2a.*: the optional A2A features, off by default. */}}
+            {{- with (include "coder.a2aEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           startupProbe:
             httpGet:
               path: /healthz
@@ -83,6 +87,23 @@ spec:
             timeoutSeconds: 3
           resources:
             {{- toYaml .Values.front.resources | nindent 12 }}
+          {{- if include "coder.a2aCardSigning" . }}
+          volumeMounts:
+            - name: card-signing
+              mountPath: {{ include "coder.a2aCardSigningDir" . }}
+              readOnly: true
+          {{- end }}
+      {{- if include "coder.a2aCardSigning" . }}
+      volumes:
+        - name: card-signing
+          secret:
+            secretName: {{ .Values.a2a.cardSigning.secretName }}
+            # Group-readable by the runtime user (fsGroup); the key is for the coder alone.
+            defaultMode: 0440
+            items:
+              - key: private-key.pem
+                path: private-key.pem
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
