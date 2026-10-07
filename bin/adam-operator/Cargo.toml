@@ -1,0 +1,53 @@
+[package]
+name = "adam-operator"
+description = "The adam-rs operator: the composition root. `run` composes the Kubernetes runtime provider, the Secret store and the controllers; `crdgen` prints the CRDs"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "adam-operator"
+path = "src/main.rs"
+
+[features]
+# What `run` can compose: `runtime-kubernetes`, `store-cnpg` and `registry`. Without a runtime
+# provider the binary still has `crdgen` and `run` says what is missing. Without `store-cnpg` the store is
+# the referenced-Secret one alone, and a service that asks for a cluster is `StoreReady: False`, reason
+# `CNPGNotInstalled`. Without `registry` nothing is served on 8080 and `Listed` says `RegistryDisabled`.
+default = ["runtime-kubernetes", "store-cnpg", "registry"]
+runtime-kubernetes = ["dep:adam-operator-runtime-kubernetes"]
+store-cnpg = ["dep:adam-operator-store-cnpg"]
+registry = ["dep:adam-operator-registry"]
+
+[dependencies]
+adam-operator-api.workspace = true
+adam-operator-controller.workspace = true
+adam-operator-registry = { workspace = true, optional = true }
+adam-operator-runtime-kubernetes = { workspace = true, optional = true }
+adam-operator-store-cnpg = { workspace = true, optional = true }
+adam-operator-store-secret.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap = { workspace = true, features = ["env", "help", "usage", "error-context"] }
+kube.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["ansi"] }
+
+[dev-dependencies]
+adam-operator-domain.workspace = true
+adam-operator-ports.workspace = true
+adam-operator-runtime-kubernetes.workspace = true
+http.workspace = true
+k8s-openapi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tower.workspace = true
+
+[lints]
+workspace = true
