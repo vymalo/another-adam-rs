@@ -110,6 +110,50 @@ model). Renders "true" or nothing, like coder.runsWorkers.
 {{- end -}}
 
 {{/*
+The optional A2A features (values `a2a.*`). Each renders "true" or nothing, like coder.runsWorkers.
+Push notifications are on when the allow-list is not empty; the card signature when a Secret is named.
+*/}}
+{{- define "coder.a2aPush" -}}
+{{- if .Values.a2a.push.allowedUrls -}}true{{- end -}}
+{{- end -}}
+{{- define "coder.a2aCardSigning" -}}
+{{- if .Values.a2a.cardSigning.secretName -}}true{{- end -}}
+{{- end -}}
+{{/* Where the signing key's Secret is mounted. */}}
+{{- define "coder.a2aCardSigningDir" -}}/var/run/secrets/card-signing{{- end -}}
+
+{{/*
+The environment of the optional A2A features, as list items for a container's `env`. Include it only in
+a pod that serves A2A (the combined StatefulSet, the split front).
+*/}}
+{{- define "coder.a2aEnv" -}}
+{{- if include "coder.a2aPush" . }}
+- name: A2A_PUSH_ALLOWED_URLS
+  value: {{ join "," .Values.a2a.push.allowedUrls | quote }}
+{{- if .Values.a2a.push.allowPrivateAddresses }}
+- name: A2A_PUSH_ALLOW_PRIVATE
+  value: "true"
+{{- end }}
+- name: A2A_PUSH_GIVE_UP_AFTER_SECS
+  value: {{ int64 .Values.a2a.push.giveUpAfterSecs | quote }}
+- name: A2A_PUSH_REQUEST_TIMEOUT_SECS
+  value: {{ int64 .Values.a2a.push.requestTimeoutSecs | quote }}
+{{- end }}
+{{- if include "coder.a2aCardSigning" . }}
+- name: A2A_CARD_SIGNING_KEY_FILE
+  value: {{ printf "%s/private-key.pem" (include "coder.a2aCardSigningDir" .) | quote }}
+{{- with .Values.a2a.cardSigning.keyId }}
+- name: A2A_CARD_SIGNING_KEY_ID
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.a2a.cardSigning.jku }}
+- name: A2A_CARD_SIGNING_JKU
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Whether this pod authenticates to GitHub as an App installation: github.auth=app, and the role runs workers
 (a control plane never talks to GitHub). Renders "true" or nothing, like coder.runsWorkers.
 */}}

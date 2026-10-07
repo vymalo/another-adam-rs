@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig};
+use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig, ServerOptions};
 use adam_a2a_runtime::{InboundFn, RuntimeTaskBackend};
 use adam_core::ClaimScope;
 use adam_runtime::{
@@ -167,12 +167,34 @@ impl Service {
     pub fn router(&self, card: AgentCardConfig, auth: AuthConfig) -> Router {
         router(&self.backend, card, auth)
     }
+
+    /// [`router`](Self::router) with `options`: push notifications and the signature of the card.
+    pub fn router_with_options(
+        &self,
+        card: AgentCardConfig,
+        auth: AuthConfig,
+        options: ServerOptions,
+    ) -> Router {
+        router_with_options(&self.backend, card, auth, options)
+    }
 }
 
 /// The A2A router (agent card, JSON-RPC, `/healthz`) over `backend`, for a composition that holds
 /// the runtime and the backend itself.
 pub fn router(backend: &RuntimeTaskBackend, card: AgentCardConfig, auth: AuthConfig) -> Router {
-    A2aServer::router(card, Arc::new(backend.clone()), auth)
+    router_with_options(backend, card, auth, ServerOptions::default())
+}
+
+/// [`router`] with [`ServerOptions`]: push notifications
+/// ([`ServerOptions::with_push`]) and the signature of the card
+/// ([`ServerOptions::with_card_signer`]).
+pub fn router_with_options(
+    backend: &RuntimeTaskBackend,
+    card: AgentCardConfig,
+    auth: AuthConfig,
+    options: ServerOptions,
+) -> Router {
+    A2aServer::router_with_options(card, Arc::new(backend.clone()), auth, options)
 }
 
 #[cfg(test)]

@@ -13,27 +13,48 @@ use a2a::{
     GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
     ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
-    SubscribeToTaskRequest, Task, TaskPushNotificationConfig,
+    SubscribeToTaskRequest, Task, TaskPushNotificationConfig, TaskState,
 };
 use a2a_server::{RequestHandler, ServiceParams};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::{StreamExt, future};
 
+use adam_error::{Classify, ErrorClass};
+
 use crate::activation::{self, HEADER};
 use crate::auth::CALLER_HEADER;
 use crate::backend::{BackendError, Caller, DynTaskBackend, TaskEvent};
+use crate::page::TaskQuery;
+use crate::push::{
+    MAX_CONFIG_ID_LEN, MAX_CONFIGS_PER_TASK, MAX_CREDENTIALS_LEN, MAX_TOKEN_LEN, NewPushConfig,
+    PushCursor, PushStoreError, PushSupport,
+};
 
 /// Serves the A2A 1.0 JSON-RPC methods on top of a [`TaskBackend`](crate::TaskBackend).
 pub(crate) struct BackendHandler {
     backend: DynTaskBackend,
     /// The URIs the card declares: what a request may activate.
     declared: Vec<String>,
+    /// Push notifications, when the deployment turned them on (the policy allows a webhook).
+    push: Option<PushSupport>,
+    /// The extended agent card, when one is configured and the server authenticates.
+    extended: Option<Arc<AgentCard>>,
 }
 
 impl BackendHandler {
-    pub(crate) fn new(backend: DynTaskBackend, declared: Vec<String>) -> Arc<Self> {
-        Arc::new(Self { backend, declared })
+    pub(crate) fn new(
+        backend: DynTaskBackend,
+        declared: Vec<String>,
+        push: Option<PushSupport>,
+        extended: Option<Arc<AgentCard>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            backend,
+            declared,
+            push,
+            extended,
+        })
     }
 
     /// The caller of this request: who the auth middleware vouched for, with the extensions the
@@ -120,15 +141,269 @@ fn validate(request: &SendMessageRequest) -> Result<(), A2AError> {
 }
 
 impl BackendHandler {
+    /// Submit the message, and register the push configuration it carries, if any.
+    ///
+    /// Everything that can be checked without writing is checked **before** the task is created
+    /// (the webhook against the policy, the header values, the cap of configs of a task the message
+    /// continues), so a refused configuration fails the call and leaves no task behind. The
+    /// configuration is registered **after**, against the task that came back, with what the task
+    /// says now as the baseline (a message that was just sent is news to the webhook). If that
+    /// write fails, the call still succeeds with the task: failing it would make the client send
+    /// the message again. The failure is logged (task id and error class, no URL or secret) and the
+    /// client can register the webhook with `CreateTaskPushNotificationConfig`.
     async fn submit(&self, caller: Caller, request: SendMessageRequest) -> Result<Task, A2AError> {
         validate(&request)?;
+        let inline = request
+            .configuration
+            .as_ref()
+            .and_then(|c| c.task_push_notification_config.clone());
+        if let Some(config) = &inline {
+            self.validate_push_config(self.push_support()?, config)?;
+            if let Some(task_id) = request.message.task_id.as_deref().filter(|t| !t.is_empty()) {
+                self.check_config_cap(task_id, config).await?;
+            }
+        }
         let message = request.message;
         let task_id = message.task_id.clone();
         let context_id = message.context_id.clone();
-        Ok(self
+        let task = self
             .backend
-            .submit(caller, message, task_id, context_id)
-            .await?)
+            .submit(caller.clone(), message, task_id, context_id)
+            .await?;
+        if let Some(config) = inline
+            && let Err(failure) = self.register_inline(&caller, &task, config).await
+        {
+            tracing::warn!(
+                task_id = %task.id,
+                class = ?failure.class(),
+                "the push notification config of a message could not be registered; the task was created"
+            );
+        }
+        Ok(task)
+    }
+
+    /// Refuse an inline config that would be the seventeenth of the task the message continues.
+    async fn check_config_cap(
+        &self,
+        task_id: &str,
+        config: &TaskPushNotificationConfig,
+    ) -> Result<(), A2AError> {
+        let id = inline_config_id(config);
+        let existing = self
+            .push_support()?
+            .store()
+            .list(task_id)
+            .await
+            .map_err(|e| push_error(e, task_id))?;
+        if existing.len() >= MAX_CONFIGS_PER_TASK && !existing.iter().any(|r| r.id == id) {
+            return Err(cap_error());
+        }
+        Ok(())
+    }
+
+    fn push_support(&self) -> Result<&PushSupport, A2AError> {
+        self.push
+            .as_ref()
+            .ok_or_else(A2AError::push_notification_not_supported)
+    }
+
+    /// The task, if it is the caller's: another caller's task is not found, as for `GetTask`.
+    async fn owned_task(&self, caller: &Caller, task_id: &str) -> Result<Task, A2AError> {
+        if task_id.is_empty() {
+            return Err(A2AError::invalid_params("taskId is required"));
+        }
+        self.backend
+            .get(caller, task_id)
+            .await?
+            .ok_or_else(|| A2AError::task_not_found(task_id))
+    }
+
+    /// What a webhook configuration must be, before anything is stored.
+    fn validate_push_config(
+        &self,
+        support: &PushSupport,
+        config: &TaskPushNotificationConfig,
+    ) -> Result<(), A2AError> {
+        support
+            .policy()
+            .check(&config.url)
+            .map_err(|refused| A2AError::invalid_params(refused.to_string()))?;
+        if let Some(id) = config.id.as_deref().filter(|id| !id.is_empty()) {
+            let ok = id.len() <= MAX_CONFIG_ID_LEN
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+            if !ok {
+                return Err(A2AError::invalid_params(format!(
+                    "the push config id must be at most {MAX_CONFIG_ID_LEN} characters of letters, digits and - _ . :"
+                )));
+            }
+        }
+        // Everything the deliverer will put in a header must be a header value, now, so the
+        // client hears about it instead of a delivery that fails for ever.
+        let header_ok = |text: &str| reqwest::header::HeaderValue::from_str(text).is_ok();
+        if let Some(token) = &config.token
+            && (token.len() > MAX_TOKEN_LEN || !header_ok(token))
+        {
+            return Err(A2AError::invalid_params(
+                "the push notification token must be a header value of at most 4096 characters",
+            ));
+        }
+        if let Some(auth) = &config.authentication {
+            let scheme_ok = !auth.scheme.is_empty()
+                && auth.scheme.len() <= 64
+                && auth
+                    .scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c));
+            if !scheme_ok {
+                return Err(A2AError::invalid_params(
+                    "the push authentication scheme must be an HTTP authentication scheme name",
+                ));
+            }
+            if let Some(credentials) = &auth.credentials
+                && (credentials.len() > MAX_CREDENTIALS_LEN || !header_ok(credentials))
+            {
+                return Err(A2AError::invalid_params(
+                    "the push credentials must be a header value of at most 4096 characters",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Store `config` for `task`, starting from `cursor`; the config as it is read back.
+    async fn store_push_config(
+        &self,
+        caller: &Caller,
+        task: &Task,
+        mut config: TaskPushNotificationConfig,
+        cursor: PushCursor,
+        replace: bool,
+    ) -> Result<Option<TaskPushNotificationConfig>, PushFailure> {
+        let support = self.push_support().map_err(PushFailure::Refused)?;
+        let id = config
+            .id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let existing = support
+            .store()
+            .list(&task.id)
+            .await
+            .map_err(PushFailure::Store)?;
+        let present = existing.iter().any(|r| r.id == id);
+        if present && !replace {
+            return Ok(None);
+        }
+        if !present && existing.len() >= MAX_CONFIGS_PER_TASK {
+            return Err(PushFailure::Refused(cap_error()));
+        }
+        config.id = Some(id.clone());
+        config.task_id.clone_from(&task.id);
+        config.tenant = None;
+        let record = support
+            .store()
+            .put(NewPushConfig {
+                task_id: task.id.clone(),
+                id,
+                owner: caller.subject.clone(),
+                config,
+                cursor,
+            })
+            .await
+            .map_err(PushFailure::Store)?;
+        // A hint: the deliverer looks at the config now instead of at its next poll.
+        support.nudge.notify_one();
+        Ok(Some(redacted(record.config)))
+    }
+
+    /// The configuration of a `SendMessage` request, registered against the task it created.
+    ///
+    /// An id the task already has is left alone (a repeated request must not reset the cursor
+    /// of the first), and an absent id is derived from the URL, so a repeated request does not
+    /// add a second config for the same webhook.
+    async fn register_inline(
+        &self,
+        caller: &Caller,
+        task: &Task,
+        mut config: TaskPushNotificationConfig,
+    ) -> Result<(), PushFailure> {
+        config.id = Some(inline_config_id(&config));
+        self.store_push_config(caller, task, config, PushCursor::baseline(task), false)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// What a client may read back of a config: everything but the secrets it wrote (the token and
+/// the credentials are write-only).
+fn redacted(mut config: TaskPushNotificationConfig) -> TaskPushNotificationConfig {
+    config.token = None;
+    if let Some(auth) = &mut config.authentication {
+        auth.credentials = None;
+    }
+    config
+}
+
+/// The id of a config a `SendMessage` request gave no id: stable for one URL.
+fn inline_id(url: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(url.as_bytes());
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("inline-{hex}")
+}
+
+/// The id an inline config is stored under: the one it names, else one derived from its URL.
+fn inline_config_id(config: &TaskPushNotificationConfig) -> String {
+    match config.id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_owned(),
+        _ => inline_id(&config.url),
+    }
+}
+
+fn cap_error() -> A2AError {
+    A2AError::invalid_params(format!(
+        "a task may have at most {MAX_CONFIGS_PER_TASK} push notification configs"
+    ))
+}
+
+/// Why a config was not stored.
+enum PushFailure {
+    /// The request was refused (the cap, push switched off).
+    Refused(A2AError),
+    /// The store failed.
+    Store(PushStoreError),
+}
+
+impl PushFailure {
+    fn class(&self) -> ErrorClass {
+        match self {
+            Self::Refused(_) => ErrorClass::Invalid,
+            Self::Store(e) => e.class(),
+        }
+    }
+
+    fn into_a2a(self, task_id: &str) -> A2AError {
+        match self {
+            Self::Refused(e) => e,
+            Self::Store(e) => push_error(e, task_id),
+        }
+    }
+}
+
+/// A push-store failure, as the A2A error the client is told (the cause goes to the log).
+fn push_error(err: PushStoreError, task_id: &str) -> A2AError {
+    match err {
+        PushStoreError::NotFound => A2AError::task_not_found(task_id),
+        PushStoreError::Conflict => A2AError::from(BackendError::unavailable("push store busy")),
+        PushStoreError::Unavailable(source) => A2AError::from(
+            BackendError::unavailable("the push notification store is unavailable")
+                .with_source(source),
+        ),
+        PushStoreError::Internal(source) => A2AError::from(
+            BackendError::internal("the push notification store failed").with_source(source),
+        ),
     }
 }
 
@@ -201,15 +476,42 @@ impl RequestHandler for BackendHandler {
         Ok(trim_history(task, req.history_length))
     }
 
+    #[tracing::instrument(skip_all, fields(method = "ListTasks"))]
     async fn list_tasks(
         &self,
         params: &ServiceParams,
-        _req: ListTasksRequest,
+        req: ListTasksRequest,
     ) -> Result<ListTasksResponse, A2AError> {
-        caller(params)?;
-        Err(A2AError::unsupported_operation(
-            "ListTasks is not supported",
-        ))
+        let caller = self.caller(params, &[])?;
+        let page_size = TaskQuery::resolve_page_size(req.page_size);
+        let include_artifacts = req.include_artifacts.unwrap_or(false);
+        let mut query = TaskQuery::new();
+        query.context_id = req.context_id.filter(|c| !c.is_empty());
+        query.status = req.status.filter(|s| *s != TaskState::Unspecified);
+        query.status_timestamp_after = req.status_timestamp_after;
+        query.page_size = page_size;
+        query.page_token = req.page_token.filter(|t| !t.is_empty());
+        query.include_artifacts = include_artifacts;
+        let page = self.backend.list(&caller, &query).await?;
+        let tasks = page
+            .tasks
+            .into_iter()
+            .map(|mut task| {
+                // The field is omitted entirely, not empty, when artifacts were not asked for
+                // (specification §3.1.4).
+                if !include_artifacts {
+                    task.artifacts = None;
+                }
+                trim_history(task, req.history_length)
+            })
+            .collect();
+        Ok(ListTasksResponse {
+            tasks,
+            // Always present; the empty string on the last page (specification §3.1.4).
+            next_page_token: page.next_page_token.unwrap_or_default(),
+            page_size: i32::try_from(page_size).unwrap_or(i32::MAX),
+            total_size: i32::try_from(page.total_size).unwrap_or(i32::MAX),
+        })
     }
 
     #[tracing::instrument(skip_all, fields(method = "CancelTask", task_id = %req.id))]
@@ -245,50 +547,130 @@ impl RequestHandler for BackendHandler {
         Ok(a2a_stream(self.backend.subscribe(&caller, &req.id)))
     }
 
+    #[tracing::instrument(skip_all, fields(method = "CreateTaskPushNotificationConfig", task_id = %req.task_id))]
     async fn create_push_config(
         &self,
         params: &ServiceParams,
-        _req: TaskPushNotificationConfig,
+        req: TaskPushNotificationConfig,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        caller(params)?;
-        Err(A2AError::push_notification_not_supported())
+        let caller = self.caller(params, &[])?;
+        let support = self.push_support()?;
+        let task = self.owned_task(&caller, &req.task_id).await?;
+        self.validate_push_config(support, &req)?;
+        // What the webhook already knows is what the task is now: only later changes are news.
+        let cursor = PushCursor::baseline(&task);
+        self.store_push_config(&caller, &task, req, cursor, true)
+            .await
+            .map_err(|f| f.into_a2a(&task.id))?
+            .ok_or_else(|| A2AError::internal("internal error"))
     }
 
+    #[tracing::instrument(skip_all, fields(method = "GetTaskPushNotificationConfig", task_id = %req.task_id))]
     async fn get_push_config(
         &self,
         params: &ServiceParams,
-        _req: GetTaskPushNotificationConfigRequest,
+        req: GetTaskPushNotificationConfigRequest,
     ) -> Result<TaskPushNotificationConfig, A2AError> {
-        caller(params)?;
-        Err(A2AError::push_notification_not_supported())
+        let caller = self.caller(params, &[])?;
+        let support = self.push_support()?;
+        let task = self.owned_task(&caller, &req.task_id).await?;
+        support
+            .store()
+            .list(&task.id)
+            .await
+            .map_err(|e| push_error(e, &task.id))?
+            .into_iter()
+            .find(|r| r.id == req.id)
+            .map(|r| redacted(r.config))
+            // "The push notification configuration does not exist" is TaskNotFound (§3.1.8).
+            .ok_or_else(|| A2AError::task_not_found(&req.id))
     }
 
+    #[tracing::instrument(skip_all, fields(method = "ListTaskPushNotificationConfigs", task_id = %req.task_id))]
     async fn list_push_configs(
         &self,
         params: &ServiceParams,
-        _req: ListTaskPushNotificationConfigsRequest,
+        req: ListTaskPushNotificationConfigsRequest,
     ) -> Result<ListTaskPushNotificationConfigsResponse, A2AError> {
-        caller(params)?;
-        Err(A2AError::push_notification_not_supported())
+        let caller = self.caller(params, &[])?;
+        let support = self.push_support()?;
+        let task = self.owned_task(&caller, &req.task_id).await?;
+        let page_size = TaskQuery::resolve_page_size(req.page_size);
+        // The configs are ordered by id and a task has few: the token is the last id of the
+        // page, and the page is what follows it.
+        let after = match req.page_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => Some(decode_config_token(token)?),
+            None => None,
+        };
+        let mut configs: Vec<_> = support
+            .store()
+            .list(&task.id)
+            .await
+            .map_err(|e| push_error(e, &task.id))?
+            .into_iter()
+            .filter(|r| after.as_deref().is_none_or(|a| r.id.as_str() > a))
+            .collect();
+        let more = configs.len() > page_size;
+        configs.truncate(page_size);
+        let next_page_token = more
+            .then(|| configs.last().map(|r| encode_config_token(&r.id)))
+            .flatten();
+        Ok(ListTaskPushNotificationConfigsResponse {
+            configs: configs.into_iter().map(|r| redacted(r.config)).collect(),
+            next_page_token,
+        })
     }
 
+    #[tracing::instrument(skip_all, fields(method = "DeleteTaskPushNotificationConfig", task_id = %req.task_id))]
     async fn delete_push_config(
         &self,
         params: &ServiceParams,
-        _req: DeleteTaskPushNotificationConfigRequest,
+        req: DeleteTaskPushNotificationConfigRequest,
     ) -> Result<(), A2AError> {
-        caller(params)?;
-        Err(A2AError::push_notification_not_supported())
+        let caller = self.caller(params, &[])?;
+        let support = self.push_support()?;
+        let task = self.owned_task(&caller, &req.task_id).await?;
+        // Idempotent: deleting what is not there is not an error (§3.1.10).
+        support
+            .store()
+            .delete(&task.id, &req.id)
+            .await
+            .map(|_| ())
+            .map_err(|e| push_error(e, &task.id))
     }
 
+    #[tracing::instrument(skip_all, fields(method = "GetExtendedAgentCard"))]
     async fn get_extended_agent_card(
         &self,
         params: &ServiceParams,
         _req: GetExtendedAgentCardRequest,
     ) -> Result<AgentCard, A2AError> {
-        caller(params)?;
-        Err(A2AError::extended_card_not_configured())
+        let caller = self.caller(params, &[])?;
+        // Authenticated callers only. The server turns the extended card on only when it
+        // authenticates, so the anonymous caller never reaches a card here; this refuses it all
+        // the same.
+        match &self.extended {
+            Some(card) if caller.subject != Caller::ANONYMOUS => Ok(AgentCard::clone(card)),
+            _ => Err(A2AError::unsupported_operation(
+                "this agent has no extended agent card",
+            )),
+        }
     }
+}
+
+/// A page token of `ListTaskPushNotificationConfigs`: the last id of the page, opaque to clients.
+fn encode_config_token(id: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(id)
+}
+
+fn decode_config_token(token: &str) -> Result<String, A2AError> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .ok_or_else(|| A2AError::invalid_params("invalid page token"))
 }
 
 #[cfg(test)]

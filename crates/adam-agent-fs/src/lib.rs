@@ -58,9 +58,9 @@ pub use manifest::{
     SKILL_RESOURCE_LIMIT, Schedule, Skill, SkillLayout, Strictness, Subagent,
 };
 pub use schema::{
-    AgentFrontmatter, Card, CardSkill, EnvRef, Limits, McpConfig, McpServer, ModelRef, RemoteKind,
-    ScheduleFrontmatter, Segment, SkillFrontmatter, SkillSelection, ToolList, is_agent_name,
-    is_env_name, is_skill_name, is_tool_name, split_env_references,
+    AgentFrontmatter, Card, CardSkill, EnvRef, ExtendedCard, Limits, McpConfig, McpServer,
+    ModelRef, RemoteKind, ScheduleFrontmatter, Segment, SkillFrontmatter, SkillSelection, ToolList,
+    is_agent_name, is_env_name, is_skill_name, is_tool_name, split_env_references,
 };
 pub use source::{Dir, ManifestSource};
 

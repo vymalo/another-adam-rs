@@ -7,8 +7,8 @@ The chart sets these from its values: [chart README](../../deploy/coder/README.m
 files or logs; they are `SecretString`s and absent from `Debug`.
 
 The roles that run workers (`all`, `worker`) read everything below except where a row says otherwise.
-A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR` and
-`ADAM_AGENT_DIR`, and a chart may set the rest for every role.
+A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`,
+`ADAM_AGENT_DIR` and the optional `A2A_PUSH_*` and `A2A_CARD_SIGNING_*`, and a chart may set the rest for every role.
 
 ## Both binaries (`adam-service`)
 
@@ -30,6 +30,21 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLI
 | `MCP_ALLOW_URL_VARS` | allow `${VAR}` in a server `url` (the SDK logs URLs) | `false` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | longest wait for a thread-tool call (1 to 86400) | `3600` |
 | `RUST_LOG` | log filter; JSON logs on stdout; replaces the default whole | `info,rmcp=warn` |
+
+### Optional A2A features (roles that serve A2A: `all`, `control-plane`)
+
+Nothing here is on by default; a role that does not serve A2A reads none of it. A bad value is a startup problem (exit 78).
+[ADR 0030](../decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md), [what a client sees](a2a-server.md).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `A2A_PUSH_ALLOWED_URLS` | **turns push notifications on** and names the webhooks they may reach: comma-separated URL prefixes (`https://hooks.example.com/a2a/`) or hosts (`hooks.example.com`, `*.example.com`, `host:8443`). A client's webhook that matches none, is not `https` or is a private address is refused | unset: off, the card says `pushNotifications: false` |
+| `A2A_PUSH_ALLOW_PRIVATE` | also allow webhooks on loopback, private and link-local addresses, and `http` to loopback. **Development only** | `false` |
+| `A2A_PUSH_GIVE_UP_AFTER_SECS` | how long one notification may keep failing before delivery to that webhook is abandoned (1 to 604800) | `3600` |
+| `A2A_PUSH_REQUEST_TIMEOUT_SECS` | how long one request to a webhook may take (1 to 120) | `15` |
+| `A2A_CARD_SIGNING_KEY_FILE` | a PKCS#8 PEM private key, ECDSA P-256 or Ed25519, that signs the public and the extended card; mount it from a Secret; must exist and be usable | unset: the card is unsigned |
+| `A2A_CARD_SIGNING_KEY_ID` | the signature's `kid`; needs the key file | the key's RFC 7638 thumbprint |
+| `A2A_CARD_SIGNING_JKU` | the `jku` in the signature's header (where clients fetch the key set; the server serves it at `/.well-known/jwks.json`); needs the key file | unset |
 
 ## Agent folder (both binaries)
 

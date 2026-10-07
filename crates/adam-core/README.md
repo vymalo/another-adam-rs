@@ -16,12 +16,14 @@ database driver.
 
 | Item | What |
 |---|---|
-| `Store` (trait) | `migrate`, `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` |
+| `Store` (trait) | `migrate`, `create_run`, `load_run`, `commit_run` (compare-and-swap on `version`), `open_run_for_conversation`, `journal_get`/`journal_put`/`journal_list`, `claim_due` (with a `ClaimScope` and the runs the caller is `busy` with), `renew_lease`, `release_lease`, `lease_until` (when a run's lease ends, if it has one), `purge_finished` (also deletes the push configs of the runs it purges), `list_runs` and `count_runs` (a caller's runs, newest update first, by keyset: `RunQuery`, `ConversationScope`), and the five **push-notification** methods `push_put`, `push_list`, `push_delete`, `push_claim_due`, `push_commit` (see *Push configurations*) |
 | `DynStore` | `Arc<dyn Store>`, the handle the runtime holds |
 | `RunRecord`, `NewRun`, `RunUpdate`, `RunStatus`, `RunId` | a run and how to create or advance one |
 | `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
 | `ClaimScope` | `Any` (default) or `Pinned`, the scope of a `claim_due`. Closed: no `#[non_exhaustive]` |
 | `Lease` | a run claimed by a worker until a deadline |
+| `RunQuery`, `ConversationScope` | what `list_runs` and `count_runs` select: always scoped (`Prefix` of an owner's conversations, or `Exact`), optionally by run statuses and last update, one page after a `(updated_at, id)` position |
+| `NewPushConfig`, `PushRecord`, `PushProgress`, `PushState` | an A2A push-notification configuration and how far its delivery got; `PushState` (`Active`, `Done`, `GaveUp`) is closed on purpose |
 | `StoreError`, `StoreResult` | `AlreadyExists`, `NotFound`, `Conflict`, `ConversationBusy`, `NonDeterminism`, `InvalidInput`, `Corrupt`, `Backend { class, source }`; `#[non_exhaustive]`, see *Errors* |
 | `MemoryStore` | in-memory `Store`, the reference implementation of the suite |
 | `testing` (`#[doc(hidden)]`) | `test_env`, `skipped`, `require_db`: gate for database-backed tests, not part of the supported API |
@@ -61,6 +63,38 @@ about `Placement`; the host maps `Placement::pins_runs()` to `ClaimScope::Pinned
 ([`adam-host`](../adam-host/README.md)). The signature change is breaking for anyone who
 implements `Store`; the conformance cases in
 [`adam-store-testkit`](../adam-store-testkit/README.md) prove an implementation.
+
+## Listing runs
+
+`Store::list_runs(&RunQuery)` returns one page of runs ordered by `updated_at` descending and then `id` descending (what A2A's
+`ListTasks` needs: most recently updated first, made total by the id), starting strictly after `query.after`, and
+`Store::count_runs` how many match the filters (ignoring `after` and `limit`). The scope is required, so a listing cannot leak
+another owner's runs by leaving a filter out: `ConversationScope::Prefix` for everything of an owner (the A2A server uses
+`<subject>:`), `Exact` for one conversation. Every adapter serves a page from an index (Postgres compares the conversation id
+in the `"C"` collation so a prefix is a range, MongoDB uses an anchored escaped prefix). Two more **required** `Store` methods:
+breaking for implementers, proved by the `list_runs_*` and `count_runs_*` conformance cases.
+
+## Push configurations
+
+A2A push notifications must survive a restart and a second replica, so the webhook a client
+registered for a task, and how far its delivery got, are kept in the store beside the run
+([ADR 0030](../../docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md)).
+The store knows nothing of A2A: `config` and `cursor` are opaque JSON, and what it owns is the
+scheduling, as for runs.
+
+| Method | What |
+|---|---|
+| `push_put(NewPushConfig)` | create or replace `(run, id)`; the run must exist (`NotFound`). New: `Active`, version 1, due at once. Replacing resets state, attempts and error, drops the lease and bumps the version |
+| `push_list(run)` | the run's configs, by id |
+| `push_delete(run, id)` | idempotent; whether it existed |
+| `push_claim_due(agents, worker, now, ttl, limit)` | lease active configs that are due, earliest `next_attempt_at` first; exclusive while the lease lives |
+| `push_commit(run, id, expected_version, PushProgress)` | compare-and-swap on the version, drops the lease; `Conflict` on a stale version, `NotFound` when deleted |
+
+A config goes with its run (`purge_finished`). **The store holds what the client gave it, webhook
+credentials included, and does not encrypt them**: protect the database like the runs. The five
+methods are new **required** methods of `Store`: breaking for anyone who implements it (the
+conformance cases `push_*` in [`adam-store-testkit`](../adam-store-testkit/README.md) prove an
+implementation).
 
 ## Runs the caller is stepping
 
@@ -106,7 +140,7 @@ instead of skipping.
 
 ## Tests
 
-`MemoryStore` is run through the conformance suite by
+`MemoryStore` (which implements the push methods too) is run through the conformance suite by
 `crates/adam-store-testkit/tests/memory.rs`. Behavioural tests of the types
 live next to the code; those in `src/store/mod.rs` (`class_table`,
 `retryable_is_derived_from_the_class`,

@@ -85,6 +85,25 @@ read the exact strings in the file at your rev.
   skip without `ADAM_TEST_POSTGRES_URL`; `ADAM_TEST_REQUIRE_DB=1` makes a skip a failure).
 * `node tools/docs-check/check-docs.mjs` after editing docs.
 
+## Beyond extensions: what the plain A2A 1.0 server supports
+
+Not extensions, so nothing to activate; each is **off until the deployment turns it on, and the card says so**. Read the
+card before you call (`capabilities.pushNotifications`, `capabilities.extendedAgentCard`, `signatures`):
+
+* **Push notifications** (`CreateTaskPushNotificationConfig`, `Get`, `List`, `Delete`, or `configuration.taskPushNotificationConfig`
+  in a send): on when the deployment sets `A2A_PUSH_ALLOWED_URLS`; your webhook must be on its list and `https`. A
+  notification is a hint, `GetTask` is the truth; delivery is at least once, a state between two polls can be skipped, and
+  after a bounded time of failures it stops. `token` and `credentials` are write-only. See `crates/adam-a2a/src/push/mod.rs`
+  and `docs/reference/a2a-server.md`.
+* **`ListTasks`**: your own tasks only, newest first, by an opaque cursor that works only for the same caller and filters;
+  `totalSize` is exact without a status filter and for `completed`, an upper bound otherwise.
+* **`GetExtendedAgentCard`**: authenticated callers only, when the agent folder has `card.extended`.
+* **Card signatures**: a JWS (ES256 or EdDSA) over the RFC 8785 canonical card, key set at `/.well-known/jwks.json`;
+  verify with `adam_a2a::VerifyingKey` (`crates/adam-a2a/src/signing.rs`). Agreement with other SDKs' canonical payloads is
+  unverified.
+
+Decision: `docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md`.
+
 ## Pitfalls
 
 * An extension not named by the client is off: `steps/v1` and `text-stream/v1` send plain text

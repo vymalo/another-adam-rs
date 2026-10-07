@@ -1,0 +1,408 @@
+---
+# Source: coder/templates/networkpolicy.yaml
+# Ingress only from the orchestrator's namespace. Egress is not restricted: the
+# agent needs git hosts, the model gateway and package registries.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: coder
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: coder
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - coder
+          - coder-front
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: another-agentic-system
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# Source: coder/templates/service.yaml
+# ClusterIP only, never exposed: the orchestrator reaches it in-cluster over A2A
+# with a bearer token. This is also the StatefulSet's governing service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: coder
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: coder-front
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/component: front
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+# Source: coder/templates/front-deployment.yaml
+# topology=split: the control plane (ROLE=control-plane) serves A2A and starts,
+# delivers to, cancels and views runs. It needs neither the model, GitHub nor a
+# workspace, so it has no volume; the worker StatefulSet runs the steps.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coder-front
+  labels:
+    app.kubernetes.io/name: coder-front
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/component: front
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coder-front
+      app.kubernetes.io/instance: coder
+      app.kubernetes.io/component: front
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: coder-front
+        app.kubernetes.io/instance: coder
+        app.kubernetes.io/component: front
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: coder
+          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            - name: ROLE
+              value: "control-plane"
+            - name: PUBLIC_URL
+              value: "http://coder.coder-ns.svc.cluster.local:8080/"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  # Created by CloudNativePG for the app database and owner.
+                  name: coder-db-app
+                  key: uri
+            - name: A2A_BEARER_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: coder
+                  key: A2A_BEARER_TOKENS
+            - name: A2A_PUSH_ALLOWED_URLS
+              value: "hooks.example.com"
+            - name: A2A_PUSH_GIVE_UP_AFTER_SECS
+              value: "3600"
+            - name: A2A_PUSH_REQUEST_TIMEOUT_SECS
+              value: "15"
+            - name: A2A_CARD_SIGNING_KEY_FILE
+              value: "/var/run/secrets/card-signing/private-key.pem"
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            limits:
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: card-signing
+              mountPath: /var/run/secrets/card-signing
+              readOnly: true
+      volumes:
+        - name: card-signing
+          secret:
+            secretName: coder-card-key
+            # Group-readable by the runtime user (fsGroup); the key is for the coder alone.
+            defaultMode: 0440
+            items:
+              - key: private-key.pem
+                path: private-key.pem
+---
+# Source: coder/templates/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: coder
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  replicas: 1
+  serviceName: coder
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coder
+      app.kubernetes.io/instance: coder
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: coder
+        app.kubernetes.io/instance: coder
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: github-mcp
+          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+          imagePullPolicy: IfNotPresent
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          command: ["tini", "--", "github-mcp-server"]
+          args:
+            - http
+            - --read-only
+            - --toolsets
+            - context,repos,issues,pull_requests
+            - --listen-host
+            - 127.0.0.1
+            - --port
+            - "8082"
+          startupProbe:
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8082"]
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            limits:
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      containers:
+        - name: coder
+          image: "ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:8080"
+            - name: WORKSPACE_ROOT
+              value: /work
+            - name: ROLE
+              value: "worker"
+            - name: MODEL_BASE_URL
+              value: "https://gateway.example.invalid/v1"
+            - name: MODEL
+              value: "coder"
+            - name: OPENCODE_MODEL
+              value: "coder"
+            - name: WORKERS
+              value: "4"
+            - name: MAX_CHECK_CYCLES
+              value: "3"
+            - name: CHECK_TIMEOUT_SECS
+              value: "900"
+            - name: WORKSPACE_SWEEP_SECS
+              value: "300"
+            - name: MCP_ALLOW_STDIO
+              value: "true"
+            - name: GITHUB_MCP_URL
+              value: "http://127.0.0.1:8082"
+            - name: ALLOWED_REPO_HOSTS
+              value: "github.com"
+            - name: GITHUB_API_URL
+              value: "https://api.github.com"
+            - name: PR_DRAFT
+              value: "false"
+            - name: GIT_AUTHOR_NAME
+              value: "adam-coder"
+            - name: GIT_AUTHOR_EMAIL
+              value: "adam-coder@users.noreply.github.com"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  # Created by CloudNativePG for the app database and owner.
+                  name: coder-db-app
+                  key: uri
+            - name: MODEL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: coder
+                  key: MODEL_API_KEY
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: coder
+                  key: GITHUB_TOKEN
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 40
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            limits:
+              memory: 6Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+  volumeClaimTemplates:
+    - metadata:
+        name: work
+        labels:
+          app.kubernetes.io/name: coder
+          app.kubernetes.io/instance: coder
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: "longhorn"
+        resources:
+          requests:
+            storage: "20Gi"
+---
+# Source: coder/templates/cnpg-cluster.yaml
+# The coder's own Postgres. CloudNativePG creates the database, its owner and
+# the Secret `<name>-app` (key `uri` is the connection string the pod uses).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: coder-db
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  instances: 1
+  storage:
+    size: "5Gi"
+    storageClass: "longhorn"
+  bootstrap:
+    initdb:
+      database: adam
+      owner: adam
+---
+# Source: coder/templates/externalsecret.yaml
+# Secret values live in AWS Secrets Manager (`prod/meta/test-app`)
+# and are copied into a Secret by External Secrets; none is in this chart.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: coder
+  labels:
+    app.kubernetes.io/name: coder
+    app.kubernetes.io/instance: coder
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    helm.sh/chart: coder-0.4.0
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: ssegning-aws
+    kind: ClusterSecretStore
+  target:
+    name: coder
+    creationPolicy: Owner
+  data:
+    - secretKey: MODEL_API_KEY
+      remoteRef:
+        key: prod/meta/test-app
+        property: adam_coder_model_api_key
+    - secretKey: GITHUB_TOKEN
+      remoteRef:
+        key: prod/meta/test-app
+        property: adam_coder_github_token
+    - secretKey: A2A_BEARER_TOKENS
+      remoteRef:
+        key: prod/meta/test-app
+        property: adam_coder_a2a_bearer_tokens

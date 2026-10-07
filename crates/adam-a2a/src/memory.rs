@@ -27,6 +27,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::backend::{BackendError, Caller, TaskBackend, TaskEvent, state_ends_stream};
+use crate::page::{PageToken, TaskPage, TaskQuery};
 
 /// Marker that sends a task to `input-required` after it starts working.
 pub const INPUT_REQUIRED_MARKER: &str = "[input-required]";
@@ -355,6 +356,53 @@ impl TaskBackend for InMemoryBackend {
             }
         }
         Ok(entry.task.clone())
+    }
+
+    async fn list(&self, caller: &Caller, query: &TaskQuery) -> Result<TaskPage, BackendError> {
+        let after = query
+            .page_token
+            .as_deref()
+            .map(|t| PageToken::decode(t, caller, query))
+            .transpose()?;
+        // Last update, in milliseconds: the order, and the position a token stands for.
+        let key = |task: &Task| {
+            (
+                task.status.timestamp.map_or(0, |t| t.timestamp_millis()),
+                task.id.clone(),
+            )
+        };
+        let mut matching: Vec<Task> = self
+            .inner
+            .lock()
+            .values()
+            .filter(|e| e.owner == caller.subject)
+            .map(|e| &e.task)
+            .filter(|t| query.context_id.as_ref().is_none_or(|c| &t.context_id == c))
+            .filter(|t| query.status.as_ref().is_none_or(|s| &t.status.state == s))
+            .filter(|t| {
+                query
+                    .status_timestamp_after
+                    .is_none_or(|after| t.status.timestamp.is_some_and(|ts| ts >= after))
+            })
+            .cloned()
+            .collect();
+        matching.sort_by_key(|t| std::cmp::Reverse(key(t)));
+        let total_size = matching.len();
+        if let Some(after) = &after {
+            let position = (after.updated_at.timestamp_millis(), after.id.clone());
+            matching.retain(|t| key(t) < position);
+        }
+        let more = matching.len() > query.page_size;
+        matching.truncate(query.page_size);
+        let next = more.then(|| matching.last()).flatten().and_then(|last| {
+            last.status
+                .timestamp
+                .map(|ts| PageToken::encode(caller, query, ts, &last.id))
+        });
+        for task in &mut matching {
+            task.history = None;
+        }
+        Ok(TaskPage::new(matching, next, total_size))
     }
 
     fn subscribe(

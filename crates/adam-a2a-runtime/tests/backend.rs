@@ -34,7 +34,8 @@ const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2
 /// * `[hold]`: parks on a far timer (so it is `working` until cancelled);
 /// * `[fail]`: fails with `boom`;
 /// * `[file]`: like (none), and also shares the file `logo.svg`;
-/// * `[reject]`: `init` refuses the start message, like an agent that cannot read it.
+/// * `[reject]`: `init` refuses the start message, like an agent that cannot read it;
+/// * `[slow]`: waits 1 s in its first step, before it does what the other markers say.
 ///
 /// A task started as the continuation of another lists the texts of the tasks before it in
 /// `state.earlier`.
@@ -111,6 +112,11 @@ impl Agent for Scripted {
     async fn step(&self, ctx: &mut Ctx, mut state: Value) -> Result<Transition<Value>, AgentError> {
         let text = state["text"].as_str().unwrap_or_default().to_owned();
         let phase = state["phase"].as_u64().unwrap_or(0);
+        if text.contains("[slow]") && phase == 0 {
+            // Long enough that a client that registers a webhook with its message does so while the
+            // task is still running, whatever the speed of the machine.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
         if text.contains("[fail]") {
             return Ok(Transition::Fail {
                 state,
@@ -2251,4 +2257,672 @@ async fn references_that_all_miss_leave_one_line_with_counts_and_no_foreign_ids(
     assert!(text.contains("..."), "{text}");
     wait_state(&rig, &alice(), &t.id, TaskState::Completed).await;
     worker.stop().await;
+}
+
+// ------------------------------------------------------------------ ListTasks
+
+mod listing {
+    use adam_a2a::{PageToken, TaskQuery};
+
+    use super::*;
+
+    async fn submit(rig: &Rig, who: &Caller, text: &str, context: &str) -> Task {
+        let mut message = user(text);
+        message.message_id = format!("m-{}", RunId::new());
+        rig.backend
+            .submit(who.clone(), message, None, Some(context.into()))
+            .await
+            .expect("submit")
+    }
+
+    async fn listed(rig: &Rig, who: &Caller, query: &TaskQuery) -> adam_a2a::TaskPage {
+        rig.backend.list(who, query).await.expect("list")
+    }
+
+    fn ids(page: &adam_a2a::TaskPage) -> Vec<String> {
+        page.tasks.iter().map(|t| t.id.clone()).collect()
+    }
+
+    fn with_status(state: TaskState) -> TaskQuery {
+        let mut q = TaskQuery::new();
+        q.status = Some(state);
+        q
+    }
+
+    /// Every page of `query`, `size` at a time, until there is no token: the ids in order.
+    async fn walk(rig: &Rig, who: &Caller, mut query: TaskQuery, size: usize) -> Vec<String> {
+        query.page_size = size;
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            let page = listed(rig, who, &query).await;
+            assert!(page.tasks.len() <= size);
+            seen.extend(ids(&page));
+            match page.next_page_token {
+                Some(token) => query.page_token = Some(token),
+                None => return seen,
+            }
+        }
+        panic!("the cursor never ended: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn the_callers_tasks_come_newest_first_filtered_by_the_state_a_client_sees() {
+        let rig = Rig::new();
+        // Without a worker, tasks stay `submitted`.
+        let s1 = submit(&rig, &alice(), "one", "ctx-a").await;
+        let s2 = submit(&rig, &alice(), "two", "ctx-b").await;
+        let submitted = listed(&rig, &alice(), &with_status(TaskState::Submitted)).await;
+        assert_eq!(submitted.tasks.len(), 2);
+        assert_eq!(submitted.total_size, 2);
+        assert!(
+            listed(&rig, &alice(), &with_status(TaskState::Working))
+                .await
+                .tasks
+                .is_empty()
+        );
+
+        let worker = rig.worker();
+        wait_state(&rig, &alice(), &s1.id, TaskState::Completed).await;
+        wait_state(&rig, &alice(), &s2.id, TaskState::Completed).await;
+        let done = submit(&rig, &alice(), "three", "ctx-a").await;
+        wait_state(&rig, &alice(), &done.id, TaskState::Completed).await;
+        let failed = submit(&rig, &alice(), "[fail] x", "ctx-a").await;
+        wait_state(&rig, &alice(), &failed.id, TaskState::Failed).await;
+        let canceled = submit(&rig, &alice(), "[hold] y", "ctx-b").await;
+        wait_state(&rig, &alice(), &canceled.id, TaskState::Working).await;
+        rig.backend.cancel(&alice(), &canceled.id).await.unwrap();
+        let working = submit(&rig, &alice(), "[hold] z", "ctx-a").await;
+        wait_state(&rig, &alice(), &working.id, TaskState::Working).await;
+        let input = submit(&rig, &alice(), "[input] w", "ctx-b").await;
+        wait_state(&rig, &alice(), &input.id, TaskState::InputRequired).await;
+
+        let all = listed(&rig, &alice(), &TaskQuery::new()).await;
+        assert_eq!(all.tasks.len(), 7);
+        assert_eq!(all.total_size, 7);
+        assert!(all.next_page_token.is_none());
+        let stamps: Vec<_> = all
+            .tasks
+            .iter()
+            .map(|t| t.status.timestamp.unwrap())
+            .collect();
+        assert!(
+            stamps.windows(2).all(|w| w[0] >= w[1]),
+            "newest update first: {stamps:?}"
+        );
+
+        // Each state is told from the others, including the two that are one run status.
+        let only = |state, expected: &[&Task]| {
+            let rig = &rig;
+            let want: Vec<String> = expected.iter().map(|t| t.id.clone()).collect();
+            async move {
+                let page = listed(rig, &alice(), &with_status(state)).await;
+                let mut got = ids(&page);
+                let mut want = want;
+                got.sort();
+                want.sort();
+                assert_eq!(got, want);
+                page
+            }
+        };
+        let completed = only(TaskState::Completed, &[&s1, &s2, &done]).await;
+        assert_eq!(completed.total_size, 3, "exact for completed");
+        let failed_page = only(TaskState::Failed, &[&failed]).await;
+        assert!(
+            failed_page.total_size >= 1,
+            "an upper bound for the states that share a run status"
+        );
+        only(TaskState::Canceled, &[&canceled]).await;
+        only(TaskState::Working, &[&working]).await;
+        only(TaskState::InputRequired, &[&input]).await;
+        only(TaskState::Submitted, &[]).await;
+        only(TaskState::Rejected, &[]).await;
+
+        // By context.
+        let mut ctx = TaskQuery::new();
+        ctx.context_id = Some("ctx-a".into());
+        let page = listed(&rig, &alice(), &ctx).await;
+        let mut got = ids(&page);
+        got.sort();
+        let mut want = vec![
+            s1.id.clone(),
+            done.id.clone(),
+            failed.id.clone(),
+            working.id.clone(),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(page.total_size, 4);
+        assert!(page.tasks.iter().all(|t| t.context_id == "ctx-a"));
+
+        // By the time of the last change.
+        let mut after = TaskQuery::new();
+        after.status_timestamp_after = Some(input.status.timestamp.unwrap());
+        let page = listed(&rig, &alice(), &after).await;
+        assert!(page.tasks.iter().any(|t| t.id == input.id));
+        assert!(
+            page.tasks
+                .iter()
+                .all(|t| t.status.timestamp.unwrap() >= input.status.timestamp.unwrap())
+        );
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn pages_walk_the_whole_list_once_and_a_filter_that_needs_the_state_pages_too() {
+        let rig = Rig::new();
+        let worker = rig.worker();
+        let mut made = Vec::new();
+        for i in 0..5 {
+            let t = submit(&rig, &alice(), &format!("job {i}"), "ctx").await;
+            wait_state(&rig, &alice(), &t.id, TaskState::Completed).await;
+            made.push(t.id);
+        }
+        // Failures and cancellations interleaved: both are `failed` runs, one is told apart by
+        // reading it.
+        let mut failed = Vec::new();
+        let mut canceled = Vec::new();
+        for i in 0..3 {
+            let f = submit(&rig, &alice(), &format!("[fail] {i}"), "ctx").await;
+            wait_state(&rig, &alice(), &f.id, TaskState::Failed).await;
+            failed.push(f.id);
+            let c = submit(&rig, &alice(), &format!("[hold] {i}"), "ctx").await;
+            wait_state(&rig, &alice(), &c.id, TaskState::Working).await;
+            rig.backend.cancel(&alice(), &c.id).await.unwrap();
+            canceled.push(c.id);
+        }
+        let everything = walk(&rig, &alice(), TaskQuery::new(), 100).await;
+        assert_eq!(everything.len(), 11);
+        for size in [1, 2, 3, 4, 10] {
+            assert_eq!(
+                walk(&rig, &alice(), TaskQuery::new(), size).await,
+                everything,
+                "page size {size}"
+            );
+        }
+        for (state, expected) in [
+            (TaskState::Failed, &failed),
+            (TaskState::Canceled, &canceled),
+            (TaskState::Completed, &made),
+        ] {
+            let mut got = walk(&rig, &alice(), with_status(state.clone()), 1).await;
+            got.sort();
+            let mut want = expected.clone();
+            want.sort();
+            assert_eq!(got, want, "{state:?} one at a time");
+        }
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_caller_never_sees_another_callers_tasks_counts_or_cursors() {
+        let rig = Rig::new();
+        let worker = rig.worker();
+        for i in 0..3 {
+            let t = submit(&rig, &alice(), &format!("a{i}"), "shared-ctx").await;
+            wait_state(&rig, &alice(), &t.id, TaskState::Completed).await;
+        }
+        let bobs = submit(&rig, &bob(), "b", "shared-ctx").await;
+        wait_state(&rig, &bob(), &bobs.id, TaskState::Completed).await;
+
+        let theirs = listed(&rig, &bob(), &TaskQuery::new()).await;
+        assert_eq!(ids(&theirs), vec![bobs.id.clone()]);
+        assert_eq!(theirs.total_size, 1);
+        let mut ctx = TaskQuery::new();
+        ctx.context_id = Some("shared-ctx".into());
+        assert_eq!(listed(&rig, &bob(), &ctx).await.tasks.len(), 1);
+        assert_eq!(listed(&rig, &alice(), &ctx).await.tasks.len(), 3);
+        // The anonymous caller is a subject of its own.
+        assert!(
+            listed(&rig, &Caller::anonymous(), &TaskQuery::new())
+                .await
+                .tasks
+                .is_empty()
+        );
+
+        // Alice's cursor is refused for Bob, and a forged position stays inside the forger's tasks.
+        let mut q = TaskQuery::new();
+        q.page_size = 1;
+        let token = listed(&rig, &alice(), &q)
+            .await
+            .next_page_token
+            .expect("more");
+        q.page_token = Some(token);
+        let err = rig.backend.list(&bob(), &q).await.unwrap_err();
+        assert!(matches!(err, BackendError::InvalidParams(m) if m == "invalid page token"));
+        let mut forged = TaskQuery::new();
+        forged.page_token = Some(PageToken::encode(
+            &bob(),
+            &TaskQuery::new(),
+            chrono::Utc::now() + chrono::Duration::days(1),
+            &RunId::new().to_string(),
+        ));
+        let page = listed(&rig, &bob(), &forged).await;
+        assert!(
+            page.tasks.iter().all(|t| t.id == bobs.id),
+            "only Bob's own task can come back"
+        );
+        // A token with an id that is no run id is refused the same way.
+        let mut bad = TaskQuery::new();
+        bad.page_token = Some(PageToken::encode(
+            &bob(),
+            &TaskQuery::new(),
+            chrono::Utc::now(),
+            "not-a-uuid",
+        ));
+        assert!(matches!(
+            rig.backend.list(&bob(), &bad).await.unwrap_err(),
+            BackendError::InvalidParams(_)
+        ));
+        worker.stop().await;
+    }
+
+    #[tokio::test]
+    async fn another_agents_runs_in_the_same_store_are_not_listed() {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let ours = Rig::over_as(store.clone(), "listing-ours");
+        let theirs = Rig::over_as(store, "listing-theirs");
+        let worker = theirs.worker();
+        let t = submit(&theirs, &alice(), "x", "ctx").await;
+        wait_state(&theirs, &alice(), &t.id, TaskState::Completed).await;
+        assert!(
+            listed(&ours, &alice(), &TaskQuery::new())
+                .await
+                .tasks
+                .is_empty()
+        );
+        assert_eq!(
+            listed(&theirs, &alice(), &TaskQuery::new())
+                .await
+                .tasks
+                .len(),
+            1
+        );
+        worker.stop().await;
+    }
+}
+
+// ------------------------------------------------------------------ push notifications
+
+mod push {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    use a2a::{
+        AuthenticationInfo, SendMessageConfiguration, SendMessageRequest, SendMessageResponse,
+        TaskPushNotificationConfig,
+    };
+    use a2a_client::A2AClientFactory;
+    use a2a_client::agent_card::AgentCardResolver;
+    use a2a_client::auth::AuthInterceptor;
+    use adam_a2a::ServerOptions;
+    use adam_a2a::push::{PushDeliveryOptions, PushPolicy, PushSupport};
+    use secrecy::SecretString;
+
+    use super::*;
+
+    struct Webhook {
+        port: u16,
+        status: Arc<AtomicU16>,
+        bodies: Arc<Mutex<Vec<(u16, Value)>>>,
+    }
+
+    impl Webhook {
+        async fn start() -> Self {
+            let status = Arc::new(AtomicU16::new(200));
+            let bodies = Arc::new(Mutex::new(Vec::new()));
+            let (s, b) = (status.clone(), bodies.clone());
+            let app = axum::Router::new().route(
+                "/hook",
+                axum::routing::post(move |body: axum::body::Bytes| {
+                    let (s, b) = (s.clone(), b.clone());
+                    async move {
+                        let code = s.load(Ordering::SeqCst);
+                        let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        b.lock().unwrap().push((code, value));
+                        axum::http::StatusCode::from_u16(code).unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                port,
+                status,
+                bodies,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}/hook", self.port)
+        }
+
+        fn requests(&self) -> usize {
+            self.bodies.lock().unwrap().len()
+        }
+
+        fn accepted(&self) -> Vec<String> {
+            self.bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(code, _)| (200..300).contains(code))
+                .map(|(_, v)| {
+                    if let Some(s) = v.get("statusUpdate") {
+                        format!("status:{}", s["status"]["state"].as_str().unwrap_or("?"))
+                    } else if let Some(a) = v.get("artifactUpdate") {
+                        format!(
+                            "artifact:{}",
+                            a["artifact"]["parts"][0]["text"].as_str().unwrap_or("?")
+                        )
+                    } else {
+                        "other".to_owned()
+                    }
+                })
+                .collect()
+        }
+    }
+
+    /// One replica: a server over its own runtime and backend, the push loop, and a worker.
+    struct Replica {
+        addr: std::net::SocketAddr,
+        server: tokio::task::JoinHandle<()>,
+        delivery: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::task::JoinHandle<()>,
+        )>,
+        worker: Option<Worker>,
+        rig: Rig,
+    }
+
+    impl Replica {
+        async fn start(rig: Rig, hook: &Webhook) -> Self {
+            let policy = PushPolicy::new([format!("127.0.0.1:{}", hook.port)])
+                .unwrap()
+                .allow_private_addresses(true);
+            // The durable store: configs and delivery progress live beside the runs.
+            let push = PushSupport::new(Arc::new(rig.backend.push_store()), policy);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let card = AgentCardConfig::new(
+                "scripted",
+                "Scripted test agent",
+                format!("http://{addr}/").parse().unwrap(),
+                "0.1.0",
+            );
+            let app = A2aServer::router_with_options(
+                card,
+                Arc::new(rig.backend.clone()),
+                AuthConfig::BearerTokens(vec![SecretString::from("t0")]),
+                ServerOptions::default().with_push(push.clone()),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let options = PushDeliveryOptions::new()
+                .with_poll_interval(Duration::from_millis(10))
+                .with_backoff(Duration::from_millis(10), Duration::from_millis(40))
+                .with_give_up_after(Duration::from_secs(60));
+            let deliverer = push
+                .deliverer(Arc::new(rig.backend.clone()), options)
+                .unwrap();
+            let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                deliverer
+                    .run(async {
+                        let _ = rx.await;
+                    })
+                    .await;
+            });
+            let worker = Some(rig.worker());
+            Self {
+                addr,
+                server,
+                delivery: Some((stop, handle)),
+                worker,
+                rig,
+            }
+        }
+
+        /// What a crash or a deploy does: the loop, the worker and the server stop.
+        async fn stop(mut self) -> Rig {
+            if let Some((stop, handle)) = self.delivery.take() {
+                let _ = stop.send(());
+                let _ = handle.await;
+            }
+            if let Some(worker) = self.worker.take() {
+                worker.stop().await;
+            }
+            self.server.abort();
+            self.rig
+        }
+
+        async fn client(&self) -> a2a_client::A2AClient<Box<dyn a2a_client::Transport>> {
+            let card = AgentCardResolver::new(None)
+                .resolve(&format!("http://{}", self.addr))
+                .await
+                .unwrap();
+            A2AClientFactory::builder()
+                .with_interceptor(Arc::new(AuthInterceptor::bearer("t0")))
+                .build()
+                .create_from_card(&card)
+                .await
+                .unwrap()
+        }
+    }
+
+    fn request(text: &str, task_id: Option<&str>, hook: Option<&Webhook>) -> SendMessageRequest {
+        let mut message = user(text);
+        message.message_id = format!("m-{}", RunId::new());
+        message.task_id = task_id.map(str::to_owned);
+        SendMessageRequest {
+            message,
+            configuration: Some(SendMessageConfiguration {
+                accepted_output_modes: None,
+                task_push_notification_config: hook.map(|h| TaskPushNotificationConfig {
+                    url: h.url(),
+                    id: None,
+                    task_id: String::new(),
+                    token: Some("tok-1".into()),
+                    authentication: Some(AuthenticationInfo {
+                        scheme: "Bearer".into(),
+                        credentials: Some("cred-1".into()),
+                    }),
+                    tenant: None,
+                }),
+                history_length: None,
+                return_immediately: Some(true),
+            }),
+            metadata: None,
+            tenant: None,
+        }
+    }
+
+    async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+        for _ in 0..1000 {
+            if ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test]
+    async fn notifications_survive_a_restart_because_the_store_keeps_the_configs_and_the_progress()
+    {
+        restart_scenario(Arc::new(MemoryStore::new()), "scripted").await;
+    }
+
+    /// The same, over PostgreSQL: the configs, the pending event and the version live in the database.
+    #[tokio::test]
+    async fn notifications_survive_a_restart_over_postgres_too() {
+        let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let store = adam_store_postgres::PgStore::connect(&url)
+            .await
+            .expect("connect to postgres");
+        adam_core::Store::migrate(&store).await.expect("migrate");
+        let agent = format!("push-restart-{}", RunId::new().0.simple());
+        restart_scenario(Arc::new(store), &agent).await;
+    }
+
+    async fn restart_scenario(store: DynStore, agent: &str) {
+        let hook = Webhook::start().await;
+        hook.status.store(503, Ordering::SeqCst); // the webhook is down
+
+        let first = Replica::start(Rig::over_as(store.clone(), agent), &hook).await;
+        let client = first.client().await;
+        let SendMessageResponse::Task(task) = client
+            .send_message(&request("[input] pick [slow]", None, Some(&hook)))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a task")
+        };
+        // The task reaches `input-required` while the webhook keeps failing.
+        wait_state(&first.rig, &alice(), &task.id, TaskState::InputRequired).await;
+        until("a failed attempt", || hook.requests() >= 2).await;
+        assert!(hook.accepted().is_empty());
+        // Replica 1 goes away (loop, worker, server); a new one starts over the same store.
+        first.stop().await;
+        let state = store
+            .push_list(RunId(task.id.parse().unwrap()))
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            state.state,
+            adam_core::PushState::Active,
+            "the config outlived the process"
+        );
+        assert!(state.attempts >= 1, "and so did the record of the failures");
+        assert!(
+            state.cursor["pending"].is_object(),
+            "and the event that was not delivered"
+        );
+
+        hook.status.store(200, Ordering::SeqCst); // the webhook is back
+        let second = Replica::start(Rig::over_as(store.clone(), agent), &hook).await;
+        until("the pending event", || {
+            hook.accepted()
+                .iter()
+                .any(|l| l == "status:TASK_STATE_INPUT_REQUIRED")
+                || hook
+                    .accepted()
+                    .iter()
+                    .any(|l| l == "status:TASK_STATE_WORKING")
+        })
+        .await;
+        until("input-required", || {
+            hook.accepted()
+                .last()
+                .is_some_and(|l| l == "status:TASK_STATE_INPUT_REQUIRED")
+        })
+        .await;
+
+        // The follow-up completes the task; the webhook hears the artifact, then the end.
+        let client = second.client().await;
+        client
+            .send_message(&request("blue", Some(&task.id), None))
+            .await
+            .unwrap();
+        wait_state(&second.rig, &alice(), &task.id, TaskState::Completed).await;
+        until("completion", || {
+            hook.accepted()
+                .last()
+                .is_some_and(|l| l == "status:TASK_STATE_COMPLETED")
+        })
+        .await;
+        // The deliverer tells the webhook what the task is, not every step it took: the resumed
+        // task is `working` for as long as it takes to answer, and a round may or may not land in
+        // that window. So at most one `working` sits between input-required and the artifact.
+        let heard = hook.accepted();
+        let input = heard
+            .iter()
+            .rposition(|l| l == "status:TASK_STATE_INPUT_REQUIRED")
+            .unwrap_or_else(|| panic!("input-required was never heard: {heard:?}"));
+        let after: Vec<&str> = heard[input + 1..].iter().map(String::as_str).collect();
+        assert!(
+            after == ["artifact:blue", "status:TASK_STATE_COMPLETED"]
+                || after
+                    == [
+                        "status:TASK_STATE_WORKING",
+                        "artifact:blue",
+                        "status:TASK_STATE_COMPLETED",
+                    ],
+            "{heard:?}"
+        );
+        // Before it, only the state the task had while the webhook was down.
+        assert!(
+            heard[..input]
+                .iter()
+                .all(|l| l == "status:TASK_STATE_WORKING"),
+            "{heard:?}"
+        );
+        // Nothing was delivered twice: the same label next to itself would be a repeat (a label
+        // alone cannot say so: `working` is heard before and after the pause, as two events).
+        assert!(
+            heard.windows(2).all(|w| w[0] != w[1]),
+            "nothing was delivered twice: {heard:?}"
+        );
+        // The terminal state ended the config.
+        let id = RunId(task.id.parse().unwrap());
+        let mut done = false;
+        for _ in 0..300 {
+            if store.push_list(id).await.unwrap()[0].state == adam_core::PushState::Done {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(done, "the config is done once the task is terminal");
+        second.stop().await;
+    }
+
+    #[tokio::test]
+    async fn two_replicas_deliver_each_event_once_and_a_purged_task_takes_its_configs() {
+        let hook = Webhook::start().await;
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let a = Replica::start(Rig::over(store.clone()), &hook).await;
+        let b = Replica::start(Rig::over(store.clone()), &hook).await;
+        let client = a.client().await;
+        let SendMessageResponse::Task(task) = client
+            .send_message(&request("one shot [slow]", None, Some(&hook)))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a task")
+        };
+        wait_state(&a.rig, &alice(), &task.id, TaskState::Completed).await;
+        until("the end", || {
+            hook.accepted()
+                .last()
+                .is_some_and(|l| l == "status:TASK_STATE_COMPLETED")
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let heard = hook.accepted();
+        let completed = heard
+            .iter()
+            .filter(|l| *l == "status:TASK_STATE_COMPLETED")
+            .count();
+        let artifacts = heard.iter().filter(|l| l.starts_with("artifact:")).count();
+        assert_eq!(
+            (completed, artifacts),
+            (1, 1),
+            "leases keep replicas from repeating each other: {heard:?}"
+        );
+        let id = RunId(task.id.parse().unwrap());
+        assert_eq!(store.push_list(id).await.unwrap().len(), 1);
+        a.stop().await;
+        b.stop().await;
+        // Retention removes the run, and the config with it.
+        let cutoff = chrono::Utc::now() + chrono::Duration::seconds(5);
+        assert!(store.purge_finished("scripted", cutoff).await.unwrap() >= 1);
+        assert!(store.push_list(id).await.unwrap().is_empty());
+    }
 }

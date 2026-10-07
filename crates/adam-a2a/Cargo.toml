@@ -16,6 +16,15 @@ test-util = ["dep:tokio-stream"]
 [dependencies]
 adam-error.workspace = true
 a2a-lf.workspace = true
+# Signs the agent card (ES256, EdDSA) and reads the PEM of its key; already in the tree under rustls.
+aws-lc-rs.workspace = true
+base64.workspace = true
+rustls-pki-types.workspace = true
+ryu-js.workspace = true
+# Push-notification delivery: one client that never follows a redirect and only connects to the
+# addresses the guarded resolver allows.
+reqwest.workspace = true
+uuid.workspace = true
 a2a-server-lf.workspace = true
 async-trait.workspace = true
 axum.workspace = true
@@ -27,7 +36,7 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time", "sync", "rt"] }
+tokio = { workspace = true, features = ["time", "sync", "rt", "net"] }
 tokio-stream = { workspace = true, optional = true }
 tracing.workspace = true
 url.workspace = true
@@ -37,6 +46,7 @@ url.workspace = true
 adam-a2a = { path = ".", features = ["test-util"] }
 a2a-client-lf.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
+wiremock.workspace = true
 
 [lints]
 workspace = true

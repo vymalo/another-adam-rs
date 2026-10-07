@@ -41,6 +41,8 @@
 //! all behave the same.
 
 pub mod memory;
+pub mod push;
+pub mod query;
 
 use std::fmt;
 use std::sync::Arc;
@@ -52,6 +54,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+
+pub use push::{NewPushConfig, PushProgress, PushRecord, PushState};
+pub use query::{ConversationScope, RunQuery};
 
 /// Identifier of a run. UUIDv7 by default, so ids sort roughly by creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -495,8 +500,64 @@ pub trait Store: Send + Sync + 'static {
     /// that a worker is stepping a run: see `RunView::claimed` in `adam-runtime`.
     async fn lease_until(&self, id: RunId) -> StoreResult<Option<DateTime<Utc>>>;
 
+    /// The runs `query` selects, ordered by `updated_at` descending and then `id` descending, one
+    /// page of at most `query.limit`: the keyset page that starts strictly after `query.after`.
+    ///
+    /// The scope is required, so a listing is always one owner's (or one conversation's) runs.
+    /// Every adapter indexes it: a page is one indexed read, however deep.
+    async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>>;
+
+    /// How many runs match `query`'s filters (its `after` and `limit` are ignored): the total
+    /// before pagination.
+    async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64>;
+
+    /// Create or replace the push configuration `(new.run, new.id)` and return it.
+    ///
+    /// The run must exist ([`StoreError::NotFound`] otherwise). A new config is
+    /// [`PushState::Active`], at version 1, with no attempts and due at once. Putting an id that
+    /// exists **replaces** the config: `config` and `cursor` are the new ones, the state is
+    /// `Active` again, attempts and the last error are cleared, the lease is dropped and the
+    /// version is the old one plus 1, so a deliverer still holding the old version loses its
+    /// next [`push_commit`](Self::push_commit). `created_at` is kept.
+    async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord>;
+
+    /// The push configurations of a run, ordered by id. Empty for a run that has none or does not
+    /// exist.
+    async fn push_list(&self, run: RunId) -> StoreResult<Vec<PushRecord>>;
+
+    /// Delete a push configuration. Returns whether it existed (deleting twice is not an error).
+    async fn push_delete(&self, run: RunId, id: &str) -> StoreResult<bool>;
+
+    /// Lease up to `limit` due push configurations of the given agents to `worker` until
+    /// `now + ttl`, earliest `next_attempt_at` first. A config is claimable when it is
+    /// [`PushState::Active`], due (`next_attempt_at <= now`) and has no unexpired lease. Concurrent
+    /// callers never receive the same config while its lease is valid. The records returned carry
+    /// the version to pass to [`push_commit`](Self::push_commit).
+    async fn push_claim_due(
+        &self,
+        agents: &[String],
+        worker: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> StoreResult<Vec<PushRecord>>;
+
+    /// Atomically record the progress of a push configuration if its version is still
+    /// `expected_version`, drop its lease, and return the new record (version + 1).
+    ///
+    /// Errors with [`StoreError::Conflict`] on a stale version (the config was replaced or
+    /// committed by someone else) and [`StoreError::NotFound`] if the config no longer exists (it
+    /// was deleted, or its run purged).
+    async fn push_commit(
+        &self,
+        run: RunId,
+        id: &str,
+        expected_version: u64,
+        progress: PushProgress,
+    ) -> StoreResult<PushRecord>;
+
     /// Delete finished (done or failed) runs of `agent` last updated before
-    /// `before`, with their journals. Returns the number of runs deleted.
+    /// `before`, with their journals and push configurations. Returns the number of runs deleted.
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64>;
 }
 

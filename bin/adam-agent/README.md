@@ -31,7 +31,7 @@ applies at the next start, and a restart is a deploy.
 |---|---|
 | `agent/instructions.md` frontmatter `name` | the registered name of the agent, which is the key of its stored runs: **renaming strands the runs of the old name**. Required |
 | `description` or `card.description` | the A2A card needs one of them (exit 78 for a role that serves A2A otherwise) |
-| `card:` | the card: `name`, `skills` (`id`, `name`, `description`, `tags`, `examples`). The URL is `PUBLIC_URL`, the version is this binary's with the build's revision as build metadata (`0.1.0+6478fbc`, `+unknown` without one: the build argument `ADAM_BUILD_REVISION` of the image) |
+| `card:` | the card: `name`, `skills` (`id`, `name`, `description`, `tags`, `examples`) and `extended` (`description`, `skills`: what an authenticated caller sees on top, `GetExtendedAgentCard`). The URL is `PUBLIC_URL`, the version is this binary's with the build's revision as build metadata (`0.1.0+6478fbc`, `+unknown` without one: the build argument `ADAM_BUILD_REVISION` of the image) |
 | `limits:` | `max_turns`, `max_tool_calls`, `max_output_tokens`, `max_history_tokens` |
 | `model:` | the model alias of the agent, when it should not be `MODEL` |
 | `vars:` | `{{placeholders}}` of the prompt. **Every var needs a value in the file**: nothing in this binary supplies one, so a var declared without a value (or one the prompt does not use, or a placeholder `vars` does not declare) stops the process at startup, naming it |
@@ -176,6 +176,10 @@ same way; every problem is reported at once at startup):
 | `DATABASE_URL` | Postgres for the run store | required |
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
+| `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and names the webhooks they may reach: comma-separated URL prefixes or hosts ([`adam-service`](../../crates/adam-service/README.md#environment)); a client's webhook that matches none, is not `https` or is a private address is refused | unset: off, the card says so |
+| `A2A_PUSH_ALLOW_PRIVATE` | also allow loopback, private and link-local webhooks and `http` to loopback: development only | `false` |
+| `A2A_PUSH_GIVE_UP_AFTER_SECS`, `A2A_PUSH_REQUEST_TIMEOUT_SECS` | how long a notification may keep failing before delivery to that webhook is abandoned (1 to 604800), and how long one request may take (1 to 120) | `3600`, `15` |
+| `A2A_CARD_SIGNING_KEY_FILE`, `A2A_CARD_SIGNING_KEY_ID`, `A2A_CARD_SIGNING_JKU` | a PKCS#8 PEM key (ECDSA P-256 or Ed25519) that signs the agent card, its `kid` (default: the key's thumbprint) and its `jku` ; the server serves the key set at `/.well-known/jwks.json` | unset: unsigned |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
 | `WORKERS` | runs advanced concurrently | `4` |
 | `WORKER_ID` | lease identity of this worker: 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process |

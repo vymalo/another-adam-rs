@@ -140,6 +140,7 @@ The values you will actually set:
 | `github.createRepoOwners` | owners the coder may create repositories for, after the person agrees; empty turns it off |
 | `database.*` | CloudNativePG `Cluster` (default) or `existingSecret` |
 | `mcp.websearch.url`, `mcp.context7.enabled` | optional extra MCP servers, off by default |
+| `a2a.push.allowedUrls`, `a2a.cardSigning.secretName` | optional A2A push notifications (the webhooks they may reach) and a signed agent card (a Secret with the key), both off by default ([the chart](../../deploy/coder/README.md#push-notifications-and-the-cards-signature-a2a)) |
 | `config.modelExtraBody`, `config.modelEchoReasoning` | to make a model emit its reasoning |
 | `runPods.enabled` | [below](#run-pods) |
 

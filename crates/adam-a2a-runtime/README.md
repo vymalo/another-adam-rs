@@ -21,6 +21,8 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `vymalo_inbound`, `CONTEXT_UI_REF`, `CONTEXT_UI_CATALOG`, `CONTEXT_THREAD_TOOLS`, `integral_numbers` | the inbound function of an agent that serves a screen (`.with_inbound(vymalo_inbound)`): an A2UI action reads as the person's answer, and the extensions a message carries become the run's inbound context; see *A screen as the sender* |
 | `task_id_for(agent, subject, context_id, message_id)` | the task id a new task of `agent` started by that message gets (see *Stable ids*) |
 | `MAX_REFERENCES` | how many of a message's `referenceTaskIds` are looked at (8); see *Continuing a task* |
+| `RuntimeTaskBackend::list` (`TaskBackend::list`), `MAX_SCAN` | `ListTasks`: the caller's tasks, newest update first, by keyset cursor; see *Listing tasks* |
+| `RuntimeTaskBackend::push_store()`, `StorePushStore::new(store, agent)` | the `adam_a2a::push::PushStore` over the run `Store`: configs and delivery progress next to the runs, so a restart or another replica loses nothing; see *Push notifications* |
 
 ```rust
 use std::sync::Arc;
@@ -67,6 +69,29 @@ subscription of a task another process is stepping advances at the durable poll.
 delivers a `CancelTask` to the running step at once (a `Notifier`), instead of at
 the next poll. `adam-coder` wires it in for every role (`Coder::new_with`,
 `Coder::control_plane_with`).
+
+## Listing tasks
+
+`TaskBackend::list` is one indexed read per page of the run store (`Store::list_runs`, `count_runs`), scoped to
+`<subject>:` (an owner's whole namespace, or exactly `<subject>:<context>` for a `contextId`; a `:` in a subject is escaped, so
+no subject's namespace is a prefix of another's), ordered by last update, newest first, id breaking ties, and continued by the
+`PageToken` of `adam-a2a` (the position of the last task; never an offset). The A2A state is derived, not stored (`failed` and
+`canceled` are both a failed run, `submitted` and `working` both a runnable one), so a `status` filter narrows by the run
+statuses its state can come from and each candidate is read as a task and kept only if its state is the one asked for, reading
+at most `MAX_SCAN` (500) runs per page: a rare filter returns a short page and a token that continues. **`totalSize` is exact for
+no status filter and for `completed`, and an upper bound for the other states.** A run of another agent in the same store, an
+unreadable record and a record whose conversation id has no subject are not listed.
+
+## Push notifications
+
+The configs and each one's delivery progress are kept by the `Store` (`push_put`, `push_list`, `push_delete`,
+`push_claim_due`, `push_commit`: see [`adam-core`](../adam-core/README.md#push-configurations)), and `StorePushStore` maps the
+`adam_a2a::push::PushStore` port onto them (`TaskPushNotificationConfig` and `PushCursor` as the store's opaque JSON; the agent
+name scopes the claims, so two agents sharing a database never deliver each other's). A stored config that cannot be read is
+given up on (`GaveUp`, "the stored configuration cannot be read") and never returned; a cursor that cannot be read starts
+over (at least once). Run `PushSupport::new(Arc::new(backend.push_store()), policy).deliverer(Arc::new(backend), options)`
+beside the server (`adam-service` does, in the control plane). The mechanism, the guarantees and the lifecycle are in
+[`adam-a2a`](../adam-a2a/README.md) and [ADR 0030](../../docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md).
 
 ## Steering a running task
 
@@ -326,7 +351,14 @@ No Cargo features, no environment variables at runtime.
 ## Tests
 
 `tests/backend.rs` drives the backend with a real A2A client over HTTP and a
-scripted agent: snapshot/progress/artifact/completed order, `input-required`
+scripted agent (its `listing` module: the caller's tasks newest first and each state told from the others, including
+`failed` from `canceled` and `submitted` from `working`; pages that walk the whole list once at every page size, also under
+a filter that needs the state read; another caller's tasks, counts and cursors never visible, a forged position staying
+inside the forger's own tasks; another agent's runs not listed. Its `push` module, over a real server, the official client,
+a local webhook and `StorePushStore`: **notifications survive a restart** because the store keeps the configs, the progress
+and the pending event, the pending event is delivered first by the replica that starts over the same store, nothing is
+delivered twice, the terminal state ends the config; two replicas deliver each event once; a purged run takes its configs
+with it. `src/push.rs`: configs round-trip, a task id that is no run is not found, a damaged config is given up on): snapshot/progress/artifact/completed order, `input-required`
 round trips, ownership between callers, context handling, an `init` rejection
 that is `-32602` and not `-32603`
 (`an_init_rejection_is_invalid_params_not_internal`,

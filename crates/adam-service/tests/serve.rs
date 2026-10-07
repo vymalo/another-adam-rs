@@ -55,6 +55,10 @@ impl Agent for Echo {
 
     async fn step(&self, _ctx: &mut Ctx, state: Value) -> Result<Transition<Value>, AgentError> {
         let text = state["text"].as_str().unwrap_or_default().to_owned();
+        if text.contains("[slow]") {
+            // Long enough that the task is still running when a webhook is registered for it.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
         Ok(Transition::Done {
             state,
             output: json!({"text": format!("{} says: {text}", self.0)}),
@@ -74,13 +78,19 @@ async fn free_port() -> u16 {
 }
 
 fn config(database: &str, role: &str, port: u16) -> ServiceConfig {
-    let vars = [
+    config_with(database, role, port, &[])
+}
+
+/// [`config`] with more variables of the environment.
+fn config_with(database: &str, role: &str, port: u16, more: &[(&str, String)]) -> ServiceConfig {
+    let mut vars = vec![
         ("DATABASE_URL", database.to_owned()),
         ("ROLE", role.to_owned()),
         ("A2A_BEARER_TOKENS", "serve-test-token".to_owned()),
         ("PUBLIC_URL", "http://agent.test:8080/".to_owned()),
         ("LISTEN_ADDR", format!("127.0.0.1:{port}")),
     ];
+    vars.extend(more.iter().map(|(k, v)| (*k, v.clone())));
     let mut problems = Vec::new();
     let config = ServiceConfig::parse(
         &|name: &str| {
@@ -370,4 +380,221 @@ async fn an_address_that_is_taken_is_a_bind_error_and_exit_71() {
     assert!(matches!(error, ServeError::Bind { .. }), "{error:?}");
     assert_eq!(error.to_string(), format!("binding 127.0.0.1:{port}"));
     assert_eq!(exit_code(&error), 71);
+}
+
+/// What a deployment turns on is on, end to end over Postgres: the card says push notifications and
+/// the extended card are on and carries a signature that verifies with the key set the server
+/// publishes, `ListTasks` and `GetExtendedAgentCard` answer, and a webhook named in a message is
+/// told when the task completes.
+#[tokio::test]
+async fn push_notifications_the_extended_card_and_the_signature_work_through_serve() {
+    use std::sync::{Arc, Mutex};
+
+    use a2a::{
+        AuthenticationInfo, GetExtendedAgentCardRequest, ListTasksRequest,
+        SendMessageConfiguration, SendMessageRequest, SendMessageResponse,
+        TaskPushNotificationConfig,
+    };
+    use a2a_client::A2AClientFactory;
+    use a2a_client::agent_card::AgentCardResolver;
+    use a2a_client::auth::AuthInterceptor;
+    use adam_a2a::{ExtendedCardConfig, SkillConfig};
+
+    let Some(url) = database() else { return };
+
+    // A webhook that records what it is sent.
+    /// What the webhook saw: the `Authorization` header and the body.
+    type Seen = Vec<(Option<String>, serde_json::Value)>;
+    let received: Arc<Mutex<Seen>> = Arc::default();
+    let sink = received.clone();
+    let hook = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let sink = sink.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    sink.lock()
+                        .unwrap()
+                        .push((auth, serde_json::from_slice(&body).unwrap_or_default()));
+                    axum::http::StatusCode::OK
+                }
+            },
+        ),
+    );
+    let hook_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hook_port = hook_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(hook_listener, hook).await.unwrap();
+    });
+
+    // The key, as a Secret would mount it.
+    let dir = std::env::temp_dir().join(format!("adam-serve-key-{}", RunId::new().0.simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key_file = dir.join("card-signing.pem");
+    std::fs::write(&key_file, adam_a2a::generate_signing_key_pem(false)).unwrap();
+
+    let name = unique("serve-features");
+    let port = free_port().await;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let cfg = config_with(
+        &url,
+        "all",
+        port,
+        &[
+            ("A2A_PUSH_ALLOWED_URLS", format!("127.0.0.1:{hook_port}")),
+            ("A2A_PUSH_ALLOW_PRIVATE", "true".to_owned()),
+            ("A2A_CARD_SIGNING_KEY_FILE", key_file.display().to_string()),
+        ],
+    );
+    let verifying = cfg
+        .a2a
+        .card_signing
+        .as_ref()
+        .expect("signing is configured")
+        .signer
+        .verifying_key();
+    let extended = ExtendedCardConfig::new().with_skill(SkillConfig::new(
+        "audit",
+        "Audit",
+        "For the signed in",
+    ));
+    let agents = agents(&name, &cfg)
+        .card(
+            AgentCardConfig::new(
+                &name,
+                "A test agent.",
+                format!("http://{addr}/").parse().unwrap(),
+                "0.0.1",
+            )
+            .with_extended_card(extended),
+        )
+        .options(RuntimeOptions {
+            poll_interval: Duration::from_millis(20),
+            ..RuntimeOptions::default()
+        });
+    let running = Running::start(cfg, agents);
+    until_ok(addr, "/healthz", &running.handle).await;
+
+    let base = format!("http://{addr}");
+    let public = AgentCardResolver::new(None).resolve(&base).await.unwrap();
+    assert_eq!(public.capabilities.push_notifications, Some(true));
+    assert_eq!(public.capabilities.extended_agent_card, Some(true));
+    assert_eq!(
+        verifying.verify_card(&public),
+        Ok(()),
+        "the card is signed by the configured key"
+    );
+    // The key set is served and verifies it too.
+    assert_eq!(status_of(addr, "/.well-known/jwks.json").await, Some(200));
+
+    let client = A2AClientFactory::builder()
+        .with_interceptor(Arc::new(AuthInterceptor::bearer("serve-test-token")))
+        .build()
+        .create_from_card(&public)
+        .await
+        .unwrap();
+    let extended = client
+        .get_extended_agent_card(&GetExtendedAgentCardRequest { tenant: None })
+        .await
+        .unwrap();
+    assert!(extended.skills.iter().any(|s| s.id == "audit"));
+    assert_eq!(verifying.verify_card(&extended), Ok(()));
+
+    let message = Message::new(Role::User, vec![Part::text("tell the webhook [slow]")]);
+    let response = client
+        .send_message(&SendMessageRequest {
+            message,
+            configuration: Some(SendMessageConfiguration {
+                accepted_output_modes: None,
+                task_push_notification_config: Some(TaskPushNotificationConfig {
+                    url: format!("http://127.0.0.1:{hook_port}/hook"),
+                    id: None,
+                    task_id: String::new(),
+                    token: None,
+                    authentication: Some(AuthenticationInfo {
+                        scheme: "Bearer".into(),
+                        credentials: Some("hook-secret".into()),
+                    }),
+                    tenant: None,
+                }),
+                history_length: None,
+                return_immediately: Some(true),
+            }),
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    let SendMessageResponse::Task(task) = response else {
+        panic!("expected a task")
+    };
+    let mut told = false;
+    for _ in 0..600 {
+        told = received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, body)| body["statusUpdate"]["status"]["state"] == "TASK_STATE_COMPLETED");
+        if told {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        told,
+        "the webhook was told the task completed: {:?}",
+        received.lock().unwrap()
+    );
+    assert!(
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(auth, body)| auth.as_deref() == Some("Bearer hook-secret")
+                && body["statusUpdate"]["taskId"] == task.id.as_str()),
+        "every notification carried the credentials and named the task"
+    );
+
+    let listed = client
+        .list_tasks(&ListTasksRequest {
+            context_id: None,
+            status: Some(TaskState::Completed),
+            page_size: None,
+            page_token: None,
+            history_length: None,
+            status_timestamp_after: None,
+            include_artifacts: None,
+            tenant: None,
+        })
+        .await
+        .unwrap();
+    assert!(listed.tasks.iter().any(|t| t.id == task.id));
+    running.finish().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Without the variables, none of it is on: no push, no signature, no key set.
+#[tokio::test]
+async fn nothing_optional_is_on_unless_the_environment_says_so() {
+    use a2a_client::agent_card::AgentCardResolver;
+    let Some(url) = database() else { return };
+    let name = unique("serve-plain");
+    let port = free_port().await;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let cfg = config(&url, "control-plane", port);
+    let running = Running::start(config(&url, "control-plane", port), agents(&name, &cfg));
+    until_ok(addr, "/healthz", &running.handle).await;
+    let card = AgentCardResolver::new(None)
+        .resolve(&format!("http://{addr}"))
+        .await
+        .unwrap();
+    assert_eq!(card.capabilities.push_notifications, Some(false));
+    assert_eq!(card.capabilities.extended_agent_card, Some(false));
+    assert!(card.signatures.is_none());
+    assert_eq!(status_of(addr, "/.well-known/jwks.json").await, Some(401));
+    running.finish().await;
 }

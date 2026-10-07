@@ -9,8 +9,9 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use super::{
-    ClaimScope, JournalEntry, Lease, NewRun, RunId, RunRecord, RunUpdate, Store, StoreError,
-    StoreResult, add_ttl, now, truncate_ms,
+    ClaimScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress, PushRecord, PushState,
+    RunId, RunQuery, RunRecord, RunUpdate, Store, StoreError, StoreResult, add_ttl, now,
+    truncate_ms,
 };
 
 #[derive(Default)]
@@ -22,6 +23,12 @@ pub struct MemoryStore {
 struct Inner {
     runs: HashMap<RunId, Slot>,
     journal: BTreeMap<(RunId, u64), JournalEntry>,
+    push: BTreeMap<(RunId, String), PushSlot>,
+}
+
+struct PushSlot {
+    record: PushRecord,
+    lease: Option<(String, DateTime<Utc>)>,
 }
 
 struct Slot {
@@ -279,6 +286,150 @@ impl Store for MemoryStore {
             .map(|(_, until)| *until))
     }
 
+    async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
+        let inner = self.inner.lock().await;
+        let mut found: Vec<RunRecord> = inner
+            .runs
+            .values()
+            .map(|s| &s.run)
+            .filter(|r| query.matches(r))
+            .filter(|r| {
+                query
+                    .after
+                    .is_none_or(|(at, id)| (r.updated_at, r.id) < (at, id))
+            })
+            .cloned()
+            .collect();
+        found.sort_by_key(|a| std::cmp::Reverse((a.updated_at, a.id)));
+        found.truncate(query.limit);
+        Ok(found)
+    }
+
+    async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .runs
+            .values()
+            .filter(|s| query.matches(&s.run))
+            .count() as u64)
+    }
+
+    async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {
+        let mut inner = self.inner.lock().await;
+        if !inner.runs.contains_key(&new.run) {
+            return Err(StoreError::NotFound(new.run));
+        }
+        let t = now();
+        let key = (new.run, new.id.clone());
+        let (version, created_at) = inner
+            .push
+            .get(&key)
+            .map_or((1, t), |s| (s.record.version + 1, s.record.created_at));
+        let record = PushRecord {
+            run: new.run,
+            id: new.id,
+            agent: new.agent,
+            owner: new.owner,
+            config: new.config,
+            cursor: new.cursor,
+            state: PushState::Active,
+            attempts: 0,
+            last_error: None,
+            next_attempt_at: t,
+            version,
+            created_at,
+            updated_at: t,
+        };
+        inner.push.insert(
+            key,
+            PushSlot {
+                record: record.clone(),
+                lease: None,
+            },
+        );
+        Ok(record)
+    }
+
+    async fn push_list(&self, run: RunId) -> StoreResult<Vec<PushRecord>> {
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .push
+            .range((run, String::new())..)
+            .take_while(|((r, _), _)| *r == run)
+            .map(|(_, s)| s.record.clone())
+            .collect())
+    }
+
+    async fn push_delete(&self, run: RunId, id: &str) -> StoreResult<bool> {
+        let mut inner = self.inner.lock().await;
+        Ok(inner.push.remove(&(run, id.to_owned())).is_some())
+    }
+
+    async fn push_claim_due(
+        &self,
+        agents: &[String],
+        worker: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> StoreResult<Vec<PushRecord>> {
+        let now = truncate_ms(now);
+        let until = add_ttl(now, ttl);
+        let mut inner = self.inner.lock().await;
+        let mut due: Vec<_> = inner
+            .push
+            .iter()
+            .filter(|(_, s)| {
+                s.record.state == PushState::Active
+                    && agents.contains(&s.record.agent)
+                    && s.record.next_attempt_at <= now
+                    && s.lease.as_ref().is_none_or(|(_, u)| *u <= now)
+            })
+            .map(|(k, s)| (s.record.next_attempt_at, k.clone()))
+            .collect();
+        due.sort();
+        due.truncate(limit);
+        Ok(due
+            .into_iter()
+            .filter_map(|(_, key)| {
+                let slot = inner.push.get_mut(&key)?;
+                slot.lease = Some((worker.to_owned(), until));
+                Some(slot.record.clone())
+            })
+            .collect())
+    }
+
+    async fn push_commit(
+        &self,
+        run: RunId,
+        id: &str,
+        expected: u64,
+        progress: PushProgress,
+    ) -> StoreResult<PushRecord> {
+        let mut inner = self.inner.lock().await;
+        let slot = inner
+            .push
+            .get_mut(&(run, id.to_owned()))
+            .ok_or(StoreError::NotFound(run))?;
+        if slot.record.version != expected {
+            return Err(StoreError::Conflict {
+                run,
+                expected,
+                actual: slot.record.version,
+            });
+        }
+        let record = &mut slot.record;
+        record.state = progress.state;
+        record.cursor = progress.cursor;
+        record.attempts = progress.attempts;
+        record.last_error = progress.last_error;
+        record.next_attempt_at = truncate_ms(progress.next_attempt_at);
+        record.version += 1;
+        record.updated_at = now();
+        slot.lease = None;
+        Ok(slot.record.clone())
+    }
+
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
         let mut inner = self.inner.lock().await;
         let doomed: Vec<RunId> = inner
@@ -291,6 +442,7 @@ impl Store for MemoryStore {
             .collect();
         for id in &doomed {
             inner.runs.remove(id);
+            inner.push.retain(|(run, _), _| run != id);
             let keys: Vec<_> = inner
                 .journal
                 .range((*id, 0)..=(*id, u64::MAX))

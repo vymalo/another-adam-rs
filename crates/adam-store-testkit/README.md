@@ -13,11 +13,11 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (28
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (43
   cases: create/load, state round trip, CAS conflicts, concurrent commits,
   journal ordering and first-writer-wins, claim rules and exclusivity, busy runs
   that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
-  run owner, one open run per conversation, purge).
+  run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes, `count_runs`), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.
 * `cases::*`: the cases as plain async functions taking a `DynStore`, for
   harnesses that do not use the macro.
@@ -57,6 +57,7 @@ failure (see `adam_core::testing`).
   after a release, a commit or an expired lease; the first pinned claim sets the owner and an
   `Any` claim neither reads nor sets it; 4 workers racing on 48 runs split them exactly once and
   each gets back exactly its own.
+* The `push_*` cases: a put creates then replaces (version, state and cursor reset, `created_at` kept), needs its run, lists per run in id order, round-trips configs with unusual keys, deletes idempotently; a claim takes only active, due configs of the asked agents, honours the limit and the lease, and 8 workers racing on 40 configs split them exactly once; a commit advances the version, drops the lease and fails with `Conflict` on a stale or replaced version and `NotFound` once deleted; configs go with their purged run.
 * `src/fault.rs`: unit tests and a doctest of `FaultyStore`.
 
 The Postgres and MongoDB adapters run the suite from their own

@@ -25,7 +25,7 @@ Start with the [root README](../README.md), then the guide for what you are doin
 |---|---|
 | [Environment variables](reference/environment.md) | every variable of the binaries, the compose stack and the tests |
 | [Agent files and `#[tool]`](reference/agent-files.md) | the folder layout and formats, validation, skills, subagents, MCP, dev reload, the macro |
-| [The A2A server](reference/a2a-server.md) | follow-ups, continuing a finished task, and the steps, text and reasoning streams |
+| [The A2A server](reference/a2a-server.md) | the methods, follow-ups, continuing a finished task, push notifications, `ListTasks`, the extended card, the card's signature, and the steps, text and reasoning streams |
 | [Child runs and remote tasks](reference/child-runs.md) | how a subagent waits, every failure interleaving and its test |
 | [Workspace and environments](reference/workspace-and-environments.md) | placement, a run's slots, devcontainers and run pods |
 | [The coder agent](reference/coder-agent.md) | its flow and states, the rules its tools enforce, how a run ends |
@@ -66,6 +66,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0027](decisions/0027-every-tool-has-a-title-for-its-step.md) | every tool has a title for its step |
 | [0028](decisions/0028-the-card-says-which-build-answers.md) | the card says which build and which agent files answer |
 | [0029](decisions/0029-adam-rs-has-an-operator.md) | adam-rs ships the Kubernetes operator of `AgentService` and `AgentConfig`, moved from the platform repository |
+| [0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md) | A2A push notifications, `ListTasks`, the extended card and card signatures |
 
 ## Keeping these docs short and true
 

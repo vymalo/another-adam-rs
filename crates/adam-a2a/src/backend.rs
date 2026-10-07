@@ -12,6 +12,8 @@ use adam_error::{BoxError, Classify, ErrorClass, report};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+use crate::page::{TaskPage, TaskQuery};
+
 /// The authenticated principal on whose behalf a request runs, and the extensions the request
 /// activated.
 ///
@@ -252,6 +254,7 @@ impl From<BackendError> for a2a::A2AError {
 ///   [`BackendError::TaskNotFound`].
 /// * **Cancel** of an already-canceled task returns it unchanged; cancel of a
 ///   task in another terminal state is [`BackendError::NotCancelable`].
+/// * **Listing** ([`list`](Self::list)) is the caller's own tasks, newest update first, by cursor.
 #[async_trait]
 pub trait TaskBackend: Send + Sync + 'static {
     /// New task, or a follow-up message to an existing task/context.
@@ -278,6 +281,26 @@ pub trait TaskBackend: Send + Sync + 'static {
         caller: &Caller,
         task_id: &str,
     ) -> BoxStream<'static, Result<TaskEvent, BackendError>>;
+
+    /// One page of the caller's tasks that match `query`, most recently updated first (ties by
+    /// task id, descending), and how many match in all.
+    ///
+    /// * **Only the caller's own tasks**, whatever the filters say (A2A §13.1): scope the
+    ///   query to the caller before anything else, so no count, no token and no error depends
+    ///   on another caller's tasks.
+    /// * **Cursor pagination**: continue after the position [`PageToken::decode`](crate::PageToken::decode) gives for
+    ///   `query.page_token`, and issue the next token with [`PageToken::encode`](crate::PageToken::encode) when more
+    ///   tasks follow. A token that does not decode is [`BackendError::InvalidParams`].
+    /// * Tasks carry no history; the handler applies `historyLength` and `includeArtifacts`.
+    ///
+    /// The default answers [`BackendError::UnsupportedOperation`], so a backend written before
+    /// `ListTasks` existed keeps compiling and keeps saying it cannot list.
+    async fn list(&self, caller: &Caller, query: &TaskQuery) -> Result<TaskPage, BackendError> {
+        let _ = (caller, query);
+        Err(BackendError::UnsupportedOperation(
+            "ListTasks is not supported".to_owned(),
+        ))
+    }
 }
 
 /// A shareable, type-erased [`TaskBackend`].

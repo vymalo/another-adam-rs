@@ -532,6 +532,29 @@ parallel): `mcp.websearch.header`, `valuePrefix` and `tools` are values for that
 behaves for a missing property beyond what its documentation says (the sync fails and the Secret is not updated); not tried
 on the cluster.
 
+## Push notifications and the card's signature (`a2a.*`)
+
+Two optional features of the A2A server, **both off by default**; with both off the render is byte for byte what it was
+(`tests/golden/combined.yaml`; the chart version moved to 0.4.0, the one line that differs). They belong to the pod that serves A2A: the StatefulSet with `topology: combined`, the front
+Deployment with `topology: split` (the worker renders none of it). Design and what a client sees:
+[ADR 0030](../../docs/decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md),
+[the A2A server](../../docs/reference/a2a-server.md#push-notifications).
+
+| Value | Environment | Effect |
+|---|---|---|
+| `a2a.push.allowedUrls` (a list) | `A2A_PUSH_ALLOWED_URLS` (joined by commas) | **turns push notifications on** and is the whole policy: URL prefixes (`https://hooks.example.com/a2a/`) or hosts (`hooks.example.com`, `*.example.com`, `host:8443`). A client's webhook that matches none, is not `https` or resolves to a private address is refused. Entries are not secrets (they show in the pod's environment) |
+| `a2a.push.allowPrivateAddresses` | `A2A_PUSH_ALLOW_PRIVATE` | development only: loopback, private and link-local webhooks and `http` to loopback. The render refuses it without `allowedUrls`, and refuses an `http://` entry without it |
+| `a2a.push.giveUpAfterSecs`, `a2a.push.requestTimeoutSecs` | `A2A_PUSH_GIVE_UP_AFTER_SECS`, `A2A_PUSH_REQUEST_TIMEOUT_SECS` | how long a notification may keep failing before delivery to that webhook is abandoned (1 to 604800, default 3600), how long one request may take (1 to 120, default 15) |
+| `a2a.cardSigning.secretName` | `A2A_CARD_SIGNING_KEY_FILE` | **turns the signature on**: the name of a Secret in the release namespace with one key, `private-key.pem` (PKCS#8 PEM, ECDSA P-256 or Ed25519: `openssl genpkey -algorithm ed25519`). Mounted read-only at `/var/run/secrets/card-signing` (mode 0440, group-readable by the runtime user); read at startup, so a rotated key needs a restart; the server serves the public key at `/.well-known/jwks.json` |
+| `a2a.cardSigning.keyId`, `a2a.cardSigning.jku` | `A2A_CARD_SIGNING_KEY_ID`, `A2A_CARD_SIGNING_JKU` | the signature's `kid` (default: the key's thumbprint) and `jku`; they need `secretName` |
+
+The chart never carries the key (the same pattern as `github.app.privateKeySecret`: a Secret you or an `ExternalSecret`
+manage). Webhook credentials are **the clients'**, stored in the coder's database as given (clear text: protect the database),
+never in values. The pods need egress to the webhook hosts (the chart's `NetworkPolicy` is ingress only). Pushes need a
+control plane that runs for as long as a task does: delivery is a loop in the pod that serves A2A, and replicas share it by
+leases. `extraEnv` may not set `A2A_PUSH_ALLOWED_URLS` or `A2A_CARD_SIGNING_KEY_FILE` while the value that sets it is on. The
+extended agent card needs no value: it is `card.extended` in the agent's folder.
+
 ## Run pods
 
 `runPods.enabled: true` ([ADR 0019](../../docs/decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)) runs the processes of each active

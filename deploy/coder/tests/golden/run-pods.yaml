@@ -12,7 +12,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 value: 0
 preemptionPolicy: Never
 globalDefault: false
@@ -30,7 +30,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 spec:
   podSelector:
     matchLabels:
@@ -61,7 +61,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 spec:
   podSelector:
     matchLabels:
@@ -108,7 +108,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 spec:
   hard:
     limits.memory: "8Gi"
@@ -132,7 +132,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 automountServiceAccountToken: false
 ---
 # Source: coder/templates/run-pods-configmap.yaml
@@ -147,7 +147,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 data:
   pod.yaml: |
     apiVersion: v1
@@ -251,7 +251,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -270,7 +270,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -292,7 +292,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 spec:
   type: ClusterIP
   selector:
@@ -314,7 +314,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 spec:
   replicas: 1
   serviceName: coder
@@ -331,7 +331,7 @@ spec:
         app.kubernetes.io/name: coder
         app.kubernetes.io/instance: coder
       annotations:
-        checksum/run-pod: 9d2474b647a08036c552d37ed4f85c1adb7e6809250e68faad991b86fe595220
+        checksum/run-pod: 3a7f2c28fd47e769fb5360a032d2b077ca91a847d55a3bbcfb98b6c35936f1e7
     spec:
       serviceAccountName: coder
       automountServiceAccountToken: true
@@ -529,7 +529,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 spec:
   instances: 1
   storage:
@@ -552,7 +552,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 spec:
   refreshInterval: 1h
   secretStoreRef:
@@ -589,7 +589,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -634,7 +634,7 @@ metadata:
     app.kubernetes.io/instance: coder
     app.kubernetes.io/version: "0.1.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.3.0
+    helm.sh/chart: coder-0.4.0
 spec:
   policyName: coder-coder-ns-run-pods
   validationActions: ["Deny"]

@@ -193,3 +193,65 @@ fn def_of_name_only() -> AgentDef {
         &instructions("name: helper", "Hi."),
     )])
 }
+
+/// `card.extended` is what an authenticated caller sees on top of the public card: it becomes the
+/// config's extended card, and a card without it, or with one that adds nothing, has none.
+#[test]
+fn card_extended_becomes_the_extended_card_of_the_config() {
+    let assembly = assembly_of(
+        def(&[(
+            "agent/instructions.md",
+            &instructions(
+                "name: helper\n\
+                 description: Helps out.\n\
+                 card:\n  \
+                   skills:\n    - { id: help, name: Help, description: Public help }\n  \
+                   extended:\n    \
+                     description: Helps out, and audits for the signed in.\n    \
+                     skills:\n      - { id: audit, name: Audit, description: Only for you, tags: [internal] }",
+                "Hi.",
+            ),
+        )]),
+        ToolSet::new(),
+    );
+    let card = assembly.card(url(), "1").unwrap();
+    assert_eq!(
+        card.skills.len(),
+        1,
+        "the public card lists the public skill only"
+    );
+    let extended = card.extended.as_ref().expect("an extended card");
+    assert_eq!(
+        extended.description.as_deref(),
+        Some("Helps out, and audits for the signed in.")
+    );
+    assert_eq!(extended.skills.len(), 1);
+    assert_eq!(extended.skills[0].id, "audit");
+    assert_eq!(extended.skills[0].tags, ["internal"]);
+    assert!(
+        extended.extensions.is_empty(),
+        "extensions come from code, not from files"
+    );
+
+    // Declared and empty: nothing is served.
+    let empty = assembly_of(
+        def(&[(
+            "agent/instructions.md",
+            &instructions(
+                "name: helper\ndescription: Helps out.\ncard:\n  extended: {}",
+                "Hi.",
+            ),
+        )]),
+        ToolSet::new(),
+    );
+    assert!(empty.card(url(), "1").unwrap().extended.is_none());
+    // And without the key, none.
+    let none = assembly_of(
+        def(&[(
+            "agent/instructions.md",
+            &instructions("name: helper\ndescription: Helps out.", "Hi."),
+        )]),
+        ToolSet::new(),
+    );
+    assert!(none.card(url(), "1").unwrap().extended.is_none());
+}

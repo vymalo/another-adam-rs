@@ -120,9 +120,14 @@ dependencies = [
  "adam-a2a",
  "adam-error",
  "async-trait",
+ "aws-lc-rs",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "futures",
+ "reqwest",
+ "rustls-pki-types",
+ "ryu-js",
  "secrecy",
  "serde",
  "serde_json",
@@ -133,6 +138,8 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -721,6 +728,7 @@ dependencies = [
 name = "adam-service"
 version = "0.1.0"
 dependencies = [
+ "a2a-client-lf",
  "a2a-lf",
  "adam-a2a",
  "adam-a2a-runtime",
@@ -4777,6 +4785,12 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "ryu-js"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "same-file"

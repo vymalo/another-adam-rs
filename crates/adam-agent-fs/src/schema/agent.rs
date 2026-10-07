@@ -159,6 +159,24 @@ pub struct CardSkill {
     pub extra: BTreeMap<String, Value>,
 }
 
+/// What an authenticated caller sees on top of the public card (`card.extended`): A2A's
+/// `GetExtendedAgentCard`. The extended card is the public card with these applied
+/// (`adam_a2a::ExtendedCardConfig`): the description replaced when given, the skills added (a skill
+/// with the id of a public one replaces it). Put nothing in it you would not give every holder of a
+/// bearer token, and no secret: it is a file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ExtendedCard {
+    /// A longer description, replacing the public one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Skills only authenticated callers see.
+    pub skills: Vec<CardSkill>,
+    /// Keys this schema does not know.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
 /// The A2A agent card of the root agent (`adam_a2a::AgentCardConfig`, minus the public URL and
 /// the version, which the composition root supplies).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -172,6 +190,10 @@ pub struct Card {
     pub description: Option<String>,
     /// The skills the card advertises.
     pub skills: Vec<CardSkill>,
+    /// What authenticated callers see on top of this (`GetExtendedAgentCard`). Absent: the agent
+    /// has no extended card.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extended: Option<ExtendedCard>,
     /// Keys this schema does not know.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,

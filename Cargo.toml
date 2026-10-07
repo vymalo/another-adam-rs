@@ -90,6 +90,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 # Reads the PEM of a GitHub App's private key (adam-workspace): already in the tree under rustls.
 rustls-pki-types = "1"
+# ECMAScript number formatting for the JSON Canonicalization Scheme (RFC 8785) that signs an agent card (adam-a2a).
+ryu-js = "1"
 schemars = { version = "1.2", default-features = false, features = ["std"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }

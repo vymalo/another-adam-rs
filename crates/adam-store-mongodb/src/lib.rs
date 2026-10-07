@@ -2,12 +2,16 @@
 //!
 //! # Collections
 //!
-//! Two collections (names prefixed, `adam_` by default):
+//! Three collections (names prefixed, `adam_` by default):
 //!
 //! * `adam_runs`: one document per run. `_id` is the run's UUID (BSON binary
 //!   subtype 4), `state` is a real BSON document (see [`codec`] for how keys
 //!   like `$ref` are escaped), so runs are queryable from `mongosh`.
 //! * `adam_journal`: one document per recorded step, `_id` = `"<run>:<seq>"`.
+//! * `adam_push` (schema version 3): one document per A2A push-notification configuration,
+//!   `_id` = `"<run>:<config id>"` (a run id is 36 characters, so the join is unambiguous).
+//!   `config` holds the webhook **with its credentials, as the client gave them**; `cursor` is how
+//!   far delivery got. Deleted with its run by the purge.
 //!
 //! # Concurrency without transactions
 //!
@@ -26,6 +30,10 @@
 //!   filter and `$set`s `owner` in the same `updateMany`. `{ owner: null }` matches a missing
 //!   field, so runs written before schema version 2 need no migration. Releasing a lease
 //!   leaves `owner` alone.
+//! * Push configurations: claiming is a loop of `findOneAndUpdate` (filter: active, due, no live
+//!   lease; sort: `next_attempt_at`), each one atomic on its document; progress is
+//!   `findOneAndUpdate({_id, version: expected}, ..)`; putting an id again is an update that
+//!   bumps `version`, or an insert at 1 when there is none.
 //! * One open run per conversation: every run has an `open_key` with a plain
 //!   unique index. Open runs with a conversation use
 //!   `open_conversation_key(agent, conversation)`; every other run uses
@@ -38,8 +46,9 @@ use std::time::Duration;
 
 use adam_core::store::{add_ttl, now, open_conversation_key, sched_at, truncate_ms};
 use adam_core::{
-    ClaimScope, JournalEntry, Lease, NewRun, RunId, RunRecord, RunStatus, RunUpdate, Store,
-    StoreError, StoreResult,
+    ClaimScope, ConversationScope, JournalEntry, Lease, NewPushConfig, NewRun, PushProgress,
+    PushRecord, PushState, RunId, RunQuery, RunRecord, RunStatus, RunUpdate, Store, StoreError,
+    StoreResult,
 };
 use adam_error::ErrorClass;
 use async_trait::async_trait;
@@ -60,7 +69,9 @@ use codec::{bson_to_json, json_to_bson};
 /// * 1: the first schema.
 /// * 2: `owner` on runs (see [`ClaimScope`]). A missing field reads as no owner, so nothing
 ///   is rewritten; the number only says which release last migrated.
-pub const SCHEMA_VERSION: i32 = 2;
+/// * 3: the `push` collection (A2A push-notification configurations and their delivery progress)
+///   and the index `ListTasks` reads runs by (`adam_list`).
+pub const SCHEMA_VERSION: i32 = 3;
 
 const DUPLICATE_KEY: i32 = 11000;
 const OPEN_CONVERSATION_INDEX: &str = "adam_open_conversation";
@@ -74,6 +85,7 @@ pub struct MongoStore {
     prefix: String,
     runs: Collection<Document>,
     journal: Collection<Document>,
+    push: Collection<Document>,
 }
 
 impl MongoStore {
@@ -115,12 +127,14 @@ impl MongoStore {
             .selection_criteria(SelectionCriteria::ReadPreference(ReadPreference::Primary))
             .build();
         let runs = db.collection_with_options(&format!("{prefix}runs"), primary.clone());
-        let journal = db.collection_with_options(&format!("{prefix}journal"), primary);
+        let journal = db.collection_with_options(&format!("{prefix}journal"), primary.clone());
+        let push = db.collection_with_options(&format!("{prefix}push"), primary);
         Self {
             db,
             prefix,
             runs,
             journal,
+            push,
         }
     }
 
@@ -190,6 +204,70 @@ fn opt_date(t: Option<DateTime<Utc>>) -> Bson {
 
 fn journal_id(run: RunId, seq: u64) -> String {
     format!("{run}:{seq}")
+}
+
+/// The filters of a [`RunQuery`] (not its position or its limit), without runs a purge has
+/// tombstoned.
+fn run_query_filter(query: &RunQuery) -> Document {
+    let mut filter = doc! { "agent": &query.agent, "purging": { "$ne": true } };
+    match &query.scope {
+        // An anchored, escaped prefix is a range over the index `(agent, conversation_id, ..)`.
+        ConversationScope::Prefix(prefix) => {
+            filter.insert(
+                "conversation_id",
+                doc! { "$regex": format!("^{}", regex_escape(prefix)) },
+            );
+        }
+        ConversationScope::Exact(conversation) => {
+            filter.insert("conversation_id", conversation);
+        }
+    }
+    if let Some(statuses) = &query.statuses {
+        let statuses: Vec<&str> = statuses.iter().map(|s| s.as_str()).collect();
+        filter.insert("status", doc! { "$in": statuses });
+    }
+    if let Some(since) = query.updated_since {
+        filter.insert("updated_at", doc! { "$gte": date(truncate_ms(since)) });
+    }
+    filter
+}
+
+/// `text` as a regular expression that matches exactly that text: every character that is not a
+/// letter, a digit or `_` is escaped.
+fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for c in text.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('\\');
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn push_key(run: RunId, id: &str) -> String {
+    format!("{run}:{id}")
+}
+
+fn push_from_doc(d: &Document) -> StoreResult<PushRecord> {
+    let state = get_str(d, "state")?.ok_or_else(|| bad("state"))?;
+    Ok(PushRecord {
+        run: get_uuid(d, "run_id")?.ok_or_else(|| bad("run_id"))?,
+        id: get_str(d, "id")?.ok_or_else(|| bad("id"))?,
+        agent: get_str(d, "agent")?.ok_or_else(|| bad("agent"))?,
+        owner: get_str(d, "owner")?.ok_or_else(|| bad("owner"))?,
+        config: bson_to_json(d.get("config").ok_or_else(|| bad("config"))?)?,
+        cursor: bson_to_json(d.get("cursor").ok_or_else(|| bad("cursor"))?)?,
+        state: PushState::parse(&state).ok_or_else(|| bad("state"))?,
+        attempts: u32::try_from(get_u64(d, "attempts")?).map_err(|_| bad("attempts"))?,
+        last_error: get_str(d, "last_error")?,
+        next_attempt_at: get_date(d, "next_attempt_at")?.ok_or_else(|| bad("next_attempt_at"))?,
+        version: get_u64(d, "version")?,
+        created_at: get_date(d, "created_at")?.ok_or_else(|| bad("created_at"))?,
+        updated_at: get_date(d, "updated_at")?.ok_or_else(|| bad("updated_at"))?,
+    })
 }
 
 fn open_key(id: RunId, agent: &str, conversation: Option<&str>, status: RunStatus) -> String {
@@ -352,13 +430,32 @@ impl Store for MongoStore {
                 .keys(doc! { "parent_id": 1 })
                 .options(named("adam_parent"))
                 .build(),
+            // Listing an owner's runs, newest first (`ListTasks`): an anchored prefix on
+            // `conversation_id` is a range over this index.
+            IndexModel::builder()
+                .keys(doc! { "agent": 1, "conversation_id": 1, "updated_at": -1, "_id": -1 })
+                .options(named("adam_list"))
+                .build(),
         ];
         let journal_indexes = [IndexModel::builder()
             .keys(doc! { "run_id": 1, "seq": 1 })
             .options(named("adam_journal_run"))
             .build()];
+        let push_indexes = [
+            // Claiming: due configs per agent, earliest first. The run's own configs are `_id`
+            // prefixed, listed by `run_id`.
+            IndexModel::builder()
+                .keys(doc! { "agent": 1, "state": 1, "next_attempt_at": 1 })
+                .options(named("adam_push_due"))
+                .build(),
+            IndexModel::builder()
+                .keys(doc! { "run_id": 1, "id": 1 })
+                .options(named("adam_push_run"))
+                .build(),
+        ];
         ensure_indexes(&self.runs, run_indexes).await?;
         ensure_indexes(&self.journal, journal_indexes).await?;
+        ensure_indexes(&self.push, push_indexes).await?;
         self.db
             .collection::<Document>(&format!("{}meta", self.prefix))
             .update_one(
@@ -703,6 +800,218 @@ impl Store for MongoStore {
         found.map_or(Ok(None), |d| get_date(&d, "lease_until"))
     }
 
+    async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
+        // `limit(0)` means "no limit" to MongoDB, and a page of none is none.
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut filter = run_query_filter(query);
+        if let Some((at, id)) = query.after {
+            let at = date(truncate_ms(at));
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "updated_at": { "$lt": at.clone() } },
+                    doc! { "updated_at": at, "_id": { "$lt": uuid(id) } },
+                ],
+            );
+        }
+        let docs: Vec<Document> = self
+            .runs
+            .find(filter)
+            .sort(doc! { "updated_at": -1, "_id": -1 })
+            .limit(i64::try_from(query.limit).unwrap_or(i64::MAX))
+            .await
+            .map_err(classify)?
+            .try_collect()
+            .await
+            .map_err(classify)?;
+        docs.iter().map(run_from_doc).collect()
+    }
+
+    async fn count_runs(&self, query: &RunQuery) -> StoreResult<u64> {
+        self.runs
+            .count_documents(run_query_filter(query))
+            .await
+            .map_err(classify)
+    }
+
+    async fn push_put(&self, new: NewPushConfig) -> StoreResult<PushRecord> {
+        if !self.run_exists(new.run).await? {
+            return Err(StoreError::NotFound(new.run));
+        }
+        let key = push_key(new.run, &new.id);
+        let t = now();
+        let fresh = doc! {
+            "agent": &new.agent,
+            "owner": &new.owner,
+            "config": json_to_bson(&new.config)?,
+            "cursor": json_to_bson(&new.cursor)?,
+            "state": PushState::Active.as_str(),
+            "attempts": 0_i64,
+            "last_error": Bson::Null,
+            "next_attempt_at": date(t),
+            "lease_owner": Bson::Null,
+            "lease_until": Bson::Null,
+            "updated_at": date(t),
+        };
+        let mut stored = None;
+        // Replace an existing config, or insert it. Two puts of one id can race, so a duplicate
+        // key on insert means "it exists now": go round once more and replace it.
+        for _ in 0..2 {
+            let replaced = self
+                .push
+                .find_one_and_update(
+                    doc! { "_id": &key },
+                    doc! { "$set": fresh.clone(), "$inc": { "version": 1_i64 } },
+                )
+                .return_document(ReturnDocument::After)
+                .await
+                .map_err(classify)?;
+            if let Some(found) = replaced {
+                stored = Some(found);
+                break;
+            }
+            let mut inserted = fresh.clone();
+            inserted.insert("_id", &key);
+            inserted.insert("run_id", uuid(new.run));
+            inserted.insert("id", &new.id);
+            inserted.insert("version", 1_i64);
+            inserted.insert("created_at", date(t));
+            match self.push.insert_one(&inserted).await {
+                Ok(_) => {
+                    stored = Some(inserted);
+                    break;
+                }
+                Err(err) if is_duplicate_key(&err) => {}
+                Err(err) => return Err(classify(err)),
+            }
+        }
+        let stored = stored.ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "push config {key} neither exists nor can be created"
+            ))
+        })?;
+        // The run check above and the write are not atomic: a purge that removed the run in
+        // between must not leave an orphan for a future run with the same id.
+        if !self.run_exists(new.run).await? {
+            self.push
+                .delete_one(doc! { "_id": &key })
+                .await
+                .map_err(classify)?;
+            return Err(StoreError::NotFound(new.run));
+        }
+        push_from_doc(&stored)
+    }
+
+    async fn push_list(&self, run: RunId) -> StoreResult<Vec<PushRecord>> {
+        let docs: Vec<Document> = self
+            .push
+            .find(doc! { "run_id": uuid(run) })
+            .sort(doc! { "id": 1 })
+            .await
+            .map_err(classify)?
+            .try_collect()
+            .await
+            .map_err(classify)?;
+        docs.iter().map(push_from_doc).collect()
+    }
+
+    async fn push_delete(&self, run: RunId, id: &str) -> StoreResult<bool> {
+        let done = self
+            .push
+            .delete_one(doc! { "_id": push_key(run, id) })
+            .await
+            .map_err(classify)?;
+        Ok(done.deleted_count == 1)
+    }
+
+    async fn push_claim_due(
+        &self,
+        agents: &[String],
+        worker: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+        limit: usize,
+    ) -> StoreResult<Vec<PushRecord>> {
+        if agents.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = truncate_ms(now);
+        let until = add_ttl(now, ttl);
+        let claimable = doc! {
+            "agent": { "$in": agents },
+            "state": PushState::Active.as_str(),
+            "next_attempt_at": { "$lte": date(now) },
+            "$or": [ { "lease_until": Bson::Null }, { "lease_until": { "$lte": date(now) } } ],
+        };
+        let mut claimed = Vec::new();
+        for _ in 0..limit {
+            // One atomic claim per document; the filter is re-checked under the document's lock,
+            // so two workers never lease the same config.
+            let found = self
+                .push
+                .find_one_and_update(
+                    claimable.clone(),
+                    doc! { "$set": { "lease_owner": worker, "lease_until": date(until) } },
+                )
+                .sort(doc! { "next_attempt_at": 1, "_id": 1 })
+                .return_document(ReturnDocument::After)
+                .await
+                .map_err(classify)?;
+            match found {
+                Some(found) => claimed.push(push_from_doc(&found)?),
+                None => break,
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn push_commit(
+        &self,
+        run: RunId,
+        id: &str,
+        expected: u64,
+        progress: PushProgress,
+    ) -> StoreResult<PushRecord> {
+        let key = push_key(run, id);
+        let set = doc! {
+            "state": progress.state.as_str(),
+            "cursor": json_to_bson(&progress.cursor)?,
+            "attempts": i64::from(progress.attempts),
+            "last_error": progress.last_error.as_deref().map(Bson::from).unwrap_or(Bson::Null),
+            "next_attempt_at": date(truncate_ms(progress.next_attempt_at)),
+            "lease_owner": Bson::Null,
+            "lease_until": Bson::Null,
+            "updated_at": date(now()),
+        };
+        let committed = self
+            .push
+            .find_one_and_update(
+                doc! { "_id": &key, "version": to_i64(expected, "version")? },
+                doc! { "$set": set, "$inc": { "version": 1_i64 } },
+            )
+            .return_document(ReturnDocument::After)
+            .await
+            .map_err(classify)?;
+        if let Some(committed) = committed {
+            return push_from_doc(&committed);
+        }
+        let current = self
+            .push
+            .find_one(doc! { "_id": &key })
+            .await
+            .map_err(classify)?;
+        match current {
+            None => Err(StoreError::NotFound(run)),
+            Some(current) => Err(StoreError::Conflict {
+                run,
+                expected,
+                actual: get_u64(&current, "version")?,
+            }),
+        }
+    }
+
     async fn purge_finished(&self, agent: &str, before: DateTime<Utc>) -> StoreResult<u64> {
         // `updated_at < before` at millisecond precision, rounding `before` up so
         // a sub-millisecond cutoff selects the same runs as in the other stores.
@@ -737,6 +1046,10 @@ impl Store for MongoStore {
             // 2. Journal, then 3. runs. A crash between steps leaves tombstoned
             //    runs, which the next sweep picks up again.
             self.journal
+                .delete_many(doc! { "run_id": { "$in": &doomed } })
+                .await
+                .map_err(classify)?;
+            self.push
                 .delete_many(doc! { "run_id": { "$in": &doomed } })
                 .await
                 .map_err(classify)?;

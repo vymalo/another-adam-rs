@@ -90,6 +90,10 @@ card:                          # root only: becomes adam_a2a::AgentCardConfig
   name: adam-coder
   skills:
     - { id: coding-task, name: Coding task to pull request, description: "...", tags: [code] }
+  extended:                    # optional: what an authenticated caller sees on top (GetExtendedAgentCard)
+    description: A longer description, for callers that signed in.
+    skills:
+      - { id: audit, name: Audit, description: "Only for authenticated callers" }
 metadata: { owner: platform-team }
 ---
 You are the coder agent. Stop after at most {{max_check_cycles}} failed check cycles ...
@@ -449,6 +453,10 @@ stateDiagram-v2
   tools are added while `bind` resolves an agent, so `AgentInfo::tools` is what the model is offered.
 * **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
   `adam_a2a::AgentCardConfig`; `AgentDef::card` gives it before anything is bound, for a control plane.
+  `card.extended` (`description`, `skills`) becomes the config's extended card: the public card with the description
+  replaced and the skills added (a public id is replaced). It is served only to authenticated callers and only when the
+  server authenticates ([the A2A server](a2a-server.md#the-extended-card)); an empty `extended: {}` declares nothing, and a
+  file holds no secret, so put nothing in it that you would not give every holder of a token.
 
 ## Skills at run time
 

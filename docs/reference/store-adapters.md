@@ -1,7 +1,7 @@
 # Store adapters
 
 The `Store` port ([`adam-core`](../../crates/adam-core/README.md)) is the durable state: runs, journal,
-leases. Two adapters ship, and every adapter must pass the same conformance suite
+leases, A2A push-notification configs and their delivery progress, and the listing of a caller's runs. Two adapters ship, and every adapter must pass the same conformance suite
 ([`adam-store-testkit`](../../crates/adam-store-testkit/README.md)). The model they implement is in
 [Architecture](../architecture.md#the-mental-model); the schema is in
 [Data: the run store](../architecture.md#data-the-run-store).
@@ -38,6 +38,9 @@ cron tick across all replicas. A second message on a conversation that has an op
 | Pinned claiming (`owner`, schema version 2) | `AND (owner IS NULL OR owner = $w)` and `owner = COALESCE(owner, $w)` | the same condition in the candidate and `updateMany` filters (a missing field is `null`) |
 | One open run per conversation | partial unique index | plain unique index on `open_key`; closed runs get `~<run id>`, so no partial or sparse index |
 | Journal deleted with its run | `ON DELETE CASCADE` | journal first, then runs, in batches |
+| Push configs (`push_*`, schema version 3): put, claim, commit | `INSERT .. ON CONFLICT DO UPDATE` bumping `version`; one `FOR UPDATE SKIP LOCKED` claim; `UPDATE .. WHERE version = $n` | update-or-insert on `_id = "<run>:<id>"`; a loop of `findOneAndUpdate` claims, each atomic; `findOneAndUpdate({_id, version: n})` |
+| Push configs deleted with their run | `ON DELETE CASCADE` | deleted with the journal by the purge |
+| `list_runs` / `count_runs` (`ListTasks`), keyset on `(updated_at, id)` | `runs (agent, conversation_id COLLATE "C", updated_at DESC, id DESC)`, a prefix is a range plus `starts_with` | `(agent, conversation_id, updated_at, _id)`, a prefix is an anchored escaped regex |
 | State | `JSONB` (queryable with SQL) | real BSON document (queryable with dot paths) |
 | Transactions | none held open | none |
 | Cross-process signals | `LISTEN`/`NOTIFY` via `adam-notify-postgres` | none: workers poll |
