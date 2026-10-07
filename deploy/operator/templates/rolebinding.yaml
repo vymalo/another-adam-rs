@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "adam-operator.fullname" . }}
+  namespace: {{ include "adam-operator.watchNamespace" . }}
+  labels:
+    {{- include "adam-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "adam-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "adam-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

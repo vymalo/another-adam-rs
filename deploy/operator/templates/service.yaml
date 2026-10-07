@@ -1,0 +1,34 @@
+{{- if include "adam-operator.registrySecretName" . }}
+# The agent registry (agent-registry/v1), cluster-internal only: no Ingress, and a bearer token on every request.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "adam-operator.fullname" . }}-registry
+  labels:
+    {{- include "adam-operator.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "adam-operator.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: registry
+      port: 8080
+      targetPort: registry
+      protocol: TCP
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "adam-operator.fullname" . }}-metrics
+  labels:
+    {{- include "adam-operator.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "adam-operator.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP

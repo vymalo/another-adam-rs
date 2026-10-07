@@ -1,0 +1,107 @@
+# examples/coder.yaml, adapted for the kind end-to-end of the coder (S9, coder-e2e.sh): the real adam-rs image, a Postgres the
+# job runs, and dummy Secrets. Everything that differs from the netcup coder is marked `# e2e:`. No value is a secret: every
+# Secret is a reference, and the job makes them from random or dummy literals.
+# The AgentConfig comes first, so the service never looks for it before it exists.
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: coder
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-coder
+      agent:
+        embedded: {}
+      coder:
+        workers: 1 # e2e: the netcup coder has 4
+        maxCheckCycles: 3
+        checkTimeoutSecs: 900
+        workspaceSweepSecs: 300
+        allowedRepoHosts: [github.com]
+        githubApiUrl: https://api.github.com
+        prDraft: true
+        gitAuthor:
+          name: "e2e[bot]"
+          email: "e2e@example.invalid"
+        opencodeModel: coding-model
+        github:
+          token: # e2e: the token variant with a dummy token; the GitHub App needs a real key
+            secretRef:
+              name: coder-secrets
+              key: GITHUB_TOKEN
+  model:
+    model: coding-model
+    baseUrl: # e2e: never called; the coder opens no connection to its model at startup
+      value: http://model.invalid/v1
+    apiKeySecretRef:
+      name: coder-secrets
+      key: MODEL_API_KEY
+  tools:
+    # The embedded agent reads GitHub through this server (a native sidecar, the same image): without it the coder exits 69.
+    githubMcp:
+      sidecar: true
+      port: 8082
+      host: ""
+    # e2e: no web search and no Context7 (both optional in the netcup coder)
+    mcpServers: {}
+  environment:
+    image:
+      # The newest main image of adam-rs at the time (sha-4363924, read from ghcr.io on 2026-10-07, anonymously): tag and digest.
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924@sha256:1eb43882cc1a94663f03212f4df8999084b11e4f55a9d935041239fe60962c38
+    resources: # e2e: a runner, not netcup
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 2Gi
+    volumes:
+      - name: work
+        scope: agent
+        mountPath: /work
+        source:
+          persistent:
+            size: 1Gi # e2e: the netcup coder has 20Gi on longhorn; here kind's default storage class
+            perReplica: true
+    terminationGracePeriodSeconds: 30
+  security:
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+  extraEnv: {}
+---
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentService
+metadata:
+  name: coder
+  namespace: another-agentic-system
+spec:
+  description: Coding task to verified pull request.
+  configRef:
+    name: coder
+  interfaces:
+    a2a:
+      enabled: true
+      bearerTokensSecretRef:
+        name: coder-secrets
+        key: A2A_BEARER_TOKENS
+      publicUrl: "" # empty: http://<name>.<ns>.svc:8080/
+  scaling:
+    topology: combined
+    workers: 1
+  store:
+    postgres:
+      secretRef: # e2e: the Postgres the job runs (postgres.yaml), not a CloudNativePG cluster
+        name: coder-db-uri
+        key: uri
+  access:
+    allowFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: another-agentic-system
+  registry:
+    title: Coder
+    tags: [coding, git]
+  deletionPolicy: Retain # the claim must stay when the service is deleted
