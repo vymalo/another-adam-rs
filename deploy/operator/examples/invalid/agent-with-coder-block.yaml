@@ -1,0 +1,33 @@
+# Refused: binary adam-agent with a coder block.
+# expect: binary adam-agent needs agent.folder and no coder block
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: invalid-agent-coder
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-agent
+      agent:
+        folder:
+          files:
+            instructions.md: |
+              Hello.
+      coder:
+        github:
+          token:
+            secretRef:
+              name: gh
+              key: GITHUB_TOKEN
+  model:
+    model: m
+    baseUrl:
+      value: https://gateway.example.invalid/v1
+    apiKeySecretRef:
+      name: s
+      key: MODEL_API_KEY
+  environment:
+    image:
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924

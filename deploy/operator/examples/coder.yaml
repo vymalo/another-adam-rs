@@ -1,0 +1,138 @@
+# The netcup coder as an AgentService and its AgentConfig .
+# Every secret is a reference to a Secret key; no value is in this file.
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentService
+metadata:
+  name: coder
+  namespace: another-agentic-system
+spec:
+  description: Coding task to verified pull request.
+  configRef:
+    name: coder
+  interfaces:
+    a2a:
+      enabled: true
+      bearerTokensSecretRef:
+        name: coder-secrets
+        key: A2A_BEARER_TOKENS
+      publicUrl: "" # empty: http://<name>.<ns>.svc:8080/
+    responses:
+      enabled: false # v0: CEL refuses true
+    mcp:
+      enabled: false # v0: CEL refuses true
+  scaling:
+    topology: combined # combined | split
+    workers: 1
+    # front: { replicas: 1 } # split only; a PodDisruptionBudget when > 1
+  suspend: false
+  store:
+    postgres:
+      secretRef:
+        name: coder-db-uri
+        key: uri
+      # or an operator-owned CloudNativePG cluster:
+      # cnpg: { instances: 1, storage: { size: 5Gi, storageClass: longhorn } }
+  access:
+    allowFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: another-agentic-system
+  registry:
+    title: Coder
+    tags: [coding, git]
+  deletionPolicy: Retain # Retain | Delete
+---
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: coder
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-coder # adam-coder | adam-agent
+      agent:
+        embedded: {}
+      coder:
+        workers: 4
+        maxCheckCycles: 3
+        checkTimeoutSecs: 900
+        workspaceSweepSecs: 300
+        workspacePlacement: "" # "" | shared | affinity | isolated
+        allowedRepoHosts: [github.com]
+        githubApiUrl: https://api.github.com
+        prDraft: true
+        gitAuthor:
+          name: "bored-giant-panda[bot]"
+          email: "337696346+bored-giant-panda[bot]@users.noreply.github.com"
+        createRepoOwners: []
+        opencodeModel: coding-model
+        github:
+          app:
+            id: Iv23li4m1ZrQ8wdwjnQH # the App's client ID: public, not a secret
+            owners: [vymalo] # or installationId: 12345 (exactly one of the two)
+            privateKeySecretRef:
+              name: coder-github-app
+              key: private-key.pem
+          # token: { secretRef: { name: coder-secrets, key: GITHUB_TOKEN } } # instead of app, never both
+  model:
+    model: coding-model
+    baseUrl: # or { value: https://…/v1 }
+      secretRef:
+        name: coder-secrets
+        key: MODEL_BASE_URL
+    apiKeySecretRef:
+      name: coder-secrets
+      key: MODEL_API_KEY
+  tools:
+    githubMcp:
+      sidecar: true
+      port: 8082
+      host: ""
+    mcpServers:
+      websearch:
+        url: http://another-agentic-websearch.another-agentic-system.svc:8080/mcp
+        headers:
+          Authorization:
+            prefix: "Bearer "
+            secretRef:
+              name: coder-secrets
+              key: SEARCH_MCP_TOKEN
+        optional: true
+      context7:
+        url: https://mcp.context7.com/mcp
+        headers:
+          Authorization:
+            prefix: "Bearer "
+            secretRef:
+              name: coder-secrets
+              key: CONTEXT7_API_KEY
+        optional: true
+    allowInsecureHttp: true
+  environment:
+    image:
+      # tag and digest (digest of the tag read from ghcr.io on 2026-10-07)
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924@sha256:1eb43882cc1a94663f03212f4df8999084b11e4f55a9d935041239fe60962c38
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        memory: 6Gi
+    volumes:
+      - name: work
+        scope: agent
+        mountPath: /work
+        source:
+          persistent:
+            size: 20Gi
+            storageClass: longhorn
+            perReplica: true
+    terminationGracePeriodSeconds: 120
+  security:
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+  extraEnv: {}

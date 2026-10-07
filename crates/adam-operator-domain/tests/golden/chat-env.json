@@ -1,0 +1,33 @@
+{
+  "source": {
+    "kind": "hand-written, not rendered",
+    "why": "the adam-rs chart at the pinned revision renders adam-coder only: it cannot mount a folder or override the command, so there is nothing to render for adam-agent (deploy/coder-agent is slice S11 of the operator plan)",
+    "revision": "039180993666f0d45eec52f60b1e01e88bc62dbd",
+    "derivedFrom": [
+      "bin/adam-agent/README.md: Configuration, Roles, Image and compose",
+      "docker/coder/Dockerfile: ENTRYPOINT [tini, --, adam-coder], the image sets no MCP_ALLOW_STDIO"
+    ],
+    "forExample": "examples/chat.yaml",
+    "verified": "2026-10-05, by reading those files at the revision; not by running the binary"
+  },
+  "agent": {
+    "command": ["tini", "--", "adam-agent"],
+    "env": [
+      { "name": "LISTEN_ADDR", "literal": "0.0.0.0:8080" },
+      { "name": "PUBLIC_URL", "literal": "http://chat.another-agentic-system.svc:8080/" },
+      { "name": "ADAM_AGENT_DIR", "literal": "/etc/adam/agent" },
+      { "name": "MODEL_BASE_URL", "literal": "https://gateway.example.invalid/v1" },
+      { "name": "MODEL", "literal": "chat-model" },
+      { "name": "MCP_ALLOW_INSECURE", "literal": "true" },
+      { "name": "DATABASE_URL", "secret": { "name": "chat-db-app", "key": "uri" } },
+      { "name": "MODEL_API_KEY", "secret": { "name": "chat-secrets", "key": "MODEL_API_KEY" } },
+      { "name": "A2A_BEARER_TOKENS", "secret": { "name": "chat-secrets", "key": "A2A_BEARER_TOKENS" } }
+    ],
+    "mounts": [{ "name": "agent-folder", "path": "/etc/adam/agent", "readOnly": true }]
+  },
+  "absent": [
+    "ROLE", "WORKERS", "WORKER_ID", "WORKSPACE_ROOT", "WORKSPACE_PLACEMENT", "MCP_ALLOW_STDIO",
+    "GITHUB_TOKEN", "GITHUB_APP_ID", "GITHUB_MCP_URL", "ALLOWED_REPO_HOSTS", "GITHUB_API_URL",
+    "ADAM_EXTRA_MCP_FILE", "OPENCODE_MODEL", "PR_DRAFT"
+  ]
+}

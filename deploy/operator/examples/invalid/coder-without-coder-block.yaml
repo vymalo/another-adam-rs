@@ -1,0 +1,24 @@
+# Refused: binary adam-coder without the coder block.
+# expect: binary adam-coder needs agent.embedded and the coder block
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: invalid-coder-nocoder
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-coder
+      agent:
+        embedded: {}
+  model:
+    model: m
+    baseUrl:
+      value: https://gateway.example.invalid/v1
+    apiKeySecretRef:
+      name: s
+      key: MODEL_API_KEY
+  environment:
+    image:
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924

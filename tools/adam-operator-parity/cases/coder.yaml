@@ -1,0 +1,70 @@
+# Values of the adam-rs chart `deploy/coder` that say what examples/coder.yaml says.
+# One render: topology combined, a GitHub App by owners, a per-replica `work` volume, two extra MCP
+# servers, the GitHub MCP sidecar, every secret by reference.
+fullnameOverride: coder
+image:
+  tag: sha-4363924
+topology: combined
+replicaCount: 1
+config:
+  modelBaseUrlFromSecret: true
+  modelBaseUrl: ""
+  model: coding-model
+  opencodeModel: coding-model
+  publicUrl: ""
+  workers: 4
+  maxCheckCycles: 3
+  checkTimeoutSecs: 900
+  workspaceSweepSecs: 300
+  allowedRepoHosts: [github.com]
+  githubApiUrl: https://api.github.com
+  prDraft: true
+  gitAuthorName: "bored-giant-panda[bot]"
+  gitAuthorEmail: "337696346+bored-giant-panda[bot]@users.noreply.github.com"
+github:
+  auth: app
+  createRepoOwners: []
+  app:
+    id: Iv23li4m1ZrQ8wdwjnQH
+    owners: [vymalo]
+    privateKeySecret: coder-github-app
+githubMcp:
+  enabled: true
+  port: 8082
+  host: ""
+mcp:
+  websearch:
+    url: http://another-agentic-websearch.another-agentic-system.svc:8080/mcp
+    header: Authorization
+    valuePrefix: "Bearer "
+    optional: true
+    allowInsecure: true
+  context7:
+    enabled: true
+    url: https://mcp.context7.com/mcp
+    header: Authorization
+    valuePrefix: "Bearer "
+    optional: true
+database:
+  enabled: false
+  existingSecret:
+    name: coder-db-uri
+    key: uri
+externalSecrets:
+  enabled: true
+  targetSecretName: coder-secrets
+workspace:
+  placement: ""
+persistence:
+  size: 20Gi
+  storageClass: longhorn
+terminationGracePeriodSeconds: 120
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 6Gi
+networkPolicy:
+  enabled: true
+  allowedNamespace: another-agentic-system

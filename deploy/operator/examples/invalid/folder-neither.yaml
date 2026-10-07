@@ -1,0 +1,24 @@
+# Refused: agent.folder has neither files nor configMapRef.
+# expect: exactly one of agent.folder.files and agent.folder.configMapRef
+apiVersion: agents.vymalo.com/v1alpha1
+kind: AgentConfig
+metadata:
+  name: invalid-folder-neither
+  namespace: another-agentic-system
+spec:
+  harness:
+    type: adam-rs
+    adam:
+      binary: adam-agent
+      agent:
+        folder: {}
+  model:
+    model: m
+    baseUrl:
+      value: https://gateway.example.invalid/v1
+    apiKeySecretRef:
+      name: s
+      key: MODEL_API_KEY
+  environment:
+    image:
+      ref: ghcr.io/vymalo/another-adam-rs/coder:sha-4363924
