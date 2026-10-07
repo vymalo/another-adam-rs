@@ -90,6 +90,6 @@ documented in `dev/coder-e2e.sh`.
 | Check | Command |
 |---|---|
 | chart render guarantees | `sh deploy/coder/tests/render-check.sh` (also kubeconform and golden renders in CI), `sh deploy/coder/tests/bump-tag-test.sh` |
-| image smoke tests | `sh docker/coder/test/container-smoke.sh <image>`, `sh docker/coder/test/agent-smoke.sh <image>` |
+| image smoke tests | `sh docker/coder/test/container-smoke.sh <image>`, `sh docker/coder/test/agent-smoke.sh <image>`; with `EXPECT_REVISION=<commit>` (the image's `ADAM_BUILD_REVISION`) they also check the card's version and `build/v1` |
 | shell scripts | `shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh` |
 | a model mock's streamed twin | `cargo test -p adam-model-openai --test wiremock_compose` (plays every script both ways) |

@@ -26,7 +26,9 @@ helm template coder deploy/coder --set topology=split   # front Deployment + wor
 ```
 
 `image.tag` is bumped by `.github/workflows/coder.yml` on every green build of
-main (`deploy/coder/bump-tag.sh`, also run as a dry run on pull requests).
+main (`deploy/coder/bump-tag.sh`, also run as a dry run on pull requests). The image is built with the commit as
+`ADAM_BUILD_REVISION`, so the agent card's `version` ends in `+<sha7>` and `build/v1` says the commit and the digest of the
+agent's files ([ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)): the tag and the card agree.
 
 ## Devcontainers are off here
 
