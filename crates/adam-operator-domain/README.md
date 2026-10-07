@@ -177,5 +177,5 @@ How the goldens are regenerated, and the differences that are intended:
 | `tests/conformance.rs` | every resolved spec passes `RuntimeSpec::check` and is made by `MemoryRuntime`/`MemoryStore`; `DATABASE_URL` and the provisioner's connection agree |
 | `src/*` unit tests | the syntax checks (DNS label, URL, quantity, paths) and the canonical JSON |
 
-Not tested here: anything that needs a cluster (the CEL rules against a real API server are the `kind` job's;
+Not tested here: anything that needs a cluster (the CEL rules against a real API server are the `kind-crds` job's;
 the pods a provider makes from a spec are S4's).

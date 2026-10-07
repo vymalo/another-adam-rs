@@ -125,10 +125,10 @@ not ready. The controller does not apply the agent while the store is not ready 
   instances in the cluster"); the operator is `ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1` in `cnpg-system`.
 * *Verified 2026-10-05*, <https://cloudnative-pg.io/docs/devel/supported_releases>: 1.30.x supports Kubernetes 1.34, 1.35
   and 1.36 (kind's node image here is 1.35.8) and PostgreSQL 14 to 18.
-* **Not read in the source, *unverified* until CI has run it**: that `"Cluster in healthy state"` is the exact string of a
-  healthy phase. It is what `kubectl get cluster` shows in the documentation's examples and in third-party write-ups (a web
-  search on 2026-10-05); the CloudNativePG constant was not read. The `store-cnpg` job waits for `ClusterReady` of a real
-  Cluster, so a different string fails CI rather than going unnoticed. Also *unverified*: that CloudNativePG's name limit
+* **Not read in the source**: that `"Cluster in healthy state"` is the exact string of a healthy phase. It is what
+  `kubectl get cluster` shows in the documentation's examples and in third-party write-ups (a web search on 2026-10-05); the
+  CloudNativePG constant was not read. The `store-cnpg` job waits for `ClusterReady` of a real Cluster and passed on `2644008`
+  (*verified 2026-10-07*: `operator` workflow run 37595241571 on `main` at `2644008`, every job `success`, read through the GitHub Actions API), so the string is right for the CloudNativePG release that job installs. *Unverified*: that CloudNativePG's name limit
   for a Cluster (the webhook refuses a long one) allows every service name; a refusal is `InvalidSpec` with the API
   server's words.
 
@@ -173,13 +173,12 @@ sharing an object. The cluster tests leave the Clusters of `Retain` (and the con
 
 ### What is not tested
 
-* **The cluster tests have not been run.** No kind, docker daemon or CloudNativePG existed where this slice was written.
-  They compile, their skip path was run, and the logic they check is covered by `tests/api.rs` against the fake. What the
-  fake cannot say (CloudNativePG making a database and its Secret, the phase string, the webhook's refusals, the garbage
-  collector) is theirs, and is *unverified* until the `store-cnpg` job of `.github/workflows/operator.yml` has run them.
-* What *was* run against a real API server (a bare kube-apiserver v1.35.8 with etcd, 2026-10-05, no CloudNativePG): the
-  `404` of a missing API (it found the bug above), and the operator's case *a service that asks for a cluster is
-  `CNPGNotInstalled` without CloudNativePG* with its deletion.
+* **The cluster tests ran green in CI** (the `store-cnpg` job of `.github/workflows/operator.yml`, *verified 2026-10-07*: `operator` workflow run 37595241571 on `main` at `2644008`, every job `success`, read through the GitHub Actions API), with CloudNativePG
+  installed: it making a database and its Secret, the phase string, the garbage collector. The webhook's refusals are only as
+  covered as that job's cases say.
+* Before that, on 2026-10-05, against a bare kube-apiserver v1.35.8 with etcd and no CloudNativePG: the `404` of a missing API
+  (it found the bug above), and the operator's case *a service that asks for a cluster is `CNPGNotInstalled` without
+  CloudNativePG* with its deletion.
 * A change of `storage.size` (CloudNativePG only grows a volume), of `instances` on a live cluster, and a Cluster whose
   webhook refuses the spec, are not exercised.
 * A race in the adoption guard: the read and the apply are two requests, so a Cluster that appears between them is

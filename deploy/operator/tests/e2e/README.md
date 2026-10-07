@@ -85,8 +85,8 @@ stateDiagram-v2
 * The image of adam-rs is the one of `main` on 2026-10-07 and is not tracked: a bump of the pin is a deliberate change of `coder.yaml`,
   with the digest of the tag read from ghcr.io again (`adam-upgrade`, `bump-adam`).
 
-*Unverified* until the job has run: all of the above has been checked here only as far as `shellcheck`, `actionlint`, `helm` and the
-`cargo test` of `e2e_fixture.rs` can reach; no cluster, no docker daemon and no kubelet existed where the job was written. Where it
-may need a fix: the size of the coder image on a runner's disk (the job frees about 25 GB first), the time of the first pull (25
+The job ran green on `main` at `2644008` (*verified 2026-10-07*: `operator` workflow run 37595241571, job "the operator runs the coder",
+`success`, read through the GitHub Actions API; its log was not readable from here, so the NetworkPolicy refusal, which the job downgrades to a
+warning on a CNI that does not enforce it, was not checked: no warning annotation was raised). When it needs a fix, look first at: the size of the coder image on a runner's disk (the job frees about 25 GB first), the time of the first pull (25
 minutes allowed), kindnet's handling of the operator's egress policy, whether a POST of `{}` to the JSON-RPC endpoint with the right
 token is answered with something other than 401 or 403, and `busybox`-free tools: the script asks from `curlimages/curl`, pinned by digest.

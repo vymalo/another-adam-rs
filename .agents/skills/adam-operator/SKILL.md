@@ -24,8 +24,9 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
   adding one, changing one, finding out why one is not `Ready`, or moving the coder off its Helm chart.
 * Not for the chart itself (`adam-coder-deploy`), nor for the folder's content (`adam-agent-folder`).
 * Not for run pods (ADR 0019): the operator makes none yet (ADR 0029, "What is missing"); the chart does.
-* Proof so far: no `AgentService` had run by hand on a cluster when ADR 0029 was written. The kind jobs of
-  `.github/workflows/operator.yml` are the evidence; each README has a "What is not proven" section.
+* Proof so far: the kind jobs of `.github/workflows/operator.yml` (the coder under an `AgentService`, the binary, the CRDs, the
+  provider, the CloudNativePG store) passed on `main` at `2644008` (*verified 2026-10-07*, the GitHub Actions API). The repository
+  holds no production evidence; each README has a "What is not proven" section, and ADR 0029 an *Amended 2026-10-07* note.
 
 ## Procedure
 
@@ -147,8 +148,8 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
    `deploy/operator/examples/invalid/`, whose `# expect:` line is that message.
 8. **The registry.** With a token (`registry.tokenSecret` or `externalSecrets`: random, 32 bytes or more) the
    operator serves `GET /registry/v1/agents` on the Service `adam-operator-registry`, port 8080, with
-   `Authorization: Bearer <token>`: an `agent-registry/v1` linkset of every service that has A2A on and is not
-   `Blocked`, each item with `href` (its card URL), `service` (its name), `title` and `tags`. No token, no
+   `Authorization: Bearer <token>`: an `agent-registry/v1` linkset of every service that has A2A on, a card URL and is
+   not `Blocked` (a `Degraded` one is listed), each item with `href` (its card URL), `service` (its name), `title` and `tags`. No token, no
    registry. Past 500 items or 1 MiB it answers 503 rather than truncate. The orchestrator reads it with that
    token (its `AGENT_REGISTRY_URL` and `AGENT_REGISTRY_TOKEN`) and sends one agent token to every agent, which
    must be a member of each service's `A2A_BEARER_TOKENS`: the operator cannot check that. The contract is in the

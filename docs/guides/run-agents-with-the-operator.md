@@ -4,8 +4,8 @@ The operator ([ADR 0029](../decisions/0029-adam-rs-has-an-operator.md)) runs an 
 instead of a Helm release: an `AgentConfig` (what runs) and an `AgentService` (how it runs). It makes the pods, the
 Service and the network policy, wires the database, and lists the agent in a registry for the orchestrator. The
 coder chart is the other way to deploy the coder: [Deploy the coder](deploy-the-coder.md). Status: the types are
-`v1alpha1`, and no `AgentService` had run on a cluster by hand when the ADR was written; the kind jobs of
-[`operator.yml`](../../.github/workflows/operator.yml) are the proof so far.
+`v1alpha1`. The kind jobs of [`operator.yml`](../../.github/workflows/operator.yml) passed on `main` at `2644008` (*verified 2026-10-07*,
+GitHub Actions API); this repository holds no production evidence (see the *Amended* note of the ADR).
 
 ## Before you start
 

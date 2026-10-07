@@ -104,7 +104,7 @@ image runs as the real binaries would.
 | `suspend_scales_to_zero_and_resume_wakes` | `Suspended` with zero replicas, then `Ready` again |
 | `an_object_that_is_not_ours_with_the_name_is_a_conflict_that_changes_nothing` | a Deployment named like the service, labelled `Helm`: `NameConflict`, `Blocked`, the foreign object not written; its removal lets the operator make its own |
 | `a_deletion_that_happens_while_the_operator_is_down_completes_when_it_returns` | the operator is killed (SIGKILL), the service deleted: the finalizer holds the object and the Deployment; a new operator completes it |
-| `the_registry_lists_a_ready_agent_to_whoever_holds_the_token_and_nobody_else` | S7: with a token file the operator serves the registry: `401` with no body for no token, a wrong one and the wrong scheme; `200` with the contract's headers, the `Ready` agent as an item with its card URL, title and tags, and the `Blocked` one not listed (`Listed: False` / `ServiceBlocked`); `304` on a match; `HEAD`; and, when `ADAM_OPERATOR_TEST_HOST_ADDR` is set, the registry and the card it lists read **from a pod** (and refused there without the token); a deleted service leaves the list |
+| `the_registry_lists_a_ready_agent_to_whoever_holds_the_token_and_nobody_else` | S7: with a token file the operator serves the registry: `401` with no body for no token, a wrong one and the wrong scheme; `200` with the contract's headers, the `Ready` agent as an item with its card URL, title and tags (a `Degraded` one is listed too), and the `Blocked` one not listed (`Listed: False` / `ServiceBlocked`); `304` on a match; `HEAD`; and, when `ADAM_OPERATOR_TEST_HOST_ADDR` is set, the registry and the card it lists read **from a pod** (and refused there without the token); a deleted service leaves the list |
 | `without_a_token_no_registry_is_served_and_nothing_is_listed` | S7: no `REGISTRY_TOKEN_FILE`: nothing listens on the registry's port and the service is `Listed: False` / `RegistryDisabled` |
 | `a_service_that_asks_for_a_cluster_is_cnpg_not_installed_without_cloudnativepg` | S6: `store.postgres.cnpg` on a cluster without CloudNativePG is `StoreReady: False`, `CNPGNotInstalled`, `Blocked`, no workload, and the deletion of that service completes (a skip when CloudNativePG is installed; a failure under `ADAM_OPERATOR_TEST_REQUIRE_CLUSTER=1`) |
 | `health_readiness_and_metrics_are_served` | `/healthz`, `/readyz` 200 and the counters on `/metrics` |
@@ -120,11 +120,11 @@ image runs as the real binaries would.
 
 ### What has and has not been run
 
-* **The `operator-e2e` job of `operator.yml` has not run.** No kind, docker daemon or kubelet existed where this slice was
-  written. Everything below that needs pods (the claims of a StatefulSet, the kubelet's `CreateContainerConfigError`, a real
-  rollout, the stub image) is *unverified* until CI has run it.
+* **The `operator-e2e` job of `operator.yml` ran green** on `main` at `2644008` (*verified 2026-10-07*: `operator` workflow run 37595241571 on `main` at `2644008`, every job `success`, read through the GitHub Actions API), as did `kind-crds` and `coder-e2e`:
+  pods that start, the claims of a StatefulSet, the kubelet's `CreateContainerConfigError`, a real rollout and the stub image are
+  proven on kind. Not proven in this repository: any production cluster.
 * **What was run**: on 2026-10-05, the nine cases (the missing-Secret case returns early) against a bare **kube-apiserver
-  v1.35.8 and etcd v3.5.21** started by hand (the kind job's Kubernetes version; no controller manager, no kubelet), with
+  v1.35.8 and etcd v3.5.21** started by hand (the Kubernetes version of the kind jobs; no controller manager, no kubelet), with
   `ADAM_OPERATOR_TEST_NO_WORKLOADS=1`: all passed. That proves the operator binary, the controllers, the provider's server-side
   apply, the finalizer, the status subresource, Events, list and watch, and the CRDs and their CEL rules against a real API
   server. It does **not** prove that a pod starts, that the kubelet words a missing Secret as the provider expects, that
@@ -138,5 +138,5 @@ image runs as the real binaries would.
   its fake API server and by this case.
 * **S7, 2026-10-05**, the same bare kube-apiserver, all twelve cases: they passed, the registry case's host-side part
   included (the token, the headers, the item, `304`, `HEAD`, a Blocked service not listed, a deleted one gone). **Its pod
-  part has not run** (`ADAM_OPERATOR_TEST_HOST_ADDR` is unset there: no pod ever exists on a bare API server), and neither has
-  the kind job: *unverified* until `operator-e2e` has run.
+  part did not run there** (`ADAM_OPERATOR_TEST_HOST_ADDR` is unset there: no pod ever exists on a bare API server); the kind jobs ran
+  later, green, in CI (`operator-e2e`, see the first bullet).

@@ -73,7 +73,7 @@ the `githubMcp` port beyond its 1 to 65535 range (the range is also in the schem
 
 The CEL rules are evaluated with `kube-cel` (the `cel` feature of `kube`, a dev-dependency), a
 client-side implementation. **It is a proxy for an API server, not one**, and it does not check
-the OpenAPI schema (types, `required`, `enum`). The `kind` job of
+the OpenAPI schema (types, `required`, `enum`). The `kind-crds` job of
 [`.github/workflows/operator.yml`](../../.github/workflows/operator.yml) applies the CRDs, the
 examples and the invalid examples to a real API server.
 
@@ -82,6 +82,6 @@ tested by `adam-operator`.
 
 ## Versions
 
-`kube` 4.0.0 (`derive`; the lock pins it, `cargo update` would take 4.2.0), `k8s-openapi` 0.28.0
+`kube` 4.2.0 (`derive`; `Cargo.lock` pins it), `k8s-openapi` 0.28.0
 (`v1_32`, `schemars`), `schemars` 1.2.2. Resource requirements, the label selectors of `allowFrom`
 and `Quantity` are `k8s-openapi` types, so the schema embeds their upstream descriptions.

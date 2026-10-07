@@ -85,8 +85,9 @@ stateDiagram-v2
 
 ## The document
 
-`document::build` lists a service when the directory's own rule holds (`DirectoryEntry::listed`: A2A enabled, not
-`Blocked`, with a card URL), **in scope-then-name order**, which is the display order and the same between reads. Then:
+`document::build` lists a service when the directory's own rule holds (`DirectoryEntry::listed`, in `adam-operator-ports`:
+`a2a_enabled && !blocked && agent_card.is_some()`, so a `Degraded` or `Suspended` service with a card URL is listed, and only a `Blocked`
+one, or one the controller has not reconciled yet, is not), **in scope-then-name order**, which is the display order and the same between reads. Then:
 
 | Rule of the contract | What the builder does |
 |---|---|
@@ -172,10 +173,9 @@ ADAM_OPERATOR_UPDATE_GOLDENS=1 cargo test -p adam-operator-registry --test docum
 
 ### What is not tested
 
-* **A pod reading the registry has not been run.** No kind or docker daemon existed where this slice was written. The case
-  does it when `ADAM_OPERATOR_TEST_HOST_ADDR` is set (CI computes the gateway of the docker network `kind`) and is *unverified*
-  until the `operator-e2e` job has run. The same case, host side, **was run** against a bare kube-apiserver v1.35.8 on
-  2026-10-05 (the controller manager and the kubelet played by the test): all of it passed but the pod.
+* **A pod reading the registry ran green in CI**: the `operator-e2e` job sets `ADAM_OPERATOR_TEST_HOST_ADDR` (it computes the
+  gateway of the docker network `kind`), and the `coder-e2e` job reads the registry from a pod too (*verified 2026-10-07*: `operator` workflow run 37595241571 on `main` at `2644008`, every job `success`, read through the GitHub Actions API). Before that, on
+  2026-10-05, the host side ran against a bare kube-apiserver v1.35.8 (the controller manager and the kubelet played by the test).
 * A reader over real HTTP and TLS: the registry is plain HTTP in the cluster, and the system's own reader is tested in its
   repository. The two have not been run against each other.
 * Behaviour under load, and a registry of more than a few hundred services.

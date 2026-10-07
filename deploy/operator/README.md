@@ -41,14 +41,14 @@ helm upgrade --install adam-operator deploy/operator --namespace another-agentic
 ```
 
 On netcup an Argo CD Application does this (`helm.valuesObject`, the contents of
-[`examples/netcup.values.yaml`](examples/netcup.values.yaml)), and CI bumps `image.tag` ([below](#the-image)). The image tag is
-`sha-0000000` until the first build of `main` bumps it: **a render of the chart before that deploys an image that does not exist**.
+[`examples/netcup.values.yaml`](examples/netcup.values.yaml)), and CI bumps `image.tag` ([below](#the-image)): `values.yaml` holds the tag of the last green build of `main`. Before the first build it was
+the placeholder `sha-0000000`, an image that does not exist.
 
 ## Values
 
 | Value | Default | What |
 |---|---|---|
-| `image.repository`, `image.tag`, `image.digest`, `image.pullPolicy` | `ghcr.io/vymalo/another-adam-rs/operator`, `sha-0000000`, none, `IfNotPresent` | The tag is **written by CI only** (`bump-tag.sh`), never by hand. `latest` and a malformed digest are refused |
+| `image.repository`, `image.tag`, `image.digest`, `image.pullPolicy` | `ghcr.io/vymalo/another-adam-rs/operator`, `sha-<7>` of the last green build of `main`, none, `IfNotPresent` | The tag is **written by CI only** (`bump-tag.sh`), never by hand. `latest` and a malformed digest are refused |
 | `imagePullSecrets` | `[]` | For a private package ([below](#the-image)) |
 | `watchNamespace` | the release's namespace | The one namespace watched; the `Role` and `RoleBinding` are made there. A name, never a list or a wildcard: **there is no value that gives the operator a `ClusterRole`** |
 | `storeCnpg` | `true` | The right on CloudNativePG `Cluster`s (`get patch create delete`). The image is built with the `store-cnpg` feature; `false` is for a cluster that has no CloudNativePG |
@@ -94,6 +94,9 @@ The `Role` is the sum of the three crates' tables, no more
 `agentservices/finalizers`, none on `databases`, `poolers` or `clusters/status`, and nothing outside the watched namespace.
 
 ## The registry and its token
+
+The registry lists every service that has A2A on, is not `Blocked` and has a card URL (`a2a_enabled && !blocked && agent_card.is_some()`),
+so a `Degraded` service is listed too ([`adam-operator-registry`](../../crates/adam-operator-registry/README.md)).
 
 `adam-operator run` serves the registry only with a token, and the chart follows: **no `registry.tokenSecret.name` and no
 `externalSecrets.enabled` means no `REGISTRY_TOKEN_FILE`, no port 8080, no registry Service**, and every service says `Listed: False`,
@@ -143,14 +146,17 @@ sh deploy/operator/tests/bump-tag-test.sh
 | `tests/e2e/` | the kind end-to-end of the coder (S9): [`tests/e2e/README.md`](tests/e2e/README.md) |
 
 CI also runs kubeconform in strict mode over four renders (the defaults, netcup, `secret.values.yaml`, and the CRDs chart with the
-`CustomResourceDefinition` kind skipped, because the schema set has none: the `kind` job of `operator.yml` applies them to a real API server).
+`CustomResourceDefinition` kind skipped, because the schema set has none: the `kind-crds` job of `operator.yml` applies them to a real API server).
 
 ## What is not proven
 
-* The chart has been rendered, linted and checked with kubeconform; **it has not been installed on a cluster by hand**. The first
-  install is the `coder-e2e` job of `operator.yml` (*unverified* until CI has run it), which installs this chart
-  into kind and runs the real coder under it. In particular *unverified*: that a read-only root filesystem is enough for the
-  binary, that the NetworkPolicy's egress is enough on a cluster that enforces it (kind's does), and that `list` without `watch` on
-  `services`, `configmaps` and `persistentvolumeclaims`, as the runtime README lists them, is what the provider needs.
-* That Argo CD syncs the CRDs of `deploy/operator-crds` and this chart in that order (its sync waves, or two Applications) and leaves
-  an agent's objects alone while it does.
+* **Proven on kind, 2026-10-07** (*verified*: the `operator` workflow run 37595241571 on `main` at `2644008`,
+  https://github.com/vymalo/another-adam-rs/actions/runs/37595241571, every job `success`, read through the GitHub Actions API): the `coder-e2e`
+  job installs this chart and the CRDs chart into kind and runs the real coder under an `AgentService`, with a read-only root filesystem, the
+  Role as it is, and the registry read from a pod; `kind-crds`, `operator-e2e`, `runtime-kubernetes` and `store-cnpg` apply the CRDs, the
+  examples, the binary, the provider and the CloudNativePG store to a real API server. What `coder-e2e` does and does not exercise:
+  [`tests/e2e/README.md`](tests/e2e/README.md).
+* **Not proven in this repository**: any production cluster. A deployment's own evidence lives in that deployment's repository
+  (ADR 0029, *Amended 2026-10-07*). Also *unverified*: that Argo CD syncs the CRDs of `deploy/operator-crds` and this chart in that order
+  (its sync waves, or two Applications) and leaves an agent's objects alone while it does; and that the NetworkPolicy's egress is
+  enough on a cluster whose CNI differs from kind's.
