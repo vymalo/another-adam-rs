@@ -65,7 +65,7 @@ Everything `run` does to the API, for the chart of S8 (a namespaced `Role`, §59
 
 [`deploy/crds/agents.vymalo.com.yaml`](../../deploy/crds/agents.vymalo.com.yaml) is the output of
 `crdgen`, byte for byte. Change a type in `adam-operator-api`, regenerate, commit both. Two checks hold it:
-`cargo test -p adam-operator` (`tests/cli.rs`) and the `crds-drift` job of
+`cargo test -p adam-operator` (`tests/cli.rs`) and the `crds` job of
 [`.github/workflows/operator.yml`](../../.github/workflows/operator.yml).
 
 ## Tests

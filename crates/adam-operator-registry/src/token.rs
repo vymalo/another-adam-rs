@@ -3,6 +3,7 @@
 use std::fmt;
 use std::path::Path;
 
+use adam_error::{Classify, ErrorClass};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -29,6 +30,16 @@ impl std::error::Error for TokenError {
         match self {
             Self::Unreadable(e) => Some(e),
             Self::Empty => None,
+        }
+    }
+}
+
+impl Classify for TokenError {
+    fn class(&self) -> ErrorClass {
+        match self {
+            // A mounted Secret that cannot be read is the deployment's fault, not the input's.
+            Self::Unreadable(_) => ErrorClass::Internal,
+            Self::Empty => ErrorClass::Invalid,
         }
     }
 }

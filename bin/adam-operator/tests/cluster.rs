@@ -218,7 +218,7 @@ async fn connect() -> Option<Cluster> {
 }
 
 /// Install the CRDs the way a deployment would (`crdgen` is what `deploy/crds` holds, byte for byte: the
-/// `crds-drift` job and `tests/cli.rs` say so), and wait until the API serves them.
+/// `crds` job and `tests/cli.rs` say so), and wait until the API serves them.
 async fn install_crds(client: &Client) {
     let crds: Api<CustomResourceDefinition> = Api::all(client.clone());
     for crd in adam_operator_api::crds() {

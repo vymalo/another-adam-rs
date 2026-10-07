@@ -1,2 +1,2 @@
 # There is nothing to set: the CRDs are the file files/agents.vymalo.com.yaml, a copy of deploy/crds/agents.vymalo.com.yaml,
-# which is what `adam-operator crdgen` prints. A test and the `crds-drift` job fail when the two differ.
+# which is what `adam-operator crdgen` prints. A test and the `crds` job fail when the two differ.

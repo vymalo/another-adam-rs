@@ -76,7 +76,8 @@ rules_are() { [ "$(role_rules)" = "$1" ]; }
 # ---- The three golden renders ---------------------------------------------------------------------------------------------
 golden() { # golden <name> <helm args>: the render equals tests/golden/<name>.yaml (or rewrites it)
   name=$1; shift
-  render "$@"
+  # The goldens hold the placeholder tag: the bump job rewrites values.yaml on main, and a golden must not follow it.
+  render --set image.tag=sha-0000000 "$@"
   if [ "${UPDATE_GOLDEN:-}" = 1 ]; then cp "$out" "$here/golden/$name.yaml"; echo "wrote tests/golden/$name.yaml" >&2; return 0; fi
   cmp -s "$out" "$here/golden/$name.yaml"
 }

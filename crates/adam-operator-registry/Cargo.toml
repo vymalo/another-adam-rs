@@ -9,6 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+adam-error.workspace = true
 adam-operator-ports.workspace = true
 axum.workspace = true
 serde_json.workspace = true

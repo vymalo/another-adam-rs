@@ -631,6 +631,7 @@ dependencies = [
 name = "adam-operator-registry"
 version = "0.1.0"
 dependencies = [
+ "adam-error",
  "adam-operator-ports",
  "axum",
  "proptest",

@@ -98,7 +98,7 @@ jobs:
       # until the goldens are regenerated and adam-operator-domain agrees with them (cargo test, in ci.yml).
       - name: The parity goldens are what deploy/coder renders now
         run: |
-          python3 -m pip install --quiet pyyaml
+          python3 -c 'import yaml' 2>/dev/null || sudo apt-get install -y python3-yaml
           sh tools/adam-operator-parity/regen.sh --check
       # Core kinds against the Kubernetes schemas, the ExternalSecret against the CRD schema vendored in
       # deploy/operator/tests/schemas (a pinned copy of the datreeio catalog: a live catalog 500 once skipped an image job).
@@ -509,7 +509,7 @@ jobs:
           docker push "$IMAGE:$tag"
           # `latest` follows the newest build only: image jobs can finish out of order, and an older run must not move it
           # back (the same rule as the bump below; the bump commits themselves do not count).
-          newer="$(git log --format=%s "$GITHUB_SHA..origin/main" -- crates/adam-operator-* bin/adam-operator Cargo.toml Cargo.lock docker/operator deploy/operator deploy/operator-crds deploy/crds .github/workflows/operator.yml | grep -v '^chore(deploy): bump operator to ' || true)"
+          newer="$(git log --format=%s "$GITHUB_SHA..origin/main" -- crates/adam-operator-* bin/adam-operator Cargo.toml Cargo.lock docker/operator deploy/operator deploy/operator-crds deploy/crds deploy/coder .github/workflows/operator.yml | grep -v '^chore(deploy): bump operator to ' || true)"
           if [ -n "$newer" ]; then
             pushed="\`$IMAGE:$tag\` (not \`latest\`: main has moved on since this commit, the newer build pushes it)."
           else
@@ -555,7 +555,7 @@ jobs:
             git reset --hard origin/main
             # A newer commit that changes what this workflow builds makes its own image and bumps for itself; do not put the
             # tag back to this older one (image jobs can finish out of order). The bump commits themselves do not count.
-            newer="$(git log --format=%s "$SHA..origin/main" -- crates/adam-operator-* bin/adam-operator Cargo.toml Cargo.lock docker/operator deploy/operator deploy/operator-crds deploy/crds .github/workflows/operator.yml | grep -v '^chore(deploy): bump operator to ' || true)"
+            newer="$(git log --format=%s "$SHA..origin/main" -- crates/adam-operator-* bin/adam-operator Cargo.toml Cargo.lock docker/operator deploy/operator deploy/operator-crds deploy/crds deploy/coder .github/workflows/operator.yml | grep -v '^chore(deploy): bump operator to ' || true)"
             if [ -n "$newer" ]; then
               echo "main has moved on since $SHA; the newer build will bump"
               exit 0

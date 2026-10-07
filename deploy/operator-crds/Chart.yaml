@@ -1,6 +1,6 @@
 apiVersion: v2
 name: adam-operator-crds
-description: "The CustomResourceDefinitions of the operator (AgentService and AgentConfig, agents.vymalo.com/v1alpha1), and nothing else. Its own chart so the CRDs are installed, and upgraded, apart from the operator (§93)."
+description: "The CustomResourceDefinitions of the operator (AgentService and AgentConfig, agents.vymalo.com/v1alpha1), and nothing else. Its own chart so the CRDs are installed, and upgraded, apart from the operator (ADR 0029)."
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
