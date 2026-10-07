@@ -224,6 +224,8 @@ struct WebhookState {
     received: Mutex<Vec<Received>>,
     script: Mutex<VecDeque<u16>>,
     default_status: Mutex<Option<u16>>,
+    /// How long to hold each request before answering it.
+    delay: Mutex<Duration>,
 }
 
 /// A local webhook: records every request, answers from a script and then a default status.
@@ -256,6 +258,11 @@ impl Webhook {
     /// Answer every request that is not scripted with `status`.
     pub fn answer_with(&self, status: u16) {
         *self.state.default_status.lock().unwrap() = Some(status);
+    }
+
+    /// Hold every request for `delay` before answering it (a slow webhook).
+    pub fn answer_after(&self, delay: Duration) {
+        *self.state.delay.lock().unwrap() = delay;
     }
 
     /// Answer the next requests with these statuses, then the default.
@@ -310,6 +317,8 @@ async fn record(
         .pop_front()
         .or(*state.default_status.lock().unwrap())
         .unwrap_or(200);
+    let delay = *state.delay.lock().unwrap();
+    // Recorded on arrival, answered after the delay: a request in flight is already counted.
     state.received.lock().unwrap().push(Received {
         headers: headers
             .iter()
@@ -318,6 +327,7 @@ async fn record(
         body: serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
         answered,
     });
+    tokio::time::sleep(delay).await;
     StatusCode::from_u16(answered).unwrap()
 }
 

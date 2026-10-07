@@ -659,6 +659,46 @@ async fn delivery_resumes_after_a_restart_on_the_same_store_without_loss() {
 }
 
 #[tokio::test]
+async fn stopping_the_loop_lets_the_request_in_flight_finish_and_release_its_lease() {
+    // A restart (or a deploy) stops the loop while a request is on its way. The lease of that
+    // config must not be left to run out: the request finishes and its outcome is committed, so
+    // the next instance finds the config due at once rather than a lease-length later.
+    let hook = Webhook::start().await;
+    hook.answer_after(Duration::from_millis(300));
+    let (push, store) = local_push(&[&hook]);
+    let server = started(Some(push.clone())).await;
+    let backend: adam_a2a::DynTaskBackend = Arc::new(server.backend.clone());
+    let delivery = Delivery::start(push.deliverer(backend, fast_options()).unwrap());
+    let client = server.client(Some(TOKEN)).await;
+    let task = send_hold_with_hook(&client, &hook.url()).await;
+    server.backend.release(&task.id);
+    for _ in 0..300 {
+        if !hook.all().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(!hook.all().is_empty(), "a request is on its way");
+    delivery.stop().await;
+
+    // Another instance, at once: the claim is not blocked by a lease the first one left behind.
+    let claimed = store
+        .claim_due(
+            "next-instance",
+            chrono::Utc::now(),
+            Duration::from_secs(60),
+            8,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "the config is due, not leased: {claimed:?}"
+    );
+}
+
+#[tokio::test]
 async fn delivery_gives_up_after_the_bound_and_records_why() {
     let hook = Webhook::start().await;
     hook.answer_with(500);

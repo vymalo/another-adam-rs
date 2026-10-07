@@ -35,7 +35,7 @@ const SVG: &[u8] = b"<svg xmlns='http://www.w3.org/2000/svg' width='2' height='2
 /// * `[fail]`: fails with `boom`;
 /// * `[file]`: like (none), and also shares the file `logo.svg`;
 /// * `[reject]`: `init` refuses the start message, like an agent that cannot read it;
-/// * `[slow]`: waits 300 ms in its first step, before it does what the other markers say.
+/// * `[slow]`: waits 1 s in its first step, before it does what the other markers say.
 ///
 /// A task started as the continuation of another lists the texts of the tasks before it in
 /// `state.earlier`.
@@ -115,7 +115,7 @@ impl Agent for Scripted {
         if text.contains("[slow]") && phase == 0 {
             // Long enough that a client that registers a webhook with its message does so while the
             // task is still running, whatever the speed of the machine.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
         if text.contains("[fail]") {
             return Ok(Transition::Fail {
@@ -2837,27 +2837,36 @@ mod push {
                 .is_some_and(|l| l == "status:TASK_STATE_COMPLETED")
         })
         .await;
+        // The deliverer tells the webhook what the task is, not every step it took: the resumed
+        // task is `working` for as long as it takes to answer, and a round may or may not land in
+        // that window. So at most one `working` sits between input-required and the artifact.
         let heard = hook.accepted();
-        let tail: Vec<&str> = heard
+        let input = heard
             .iter()
-            .rev()
-            .take(3)
-            .rev()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            tail,
-            [
-                "status:TASK_STATE_INPUT_REQUIRED",
-                "artifact:blue",
-                "status:TASK_STATE_COMPLETED"
-            ],
+            .rposition(|l| l == "status:TASK_STATE_INPUT_REQUIRED")
+            .unwrap_or_else(|| panic!("input-required was never heard: {heard:?}"));
+        let after: Vec<&str> = heard[input + 1..].iter().map(String::as_str).collect();
+        assert!(
+            after == ["artifact:blue", "status:TASK_STATE_COMPLETED"]
+                || after
+                    == [
+                        "status:TASK_STATE_WORKING",
+                        "artifact:blue",
+                        "status:TASK_STATE_COMPLETED",
+                    ],
             "{heard:?}"
         );
-        let unique: std::collections::HashSet<_> = heard.iter().collect();
-        assert_eq!(
-            unique.len(),
-            heard.len(),
+        // Before it, only the state the task had while the webhook was down.
+        assert!(
+            heard[..input]
+                .iter()
+                .all(|l| l == "status:TASK_STATE_WORKING"),
+            "{heard:?}"
+        );
+        // Nothing was delivered twice: the same label next to itself would be a repeat (a label
+        // alone cannot say so: `working` is heard before and after the pause, as two events).
+        assert!(
+            heard.windows(2).all(|w| w[0] != w[1]),
             "nothing was delivered twice: {heard:?}"
         );
         // The terminal state ended the config.

@@ -187,14 +187,19 @@ impl PushDeliverer {
         self.nudge.clone()
     }
 
-    /// Deliver until `stop` resolves. Returns when it does; an in-flight request finishes first.
+    /// Deliver until `stop` resolves. Returns when it does; the round in progress finishes first
+    /// (it is bounded by [`PushDeliveryOptions::request_timeout`]), so that what it claimed is
+    /// committed and its leases released rather than left to run out for the next instance.
     pub async fn run(&self, stop: impl std::future::Future<Output = ()> + Send) {
+        use futures::FutureExt as _;
         tokio::pin!(stop);
         loop {
-            let worked = tokio::select! {
-                () = &mut stop => return,
-                worked = self.round() => worked,
-            };
+            // A stop is looked at between rounds, never in the middle of one: dropping a round
+            // after `claim_due` would strand its configs behind a lease of `lease_ttl`.
+            if stop.as_mut().now_or_never().is_some() {
+                return;
+            }
+            let worked = self.round().await;
             if worked {
                 // There was something to do: look again at once (the next event of a config is
                 // due immediately), but let a stop through.
