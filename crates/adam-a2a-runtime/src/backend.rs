@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
-use adam_a2a::{BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskEvent};
+use adam_a2a::{
+    BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskEvent, TaskPage, TaskQuery,
+};
 use adam_core::{RunId, StoreError};
 use adam_error::ErrorClass;
 use adam_runtime::{AgentError, BroadcastSink, Classify, RunView, Runtime, RuntimeError};
@@ -195,6 +197,14 @@ impl RuntimeTaskBackend {
             prompt: Arc::new(default_prompt),
             inbound: Arc::new(default_inbound),
         }
+    }
+
+    /// The push-notification state of this backend's agent, kept in the same store as its runs
+    /// ([`StorePushStore`](crate::StorePushStore)): give it to
+    /// `adam_a2a::push::PushSupport::new` so configs and delivery progress survive a restart and
+    /// are shared between replicas.
+    pub fn push_store(&self) -> crate::StorePushStore {
+        crate::StorePushStore::new(self.runtime.store().clone(), self.agent.clone())
     }
 
     /// How often a subscription re-reads the durable run (default
@@ -795,6 +805,10 @@ impl TaskBackend for RuntimeTaskBackend {
         task_id: &str,
     ) -> BoxStream<'static, Result<TaskEvent, BackendError>> {
         subscribe::subscribe(self.clone(), caller.clone(), task_id.to_owned())
+    }
+
+    async fn list(&self, caller: &Caller, query: &TaskQuery) -> Result<TaskPage, BackendError> {
+        self.list_tasks(caller, query).await
     }
 }
 

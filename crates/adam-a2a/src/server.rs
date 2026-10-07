@@ -19,10 +19,12 @@ use axum::routing::get;
 use futures::StreamExt;
 
 use crate::activation::{self, HEADER};
-use crate::auth::{self, AuthConfig, Authenticator};
+use crate::auth::{self, AuthConfig, Authenticator, JWKS_PATH};
 use crate::backend::DynTaskBackend;
-use crate::card::{AgentCardConfig, build_card};
+use crate::card::{AgentCardConfig, Flags, build_card, build_extended_card};
 use crate::handler::BackendHandler;
+use crate::push::PushSupport;
+use crate::signing::CardSigner;
 
 /// The SSE comment frame (ignored by clients) used as a keepalive.
 const KEEPALIVE_FRAME: &[u8] = b":\n\n";
@@ -40,6 +42,11 @@ pub struct ServerOptions {
     /// [`SDK_KEEPALIVE_INTERVAL`] for proxies with short idle timeouts (and for
     /// tests); `None` relies on the SDK's alone.
     pub keepalive_interval: Option<Duration>,
+    /// Push notifications (see [`PushSupport`]). `None`, or a policy that allows no webhook: they
+    /// are off, the card says so, and the four push methods answer `PushNotificationNotSupported`.
+    pub push: Option<PushSupport>,
+    /// Signs the public card and the extended card (see [`CardSigner`]). `None`: unsigned.
+    pub card_signer: Option<CardSigner>,
 }
 
 impl ServerOptions {
@@ -47,6 +54,23 @@ impl ServerOptions {
     #[must_use]
     pub fn with_keepalive_interval(mut self, interval: Duration) -> Self {
         self.keepalive_interval = Some(interval);
+        self
+    }
+
+    /// Turn push notifications on, for the webhooks `push`'s policy allows. The card advertises
+    /// `pushNotifications: true` only when the policy allows at least one. Run the delivery loop
+    /// ([`PushSupport::deliverer`]) beside the server: this only accepts and stores the configs.
+    #[must_use]
+    pub fn with_push(mut self, push: PushSupport) -> Self {
+        self.push = Some(push);
+        self
+    }
+
+    /// Sign the public card, and the extended card if there is one, with `signer`, and serve the
+    /// public key at `GET /.well-known/jwks.json`.
+    #[must_use]
+    pub fn with_card_signer(mut self, signer: CardSigner) -> Self {
+        self.card_signer = Some(signer);
         self
     }
 }
@@ -60,7 +84,8 @@ impl ServerOptions {
 /// |---|---|
 /// | `GET /.well-known/agent-card.json` | public |
 /// | `GET /healthz` | public |
-/// | `POST /` JSON-RPC: `SendMessage`, `SendStreamingMessage` (SSE), `GetTask`, `CancelTask`, `SubscribeToTask` (SSE) | required |
+/// | `GET /.well-known/jwks.json` (only when the card is signed) | public |
+/// | `POST /` JSON-RPC: `SendMessage`, `SendStreamingMessage` (SSE), `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask` (SSE), the four push-notification methods (when push is on), `GetExtendedAgentCard` (when configured) | required |
 ///
 /// Any other route is also behind authentication (fail closed). Mount the
 /// router at the root of a listener, or `nest` it and set
@@ -92,29 +117,82 @@ impl A2aServer {
         auth: AuthConfig,
         options: ServerOptions,
     ) -> Router {
-        let authenticator = Arc::new(Authenticator::new(auth));
-        let agent_card = build_card(&card, authenticator.requires_bearer());
+        let mut authenticator = Authenticator::new(auth);
+        let bearer = authenticator.requires_bearer();
+
+        // Push is on only when the deployment allowed a webhook; the extended card only when it
+        // is configured **and** callers authenticate (an anonymous server has no "authenticated").
+        let push = options.push.clone().filter(PushSupport::is_enabled);
+        let extended_config = card.extended.as_ref().filter(|e| !e.is_empty());
+        if extended_config.is_some() && !bearer {
+            tracing::warn!(
+                "an extended agent card is configured but the server does not authenticate callers: it is not served"
+            );
+        }
+        let extended_config = extended_config.filter(|_| bearer);
+        let flags = Flags {
+            bearer,
+            push: push.is_some(),
+            extended: extended_config.is_some(),
+        };
+        let mut agent_card = build_card(&card, flags);
+        let mut extended_card = extended_config.map(|e| build_extended_card(&card, e, flags));
+        if let Some(signer) = &options.card_signer {
+            agent_card = sign_or_warn(signer, agent_card, "public");
+            extended_card = extended_card.map(|c| sign_or_warn(signer, c, "extended"));
+            authenticator = authenticator.with_public_jwks();
+        }
+        let authenticator = Arc::new(authenticator);
 
         let declared: Arc<[String]> = card.extension_uris().into();
-        let mut rpc = jsonrpc_router(BackendHandler::new(backend, card.extension_uris()))
+        let handler = BackendHandler::new(
+            backend,
+            card.extension_uris(),
+            push,
+            extended_card.map(Arc::new),
+        );
+        let mut rpc = jsonrpc_router(handler)
             .layer(middleware::from_fn_with_state(declared, echo_extensions))
             .layer(middleware::from_fn(json_rpc_rejections));
         if let Some(interval) = options.keepalive_interval {
             rpc = rpc.layer(middleware::from_fn_with_state(interval, keepalive));
         }
 
-        Router::new()
+        let mut router = Router::new()
             .merge(rpc)
             .merge(agent_card_router(Arc::new(StaticAgentCard::new(
                 agent_card,
             ))))
-            .merge(Self::health_router())
+            .merge(Self::health_router());
+        if let Some(signer) = &options.card_signer {
+            let jwks = Arc::new(signer.jwks());
+            router = router.route(
+                JWKS_PATH,
+                get(move || {
+                    let jwks = jwks.clone();
+                    async move { Json((*jwks).clone()) }
+                }),
+            );
+        }
+        router
             // Outermost, and over everything (including the fallback), so a
             // route added later is protected unless `auth::is_public` says so.
             .layer(middleware::from_fn_with_state(
                 authenticator,
                 auth::authenticate,
             ))
+    }
+}
+
+/// Sign `card`; if signing fails (it does not with a key that loaded) serve it unsigned and say
+/// so at error level, so the operator sees it. A client that requires a signature refuses the card.
+fn sign_or_warn(signer: &CardSigner, card: a2a::AgentCard, which: &str) -> a2a::AgentCard {
+    match signer.sign_card(card.clone()) {
+        Ok(signed) => signed,
+        Err(error) => {
+            tracing::error!(card = which, error = %adam_error::report(&error), "signing the agent card failed; it is served unsigned");
+            card
+        }
     }
 }
 
@@ -203,6 +281,16 @@ async fn json_rpc_rejections(request: Request, next: Next) -> Response {
     let Ok(bytes) = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await else {
         return rejection(INVALID_REQUEST, "invalid request: the body is too large");
     };
+    if let Some(id) = legacy_push_config(&bytes) {
+        // The SDK reads a request as proto3 JSON, which has no such member: it would be dropped, the
+        // task would start, and the client would wait for notifications that were never registered.
+        let error = a2a::A2AError::invalid_params(
+            "configuration.pushNotificationConfig is the name of an earlier draft: send \
+             configuration.taskPushNotificationConfig",
+        )
+        .to_jsonrpc_error();
+        return (StatusCode::OK, Json(a2a::JsonRpcResponse::error(id, error))).into_response();
+    }
     let response = next
         .run(Request::from_parts(parts, Body::from(bytes.clone())))
         .await;
@@ -233,6 +321,32 @@ async fn json_rpc_rejections(request: Request, next: Next) -> Response {
     };
     tracing::debug!(%status, code, "malformed JSON-RPC request");
     rejection(code, message)
+}
+
+/// The id of a `SendMessage` or `SendStreamingMessage` request whose configuration names the push
+/// notification config the way earlier drafts of the protocol did (`pushNotificationConfig`), and not
+/// the 1.0 way (`taskPushNotificationConfig`).
+fn legacy_push_config(body: &[u8]) -> Option<a2a::JsonRpcId> {
+    use a2a::jsonrpc::methods::{SEND_MESSAGE, SEND_STREAMING_MESSAGE};
+    // Cheap first: almost every request does not contain the word.
+    const LEGACY: &[u8] = b"\"pushNotificationConfig\"";
+    if !body.windows(LEGACY.len()).any(|w| w == LEGACY) {
+        return None;
+    }
+    let request: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if !matches!(
+        request["method"].as_str(),
+        Some(SEND_MESSAGE | SEND_STREAMING_MESSAGE)
+    ) {
+        return None;
+    }
+    let configuration = &request["params"]["configuration"];
+    if configuration.get("pushNotificationConfig").is_none()
+        || configuration.get("taskPushNotificationConfig").is_some()
+    {
+        return None;
+    }
+    Some(serde_json::from_value(request["id"].clone()).unwrap_or(a2a::JsonRpcId::Null))
 }
 
 const NOT_JSON: &str = "parse error: the body is not valid JSON";

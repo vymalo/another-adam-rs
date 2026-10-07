@@ -291,6 +291,25 @@ fn check_keys(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
                 );
             }
         }
+        if let Some(extended) = &card.extended {
+            for key in extended.extra.keys() {
+                sink.warn(
+                    line,
+                    format!("unknown key `card.extended.{key}` is ignored"),
+                );
+            }
+            for skill in &extended.skills {
+                for key in skill.extra.keys() {
+                    sink.warn(
+                        line,
+                        format!(
+                            "unknown key `card.extended.skills[{}].{key}` is ignored",
+                            skill.id
+                        ),
+                    );
+                }
+            }
+        }
     }
 }
 

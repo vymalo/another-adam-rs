@@ -157,7 +157,9 @@ the agents with `try_build`, so a tool whose `required_state` nobody gave is
 
 **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
 `adam_a2a::AgentCardConfig`: `card.name` (default: the agent's), `card.description` (default: the
-frontmatter `description`, else `Error::MissingCardDescription`) and `card.skills`. The public URL and the
+frontmatter `description`, else `Error::MissingCardDescription`), `card.skills` and `card.extended` (`description`,
+`skills`: what an authenticated caller sees on top of the public card, `GetExtendedAgentCard`; it becomes
+`AgentCardConfig::extended`, and `extended: {}` declares nothing). The public URL and the
 version are the deployment's, so they are arguments. A2A card skills are not Agent Skills. The card is a fact
 about the files, so `AgentDef::card(url, version)` gives the same card before any tool, state or model is
 bound: a process that only serves A2A (a control plane, with no model) needs it, and the coder uses it.

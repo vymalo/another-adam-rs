@@ -1,6 +1,6 @@
 //! The root agent's A2A card (feature `a2a`).
 
-use adam_a2a::{AgentCardConfig, SkillConfig};
+use adam_a2a::{AgentCardConfig, ExtendedCardConfig, SkillConfig};
 use url::Url;
 
 use adam_agent_fs::AgentManifest;
@@ -59,13 +59,32 @@ fn card_of(manifest: &AgentManifest, url: Url, version: String) -> Result<AgentC
         })?;
     let mut config = AgentCardConfig::new(name, description, url, version);
     for skill in card.map(|c| c.skills.as_slice()).unwrap_or_default() {
-        config = config.with_skill(SkillConfig {
-            id: skill.id.clone(),
-            name: skill.name.clone(),
-            description: skill.description.clone(),
-            tags: skill.tags.clone(),
-            examples: skill.examples.clone(),
-        });
+        config = config.with_skill(skill_of(skill));
+    }
+    // `card.extended`: what an authenticated caller sees on top. Nothing declared, nothing
+    // served (an extended card that adds nothing is not worth declaring).
+    if let Some(extended) = card.and_then(|c| c.extended.as_ref()) {
+        let mut extra = ExtendedCardConfig::new();
+        extra.description = extended
+            .description
+            .clone()
+            .filter(|d| !d.trim().is_empty());
+        for skill in &extended.skills {
+            extra = extra.with_skill(skill_of(skill));
+        }
+        if !extra.is_empty() {
+            config = config.with_extended_card(extra);
+        }
     }
     Ok(config)
+}
+
+fn skill_of(skill: &adam_agent_fs::CardSkill) -> SkillConfig {
+    SkillConfig {
+        id: skill.id.clone(),
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        tags: skill.tags.clone(),
+        examples: skill.examples.clone(),
+    }
 }

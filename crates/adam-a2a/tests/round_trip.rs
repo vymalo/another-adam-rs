@@ -597,12 +597,9 @@ async fn unsupported_methods_answer_with_a2a_errors() {
     let auth = [("Authorization", format!("Bearer {TOKEN}"))];
     let headers: Vec<(&str, &str)> = auth.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
+    // What this server was not given: push notifications and an extended card are off by default
+    // (`ListTasks` is served: see `tests/list_tasks.rs`).
     for (method, params, code) in [
-        (
-            "ListTasks",
-            serde_json::json!({}),
-            error_code::UNSUPPORTED_OPERATION,
-        ),
         (
             "CreateTaskPushNotificationConfig",
             serde_json::json!({"taskId": "t", "url": "https://example.com/hook"}),
@@ -611,7 +608,8 @@ async fn unsupported_methods_answer_with_a2a_errors() {
         (
             "GetExtendedAgentCard",
             serde_json::json!({}),
-            error_code::EXTENDED_CARD_NOT_CONFIGURED,
+            // A2A §3.3.4: without the capability the answer is UnsupportedOperationError.
+            error_code::UNSUPPORTED_OPERATION,
         ),
         (
             "message/send",

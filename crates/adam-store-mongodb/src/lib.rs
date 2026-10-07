@@ -801,6 +801,10 @@ impl Store for MongoStore {
     }
 
     async fn list_runs(&self, query: &RunQuery) -> StoreResult<Vec<RunRecord>> {
+        // `limit(0)` means "no limit" to MongoDB, and a page of none is none.
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
         let mut filter = run_query_filter(query);
         if let Some((at, id)) = query.after {
             let at = date(truncate_ms(at));

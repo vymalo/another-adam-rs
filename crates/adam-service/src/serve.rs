@@ -9,8 +9,8 @@
 //!
 //! | Role | Components | Also |
 //! |---|---|---|
-//! | `all` (default) | `a2a-server` (control plane), `worker`, `notify` | |
-//! | `control-plane` | `a2a-server`, `notify` | the runtime knows the agent as a starter only: no model, no tools |
+//! | `all` (default) | `a2a-server` (control plane), `worker`, `notify` | `push-delivery` (control plane) when `A2A_PUSH_ALLOWED_URLS` is set |
+//! | `control-plane` | `a2a-server`, `notify` | the runtime knows the agent as a starter only: no model, no tools; `push-delivery` when `A2A_PUSH_ALLOWED_URLS` is set |
 //! | `worker` | `worker`, `health`, `notify` | `/healthz` on [`ServiceConfig::listen_addr`], no A2A |
 //!
 //! `notify` is the [`adam_notify_postgres::PgNotify`] listener and publisher: live events and
@@ -28,7 +28,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig};
+use adam_a2a::push::{PushDeliverer, PushDeliveryOptions, PushSupport};
+use adam_a2a::{A2aServer, AgentCardConfig, AuthConfig, ServerOptions};
 use adam_a2a_runtime::InboundFn;
 use adam_core::{ClaimScope, DynStore, StoreError};
 use adam_error::BoxError;
@@ -212,6 +213,69 @@ pub enum ServeError {
     /// the host's own.
     #[error(transparent)]
     Host(#[from] HostError),
+    /// Push notifications are on and their webhook client cannot be built (no TLS backend), or
+    /// the allow-list cannot be read. A mistake of the deployment (or the build): a restart with
+    /// other code or configuration fixes it.
+    #[error("setting up push notifications")]
+    Push(#[source] BoxError),
+}
+
+/// Deliver push notifications until `stop`, and let a status event of any run start a round at
+/// once. The events are only a hint: the loop polls the store, and the store decides.
+async fn run_push_delivery(
+    deliverer: PushDeliverer,
+    events: BroadcastSink,
+    stop: CancellationToken,
+) -> Result<(), adam_error::BoxError> {
+    use adam_runtime::RunEvent;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let nudge = deliverer.nudger();
+    let mut received = events.subscribe();
+    let hint = async move {
+        loop {
+            match received.recv().await {
+                Ok(event) if matches!(event.event, RunEvent::Status { .. }) => nudge.notify_one(),
+                Ok(_) => {}
+                // Missed some: a round is the way to catch up.
+                Err(RecvError::Lagged(_)) => nudge.notify_one(),
+                // No more events (the sink is gone): polling alone goes on.
+                Err(RecvError::Closed) => std::future::pending::<()>().await,
+            }
+        }
+    };
+    tokio::select! {
+        () = deliverer.run(stop.cancelled_owned()) => Ok(()),
+        () = hint => Ok(()),
+    }
+}
+
+/// What the deployment turned on in the A2A server: the options of the router, and the delivery
+/// loop of push notifications (which runs beside the server, in the control plane).
+fn a2a_features(
+    config: &ServiceConfig,
+    service: &Service,
+) -> Result<(ServerOptions, Option<PushDeliverer>), ServeError> {
+    let mut options = ServerOptions::default();
+    let mut deliverer = None;
+    if let Some(push) = &config.a2a.push {
+        let policy = push.policy().map_err(|e| ServeError::Push(Box::new(e)))?;
+        // The durable store: configs and delivery progress live in the run store.
+        let support = PushSupport::new(Arc::new(service.backend.push_store()), policy);
+        let delivery = PushDeliveryOptions::new()
+            .with_give_up_after(push.give_up_after)
+            .with_request_timeout(push.request_timeout);
+        deliverer = Some(
+            support
+                .deliverer(Arc::new(service.backend.clone()), delivery)
+                .map_err(|e| ServeError::Push(Box::new(e)))?,
+        );
+        options = options.with_push(support);
+    }
+    if let Some(signing) = &config.a2a.card_signing {
+        options = options.with_card_signer(signing.signer.clone());
+    }
+    Ok((options, deliverer))
 }
 
 /// Drive the notifier until `stop`, and log once `LISTEN` is active.
@@ -284,6 +348,7 @@ pub async fn serve(
     // listener (`notify.run`) is a host component below; the runtime only holds the two halves.
     let broadcast = BroadcastSink::default();
     let notify = PgNotify::new(pool, broadcast.clone());
+    let push_events = broadcast.clone();
     let live = LiveSignals {
         broadcast,
         sink: Arc::new(notify.event_sink()),
@@ -311,11 +376,15 @@ pub async fn serve(
         .control_plane_drain(Some(SERVER_DRAIN))
         // Workers are never cut short here; the orchestrator's grace period bounds the wait.
         .worker_grace(None);
+    let mut push_delivery = None;
     let host = match card {
         Some(card) if role.runs_control_plane() => {
-            let app = service.router(
+            let (options, deliverer) = a2a_features(config, &service)?;
+            push_delivery = deliverer;
+            let app = service.router_with_options(
                 card,
                 AuthConfig::BearerTokens(config.a2a_bearer_tokens.clone()),
+                options,
             );
             host.control_plane("a2a-server", |stop| async move {
                 axum::serve(listener, app)
@@ -352,6 +421,15 @@ pub async fn serve(
         })
     } else {
         host.control_plane("notify", |stop| run_notify(notify, stop.cancelled_owned()))
+    };
+
+    // Push notifications are delivered beside the server that accepts them, in the control plane:
+    // it needs the store and the backend, not the agent.
+    let host = match push_delivery {
+        Some(deliverer) => host.control_plane("push-delivery", |stop| {
+            run_push_delivery(deliverer, push_events, stop)
+        }),
+        None => host,
     };
 
     // The binary's own components: they run in the worker tier, so the host stops them with the

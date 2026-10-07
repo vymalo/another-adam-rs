@@ -8,7 +8,7 @@
 //! | Code | Name | Root cause |
 //! |---|---|---|
 //! | 0 | | clean shutdown after a signal (not an error) |
-//! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, [`ServeError::NoCard`], or any error whose class is `Invalid` (a mistake in the agent's files, for the errors a binary classifies with [`exit_code_with`]) |
+//! | 78 | `EX_CONFIG` | [`ConfigError`], `OpenAiConfigError`, [`ServeError::NoCard`], [`ServeError::Push`] (push notifications are on and cannot be set up), or any error whose class is `Invalid` (a mistake in the agent's files, for the errors a binary classifies with [`exit_code_with`]) |
 //! | 69 | `EX_UNAVAILABLE` | a dependency is unreachable: a `Transient`, `RateLimited` or `Conflict` error, such as Postgres or an MCP server |
 //! | 71 | `EX_OSERR` | an [`std::io::Error`], and [`ServeError::Bind`]: a listener that cannot bind, a directory that cannot be created |
 //! | 70 | `EX_SOFTWARE` | [`HostError`] (a component of the process stopped, panicked or ended while still needed), a panicked task, or a `Corrupt` or `Internal` error |
@@ -80,7 +80,7 @@ fn code_of(
     if let Some(e) = cause.downcast_ref::<ServeError>() {
         match e {
             ServeError::Host(_) => return Some(EX_SOFTWARE),
-            ServeError::NoCard => return Some(EX_CONFIG),
+            ServeError::NoCard | ServeError::Push(_) => return Some(EX_CONFIG),
             ServeError::Bind { .. } | ServeError::LocalAddr(_) => return Some(EX_OSERR),
             // The cause, next in the chain, says why.
             ServeError::Connect(_) | ServeError::Migrate(_) => {}
@@ -158,6 +158,7 @@ mod tests {
         };
         assert_eq!(coded(e), 78);
         assert_eq!(coded(ServeError::NoCard), 78);
+        assert_eq!(coded(ServeError::Push("no TLS backend".into())), 78);
     }
 
     #[test]

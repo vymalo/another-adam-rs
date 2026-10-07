@@ -30,6 +30,7 @@ an agent does.
 | Item | What |
 |---|---|
 | `ServiceConfig::parse(&lookup, &mut problems)` | `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLIC_URL`, `LISTEN_ADDR`, and for a role that runs workers `WORKERS` and `WORKER_ID`. A role reads only what it uses; every problem is collected, none stops the parse |
+| `A2aSettings`, `PushSettings`, `CardSigning` | the optional A2A features, read by the roles that serve A2A (`ServiceConfig::a2a`): `A2A_PUSH_ALLOWED_URLS`, `A2A_PUSH_ALLOW_PRIVATE`, `A2A_PUSH_GIVE_UP_AFTER_SECS`, `A2A_PUSH_REQUEST_TIMEOUT_SECS`, `A2A_CARD_SIGNING_KEY_FILE`, `A2A_CARD_SIGNING_KEY_ID`, `A2A_CARD_SIGNING_JKU`. **Nothing is on unless set.** The key file is read and checked at startup (a problem naming the variable, never the key). `ServiceConfig` gained the field `a2a`: **a literal built by hand needs it** |
 | `WorkerSettings` | `WORKERS` (at least 1) and `WORKER_ID` (`is_worker_id`); `options()` gives the `RuntimeOptions` |
 | `ModelConfig::parse`, `client()` | `MODEL_BASE_URL`, `MODEL_API_KEY` (may be empty, not unset), `MODEL`, and `MODEL_EXTRA_BODY` and `MODEL_ECHO_REASONING` (the `extra_body` and `echo_reasoning` fields, **new public fields: a `ModelConfig` built with a struct literal needs them**); the OpenAI-compatible client over them. Its `Debug` (the startup log prints the configuration) shows the gateway by **scheme and host only** (`adam_service::endpoint_for_logs`, re-exported from `adam-model-openai`), the key not at all, and `ServiceConfig`'s shows `PUBLIC_URL` the same way and `DATABASE_URL` as `[REDACTED]`: deployments keep these addresses in secrets |
 | `harden::make_non_dumpable()` | `prctl(PR_SET_DUMPABLE, 0)` on Linux, through `rustix`'s safe call: a same-user child without `CAP_SYS_PTRACE` cannot read the process's `/proc/<pid>/environ`. Every agent binary calls it at startup (`adam-coder`, `adam-agent`); `adam_coder::harden` re-exports it. Returns whether it was set; a failure is a warning |
@@ -38,10 +39,10 @@ an agent does.
 | `parse_or`, `parse_flag`, `parse_file`, `is_worker_id` | the helpers a binary parses its own variables with, into the same list of problems (`parse_file`: an existing file, or a problem naming the variable; `ADAM_EXTRA_MCP_FILE` of `adam-coder` and `adam-agent`) |
 | `ConfigError { problems }` | what a non-empty list becomes (`ConfigError::check(problems)`); `Classify` gives `Invalid` |
 | `RuntimeOptions`, `LiveSignals` | how the runtime is set up (worker id, claim scope, concurrency, lease, poll), and how a process learns of other processes (`LiveSignals::local()` or the Postgres `NOTIFY` ones `serve` builds) |
-| `Service { runtime, backend }` | `Service::new(builder, name, options)`, `new_with(.., live)`, `with_inbound(Option<InboundFn>)` (how an A2A message becomes the agent's input), `router(card, auth)`, `run_worker(shutdown)`; `router(&backend, card, auth)` for a composition that holds the parts itself |
+| `Service { runtime, backend }` | `Service::new(builder, name, options)`, `new_with(.., live)`, `with_inbound(Option<InboundFn>)` (how an A2A message becomes the agent's input), `router(card, auth)`, `router_with_options(card, auth, ServerOptions)` (push notifications, the card's signature), `run_worker(shutdown)`; `router(&backend, card, auth)` and `router_with_options(&backend, ..)` for a composition that holds the parts itself |
 | `Agents::new(name, register)` | the agent a process serves: its name, `.card(card)`, `.options(options)`, `.inbound(f)` (read A2A messages with `f`, e.g. `adam_a2a_runtime::vymalo_inbound` for an agent behind a screen; the default is `default_inbound`), and `register`, a closure that puts it on the runtime builder (`Assembly::register`, or the starter only for a control plane); `.worker_component(name, f)` adds a component of the binary to the worker tier (below) |
 | `serve(&config, agents, shutdown)` | the whole process, until `shutdown` resolves; `ServeError` on failure |
-| `ServeError` | `Connect`, `Migrate`, `NoCard`, `Bind`, `LocalAddr`, `Host`. The message names the step; the cause is the `source`, so a chain printed whole says it once |
+| `ServeError` | `Connect`, `Migrate`, `NoCard`, `Bind`, `LocalAddr`, `Host`, `Push` (push notifications are on and cannot be set up: exit 78). The message names the step; the cause is the `source`, so a chain printed whole says it once |
 | `claim_scope_for(placement)` | `Pinned` for a placement that pins runs, `Any` otherwise |
 | `exit_code(&err)`, `exit_code_with(&err, classify)`, `EX_*` | the exit code of an error chain (below); `classify` is how a binary adds its own error types |
 
@@ -54,6 +55,10 @@ an agent does.
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
+| `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and names the webhooks they may reach: comma-separated URL prefixes or hosts (`PushSettings`); a client's webhook that matches none, is not `https` or is a private address is refused | unset: off, the card says so |
+| `A2A_PUSH_ALLOW_PRIVATE` | also allow loopback, private and link-local webhooks and `http` to loopback: development only | `false` |
+| `A2A_PUSH_GIVE_UP_AFTER_SECS`, `A2A_PUSH_REQUEST_TIMEOUT_SECS` | how long a notification may keep failing before delivery to that webhook is abandoned (1 to 604800), and how long one request may take (1 to 120) | `3600`, `15` |
+| `A2A_CARD_SIGNING_KEY_FILE`, `A2A_CARD_SIGNING_KEY_ID`, `A2A_CARD_SIGNING_JKU` | a PKCS#8 PEM key (ECDSA P-256 or Ed25519) that signs the agent card, its `kid` (default: the key's thumbprint) and its `jku` (`CardSigning`); the server serves the key set at `/.well-known/jwks.json` | unset: unsigned |
 | `WORKERS` | runs advanced concurrently | `4` (roles that run workers) |
 | `WORKER_ID` | lease identity: 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process (roles that run workers) |
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL` | the model (`ModelConfig`) | required by the binaries that call `ModelConfig::parse`, for the roles that run workers |

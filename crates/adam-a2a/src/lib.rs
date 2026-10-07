@@ -38,10 +38,12 @@
 //! | `tasks/cancel` | `CancelTask` |
 //! | `tasks/resubscribe` | `SubscribeToTask` |
 //!
-//! States on the wire are `TASK_STATE_*`. Other 1.0 methods are answered with
-//! the matching A2A error: `ListTasks` is unsupported (the seam has no listing),
-//! push-notification methods return `PushNotificationNotSupported`, and the
-//! extended agent card is not configured.
+//! States on the wire are `TASK_STATE_*`. The other 1.0 methods are served too, and what is optional is
+//! **off by default** and the card says so: `ListTasks` ([`TaskBackend::list`]); the four push-notification
+//! methods (the [`push`] module: `PushNotificationNotSupported` unless [`ServerOptions::with_push`]
+//! gave a policy that allows a webhook); and `GetExtendedAgentCard` (the public card plus an
+//! [`ExtendedCardConfig`], for authenticated callers only: `UnsupportedOperation` without one). The card is signed
+//! when [`ServerOptions::with_card_signer`] is given a [`CardSigner`].
 //!
 //! # Why not the SDK's `DefaultRequestHandler`
 //!
@@ -83,8 +85,8 @@
 //! # TLS
 //!
 //! The SDK crates default to rustls with `aws-lc-rs`, which needs a C
-//! toolchain to build. TLS is only used by the SDK's outbound push sender,
-//! which this crate does not enable.
+//! toolchain to build. TLS is used by the delivery client of the [`push`] module (webhooks
+//! over `https`), which is this crate's own (`reqwest`), not the SDK's push sender.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -97,11 +99,14 @@ mod extensions;
 mod handler;
 #[cfg(feature = "test-util")]
 mod memory;
+mod page;
+pub mod push;
 mod server;
+mod signing;
 
 pub use auth::AuthConfig;
 pub use backend::{BackendError, Caller, DynTaskBackend, TaskBackend, TaskEvent};
-pub use card::{AgentCardConfig, ExtensionConfig, SkillConfig};
+pub use card::{AgentCardConfig, ExtendedCardConfig, ExtensionConfig, SkillConfig};
 pub use extensions::{
     A2UI_BASIC_CATALOG_V0_9_1, A2UI_EXTENSION_V0_9_1, A2UI_MEDIA_TYPE, MENTIONS_EXTENSION,
     STEER_EXTENSION, STEPS_EXTENSION, TEXT_STREAM_EXTENSION, TEXT_STREAM_KIND_REASONING,
@@ -109,4 +114,10 @@ pub use extensions::{
 };
 #[cfg(feature = "test-util")]
 pub use memory::{InMemoryBackend, InMemoryConfig};
+pub use page::{DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, PageToken, TaskPage, TaskQuery};
 pub use server::{A2aServer, SDK_KEEPALIVE_INTERVAL, ServerOptions};
+#[cfg(feature = "test-util")]
+pub use signing::generate_signing_key_pem;
+pub use signing::{
+    CardSigner, SigningError, VerifyError, VerifyingKey, canonical_payload, canonicalize,
+};

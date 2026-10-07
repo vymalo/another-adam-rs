@@ -57,7 +57,13 @@ impl std::fmt::Debug for AuthConfig {
 /// Resolved, ready-to-check form of [`AuthConfig`].
 pub(crate) struct Authenticator {
     mode: Mode,
+    /// Whether `GET /.well-known/jwks.json` needs no credential (it exists only when the card
+    /// is signed, and then it is the public half of the key that signs it).
+    public_jwks: bool,
 }
+
+/// Where the public key set of the card signature is served, when there is one.
+pub(crate) const JWKS_PATH: &str = "/.well-known/jwks.json";
 
 enum Mode {
     Anonymous,
@@ -100,7 +106,17 @@ impl Authenticator {
                 Mode::Bearer(digests)
             }
         };
-        Self { mode }
+        Self {
+            mode,
+            public_jwks: false,
+        }
+    }
+
+    /// Serve the card's key set (`/.well-known/jwks.json`) without a credential.
+    #[must_use]
+    pub(crate) fn with_public_jwks(mut self) -> Self {
+        self.public_jwks = true;
+        self
     }
 
     /// Whether requests carry credentials (drives the card's security scheme).
@@ -176,7 +192,10 @@ pub(crate) async fn authenticate(
 ) -> Response {
     request.headers_mut().remove(CALLER_HEADER);
 
-    if is_public(request.method(), request.uri().path()) {
+    let path = request.uri().path();
+    if is_public(request.method(), path)
+        || (authenticator.public_jwks && request.method() == Method::GET && path == JWKS_PATH)
+    {
         return next.run(request).await;
     }
 

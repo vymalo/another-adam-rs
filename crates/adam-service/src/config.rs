@@ -6,6 +6,13 @@
 //! | `DATABASE_URL` | Postgres for the run store (`adam-store-postgres`) | required |
 //! | `A2A_BEARER_TOKENS` | comma-separated tokens accepted by the A2A server | required for `all` and `control-plane`, non-empty (fail closed) |
 //! | `PUBLIC_URL` | URL clients reach the JSON-RPC endpoint at (agent card) | required for `all` and `control-plane` |
+//! | `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and says which webhooks they may reach: comma-separated URL prefixes (`https://hooks.example.com/a2a/`) or hosts (`hooks.example.com`, `*.example.com`, `host:8443`) ([`PushSettings`]) | unset: push notifications are off, the card says so |
+//! | `A2A_PUSH_ALLOW_PRIVATE` | also allow webhooks on loopback, private and link-local addresses, and `http` to loopback: **for development only** | `false` |
+//! | `A2A_PUSH_GIVE_UP_AFTER_SECS` | how long one notification may keep failing before delivery to that webhook is abandoned (1 to 604800) | `3600` |
+//! | `A2A_PUSH_REQUEST_TIMEOUT_SECS` | how long one request to a webhook may take (1 to 120) | `15` |
+//! | `A2A_CARD_SIGNING_KEY_FILE` | a PKCS#8 PEM private key (ECDSA P-256 or Ed25519) that signs the agent card; mount it from a Secret ([`CardSigning`]) | unset: the card is unsigned |
+//! | `A2A_CARD_SIGNING_KEY_ID` | the `kid` of the signature | the key's RFC 7638 thumbprint |
+//! | `A2A_CARD_SIGNING_JKU` | the `jku` (URL of the key set) in the signature header; the server serves the key set at `/.well-known/jwks.json` | unset: no `jku` |
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
 //! | `WORKER_ID` | stable identity of this worker (the lease identity; the run owner for a binary that pins runs); letters, digits, `.`, `_`, `-` | random per process |
@@ -42,6 +49,8 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use adam_a2a::CardSigner;
+use adam_a2a::push::PushPolicy;
 use adam_error::{Classify, ErrorClass};
 use adam_host::Role;
 use adam_model::DynModel;
@@ -183,6 +192,9 @@ pub struct ServiceConfig {
     pub listen_addr: SocketAddr,
     /// `WORKERS` and `WORKER_ID`. `Some` exactly when [`Role::runs_workers`].
     pub worker: Option<WorkerSettings>,
+    /// The optional A2A features (push notifications, the signature of the card): read only by a
+    /// role that serves A2A, and nothing is on unless the environment turns it on.
+    pub a2a: A2aSettings,
 }
 
 impl std::fmt::Debug for ServiceConfig {
@@ -200,6 +212,7 @@ impl std::fmt::Debug for ServiceConfig {
             )
             .field("listen_addr", &self.listen_addr)
             .field("worker", &self.worker)
+            .field("a2a", &self.a2a)
             .finish()
     }
 }
@@ -281,6 +294,11 @@ impl ServiceConfig {
         let worker = role
             .runs_workers()
             .then(|| WorkerSettings::parse(lookup, problems));
+        let a2a = if front {
+            A2aSettings::parse(lookup, problems)
+        } else {
+            A2aSettings::default()
+        };
 
         Self {
             role,
@@ -289,6 +307,152 @@ impl ServiceConfig {
             public_url,
             listen_addr,
             worker,
+            a2a,
+        }
+    }
+}
+
+/// The optional features of the A2A server: **nothing is on by default**.
+#[derive(Clone, Debug, Default)]
+pub struct A2aSettings {
+    /// `A2A_PUSH_*`: push notifications. `None`: off.
+    pub push: Option<PushSettings>,
+    /// `A2A_CARD_SIGNING_*`: the signature of the agent card. `None`: unsigned.
+    pub card_signing: Option<CardSigning>,
+}
+
+/// Push notifications the deployment turned on (`A2A_PUSH_*`): which webhooks they may reach and
+/// how delivery behaves. The webhooks' credentials are the clients', in the store, never here.
+#[derive(Clone, Debug)]
+pub struct PushSettings {
+    /// `A2A_PUSH_ALLOWED_URLS`, as written (already checked).
+    pub allowed_urls: Vec<String>,
+    /// `A2A_PUSH_ALLOW_PRIVATE`.
+    pub allow_private_addresses: bool,
+    /// `A2A_PUSH_GIVE_UP_AFTER_SECS`.
+    pub give_up_after: std::time::Duration,
+    /// `A2A_PUSH_REQUEST_TIMEOUT_SECS`.
+    pub request_timeout: std::time::Duration,
+}
+
+impl PushSettings {
+    /// The policy these settings state.
+    ///
+    /// # Errors
+    ///
+    /// An allow-list entry that cannot be read ([`PushSettings::parse`] has checked them, so this
+    /// does not happen for settings that came from it).
+    pub fn policy(&self) -> Result<PushPolicy, adam_a2a::push::PolicyEntryError> {
+        Ok(PushPolicy::new(&self.allowed_urls)?
+            .allow_private_addresses(self.allow_private_addresses))
+    }
+
+    /// Read the `A2A_PUSH_*` variables: `None` when `A2A_PUSH_ALLOWED_URLS` is unset or blank.
+    pub fn parse(
+        lookup: &impl Fn(&str) -> Option<String>,
+        problems: &mut Vec<String>,
+    ) -> Option<Self> {
+        let get = |name: &str| not_blank(lookup, name);
+        let raw = get("A2A_PUSH_ALLOWED_URLS")?;
+        let allowed_urls: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if let Err(e) = PushPolicy::new(&allowed_urls) {
+            problems.push(format!("A2A_PUSH_ALLOWED_URLS: {e}"));
+        }
+        let allow_private_addresses = parse_flag(&get, "A2A_PUSH_ALLOW_PRIVATE", problems);
+        let mut secs = |name: &str, default: u64, max: u64| {
+            let n = parse_or(&get, name, default, problems);
+            if n == 0 || n > max {
+                problems.push(format!("{name} must be between 1 and {max}, got {n}"));
+                return std::time::Duration::from_secs(default);
+            }
+            std::time::Duration::from_secs(n)
+        };
+        let give_up_after = secs("A2A_PUSH_GIVE_UP_AFTER_SECS", 3600, 604_800);
+        let request_timeout = secs("A2A_PUSH_REQUEST_TIMEOUT_SECS", 15, 120);
+        Some(Self {
+            allowed_urls,
+            allow_private_addresses,
+            give_up_after,
+            request_timeout,
+        })
+    }
+}
+
+/// The key that signs the agent card (`A2A_CARD_SIGNING_*`), read and checked at startup. The
+/// key never appears in `Debug` output.
+#[derive(Clone, Debug)]
+pub struct CardSigning {
+    /// The signer: the key, its `kid` and the `jku` if there is one.
+    pub signer: CardSigner,
+}
+
+impl CardSigning {
+    /// Read `A2A_CARD_SIGNING_KEY_FILE` (and `_KEY_ID`, `_JKU`): `None` when the file is not
+    /// named. A key id or a `jku` without a key is a problem, and so is a key that cannot be read
+    /// or used.
+    pub fn parse(
+        lookup: &impl Fn(&str) -> Option<String>,
+        problems: &mut Vec<String>,
+    ) -> Option<Self> {
+        let get = |name: &str| not_blank(lookup, name);
+        let kid = get("A2A_CARD_SIGNING_KEY_ID");
+        let jku = get("A2A_CARD_SIGNING_JKU");
+        if get("A2A_CARD_SIGNING_KEY_FILE").is_none() {
+            for (name, set) in [
+                ("A2A_CARD_SIGNING_KEY_ID", kid.is_some()),
+                ("A2A_CARD_SIGNING_JKU", jku.is_some()),
+            ] {
+                if set {
+                    problems.push(format!("{name} needs A2A_CARD_SIGNING_KEY_FILE"));
+                }
+            }
+            return None;
+        }
+        let path = parse_file(&get, "A2A_CARD_SIGNING_KEY_FILE", problems)?;
+        let pem = match std::fs::read_to_string(&path) {
+            Ok(pem) => pem,
+            Err(e) => {
+                problems.push(format!(
+                    "A2A_CARD_SIGNING_KEY_FILE {:?} cannot be read: {}",
+                    path.display().to_string(),
+                    e.kind()
+                ));
+                return None;
+            }
+        };
+        // The error names the problem with the key, never its content.
+        let signer = match CardSigner::from_pem(&pem, kid.as_deref()) {
+            Ok(signer) => signer,
+            Err(e) => {
+                problems.push(format!("A2A_CARD_SIGNING_KEY_FILE or _KEY_ID: {e}"));
+                return None;
+            }
+        };
+        let signer = match jku.as_deref() {
+            None => signer,
+            Some(jku) => match signer.with_jku(jku) {
+                Ok(signer) => signer,
+                Err(e) => {
+                    problems.push(format!("A2A_CARD_SIGNING_JKU: {e}"));
+                    return None;
+                }
+            },
+        };
+        Some(Self { signer })
+    }
+}
+
+impl A2aSettings {
+    /// Read the optional A2A variables, adding a problem for each unusable one.
+    pub fn parse(lookup: &impl Fn(&str) -> Option<String>, problems: &mut Vec<String>) -> Self {
+        Self {
+            push: PushSettings::parse(lookup, problems),
+            card_signing: CardSigning::parse(lookup, problems),
         }
     }
 }
@@ -785,6 +949,145 @@ mod tests {
             vars.insert(name, bad);
             assert!(mentions(&problems_of(&vars), name), "{name}={bad}");
         }
+    }
+
+    #[test]
+    fn nothing_of_a2a_is_on_by_default() {
+        let config = parse(&full()).unwrap();
+        assert!(config.a2a.push.is_none() && config.a2a.card_signing.is_none());
+        // A role that does not serve A2A reads none of it, and is not stopped by a bad value.
+        let mut vars = with_role("worker");
+        vars.insert("A2A_PUSH_ALLOWED_URLS", "not a url at all");
+        vars.insert("A2A_CARD_SIGNING_KEY_FILE", "/nonexistent");
+        let config = parse(&vars).unwrap();
+        assert!(config.a2a.push.is_none() && config.a2a.card_signing.is_none());
+    }
+
+    #[test]
+    fn push_is_turned_on_by_an_allow_list_and_nothing_else() {
+        let mut vars = full();
+        vars.insert(
+            "A2A_PUSH_ALLOWED_URLS",
+            " https://hooks.example.com/a2a/ , *.partner.io,, ",
+        );
+        let push = parse(&vars).unwrap().a2a.push.expect("on");
+        assert_eq!(
+            push.allowed_urls,
+            ["https://hooks.example.com/a2a/", "*.partner.io"]
+        );
+        assert!(!push.allow_private_addresses);
+        assert_eq!(push.give_up_after.as_secs(), 3600);
+        assert_eq!(push.request_timeout.as_secs(), 15);
+        let policy = push.policy().unwrap();
+        assert!(policy.is_enabled() && !policy.allows_private_addresses());
+        assert!(policy.check("https://hooks.example.com/a2a/x").is_ok());
+        assert!(policy.check("https://hooks.example.com/other").is_err());
+
+        vars.insert("A2A_PUSH_ALLOW_PRIVATE", "true");
+        vars.insert("A2A_PUSH_GIVE_UP_AFTER_SECS", "60");
+        vars.insert("A2A_PUSH_REQUEST_TIMEOUT_SECS", "5");
+        let push = parse(&vars).unwrap().a2a.push.unwrap();
+        assert!(push.allow_private_addresses);
+        assert_eq!(
+            (push.give_up_after.as_secs(), push.request_timeout.as_secs()),
+            (60, 5)
+        );
+
+        // Blank means off.
+        let mut off = full();
+        off.insert("A2A_PUSH_ALLOWED_URLS", "  ");
+        assert!(parse(&off).unwrap().a2a.push.is_none());
+    }
+
+    #[test]
+    fn a_bad_push_setting_names_its_variable() {
+        for (name, value) in [
+            ("A2A_PUSH_ALLOWED_URLS", "ftp://hooks.example.com/"),
+            ("A2A_PUSH_ALLOWED_URLS", "hooks.example.com/path"),
+            ("A2A_PUSH_GIVE_UP_AFTER_SECS", "0"),
+            ("A2A_PUSH_GIVE_UP_AFTER_SECS", "999999999"),
+            ("A2A_PUSH_GIVE_UP_AFTER_SECS", "soon"),
+            ("A2A_PUSH_REQUEST_TIMEOUT_SECS", "121"),
+            ("A2A_PUSH_ALLOW_PRIVATE", "maybe"),
+        ] {
+            let mut vars = full();
+            vars.insert("A2A_PUSH_ALLOWED_URLS", "hooks.example.com");
+            vars.insert(name, value);
+            assert!(mentions(&problems_of(&vars), name), "{name}={value}");
+        }
+    }
+
+    #[test]
+    fn the_card_signing_key_is_read_checked_and_never_shown() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("adam-service-sign-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("key.pem");
+        std::fs::File::create(&good)
+            .unwrap()
+            .write_all(adam_a2a::generate_signing_key_pem(false).as_bytes())
+            .unwrap();
+        let bad = dir.join("bad.pem");
+        std::fs::write(&bad, "not a key").unwrap();
+        let (good, bad) = (
+            good.to_str().unwrap().to_owned(),
+            bad.to_str().unwrap().to_owned(),
+        );
+        let (good, bad): (&'static str, &'static str) = (
+            Box::leak(good.into_boxed_str()),
+            Box::leak(bad.into_boxed_str()),
+        );
+
+        let mut vars = full();
+        vars.insert("A2A_CARD_SIGNING_KEY_FILE", good);
+        vars.insert("A2A_CARD_SIGNING_KEY_ID", "key-1");
+        vars.insert(
+            "A2A_CARD_SIGNING_JKU",
+            "https://agent.example.com/.well-known/jwks.json",
+        );
+        let config = parse(&vars).unwrap();
+        let signing = config.a2a.card_signing.as_ref().expect("signing is on");
+        assert_eq!(signing.signer.kid(), "key-1");
+        assert_eq!(
+            signing.signer.jku(),
+            Some("https://agent.example.com/.well-known/jwks.json")
+        );
+        let shown = format!("{config:?}");
+        assert!(
+            !shown.contains("PRIVATE") && !shown.contains("MIG"),
+            "{shown}"
+        );
+
+        // Without a kid, the thumbprint; a key that is not one, a missing file, and a kid or a
+        // jku without a key are problems that name their variable and never the key.
+        vars.remove("A2A_CARD_SIGNING_KEY_ID");
+        vars.remove("A2A_CARD_SIGNING_JKU");
+        assert!(
+            !parse(&vars)
+                .unwrap()
+                .a2a
+                .card_signing
+                .unwrap()
+                .signer
+                .kid()
+                .is_empty()
+        );
+        vars.insert("A2A_CARD_SIGNING_KEY_FILE", bad);
+        let problems = problems_of(&vars);
+        assert!(
+            mentions(&problems, "A2A_CARD_SIGNING_KEY_FILE"),
+            "{problems:?}"
+        );
+        assert!(!problems.join(" ").contains("not a key"));
+        vars.insert("A2A_CARD_SIGNING_KEY_FILE", "/does/not/exist.pem");
+        assert!(mentions(&problems_of(&vars), "A2A_CARD_SIGNING_KEY_FILE"));
+        vars.remove("A2A_CARD_SIGNING_KEY_FILE");
+        vars.insert("A2A_CARD_SIGNING_KEY_ID", "orphan");
+        assert!(mentions(&problems_of(&vars), "A2A_CARD_SIGNING_KEY_ID"));
+        vars.remove("A2A_CARD_SIGNING_KEY_ID");
+        vars.insert("A2A_CARD_SIGNING_JKU", "https://x.example/jwks");
+        assert!(mentions(&problems_of(&vars), "A2A_CARD_SIGNING_JKU"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

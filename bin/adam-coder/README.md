@@ -1467,6 +1467,10 @@ way; every problem is reported at once at startup):
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
+| `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and names the webhooks they may reach: comma-separated URL prefixes or hosts ([`adam-service`](../../crates/adam-service/README.md#environment)); a client's webhook that matches none, is not `https` or is a private address is refused | unset: off, the card says so |
+| `A2A_PUSH_ALLOW_PRIVATE` | also allow loopback, private and link-local webhooks and `http` to loopback: development only | `false` |
+| `A2A_PUSH_GIVE_UP_AFTER_SECS`, `A2A_PUSH_REQUEST_TIMEOUT_SECS` | how long a notification may keep failing before delivery to that webhook is abandoned (1 to 604800), and how long one request may take (1 to 120) | `3600`, `15` |
+| `A2A_CARD_SIGNING_KEY_FILE`, `A2A_CARD_SIGNING_KEY_ID`, `A2A_CARD_SIGNING_JKU` | a PKCS#8 PEM key (ECDSA P-256 or Ed25519) that signs the agent card, its `kid` (default: the key's thumbprint) and its `jku` ; the server serves the key set at `/.well-known/jwks.json` | unset: unsigned |
 | `MODEL_BASE_URL`, `MODEL_API_KEY` | OpenAI-compatible gateway (with `/v1`) and its key | required by `all` and `worker` (key may be empty) |
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value; read by the agent's own model calls only, not by OpenCode (`OPENCODE_MODEL`) | unset: nothing is added |
@@ -1607,7 +1611,7 @@ By default any worker may lease any run at any step. Several workers therefore n
 | Variable | `all` | `control-plane` | `worker` |
 |---|---|---|---|
 | `DATABASE_URL` | yes | yes | yes |
-| `A2A_BEARER_TOKENS`, `PUBLIC_URL` | yes | yes | not read |
+| `A2A_BEARER_TOKENS`, `PUBLIC_URL`, and the optional `A2A_PUSH_*` and `A2A_CARD_SIGNING_*` | yes (the optional ones if set) | yes (the optional ones if set) | not read |
 | `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, and `GITHUB_TOKEN` or the `GITHUB_APP_*` variables | yes | not read | yes |
 | the rest of the table above (`OPENCODE_*`, `ALLOWED_REPO_HOSTS`, `ALLOW_LOCAL_REPOS`, `GITHUB_API_URL`, `WORKSPACE_ROOT`, `WORKSPACE_PLACEMENT`, `WORKER_ID`, `WORKERS`, `MAX_CHECK_CYCLES`, `SCRATCH_CHECK_CYCLES`, `CHECK_*`, `GIT_AUTHOR_*`, `PR_DRAFT`) | read, defaulted | not read | read, defaulted |
 
