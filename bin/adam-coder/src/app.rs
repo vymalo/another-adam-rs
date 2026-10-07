@@ -193,7 +193,7 @@ mod tests {
     }
 
     /// The card is the golden `tests/fixtures/agent/card.json`: the one the Rust literal used to
-    /// build, with the name `Coder` since #55 (the golden changes in the same commit as the file);
+    /// build, with the name `Adam` (the golden changes in the same commit as the file);
     /// only the version follows the crate's.
     #[test]
     fn the_card_from_the_agent_file_equals_the_golden() {

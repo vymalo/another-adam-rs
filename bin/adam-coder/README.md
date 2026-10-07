@@ -1,6 +1,9 @@
 # adam-coder
 
-The coder agent: a coding task in, a verified pull request out, over A2A.
+Adam, the general agent of adam-rs, over A2A: it answers and explains, researches with the tools it is given, writes
+documents and files, plans before it acts on a large request, and takes a coding task to a verified pull request
+([ADR 0021](../../docs/decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)). The crate, the binary and the
+image keep the name `coder`.
 
 Given "in repo X, do Y" it
 
@@ -86,7 +89,7 @@ The card lists `steps/v1` ([ADR 0007](../../docs/decisions/0007-progress-as-step
 the orchestration layer's `docs/api/steps-v1.md`), and every tool call is a step to a client that activates it. Most are
 plain steps labelled with the tool's name (`prepare_workspace`, `run_checks`, ...), whose progress lines
 (`running checks: ...`) are updates of their own step. **`delegate_to_opencode` is a `subagent` step labelled
-OpenCode** (`#[tool(step = "subagent", label = "OpenCode", icon = "agent")]`), and what OpenCode reports over ACP is the
+OpenCode** with its own icon, `opencode` (`#[tool(step = "subagent", label = "OpenCode", icon = "opencode")]`), and what OpenCode reports over ACP is the
 tree under it:
 
 | OpenCode reports | The step |
@@ -566,6 +569,27 @@ stateDiagram-v2
   NoWorkspace --> Swept: the store does not know the run
   Swept --> [*]: the notes and the branches stay
 ```
+
+### Subagents: `explorer` and `reviewer`
+
+`agent/subagents/` has two read-only helpers, each a child run with its own prompt and the tools `read_file` and
+`run_command` only (no write, no checks, no `delegate_to_opencode`, no publishing, nothing that asks the person).
+`explorer` answers where and how questions about a repository with file paths and line numbers; `reviewer` reads
+`git diff origin/<base>...HEAD` and returns findings by severity with file and line. The prompt says when to use them
+(a large or unfamiliar repository; once before `open_pull_request`), and what they say is advice: the gates decide.
+
+A child run has an id of its own, so the tools key by the **root run** (`ToolCtx::root_run_id()`, carried down by
+`ToolCtx::start_child`: [ADR 0021](../../docs/decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)). Per place:
+
+| What | Keyed by | Why |
+|---|---|---|
+| the workspace's slots, the environment session, `prepare_workspace`, `start_scratch`, `rebuild_environment` | root | a subagent works in its parent's worktree and environment |
+| the run notes: check cycles and results, the repositories named and agreed to, created repositories, the credentials blocker, OpenCode's version check | root | a budget or a gate that protects the pull request is counted once, on the root: a subagent has no fresh budget and passes no gate the root has not |
+| a call id in the notes (`record_missing_tool`) | the subagent's run plus the call id | model call ids are unique only within the run that made them |
+| the steps the environment shows (`env:<run>:...`) | the run that makes the call | a step belongs to the run that emits it |
+| `share_file`'s "delivered" note, and its 6 MiB budget | the run that shares | the artifact stays on the subagent's run and never reaches the person, so it delivers nothing for the root |
+
+The janitor and the run pods look at the root's directory and run only: a child never has a workspace of its own.
 
 ### Scratch projects
 
@@ -1169,7 +1193,7 @@ that was pushed is what carries the work, so the new worktree does not depend on
 
 The coder has a name and talks like a colleague, not like its tool schemas (adam-rs#55).
 
-* **Its name** is `Coder`: `vars.display_name` in `agent/instructions.md`, said by the first line of the prompt,
+* **Its name** is `Adam` (the crate and the binary stay `adam-coder`): `vars.display_name` in `agent/instructions.md`, said by the first line of the prompt,
   `Your name is {{display_name}}.`, and the `card.name` the A2A card advertises. "What is your name?" is answered
   with it, never with "I don't have a name". A deployment that mounts its own folder
   ([`ADAM_AGENT_DIR`](#a-folder-at-run-time-adam_agent_dir)) changes the name by changing the var (and `card.name`).
@@ -1185,11 +1209,11 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
   `show` and `ui_catalog` are as
   [`adam-ui`](../../crates/adam-ui/README.md) makes them (`show` refuses a `Choices` form: ask with `ask_user`).
 * **A greeting gets a greeting**: "hi" is answered with a short greeting that says the name and what the agent does
-  in one sentence (the second persona line, `In one sentence: <summary>.`) and asks one question, which repository
-  and what to change. It is not a task with something missing, so no tool is called and nothing is asked for "the
-  task". The run waits for the answer (A2A `input-required`, as for any plain-text stop that delivers nothing).
-* **"What can you do?" and "list your tools"** are answered in plain words first: look around a repository the
-  person names, have a change made, run its checks, push a branch and open a pull request, ask when unsure. Then what
+  in one sentence (the second persona line, `In one sentence: <summary>.`) and asks one open question, what it can help with. It is not a task with something missing, so no tool is called
+  and nothing is asked for "the task" or for a repository. The run waits for the answer (A2A `input-required`, as for any plain-text stop that delivers nothing).
+* **"What can you do?" and "list your tools"** are answered in plain words first: answer and explain, research when it has research tools, write a report, plan or chart
+  and share it as a file, plan a large request and confirm it, make a change to a repository the person names (look around,
+  run its checks, push a branch, open a pull request), ask when unsure. Then what
   it cannot do, and why: it works only on a repository the person names (it cannot start without one or create one),
   and it makes the change inside a private worktree of the repository, itself (`read_file`, `write_file`,
   `apply_patch`: adam-rs#53) or with OpenCode. Tool names and arguments appear only if the person asks for the
@@ -1211,8 +1235,8 @@ greets from the persona lines gets the run to wait without any tool, editing the
 One file, [`agent/instructions.md`](agent/instructions.md), holds what describes the agent, in the format of
 [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md): the frontmatter has `name` (`coder`, which must equal
 `AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 8192 output tokens, 100000 tokens of history),
-`vars.max_check_cycles` (the default, 3), `vars.scratch_check_cycles` (5), `vars.display_name` (`Coder`: the name the agent says), `vars.repository_creation` (what the prompt says about making a repository for the person: the default is the sentence for a deployment that allows it, and **when `CREATE_REPO_OWNERS` is empty `CoderAgent` replaces it with a note that there is no such tool**, that the person must create the repository and name it, and that "a new repository" is never an option of a question; a folder that does not declare the var keeps its own text) and `card:` (the A2A
-card: name `Coder`, the `coding-task` skill with its tags and example); the body is the system prompt.
+`vars.max_check_cycles` (the default, 3), `vars.scratch_check_cycles` (5), `vars.display_name` (`Adam`: the name the agent says), `vars.repository_creation` (what the prompt says about making a repository for the person: the default is the sentence for a deployment that allows it, and **when `CREATE_REPO_OWNERS` is empty `CoderAgent` replaces it with a note that there is no such tool**, that the person must create the repository and name it, and that "a new repository" is never an option of a question; a folder that does not declare the var keeps its own text) and `card:` (the A2A
+card: name `Adam`, the skills `explain`, `research`, `documents` and `coding-task`, each with tags and examples); the body is the system prompt.
 
 ```mermaid
 sequenceDiagram
@@ -2016,7 +2040,7 @@ database of its own, so the role needs `CREATEDB`):
   `the_prompt_gives_the_agent_a_name_and_asks_for_plain_words` pins what #55 added (the persona lines first, the
   greeting rule, the plain-words answer, what it cannot do, no tool list); the prompt equals
   `tests/fixtures/agent/prompt.txt` (the **instruction snapshot**: it began as the old Rust constant, and #55 is its
-  first deliberate change) for several limits, with `{{display_name}}` as `Coder`, but for its final newline, which the
+  first deliberate change) for several limits, with `{{display_name}}` as `Adam`, but for its final newline, which the
   loader drops from every body; the limits, the tool order and the model alias are the old ones; a run through a runtime on a `MockModel` sends the old system prompt, tools and `max_output_tokens` and
   journals the old step names (`model:0`, `tool:<call id>`, so a run journaled before replays); the assembly's
   card equals `agent_card`. A model alias the assembly refuses (empty, whitespace) is an error from `try_new`.
@@ -2158,6 +2182,10 @@ database of its own, so the role needs `CREATEDB`):
   over, the task is `Completed` with the file as an A2A artifact, no pull request and no check),
   `a_scratch_file_that_was_not_shared_does_not_complete_the_run` and
   `a_run_in_a_repository_that_shared_a_file_but_opened_no_pull_request_still_waits`.
+* Subagents (ADR 0021): `tests/agent_files.rs` has the manifest test (`explorer` and `reviewer`, each with exactly `read_file` and
+  `run_command`) and a run where the coder prepares a workspace and the explorer's `read_file` reads a file of it;
+  `tests/tools.rs` `a_subagent_works_in_the_worktree_and_on_the_budget_of_its_root_run` (a child context reads the root's
+  worktree, a stranger finds none, a failed check of the subagent is a cycle of the root).
 * `run_command`, the shell and the missing toolchain are tested in `tests/tools.rs`
   (`run_command_looks_around_without_reporting_checks_or_using_cycles`: no artifact, no cycle, `cat` of a
   missing file five times with a budget of three; `run_command_undoes_a_change_and_says_where_changes_go`: a new
@@ -2261,8 +2289,8 @@ curl -N http://127.0.0.1:8080/ \
 Expected: a stream of status updates whose messages include OpenCode's tool calls (`Write ...`, then
 `Write ...: done`) and `running checks: ...`, then artifacts `checks` (twice: of `HEAD`, then bound to the pushed commit), `branch` and `pull_request`,
 then `TASK_STATE_COMPLETED`. Send only "Hi" instead and the task ends `TASK_STATE_INPUT_REQUIRED` with
-the model's question, which should be a greeting that says the agent's name (`Coder`) and what it does in one
-sentence and asks which repository and what to change ([Who it is](#who-it-is)); "What is your name?" and "List me all
+the model's question, which should be a greeting that says the agent's name (`Adam`) and what it does in one
+sentence and asks what it can help with ([Who it is](#who-it-is)); "What is your name?" and "List me all
 your tools" (each a new task, or an answer to the open one) should be answered in plain words, with no tool signatures.
 That is what the instructions ask for; that a live model follows them is *unverified* until this has been run. Verify:
 

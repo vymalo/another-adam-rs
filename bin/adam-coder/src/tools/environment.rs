@@ -37,7 +37,7 @@ pub async fn rebuild_environment(
         return Err(cancelled("the environment was not rebuilt"));
     }
     let use_default = use_default.unwrap_or(false);
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let made_again = env
         .environment
         .rebuild(&run, use_default)

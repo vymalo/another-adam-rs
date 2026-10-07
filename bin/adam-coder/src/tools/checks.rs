@@ -395,9 +395,9 @@ pub(crate) async fn missing_tool_answer(
     dirs: &[&std::path::Path],
     environment: &EnvKind,
 ) -> Result<String, ToolError> {
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-    let earlier = notes.record_missing_tool(ctx.call_id(), &missing.name);
+    let earlier = notes.record_missing_tool(&ToolEnv::call_key(ctx), &missing.name);
     env.notes
         .save(&run, &notes)
         .await
@@ -544,7 +544,7 @@ pub async fn run_checks(
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
     };
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
 
     // A repository's worktree or a scratch project: the checks run on either.
@@ -558,7 +558,9 @@ pub async fn run_checks(
 
     // A replayed call that was already counted may run again; a new call
     // past the limit may not.
-    let replay = notes.checks.counted.iter().any(|c| c == ctx.call_id());
+    // Keyed by run and call: the notes are the root run's, and a subagent's call ids are its own.
+    let call = ToolEnv::call_key(ctx);
+    let replay = notes.checks.counted.contains(&call);
     if notes.cycles_exhausted(scratch, max) && !replay {
         let findings = notes
             .last_in(scratch)
@@ -637,7 +639,7 @@ pub async fn run_checks(
     let artifact = report.clone().into_artifact(redactor);
     let text = render(&shown, &outcome, env.settings.check_timeout);
     let failures = notes.record_check(CheckRecord {
-        call_id: ctx.call_id().to_owned(),
+        call_id: call,
         command: shown.clone(),
         passed,
         exit_code: outcome.exit_code,

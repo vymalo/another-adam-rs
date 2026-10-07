@@ -619,7 +619,7 @@ icon_tools!(
     i_agent IAgent "agent", i_read IRead "read", i_edit IEdit "edit", i_delete IDelete "delete",
     i_move IMove "move", i_search ISearch "search", i_execute IExecute "execute",
     i_think IThink "think", i_fetch IFetch "fetch", i_web IWeb "web", i_git IGit "git",
-    i_test ITest "test", i_file IFile "file", i_tool ITool "tool",
+    i_test ITest "test", i_file IFile "file", i_tool ITool "tool", i_opencode IOpencode "opencode",
 );
 
 #[test]

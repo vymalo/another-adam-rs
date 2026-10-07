@@ -4,7 +4,7 @@ adam-rs is a Rust framework for **durable AI agents**: an agent is a state machi
 effect are saved after each step, so a worker that dies loses nothing and another resumes the run. Every piece
 of infrastructure (database, model, code host) sits behind a trait with a conformance testkit, and agents are
 authored as Markdown folders plus `#[tool]` functions, in the spirit of [eve](https://eve.dev). It ships two
-agents over A2A 1.0: a coder that turns a task into a verified pull request, and one that serves any agent folder.
+agents over A2A 1.0: Adam, a general agent that answers, researches, writes documents and turns a coding task into a verified pull request, and one that serves any agent folder.
 
 ```mermaid
 flowchart LR
@@ -48,7 +48,7 @@ The stream ends in `TASK_STATE_COMPLETED` with a `pull_request` artifact. More: 
 
 | | What it does | Read |
 |---|---|---|
-| [`adam-coder`](bin/adam-coder/README.md) | a coding task to a verified pull request: worktree, OpenCode, the project's own checks, push, PR | [the coder](docs/reference/coder-agent.md), [deploy it](docs/guides/deploy-the-coder.md) |
+| [`adam-coder`](bin/adam-coder/README.md) (the binary of **Adam**) | answers, researches, writes documents, and takes a coding task to a verified pull request: worktree, OpenCode, the project's own checks, push, PR | [the coder](docs/reference/coder-agent.md), [deploy it](docs/guides/deploy-the-coder.md) |
 | [`adam-agent`](bin/adam-agent/README.md) | serves **any agent folder** (instructions, skills, subagents, MCP tools) with no build | [write an agent](docs/guides/write-an-agent.md) |
 
 Both ship in one image, `ghcr.io/vymalo/another-adam-rs/coder`, and share the process in

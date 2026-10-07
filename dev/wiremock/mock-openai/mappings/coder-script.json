@@ -43,7 +43,7 @@
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "Hi! I'm {{regexExtract (jsonPath request.body '$.messages[0].content') 'Your name is ([A-Za-z0-9 _-]+)' 'name'}}{{name.0}}. {{regexExtract (jsonPath request.body '$.messages[0].content') 'In one sentence: ([^.]+)' 'summary'}}{{summary.0}}. Which repository should I work on, and what should I change?"
+                "content": "Hi! I'm {{regexExtract (jsonPath request.body '$.messages[0].content') 'Your name is ([A-Za-z0-9 _-]+)' 'name'}}{{name.0}}. {{regexExtract (jsonPath request.body '$.messages[0].content') 'In one sentence: ([^.]+)' 'summary'}}{{summary.0}}. What can I help with?"
               },
               "logprobs": null,
               "finish_reason": "stop"

@@ -185,7 +185,7 @@ pub async fn create_repository(
         name.to_ascii_lowercase()
     );
 
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     // A call that comes again after the repository was made is the same answer.
     if let Some(done) = notes

@@ -24,6 +24,17 @@ pub fn user_message(text: impl Into<String>) -> Inbound {
     Inbound::new(MESSAGE_KIND, json!({ "text": text.into() }))
 }
 
+/// The key of the payload of a child's first message that names the run the child works for: the top
+/// of its parent chain ([`ToolCtx::root_run_id`](crate::ToolCtx::root_run_id)). Only code in the
+/// process writes it ([`ToolCtx::start_child`](crate::ToolCtx::start_child)): the A2A front builds
+/// a payload of `text` and `context` only.
+pub(crate) const ROOT_RUN_KEY: &str = "root_run";
+
+/// The run named by [`ROOT_RUN_KEY`] in an inbound payload, if it is there and is a run id.
+pub(crate) fn parse_root_run(payload: &Value) -> Option<RunId> {
+    serde_json::from_value(payload.get(ROOT_RUN_KEY)?.clone()).ok()
+}
+
 /// The text of an inbound payload: `{"text": "..."}` or a bare JSON string.
 pub(crate) fn parse_user_text(payload: &Value) -> Result<String, String> {
     match payload {
@@ -249,6 +260,14 @@ pub struct Conversation {
     /// is empty.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub context: Map<String, Value>,
+    /// The run this one works for, when it is a child run: the top of its parent chain, put in its
+    /// first message by the tool that started it ([`ToolCtx::start_child`](crate::ToolCtx::start_child)).
+    /// `None` for a run that is nobody's child. Tools read it as
+    /// [`ToolCtx::root_run_id`](crate::ToolCtx::root_run_id). Part of the durable state, so it
+    /// survives a restart and a change of worker; a run that continues another does not inherit it.
+    /// Absent from state written before it existed, and not written while it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_run: Option<RunId>,
     /// The ids (`Inbound::id`, an A2A `messageId`) of the messages the run has read after its first,
     /// the last [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them
     /// (the same one sent twice, as the orchestration layer does after a lost lease) is not read a
@@ -695,6 +714,26 @@ mod tests {
         assert!(parse_user_text(&json!({})).is_err());
         assert!(parse_user_text(&json!(null)).is_err());
         assert!(parse_user_text(&json!([1])).is_err());
+    }
+
+    #[test]
+    fn the_root_run_of_a_payload_is_a_run_id_or_nothing() {
+        let run = RunId::new();
+        assert_eq!(
+            parse_root_run(&json!({"text": "x", "root_run": run.to_string()})),
+            Some(run)
+        );
+        assert_eq!(parse_root_run(&json!({"text": "x"})), None);
+        assert_eq!(parse_root_run(&json!({"root_run": "not a run"})), None);
+        assert_eq!(parse_root_run(&json!({"root_run": 7})), None);
+        assert_eq!(parse_root_run(&json!("bare")), None);
+    }
+
+    #[test]
+    fn a_continuing_run_is_nobodys_child() {
+        let mut prior = Conversation::new("first task");
+        prior.root_run = Some(RunId::new());
+        assert_eq!(prior.continued("second", RunId::new()).root_run, None);
     }
 
     #[test]

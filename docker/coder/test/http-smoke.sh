@@ -12,7 +12,7 @@
 # (adam-agent) answers: its task completes with that text.
 #
 # What the agent is says what is expected (the defaults are the coder's):
-#   EXPECT_NAME   Coder                        the name on the agent card
+#   EXPECT_NAME   Adam                         the name on the agent card
 #   EXPECT_SKILL  coding-task                  a skill id the card lists
 #   EXPECT_STATE  TASK_STATE_INPUT_REQUIRED    the state the task reaches
 # Needs curl and jq.
@@ -24,7 +24,7 @@ if [ "$#" -ne 2 ]; then
 fi
 base=${1%/}
 token=$2
-expect_name=${EXPECT_NAME:-Coder}
+expect_name=${EXPECT_NAME:-Adam}
 expect_skill=${EXPECT_SKILL:-coding-task}
 expect_state=${EXPECT_STATE:-TASK_STATE_INPUT_REQUIRED}
 fail=0

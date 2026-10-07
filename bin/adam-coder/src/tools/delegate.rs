@@ -80,7 +80,7 @@ async fn opencode_refusal(
     {
         return Ok(Some(NO_NETWORK.to_owned()));
     }
-    let run = ctx.run_id().to_string();
+    let run = ctx.root_run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     let check = match notes.environment.opencode.clone() {
         Some(check) => check,
@@ -198,7 +198,7 @@ fn tail(text: &str, cap: usize) -> &str {
 /// verified. One concern per call. It reads and edits files itself; do not ask
 /// it to commit, push or open pull requests. Returns its summary and the files
 /// that changed.
-#[tool(type = DelegateToOpenCode, step = "subagent", label = "OpenCode", icon = "agent")]
+#[tool(type = DelegateToOpenCode, step = "subagent", label = "OpenCode", icon = "opencode")]
 pub async fn delegate_to_opencode(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

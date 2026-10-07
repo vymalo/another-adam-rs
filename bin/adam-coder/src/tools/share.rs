@@ -122,7 +122,9 @@ pub async fn share_file(
         Err(e) => return Ok(ToolOutput::error(e.to_string())),
     };
     // The run delivered something: a scratch run that ends here may complete without a pull
-    // request (`CoderAgent`). Noted once however often the file is shared.
+    // request (`CoderAgent`). Noted once however often the file is shared. In the notes of the
+    // run that shares, not of its root: a subagent's file stays on the subagent's run and the
+    // person never gets it, so it delivers nothing for the root.
     let run = ctx.run_id().to_string();
     let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     if notes.record_shared(&format!("{}/{}", slot.dir(), path)) {

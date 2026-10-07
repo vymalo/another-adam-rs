@@ -278,10 +278,10 @@ jobs:
           # mock-openai, model mock-coder: a greeting is answered with the name and the one-sentence
           # summary that the two persona lines of the system prompt give (what the coder's
           # `agent/instructions.md` opens with), not with the workspace script ...
-          want="I'm Coder. I take a repository you name. Which repository should I work on"
+          want="I'm Adam. I answer questions. What can I help with?"
           curl -fsS http://127.0.0.1:8081/v1/chat/completions \
             -H 'Content-Type: application/json' \
-            -d '{"model":"mock-coder","messages":[{"role":"system","content":"Your name is Coder.\nIn one sentence: I take a repository you name.\n"},{"role":"user","content":"Hi"}]}' \
+            -d '{"model":"mock-coder","messages":[{"role":"system","content":"Your name is Adam.\nIn one sentence: I answer questions.\n"},{"role":"user","content":"Hi"}]}' \
             | jq -e --arg want "$want" '.choices[0].finish_reason == "stop" and (.choices[0].message.content | contains($want))' > /dev/null
           # ... a persona that is edited gives another answer, with no rebuild ...
           curl -fsS http://127.0.0.1:8081/v1/chat/completions \
