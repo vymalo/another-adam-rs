@@ -60,6 +60,8 @@ struct Inner {
 #[derive(Default)]
 pub struct MockModel {
     inner: Mutex<Inner>,
+    provider: Option<String>,
+    context_windows: Vec<(String, u64)>,
 }
 
 impl std::fmt::Debug for MockModel {
@@ -83,6 +85,20 @@ impl MockModel {
         let mock = Self::new();
         mock.lock().script.extend(script);
         mock
+    }
+
+    /// Say `provider` as [`ModelClient::provider`] (a mock says none by default).
+    #[must_use]
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self
+    }
+
+    /// Say `window` as the [`ModelClient::context_window`] of the alias `model`.
+    #[must_use]
+    pub fn with_context_window(mut self, model: impl Into<String>, window: u64) -> Self {
+        self.context_windows.push((model.into(), window));
+        self
     }
 
     /// Wrap into a [`DynModel`].
@@ -156,6 +172,17 @@ impl MockModel {
 impl ModelClient for MockModel {
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         self.next(req, false)
+    }
+
+    fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    fn context_window(&self, model: &str) -> Option<u64> {
+        self.context_windows
+            .iter()
+            .find(|(alias, _)| alias == model)
+            .map(|(_, window)| *window)
     }
 
     async fn stream(
@@ -295,6 +322,15 @@ mod tests {
         // `Arc<dyn ModelClient>` is itself a `ModelClient`.
         fn takes_client(_: impl ModelClient) {}
         takes_client(dyn_model.clone());
+        // A mock says no provider and no window unless it is told one, and an `Arc` forwards both.
+        assert_eq!(dyn_model.provider(), None);
+        let told: DynModel = MockModel::new()
+            .with_provider("mock")
+            .with_context_window("m", 8192)
+            .into_dyn();
+        assert_eq!(told.provider(), Some("mock"));
+        assert_eq!(told.context_window("m"), Some(8192));
+        assert_eq!(told.context_window("other"), None);
         assert_eq!(
             dyn_model
                 .complete(ModelRequest::new("m"))

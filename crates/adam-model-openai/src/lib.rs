@@ -226,7 +226,12 @@ pub struct OpenAiCompatible {
     max_tokens_field: MaxTokensField,
     extra_body: Option<serde_json::Map<String, serde_json::Value>>,
     echo_reasoning: Option<ReasoningField>,
+    context_windows: BTreeMap<String, u64>,
 }
+
+/// What [`OpenAiCompatible`] says its provider is ([`ModelClient::provider`]): the protocol it
+/// speaks, whatever gateway or model is behind it.
+pub const PROVIDER: &str = "openai";
 
 impl fmt::Debug for OpenAiCompatible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -243,6 +248,7 @@ impl fmt::Debug for OpenAiCompatible {
                     .map(|m| m.keys().collect::<Vec<_>>()),
             )
             .field("echo_reasoning", &self.echo_reasoning)
+            .field("context_windows", &self.context_windows)
             .finish_non_exhaustive()
     }
 }
@@ -295,7 +301,18 @@ impl OpenAiCompatible {
             max_tokens_field: MaxTokensField::default(),
             extra_body: None,
             echo_reasoning: None,
+            context_windows: BTreeMap::new(),
         })
+    }
+
+    /// Say that the model the alias `model` names has a context window of `window` tokens, as the
+    /// deployment knows it (`MODEL_CONTEXT_WINDOW`): what [`ModelClient::context_window`] answers
+    /// for that alias, and nothing for any other. The client sends nothing of it; a report of a
+    /// call says it, so a screen can show how full the context is.
+    #[must_use]
+    pub fn with_context_window(mut self, model: impl Into<String>, window: u64) -> Self {
+        self.context_windows.insert(model.into(), window);
+        self
     }
 
     /// Members merged into the body of **every** request, at its top level (they win over what
@@ -413,6 +430,14 @@ fn transport_error(e: reqwest::Error) -> ModelError {
 
 #[async_trait]
 impl ModelClient for OpenAiCompatible {
+    fn provider(&self) -> Option<&str> {
+        Some(PROVIDER)
+    }
+
+    fn context_window(&self, model: &str) -> Option<u64> {
+        self.context_windows.get(model).copied()
+    }
+
     #[tracing::instrument(name = "model.complete", skip_all, fields(model = %req.model, url = %self.url))]
     async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = wire::build_request(&req, false, self.options())?;
@@ -472,6 +497,19 @@ mod tests {
         let shown = format!("{client:?}");
         assert!(!shown.contains("sk-super-secret"), "{shown}");
         assert!(!shown.contains("header-secret"), "{shown}");
+    }
+
+    #[test]
+    fn the_provider_is_openai_and_a_window_is_said_for_its_alias_only() {
+        let client = OpenAiCompatible::new(config("https://x.example/v1")).unwrap();
+        assert_eq!(client.provider(), Some(PROVIDER));
+        assert_eq!(client.context_window("glm-5.3"), None);
+        let client = client.with_context_window("glm-5.3", 131_072);
+        assert_eq!(client.context_window("glm-5.3"), Some(131_072));
+        assert_eq!(client.context_window("another"), None);
+        let shared: adam_model::DynModel = std::sync::Arc::new(client);
+        assert_eq!(shared.provider(), Some("openai"));
+        assert_eq!(shared.context_window("glm-5.3"), Some(131_072));
     }
 
     #[test]

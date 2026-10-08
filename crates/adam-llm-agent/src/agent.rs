@@ -903,11 +903,8 @@ impl LlmAgent {
                 "model call failed: the response is not an assistant message".into(),
             ));
         }
-        state.usage.input_tokens = state.usage.input_tokens.saturating_add(usage.input_tokens);
-        state.usage.output_tokens = state
-            .usage
-            .output_tokens
-            .saturating_add(usage.output_tokens);
+        let usage = usage.accounted();
+        state.usage = state.usage.saturating_add(usage);
         state.turns += 1;
 
         let text = message.text();

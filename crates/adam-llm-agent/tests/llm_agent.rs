@@ -388,10 +388,7 @@ async fn parallel_calls_in_one_message_run_in_order() {
                 reasoning: None,
             },
             finish: adam_model::FinishReason::ToolCalls,
-            usage: adam_model::Usage {
-                input_tokens: 5,
-                output_tokens: 7,
-            },
+            usage: adam_model::Usage::new(5, 7),
             reasoning: None,
         })
         .push_text("ok");

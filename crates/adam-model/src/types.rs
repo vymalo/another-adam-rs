@@ -262,13 +262,115 @@ pub enum FinishReason {
     Other(String),
 }
 
-/// Token accounting for one call.
+/// Token accounting for one call, or for several summed.
+///
+/// The accounting is AG-UI 1.0's `TokenUsage`: `input_tokens` and `output_tokens` are **totals**,
+/// and the optional counts are **parts** of them, never additions. `reasoning_tokens` is part of
+/// `output_tokens`; `cached_input_tokens` (read from a provider's cache) and
+/// `cache_write_input_tokens` (written to it) are disjoint parts of `input_tokens`. A part is
+/// `None` when the provider did not say. [`accounted`](Self::accounted) brings a provider that
+/// reports a part beside a smaller total back to this rule.
+///
+/// Build one with [`Usage::new`] and the `with_*` methods; the struct is `#[non_exhaustive]`, so a
+/// later count is not a breaking change. Every member but the two totals is left out of the JSON
+/// while it is `None`, so a usage recorded before the parts existed reads the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Usage {
-    /// Tokens in the prompt.
+    /// Tokens in the prompt: every prompt token the call was charged for, cached ones included.
     pub input_tokens: u64,
-    /// Tokens generated.
+    /// Tokens generated, reasoning included.
     pub output_tokens: u64,
+    /// The part of [`output_tokens`](Self::output_tokens) spent on reasoning, when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// The part of [`input_tokens`](Self::input_tokens) read from the provider's cache, when the
+    /// provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    /// The part of [`input_tokens`](Self::input_tokens) written to the provider's cache on this call,
+    /// when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// `input` prompt tokens and `output` generated ones, no parts.
+    pub fn new(input: u64, output: u64) -> Self {
+        Self {
+            input_tokens: input,
+            output_tokens: output,
+            ..Self::default()
+        }
+    }
+
+    /// With `tokens` of the output spent on reasoning.
+    #[must_use]
+    pub fn with_reasoning_tokens(mut self, tokens: u64) -> Self {
+        self.reasoning_tokens = Some(tokens);
+        self
+    }
+
+    /// With `tokens` of the input read from the provider's cache.
+    #[must_use]
+    pub fn with_cached_input_tokens(mut self, tokens: u64) -> Self {
+        self.cached_input_tokens = Some(tokens);
+        self
+    }
+
+    /// With `tokens` of the input written to the provider's cache.
+    #[must_use]
+    pub fn with_cache_write_input_tokens(mut self, tokens: u64) -> Self {
+        self.cache_write_input_tokens = Some(tokens);
+        self
+    }
+
+    /// `input_tokens + output_tokens`, saturating.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// The same counts under the accounting of the type: a provider that reports a part beside a
+    /// smaller total has the part **added in** (AG-UI's rule for a producer), so that every part
+    /// fits in its total. Reasoning above the output is added to the output; cache reads and writes
+    /// above the input are added to the input. Counts that already follow the rule are unchanged,
+    /// so applying it twice changes nothing.
+    #[must_use]
+    pub fn accounted(mut self) -> Self {
+        if let Some(reasoning) = self.reasoning_tokens
+            && reasoning > self.output_tokens
+        {
+            self.output_tokens = self.output_tokens.saturating_add(reasoning);
+        }
+        let cache = self
+            .cached_input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_write_input_tokens.unwrap_or(0));
+        if cache > self.input_tokens {
+            self.input_tokens = self.input_tokens.saturating_add(cache);
+        }
+        self
+    }
+
+    /// The counts of two calls together, each saturating. A part one of them did not report counts
+    /// as zero beside one the other did, and stays `None` when neither did.
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        let part = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+        };
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            reasoning_tokens: part(self.reasoning_tokens, other.reasoning_tokens),
+            cached_input_tokens: part(self.cached_input_tokens, other.cached_input_tokens),
+            cache_write_input_tokens: part(
+                self.cache_write_input_tokens,
+                other.cache_write_input_tokens,
+            ),
+        }
+    }
 }
 
 /// One item of a streamed completion.
@@ -322,10 +424,9 @@ mod tests {
                 reasoning: None,
             },
             finish: FinishReason::ToolCalls,
-            usage: Usage {
-                input_tokens: 12,
-                output_tokens: 34,
-            },
+            usage: Usage::new(12, 34)
+                .with_reasoning_tokens(30)
+                .with_cached_input_tokens(10),
             reasoning: Some("the user wants the weather".into()),
         }
     }
@@ -442,11 +543,69 @@ mod tests {
             parameters: json!({"type": "object"}),
         });
         roundtrip(tool_call());
-        roundtrip(Usage {
-            input_tokens: u64::MAX,
-            output_tokens: 0,
-        });
+        roundtrip(Usage::new(u64::MAX, 0));
+        roundtrip(
+            Usage::new(5, 6)
+                .with_reasoning_tokens(1)
+                .with_cached_input_tokens(2)
+                .with_cache_write_input_tokens(3),
+        );
         roundtrip(response());
+    }
+
+    #[test]
+    fn usage_writes_a_part_only_when_there_is_one_and_reads_the_old_shape() {
+        assert_eq!(
+            serde_json::to_value(Usage::new(3, 4)).unwrap(),
+            json!({"input_tokens": 3, "output_tokens": 4})
+        );
+        assert_eq!(
+            serde_json::to_value(Usage::new(3, 4).with_reasoning_tokens(2)).unwrap(),
+            json!({"input_tokens": 3, "output_tokens": 4, "reasoning_tokens": 2})
+        );
+        let old: Usage =
+            serde_json::from_value(json!({"input_tokens": 3, "output_tokens": 4})).unwrap();
+        assert_eq!(old, Usage::new(3, 4));
+        assert_eq!(old.reasoning_tokens, None);
+        assert_eq!(Usage::new(u64::MAX, 1).total_tokens(), u64::MAX);
+    }
+
+    #[test]
+    fn a_part_above_its_total_is_added_in_and_one_within_it_is_left() {
+        // Reasoning beside a smaller completion count: the producer adds it in.
+        let beside = Usage::new(10, 5).with_reasoning_tokens(300).accounted();
+        assert_eq!(beside.output_tokens, 305);
+        assert_eq!(beside.reasoning_tokens, Some(300));
+        // Within the total: a part, nothing changes.
+        let within = Usage::new(10, 500).with_reasoning_tokens(300);
+        assert_eq!(within.accounted(), within);
+        // Cache reads and writes beside a smaller input are added in, together.
+        let cached = Usage::new(100, 1)
+            .with_cached_input_tokens(80)
+            .with_cache_write_input_tokens(40)
+            .accounted();
+        assert_eq!(cached.input_tokens, 220);
+        let fits = Usage::new(100, 1).with_cached_input_tokens(80);
+        assert_eq!(fits.accounted(), fits);
+        // Twice is once.
+        assert_eq!(beside.accounted(), beside);
+        assert_eq!(cached.accounted(), cached);
+    }
+
+    #[test]
+    fn usages_add_part_by_part_and_saturate() {
+        let a = Usage::new(1, 2).with_reasoning_tokens(1);
+        let b = Usage::new(10, 20).with_cached_input_tokens(5);
+        let sum = a.saturating_add(b);
+        assert_eq!(sum.input_tokens, 11);
+        assert_eq!(sum.output_tokens, 22);
+        assert_eq!(sum.reasoning_tokens, Some(1));
+        assert_eq!(sum.cached_input_tokens, Some(5));
+        assert_eq!(sum.cache_write_input_tokens, None);
+        let full = Usage::new(u64::MAX, u64::MAX).with_reasoning_tokens(u64::MAX);
+        let over = full.saturating_add(full);
+        assert_eq!(over.input_tokens, u64::MAX);
+        assert_eq!(over.reasoning_tokens, Some(u64::MAX));
     }
 
     #[test]

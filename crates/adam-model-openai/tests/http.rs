@@ -99,13 +99,7 @@ async fn complete_sends_the_documented_request() {
 
     assert_eq!(resp.message.text(), "Sunny.");
     assert_eq!(resp.finish, FinishReason::Stop);
-    assert_eq!(
-        resp.usage,
-        Usage {
-            input_tokens: 20,
-            output_tokens: 3
-        }
-    );
+    assert_eq!(resp.usage, Usage::new(20, 3));
 
     let body = sent_body(&server).await;
     assert_eq!(body["model"], "gw-model");
@@ -274,13 +268,7 @@ async fn stream_text_deltas_concatenate_and_end_with_finished() {
     assert_eq!(text, "Sunny.");
     assert_eq!(resp.message.text(), text);
     assert_eq!(resp.finish, FinishReason::Stop);
-    assert_eq!(
-        resp.usage,
-        Usage {
-            input_tokens: 20,
-            output_tokens: 3
-        }
-    );
+    assert_eq!(resp.usage, Usage::new(20, 3));
     assert_eq!(
         deltas
             .iter()

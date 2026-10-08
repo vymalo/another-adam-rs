@@ -909,10 +909,7 @@ mod tests {
         prior.messages.push(Message::assistant_text("done"));
         prior.turns = 7;
         prior.tool_calls = 5;
-        prior.usage = Usage {
-            input_tokens: 10,
-            output_tokens: 20,
-        };
+        prior.usage = Usage::new(10, 20);
         prior.artifacts = vec![ArtifactRef {
             name: "report".into(),
             mime_type: None,
