@@ -297,6 +297,35 @@ mod tests {
         assert!(mcp.allow_stdio && mcp.allow_insecure && mcp.allow_url_vars);
     }
 
+    /// `MODEL_CONTEXT_WINDOW` is read with the model: a count of tokens, or a startup error with the
+    /// configuration's exit code (78); a control plane runs no model and does not read it.
+    #[test]
+    fn the_context_window_is_read_by_the_workers_and_a_bad_one_stops_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = full(dir.path());
+        assert_eq!(
+            parse(&vars).unwrap().worker.unwrap().model.context_window,
+            None
+        );
+        vars.insert("MODEL_CONTEXT_WINDOW".into(), "131072".into());
+        assert_eq!(
+            parse(&vars).unwrap().worker.unwrap().model.context_window,
+            Some(131_072)
+        );
+        vars.insert("MODEL_CONTEXT_WINDOW".into(), "lots".into());
+        let error = parse(&vars).unwrap_err();
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|p| p.starts_with("MODEL_CONTEXT_WINDOW")),
+            "{error}"
+        );
+        assert_eq!(adam_service::exit_code(&error), 78);
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse(&vars).unwrap().worker.is_none());
+    }
+
     /// A control plane serves the card and starts runs, which needs no model and no MCP server, so
     /// it reads and validates none of their variables.
     #[test]

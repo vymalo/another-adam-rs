@@ -25,6 +25,7 @@ A `control-plane` reads only `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS`, `PUBLI
 | `MODEL` | the agent's model alias | required by `all`, `worker` |
 | `MODEL_EXTRA_BODY` | JSON object merged into every chat request, e.g. `{"reasoning_effort":"medium"}`; **not a secret**; may not set `model`, `messages`, `tools`, `tool_choice`, `stream` | unset |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: send earlier reasoning back under that name (DeepSeek thinking mode with tools needs it) | unset |
+| `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): the `contextWindow` of each `usage/v1` call report on that alias, so a screen shows how full the context is; a subagent whose `model:` names another alias reports none; anything else is a startup problem (exit 78). The chart and the operator have no value for it yet: set it with `config.extraEnv` | unset: reports carry no window |
 | `MCP_ALLOW_STDIO` | let `mcp.json` start local processes | `false` |
 | `MCP_ALLOW_INSECURE` | allow plain `http` MCP servers on other machines; development only | `false` |
 | `MCP_ALLOW_URL_VARS` | allow `${VAR}` in a server `url` (the SDK logs URLs) | `false` |
