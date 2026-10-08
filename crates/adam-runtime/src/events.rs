@@ -20,6 +20,7 @@ use adam_core::{RunId, RunStatus};
 
 use crate::step::StepEvent;
 use crate::text::is_false;
+use crate::usage::UsageEvent;
 
 /// The most bytes of one file artifact: 4 MiB.
 ///
@@ -261,6 +262,14 @@ pub enum RunEvent {
         #[serde(default, skip_serializing_if = "is_false")]
         abandoned: bool,
     },
+    /// A model call completed: its tokens, its model, and the step of the task it ran under (see
+    /// [`UsageEvent`]). The A2A server serves it as a `usage/v1` call report to a client that
+    /// activated the extension, and as nothing to one that did not.
+    ///
+    /// A child run's call is emitted as an event of the **root** run it works for
+    /// ([`Emitter::emit_for`](crate::Emitter::emit_for)), with the root's step it runs under, so that
+    /// the root's subscribers, the ones who asked for the task, hear it.
+    Usage(UsageEvent),
     /// Application-defined event.
     Custom {
         /// Event kind.
@@ -670,6 +679,16 @@ mod tests {
                 last: false,
                 abandoned: false,
             },
+            RunEvent::Usage(
+                UsageEvent::new(
+                    "run-c0-a1b2c3d4",
+                    "glm-5.3",
+                    adam_model::Usage::new(41250, 812).with_reasoning_tokens(300),
+                )
+                .under("tool:c2")
+                .with_provider("openai")
+                .with_context_window(131_072),
+            ),
         ];
         for e in events {
             let json = serde_json::to_value(&e).expect("serialize");
@@ -689,6 +708,16 @@ mod tests {
             serde_json::to_value(&event).expect("serialize"),
             serde_json::json!({"type": "step", "id": "tool:c1", "kind": "tool",
                                "label": "run_checks", "state": "running"})
+        );
+    }
+
+    #[test]
+    fn a_usage_event_is_tagged_usage() {
+        let event = RunEvent::Usage(UsageEvent::new("c1", "m", adam_model::Usage::new(3, 4)));
+        assert_eq!(
+            serde_json::to_value(&event).expect("serialize"),
+            serde_json::json!({"type": "usage", "call": "c1", "model": "m",
+                               "usage": {"input_tokens": 3, "output_tokens": 4}})
         );
     }
 

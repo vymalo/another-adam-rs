@@ -11,6 +11,9 @@ rust-version.workspace = true
 [dependencies]
 adam-error.workspace = true
 adam-core.workspace = true
+# The token counts of a model call (`Usage`), carried by `RunEvent::Usage` and `UsageTotals`: data
+# types only, no client.
+adam-model.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true

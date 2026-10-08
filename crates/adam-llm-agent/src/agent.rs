@@ -12,7 +12,8 @@ use adam_model::{
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, ChildStatus, Ctx, Emitter, Inbound,
-    MAX_RUN_FILE_BYTES, RUN_FINISHED_KIND, RunEvent, StepState, Transition,
+    MAX_RUN_FILE_BYTES, RUN_FINISHED_KIND, RunEvent, StepState, Transition, UsageEvent,
+    UsageTotals,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -21,7 +22,7 @@ use serde_json::{Map, Value, json};
 
 use crate::conversation::{
     ArtifactRef, Conversation, PendingQuestion, PendingRemote, PendingRun, PendingWait,
-    parse_context, parse_root_run, parse_user_text,
+    parse_context, parse_root_run, parse_root_step, parse_user_text,
 };
 use crate::history::fit_history;
 use crate::source::{DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined};
@@ -142,6 +143,11 @@ struct Recorded {
     /// read as "the answer is current".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seen: Option<usize>,
+    /// The call's id for its usage report ([`call_id`]), made inside the step: a replay reports the
+    /// call under the same id, a call made again (its first try never recorded) under another.
+    /// Absent in journals written before reports existed, which report under [`old_call_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    call: Option<String>,
 }
 
 /// The id of the stream of the words of turn `turn` of `run`: unique within the task, because the
@@ -151,6 +157,22 @@ fn stream_id(run: RunId, turn: u32) -> String {
     let mut suffix = uuid::Uuid::new_v4().simple().to_string();
     suffix.truncate(8);
     format!("{run}-m{turn}-{suffix}")
+}
+
+/// The id of model call `turn` of `run` in its usage report: unique within the task (the run id is
+/// in it, a child run's too), at most 57 bytes. Made inside the journaled step and recorded with the
+/// answer, like [`stream_id`]: a replay finds it there, and a call that runs again because its first
+/// try was never recorded (the process died before the journal write) is a new call with a new id.
+fn call_id(run: RunId, turn: u32) -> String {
+    let mut suffix = uuid::Uuid::new_v4().simple().to_string();
+    suffix.truncate(8);
+    format!("{run}-c{turn}-{suffix}")
+}
+
+/// The id of a call recorded by a build that made none: the run and the turn, which a replay of the
+/// same journal entry always gives again.
+fn old_call_id(run: RunId, turn: u32) -> String {
+    format!("{run}-c{turn}")
 }
 
 /// The id of the stream the reasoning of a model turn is sent as: apart from [`stream_id`]'s, which
@@ -463,6 +485,14 @@ impl LlmAgentBuilder {
 /// * `Step` again from [`ToolCtx::emit_progress`] (an update of the call's own step, the text in its
 ///   detail) and from [`ToolCtx::report_step`] (steps that run under the call's: a command, a tool
 ///   of the agent the call drives);
+/// * `Usage` for each model call that completed (the provider answered, with or without usage): its
+///   tokens ([`Usage::accounted`](adam_model::Usage::accounted)), the alias, the provider and the
+///   context window the model client says, and an id made inside the journaled step and recorded with
+///   the answer, so a replay reports the call under the same id. It is an event of the **root** run
+///   ([`ToolCtx::root_run_id`]): a child run's report names the root's step it works under
+///   (`Conversation::root_step`), so the task's client counts a subagent apart. The tokens are also
+///   counted in [`Conversation::usage_totals`], and a child's totals are added to its parent's when it
+///   answers (ADR 0032);
 /// * `Artifact` for each artifact a tool returns (also durable);
 /// * `Custom { kind: "input_required", payload: {question, call_id} }` before parking;
 /// * `Custom { kind: "awaiting_run", payload: {call_id, run} }` before parking on a child run,
@@ -835,6 +865,7 @@ impl LlmAgent {
                         stream: None,
                         notes,
                         seen: Some(seen),
+                        call: Some(call_id(run, turn)),
                     });
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
@@ -855,9 +886,22 @@ impl LlmAgent {
                     stream: streamed.stream,
                     notes,
                     seen: Some(seen),
+                    call: Some(call_id(run, turn)),
                 })
             })
             .await?;
+        // The call completed (the provider answered): it is reported, every time this step is
+        // passed, under the id its record holds, so a replay says the same report again. A
+        // cancelled turn's call is reported too: it was made, though the turn is not kept.
+        let usage = match &recorded {
+            Ok(r) => {
+                let usage = r.response.usage.accounted();
+                let call = r.call.clone().unwrap_or_else(|| old_call_id(run, turn));
+                self.report_usage(ctx, state, call, usage).await;
+                usage
+            }
+            Err(_) => adam_model::Usage::default(),
+        };
         // A cancel ends the turn here: nothing the model said is acted on, said or kept. The run is
         // already `Failed` in the store (that is what told the token), so this result is dropped
         // by the worker's commit.
@@ -871,6 +915,7 @@ impl LlmAgent {
                 stream,
                 notes,
                 seen,
+                call: _,
             }) => {
                 // The calls this turn asks for are the ones its listing described.
                 state.source_notes = notes;
@@ -895,16 +940,19 @@ impl LlmAgent {
         let ModelResponse {
             message,
             finish,
-            usage,
+            usage: _,
             reasoning: _,
         } = response;
+        // The call's tokens count whatever its answer was: the provider took them.
+        state.usage = state.usage.saturating_add(usage);
+        state
+            .usage_totals
+            .add(self.model.provider(), &self.model_alias, usage);
         if !matches!(message, Message::Assistant { .. }) {
             return Ok(Flow::Fail(
                 "model call failed: the response is not an assistant message".into(),
             ));
         }
-        let usage = usage.accounted();
-        state.usage = state.usage.saturating_add(usage);
         state.turns += 1;
 
         let text = message.text();
@@ -990,6 +1038,52 @@ impl LlmAgent {
         Ok(Flow::Next)
     }
 
+    /// Report a completed model call of this run (`usage/v1`): as an event of the **root** run, the
+    /// task's, with the root's step this run works under when it is a child, so the task's client
+    /// counts a subagent's tokens apart. The model is the alias the request named, the provider and
+    /// the context window what the model client says of it.
+    async fn report_usage(
+        &self,
+        ctx: &Ctx,
+        state: &Conversation,
+        call: String,
+        usage: adam_model::Usage,
+    ) {
+        let mut event = UsageEvent::new(call, &self.model_alias, usage);
+        if let Some(provider) = self.model.provider() {
+            event = event.with_provider(provider);
+        }
+        if let Some(window) = self.model.context_window(&self.model_alias) {
+            event = event.with_context_window(window);
+        }
+        if let Some(step) = &state.root_step {
+            event = event.under(step);
+        }
+        let root = state.root_run.unwrap_or_else(|| ctx.run_id());
+        ctx.emitter().emit_for(root, RunEvent::Usage(event)).await;
+    }
+
+    /// Count the model calls of the child run `child`, which has just answered, in this run's
+    /// totals: the totals its state keeps (`usage_totals`, its own children's included). A child
+    /// whose state says none (another kind of agent, or one purged) adds nothing.
+    async fn count_child(
+        ctx: &Ctx,
+        state: &mut Conversation,
+        child: RunId,
+    ) -> Result<(), AgentError> {
+        let Some(child_state) = ctx.child_state(child).await? else {
+            return Ok(());
+        };
+        let totals = child_state
+            .get("usage_totals")
+            .cloned()
+            .and_then(|totals| serde_json::from_value::<UsageTotals>(totals).ok());
+        if let Some(totals) = totals {
+            state.usage_totals.merge(&totals);
+        }
+        Ok(())
+    }
+
     /// Run the owed tool calls in order, each as its own journaled step.
     ///
     /// `notices` are the finished-child messages this transition received: a call that starts a
@@ -1010,7 +1104,7 @@ impl LlmAgent {
                 .run_tool(
                     ctx,
                     &state.context,
-                    state.root_run,
+                    (state.root_run, state.root_step.as_deref()),
                     &state.source_notes,
                     &call,
                     used,
@@ -1069,6 +1163,7 @@ impl LlmAgent {
                         return Ok(Flow::Wait);
                     };
                     let outcome = Self::answer_run(state, &wait, child);
+                    Self::count_child(ctx, state, run).await?;
                     say(
                         ctx,
                         silent_call(self, state, &call.name),
@@ -1121,7 +1216,7 @@ impl LlmAgent {
         &self,
         ctx: &mut Ctx,
         context: &Map<String, Value>,
-        root_run: Option<RunId>,
+        root: (Option<RunId>, Option<&str>),
         notes: &[ToolNote],
         call: &ToolCall,
         files_used: u64,
@@ -1143,7 +1238,7 @@ impl LlmAgent {
         say(ctx, silent, RunEvent::Step(start)).await;
 
         let tool_ctx = self
-            .tool_ctx(ctx, context, root_run, notes, &call.id, &call.name)
+            .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
             .with_note(note.cloned());
         let args = call.arguments.clone();
         let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
@@ -1279,7 +1374,7 @@ impl LlmAgent {
         &self,
         ctx: &Ctx,
         context: &Map<String, Value>,
-        root_run: Option<RunId>,
+        (root_run, root_step): (Option<RunId>, Option<&str>),
         notes: &[ToolNote],
         call_id: &str,
         tool: &str,
@@ -1295,6 +1390,7 @@ impl LlmAgent {
             Some(ctx.child_starter()),
             Arc::new(context.clone()),
             root_run,
+            root_step.map(str::to_owned),
             self.style_of(tool, notes)
                 .event(tool, call_id, StepState::Running),
         )
@@ -1431,7 +1527,7 @@ impl LlmAgent {
         let tool_ctx = self.tool_ctx(
             ctx,
             &state.context,
-            state.root_run,
+            (state.root_run, state.root_step.as_deref()),
             &state.source_notes,
             &wait.call_id,
             &wait.tool,
@@ -1558,6 +1654,7 @@ fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
     let text = start_text(&input)?;
     let mut conversation = Conversation::new(text);
     conversation.root_run = parse_root_run(&input.payload);
+    conversation.root_step = parse_root_step(&input.payload);
     if let Some(context) = parse_context(&input.payload) {
         conversation.merge_context(context);
     }
@@ -1768,6 +1865,7 @@ impl Agent for LlmAgent {
             match Self::settle(ctx, &wait, &notices).await? {
                 Some(child) => {
                     let outcome = Self::answer_run(&mut state, &wait, &child);
+                    Self::count_child(ctx, &mut state, wait.run).await?;
                     ctx.emit(self.step_end_with_result(&state, &wait.tool, &wait.call_id, outcome))
                         .await;
                 }
@@ -1918,6 +2016,7 @@ mod failure_tests {
             stream: Some("run-m0-a1b2c3d4".into()),
             notes: Vec::new(),
             seen: None,
+            call: None,
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -1936,6 +2035,7 @@ mod failure_tests {
             stream: None,
             notes: Vec::new(),
             seen: None,
+            call: None,
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
 
@@ -1946,6 +2046,7 @@ mod failure_tests {
             stream: None,
             notes: vec![ToolNote::new("relay__search").reporting_steps()],
             seen: None,
+            call: None,
         };
         let json = serde_json::to_value(&noted).unwrap();
         assert_eq!(
@@ -1955,6 +2056,30 @@ mod failure_tests {
         let back: Recorded = serde_json::from_value(json).unwrap();
         assert_eq!(back.notes, noted.notes);
         assert!(old.notes.is_empty());
+
+        // The call's id for its usage report is beside the response, and absent from an old record.
+        assert_eq!(old.call, None);
+        let reported = Recorded {
+            response: ModelResponse::text("hi"),
+            stream: None,
+            notes: Vec::new(),
+            seen: None,
+            call: Some("run-c0-a1b2c3d4".into()),
+        };
+        let json = serde_json::to_value(&reported).unwrap();
+        assert_eq!(json["call"], "run-c0-a1b2c3d4");
+        let back: Recorded = serde_json::from_value(json).unwrap();
+        assert_eq!(back.call.as_deref(), Some("run-c0-a1b2c3d4"));
+    }
+
+    #[test]
+    fn a_call_id_names_the_run_the_turn_and_the_try() {
+        let run = RunId::new();
+        let (first, again) = (call_id(run, 3), call_id(run, 3));
+        assert!(first.starts_with(&format!("{run}-c3-")), "{first}");
+        assert_ne!(first, again, "a call made again is another call");
+        assert!(first.len() <= adam_runtime::MAX_USAGE_CALL_BYTES);
+        assert_eq!(old_call_id(run, 3), old_call_id(run, 3));
     }
 
     #[test]

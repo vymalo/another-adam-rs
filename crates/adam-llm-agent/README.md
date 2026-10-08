@@ -105,7 +105,7 @@ the conversation of the run before:
 |---|---|
 | **Carried** | the history, oldest first, and the user messages that were waiting behind an owed tool result (`deferred`), in arrival order; then the new user message |
 | **Answered** | the tool calls of a last assistant message that did not all get a result: a run that ended mid-turn (a cancel, a limit, a question nobody answered) leaves them, and a provider rejects a call without a result. Each owed call gets an error result, `STOPPED_BY_THE_PERSON`, after the results that did arrive: the model keeps what it asked for and is told which calls did not finish. The run state cannot tell a cancel from another ending, so a run that failed gets the same text. So `pending_calls` and `pending_wait` are always empty: a continued run never answers a question or a child run of the run before, and never runs a stopped call. The side effects of the calls are not undone |
-| **Reset** | `turns`, `tool_calls`, `usage` (`Limits` are per run) and `artifacts` (the final output lists what this run produced) |
+| **Reset** | `turns`, `tool_calls`, `usage` and `usage_totals` (`Limits` are per run, and a new task counts its tokens afresh), `root_run` and `root_step`, and `artifacts` (the final output lists what this run produced) |
 | **Recorded** | `continued_from: Option<RunId>`, not written while `None`; `omitted_turns: u32`, not written while zero |
 | **Bounded** | over `MAX_CARRIED_BYTES` (256 KiB of JSON), in this order and only as far as needed: **(1) the tool outputs of the turns older than the newest are shortened**, oldest first, each keeping its head and ending in the `TRUNCATION_MARKER_PREFIX` marker (the same truncation `max_history_tokens` does when a history is sent); **(2) whole old turns are dropped** (a turn is a user message and what follows it up to the next), one marker standing in for them; **(3) the newest prior turn's tool outputs are shortened, last**. Never dropped: **the first user message of the chain** (the task; kept verbatim as the first text part of the first message) and the **newest prior turn**. A newest turn whose own text is over the cap is carried over it. The waiting messages and the new one are counted, never cut |
 | **The marker** | the **second text part of the first user message**, starting with `OMITTED_MARKER_PREFIX` and naming the number of turns; `omitted_turns` (not the text) is what says the part is a marker, so a user message that merely starts with the prefix is an ordinary one. It is always the second part: before anything is dropped, a first message that has several parts (`[task, next]`, from a run that ended before the model answered) is reduced to its task, and the rest becomes a user message of its own (a turn like any other), then merged behind the marker. A rule that reads what the user said should read user messages part by part and skip that part (`Conversation::is_omission_marker`) |
@@ -255,6 +255,20 @@ returns is closed by whoever shows the tree. These replace the `Custom` events `
 the `Progress` of `emit_progress` that earlier versions emitted (a breaking change of the events, ADR 0007):
 `tool_end`'s `ok` is `completed`, `error` and `transient_error` are `failed`, `needs_input` and `waiting` are `waiting`.
 `adam-a2a-runtime` serves steps to a client that activated `steps/v1` and as lines of text to one that did not.
+
+## Usage
+
+Every model call that completes (the provider answered, with or without usage) is reported as `RunEvent::Usage`
+([ADR 0032](../../docs/decisions/0032-usage-per-model-call.md)): its tokens (`Usage::accounted`, so a part the provider
+counted beside a smaller total is added in), the alias as `model`, and the provider and context window the model client says
+(`ModelClient::provider`, `ModelClient::context_window(alias)`). Zeros for a provider that said nothing.
+
+| | |
+|---|---|
+| **The id** | `<run id>-c<turn>-<8 hex digits>`, made inside the journaled step `model:<turn>` and recorded with the answer (the record's `call` member, beside `stream`): a replay of the entry reports the call under the same id, and a call made again (a transient retry starts at a fresh journal position; a crash before the journal write runs the call again) is another id. A journal written before this reports under `<run id>-c<turn>`. At most 57 bytes, unique within the task: a child's ids carry the child's run id |
+| **Where** | an event of the **root** run (`Conversation::root_run`, the run itself when it is nobody's child), sent with `Emitter::emit_for`, so the task's client hears a subagent's calls; a child's report names `Conversation::root_step`, the root's `tool:<call id>` that started the chain (`ToolCtx::start_child` puts it in the child's first message, and a child hands it down); the agent's own calls name none |
+| **The totals** | `Conversation::usage_totals` (`adam_runtime::UsageTotals`): one entry per provider and model, every call this run made and, when a child answers (its message or `Ctx::child_status`), the child's own totals read with `Ctx::child_state`. Durable with the state: a run taken up again after a question goes on from them. `Conversation::usage` stays this run's own calls |
+| **Not counted** | a call of a try that failed transiently and was tried again is reported live, but its try's state is abandoned, so it is not in the totals; a call of a turn that a cancel ended likewise; a remote (`a2a:`) subagent's calls are its own agent's; OpenCode over ACP reports no tokens (`adam-coder`) |
 
 ## Reasoning
 
@@ -462,6 +476,12 @@ the run's answer the second one); no message, no extra turn; the same message se
 message is read; a recorded answer that predates a message read in the next transition is dropped and not said; a journal
 from before `seen` reads as current; state from before `read_ids` loads. Memory always, PostgreSQL when
 `ADAM_TEST_POSTGRES_URL` is set; models and tools are held at gates, nothing sleeps. `src/conversation.rs` bounds the ids.
+
+`tests/usage.rs`: one report per completed call with its tokens, alias, provider and window, and the totals; a call without
+usage reported with zeros; **a subagent's calls (and its own child's) reported on the root's task under the root's step**,
+none on the children's runs, and the root's totals holding all of them per provider and model; a replayed call reported
+under the id its record holds (and a journal from before, under the run and the turn); a call made again after a transient
+failure reported under another id, and only the kept try's call in the totals. `src/agent.rs` pins the record's `call` member.
 
 `tests/child_runs.rs` is the child-run suite (one case per failure interleaving, see *Child runs*), run against
 `MemoryStore` always, against PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set and against MongoDB when

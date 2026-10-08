@@ -113,6 +113,20 @@ impl Emitter {
         }
         self.sink.emit(self.run, &self.agent, event).await;
     }
+
+    /// Send `event` as an event of the run `run` instead of this emitter's own: for work this run
+    /// does for another one. A child run's model call is its root's work, so its
+    /// [`RunEvent::Usage`] goes to the root, where the subscribers of the task are. Best effort, like
+    /// every event. An artifact sent to another run is not recorded by this transition (artifacts
+    /// are recorded only for the run that commits them); `run` equal to this emitter's run is
+    /// [`emit`](Self::emit).
+    pub async fn emit_for(&self, run: RunId, event: RunEvent) {
+        if run == self.run {
+            self.emit(event).await;
+        } else {
+            self.sink.emit(run, &self.agent, event).await;
+        }
+    }
 }
 
 /// What the runtime needs back from a [`Ctx`] after the transition.
@@ -397,6 +411,32 @@ impl Ctx {
         Ok(Some(ChildStatus::from_record(&rec)))
     }
 
+    /// The child run `run`'s own state, as its agent last committed it (what its agent serialized,
+    /// not the runtime's envelope): for a parent that keeps something its child kept, such as the
+    /// tokens its model calls took. **Not journaled**: a live read, like
+    /// [`child_status`](Self::child_status); a finished child's state does not change any more.
+    ///
+    /// `Ok(None)` when the run does not exist (a child purged after it finished).
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Permanent`] when `run` is not a child of this run, or its record does not
+    /// decode. A store failure is [`AgentError::Store`].
+    pub async fn child_state(&self, run: RunId) -> Result<Option<serde_json::Value>, AgentError> {
+        let Some(rec) = self.store.load_run(run).await.map_err(store_error)? else {
+            return Ok(None);
+        };
+        if rec.parent_id != Some(self.run) {
+            return Err(AgentError::permanent(format!(
+                "run {run} is not a child of run {}",
+                self.run
+            )));
+        }
+        let env = Envelope::decode(run, &rec.state)
+            .map_err(|e| AgentError::permanent(format!("the child's record is unreadable: {e}")))?;
+        Ok(Some(env.agent))
+    }
+
     /// A handle for starting children of this run on the runtime that steps it: owned and cloneable,
     /// so it can be moved into a [`Ctx::step`] closure (see [`ChildStarter`]).
     pub fn child_starter(&self) -> ChildStarter {
@@ -564,6 +604,68 @@ mod tests {
         let outcome = ctx.into_outcome();
         assert_eq!(outcome.artifacts.len(), 1);
         assert_eq!(outcome.artifacts[0].name, "report");
+    }
+
+    #[tokio::test]
+    async fn an_event_for_another_run_reaches_that_runs_subscribers_and_records_nothing() {
+        let sink = CollectingSink::new();
+        let ctx = ctx(&sink).await;
+        let root = RunId::new();
+        let emitter = ctx.emitter();
+        let usage = RunEvent::Usage(crate::UsageEvent::new(
+            "c1",
+            "m",
+            adam_model::Usage::new(1, 2),
+        ));
+        emitter.emit_for(root, usage.clone()).await;
+        emitter
+            .emit_for(
+                root,
+                RunEvent::Artifact {
+                    name: "not mine".into(),
+                    mime_type: None,
+                    data: serde_json::json!(1),
+                    file: None,
+                },
+            )
+            .await;
+        emitter.emit_for(ctx.run_id(), usage.clone()).await;
+        assert_eq!(sink.events_for(root).len(), 2);
+        assert_eq!(sink.events_for(root)[0], usage);
+        assert_eq!(sink.events_for(ctx.run_id()), vec![usage]);
+        assert_eq!(sink.events()[0].agent, "a");
+        assert!(ctx.into_outcome().artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_reads_the_state_of_its_own_children_only() {
+        let sink = CollectingSink::new();
+        let ctx = ctx(&sink).await;
+        assert!(matches!(ctx.child_state(RunId::new()).await, Ok(None)));
+        let mut child = adam_core::NewRun::new(
+            "child",
+            Envelope::new(serde_json::json!({"usage_totals": []}))
+                .encode()
+                .expect("an envelope"),
+        );
+        child.parent_id = Some(ctx.run_id());
+        let child = ctx.store.create_run(child).await.expect("create the child");
+        assert_eq!(
+            ctx.child_state(child.id)
+                .await
+                .expect("a child")
+                .expect("there"),
+            serde_json::json!({"usage_totals": []})
+        );
+        let stranger = ctx
+            .store
+            .create_run(adam_core::NewRun::new("x", serde_json::json!({})))
+            .await
+            .expect("create a stranger");
+        assert!(matches!(
+            ctx.child_state(stranger.id).await,
+            Err(AgentError::Permanent { .. })
+        ));
     }
 
     #[tokio::test]

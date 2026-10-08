@@ -202,7 +202,7 @@ impl Tracker {
                     Vec::new()
                 }
             }
-            RunEvent::Status { .. } => Vec::new(),
+            RunEvent::Status { .. } | RunEvent::Usage(_) => Vec::new(),
         }
     }
 }

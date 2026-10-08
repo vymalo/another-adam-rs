@@ -75,8 +75,8 @@
 //!   at-least-once: a crash between the effect and its journal write, or a
 //!   transient retry, runs it again. Keep effects idempotent (see
 //!   [`Ctx::step`]).
-//! * This crate depends on `adam-core` only. Store, sink and clock are
-//!   swappable behind traits.
+//! * This crate depends on `adam-core` for the store and on `adam-model` for the data type of a
+//!   model call's tokens only. Store, sink and clock are swappable behind traits.
 
 #![warn(missing_docs)]
 
@@ -93,9 +93,11 @@ mod retry;
 mod runtime;
 mod step;
 mod text;
+mod usage;
 mod worker;
 
 pub use adam_error::{Classify, ErrorClass};
+pub use adam_model::Usage;
 pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
 pub use cancel::CancelToken;
 pub use child::{ChildStarter, ChildStatus, RUN_FINISHED_KIND, child_run_id};
@@ -115,3 +117,7 @@ pub use step::{
     StepState,
 };
 pub use text::{AGENT_TEXT_KIND, MAX_STREAM_ID_BYTES, MAX_TEXT_DELTA_BYTES, floor_boundary};
+pub use usage::{
+    MAX_USAGE_CALL_BYTES, MAX_USAGE_LABEL_BYTES, MAX_USAGE_TOTALS, UsageEvent, UsageTotal,
+    UsageTotals,
+};

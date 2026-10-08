@@ -278,6 +278,35 @@ mod tests {
         assert_eq!(decode(&json).event, RunEvent::Step(step));
     }
 
+    /// A usage report is bounded by its constructor (a call id, a step and two labels of 128 bytes),
+    /// so the largest one crosses the channel whole, even of control characters, which JSON writes in
+    /// six bytes each.
+    #[test]
+    fn the_largest_usage_event_fits_a_payload() {
+        use adam_runtime::{MAX_USAGE_CALL_BYTES, MAX_USAGE_LABEL_BYTES, Usage, UsageEvent};
+
+        let wide = |n: usize| "\u{1}".repeat(n);
+        let usage = UsageEvent::new(
+            wide(MAX_USAGE_CALL_BYTES),
+            wide(MAX_USAGE_LABEL_BYTES),
+            Usage::new(u64::MAX, u64::MAX)
+                .with_reasoning_tokens(u64::MAX)
+                .with_cached_input_tokens(u64::MAX)
+                .with_cache_write_input_tokens(u64::MAX),
+        )
+        .under(wide(MAX_USAGE_CALL_BYTES))
+        .with_provider(wide(MAX_USAGE_LABEL_BYTES))
+        .with_context_window(u64::MAX);
+        let event = RunEvent::Usage(usage);
+        let Encoded::Fits(json) =
+            encode_event(Uuid::new_v4(), RunId::new(), &"a".repeat(64), &event)
+        else {
+            panic!("the largest usage report fits");
+        };
+        assert!(json.len() < MAX_PAYLOAD_BYTES, "{} bytes", json.len());
+        assert_eq!(decode(&json).event, event);
+    }
+
     /// A step with the most input or output its contract allows does not fit a payload beside the rest of the
     /// step: it crosses without them, and is the same step otherwise. A step whose input and output fit
     /// crosses whole.

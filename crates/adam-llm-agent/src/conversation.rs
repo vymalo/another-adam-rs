@@ -2,7 +2,7 @@
 
 use adam_core::RunId;
 use adam_model::{Message, ToolCall, Usage};
-use adam_runtime::Inbound;
+use adam_runtime::{Inbound, UsageTotals};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -33,6 +33,22 @@ pub(crate) const ROOT_RUN_KEY: &str = "root_run";
 /// The run named by [`ROOT_RUN_KEY`] in an inbound payload, if it is there and is a run id.
 pub(crate) fn parse_root_run(payload: &Value) -> Option<RunId> {
     serde_json::from_value(payload.get(ROOT_RUN_KEY)?.clone()).ok()
+}
+
+/// The key of the payload of a child's first message that names the step of the **root** run the
+/// child's work is under: the root's call of a subagent tool (`tool:<call id>`), handed down to a
+/// child's own children. Written by [`ToolCtx::start_child`](crate::ToolCtx::start_child) only, like
+/// [`ROOT_RUN_KEY`].
+pub(crate) const ROOT_STEP_KEY: &str = "root_step";
+
+/// The step named by [`ROOT_STEP_KEY`] in an inbound payload, if it is there and is a string that is
+/// not empty.
+pub(crate) fn parse_root_step(payload: &Value) -> Option<String> {
+    payload
+        .get(ROOT_STEP_KEY)
+        .and_then(Value::as_str)
+        .filter(|step| !step.is_empty())
+        .map(str::to_owned)
 }
 
 /// The text of an inbound payload: `{"text": "..."}` or a bare JSON string.
@@ -186,9 +202,17 @@ pub struct Conversation {
     /// Tool calls requested by the model so far.
     #[serde(default)]
     pub tool_calls: u32,
-    /// Token usage summed over all model calls.
+    /// Token usage summed over this run's own model calls (not its children's: see
+    /// [`usage_totals`](Self::usage_totals)).
     #[serde(default)]
     pub usage: Usage,
+    /// The tokens of every model call of the task, one entry per provider and model: this run's own
+    /// calls and, once each child run has answered, the children's (theirs, and their own children's).
+    /// What the A2A server writes on the task as the `usage/v1` totals when it ends or waits. Absent
+    /// from state written before it existed, and not written while empty; a run that continues
+    /// another starts with none (a new task).
+    #[serde(default, skip_serializing_if = "UsageTotals::is_empty")]
+    pub usage_totals: UsageTotals,
     /// Calls of the last assistant message that have no result yet, in order.
     /// Only non-empty while a step is in flight or the run is parked on
     /// [`pending_wait`](Self::pending_wait).
@@ -268,6 +292,14 @@ pub struct Conversation {
     /// Absent from state written before it existed, and not written while it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_run: Option<RunId>,
+    /// The step of the [`root_run`](Self::root_run) this child run works under: the root's call of a
+    /// subagent tool (`tool:<call id>`), put in the child's first message by the tool that started it
+    /// and handed down to the child's own children. The report of each of this run's model calls
+    /// names it, so the task's client counts a subagent's tokens apart. `None` for a run that is
+    /// nobody's child. Absent from state written before it existed, and not written while it is
+    /// `None`; a run that continues another does not inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_step: Option<String>,
     /// The ids (`Inbound::id`, an A2A `messageId`) of the messages the run has read after its first,
     /// the last [`MAX_READ_IDS`] of them, oldest first: a message that arrives again with one of them
     /// (the same one sent twice, as the orchestration layer does after a lost lease) is not read a
@@ -714,6 +746,25 @@ mod tests {
         assert!(parse_user_text(&json!({})).is_err());
         assert!(parse_user_text(&json!(null)).is_err());
         assert!(parse_user_text(&json!([1])).is_err());
+    }
+
+    #[test]
+    fn the_root_step_of_a_payload_is_a_string_or_nothing() {
+        assert_eq!(
+            parse_root_step(&json!({"text": "x", "root_step": "tool:c1"})),
+            Some("tool:c1".to_owned())
+        );
+        assert_eq!(parse_root_step(&json!({"text": "x"})), None);
+        assert_eq!(parse_root_step(&json!({"root_step": ""})), None);
+        assert_eq!(parse_root_step(&json!({"root_step": 7})), None);
+        let mut prior = Conversation::new("first");
+        prior.root_step = Some("tool:c1".into());
+        prior
+            .usage_totals
+            .add(Some("openai"), "m", Usage::new(1, 1));
+        let next = prior.continued("second", RunId::new());
+        assert_eq!(next.root_step, None);
+        assert!(next.usage_totals.is_empty(), "a new task counts afresh");
     }
 
     #[test]
