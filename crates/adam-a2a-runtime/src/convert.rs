@@ -228,16 +228,25 @@ pub(crate) fn status_key(status: &TaskStatus) -> StatusKey {
     )
 }
 
-/// The whole task, from the durable record only.
+/// The whole task, from the durable record only. A task that ended or waits for its caller carries
+/// the `usage/v1` totals its agent keeps, whoever reads it (see `usage`).
 pub(crate) fn task_from_view(view: &RunView, context_id: &str, prompt: &PromptFn) -> Task {
     let artifacts: Vec<Artifact> = view.artifacts.iter().map(artifact_of).collect();
+    let status = status_of(view, prompt);
+    let settled = status.state.is_terminal()
+        || matches!(
+            status.state,
+            TaskState::InputRequired | TaskState::AuthRequired
+        );
     Task {
         id: view.id.to_string(),
         context_id: context_id.to_owned(),
-        status: status_of(view, prompt),
+        metadata: settled
+            .then(|| crate::usage::totals_metadata(view))
+            .flatten(),
+        status,
         artifacts: (!artifacts.is_empty()).then_some(artifacts),
         history: None,
-        metadata: None,
     }
 }
 

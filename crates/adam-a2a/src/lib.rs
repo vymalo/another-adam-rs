@@ -124,7 +124,7 @@ pub use extensions::{
     A2UI_BASIC_CATALOG_V0_9_1, A2UI_EXTENSION_V0_9_1, A2UI_MEDIA_TYPE, BUILD_EXTENSION,
     MENTIONS_EXTENSION, STEER_EXTENSION, STEPS_EXTENSION, TEXT_STREAM_EXTENSION,
     TEXT_STREAM_KIND_REASONING, THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION, UNKNOWN_REVISION,
-    build_version, revision_of,
+    USAGE_EXTENSION, build_version, revision_of,
 };
 #[cfg(feature = "test-util")]
 pub use memory::{InMemoryBackend, InMemoryConfig};

@@ -168,8 +168,8 @@ async fn the_card_is_the_one_the_folder_declares() {
     assert_eq!(card.skills.len(), 1);
     assert_eq!(card.skills[0].id, "conversation");
     assert_eq!(card.skills[0].tags, ["chat"]);
-    // What it speaks, besides A2A: the screen's extensions, steps for every tool call and the model's
-    // answer as it is written.
+    // What it speaks, besides A2A: the screen's extensions, steps for every tool call, the model's
+    // answer as it is written and the tokens of each model call.
     let uris: Vec<&str> = card.extensions.iter().map(|e| e.uri.as_str()).collect();
     assert_eq!(
         uris,
@@ -181,8 +181,16 @@ async fn the_card_is_the_one_the_folder_declares() {
             adam_a2a::STEER_EXTENSION,
             adam_a2a::STEPS_EXTENSION,
             adam_a2a::TEXT_STREAM_EXTENSION,
+            adam_a2a::USAGE_EXTENSION,
         ]
     );
+    let usage = card
+        .extensions
+        .iter()
+        .find(|e| e.uri == adam_a2a::USAGE_EXTENSION)
+        .unwrap();
+    assert!(!usage.required);
+    assert!(usage.params.is_empty());
 
     // A folder that renames itself changes the card, with no code involved.
     let card = card_of(&def_of(&chat()), &url()).unwrap();

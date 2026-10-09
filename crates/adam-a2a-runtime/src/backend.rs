@@ -766,6 +766,8 @@ impl TaskBackend for RuntimeTaskBackend {
         if task.status.state == TaskState::InputRequired {
             task.status.state = TaskState::Working;
             task.status.message = None;
+            // A working task carries no totals: they are said when it ends or waits again.
+            task.metadata = None;
         }
         Ok(task)
     }

@@ -152,6 +152,8 @@ services:
       # Scripted models (see above). CODER_MODEL=mock-model gives the canned
       # answers of the other mocks back: text, no tool call, no pull request.
       MODEL: ${CODER_MODEL:-mock-coder}
+      # What each usage/v1 report of a call on that model says as its context window (ADR 0032).
+      MODEL_CONTEXT_WINDOW: "131072"
       OPENCODE_MODEL: ${CODER_OPENCODE_MODEL:-mock-opencode}
       GITHUB_API_URL: http://mock-github:8080
       # Dummy. Set MOCK_GITHUB_TOKEN=bad-token to make mock-github answer 401. An installation is

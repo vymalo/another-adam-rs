@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Eight extensions, each optional (a client that does not know one ignores it), detected by the
+//! Nine extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -13,10 +13,11 @@
 //! | `mentions/v1` | [`MENTIONS_EXTENSION`] | the agent reads the agents a person mentioned in a message, and asks them (with the tool `ask_agent` of `thread-tools/v1`) |
 //! | `steer/v1` | [`STEER_EXTENSION`] | a message that names a running task and activates the extension is added to that task's input, and the agent reads it at its next step |
 //! | `build/v1` | [`BUILD_EXTENSION`] | the card says which build of the agent answers (`revision`) and which agent files it runs (`folderDigest`); nothing to activate |
+//! | `usage/v1` | [`USAGE_EXTENSION`] | the agent reports the tokens of each model call, to a client whose request activated it, and writes a task's totals on the task when it ends or waits |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
-//! `docs/api/mentions-v1.md` and `docs/api/steer-v1.md` of `vymalo/another-agentic-system`); what an agent does with the messages is `adam-a2a-runtime`'s
+//! `docs/api/mentions-v1.md`, `docs/api/steer-v1.md` and `docs/api/usage-v1.md` of `vymalo/another-agentic-system`); what an agent does with the messages is `adam-a2a-runtime`'s
 //! `vymalo_inbound` and `adam-ui`, and what it reports is `adam-a2a-runtime`'s subscription.
 
 use serde_json::json;
@@ -69,6 +70,12 @@ pub const STEER_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/stee
 /// information only: no request activates it, and a client that does not know it ignores it.
 /// Written here first (ADR 0028); the orchestration layer's contract page follows.
 pub const BUILD_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/build/v1";
+
+/// The URI of the `usage/v1` extension: the agent reports the tokens of each completed model call as a
+/// `working` status update with no message and the report in the event's `metadata` under this URI,
+/// to a client whose request activated it, and writes a task's totals in the task's `metadata` under
+/// this URI when the task ends or waits, whoever asked (ADR 0032).
+pub const USAGE_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/usage/v1";
 
 /// What a build's revision, and the `+<revision>` of its card version, say when none was baked in.
 pub const UNKNOWN_REVISION: &str = "unknown";
@@ -190,6 +197,15 @@ impl ExtensionConfig {
         extension
     }
 
+    /// The `usage/v1` extension: the agent reports the tokens of each model call and the task's
+    /// totals. Optional, no parameters; the description is the contract's.
+    pub fn usage() -> Self {
+        let mut extension = Self::new(USAGE_EXTENSION);
+        extension.description =
+            Some("Reports the tokens of each model call and the task's totals.".into());
+        extension
+    }
+
     /// The `mentions/v1` extension: the agent reads the agents a person mentioned in a message and
     /// asks them. Optional, no parameters; the description is the contract's.
     pub fn mentions() -> Self {
@@ -269,6 +285,10 @@ mod tests {
             "https://agents.vymalo.com/a2a/extensions/build/v1"
         );
         assert_eq!(
+            USAGE_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/usage/v1"
+        );
+        assert_eq!(
             A2UI_EXTENSION_V0_9_1,
             "https://a2ui.org/a2a-extension/a2ui/v0.9.1"
         );
@@ -298,6 +318,7 @@ mod tests {
             ExtensionConfig::text_stream(),
             ExtensionConfig::mentions(),
             ExtensionConfig::steer(),
+            ExtensionConfig::usage(),
         ] {
             assert!(!e.required, "{}", e.uri);
             assert!(e.params.is_empty(), "{}", e.uri);
@@ -309,5 +330,11 @@ mod tests {
         assert_eq!(ExtensionConfig::text_stream().uri, TEXT_STREAM_EXTENSION);
         assert_eq!(ExtensionConfig::mentions().uri, MENTIONS_EXTENSION);
         assert_eq!(ExtensionConfig::steer().uri, STEER_EXTENSION);
+        assert_eq!(ExtensionConfig::usage().uri, USAGE_EXTENSION);
+        // The card entry is the contract's, word for word.
+        assert_eq!(
+            ExtensionConfig::usage().description.as_deref(),
+            Some("Reports the tokens of each model call and the task's totals.")
+        );
     }
 }

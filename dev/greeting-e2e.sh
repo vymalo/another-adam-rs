@@ -21,6 +21,11 @@
 #      was written as it arrived (`text-stream/v1`, which the script activates): at least two `reply`
 #      chunks that add up to the question, and the question names the stream of the chunks. The
 #      `reply` chunks are the answer's words, not a tool's artifact: they do not count as one.
+#      The greeting is one model call, reported once (`usage/v1`, which the script activates too): a
+#      `working` status with no message and, in its metadata, the tokens the script's mapping says
+#      (100 in, 64 of them cached; 20 out, 5 of them reasoning), provider `openai`, model
+#      `mock-coder`, the window compose.yaml sets (MODEL_CONTEXT_WINDOW=131072) and no step; and
+#      GetTask says the same as the task's totals.
 #   2. A message to the same task names http://git-server:8080/local/sandbox.git: the run goes on
 #      with the script and ends TASK_STATE_COMPLETED with a `branch` and a `pull_request` artifact.
 #   3. (unless NO_RESTART=1) a copy of the folder with `display_name: Cody` is mounted in its place
@@ -51,6 +56,8 @@ agent_dir=${AGENT_DIR:-bin/adam-coder/agent}
 repo_url=http://git-server:8080/local/sandbox.git
 # The extension that makes the coder send its answer as it is written (its card lists it).
 text_stream=https://agents.vymalo.com/a2a/extensions/text-stream/v1
+# The extension that makes the coder report the tokens of each model call (its card lists it).
+usage=https://agents.vymalo.com/a2a/extensions/usage/v1
 
 fail=0
 ok() { echo "ok   $1"; }
@@ -112,7 +119,7 @@ send() {
   code=$(curl -sN --max-time "$timeout" -o "$stream" -w '%{http_code}' \
     -X POST "$coder/" \
     -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-    -H "A2A-Extensions: $text_stream" \
+    -H "A2A-Extensions: $text_stream, $usage" \
     -d "$rpc") || curl_rc=$?
   if [ "$curl_rc" = 28 ]; then
     bad "the task did not stop within ${timeout}s"
@@ -159,6 +166,39 @@ greets() {
   names=$(artifact_names)
   if [ -z "$names" ]; then ok "no tool ran: no artifact"; else bad "a greeting produced artifacts: $names"; fi
   written_as_it_arrived "$said"
+  reports_its_tokens
+}
+
+# The members of a TokenUsage that the greeting's one model call took, as `jq` compares them (the
+# server writes a number of metadata as a float: 100.0 is 100).
+greeting_tokens='{"provider": "openai", "model": "mock-coder", "inputTokens": 100, "outputTokens": 20,
+  "totalTokens": 120, "cachedInputTokens": 64, "reasoningTokens": 5}'
+
+# reports_its_tokens: the greeting's model call was reported once, on a working status with no
+# message, with the tokens of the mapping, and the task says them as its totals.
+reports_its_tokens() {
+  reports=$(jq -s --arg u "$usage" '[.[] | .result.statusUpdate | select(.metadata[$u]?) | {state: .status.state, message: .status.message, report: .metadata[$u]}]' "$tmp/events.jsonl")
+  n_reports=$(printf '%s' "$reports" | jq 'length')
+  if [ "$n_reports" = 1 ]; then ok "the greeting's model call was reported once"; else bad "$n_reports usage reports, want 1"; fi
+  if printf '%s' "$reports" | jq -e 'all(.state == "TASK_STATE_WORKING" and .message == null)' >/dev/null; then
+    ok "the report is a working status with no message"
+  else
+    bad "a report changed the task's state or text: $reports"
+  fi
+  if printf '%s' "$reports" | jq -e --argjson want "$greeting_tokens" '.[0].report | (. as $r | $want | to_entries | all(.value == $r[.key])) and (.contextWindow == 131072) and (.stepId == null) and ((.call // "") != "")' >/dev/null; then
+    ok "the report says the tokens, the model and the window"
+  else
+    bad "the report is not the greeting's tokens: $reports"
+  fi
+  task_id=$(jq -r '(.result.task.id // .result.statusUpdate.taskId) // empty' "$tmp/events.jsonl" | head -n 1)
+  got=$(curl -s --max-time 30 -X POST "$coder/" \
+    -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg id "$task_id" '{jsonrpc: "2.0", id: "t", method: "GetTask", params: {id: $id}}')")
+  if printf '%s' "$got" | jq -e --arg u "$usage" --argjson want "$greeting_tokens" '.result.metadata[$u].totals | length == 1 and (.[0] as $t | $want | to_entries | all(.value == $t[.key]))' >/dev/null; then
+    ok "the task's totals are the greeting's tokens"
+  else
+    bad "the task's totals are not the greeting's tokens: $(printf '%s' "$got" | head -c 400)"
+  fi
 }
 
 # written_as_it_arrived <the question>: the greeting came as `reply` chunks that add up to the

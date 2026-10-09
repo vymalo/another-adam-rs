@@ -71,8 +71,8 @@ ending the run, so a message sent during the last model call is answered; a fini
 activation the message is refused as before ([`adam-a2a-runtime`](../../crates/adam-a2a-runtime/README.md#steering-a-running-task),
 [ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)).
 
-The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`, `steps/v1` and
-`text-stream/v1` (`card_of`), and `build/v1` (`card_of_folder`: the build's revision and the folder's digest, [ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
+The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`, `steps/v1`,
+`text-stream/v1` and `usage/v1` (`card_of`), and `build/v1` (`card_of_folder`: the build's revision and the folder's digest, [ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
 whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with a
 title a person reads (`Ask you`, an MCP tool's own `title`, a subagent's name capitalised, [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its-step.md)); running, then completed, failed or waiting for the person; with the
 call's arguments as `input` and its result as `output`, cut to 4 KiB and 8 KiB and **scrubbed of this process's secrets first**: the model's
@@ -84,6 +84,9 @@ orchestration layer's chat does when the card lists it), and a line of text to o
 `ask_user`, and its subagents, which are `subagent` steps. **The model's answer is streamed** (`stream_text` is on, so every model
 call is a stream) to a client that activates `text-stream/v1`: chunks while the model writes, then the whole text under the
 stream's id, and the whole reply with the turn to one that does not (the same ADR; `adam-a2a-runtime`'s README says how).
+**The tokens of every model call are reported** to a client that activates `usage/v1`, a subagent's under its step, and the
+task carries its totals when it ends or waits ([ADR 0032](../../docs/decisions/0032-usage-per-model-call.md)): the provider is
+`openai`, the model the alias, and the context window `MODEL_CONTEXT_WINDOW`.
 
 A folder that follows the **persona convention** (the body opens with `Your name is {{display_name}}.` and a line
 `In one sentence: <summary>.`, the summary without `"` and ending at its first period) is greeted by the mock
@@ -309,7 +312,7 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
   a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78), secrets
   hidden from `Debug`.
-* `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's, and lists the screen's three extensions, `steps/v1` and `text-stream/v1`; **a chat
+* `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's, and lists the screen's three extensions, `steps/v1`, `text-stream/v1` and `usage/v1`; **a chat
   folder answers "hi" in role over A2A** (the task completes with the greeting its two persona lines give, the
   model is sent the folder's rendered prompt and the screen's three tools only); an edited folder says the edited words; `ask_user`
   parks the run as `input-required` and the answer resumes it; a control plane starts a run that a worker over the
