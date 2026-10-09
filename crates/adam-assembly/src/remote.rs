@@ -400,6 +400,15 @@ impl RemoteSubagentTool {
             TaskState::Unspecified | TaskState::Submitted | TaskState::Working => Outcome::Working,
             TaskState::Completed => {
                 let mut files = self.files.then(|| ReceivedFiles::new(name, files_left));
+                // An adam agent answers in its status message and shares its files as artifacts:
+                // artifacts with no words do not replace the words.
+                let artifacts_have_words = task.artifacts.iter().flatten().any(|a| {
+                    a.parts.iter().any(|p| match &p.content {
+                        PartContent::Text(text) => !text.trim().is_empty(),
+                        PartContent::Data(_) => true,
+                        _ => false,
+                    })
+                });
                 let artifacts: Vec<String> = task
                     .artifacts
                     .iter()
@@ -419,8 +428,10 @@ impl RemoteSubagentTool {
                         }
                         _ => said,
                     }
-                } else {
+                } else if artifacts_have_words || said.trim().is_empty() {
                     artifacts.join("\n\n")
+                } else {
+                    format!("{said}\n\n{}", artifacts.join("\n\n"))
                 };
                 let text = if text.trim().is_empty() {
                     "(the remote agent finished without output)".to_owned()
@@ -1073,6 +1084,24 @@ mod tests {
             plain
                 .content
                 .starts_with("[file `page.png` not included: 16 bytes, image/png]")
+        );
+
+        // An adam agent's answer: its words in the status message, its screenshot the only
+        // artifact. The words stay, then the file's line.
+        let mut adam = task(TaskState::Completed, Some("The code is LH-7731."), &[]);
+        let mut png = Part::raw(PNG.to_vec());
+        png.filename = Some("shot.png".into());
+        png.media_type = Some("image/png".into());
+        adam.artifacts = Some(vec![artifact(None, vec![png])]);
+        let Outcome::Done(out) = sharing.outcome(&adam, RUN) else {
+            panic!("the task is over");
+        };
+        let shot = &out.artifacts[0].file.as_ref().unwrap().filename;
+        assert!(
+            out.content.starts_with("The code is LH-7731.\n\nShared ")
+                && out.content.contains(shot.as_str()),
+            "{}",
+            out.content
         );
     }
 

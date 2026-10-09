@@ -566,7 +566,8 @@ Same shape, name checks and placement as a local subagent's tool; `limits`, `too
 * **Wait.** `ToolError::AwaitRemote` parks the parent with `wait_poll` (60 s by default); each wake is a
   journaled `poll:<call id>` step (`Tool::poll_remote`). The wait ends with an error result after
   `AgentDef::remote_timeout` (default **one hour**); the remote task keeps running.
-* **Terminal states.** `completed`: the artifacts' text (cut at 64 KiB), else the status message. `failed`,
+* **Terminal states.** `completed`: the artifacts' text (cut at 64 KiB), else the status message; when the artifacts
+  hold files only (an adam agent's screenshots), the status message and then their lines. `failed`,
   `canceled`, `rejected`, and also `input-required` and `auth-required`: an error result (a subagent cannot ask
   the user). `submitted`, `working` are "still going".
 * **Failures.** A transport or JSON-RPC internal error is `Transient` (retried with backoff); anything the

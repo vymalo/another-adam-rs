@@ -498,7 +498,8 @@ auth: bearer:BILLING_AGENT_TOKEN
   Set `BoundDef::wait_poll` for the remote (default 60 s). See "Remote subagents" in
   [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#remote-subagents-a2a) and the diagrams in
   [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#remote-tasks-the-same-wait-without-a-message).
-* **The result:** `completed` gives the text of the artifacts (else of the status message), cut at 64 KiB;
+* **The result:** `completed` gives the text of the artifacts (else of the status message; when the artifacts hold
+  files only, as an adam agent's screenshots do, the status message first, then their lines), cut at 64 KiB;
   `failed`, `canceled` and `rejected` are error results with the remote's message; **`input-required` and
   `auth-required` are error results too**, because nobody can answer a subagent (the message says so and tells
   the model to call again with the whole task). Data parts are their JSON; a file at a `url` stays a line (it is not
@@ -734,7 +735,8 @@ place each:
   is that subagent's tool, and its child run sends (message id from the child's run and call), polls and answers
   the root with its text; with `files: true` a remote's screenshot is an artifact of the calling run (in its view)
   and a line for the model, without it a line only. Unit tests in `src/remote.rs`: the parts of a completed task
-  shared (names, types, a `url` part kept as a line), the parts of a plain message reply shared too (a real PNG called
+  shared (names, types, a `url` part kept as a line; an adam agent's words in its status message kept before its
+  screenshot's line), the parts of a plain message reply shared too (a real PNG called
   `evil.html` is `evil-<hash>.png`; with no budget left the part is refused before it is copied), a file over the cap
   refused as an error result, allowed plain `http` never a downgrade from an `https` card nor another host, and a
   remote card never an interface on this machine.
