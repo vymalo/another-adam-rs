@@ -375,11 +375,17 @@ fn base_of(filename: &str) -> Option<String> {
 /// `name` without control characters (so one line), at most [`MAX_NAME_CHARS`], trimmed.
 fn clean_name(name: &str) -> String {
     name.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
         .take(MAX_NAME_CHARS)
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+/// The bidirectional controls and invisible characters that can make a shown name read as another
+/// (`\u{202E}` turns `gnp.exe` into `exe.png`).
+fn is_invisible_format(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
 }
 
 /// The first 8 hexadecimal digits of the SHA-256 of `bytes`.
@@ -572,6 +578,7 @@ mod tests {
         );
         // An artifact name is one line of at most 120 characters.
         assert_eq!(clean_name(&"n".repeat(500)).chars().count(), MAX_NAME_CHARS);
+        assert_eq!(clean_name("report\u{202E}gnp.exe\u{200B}"), "reportgnp.exe");
     }
 
     /// The same bytes are the same name, so a replay names a file as the first run did; two files

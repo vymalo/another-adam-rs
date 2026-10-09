@@ -282,10 +282,12 @@ impl RemoteSubagentTool {
         Ok(client)
     }
 
-    /// Whether the client may talk to the interface at `url`: no credentials in it; https, or plain
-    /// http to this machine, or (when the deployment allowed plain http) to the host of the card the
-    /// operator configured, never to another; never plain http from an https card (a card cannot
-    /// downgrade what the deployment chose); and, when a token is attached, the card's own origin.
+    /// Whether the client may talk to the interface at `url`: no credentials in it; this machine only
+    /// from a card on this machine (a remote card cannot aim calls at the caller's own loopback);
+    /// https, or plain http to this machine, or (when the deployment allowed plain http) to the host
+    /// of the card the operator configured, never to another; never plain http from an https card (a
+    /// card cannot downgrade what the deployment chose); and, when a token is attached, the card's
+    /// own origin.
     fn interface_is_safe(&self, url: &str) -> bool {
         let Ok(url) = Url::parse(url) else {
             return false;
@@ -294,6 +296,9 @@ impl RemoteSubagentTool {
             return false;
         }
         if !url.username().is_empty() || url.password().is_some() {
+            return false;
+        }
+        if is_local(&url) && !is_local(&self.card_url) {
             return false;
         }
         if url.scheme() == "http" && !is_local(&url) {
@@ -823,7 +828,18 @@ mod tests {
         .unwrap();
         assert!(without.interface_is_safe("https://api.example.net/rpc"));
         assert!(!without.interface_is_safe("http://api.example.net/rpc"));
-        assert!(without.interface_is_safe("http://127.0.0.1:1/rpc"));
+        // A remote card never points at this machine; a card on this machine may.
+        assert!(!without.interface_is_safe("http://127.0.0.1:1/rpc"));
+        assert!(!without.interface_is_safe("https://localhost/rpc"));
+        assert!(!without.interface_is_safe("http://[::1]:1/rpc"));
+        let local = RemoteSubagentTool::bind(
+            &origin(),
+            &agent("http://127.0.0.1:8080/card", None),
+            &settings(&[]),
+        )
+        .unwrap();
+        assert!(local.interface_is_safe("http://127.0.0.1:9090/rpc"));
+        assert!(local.interface_is_safe("http://localhost:9090/rpc"));
     }
 
     /// Plain http that the deployment allowed (`A2A_ALLOW_INSECURE_REMOTES`) is for the card's own

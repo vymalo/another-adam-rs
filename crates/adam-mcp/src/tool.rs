@@ -448,10 +448,16 @@ impl<'a> Sharing<'a> {
             },
             _ => return block_text(block),
         };
-        // Four characters of base64 are three bytes, less up to two of padding: the least the file
-        // can be, checked against every cap before anything is decoded.
+        // Four characters of base64 are three bytes, less the padding: the file's length, checked
+        // against every cap before anything is decoded.
         let chars = data.bytes().filter(|b| !b.is_ascii_whitespace()).count();
-        if let Err(line) = self.files.admit(claimed, (chars / 4 * 3).saturating_sub(2)) {
+        let padding = data
+            .bytes()
+            .rev()
+            .filter(|b| !b.is_ascii_whitespace())
+            .take_while(|b| *b == b'=')
+            .count();
+        if let Err(line) = self.files.admit(claimed, (chars - padding) * 3 / 4) {
             return line;
         }
         let Some(mut bytes) = decode(data) else {
@@ -694,7 +700,7 @@ mod tests {
         let lines: Vec<&str> = output.content.lines().collect();
         assert_eq!(lines.len(), 3, "{}", output.content);
         assert!(
-            lines[0].starts_with("Not shared: a file (image/png) of 419430"),
+            lines[0].starts_with("Not shared: a file (image/png) of 4194305 bytes "),
             "{}",
             lines[0]
         );
@@ -707,7 +713,7 @@ mod tests {
             lines[0]
         );
         assert!(
-            lines[1].starts_with("Not shared: a file (image/png) of 6291454 bytes is over"),
+            lines[1].starts_with("Not shared: a file (image/png) of 6291456 bytes is over"),
             "{}",
             lines[1]
         );

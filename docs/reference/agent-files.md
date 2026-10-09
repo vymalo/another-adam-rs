@@ -579,8 +579,8 @@ Same shape, name checks and placement as a local subagent's tool; `limits`, `too
   `AgentDef::allow_insecure_remotes(true)`, which `adam-agent` sets from `A2A_ALLOW_INSECURE_REMOTES` (plain `http` to
   a service of the same cluster). **Then the messages and the bearer cross the pod network in clear text**: protect
   that network (a NetworkPolicy that admits only the caller, or mesh mTLS). A card cannot widen the switch: an `https`
-  card's plain-`http` interface is refused, and plain `http` goes only to the card's own host. A URL with credentials
-  is always refused.
+  card's plain-`http` interface is refused, and plain `http` goes only to the card's own host. A card on another
+  machine never points at this one (`localhost`, a loopback address). A URL with credentials is always refused.
 * **What does not travel.** Only text, no `contextId` (every call is a fresh conversation), and no file: a `raw` part
   is described in a line and dropped, a `url` part stays a line (it is never fetched).
 * **`files: true`** (an adam extension, remote subagents only; on any other file it warns and does nothing): each

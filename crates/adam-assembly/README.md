@@ -736,7 +736,8 @@ place each:
   and a line for the model, without it a line only. Unit tests in `src/remote.rs`: the parts of a completed task
   shared (names, types, a `url` part kept as a line), the parts of a plain message reply shared too (a real PNG called
   `evil.html` is `evil-<hash>.png`; with no budget left the part is refused before it is copied), a file over the cap
-  refused as an error result, and allowed plain `http` never a downgrade from an `https` card nor another host.
+  refused as an error result, allowed plain `http` never a downgrade from an `https` card nor another host, and a
+  remote card never an interface on this machine.
 * `tests/skills.rs`: the catalog against `tests/golden/coder-prompt.txt` (the fixture; regenerate with
   `ADAM_UPDATE_GOLDEN=1`) and against a hand-written text with escaping; no skill, no tool; `skills:`
   selection and order; unknown, unselected and unsupplied skills, an over-size skill and a reserved tool

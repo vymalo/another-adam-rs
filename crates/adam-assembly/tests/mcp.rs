@@ -692,8 +692,8 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
 
 /// Three files of about 4 MiB in one result: the result shares what the run may still share (one),
 /// refuses the rest before reading them, and so the journal entry of the call, written before the
-/// loop's run cap applies, stays within the run's 6 MiB of files (about 8 MiB of base64) on every
-/// store.
+/// loop's run cap applies, stays within the run's 6 MiB of files (about 8 MiB of base64) on memory
+/// and on Postgres.
 #[tokio::test]
 async fn one_result_is_journaled_within_the_runs_file_budget() {
     for (backend, store) in stores().await {
