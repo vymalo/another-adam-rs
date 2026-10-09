@@ -123,8 +123,10 @@ last_state() {
 words_of() {
   jq -r --arg s "$1" 'select((.result.statusUpdate.status.state // .result.task.status.state) == $s) | [.. | .text? // empty] | join(" ")' "$tmp/events.jsonl" | tail -n 1
 }
+# The names of the artifacts the run made, as updates or in the opening `task` (what the run made
+# before the subscription attached).
 artifact_names() {
-  jq -r 'select(.result.artifactUpdate) | .result.artifactUpdate.artifact.name' "$tmp/events.jsonl" | sort -u | tr '\n' ' '
+  jq -r '(.result.artifactUpdate.artifact // empty), (.result.task.artifacts[]?) | .name' "$tmp/events.jsonl" | sort -u | tr '\n' ' '
 }
 
 # card_is <name>: the public card names the agent and its skill.
