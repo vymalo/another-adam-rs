@@ -17,6 +17,12 @@ run's lease now says it (`Store::lease_until`, `RunView::claimed`), and the work
 `Status(Runnable, claimed)`. A steer is accepted in `submitted` and in `working` exactly as before; only which of the two
 a task reads has changed.
 
+*Amended 2026-10-09:* a child's `adam.run.finished` notice is not a message that arrived. `Ctx::arrived` and the commit's
+reopen rule (decision 4) count every other message, and the notice still wakes a parked run. The notice is a hint for a
+parent that waits; a parent that is finishing has settled its wait, from the notice or from the store at its timer. When
+the notice raced that timer and landed during the final step, the parent took another turn and asked the model again
+with nothing new to read (the remote-subagent test of `adam-assembly` failed so, intermittently, on PostgreSQL 12).
+
 ## Context
 
 The orchestration layer lets a person write while an agent works ("you were wrong since line 1"). A2A leaves a message with the

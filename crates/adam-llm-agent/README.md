@@ -315,7 +315,8 @@ result of a tool call that is still owed (`deferred`, as before), so the model r
 middle of a call. What is new is the end of the run:
 
 * **A final answer is not the last word while a message is unread.** After the model answers with no tool call, the step asks
-  the runtime whether a message arrived meanwhile (`Ctx::arrived`). If one did, the answer is kept in the history and said as
+  the runtime whether a message arrived meanwhile (`Ctx::arrived`, which does not count a child's `adam.run.finished` notice:
+  the wait it was for is settled). If one did, the answer is kept in the history and said as
   the words of a turn that goes on (`agent_text` with its stream's id), the step returns `Continue`, and the next one reads the
   message and calls the model again: the answer to a message sent during the final model call reflects it. **The window between
   that check and the commit** is closed by the runtime: the agent calls `Ctx::reopen_on_arrival()` in every step, so a `Done`

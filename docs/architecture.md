@@ -693,7 +693,8 @@ stateDiagram-v2
   the coder's commands listen to it.
 * **Deliver.** `Runtime::deliver` appends to the inbox; a `Parked` run becomes `Runnable` at once. A
   step that asked for it (`Ctx::reopen_on_arrival`, which `LlmAgent` does) is not committed `Done` past
-  an unread message.
+  an unread message; a child's `adam.run.finished` notice does not count (it only saves a waiting parent
+  its timer).
 * **Terminal states** are `Done` and `Failed`; `Store::purge_finished` deletes them with their journal.
 
 How a run looks to an A2A client (`task_state`, `crates/adam-a2a-runtime/src/convert.rs`):
