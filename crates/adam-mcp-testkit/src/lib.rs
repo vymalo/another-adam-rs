@@ -11,7 +11,7 @@
 //! | `mixed` | none | text, an image, an audio clip, an embedded text resource, a blob and a resource link |
 //! | `screenshot` | none | one image block, a 1x1 PNG ([`PNG`]), as a browser's screenshot tool answers |
 //! | `pdf` | none | one embedded blob resource, `application/pdf` ([`PDF`]), as a browser's PDF tool answers |
-//! | `png` | `bytes` | one image block of that many bytes that start like a PNG (at most 8 MiB) |
+//! | `png` | `bytes`, `count?` | `count` image blocks (default 1, at most 20) of that many bytes each that start like a PNG and differ (at most 8 MiB each) |
 //! | `env` | `name` | the value of the variable in the server's environment, or `(unset)` |
 //! | `pid` | none | the server's process id |
 //! | `exit` | none | nothing: the process exits during the call |
@@ -128,10 +128,10 @@ impl TestServer {
             Tool::new("pdf", "Answers with the page as a PDF resource.", none()),
             Tool::new(
                 "png",
-                "Answers with a PNG image of `bytes` bytes.",
+                "Answers with `count` PNG images (default 1) of `bytes` bytes each.",
                 schema(json!({
                     "type": "object",
-                    "properties": {"bytes": {"type": "integer"}},
+                    "properties": {"bytes": {"type": "integer"}, "count": {"type": "integer"}},
                     "required": ["bytes"]
                 })),
             ),
@@ -240,11 +240,21 @@ impl ServerHandler for TestServer {
                     .get("bytes")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| McpError::invalid_params("`bytes` must be an integer", None))?;
-                let mut image = PNG.to_vec();
-                image.resize(usize::try_from(bytes).unwrap_or(usize::MAX).min(8 << 20), 0);
-                Ok(CallToolResponse::Complete(CallToolResult::success(vec![
-                    ContentBlock::image(base64(&image), "image/png"),
-                ])))
+                let count = args
+                    .get("count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1)
+                    .min(20);
+                let len = usize::try_from(bytes).unwrap_or(usize::MAX).min(8 << 20);
+                let images = (0..count)
+                    .map(|n| {
+                        let mut image = PNG.to_vec();
+                        // Each image its own bytes, so each is its own file.
+                        image.resize(len, u8::try_from(n).unwrap_or(u8::MAX));
+                        ContentBlock::image(base64(&image), "image/png")
+                    })
+                    .collect();
+                Ok(CallToolResponse::Complete(CallToolResult::success(images)))
             }
             "env" => {
                 let name = string("name")?;

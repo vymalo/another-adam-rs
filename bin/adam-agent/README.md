@@ -162,9 +162,10 @@ works against a *stateless* server too (`POST /mcp` answered with JSON, no `Mcp-
 * **Files from a server: `"files": true`.** A server whose answers are pictures or documents (a headless
   browser's screenshot and PDF tools) says so in its entry. Each image, audio clip and embedded blob of its
   results is then a **file artifact of the run**, the shape `share_file` gives in `adam-coder` (one A2A `raw`
-  part with `mediaType` and `filename`), named after the tool (`browser_screenshot-1.png`), and the model reads
+  part with `mediaType` and `filename`), named after the tool and a hash of its bytes (`browser_screenshot-3fa2c19b.png`:
+  two screenshots never share a name), and the model reads
   one line,
-  `Shared browser_screenshot-1.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-1.png).`
+  `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).`
   A file is at most 4 MiB and a run shares at
   most 6 MiB; a subagent's files stay on the subagent's run. Without the key a file is described in a line and
   no byte of it is kept. [ADR 0033](../../docs/decisions/0033-files-from-mcp-results-are-shared-files.md),
@@ -203,7 +204,7 @@ same way; every problem is reported at once at startup):
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: keep the model's reasoning in the run's history and send it back under that member name. For a provider that requires it (DeepSeek's thinking mode with tools answers a request without it with a 400); `false` or unset sends none, which is what almost every model wants. Anything else: exit 78 | unset: never sent |
 | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias reports none. Anything else: exit 78 | unset: reports carry no window |
 | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the folder's MCP servers may be (see above) | `false` each |
-| `A2A_ALLOW_INSECURE_REMOTES` | roles that run workers: a remote subagent (`a2a:` in a subagent file) may be at plain `http` on another machine, such as a service of the same cluster (`AgentDef::allow_insecure_remotes`); without it such a URL is exit 78. The subagent's token is `auth: bearer:VAR`, a variable of this process ([remote subagents](../../docs/reference/agent-files.md#remote-subagents-a2a)) | `false` |
+| `A2A_ALLOW_INSECURE_REMOTES` | roles that run workers: a remote subagent (`a2a:` in a subagent file) may be at plain `http` on another machine, such as a service of the same cluster (`AgentDef::allow_insecure_remotes`); without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it (a NetworkPolicy that admits only the caller, or mesh mTLS); plain `http` goes only to the card's own host, never from an `https` card. The subagent's token is `auth: bearer:VAR`, a variable of this process ([remote subagents](../../docs/reference/agent-files.md#remote-subagents-a2a)) | `false` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 | `RUST_LOG` | log filter (JSON logs on stdout); when set it replaces the default whole, so `RUST_LOG=info` shows `rmcp` again | `info,rmcp=warn` (the MCP client library's per-connection lines are quiet; `adam_service::logging`) |
 
@@ -322,14 +323,15 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
   a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78),
-  `A2A_ALLOW_INSECURE_REMOTES` off by default, read by the workers and a boolean, secrets hidden from `Debug`.
+  `A2A_ALLOW_INSECURE_REMOTES` off by default, read by the workers and a boolean, secrets hidden from `Debug`;
+  `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound).
 * `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's, and lists the screen's three extensions, `steps/v1`, `text-stream/v1` and `usage/v1`; **a chat
   folder answers "hi" in role over A2A** (the task completes with the greeting its two persona lines give, the
   model is sent the folder's rendered prompt and the screen's three tools only); an edited folder says the edited words; `ask_user`
   parks the run as `input-required` and the answer resumes it; a control plane starts a run that a worker over the
   same store completes; the tools of an `mcp.json` server are offered and a call reaches the server with the
   token from the environment; **the screenshot of a `files: true` server reaches the A2A client as a file
-  artifact** (one `raw` part, `image/png`, `screenshot-1.png`) while the model reads one line; `${VAR}` in a URL is
+  artifact** (one `raw` part, `image/png`, `screenshot-<hash>.png`) while the model reads one line; `${VAR}` in a URL is
   refused unless allowed; the exit code of a server that is down
   (69), a refused policy and an unset variable (78); a local subagent runs as a child run; **a remote subagent a
   deployment points at** (`a2a:` at an in-cluster `http` URL, `auth: bearer:VAR`) is refused (78) until the token is

@@ -1195,16 +1195,24 @@ async fn the_files_of_a_remote_with_files_true_are_artifacts_of_the_calling_run(
                     .unwrap()
                     .unwrap();
                 if files {
+                    assert_eq!(view.artifacts.len(), 1, "{backend}");
+                    let artifact = &view.artifacts[0];
+                    let file = artifact.file.as_ref().unwrap();
+                    let name = file.filename.as_str();
+                    assert!(
+                        name.starts_with("page-") && name.ends_with(".png"),
+                        "{name}"
+                    );
+                    assert_eq!(artifact.name, "page.png", "the remote artifact's own name");
                     assert_eq!(
                         text,
-                        "The page is blank.\n\nShared page.png (16 bytes, image/png). To show it in \
-                         your answer, write ![description](page.png).",
+                        format!(
+                            "The page is blank.\n\nShared {name} (16 bytes, image/png). To show it \
+                             in your answer, write ![description]({name})."
+                        ),
                         "{backend}"
                     );
-                    let names: Vec<&str> =
-                        view.artifacts.iter().map(|a| a.name.as_str()).collect();
-                    assert_eq!(names, ["page.png"], "{backend}");
-                    assert_eq!(view.artifacts[0].file.as_ref().unwrap().bytes, PNG);
+                    assert_eq!(file.bytes, PNG);
                 } else {
                     assert!(
                         text.ends_with("[file `page.png` not included: 16 bytes, image/png]"),

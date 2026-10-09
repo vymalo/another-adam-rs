@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use adam_llm_agent::{StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
-use adam_runtime::{MAX_ARTIFACT_FILE_BYTES, ReceivedFiles};
+use adam_runtime::ReceivedFiles;
 use async_trait::async_trait;
 use base64::Engine as _;
 use rmcp::ServiceError;
@@ -127,6 +127,7 @@ impl McpTool {
     /// the next call reconnects.
     fn describe(
         &self,
+        ctx: &ToolCtx,
         redactor: &Redactor,
         outcome: Result<CallToolResponse, ServiceError>,
     ) -> (ToolOutput, bool) {
@@ -135,7 +136,10 @@ impl McpTool {
             Ok(CallToolResponse::Complete(result)) => map_result(
                 &result,
                 redactor,
-                self.files.then_some(self.remote.as_str()),
+                self.files.then(|| ShareAs {
+                    stem: &self.remote,
+                    budget: ctx.files_left(),
+                }),
             ),
             Ok(CallToolResponse::InputRequired(_)) => ToolOutput::error(format!(
                 "the MCP server `{}` needs more input for `{}` (input_required), which this \
@@ -211,7 +215,7 @@ impl McpTool {
         };
         match outcome {
             Ok(outcome) => {
-                let (output, broken) = self.describe(connection.redactor(), outcome);
+                let (output, broken) = self.describe(ctx, connection.redactor(), outcome);
                 if broken {
                     // A broken session is dropped, so the next call reconnects.
                     connection.mark_broken(generation).await;
@@ -283,7 +287,7 @@ impl McpTool {
             waited = tokio::time::timeout(self.call_timeout, service.peer().call_tool_once(params)) => waited,
         };
         let output = match outcome {
-            Ok(outcome) => self.describe(&recipe.redactor, outcome).0,
+            Ok(outcome) => self.describe(ctx, &recipe.redactor, outcome).0,
             Err(_) => self.no_answer(),
         };
         let _ = service.close_with_timeout(CLOSE_GRACE).await;
@@ -353,9 +357,9 @@ fn kind(value: &Value) -> &'static str {
 pub(crate) fn map_result(
     result: &CallToolResult,
     redactor: &Redactor,
-    files: Option<&str>,
+    files: Option<ShareAs<'_>>,
 ) -> ToolOutput {
-    let mut sharing = files.map(|stem| Sharing::new(stem, redactor));
+    let mut sharing = files.map(|share| Sharing::new(share, redactor));
     let mut blocks: Vec<String> = Vec::with_capacity(result.content.len());
     for block in &result.content {
         blocks.push(match sharing.as_mut() {
@@ -401,25 +405,33 @@ fn block_text(block: &ContentBlock) -> String {
     }
 }
 
+/// How a result of a server with `files: true` shares its files: named after `stem` (the tool's
+/// name on the server), within `budget` bytes in all (what the run may still share).
+pub(crate) struct ShareAs<'a> {
+    pub(crate) stem: &'a str,
+    pub(crate) budget: u64,
+}
+
 /// The files of one result of a server with `files: true`, shared as they are met
 /// ([ADR 0033](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0033-files-from-mcp-results-are-shared-files.md))
-/// by [`ReceivedFiles`]: named `<tool>-<n>.<ext>` after the tool's name on the server, the media
-/// type the server declared checked against the bytes, at most 4 MiB a file and 16 a result.
+/// by [`ReceivedFiles`]: named `<tool>-<hash>.<ext>`, the media type the server declared checked
+/// against the bytes, at most 4 MiB a file, 16 a result and what the run may still share.
 ///
 /// * A file is an image, an audio clip or an embedded blob resource; its bytes are the block's
 ///   base64. Text, text resources and resource links stay text.
 /// * A file that is text has the values the redactor knows taken out, like the text of the result.
-/// * A base64 text far over the cap is refused unread, and one that does not decode is refused.
+/// * Every cap is checked on the length of the base64, before it is decoded; a text that does not
+///   decode is refused.
 struct Sharing<'a> {
     redactor: &'a Redactor,
     files: ReceivedFiles,
 }
 
 impl<'a> Sharing<'a> {
-    fn new(stem: &str, redactor: &'a Redactor) -> Self {
+    fn new(share: ShareAs<'_>, redactor: &'a Redactor) -> Self {
         Self {
             redactor,
-            files: ReceivedFiles::new(stem),
+            files: ReceivedFiles::new(share.stem, share.budget),
         }
     }
 
@@ -436,9 +448,11 @@ impl<'a> Sharing<'a> {
             },
             _ => return block_text(block),
         };
-        // Four characters of base64 are three bytes: a file far over the cap is refused unread.
-        if data.len() / 4 * 3 > MAX_ARTIFACT_FILE_BYTES + 3 {
-            return self.files.refuse_too_large(claimed, data.len() / 4 * 3);
+        // Four characters of base64 are three bytes, less up to two of padding: the least the file
+        // can be, checked against every cap before anything is decoded.
+        let chars = data.bytes().filter(|b| !b.is_ascii_whitespace()).count();
+        if let Err(line) = self.files.admit(claimed, (chars / 4 * 3).saturating_sub(2)) {
+            return line;
         }
         let Some(mut bytes) = decode(data) else {
             return self.files.refuse(claimed, "is not valid base64");
@@ -472,7 +486,8 @@ fn decode(data: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use adam_runtime::MAX_FILES_PER_RESULT;
+    use adam_llm_agent::Artifact;
+    use adam_runtime::{MAX_ARTIFACT_FILE_BYTES, MAX_FILES_PER_RESULT, MAX_RUN_FILE_BYTES};
     use rmcp::model::{Resource, ResourceContents};
 
     use super::*;
@@ -521,13 +536,32 @@ mod tests {
         })
     }
 
-    fn file<'a>(output: &'a ToolOutput, name: &str) -> &'a adam_runtime::ArtifactFile {
+    /// Share as the tool `stem`, with the whole run's budget.
+    fn share(stem: &str) -> Option<ShareAs<'_>> {
+        Some(ShareAs {
+            stem,
+            budget: MAX_RUN_FILE_BYTES as u64,
+        })
+    }
+
+    /// The file names of the artifacts, in order.
+    fn names(output: &ToolOutput) -> Vec<String> {
         output
             .artifacts
             .iter()
-            .find(|a| a.name == name)
-            .and_then(|a| a.file.as_ref())
-            .unwrap_or_else(|| panic!("no file `{name}` in {:?}", output.artifacts))
+            .map(|a| a.file.as_ref().unwrap().filename.clone())
+            .collect()
+    }
+
+    /// `<stem>-<8 hex digits>.<ext>`.
+    fn is_named(name: &str, stem: &str, ext: &str) -> bool {
+        let Some(rest) = name.strip_prefix(&format!("{stem}-")) else {
+            return false;
+        };
+        let Some(hash) = rest.strip_suffix(&format!(".{ext}")) else {
+            return false;
+        };
+        hash.len() == 8 && hash.bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     #[test]
@@ -544,40 +578,70 @@ mod tests {
             ContentBlock::embedded_text("file:///notes.txt", "notes"),
             ContentBlock::resource_link(Resource::new("file:///c.txt", "c")),
         ]);
-        let output = map_result(&result, &Redactor::default(), Some("browser_screenshot"));
+        let output = map_result(&result, &Redactor::default(), share("browser_screenshot"));
         assert!(!output.is_error, "{}", output.content);
+        let names = names(&output);
+        assert!(
+            is_named(&names[0], "browser_screenshot", "png"),
+            "{names:?}"
+        );
+        assert!(
+            is_named(&names[1], "browser_screenshot", "pdf"),
+            "{names:?}"
+        );
+        assert!(
+            is_named(&names[2], "browser_screenshot", "wav"),
+            "{names:?}"
+        );
         assert_eq!(
             output.content,
-            "the page\nShared browser_screenshot-1.png (67 bytes, image/png). To show it in your answer, \
-             write ![description](browser_screenshot-1.png).\n\
-             Shared browser_screenshot-2.pdf (13 bytes, application/pdf).\n\
-             Shared browser_screenshot-3.wav (16 bytes, audio/wav).\nnotes\n\
-             [resource link: file:///c.txt]"
+            format!(
+                "the page\nShared {} (67 bytes, image/png). To show it in your answer, write \
+                 ![description]({}).\nShared {} (13 bytes, application/pdf).\n\
+                 Shared {} (16 bytes, audio/wav).\nnotes\n[resource link: file:///c.txt]",
+                names[0], names[0], names[1], names[2]
+            )
         );
-        let names: Vec<(&str, Option<&str>)> = output
+        let types: Vec<Option<&str>> = output
             .artifacts
             .iter()
-            .map(|a| (a.name.as_str(), a.mime_type.as_deref()))
+            .map(|a| a.mime_type.as_deref())
             .collect();
         assert_eq!(
-            names,
+            types,
             [
-                ("browser_screenshot-1.png", Some("image/png")),
-                ("browser_screenshot-2.pdf", Some("application/pdf")),
-                ("browser_screenshot-3.wav", Some("audio/wav")),
+                Some("image/png"),
+                Some("application/pdf"),
+                Some("audio/wav")
             ]
         );
-        let png = file(&output, "browser_screenshot-1.png");
+        assert_eq!(output.artifacts[0].file.as_ref().unwrap().bytes, PNG);
         assert_eq!(
-            (png.filename.as_str(), png.bytes.as_slice()),
-            ("browser_screenshot-1.png", PNG)
-        );
-        assert_eq!(
-            file(&output, "browser_screenshot-2.pdf").bytes,
+            output.artifacts[1].file.as_ref().unwrap().bytes,
             b"%PDF-1.7 page"
         );
         // The bytes are in the artifacts only, never in what the model reads.
         assert!(!output.content.contains(&b64(PNG)[..12]));
+    }
+
+    /// Two calls of a tool make two names: a screenshot is known by its content, so the inline
+    /// image of the second never shows the first.
+    #[test]
+    fn two_screenshots_of_one_run_have_two_names() {
+        let mut other = PNG.to_vec();
+        other.extend_from_slice(b"another page");
+        let shot = |bytes: &[u8]| {
+            let result =
+                CallToolResult::success(vec![ContentBlock::image(b64(bytes), "image/png")]);
+            names(&map_result(
+                &result,
+                &Redactor::default(),
+                share("browser_screenshot"),
+            ))[0]
+                .clone()
+        };
+        assert_ne!(shot(PNG), shot(&other));
+        assert_eq!(shot(PNG), shot(PNG), "a replay names a file as before");
     }
 
     #[test]
@@ -588,19 +652,29 @@ mod tests {
             blob("x://y", None, PNG),
             blob("x://z", Some("not a type"), b"\0\x01"),
         ]);
-        let output = map_result(&result, &Redactor::default(), Some("t"));
+        let output = map_result(&result, &Redactor::default(), share("t"));
         assert!(!output.is_error, "{}", output.content);
+        let names = names(&output);
+        assert!(is_named(&names[0], "t", "bin"), "{names:?}");
+        assert!(is_named(&names[1], "t", "png"), "{names:?}");
+        assert!(is_named(&names[2], "t", "bin"), "{names:?}");
+        let types: Vec<Option<&str>> = output
+            .artifacts
+            .iter()
+            .map(|a| a.mime_type.as_deref())
+            .collect();
         assert_eq!(
-            output.content,
-            "Shared t-1.bin (5 bytes, application/octet-stream).\n\
-             Shared t-2.png (67 bytes, image/png). To show it in your answer, write \
-             ![description](t-2.png).\n\
-             Shared t-3.bin (2 bytes, application/octet-stream)."
+            types,
+            [
+                Some("application/octet-stream"),
+                Some("image/png"),
+                Some("application/octet-stream")
+            ]
         );
     }
 
     #[test]
-    fn a_file_over_the_cap_is_not_shared_and_the_result_says_so_as_an_error() {
+    fn a_file_over_a_cap_is_refused_before_it_is_decoded_and_the_result_is_an_error() {
         let over = {
             let mut bytes = PNG.to_vec();
             bytes.resize(MAX_ARTIFACT_FILE_BYTES + 1, 0);
@@ -608,35 +682,79 @@ mod tests {
         };
         let result = CallToolResult::success(vec![
             ContentBlock::image(b64(&over), "image/png"),
-            // Far over: refused before it is decoded.
-            ContentBlock::image("A".repeat(MAX_ARTIFACT_FILE_BYTES * 2), "image/png"),
+            // Far over, and not even base64: refused on its length, never decoded.
+            ContentBlock::image("!".repeat(MAX_ARTIFACT_FILE_BYTES * 2), "image/png"),
             ContentBlock::image(b64(PNG), "image/png"),
         ]);
-        let output = map_result(&result, &Redactor::default(), Some("shot"));
+        let output = map_result(&result, &Redactor::default(), share("shot"));
         assert!(
             output.is_error,
             "a file the person does not get is a failure"
         );
         let lines: Vec<&str> = output.content.lines().collect();
         assert_eq!(lines.len(), 3, "{}", output.content);
-        assert_eq!(
-            lines[0],
-            "Not shared: a file (image/png) of 4194305 bytes is over the limit of 4194304 bytes \
-             (4 MiB) for one shared file: ask for a smaller one, or tell the person it is \
-             too big to share."
+        assert!(
+            lines[0].starts_with("Not shared: a file (image/png) of 419430"),
+            "{}",
+            lines[0]
         );
         assert!(
-            lines[1].starts_with("Not shared: a file (image/png) of about 6291456 bytes"),
+            lines[0].ends_with(
+                "is over the limit of 4194304 bytes (4 MiB) for one shared file: ask for a \
+                 smaller one, or tell the person it is too big to share."
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("Not shared: a file (image/png) of 6291454 bytes is over"),
             "{}",
             lines[1]
         );
-        // The counter is the file's place in the result, shared or not.
-        assert_eq!(
-            lines[2],
-            "Shared shot-3.png (67 bytes, image/png). To show it in your answer, write \
-             ![description](shot-3.png)."
-        );
+        assert!(lines[2].starts_with("Shared shot-"), "{}", lines[2]);
         assert_eq!(output.artifacts.len(), 1);
+    }
+
+    /// The whole result is journaled before the loop's run cap applies: what the run may still share
+    /// (`ToolCtx::files_left`) bounds it, three files of about 4 MiB included.
+    #[test]
+    fn a_result_shares_no_more_than_the_run_may_still_share() {
+        let big = |fill: u8| {
+            let mut bytes = PNG.to_vec();
+            bytes.resize(MAX_ARTIFACT_FILE_BYTES - 1024, fill);
+            ContentBlock::image(b64(&bytes), "image/png")
+        };
+        let result = CallToolResult::success(vec![big(1), big(2), big(3)]);
+        let output = map_result(&result, &Redactor::default(), share("shot"));
+        assert!(output.is_error);
+        assert_eq!(
+            output.artifacts.len(),
+            1,
+            "4 MiB fits the run's 6, 8 do not"
+        );
+        let kept: usize = output.artifacts.iter().map(Artifact::file_len).sum();
+        assert!(kept <= MAX_RUN_FILE_BYTES, "{kept}");
+        let lines: Vec<&str> = output.content.lines().collect();
+        assert!(
+            lines[1].contains("is over what this run may still share"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("is over what this run may still share"),
+            "{}",
+            lines[2]
+        );
+        // With 1 KiB left, nothing of it is shared.
+        let tight = map_result(
+            &result,
+            &Redactor::default(),
+            Some(ShareAs {
+                stem: "shot",
+                budget: 1024,
+            }),
+        );
+        assert!(tight.artifacts.is_empty() && tight.is_error);
     }
 
     #[test]
@@ -657,10 +775,10 @@ mod tests {
             ContentBlock::image(wrapped, "image/png"),
             ContentBlock::image("not base64 at all!", "image/png"),
         ]);
-        let output = map_result(&result, &Redactor::default(), Some("t"));
+        let output = map_result(&result, &Redactor::default(), share("t"));
         assert!(output.is_error);
-        assert_eq!(file(&output, "t-2.txt").bytes, b"hi!x");
-        assert_eq!(file(&output, "t-3.png").bytes, PNG);
+        assert_eq!(output.artifacts[1].file.as_ref().unwrap().bytes, b"hi!x");
+        assert_eq!(output.artifacts[2].file.as_ref().unwrap().bytes, PNG);
         assert!(
             output
                 .content
@@ -673,12 +791,17 @@ mod tests {
     #[test]
     fn one_result_shares_at_most_sixteen_files() {
         let blocks = (0..MAX_FILES_PER_RESULT + 2)
-            .map(|_| ContentBlock::image(b64(PNG), "image/png"))
+            .map(|n| {
+                ContentBlock::image(
+                    b64(&[PNG, &[u8::try_from(n).unwrap()]].concat()),
+                    "image/png",
+                )
+            })
             .collect();
         let output = map_result(
             &CallToolResult::success(blocks),
             &Redactor::default(),
-            Some("t"),
+            share("t"),
         );
         assert_eq!(output.artifacts.len(), MAX_FILES_PER_RESULT);
         assert!(output.is_error);
@@ -705,12 +828,17 @@ mod tests {
                 b"\xfftok-6d2f-secret",
             ),
         ]);
-        let output = map_result(&result, &redactor, Some("t"));
+        let output = map_result(&result, &redactor, share("t"));
         assert!(output.is_error, "the server said isError");
-        // The counter counts files only: the text before them is not one.
-        assert_eq!(file(&output, "t-1.txt").bytes, b"used [REDACTED]");
+        assert_eq!(
+            output.artifacts[0].file.as_ref().unwrap().bytes,
+            b"used [REDACTED]"
+        );
         // A file that is not text is left as it is.
-        assert_eq!(file(&output, "t-2.bin").bytes, b"\xfftok-6d2f-secret");
+        assert_eq!(
+            output.artifacts[1].file.as_ref().unwrap().bytes,
+            b"\xfftok-6d2f-secret"
+        );
     }
 
     #[test]

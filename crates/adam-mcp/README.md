@@ -276,12 +276,12 @@ sequenceDiagram
     participant T as McpTool (a server with files: true)
     participant S as MCP server
     participant R as Runtime and A2A server
-    L->>T: call(ctx, args)
+    L->>T: call(ctx with files_left, args)
     T->>S: tools/call
     S-->>T: content: text, an image block, a blob resource
-    Note over T: base64 decoded, the declared type checked against the bytes,<br/>named after the tool, a text file scrubbed
+    Note over T: every cap checked on the base64's length (4 MiB a file, 16 a result, files_left in all),<br/>then decoded, the declared type checked against the bytes, named by the tool and a hash, a text file scrubbed
     T-->>L: ToolOutput: one line per file, the files as artifacts
-    Note over L: output_message keeps the run within 6 MiB of files
+    Note over L: the result is journaled in tool:CALL_ID, then output_message checks the run's 6 MiB again
     L->>R: RunEvent::Artifact, kept in the run's view
     R-->>R: an A2A artifact: one raw part with mediaType and filename
 ```
@@ -290,11 +290,11 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> Block: an image, an audio clip or a blob in a result
     Block --> Described: its server has no files true
-    Block --> Refused: past the 16th file, not base64, or over 4 MiB
+    Block --> Refused: past the 16th file, over 4 MiB, over what the run may still share, or not base64
     Block --> Shared: a file artifact of the result
-    Shared --> Kept: within the run's 6 MiB
-    Shared --> Refused: over the run's 6 MiB
-    Kept --> [*]: journaled with the call, emitted, served over A2A
+    Shared --> Journaled: the result, files and all, in the step tool:CALL_ID
+    Journaled --> Kept: output_message, within the run's 6 MiB
+    Kept --> [*]: emitted, kept in the run's view, served over A2A
     Refused --> [*]: a line that says why, the result an error result
     Described --> [*]: a line, no byte kept
 ```
@@ -302,31 +302,36 @@ stateDiagram-v2
 * **What is a file**: an image block, an audio block, and an embedded resource with a `blob`; their bytes are the
   block's base64 (standard alphabet, padded or not, line breaks ignored). Text, a text resource and a resource link
   stay text.
-* **Its name** is the tool's name on the server, the file's place among the files of the result, and the extension
-  of its media type: `browser_screenshot-1.png`, `browser_pdf-1.pdf` (`bin` for a type the table does not know). The
-  artifact's name is the same. Two calls of a tool both make a `-1`: the artifacts differ by their bytes.
+* **Its name** is the tool's name on the server, the first 8 hexadecimal digits of the SHA-256 of its bytes, and the
+  extension of its media type: `browser_screenshot-3fa2c19b.png`, `browser_pdf-9d04e1a7.pdf` (`bin` for a type the table
+  does not know). The artifact's name is the same. Two screenshots of a run never share a name (the inline image of
+  the second never shows the first), and a replay names a file as it did.
 * **Its media type** is the one the server declared, checked against the bytes by `adam_runtime::checked_media_type`,
   the rule the coder's `share_file` uses: a declared PNG, JPEG, GIF, WebP or SVG must be that image by its bytes,
   bytes that are an image declared as something else disagree, and both are `application/octet-stream`; a declared
   type the rule cannot check (`application/pdf`) stands.
 * **What the model reads**: in place of the block, one line,
-  `Shared browser_screenshot-1.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-1.png).`
+  `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).`
   (`Artifact::shared_line`; a file that is not an
   image gets the first sentence only, and the name is put in `<...>` when a bare Markdown link cannot hold it). The bytes
   are in the artifact only: never in the history, the step's output or the context window.
 * **Scrubbed**: a file that is valid UTF-8 has the values the server's redactor knows taken out, like the text of the
   result; a file that is not text is left as it is.
-* **Bounded.** A file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`; a base64 text far over it is refused without being
-  decoded), a file that is not base64, and every file after the first **16** of one result are not shared: the line
-  says why (`Not shared: a file (image/png) of 4194305 bytes is over the limit ...: ask for a smaller one,
-  or tell the person it is too big to share.`) and the result is an **error result**, since the person did not get
-  what the call made. The agent loop (`adam-llm-agent`) then keeps a run within **6 MiB** of files in all
-  (`MAX_RUN_FILE_BYTES`) and says so in the result the same way; a `files: true` server is one more source for that
-  budget, with `share_file`.
+* **Bounded, before anything is decoded.** A file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`), every file after the
+  first **16** of one result, and a file over **what the run may still share** (`ToolCtx::files_left`: 6 MiB,
+  `MAX_RUN_FILE_BYTES`, less what the run kept) are refused on the length of their base64 (whitespace left out), and a
+  text that does not decode is refused too: the line says why (`Not shared: a file (image/png) of 4194305 bytes is over
+  the limit ...: ask for a smaller one, or tell the person it is too big to share.`) and the result is an **error
+  result**, since the person did not get what the call made. The budget matters because the whole result is
+  journaled (`tool:CALL_ID`) before the agent loop applies its own run cap in `output_message`: without it one result
+  of three 4 MiB images would be a 16 MiB journal entry, over MongoDB's document.
 * **A subagent's files stay on the subagent's run**, as for `share_file`: the call is the subagent's, so the artifact
   and its budget are its run's, and only the subagent's text reaches the parent (and the person).
 * **At-least-once** as any call: the files are part of the journaled result, so a replay re-emits the same artifacts
   and never calls the server again.
+* **Untrusted content.** What a server says of a file is not believed: its type is checked against the bytes and its
+  name is made here. The bytes are still the server's: a client serves them as an attachment or sanitizes them (a
+  claimed `text/html`, an SVG), as the orchestration layer does.
 * `files` is the file's, not the deployment's: it decides what becomes of a server's answers, never what a server may
   be. A deployment that adds servers with `ADAM_EXTRA_MCP_FILE` writes it there.
 
@@ -502,11 +507,12 @@ are polled with a deadline). Every test passes on its own in its own process (CI
 per test): none relies on another test's runtime to reap a process or to install a log subscriber.
 
 * Unit, files (`src/tool.rs`): with `files` an image, a PDF blob and an audio clip are shared as artifacts named
-  `<tool>-<n>.<ext>` and lines, text, text resources and links stay text, and no byte reaches the text; a "PNG" that
-  is not one and a blob of no declared type follow the bytes; a file over 4 MiB (decoded, and far over it, refused
-  undecoded) is a line and an error result while the next file is shared; base64 without padding or with a line
-  break is read and garbage is refused; one result shares 16 files; a text file is scrubbed, a binary one is not; a
-  server's `isError` stays.
+  `<tool>-<hash>.<ext>` and lines, text, text resources and links stay text, and no byte reaches the text; two
+  screenshots have two names and one has the same name twice; a "PNG" that is not one and a blob of no declared type
+  follow the bytes; a file over 4 MiB, and one far over it that is not even base64 (refused on its length, never
+  decoded), are lines and an error result while the next file is shared; three files of about 4 MiB share one, within
+  the run's 6 MiB, and none with 1 KiB left; base64 without padding or with a line break is read and garbage is
+  refused; one result shares 16 files; a text file is scrubbed, a binary one is not; a server's `isError` stays.
 * Unit: expansion (the `Env` before the process environment, defaults for unset and empty, a missing variable names
   only itself, malformed references stay literal), the URL rules and that credentials are refused and never shown,
   `sse` and stdio refusals, the names (`server__tool`, unmappable names skipped, allow-list order), the schema
@@ -517,7 +523,7 @@ per test): none relies on another test's runtime to reap a process or to install
   configuration's `Debug`), a `${VAR}` in a `url` refused unless the policy allows it, server and tool names that
   would collide (`a_`, `_x`), `Debug` without header values.
 * `tests/http.rs`, `a_server_with_files_true_shares_its_images_and_blobs_as_files`: the testkit's `screenshot` and
-  `pdf` become `screenshot-1.png` and `pdf-1.pdf` with the server's bytes, a `png` of 4 MiB and one byte is a line and
+  `pdf` become `screenshot-<hash>.png` and `pdf-<hash>.pdf` with the server's bytes, a `png` of 4 MiB and one byte is a line and
   an error result, and the same server without `files` describes the image and keeps nothing.
 * `tests/http.rs`: list and call over streamable HTTP; servers connected in name order; the allow-list and a
   listed tool the server lacks; every kind of content and an error result; a big result capped; arguments that are

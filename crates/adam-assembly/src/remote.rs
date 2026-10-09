@@ -282,9 +282,10 @@ impl RemoteSubagentTool {
         Ok(client)
     }
 
-    /// Whether the client may talk to the interface at `url`: https (or local, or the deployment
-    /// said plain http is fine), no credentials in it, and, when a token is attached, the same
-    /// origin as the card the operator configured.
+    /// Whether the client may talk to the interface at `url`: no credentials in it; https, or plain
+    /// http to this machine, or (when the deployment allowed plain http) to the host of the card the
+    /// operator configured, never to another; never plain http from an https card (a card cannot
+    /// downgrade what the deployment chose); and, when a token is attached, the card's own origin.
     fn interface_is_safe(&self, url: &str) -> bool {
         let Ok(url) = Url::parse(url) else {
             return false;
@@ -295,8 +296,12 @@ impl RemoteSubagentTool {
         if !url.username().is_empty() || url.password().is_some() {
             return false;
         }
-        if url.scheme() == "http" && !is_local(&url) && !self.allow_insecure {
-            return false;
+        if url.scheme() == "http" && !is_local(&url) {
+            let downgrade = self.card_url.scheme() == "https";
+            let elsewhere = url.host() != self.card_url.host();
+            if !self.allow_insecure || downgrade || elsewhere {
+                return false;
+            }
         }
         self.token.is_none() || url.origin() == self.card_url.origin()
     }
@@ -371,7 +376,7 @@ impl RemoteSubagentTool {
     }
 
     /// Where a task stands, as the result of the call, or "still going".
-    fn outcome(&self, task: &Task) -> Outcome {
+    fn outcome(&self, task: &Task, files_left: u64) -> Outcome {
         let said = task
             .status
             .message
@@ -389,7 +394,7 @@ impl RemoteSubagentTool {
         match task.status.state {
             TaskState::Unspecified | TaskState::Submitted | TaskState::Working => Outcome::Working,
             TaskState::Completed => {
-                let mut files = self.files.then(|| ReceivedFiles::new(name));
+                let mut files = self.files.then(|| ReceivedFiles::new(name, files_left));
                 let artifacts: Vec<String> = task
                     .artifacts
                     .iter()
@@ -446,6 +451,24 @@ impl RemoteSubagentTool {
     }
 }
 
+impl RemoteSubagentTool {
+    /// A plain message that answered the call at once, as its result: its text, and with
+    /// `files: true` its `raw` parts shared within `files_left` bytes.
+    fn reply(&self, reply: &Message, files_left: u64) -> ToolOutput {
+        let mut files = self
+            .files
+            .then(|| ReceivedFiles::new(self.name(), files_left));
+        let text = match cap_text(
+            parts_text_sharing(&reply.parts, files.as_mut(), None),
+            MAX_RESULT_BYTES,
+        ) {
+            text if text.trim().is_empty() => "(the remote agent answered without text)".to_owned(),
+            text => text,
+        };
+        with_files(text, files)
+    }
+}
+
 /// A task's state, from the tool's side.
 enum Outcome {
     Working,
@@ -473,12 +496,16 @@ fn parts_text_sharing(
             PartContent::Text(text) => text.clone(),
             PartContent::Data(value) => value.to_string(),
             PartContent::Raw(bytes) => match files.as_deref_mut() {
-                Some(files) => files.share(
-                    part.media_type.as_deref(),
-                    part.filename.as_deref(),
-                    artifact_name,
-                    bytes.clone(),
-                ),
+                // Every cap is checked on the length before the bytes are copied.
+                Some(files) => match files.admit(part.media_type.as_deref(), bytes.len()) {
+                    Ok(()) => files.share(
+                        part.media_type.as_deref(),
+                        part.filename.as_deref(),
+                        artifact_name,
+                        bytes.clone(),
+                    ),
+                    Err(line) => line,
+                },
                 None => format!(
                     "[file{} not included: {} bytes{}]",
                     part.filename
@@ -583,20 +610,8 @@ impl Tool for RemoteSubagentTool {
             .await
             .map_err(|e| self.failure("send the message to", &e))?;
         match response {
-            SendMessageResponse::Message(reply) => {
-                let mut files = self.files.then(|| ReceivedFiles::new(self.name()));
-                let text = match cap_text(
-                    parts_text_sharing(&reply.parts, files.as_mut(), None),
-                    MAX_RESULT_BYTES,
-                ) {
-                    text if text.trim().is_empty() => {
-                        "(the remote agent answered without text)".to_owned()
-                    }
-                    text => text,
-                };
-                Ok(with_files(text, files))
-            }
-            SendMessageResponse::Task(task) => match self.outcome(&task) {
+            SendMessageResponse::Message(reply) => Ok(self.reply(&reply, ctx.files_left())),
+            SendMessageResponse::Task(task) => match self.outcome(&task, ctx.files_left()) {
                 Outcome::Done(output) => Ok(output),
                 Outcome::Working => {
                     tracing::debug!(tool = %self.name(), task = %task.id, "remote task started");
@@ -611,7 +626,7 @@ impl Tool for RemoteSubagentTool {
         }
     }
 
-    async fn poll_remote(&self, _ctx: &ToolCtx, task: &str) -> Result<RemotePoll, ToolError> {
+    async fn poll_remote(&self, ctx: &ToolCtx, task: &str) -> Result<RemotePoll, ToolError> {
         let client = self.client().await?;
         let task = client
             .get_task(&GetTaskRequest {
@@ -621,7 +636,7 @@ impl Tool for RemoteSubagentTool {
             })
             .await
             .map_err(|e| self.failure("look at the task on", &e))?;
-        Ok(match self.outcome(&task) {
+        Ok(match self.outcome(&task, ctx.files_left()) {
             Outcome::Working => RemotePoll::Working,
             Outcome::Done(output) => RemotePoll::Ready(output),
         })
@@ -631,6 +646,8 @@ impl Tool for RemoteSubagentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RUN: u64 = adam_runtime::MAX_RUN_FILE_BYTES as u64;
 
     fn origin() -> Origin {
         Origin::new("coder/billing", "agent/subagents/billing.md")
@@ -809,6 +826,36 @@ mod tests {
         assert!(without.interface_is_safe("http://127.0.0.1:1/rpc"));
     }
 
+    /// Plain http that the deployment allowed (`A2A_ALLOW_INSECURE_REMOTES`) is for the card's own
+    /// host: an https card never gets a plain-http interface, and an http card never sends the
+    /// client to plain http on another host, with or without a token.
+    #[test]
+    fn allowed_plain_http_is_never_a_downgrade_nor_another_host() {
+        let lax = RemoteSettings {
+            allow_insecure: true,
+            ..RemoteSettings::default()
+        };
+        let https = RemoteSubagentTool::bind(
+            &origin(),
+            &agent("https://browser.example.com/card", None),
+            &lax,
+        )
+        .unwrap();
+        assert!(!https.interface_is_safe("http://browser.example.com/rpc"));
+        assert!(!https.interface_is_safe("http://evil.example.net/rpc"));
+        assert!(https.interface_is_safe("https://api.example.net/rpc"));
+        let http = RemoteSubagentTool::bind(
+            &origin(),
+            &agent("http://browser.agents.svc:8080/card", None),
+            &lax,
+        )
+        .unwrap();
+        assert!(http.interface_is_safe("http://browser.agents.svc:8080/"));
+        assert!(http.interface_is_safe("http://browser.agents.svc:9090/rpc"));
+        assert!(!http.interface_is_safe("http://evil.example.net/rpc"));
+        assert!(http.interface_is_safe("https://api.example.net/rpc"));
+    }
+
     fn task(state: TaskState, status: Option<&str>, artifacts: &[&str]) -> Task {
         Task {
             id: "t-1".into(),
@@ -861,11 +908,11 @@ mod tests {
             TaskState::Working,
         ] {
             assert!(matches!(
-                tool.outcome(&task(state, None, &[])),
+                tool.outcome(&task(state, None, &[]), RUN),
                 Outcome::Working
             ));
         }
-        let done = |t: Task| match tool.outcome(&t) {
+        let done = |t: Task| match tool.outcome(&t, RUN) {
             Outcome::Done(output) => output,
             Outcome::Working => panic!("still working"),
         };
@@ -969,29 +1016,40 @@ mod tests {
         let mut a = agent("https://billing.example.com/card", None);
         a.files = true;
         let sharing = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
-        let Outcome::Done(out) = sharing.outcome(&done) else {
+        let Outcome::Done(out) = sharing.outcome(&done, RUN) else {
             panic!("the task is over");
         };
         assert!(!out.is_error, "{}", out.content);
-        assert_eq!(
-            out.content,
-            "Shared page.png (16 bytes, image/png). To show it in your answer, write \
-             ![description](page.png).\n\nand a PDF:\n\
-             Shared billing-2.pdf (8 bytes, application/pdf).\n[file at https://x.example.com/f]"
-        );
         let names: Vec<(&str, &str)> = out
             .artifacts
             .iter()
             .map(|a| (a.name.as_str(), a.file.as_ref().unwrap().filename.as_str()))
             .collect();
+        // The sender's base name and the extension of the checked type, made unique by a hash of
+        // the bytes; the remote artifact's name stays the artifact's.
+        let (page, pdf) = (names[0].1, names[1].1);
+        assert_eq!(names[0].0, "The page");
+        assert!(
+            page.starts_with("page-") && page.ends_with(".png"),
+            "{page}"
+        );
+        assert!(
+            pdf.starts_with("billing-") && pdf.ends_with(".pdf"),
+            "{pdf}"
+        );
+        assert_eq!(names[1].0, pdf);
         assert_eq!(
-            names,
-            [("The page", "page.png"), ("billing-2.pdf", "billing-2.pdf")]
+            out.content,
+            format!(
+                "Shared {page} (16 bytes, image/png). To show it in your answer, write \
+                 ![description]({page}).\n\nand a PDF:\nShared {pdf} (8 bytes, application/pdf).\n\
+                 [file at https://x.example.com/f]"
+            )
         );
         assert_eq!(out.artifacts[0].file.as_ref().unwrap().bytes, PNG);
 
         // The same task to a subagent without the key: described, nothing kept.
-        let Outcome::Done(plain) = tool().outcome(&done) else {
+        let Outcome::Done(plain) = tool().outcome(&done, RUN) else {
             panic!("the task is over");
         };
         assert!(plain.artifacts.is_empty());
@@ -999,6 +1057,49 @@ mod tests {
             plain
                 .content
                 .starts_with("[file `page.png` not included: 16 bytes, image/png]")
+        );
+    }
+
+    /// A remote that answers with a plain message, not a task: its file parts are shared the same
+    /// way, within what the run may still share.
+    #[test]
+    fn with_files_the_raw_parts_of_a_message_reply_are_shared_too() {
+        let mut shot = Part::raw(b"\x89PNG\r\n\x1a\nmore".to_vec());
+        shot.filename = Some("evil.html".into());
+        shot.media_type = Some("image/png".into());
+        let reply = Message::new(Role::Agent, vec![Part::text("Here:"), shot.clone()]);
+        let mut a = agent("https://billing.example.com/card", None);
+        a.files = true;
+        let sharing = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
+        let out = sharing.reply(&reply, RUN);
+        assert!(!out.is_error, "{}", out.content);
+        let name = &out.artifacts[0].file.as_ref().unwrap().filename;
+        // A real PNG keeps its base name and gets the extension of what it is.
+        assert!(
+            name.starts_with("evil-") && name.ends_with(".png"),
+            "{name}"
+        );
+        assert!(
+            out.content.starts_with("Here:\nShared evil-"),
+            "{}",
+            out.content
+        );
+        // With no room left, the file is refused before it is copied.
+        let full = sharing.reply(&reply, 3);
+        assert!(full.is_error && full.artifacts.is_empty());
+        assert!(
+            full.content
+                .contains("is over what this run may still share"),
+            "{}",
+            full.content
+        );
+        // Without the key, described.
+        let plain = tool().reply(&reply, RUN);
+        assert!(plain.artifacts.is_empty());
+        assert!(
+            plain.content.contains("[file `evil.html` not included"),
+            "{}",
+            plain.content
         );
     }
 
@@ -1018,7 +1119,7 @@ mod tests {
         let mut a = agent("https://billing.example.com/card", None);
         a.files = true;
         let tool = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
-        let Outcome::Done(out) = tool.outcome(&done) else {
+        let Outcome::Done(out) = tool.outcome(&done, RUN) else {
             panic!("the task is over");
         };
         assert!(out.is_error);

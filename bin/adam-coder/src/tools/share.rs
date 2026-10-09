@@ -103,7 +103,8 @@ pub async fn share_file(
         Ok(shared) => shared,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
-    // The name or the type may still be refused by the artifact (a filename with a control character).
+    // The name or the type may still be refused by the artifact (a filename with a `:` or a control
+    // character).
     let artifact = match Artifact::file(
         shared.name,
         shared.media_type,

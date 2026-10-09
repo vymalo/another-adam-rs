@@ -162,25 +162,35 @@ async fn a_server_with_files_true_shares_its_images_and_blobs_as_files() {
 
     let shot = call(&tools, "browser__screenshot", json!({})).await;
     assert!(!shot.is_error, "{}", shot.content);
-    assert_eq!(
-        shot.content,
-        "Shared screenshot-1.png (67 bytes, image/png). To show it in your answer, write \
-         ![description](screenshot-1.png)."
-    );
     assert_eq!(shot.artifacts.len(), 1);
     let artifact = &shot.artifacts[0];
-    assert_eq!(artifact.name, "screenshot-1.png");
-    assert_eq!(artifact.mime_type.as_deref(), Some("image/png"));
     let file = artifact.file.as_ref().unwrap();
-    assert_eq!(
-        (file.filename.as_str(), file.bytes.as_slice()),
-        ("screenshot-1.png", PNG)
+    // `<tool>-<the first 8 hex digits of the bytes' SHA-256>.<ext>`: unique within a run.
+    let name = file.filename.as_str();
+    assert!(
+        name.starts_with("screenshot-") && name.ends_with(".png") && name.len() == 23,
+        "{name}"
     );
+    assert_eq!(
+        shot.content,
+        format!(
+            "Shared {name} (67 bytes, image/png). To show it in your answer, write \
+             ![description]({name})."
+        )
+    );
+    assert_eq!(artifact.name, name);
+    assert_eq!(artifact.mime_type.as_deref(), Some("image/png"));
+    assert_eq!(file.bytes, PNG);
 
     let pdf = call(&tools, "browser__pdf", json!({})).await;
+    let pdf_name = pdf.artifacts[0].file.as_ref().unwrap().filename.clone();
+    assert!(
+        pdf_name.starts_with("pdf-") && pdf_name.ends_with(".pdf"),
+        "{pdf_name}"
+    );
     assert_eq!(
         pdf.content,
-        format!("Shared pdf-1.pdf ({} bytes, application/pdf).", PDF.len())
+        format!("Shared {pdf_name} ({} bytes, application/pdf).", PDF.len())
     );
     assert_eq!(pdf.artifacts[0].file.as_ref().unwrap().bytes, PDF);
 

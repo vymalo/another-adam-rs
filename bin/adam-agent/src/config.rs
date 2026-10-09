@@ -19,7 +19,7 @@
 //! | `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers) | `false` |
 //! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
 //! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
-//! | `A2A_ALLOW_INSECURE_REMOTES` | let a remote subagent (`a2a:`) be at a plain-`http` URL that is not this machine, such as a Kubernetes service in the same cluster | `false` |
+//! | `A2A_ALLOW_INSECURE_REMOTES` | let a remote subagent (`a2a:`) be at a plain-`http` URL that is not this machine, such as a Kubernetes service in the same cluster; the messages and the bearer then cross the network in clear text, so protect it (a NetworkPolicy, mesh mTLS) | `false` |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 //!
 //! Every problem is reported at once, so a misconfigured deployment is fixed in one round trip.

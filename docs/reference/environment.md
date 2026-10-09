@@ -55,7 +55,7 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 |---|---|---|
 | `ADAM_AGENT_DIR` | the folder of `agent/` files, read once at startup by every role; must exist (else exit 78). Required by `adam-agent` | `adam-coder`: its embedded copy |
 | `ADAM_EXTRA_MCP_FILE` | a file of extra MCP servers in the shape of `mcp.json`, **added** to the agent's own (a name clash is exit 78) | unset |
-| `A2A_ALLOW_INSECURE_REMOTES` | `adam-agent`, roles that run workers: let a remote subagent (`a2a:`) be at plain `http` on another machine, such as a service of the same cluster; without it such a URL is exit 78. Its token is the environment's too: `auth: bearer:VAR` names the variable ([remote subagents](agent-files.md#remote-subagents-a2a)) | `false` |
+| `A2A_ALLOW_INSECURE_REMOTES` | `adam-agent`, roles that run workers: let a remote subagent (`a2a:`) be at plain `http` on another machine, such as a service of the same cluster; without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it with a NetworkPolicy that admits only the caller, or mesh mTLS. Plain `http` goes only to the card's own host, and never from an `https` card. Its token is the environment's too: `auth: bearer:VAR` names the variable ([remote subagents](agent-files.md#remote-subagents-a2a)) | `false` |
 
 ## The coder (`adam-coder`)
 

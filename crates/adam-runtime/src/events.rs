@@ -51,9 +51,9 @@ pub enum ArtifactFileError {
         /// The limit.
         max: usize,
     },
-    /// The filename is empty, too long, or holds a path separator or a control character: it is a
-    /// name, not a path.
-    #[error("`{0}` is not a file name (no path, no control characters, at most 255 bytes)")]
+    /// The filename is empty, too long, or holds a path separator, a `:` or a control character: it
+    /// is a name, not a path or a URL.
+    #[error("`{0}` is not a file name (no path, no `:`, no control characters, at most 255 bytes)")]
     BadFilename(String),
     /// The media type is not of the form `type/subtype`.
     #[error("`{0}` is not a media type (type/subtype)")]
@@ -180,15 +180,17 @@ impl Artifact {
 }
 
 /// Whether `filename` is a name a file can be saved under: not empty, at most
-/// [`MAX_ARTIFACT_FILENAME_BYTES`], not `.` or `..`, no path separator or control character.
-pub(crate) fn is_file_name(filename: &str) -> bool {
+/// [`MAX_ARTIFACT_FILENAME_BYTES`], not `.` or `..`, no path separator, no control character and
+/// no `:` (which would let a name read as a URL, `http:evil.example`, where a screen or a Markdown
+/// link resolves it).
+fn is_file_name(filename: &str) -> bool {
     !filename.is_empty()
         && filename.len() <= MAX_ARTIFACT_FILENAME_BYTES
         && filename != "."
         && filename != ".."
         && !filename
             .chars()
-            .any(|c| c.is_control() || c == '/' || c == '\\')
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
 }
 
 /// Something observers may want to know about a run.
@@ -847,6 +849,7 @@ mod tests {
             "a/b.txt",
             "a\\b.txt",
             "x\ny.txt",
+            "http:evil.example",
             &"n".repeat(256),
         ] {
             assert!(

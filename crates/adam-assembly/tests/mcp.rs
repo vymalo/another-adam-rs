@@ -655,24 +655,29 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
         let view = wait_done(&rt, run).await;
         worker.stop().await;
 
+        assert_eq!(view.artifacts.len(), 1, "{backend}");
+        let name = view.artifacts[0].name.clone();
+        assert!(
+            name.starts_with("screenshot-") && name.ends_with(".png"),
+            "{backend}: {name}"
+        );
         assert_eq!(
             last_tool_result(&model.requests()[1], "c1"),
             (
-                "Shared screenshot-1.png (67 bytes, image/png). To show it in your answer, write \
-                 ![description](screenshot-1.png)."
-                    .into(),
+                format!(
+                    "Shared {name} (67 bytes, image/png). To show it in your answer, write \
+                     ![description]({name})."
+                ),
                 false
             ),
             "{backend}"
         );
-        let names: Vec<&str> = view.artifacts.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["screenshot-1.png"], "{backend}");
         let file = view.artifacts[0].file.as_ref().unwrap();
         assert_eq!(file.bytes, adam_mcp_testkit::PNG, "{backend}");
         assert!(
             sink.events_for(run).iter().any(|event| matches!(
                 event,
-                adam_runtime::RunEvent::Artifact { name, .. } if name == "screenshot-1.png"
+                adam_runtime::RunEvent::Artifact { name: emitted, .. } if *emitted == name
             )),
             "{backend}: the artifact was emitted"
         );
@@ -681,6 +686,59 @@ async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
         assert!(
             !sent.contains("iVBORw0KGgo"),
             "{backend}: the PNG reached the model"
+        );
+    }
+}
+
+/// Three files of about 4 MiB in one result: the result shares what the run may still share (one),
+/// refuses the rest before reading them, and so the journal entry of the call, written before the
+/// loop's run cap applies, stays within the run's 6 MiB of files (about 8 MiB of base64) on every
+/// store.
+#[tokio::test]
+async fn one_result_is_journaled_within_the_runs_file_budget() {
+    for (backend, store) in stores().await {
+        let server = TestHttpServer::start(Some(TOKEN)).await;
+        let root = uniq("root");
+        let files = root_files(
+            &root,
+            "tools: ['linear__png']",
+            &mcp_json(&server.url(), "LINEAR_TOKEN", r#""files": true"#),
+        );
+        let def = def_of(&files)
+            .env("LINEAR_TOKEN", TOKEN)
+            .connect_mcp(&policy())
+            .await
+            .unwrap();
+        let model = Arc::new(MockModel::new());
+        model
+            .push_tool_calls(vec![call(
+                "c1",
+                "linear__png",
+                json!({"bytes": 4_000_000, "count": 3}),
+            )])
+            .push_text("One of three.");
+        let assembly = assemble(def, &model);
+        let rt = common::runtime_on(&assembly, store.clone());
+        let worker = spawn_worker(&rt);
+        let run = rt.start(&root, user_message("go"), None).await.unwrap();
+        let view = wait_done(&rt, run).await;
+        worker.stop().await;
+
+        assert_eq!(view.artifacts.len(), 1, "{backend}");
+        let (text, is_error) = last_tool_result(&model.requests()[1], "c1");
+        assert!(is_error, "{backend}: {text}");
+        assert_eq!(
+            text.matches("is over what this run may still share")
+                .count(),
+            2,
+            "{backend}: {text}"
+        );
+        let journal = store.journal_list(run).await.unwrap();
+        let entry = journal.iter().find(|e| e.name == "tool:c1").unwrap();
+        let size = serde_json::to_vec(&entry.payload).unwrap().len();
+        assert!(
+            size < adam_runtime::MAX_RUN_FILE_BYTES / 3 * 4 + 64 * 1024,
+            "{backend}: the journal entry is {size} bytes"
         );
     }
 }
@@ -743,7 +801,11 @@ async fn a_subagents_files_stay_on_the_subagents_run() {
     let on = |v: &adam_runtime::RunView| -> Vec<String> {
         v.artifacts.iter().map(|a| a.name.clone()).collect()
     };
-    assert_eq!(on(&child), ["screenshot-1.png"]);
+    let on_child = on(&child);
+    assert!(
+        on_child.len() == 1 && on_child[0].starts_with("screenshot-"),
+        "{on_child:?}"
+    );
     assert!(on(&view).is_empty(), "{:?}", on(&view));
 }
 

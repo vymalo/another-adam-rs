@@ -595,7 +595,11 @@ async fn a_screenshot_of_a_files_true_server_reaches_the_a2a_client_as_a_file() 
     let artifacts = done.artifacts.as_deref().unwrap_or_default();
     let shot: Vec<&a2a::Artifact> = artifacts
         .iter()
-        .filter(|a| a.name.as_deref() == Some("screenshot-1.png"))
+        .filter(|a| {
+            a.name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("screenshot-"))
+        })
         .collect();
     assert_eq!(shot.len(), 1, "{artifacts:?}");
     assert_eq!(shot[0].parts.len(), 1);
@@ -605,15 +609,19 @@ async fn a_screenshot_of_a_files_true_server_reaches_the_a2a_client_as_a_file() 
         a2a::PartContent::Raw(adam_mcp_testkit::PNG.to_vec())
     );
     assert_eq!(part.media_type.as_deref(), Some("image/png"));
-    assert_eq!(part.filename.as_deref(), Some("screenshot-1.png"));
+    let name = part.filename.clone().unwrap();
+    assert!(name.ends_with(".png") && shot[0].name.as_deref() == Some(name.as_str()));
     match mock.requests()[1].messages.last().unwrap() {
         adam_model::Message::Tool {
             content, is_error, ..
         } => assert_eq!(
             (content.as_str(), *is_error),
             (
-                "Shared screenshot-1.png (67 bytes, image/png). To show it in your answer, \
-                 write ![description](screenshot-1.png).",
+                format!(
+                    "Shared {name} (67 bytes, image/png). To show it in your answer, write \
+                     ![description]({name})."
+                )
+                .as_str(),
                 false
             )
         ),

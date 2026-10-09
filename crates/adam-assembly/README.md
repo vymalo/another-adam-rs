@@ -505,10 +505,15 @@ auth: bearer:BILLING_AGENT_TOKEN
   fetched); a `raw` file part is described and dropped, unless the file says `files: true`.
 * **`files: true`** in the subagent's file (a browser agent's screenshots) shares each `raw` part of the answer as a
   **file artifact of the calling run**, through `adam_runtime::ReceivedFiles`, the rule of a `files: true` MCP server
-  ([`adam-mcp`](../adam-mcp/README.md#files-files-true)): the sender's filename (else `<subagent>-<n>.<ext>`), its media
-  type checked against the bytes, the remote artifact's name when the part is its only one, a line for the model in
-  its place; at most 4 MiB a file and 16 a result, the run's 6 MiB being the loop's; a refused file makes the result an
-  error result. The root's go to the person (its A2A client gets them as shared files); a subagent's stay on its run.
+  ([`adam-mcp`](../adam-mcp/README.md#files-files-true)), which believes nothing the sender says of a file: it is named
+  `<base>-<hash>.<ext>` (the sender's file name without its extension, cut to `[A-Za-z0-9._-]`, else the subagent's
+  name; a hash of the bytes; the extension of the type checked against the bytes, so `evil.html` that is not a PNG is a
+  `.bin`), the remote artifact's name (one line, at most 120 characters) names the artifact when the part is its only
+  one, and the model reads a line in its place. Every cap is checked on the part's length before its bytes are copied:
+  4 MiB a file, 16 a result and what the run may still share (`ToolCtx::files_left`, also for the `poll:` step); a
+  refused file makes the result an error result. The root's go to the person (its A2A client gets them as shared
+  files); a subagent's stay on its run. A file at a `url` is never fetched. The files are untrusted content for the
+  client too: served as attachments or sanitized.
 * **Auth.** `auth: bearer:VAR` reads `VAR` at `bind`: `AgentDef::env(VAR, value)` first, then the process
   environment; trimmed; refused as `Error::RemoteAuth { origin, var, problem }` (`Missing`, `Empty`,
   `NotAToken`) without ever showing a value. The token is a `SecretString`, sent as `Authorization: Bearer` on
@@ -516,9 +521,12 @@ auth: bearer:BILLING_AGENT_TOKEN
   (tests read all of them). It goes only to the origin of the card URL: a card that advertises an interface on
   another host or port is refused for an agent with `auth`, and redirects are not followed.
 * **The URL** must be `https`, or `http` to `localhost`, `*.localhost`, `127.0.0.0/8` or `::1`
-  (`Error::RemoteUrl { problem: Insecure }` otherwise, unless `AgentDef::allow_insecure_remotes(true)`, for
-  development only). A URL with a user name or password is `Credentials`, always refused, and errors show the URL
-  without them.
+  (`Error::RemoteUrl { problem: Insecure }` otherwise, unless `AgentDef::allow_insecure_remotes(true)`: development, or
+  a service of the same cluster, `A2A_ALLOW_INSECURE_REMOTES` in `adam-agent`). With it the messages and the bearer
+  cross the pod network in clear text: the deployment is expected to protect that network (a NetworkPolicy that admits
+  only the caller, or mesh mTLS). A card cannot widen it: an `https` card's plain-`http` interface is refused, and a
+  plain-`http` interface is accepted only on the card's own host. A URL with a user name or password is
+  `Credentials`, always refused, and errors show the URL without them.
 * **Under a local subagent.** `subagents/researcher/subagents/browser.md` with `a2a:` is a tool of `researcher`
   (the walk binds every local agent's subagents, remote ones included): the researcher's child run calls it, parks
   on the remote task and polls it like a root, and the root gets the researcher's text. A subagent gets no tool its
@@ -694,8 +702,9 @@ place each:
   committed call is not repeated when a later transition is retried, a transient failure later in the turn calls
   the server again (at-least-once, documented), a server that went away is an error result and the run goes on,
   the screenshot of a `files: true` server is an artifact of the run on memory and PostgreSQL (in its view, emitted,
-  never in a model request) and one of a subagent's server stays on the subagent's run while only its text reaches
-  the parent, and, with `dev`, a reload keeps the connections (one `initialize`) and refuses a changed `mcp.json`.
+  never in a model request), three images of about 4 MiB in one result share one and the call's journal entry stays
+  within the run's 6 MiB of files (memory and PostgreSQL), and one of a subagent's server stays on the subagent's run
+  while only its text reaches the parent, and, with `dev`, a reload keeps the connections (one `initialize`) and refuses a changed `mcp.json`.
 * `tests/bind.rs` also covers `mcp.json` without the feature: unconnected servers fail closed (root and
   subagent, with the file), tools given by hand bind like connected ones, a foreign tool name is refused, the
   clashes and the unknown agent.
@@ -725,7 +734,9 @@ place each:
   is that subagent's tool, and its child run sends (message id from the child's run and call), polls and answers
   the root with its text; with `files: true` a remote's screenshot is an artifact of the calling run (in its view)
   and a line for the model, without it a line only. Unit tests in `src/remote.rs`: the parts of a completed task
-  shared (names, types, a `url` part kept as a line), a file over the cap refused as an error result.
+  shared (names, types, a `url` part kept as a line), the parts of a plain message reply shared too (a real PNG called
+  `evil.html` is `evil-<hash>.png`; with no budget left the part is refused before it is copied), a file over the cap
+  refused as an error result, and allowed plain `http` never a downgrade from an `https` card nor another host.
 * `tests/skills.rs`: the catalog against `tests/golden/coder-prompt.txt` (the fixture; regenerate with
   `ADAM_UPDATE_GOLDEN=1`) and against a hand-written text with escaping; no skill, no tool; `skills:`
   selection and order; unknown, unselected and unsupplied skills, an over-size skill and a reserved tool

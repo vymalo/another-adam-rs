@@ -577,14 +577,18 @@ Same shape, name checks and placement as a local subagent's tool; `limits`, `too
   the card URL you wrote**: a card that advertises another host is refused, redirects are not followed.
 * **URL.** `https`, or `http` to this machine; anything else is `Error::RemoteUrl` unless
   `AgentDef::allow_insecure_remotes(true)`, which `adam-agent` sets from `A2A_ALLOW_INSECURE_REMOTES` (plain `http` to
-  a service of the same cluster). A URL with credentials is always refused.
+  a service of the same cluster). **Then the messages and the bearer cross the pod network in clear text**: protect
+  that network (a NetworkPolicy that admits only the caller, or mesh mTLS). A card cannot widen the switch: an `https`
+  card's plain-`http` interface is refused, and plain `http` goes only to the card's own host. A URL with credentials
+  is always refused.
 * **What does not travel.** Only text, no `contextId` (every call is a fresh conversation), and no file: a `raw` part
   is described in a line and dropped, a `url` part stays a line (it is never fetched).
 * **`files: true`** (an adam extension, remote subagents only; on any other file it warns and does nothing): each
   `raw` part of the answer is shared as a file of the calling run, by the rule of a `files: true` MCP server
-  ([below](#files-from-a-server-files-true)): the sender's filename, its media type checked against the bytes, at most
-  4 MiB a file, 16 a result and 6 MiB a run, a line for the model in its place. A screenshot the browser agent shared
-  reaches Chat's A2A client when Chat calls `browser` itself; a subagent's files stay on its run.
+  ([below](#files-from-a-server-files-true)): a name made here from the sender's (`page.png` is `page-<hash>.png`, and
+  the extension follows the bytes), its media type checked against the bytes, at most 4 MiB a file, 16 a result and
+  what the run may still share, a line for the model in its place. A screenshot the browser agent shared reaches
+  Chat's A2A client when Chat calls `browser` itself; a subagent's files stay on its run.
 * **A deployment that points at one.** The URL is the file's and the token the environment's: a chart that renders the
   folder writes `a2a: http://browser.<namespace>.svc:8080/.well-known/agent-card.json`, sets
   `A2A_ALLOW_INSECURE_REMOTES=true` for in-cluster `http`, and gives `auth: bearer:BROWSER_A2A_TOKEN` its value from a
@@ -683,10 +687,11 @@ stores and shows it as it does a shared file ([ADR 0033](../decisions/0033-files
 
 | | |
 |---|---|
-| The model reads | `Shared browser_screenshot-1.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-1.png).` in place of the block (the second sentence for an image only); never the bytes |
-| The file's name | the tool's name on the server, its place among the files of the result, the extension of its type |
+| The model reads | `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).` in place of the block (the second sentence for an image only); never the bytes |
+| The file's name | the tool's name on the server, a hash of the bytes (unique within the run, stable on replay), the extension of its checked type |
 | Its media type | the server's, checked against the bytes (`adam_runtime::checked_media_type`): a "PNG" that is not one is `application/octet-stream` |
-| Not shared | over 4 MiB, not base64, past the 16th file of a result, or over the run's 6 MiB: a line says why and the result is an error result |
+| Not shared | over 4 MiB, past the 16th file of a result, or over what the run may still share (checked on the base64's length, before decoding: the result is journaled before the loop's run cap), or not base64: a line says why and the result is an error result |
+| Trust | none: the server's type is checked and the name made here; the bytes are untrusted content, which a client serves as an attachment or sanitizes |
 | A subagent's | stays on the subagent's run, like `share_file`'s: only the subagent's text reaches the parent |
 | Without the key | described in a line, no byte kept (fail closed) |
 

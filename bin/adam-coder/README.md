@@ -522,7 +522,8 @@ artifact; the orchestration layer keeps the bytes in its artifact store and show
   file that is not a regular file (a pipe), a missing file and a file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`) are results
   for the model, which can shrink the file or tell the person. The bytes are read up to the cap plus one, so a file that grows
   under the call is refused, not cut. The workspace is one directory whatever environment the commands run in, so a file a
-  command made in the repository's devcontainer is shared like one the coder wrote.
+  command made in the repository's devcontainer is shared like one the coder wrote. A file whose name holds a `:` is
+  refused too (`Artifact::file`: a name must never read as a URL), with a result that says why.
 * **The media type** is derived from the extension and **checked against the bytes for images** (`media_type_of`, on
   `adam_runtime::checked_media_type`, the rule a `files: true` MCP server's files follow too): `.png`
   must start with the PNG signature, `.jpg` with JPEG's, `.gif`, `.webp`, and `.svg` must hold an `<svg` element after any

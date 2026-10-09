@@ -42,24 +42,30 @@ at Chat when Chat asks it as a subagent.
    shared file does: that layer stores it unchanged in its artifact store (its ADR 0032) and its web shows it. **This is
    the hand-over the owner asked for**: no new tool and no extension. A folder agent's files come from its tools, and the
    tool that makes a file is the one that shares it.
-3. **Named after the tool**: the tool's name on the server, the file's place among the files of the result, and the
-   extension of its media type (`browser_screenshot-1.png`, `browser_pdf-1.pdf`; `bin` for an unknown type). The tool's
-   name is a valid file name by construction (`[A-Za-z0-9_-]`); a URI from the server is not used.
+3. **Named after the tool and the content**: the tool's name on the server, the first 8 hexadecimal digits of the
+   SHA-256 of the bytes, and the extension of the checked media type (`browser_screenshot-3fa2c19b.png`,
+   `browser_pdf-9d04e1a7.pdf`; `bin` for an unknown type). Names are unique within a run, so two screenshots of one
+   run never share a name and the inline image of the second never shows the first, and a replay names a file as it
+   did. The tool's name is a valid file name by construction (`[A-Za-z0-9_-]`); a URI from the server is not used.
 4. **The media type is the server's, checked against the bytes**, by the rule `share_file` already had for an extension,
    moved to `adam_runtime::checked_media_type` so that there is one: a declared PNG, JPEG, GIF, WebP or SVG must be that
    image by its bytes, bytes that are an image declared as something else disagree, and both are
    `application/octet-stream`; a type the rule cannot check stands.
 5. **The model reads one line**,
-   `Shared browser_screenshot-1.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-1.png).`
+   `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).`
    (`Artifact::shared_line`, which `share_file` says too), in place of
    the block. The second sentence is for an image only: a model that wrote an image's workspace path
    (`![alt](shots/4-matches.png)`, seen in an owner's thread of 2026-10-09) left the person's screen nothing to resolve,
    and the screen resolves an image's source against the files shared in the run, by the share's path and then by the
    file's name. So the line names the file, never a path; this amends ADR 0012 (5). The bytes are never in the history, the step's output or the context.
-6. **Bounded as every file is.** At most 4 MiB a file (`MAX_ARTIFACT_FILE_BYTES`) and 16 files a result, and the agent
-   loop keeps a run within 6 MiB (`MAX_RUN_FILE_BYTES`). A file that is not shared, for any of these or because it is not
-   base64, is a line that says why, and the result is an **error result**: the person did not get what the call made, and
-   the model is told to ask for a smaller one or say so.
+6. **Bounded before the journal sees it.** The tool's whole result is journaled in `tool:CALL_ID` (and a remote's in
+   `poll:CALL_ID`) before the agent loop applies the run's 6 MiB (`MAX_RUN_FILE_BYTES`) in `output_message`, so the
+   loop's cap alone would let one result carry 16 files of 4 MiB into one journal entry, over MongoDB's 16 MiB document
+   and unbounded on Postgres. So a result shares at most 4 MiB a file (`MAX_ARTIFACT_FILE_BYTES`), 16 files, and **what
+   the run may still share**, which the loop gives every call and poll (`ToolCtx::files_left`), checked on the length
+   (the base64's, whitespace left out, or the part's) before anything is decoded or copied. A file that is not shared,
+   for any of these or because it is not base64, is a line that says why, and the result is an **error result**: the
+   person did not get what the call made, and the model is told to ask for a smaller one or say so.
 7. **A subagent's files stay on the subagent's run**, as `share_file`'s do (`bin/adam-coder/README.md`, "Subagents"): the
    call is the subagent's, so its run holds the artifact and the budget, and only its text reaches the parent.
 8. **In the shared layer.** It is `adam-mcp`'s, so `adam-agent`, `adam-coder` and any program that connects an
@@ -68,11 +74,17 @@ at Chat when Chat asks it as a subagent.
    source of a file that another system sent.
 9. **A remote subagent passes files on with `files: true` in its file.** The same key, the same default (off: a `raw`
    part is a line, as before) and the same rule: each `raw` part of the remote's answer becomes a file artifact of the
-   calling run, under the sender's filename when it is a name (else `<subagent>-<n>.<ext>`) and the remote artifact's
-   name when the part is its only one. So the browser agent's screenshot reaches the orchestration layer whether it asks
+   calling run, named `<base>-<hash>.<ext>` from the sender's file name (its base cut to `[A-Za-z0-9._-]`, else the
+   subagent's name; never its extension, which follows the checked type: `evil.html` that is not a PNG is a `.bin`), and
+   under the remote artifact's name (one line, at most 120 characters) when the part is its only one. So the browser agent's screenshot reaches the orchestration layer whether it asks
    the browser itself or asks Chat, which asks the browser. A file at a `url` part is not fetched (it would need the
    remote's credentials somewhere else, and could point anywhere): it stays a line. A subagent's files stay on its run
    (7), so a screenshot the researcher gets from the browser stops at the researcher, by design.
+
+10. **The files are untrusted content.** Nothing a sender says of a file is believed: the type is checked against the
+    bytes, the name is made here (and `Artifact::file` refuses a `:`, so a name never reads as a URL in a Markdown
+    link), a refusal repeats the sender's type only when it is one. The bytes stay the sender's: a client serves them as
+    an attachment or sanitizes them (a claimed `text/html`, an SVG), as the orchestration layer's artifact store does.
 
 ```mermaid
 sequenceDiagram
@@ -85,9 +97,9 @@ sequenceDiagram
     L->>T: call, in the journaled step tool:CALL_ID
     T->>B: tools/call browser_screenshot
     B-->>T: an image block, base64 PNG
-    T-->>L: "Shared browser_screenshot-1.png (84.0 KiB, image/png). To show it ..." and the file artifact
+    T-->>L: "Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it ..." and the file artifact
     L->>M: the line, never the bytes
-    L->>O: the artifact: one raw part, image/png, browser_screenshot-1.png
+    L->>O: the artifact: one raw part, image/png, browser_screenshot-3fa2c19b.png
 ```
 
 ```mermaid
@@ -109,11 +121,16 @@ stateDiagram-v2
 * The coder's `share_file` reads its media type through `adam_runtime::checked_media_type` and says its line with
   `Artifact::shared_line`; what it shares is unchanged. A file an MCP server shared is not "delivered" in the coder's run
   notes (`RunNotes::shared` stays `share_file`'s).
-* Two calls of a tool both make `browser_screenshot-1.png`. The artifacts differ by their bytes (an artifact's id follows
-  its content, ADR 0012), so nothing is lost, but the person sees the same name twice.
+* `adam_runtime::Artifact::file` refuses a file name with a `:`, which `share_file` meets too: a workspace file named
+  `a:b.txt` is no longer shared (rename it). This amends ADR 0012 (2).
+* The same file shared twice in a run has the same name and the same artifact (its id follows its content, ADR 0012);
+  two different files never share a name.
+* **Follow-up:** the HTTP clients do not cap a response body: an MCP server or a remote agent can still send a huge
+  answer, which is held in memory before these caps refuse its files. `rmcp`'s transport and the A2A client take a
+  `reqwest::Client` that has no body limit; a cap there is not built here.
 * The journal carries the files, as for `share_file` (ADR 0012, 3): a browser agent that takes many screenshots meets the
   6 MiB of its run and is told so.
-* The MCP testkit gains `screenshot`, `pdf` and `png { bytes }`, the shapes obscura answers with.
+* The MCP testkit gains `screenshot`, `pdf` and `png { bytes, count? }`, the shapes obscura answers with.
 
 ## Alternatives considered
 

@@ -9,8 +9,10 @@
 
 use std::future::Future;
 
+use adam::AgentDef;
+
 use crate::agent::{WorkerParts, agents, card_of_folder};
-use crate::config::Config;
+use crate::config::{Config, WorkerConfig};
 use crate::error::AgentError;
 use crate::folder;
 use crate::redact;
@@ -53,12 +55,8 @@ pub async fn serve(
         tracing::info!(file = %file.display(), "extra MCP servers added to the folder's own");
         folder.def = def;
     }
-    // Whether a remote subagent may be at plain `http` on another machine (a service of the same
-    // cluster) is the deployment's: the workers bind the remote subagents.
     if let Some(worker) = &config.worker {
-        folder.def = folder
-            .def
-            .allow_insecure_remotes(worker.allow_insecure_remotes);
+        folder.def = for_workers(folder.def, worker);
     }
     let named_vars = folder.def.mcp_env_references();
 
@@ -87,4 +85,65 @@ pub async fn serve(
     let agents = agents(folder.def, card, parts).await?;
     adam_service::serve(&config.service, agents, shutdown).await?;
     Ok(())
+}
+
+/// The definition the workers bind: what the deployment decides of the folder's remote subagents
+/// applied, which is whether one may be at plain `http` on another machine (a service of the same
+/// cluster: `A2A_ALLOW_INSECURE_REMOTES`).
+fn for_workers(def: AgentDef, worker: &WorkerConfig) -> AgentDef {
+    def.allow_insecure_remotes(worker.allow_insecure_remotes)
+}
+
+#[cfg(test)]
+mod tests {
+    use adam_llm_agent::ToolSet;
+
+    use super::*;
+
+    /// `A2A_ALLOW_INSECURE_REMOTES` reaches the binding of the remote subagents through `serve`'s
+    /// own step: off, an in-cluster `http` remote stops the start; on, it binds.
+    #[test]
+    fn the_switch_reaches_the_remote_subagents() {
+        let tmp = tempfile::tempdir().expect("a temporary directory");
+        std::fs::create_dir_all(tmp.path().join("agent/subagents")).expect("the folders");
+        std::fs::write(
+            tmp.path().join("agent/instructions.md"),
+            "---\nname: chat\ndescription: Chats.\ntools: []\n---\nHello.\n",
+        )
+        .expect("the instructions");
+        std::fs::write(
+            tmp.path().join("agent/subagents/browser.md"),
+            "---\ndescription: Reads pages.\na2a: http://browser.agents.svc:8080/card\n---\n",
+        )
+        .expect("the subagent");
+        let config = |flag: Option<&str>| {
+            let dir = tmp.path().display().to_string();
+            Config::from_lookup(|name| {
+                Some(
+                    match name {
+                        "DATABASE_URL" => "postgres://u:p@db/adam",
+                        "MODEL_BASE_URL" => "https://gw.example/v1",
+                        "MODEL_API_KEY" => "k",
+                        "MODEL" => "m",
+                        "A2A_BEARER_TOKENS" => "t",
+                        "PUBLIC_URL" => "http://agent.svc:8080/",
+                        "A2A_ALLOW_INSECURE_REMOTES" => return flag.map(str::to_owned),
+                        n if n == adam::AGENT_DIR_ENV => return Some(dir.clone()),
+                        _ => return None,
+                    }
+                    .to_owned(),
+                )
+            })
+            .expect("a valid configuration")
+        };
+        let bind = |flag: Option<&str>| {
+            let config = config(flag);
+            let worker = config.worker.as_ref().expect("the role runs workers");
+            let def = crate::folder::load(tmp.path()).expect("the folder").def;
+            for_workers(def, worker).bind(ToolSet::new()).is_ok()
+        };
+        assert!(!bind(None), "off by default");
+        assert!(!bind(Some("false")));
+        assert!(bind(Some("true")));
+    }
 }
