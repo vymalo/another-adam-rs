@@ -336,17 +336,19 @@ impl Endpoint {
 }
 
 /// Whether the text of a transport failure says the endpoint answered 401 or 403. The library does
-/// not give a status code in a type, so the text is read; a wrong guess only changes the
-/// wording of an error.
+/// not give a status code in a type, so the text is read. The text carries the URL
+/// (`for url (http://127.0.0.1:40123/…)`), so every phrase has a space in it, which a URL never
+/// has: a bare `401` matched a port or a thread id that held those digits.
 fn looks_unauthorized(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("401")
-        || lower.contains("403")
-        || lower.contains("unauthorized")
-        || lower.contains("forbidden")
-        || lower.contains("auth required")
-        || lower.contains("authrequired")
-        || lower.contains("invalid_token")
+    [
+        "401 unauthorized", // reqwest's status error; rmcp's `HTTP 401 Unauthorized: <body>`
+        "403 forbidden",    // the same for 403
+        "auth required",    // rmcp: a 401 with `WWW-Authenticate`
+        "insufficient scope", // rmcp: a 403 with `WWW-Authenticate`
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
 }
 
 fn remote_tool(tool: ListedTool) -> RemoteTool {
@@ -477,10 +479,19 @@ mod tests {
         for text in [
             "HTTP status client error (401 Unauthorized)",
             "Auth required, www-authenticate header: Bearer error=\"invalid_token\"",
+            "unexpected server response: HTTP 401 Unauthorized: no",
             "403 Forbidden",
+            "Insufficient scope: insufficient scope: Bearer error=\"insufficient_scope\"",
         ] {
             assert!(looks_unauthorized(text), "{text}");
         }
         assert!(!looks_unauthorized("connection refused"));
+        // The URL is in the text: a port or a thread id with those digits is not a status.
+        for text in [
+            "error sending request for url (http://127.0.0.1:40123/thread-tools/thread-1/mcp)",
+            "error sending request for url (http://127.0.0.1:54031/thread-tools/4013ab/mcp)",
+        ] {
+            assert!(!looks_unauthorized(text), "{text}");
+        }
     }
 }

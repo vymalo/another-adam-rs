@@ -189,9 +189,9 @@ The URL goes through the same rules as a remote server's (https, or plain `http`
 `McpPolicy::allow_insecure`; no credentials in it), and the token is registered with the redactor: **no error and no
 result text carries it**, and `Debug` shows the URL without its query. The call has no retry and no idempotency key,
 as for any MCP call; a tool that ran and failed is a `RemoteResult` with `is_error`, and a protocol error (an unknown
-tool) is `EndpointError::Rejected`. A 401 is told apart from other failures by the text the transport reports (the
-SDK gives no status code in a type); a wrong guess only changes the wording of an error. `adam-ui`'s thread-tools
-client is its user.
+tool) is `EndpointError::Rejected`. A 401 or 403 is told apart from other failures by the status wording the transport
+reports (`401 Unauthorized`, `Auth required`, ...; the SDK gives no status code in a type), never by a bare number: the
+text carries the URL, whose port or path may hold `401`. `adam-ui`'s thread-tools client is its user.
 
 **A call with its own time and `_meta`.** `call_tool_with(name, args, CallOptions::new().timeout(d).meta(key, value))`
 waits `d` for the answer instead of the policy's `call_timeout` (the caller decides and caps it: the endpoint adds no
@@ -559,7 +559,7 @@ per test): none relies on another test's runtime to reap a process or to install
   and an unknown tool (`Rejected`), arguments reaching the tool, the token on every request and never shown, a token
   the endpoint does not accept (`Unauthorized`, nothing called), an endpoint that is down, a call that times out, plain
   `http` to another machine refused before anything is sent. Unit tests in `src/once.rs`: the URL policy, `Debug`, the
-  listed tool's defaults, the wording of a 401.
+  listed tool's defaults, the wordings of a 401 and a 403, and a URL holding `401` that is not one.
 * `tests/stdio.rs` (testkit): list and call over stdio; declared `env` expanded into the child (what the child
   reports comes back as `[REDACTED]`, which also proves it holds the value); the child does not
   inherit the environment (`CARGO`) unless asked; stdio refused without the opt-in; a missing command; a child
