@@ -575,8 +575,19 @@ Same shape, name checks and placement as a local subagent's tool; `limits`, `too
   sent as `Authorization: Bearer` on every request, never journaled or logged, and goes **only to the origin of
   the card URL you wrote**: a card that advertises another host is refused, redirects are not followed.
 * **URL.** `https`, or `http` to this machine; anything else is `Error::RemoteUrl` unless
-  `AgentDef::allow_insecure_remotes(true)` (development only). A URL with credentials is always refused.
+  `AgentDef::allow_insecure_remotes(true)`, which `adam-agent` sets from `A2A_ALLOW_INSECURE_REMOTES` (plain `http` to
+  a service of the same cluster). A URL with credentials is always refused.
 * **What does not travel.** Only text; no `contextId`, so every call is a fresh conversation.
+* **A deployment that points at one.** The URL is the file's and the token the environment's: a chart that renders the
+  folder writes `a2a: http://browser.<namespace>.svc:8080/.well-known/agent-card.json`, sets
+  `A2A_ALLOW_INSECURE_REMOTES=true` for in-cluster `http`, and gives `auth: bearer:BROWSER_A2A_TOKEN` its value from a
+  Secret. An unset variable stops the process (exit 78) naming it. There is no `${VAR}` in `a2a:`: the file is rendered.
+* **Under a local subagent.** A remote declared in a local subagent's directory
+  (`subagents/researcher/subagents/browser.md`) is a tool of that subagent: its child run sends, parks on the remote
+  task and polls it as a root does, and only the researcher's text reaches the root. Each declaration is its own tool
+  with its own `auth` (two may name the same variable); a flat `subagents/<name>.md` has no directory, so give it one
+  (`subagents/<name>/instructions.md`) to nest a remote under it. A subagent never gets a tool it does not declare or
+  list, so the root's `browser` is not the researcher's.
 
 More in the [`adam-assembly` README](../../crates/adam-assembly/README.md#subagents).
 

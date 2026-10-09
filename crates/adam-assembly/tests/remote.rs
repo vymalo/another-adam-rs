@@ -1021,3 +1021,119 @@ fn a_remote_subagent_is_a_tool_in_the_order_of_the_manifest_beside_local_ones() 
     // The remote is not an agent of the assembly: nothing to register on the runtime.
     assert_eq!(assembly.agents().len(), 2);
 }
+
+// --- a remote under a local subagent ---------------------------------------------------------
+
+/// A local subagent calls a remote one: the remote is declared under the subagent's own directory
+/// (`subagents/researcher/subagents/browser.md`), so it is a tool of the researcher, with its own
+/// `auth`, and the researcher's child run sends, parks on the remote task, polls it and goes on,
+/// exactly as a root does. Only text travels: the researcher's answer is what the root reads.
+#[tokio::test]
+async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory() {
+    for (backend, store) in stores().await {
+        let root = uniq("root");
+        let memory = InMemoryBackend::new();
+        let server = Server::start(memory.clone(), TOKEN).await;
+        let files: Files = vec![
+            (
+                "agent/instructions.md".into(),
+                instructions(&format!("name: {root}\ntools: []"), "You are the root."),
+            ),
+            (
+                "agent/subagents/researcher/instructions.md".into(),
+                instructions(
+                    "description: Researches a question.\ntools: []",
+                    "You research.",
+                ),
+            ),
+            (
+                "agent/subagents/researcher/subagents/browser.md".into(),
+                format!(
+                    "---\ndescription: Reads web pages.\na2a: {}\nauth: bearer:{VAR}\n---\n",
+                    server.card_url()
+                ),
+            ),
+        ];
+        let model = Arc::new(MockModel::new());
+        model
+            .push_tool_calls(vec![call(
+                "c1",
+                "researcher",
+                json!({"message": "what does example.com say?"}),
+            )])
+            .push_tool_calls(vec![call(
+                "r1",
+                "browser",
+                json!({"message": "read example.com"}),
+            )])
+            .push_text("It says: echo: read example.com")
+            .push_text("The researcher found it.");
+        let assembly = assemble(&files, &model);
+        // The remote is a tool of the subagent whose directory declares it, not of the root.
+        let tools_of = |name: &str| {
+            assembly
+                .info()
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap()
+                .tools
+                .clone()
+        };
+        assert_eq!(tools_of(&root), ["researcher"], "{backend}");
+        assert_eq!(
+            tools_of(&format!("{root}/researcher")),
+            ["browser"],
+            "{backend}"
+        );
+
+        let rt = runtime(&assembly, &store);
+        let worker = spawn_worker(&rt);
+        let run = rt.start(&root, user_message("go"), None).await.unwrap();
+        let view = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(
+            view.output.as_ref().unwrap()["text"],
+            "The researcher found it.",
+            "{backend}"
+        );
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 4, "{backend}");
+        assert_eq!(
+            last_tool_result(&requests[2], "r1"),
+            ("echo: read example.com".into(), false),
+            "{backend}: the researcher read the remote's answer"
+        );
+        assert_eq!(
+            last_tool_result(&requests[3], "c1"),
+            ("It says: echo: read example.com".into(), false),
+            "{backend}: the root read the researcher's text"
+        );
+        // The send and its wait are journaled steps of the researcher's run, under the id derived
+        // from that run and its call.
+        let child = child_run_id(run, "c1");
+        let names: Vec<String> = store
+            .journal_list(child)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "tool:r1"), "{backend}: {names:?}");
+        let ids = memory.task_ids();
+        assert_eq!(ids.len(), 1, "{backend}");
+        let task = memory
+            .get(&Caller::new("token-0"), &ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.history.as_ref().unwrap()[0].message_id,
+            child_run_id(child, "r1").to_string(),
+            "{backend}"
+        );
+        for header in server.authorization.lock().unwrap().iter() {
+            assert_eq!(header.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
+        }
+    }
+}

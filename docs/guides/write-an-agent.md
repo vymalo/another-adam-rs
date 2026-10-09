@@ -62,6 +62,10 @@ Rules worth knowing:
   `model` is an alias. `${VAR}` exists only in `mcp.json`.
 * **A subagent inherits nothing**, and without `tools:` it has none. It cannot use a tool that asks the person.
   A file copied from `.claude/agents/` parses unchanged, but its `tools` must name adam's tools.
+* **A remote subagent** is a file with `a2a: <agent-card URL>`: another A2A agent, called like a subagent. Its token
+  is the environment's (`auth: bearer:VAR`), plain `http` to a service of the cluster needs
+  `A2A_ALLOW_INSECURE_REMOTES=true`, and one declared in a subagent's directory (`subagents/researcher/subagents/`)
+  is that subagent's tool ([Remote subagents](../reference/agent-files.md#remote-subagents-a2a)).
 * **A subagent of Adam shares its root run's workspace**: `bin/adam-coder/agent/subagents/` has two read-only ones
   (`explorer`, `reviewer`) that read the worktree the calling run prepared.
 * **The agent already has** `ask_user`, `show` and `ui_catalog` (the person's screen), the tools of its MCP

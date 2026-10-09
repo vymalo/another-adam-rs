@@ -45,6 +45,10 @@ before you rely on a detail here.
 3. **Body**: the system prompt. Optional `skills/<name>/SKILL.md` (Agent Skills format, loaded on
    demand by `load_skill` and `read_skill_file`) and `subagents/` (each one tool of the parent, a
    child run with only the tools it lists and never `ask_user`; registered as `<name>/<subagent>`).
+   A subagent file with `a2a: <agent-card URL>` is a **remote subagent** (another A2A agent): render the URL into
+   the file, and give its token through `auth: bearer:VAR` (a variable of the process, from a Secret; unset is exit
+   78). Plain `http` to a service of the same cluster needs `A2A_ALLOW_INSECURE_REMOTES=true` on `adam-agent`. A
+   remote under a subagent's directory (`subagents/researcher/subagents/browser.md`) is that subagent's tool.
    Formats: `docs/reference/agent-files.md`; the short version is `docs/guides/write-an-agent.md`.
 4. **Built-in tools** the agent has without writing any: `ask_user`, `show`, `ui_catalog`
    (`crates/adam-ui/README.md`). Everything else comes from the folder, mainly MCP.

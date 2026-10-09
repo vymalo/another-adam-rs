@@ -53,6 +53,13 @@ pub async fn serve(
         tracing::info!(file = %file.display(), "extra MCP servers added to the folder's own");
         folder.def = def;
     }
+    // Whether a remote subagent may be at plain `http` on another machine (a service of the same
+    // cluster) is the deployment's: the workers bind the remote subagents.
+    if let Some(worker) = &config.worker {
+        folder.def = folder
+            .def
+            .allow_insecure_remotes(worker.allow_insecure_remotes);
+    }
     let named_vars = folder.def.mcp_env_references();
 
     // The card of the files this process runs, for the roles that serve A2A.

@@ -230,7 +230,7 @@ the coder's own errors in `bin/adam-coder/src/exit.rs`):
 | Code | Meaning |
 |---|---|
 | 0 | clean shutdown after SIGTERM |
-| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, `ServeError::Push`: push notifications are on and cannot be set up, any other `Invalid` error). A bad `A2A_PUSH_*`, `A2A_CARD_SIGNING_*` or `MODEL_CONTEXT_WINDOW` value is a `ConfigError` |
+| 78 | configuration (`ConfigError`, an invalid `OpenAiConfigError`, `ServeError::Push`: push notifications are on and cannot be set up, any other `Invalid` error). A bad `A2A_PUSH_*`, `A2A_CARD_SIGNING_*`, `MODEL_CONTEXT_WINDOW` or `A2A_ALLOW_INSECURE_REMOTES` value is a `ConfigError`; a remote subagent at plain `http` on another machine without `A2A_ALLOW_INSECURE_REMOTES`, or whose `auth` variable is unset, is an `Invalid` error of the assembly |
 | 69 | a dependency unreachable at boot (Postgres) |
 | 71 | an OS error (a port that cannot bind, a directory that cannot be created) |
 | 70 | a half of the process stopped, a panic or an internal error |

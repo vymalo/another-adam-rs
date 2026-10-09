@@ -512,6 +512,11 @@ auth: bearer:BILLING_AGENT_TOKEN
   (`Error::RemoteUrl { problem: Insecure }` otherwise, unless `AgentDef::allow_insecure_remotes(true)`, for
   development only). A URL with a user name or password is `Credentials`, always refused, and errors show the URL
   without them.
+* **Under a local subagent.** `subagents/researcher/subagents/browser.md` with `a2a:` is a tool of `researcher`
+  (the walk binds every local agent's subagents, remote ones included): the researcher's child run calls it, parks
+  on the remote task and polls it like a root, and the root gets the researcher's text. A subagent gets no tool its
+  own files do not declare, so a remote the root declares is the root's alone; a second declaration (the same URL,
+  the same `auth` variable if you like) gives it to another agent.
 * **The client** is made by the first call that needs it (agent card fetched with a size cap, a safe interface
   chosen, the token attached) and kept in the tool, so `bind` never touches the network and everything it decides
   is plain values: a reload binds again and gets a new client.
@@ -709,7 +714,9 @@ place each:
   or malformed token variable is a bind error naming it; a wrong token; a card that points the token at another
   origin; a restart mid-wait that polls on without sending again; a send whose response is lost and is retried
   under the same message id; the wait limit; plain http refused unless local or allowed; clashes with a tool, a
-  skill tool and a subagent; the tool's place among the subagents.
+  skill tool and a subagent; the tool's place among the subagents; a remote declared in a local subagent's directory
+  is that subagent's tool, and its child run sends (message id from the child's run and call), polls and answers
+  the root with its text.
 * `tests/skills.rs`: the catalog against `tests/golden/coder-prompt.txt` (the fixture; regenerate with
   `ADAM_UPDATE_GOLDEN=1`) and against a hand-written text with escaping; no skill, no tool; `skills:`
   selection and order; unknown, unselected and unsupplied skills, an over-size skill and a reserved tool

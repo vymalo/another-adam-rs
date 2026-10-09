@@ -1266,6 +1266,55 @@ async fn files_that_disagree_with_the_code_are_refused_at_assembly() {
     assert_eq!(exit_code(&error), 78);
 }
 
+/// A remote subagent a deployment points at: the chart renders the folder with the agent's URL in
+/// `a2a:`, and its token comes from the environment through `auth: bearer:VAR`, never from a file.
+/// An unset variable and an in-cluster plain-`http` URL are the deployment's mistakes (78) until it
+/// gives the token and says plain `http` is fine (`A2A_ALLOW_INSECURE_REMOTES`, which `serve` turns
+/// into `AgentDef::allow_insecure_remotes`).
+#[tokio::test]
+async fn a_remote_subagent_a_deployment_points_at() {
+    let folder = chat();
+    std::fs::create_dir_all(folder.path().join("agent/subagents")).unwrap();
+    std::fs::write(
+        folder.path().join("agent/subagents/browser.md"),
+        "---\ndescription: Reads web pages and takes screenshots.\n\
+         a2a: http://browser.agents.svc:8080/.well-known/agent-card.json\n\
+         auth: bearer:BROWSER_A2A_TOKEN\n---\n",
+    )
+    .unwrap();
+    let model: DynModel = Arc::new(MockModel::new());
+    let attempt = |def: AgentDef| {
+        let model = model.clone();
+        async move { build(def, None, Some(worker_parts(model))).await }
+    };
+
+    let error = attempt(def_of(&folder).env("BROWSER_A2A_TOKEN", "tok-browser-1"))
+        .await
+        .expect_err("plain http to another machine is refused");
+    let cause = std::error::Error::source(&error).unwrap().to_string();
+    assert!(
+        cause.contains("browser") && cause.contains("http"),
+        "{cause}"
+    );
+    assert_eq!(exit_code(&error), 78);
+
+    let error = attempt(def_of(&folder).allow_insecure_remotes(true))
+        .await
+        .expect_err("no token, no subagent");
+    let cause = std::error::Error::source(&error).unwrap().to_string();
+    assert!(cause.contains("BROWSER_A2A_TOKEN"), "{cause}");
+    assert_eq!(exit_code(&error), 78);
+
+    let agents = attempt(
+        def_of(&folder)
+            .allow_insecure_remotes(true)
+            .env("BROWSER_A2A_TOKEN", "tok-browser-1"),
+    )
+    .await
+    .expect("the deployment gave the token and allowed the URL");
+    assert_eq!(agents.name, "chat");
+}
+
 /// The class of what a process fails with decides its exit code; the service's own errors keep
 /// theirs.
 #[tokio::test]
