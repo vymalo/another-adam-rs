@@ -34,13 +34,14 @@
 # published by vymalo/another-agentic-images (merged in #7 as bc97d51). Deployments
 # pin an immutable tag, never `latest`. Bump it when that image changes (the tag
 # of its newest build on main), together with anything here that depends on it.
-# Anonymous pull verified 2026-10-01: the manifest request for this tag with an
+# Anonymous pull verified 2026-10-09: the manifest request for this tag with an
 # anonymous ghcr.io token returned 200, and the image's config has the
 # `devcontainer.metadata` label (it is a dev container base: the default environment of the
-# coder's devcontainers, ADR 0010). The same build is the default of DEVCONTAINER_DEFAULT_IMAGE,
+# coder's devcontainers, ADR 0010) and /opt/obscura/bin on PATH (obscura 0.2.4, a headless
+# browser, vymalo/another-agentic-images#11). The same build is the default of DEVCONTAINER_DEFAULT_IMAGE,
 # by its digest alone (bin/adam-coder/src/config.rs: the devcontainer CLI cannot parse a tag together
 # with a digest); a test keeps this tag equal to the tag that digest was published as.
-ARG WORKSPACE_TAG=1.98.1-ee2273e
+ARG WORKSPACE_TAG=1.98.1-cfd2917
 
 FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS build
 WORKDIR /src
@@ -135,10 +136,11 @@ EXPOSE 8080
 # run, and the OpenCode that is mounted into every devcontainer is a native executable (an ELF file, not
 # the npm package's script: DEVCONTAINER_RUNTIME=podman refuses to start otherwise). The run pod's tools are in
 # /opt/adam/bin (adam-exec, and OpenCode as a native executable), and adam-kube-exec rejects an empty command line.
+# obscura comes with the base; it is checked because the coder's instructions name it.
 RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/github-mcp-tools.sh \
     bash -lc 'set -e; \
       test "$(id -u)" = 10001; \
-      command -v adam-coder adam-agent adam-kube-exec git opencode tini github-mcp-server devcontainer podman-remote; \
+      command -v adam-coder adam-agent adam-kube-exec git opencode tini github-mcp-server devcontainer podman-remote obscura; \
       test "$(devcontainer --version)" = "0.89.0"; \
       podman-remote --version | grep -q "5\.8\.7"; \
       test "$(head -c 4 "$(readlink -f "$(command -v opencode)")" | tail -c 3)" = ELF; \

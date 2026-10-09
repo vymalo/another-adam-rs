@@ -1147,7 +1147,9 @@ stateDiagram-v2
 The gate does not change. A check that passed is for the tree it ran on (`RunNotes::checked`), `run` changes the tree and
 records nothing, so the pull request is allowed only after `run_checks` has run on the new tree, exactly as after `write_file` or
 OpenCode's edits. A file a command made is shared with `share_file`, which reads the workspace's one directory whatever
-ran in it.
+ran in it. A screenshot of a web page is one: the prompt names `obscura`, the headless browser of the coder's image and of
+the default environment, with `--allow-private-network` for a page served on 127.0.0.1, and says to delete the picture
+before committing.
 
 ### A task that continues a task
 

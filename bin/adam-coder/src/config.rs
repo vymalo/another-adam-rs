@@ -368,13 +368,13 @@ impl RunEnvironment {
 /// and then skips the image's details, the metadata that sets the remote user. It is the image this
 /// binary's own is built on ([`DEFAULT_DEVCONTAINER_IMAGE_TAG`] is its tag, which a test keeps equal to the
 /// `WORKSPACE_TAG` of `docker/coder/Dockerfile`), and it is a dev container base: its
-/// `devcontainer.metadata` label names the user. *Verified 2026-10-01*: an anonymous ghcr.io token and a
+/// `devcontainer.metadata` label names the user. *Verified 2026-10-09*: an anonymous ghcr.io token and a
 /// manifest request for the tag returned this digest (linux/amd64), and its config blob has the label.
-pub const DEFAULT_DEVCONTAINER_IMAGE: &str = "ghcr.io/vymalo/another-agentic-images/workspace@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a";
+pub const DEFAULT_DEVCONTAINER_IMAGE: &str = "ghcr.io/vymalo/another-agentic-images/workspace@sha256:ee7e4c7539ad62942e43f9b8ea39d8433617888cac3b0d26a37de3993671786c";
 
 /// The tag [`DEFAULT_DEVCONTAINER_IMAGE`]'s digest was published as: not part of the reference (see
 /// there), but what a person reads to know which build it is, and what a test keeps with the Dockerfile.
-pub const DEFAULT_DEVCONTAINER_IMAGE_TAG: &str = "1.98.1-ee2273e";
+pub const DEFAULT_DEVCONTAINER_IMAGE_TAG: &str = "1.98.1-cfd2917";
 
 /// The devcontainer variables of a worker: see the table at the top of this module.
 #[derive(Debug, Clone)]

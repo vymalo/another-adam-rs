@@ -601,7 +601,7 @@ What it renders, and why each is there:
 | `NetworkPolicy` `<release>-coder-run-pods` | no ingress; egress to DNS and to the internet **except** `networkPolicy.blockedCIDRs` (RFC 1918, link-local, which holds the cloud metadata address, and the shared address space) and `networkPolicy.clusterCIDRs` (the pod and service CIDRs: yours to name), so builds reach registries and the model gateway and not the services of the cluster. A gateway inside the cluster needs `networkPolicy.extraEgress`. IPv4 only |
 
 The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_POD_NAMESPACE` (its own, by the downward API), `RUN_POD_INSTANCE` (the release),
-`RUN_POD_CONTAINER`, `RUN_POD_READY_TIMEOUT_SECS` (600: the first pull of the 2.85 GB image on a node), `RUN_POD_IDLE_SECS` (900) and `RUN_POD_WAIT_SECS` (600), a
+`RUN_POD_CONTAINER`, `RUN_POD_READY_TIMEOUT_SECS` (600: the first pull of the 2.92 GB image on a node), `RUN_POD_IDLE_SECS` (900) and `RUN_POD_WAIT_SECS` (600), a
 `WORKER_ID` from the pod name (a worker sweeps only its own idle pods), the ServiceAccount, and **`runPods.coderResources`
 (a 1Gi memory limit) instead of `resources`** (6Gi), which is untouched while run pods are off. Set `runPods.coderResources: null` to keep `resources`.
 
