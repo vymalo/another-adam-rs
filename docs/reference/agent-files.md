@@ -121,6 +121,7 @@ Remote subagent (A2A; the body, if any, only extends the tool description):
 description: Handles billing questions for a customer account.
 a2a: https://billing.example.com/.well-known/agent-card.json
 auth: bearer:BILLING_AGENT_TOKEN     # names an environment variable, resolved at startup, fail closed
+files: true                          # optional: the file parts of its answer are shared, not described
 ---
 ```
 
@@ -577,7 +578,13 @@ Same shape, name checks and placement as a local subagent's tool; `limits`, `too
 * **URL.** `https`, or `http` to this machine; anything else is `Error::RemoteUrl` unless
   `AgentDef::allow_insecure_remotes(true)`, which `adam-agent` sets from `A2A_ALLOW_INSECURE_REMOTES` (plain `http` to
   a service of the same cluster). A URL with credentials is always refused.
-* **What does not travel.** Only text; no `contextId`, so every call is a fresh conversation.
+* **What does not travel.** Only text, no `contextId` (every call is a fresh conversation), and no file: a `raw` part
+  is described in a line and dropped, a `url` part stays a line (it is never fetched).
+* **`files: true`** (an adam extension, remote subagents only; on any other file it warns and does nothing): each
+  `raw` part of the answer is shared as a file of the calling run, by the rule of a `files: true` MCP server
+  ([below](#files-from-a-server-files-true)): the sender's filename, its media type checked against the bytes, at most
+  4 MiB a file, 16 a result and 6 MiB a run, a line for the model in its place. A screenshot the browser agent shared
+  reaches Chat's A2A client when Chat calls `browser` itself; a subagent's files stay on its run.
 * **A deployment that points at one.** The URL is the file's and the token the environment's: a chart that renders the
   folder writes `a2a: http://browser.<namespace>.svc:8080/.well-known/agent-card.json`, sets
   `A2A_ALLOW_INSECURE_REMOTES=true` for in-cluster `http`, and gives `auth: bearer:BROWSER_A2A_TOKEN` its value from a

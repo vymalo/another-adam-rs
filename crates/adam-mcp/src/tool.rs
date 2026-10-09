@@ -20,9 +20,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_llm_agent::{Artifact, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
+use adam_llm_agent::{StepStyle, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::ToolSpec;
-use adam_runtime::{MAX_ARTIFACT_FILE_BYTES, checked_media_type, extension_of};
+use adam_runtime::{MAX_ARTIFACT_FILE_BYTES, ReceivedFiles};
 use async_trait::async_trait;
 use base64::Engine as _;
 use rmcp::ServiceError;
@@ -340,9 +340,6 @@ fn kind(value: &Value) -> &'static str {
     }
 }
 
-/// The most files one result shares. A file block after them is not shared, and the result says so.
-pub(crate) const MAX_FILES_PER_RESULT: usize = 16;
-
 /// A server's answer as text for the model: the blocks joined by newlines, scrubbed of what
 /// `redactor` knows (a server that echoes a credential it was given must not hand it to the model
 /// and the journal), then cut at [`MAX_RESULT_BYTES`]; an error result when the server says
@@ -374,7 +371,7 @@ pub(crate) fn map_result(
         "(the tool returned no content)".to_owned()
     };
     let text = cap_text(redactor.scrub(&text), MAX_RESULT_BYTES);
-    let (artifacts, refused) = sharing.map_or((Vec::new(), false), |s| (s.artifacts, s.refused));
+    let (artifacts, refused) = sharing.map_or((Vec::new(), false), |s| s.files.into_parts());
     let mut output = if result.is_error == Some(true) || refused {
         ToolOutput::error(text)
     } else {
@@ -405,37 +402,24 @@ fn block_text(block: &ContentBlock) -> String {
 }
 
 /// The files of one result of a server with `files: true`, shared as they are met
-/// ([ADR 0033](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0033-files-from-mcp-results-are-shared-files.md)).
+/// ([ADR 0033](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0033-files-from-mcp-results-are-shared-files.md))
+/// by [`ReceivedFiles`]: named `<tool>-<n>.<ext>` after the tool's name on the server, the media
+/// type the server declared checked against the bytes, at most 4 MiB a file and 16 a result.
 ///
 /// * A file is an image, an audio clip or an embedded blob resource; its bytes are the block's
 ///   base64. Text, text resources and resource links stay text.
-/// * Its name is the tool's name on the server, the file's place among the files of the result and the
-///   extension of its media type: `browser_screenshot-1.png`.
-/// * Its media type is the one the server declared, checked against the bytes
-///   ([`checked_media_type`]): a "PNG" that is not one is `application/octet-stream`.
 /// * A file that is text has the values the redactor knows taken out, like the text of the result.
-/// * Not shared, with a line that says why: a file over [`MAX_ARTIFACT_FILE_BYTES`], one that is not
-///   base64, and every file after the first [`MAX_FILES_PER_RESULT`]. The agent loop then keeps the
-///   run's files within `MAX_RUN_FILE_BYTES` (`adam-llm-agent`).
+/// * A base64 text far over the cap is refused unread, and one that does not decode is refused.
 struct Sharing<'a> {
-    /// The tool's name on the server: the stem of each file's name.
-    stem: &'a str,
     redactor: &'a Redactor,
-    /// The file blocks met so far: the counter in a file's name.
-    met: usize,
-    artifacts: Vec<Artifact>,
-    /// A file was not shared: the result is an error result.
-    refused: bool,
+    files: ReceivedFiles,
 }
 
 impl<'a> Sharing<'a> {
-    fn new(stem: &'a str, redactor: &'a Redactor) -> Self {
+    fn new(stem: &str, redactor: &'a Redactor) -> Self {
         Self {
-            stem,
             redactor,
-            met: 0,
-            artifacts: Vec::new(),
-            refused: false,
+            files: ReceivedFiles::new(stem),
         }
     }
 
@@ -452,58 +436,21 @@ impl<'a> Sharing<'a> {
             },
             _ => return block_text(block),
         };
-        self.met += 1;
-        match self.share(data, claimed) {
-            Ok(artifact) => {
-                let line = artifact.shared_line();
-                self.artifacts.push(artifact);
-                line
-            }
-            Err(why) => {
-                self.refused = true;
-                format!(
-                    "Not shared: a file ({}) {why}.",
-                    claimed.unwrap_or("of no declared type")
-                )
-            }
-        }
-    }
-
-    /// The file of one block, or why it is not shared (the end of a sentence).
-    fn share(&self, data: &str, claimed: Option<&str>) -> Result<Artifact, String> {
-        if self.artifacts.len() >= MAX_FILES_PER_RESULT {
-            return Err(format!(
-                "is past the first {MAX_FILES_PER_RESULT} files of this result, and one result \
-                 shares no more"
-            ));
-        }
         // Four characters of base64 are three bytes: a file far over the cap is refused unread.
         if data.len() / 4 * 3 > MAX_ARTIFACT_FILE_BYTES + 3 {
-            return Err(too_large(data.len() / 4 * 3, true));
+            return self.files.refuse_too_large(claimed, data.len() / 4 * 3);
         }
-        let mut bytes = decode(data).ok_or_else(|| "is not valid base64".to_owned())?;
-        if bytes.len() > MAX_ARTIFACT_FILE_BYTES {
-            return Err(too_large(bytes.len(), false));
-        }
+        let Some(mut bytes) = decode(data) else {
+            return self.files.refuse(claimed, "is not valid base64");
+        };
         if let Ok(text) = std::str::from_utf8(&bytes) {
             let scrubbed = self.redactor.scrub(text);
             if scrubbed != text {
                 bytes = scrubbed.into_bytes();
             }
         }
-        let media_type = checked_media_type(claimed, &bytes);
-        let filename = format!("{}-{}.{}", self.stem, self.met, extension_of(&media_type));
-        Artifact::file(filename.clone(), media_type, filename, bytes).map_err(|e| e.to_string())
+        self.files.share(claimed, None, None, bytes)
     }
-}
-
-fn too_large(len: usize, about: bool) -> String {
-    format!(
-        "of {}{} bytes is over the limit of {MAX_ARTIFACT_FILE_BYTES} bytes (4 MiB) for one shared \
-         file: ask the tool for a smaller one, or tell the person it is too big to share",
-        if about { "about " } else { "" },
-        len
-    )
 }
 
 /// The bytes of a block's base64: the standard alphabet, padded or not, whitespace ignored.
@@ -525,6 +472,7 @@ fn decode(data: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use adam_runtime::MAX_FILES_PER_RESULT;
     use rmcp::model::{Resource, ResourceContents};
 
     use super::*;
@@ -674,7 +622,7 @@ mod tests {
         assert_eq!(
             lines[0],
             "Not shared: a file (image/png) of 4194305 bytes is over the limit of 4194304 bytes \
-             (4 MiB) for one shared file: ask the tool for a smaller one, or tell the person it is \
+             (4 MiB) for one shared file: ask for a smaller one, or tell the person it is \
              too big to share."
         );
         assert!(

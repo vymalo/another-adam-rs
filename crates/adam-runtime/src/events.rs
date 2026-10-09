@@ -152,14 +152,7 @@ impl Artifact {
                 max: MAX_ARTIFACT_FILE_BYTES,
             });
         }
-        let bad_name = filename.is_empty()
-            || filename.len() > MAX_ARTIFACT_FILENAME_BYTES
-            || filename == "."
-            || filename == ".."
-            || filename
-                .chars()
-                .any(|c| c.is_control() || c == '/' || c == '\\');
-        if bad_name {
+        if !is_file_name(&filename) {
             return Err(ArtifactFileError::BadFilename(filename));
         }
         let bad_type = media_type.split_once('/').is_none_or(|(kind, sub)| {
@@ -184,6 +177,18 @@ impl Artifact {
     pub fn file_len(&self) -> usize {
         self.file.as_ref().map_or(0, |f| f.bytes.len())
     }
+}
+
+/// Whether `filename` is a name a file can be saved under: not empty, at most
+/// [`MAX_ARTIFACT_FILENAME_BYTES`], not `.` or `..`, no path separator or control character.
+pub(crate) fn is_file_name(filename: &str) -> bool {
+    !filename.is_empty()
+        && filename.len() <= MAX_ARTIFACT_FILENAME_BYTES
+        && filename != "."
+        && filename != ".."
+        && !filename
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
 }
 
 /// Something observers may want to know about a run.

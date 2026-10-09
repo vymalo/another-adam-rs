@@ -1,4 +1,4 @@
-# 0033. Files from an MCP result are shared files
+# 0033. Files from an MCP result, or from a remote subagent, are shared files
 
 Status: **Accepted** (2026-10-09), at the owner's request: a **browser agent** (an `adam-agent` folder that the
 orchestration layer's chart deploys, with the headless browser obscura as a sidecar MCP server over loopback HTTP, one task
@@ -12,6 +12,9 @@ caps; the model never sees the bytes).
 result into a line for the model (`[image not included: image/png]`, `[binary resource not included: <uri> (<type>)]`,
 `src/tool.rs`) and kept no byte of it. A screenshot a browser took was seen by nobody. The one way an agent handed a file
 over was the coder's `share_file`, which reads a file of its workspace; a folder agent has no workspace, so it had nothing.
+And an adam agent that asks another over A2A (a remote subagent, `a2a:`) turned a `raw` file part of the answer into a
+line, ``[file `page.png` not included: ...]`` (`adam-assembly`, `src/remote.rs`): the browser agent's screenshot would stop
+at Chat when Chat asks it as a subagent.
 
 * **What obscura answers**, *verified 2026-10-09* by reading `crates/obscura-mcp/src/lib.rs` of
   <https://github.com/h4ckf0r0day/obscura> at tag `v0.2.4` (commit `1fccab2`): `browser_screenshot` returns one content
@@ -61,6 +64,15 @@ over was the coder's `share_file`, which reads a file of its workspace; a folder
    call is the subagent's, so its run holds the artifact and the budget, and only its text reaches the parent.
 8. **In the shared layer.** It is `adam-mcp`'s, so `adam-agent`, `adam-coder` and any program that connects an
    `mcp.json` through `adam-assembly` get it. A text file is scrubbed by the server's redactor like the text of a result.
+   The rule itself (names, checked types, the caps, the refusals) is `adam_runtime::ReceivedFiles`, one place for every
+   source of a file that another system sent.
+9. **A remote subagent passes files on with `files: true` in its file.** The same key, the same default (off: a `raw`
+   part is a line, as before) and the same rule: each `raw` part of the remote's answer becomes a file artifact of the
+   calling run, under the sender's filename when it is a name (else `<subagent>-<n>.<ext>`) and the remote artifact's
+   name when the part is its only one. So the browser agent's screenshot reaches the orchestration layer whether it asks
+   the browser itself or asks Chat, which asks the browser. A file at a `url` part is not fetched (it would need the
+   remote's credentials somewhere else, and could point anywhere): it stays a line. A subagent's files stay on its run
+   (7), so a screenshot the researcher gets from the browser stops at the researcher, by design.
 
 ```mermaid
 sequenceDiagram
@@ -91,9 +103,9 @@ stateDiagram-v2
 
 ## Consequences
 
-* **Breaking for code that builds `adam_agent_fs::McpServer` by hand:** both variants gained `files: bool` (a struct
-  literal or a pattern without `..` stops compiling). Files are unchanged: `files` is absent from every `mcp.json` until an
-  author adds it.
+* **Breaking for code that builds `adam_agent_fs::McpServer`, `RemoteAgent` or `EmbeddedRemote` by hand:** each gained
+  `files: bool` (a struct literal or a pattern without `..` stops compiling). Files are unchanged: `files` is absent until
+  an author adds it, and it is left out of a manifest's JSON when `false`, so a folder's digest does not move.
 * The coder's `share_file` reads its media type through `adam_runtime::checked_media_type` and says its line with
   `Artifact::shared_line`; what it shares is unchanged. A file an MCP server shared is not "delivered" in the coder's run
   notes (`RunNotes::shared` stays `share_file`'s).

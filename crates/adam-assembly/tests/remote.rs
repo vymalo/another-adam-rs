@@ -34,6 +34,8 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 const TOKEN: &str = "tok-7f3a9c2e51d84b06";
+/// The start of a PNG: enough for the bytes to say what they are.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 const VAR: &str = "BILLING_AGENT_TOKEN";
 const NOTE: &str =
     "The agent does not see this conversation; put everything it needs in `message`.";
@@ -260,6 +262,30 @@ impl TaskBackend for Scripted {
         {
             if entry.text.contains("[fail]") {
                 entry.task.status = status(TaskState::Failed, Some("out of budget"));
+            } else if entry.text.contains("[file]") {
+                // A browser's answer: a line and a screenshot, the file `share_file` would make.
+                let mut shot = Part::raw(PNG.to_vec());
+                shot.filename = Some("page.png".into());
+                shot.media_type = Some("image/png".into());
+                entry.task.status = status(TaskState::Completed, None);
+                entry.task.artifacts = Some(vec![
+                    Artifact {
+                        artifact_id: a2a::new_artifact_id(),
+                        name: None,
+                        description: None,
+                        parts: vec![Part::text("The page is blank.")],
+                        metadata: None,
+                        extensions: None,
+                    },
+                    Artifact {
+                        artifact_id: a2a::new_artifact_id(),
+                        name: Some("page.png".into()),
+                        description: None,
+                        parts: vec![shot],
+                        metadata: None,
+                        extensions: None,
+                    },
+                ]);
             } else {
                 entry.task.status = status(TaskState::Completed, None);
                 entry.task.artifacts = Some(vec![Artifact {
@@ -1135,5 +1161,59 @@ async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory(
         for header in server.authorization.lock().unwrap().iter() {
             assert_eq!(header.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
         }
+    }
+}
+
+// --- files of a remote's answer ------------------------------------------------------------
+
+/// A remote subagent whose file says `files: true` (a browser agent): the screenshot its task
+/// answers with is an artifact of the run that called it (in the run's view, so the parent's A2A
+/// client gets it as it gets a shared file), the model reads a line in its place, and the same remote
+/// without the key keeps nothing.
+#[tokio::test]
+async fn the_files_of_a_remote_with_files_true_are_artifacts_of_the_calling_run() {
+    for files in [true, false] {
+        let scripted = Scripted::new(1);
+        let server = Server::start(scripted.clone(), TOKEN).await;
+        let url = server.card_url();
+        run_case(
+            || {
+                let mut files_of = remote_files("x", &url, Some(VAR));
+                if files {
+                    files_of[1].1 = files_of[1].1.replace("\n---\n", "\nfiles: true\n---\n");
+                }
+                files_of
+            },
+            "screenshot it [file]",
+            async |backend, store, run, requests| {
+                let (text, is_error) = last_tool_result(&requests[1], "c1");
+                assert!(!is_error, "{backend}: {text}");
+                let view = Runtime::builder(store.clone())
+                    .build()
+                    .view(run)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if files {
+                    assert_eq!(
+                        text,
+                        "The page is blank.\n\nShared page.png (16 bytes, image/png). To show it in \
+                         your answer, write ![description](page.png).",
+                        "{backend}"
+                    );
+                    let names: Vec<&str> =
+                        view.artifacts.iter().map(|a| a.name.as_str()).collect();
+                    assert_eq!(names, ["page.png"], "{backend}");
+                    assert_eq!(view.artifacts[0].file.as_ref().unwrap().bytes, PNG);
+                } else {
+                    assert!(
+                        text.ends_with("[file `page.png` not included: 16 bytes, image/png]"),
+                        "{backend}: {text}"
+                    );
+                    assert!(view.artifacts.is_empty(), "{backend}");
+                }
+            },
+        )
+        .await;
     }
 }

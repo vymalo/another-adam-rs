@@ -589,7 +589,7 @@ impl Loader<'_> {
         else {
             return Ok(None);
         };
-        if let Some(RemoteSpec { url, auth }) = remote {
+        if let Some(RemoteSpec { url, auth, files }) = remote {
             return Ok(Some(Subagent::Remote(RemoteAgent {
                 name,
                 description: frontmatter
@@ -600,6 +600,7 @@ impl Loader<'_> {
                     .to_owned(),
                 url,
                 auth,
+                files,
                 note: body,
                 path: rel,
             })));

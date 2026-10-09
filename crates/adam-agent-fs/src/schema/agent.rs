@@ -247,6 +247,10 @@ pub struct AgentFrontmatter {
     /// How to authenticate to a remote subagent: `bearer:ENV_VAR`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
+    /// `files: true` on a remote subagent: the file parts of its answer are shared as files of the
+    /// calling run instead of being described (an adam extension; remote subagents only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<bool>,
     /// Free-form map, passed through (an Agent Skills and Copilot convention). Scalars are
     /// read as text; a list or a map is kept as its JSON text.
     #[serde(

@@ -5,7 +5,7 @@
 pub static AGENTS: &[::adam_agent_fs::EmbeddedAgent] = &[
     ::adam_agent_fs::EmbeddedAgent {
         name: "coder",
-        digest: "sha256:b0dd64c22e2ff549e7cd74da07bb2e125122e524880db0837f571bf85d822840",
+        digest: "sha256:dd6276c84a77a189a494297cbb76902d8cfb84cccaa9909993c1901a0c21b8e9",
         path: "agent/instructions.md",
         frontmatter_json: r#"{"name":"coder","description":"Turns a coding task into a verified pull request.","tools":["prepare_workspace","run_checks","ask_user","linear__*"],"model":"coder-large","skills":"all","limits":{"max_turns":200,"max_tool_calls":400,"max_output_tokens":8192,"max_history_tokens":100000},"vars":{"max_check_cycles":"3","strict":"true"},"card":{"name":"adam-coder","skills":[{"id":"coding-task","name":"Coding task to pull request","description":"Given a repository and a task, makes the change and opens a pull request.","tags":["code","git","pull-request"],"examples":["In https://github.com/acme/widgets, add a hello.txt containing hi."]}]},"metadata":{"owner":"platform-team","version":"1.2"}}"#,
         instructions: ::adam_agent_fs::EmbeddedInstructions {
@@ -58,6 +58,7 @@ See [the style guide](references/style.md)."#,
                 description: "Handles billing questions for a customer account.",
                 url: "https://billing.example.com/.well-known/agent-card.json",
                 auth: Some(::adam_agent_fs::EmbeddedAuth::Bearer { env: "BILLING_AGENT_TOKEN" }),
+                files: false,
                 note: r#"Give it the account id and the question."#,
                 path: "agent/subagents/billing.md",
             }),
@@ -77,7 +78,7 @@ See [the style guide](references/style.md)."#,
             }),
             ::adam_agent_fs::EmbeddedSubagent::Local(::adam_agent_fs::EmbeddedAgent {
                 name: "researcher",
-                digest: "sha256:551bdd54c1725cc4932a5dbacae33a46af2743730b12065ac28f0c3fb5da5abd",
+                digest: "sha256:85f038ba7d3359892edcd89162e5dd0c450264d508e41664d5c7c66027c97519",
                 path: "agent/subagents/researcher/instructions.md",
                 frontmatter_json: r#"{"description":"Researches a topic on the web and reports sources.","tools":["fetch_page"]}"#,
                 instructions: ::adam_agent_fs::EmbeddedInstructions {

@@ -3,9 +3,9 @@
 //!
 //! One rule for every source of a file: the coder's `share_file` (a media type claimed by the file's
 //! extension), the files of an MCP server's result (`adam-mcp`) and those of a remote agent's task
-//! (`adam-assembly`), both claimed by their sender.
+//! (`adam-assembly`), both claimed by their sender and shared through [`ReceivedFiles`].
 
-use crate::events::Artifact;
+use crate::events::{Artifact, MAX_ARTIFACT_FILE_BYTES, is_file_name};
 
 /// What a file is when nothing better can be said of it: bytes to download, never a picture.
 const OCTETS: &str = "application/octet-stream";
@@ -198,6 +198,122 @@ fn link_destination(name: &str) -> String {
     out
 }
 
+/// The most files one tool result shares from another system ([`ReceivedFiles`]).
+pub const MAX_FILES_PER_RESULT: usize = 16;
+
+/// The files of one tool result that another system sent (the images and blobs of an MCP server's
+/// result, the file parts of a remote agent's answer), shared as [file artifacts](Artifact::file) as
+/// they are met, each with the line the model reads in its place.
+///
+/// * A file is named `filename` when the sender gave a usable one, else `<stem>-<n>.<ext>`: the stem
+///   (a tool's or a subagent's name), the file's place among the files of the result, and the
+///   extension of its media type ([`extension_of`]). Its media type is the sender's, checked against
+///   the bytes ([`checked_media_type`]).
+/// * Its line is [`Artifact::shared_line`].
+/// * Not shared, with a line that says why: a file over [`MAX_ARTIFACT_FILE_BYTES`], every file after
+///   the first [`MAX_FILES_PER_RESULT`], and what a caller refuses ([`refuse`](Self::refuse)). A
+///   result with a refused file is an error result: the person did not get what the call made.
+///
+/// The agent loop then keeps the run within `MAX_RUN_FILE_BYTES` (`adam-llm-agent`).
+#[derive(Debug)]
+pub struct ReceivedFiles {
+    stem: String,
+    met: usize,
+    artifacts: Vec<Artifact>,
+    refused: bool,
+}
+
+impl ReceivedFiles {
+    /// No file yet; generated names start with `stem`, which must be a file name's worth of
+    /// letters, digits, `-` and `_`.
+    pub fn new(stem: impl Into<String>) -> Self {
+        Self {
+            stem: stem.into(),
+            met: 0,
+            artifacts: Vec::new(),
+            refused: false,
+        }
+    }
+
+    /// Share `bytes`, which the sender says are of the media type `claimed`, under the artifact name
+    /// `name` (else the file's name) and the file name `filename` (else a generated one). The line
+    /// for the model.
+    pub fn share(
+        &mut self,
+        claimed: Option<&str>,
+        filename: Option<&str>,
+        name: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> String {
+        self.met += 1;
+        if self.artifacts.len() >= MAX_FILES_PER_RESULT {
+            return self.refusal(
+                claimed,
+                &format!(
+                    "is past the first {MAX_FILES_PER_RESULT} files of this result, and one \
+                     result shares no more"
+                ),
+            );
+        }
+        if bytes.len() > MAX_ARTIFACT_FILE_BYTES {
+            return self.refusal(claimed, &too_large(bytes.len(), false));
+        }
+        let media_type = checked_media_type(claimed, &bytes);
+        let generated = format!("{}-{}.{}", self.stem, self.met, extension_of(&media_type));
+        let filename = filename
+            .map(str::trim)
+            .filter(|f| is_file_name(f))
+            .unwrap_or(&generated)
+            .to_owned();
+        let name = name
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&filename)
+            .to_owned();
+        match Artifact::file(name, media_type, filename, bytes) {
+            Ok(artifact) => {
+                let line = artifact.shared_line();
+                self.artifacts.push(artifact);
+                line
+            }
+            Err(error) => self.refusal(claimed, &format!("cannot be shared: {error}")),
+        }
+    }
+
+    /// A file of the media type `claimed` that is not shared, for the reason `why` (the end of a
+    /// sentence: `is not valid base64`). The line for the model.
+    pub fn refuse(&mut self, claimed: Option<&str>, why: &str) -> String {
+        self.met += 1;
+        self.refusal(claimed, why)
+    }
+
+    /// A file of about `len` bytes, known to be over the cap before it was read, as its line.
+    pub fn refuse_too_large(&mut self, claimed: Option<&str>, len: usize) -> String {
+        self.refuse(claimed, &too_large(len, true))
+    }
+
+    /// The artifacts shared, and whether a file was refused (the result is then an error result).
+    pub fn into_parts(self) -> (Vec<Artifact>, bool) {
+        (self.artifacts, self.refused)
+    }
+
+    fn refusal(&mut self, claimed: Option<&str>, why: &str) -> String {
+        self.refused = true;
+        format!(
+            "Not shared: a file ({}) {why}.",
+            claimed.unwrap_or("of no declared type")
+        )
+    }
+}
+
+fn too_large(len: usize, about: bool) -> String {
+    format!(
+        "of {}{len} bytes is over the limit of {MAX_ARTIFACT_FILE_BYTES} bytes (4 MiB) for one \
+         shared file: ask for a smaller one, or tell the person it is too big to share",
+        if about { "about " } else { "" }
+    )
+}
+
 /// `1234` bytes as `1.2 KiB`.
 pub(crate) fn human_size(len: usize) -> String {
     #[allow(clippy::cast_precision_loss)] // a file of at most a few MiB
@@ -314,6 +430,86 @@ mod tests {
         );
         let json = Artifact::new("checks", None, serde_json::json!({"passed": true}));
         assert_eq!(json.shared_line(), "Shared checks.");
+    }
+
+    #[test]
+    fn received_files_are_named_typed_and_bounded() {
+        let mut files = ReceivedFiles::new("browser_pdf");
+        // No name of the sender's: `<stem>-<n>.<ext>`, the type checked against the bytes.
+        assert_eq!(
+            files.share(Some("application/pdf"), None, None, b"%PDF-1.7".to_vec()),
+            "Shared browser_pdf-1.pdf (8 bytes, application/pdf)."
+        );
+        // A name of the sender's is kept when it is a name, and the artifact may have its own.
+        assert!(
+            files
+                .share(
+                    Some("image/png"),
+                    Some("dot.png"),
+                    Some("The dot"),
+                    PNG.to_vec()
+                )
+                .starts_with("Shared dot.png (")
+        );
+        // A path is no file name: a generated one replaces it.
+        assert!(
+            files
+                .share(Some("image/png"), Some("../x.png"), None, PNG.to_vec())
+                .starts_with("Shared browser_pdf-3.png (")
+        );
+        // A "PNG" that is not one.
+        assert!(
+            files
+                .share(Some("image/png"), None, None, b"<html>".to_vec())
+                .starts_with("Shared browser_pdf-4.bin (6 bytes, application/octet-stream).")
+        );
+        let over = files.share(None, None, None, vec![0; MAX_ARTIFACT_FILE_BYTES + 1]);
+        assert!(
+            over.starts_with("Not shared: a file (of no declared type) of 4194305 bytes is over"),
+            "{over}"
+        );
+        assert_eq!(
+            files.refuse(Some("image/png"), "is not valid base64"),
+            "Not shared: a file (image/png) is not valid base64."
+        );
+        let (artifacts, refused) = files.into_parts();
+        assert!(refused);
+        let names: Vec<(&str, &str)> = artifacts
+            .iter()
+            .map(|a| (a.name.as_str(), a.file.as_ref().unwrap().filename.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("browser_pdf-1.pdf", "browser_pdf-1.pdf"),
+                ("The dot", "dot.png"),
+                ("browser_pdf-3.png", "browser_pdf-3.png"),
+                ("browser_pdf-4.bin", "browser_pdf-4.bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_result_shares_at_most_sixteen_files() {
+        let mut files = ReceivedFiles::new("t");
+        for _ in 0..MAX_FILES_PER_RESULT {
+            assert!(
+                files
+                    .share(None, None, None, PNG.to_vec())
+                    .starts_with("Shared ")
+            );
+        }
+        assert!(
+            files
+                .share(Some("image/png"), None, None, PNG.to_vec())
+                .ends_with(
+                    "is past the first 16 files of this result, and one result shares no more."
+                )
+        );
+        let (artifacts, refused) = files.into_parts();
+        assert_eq!((artifacts.len(), refused), (MAX_FILES_PER_RESULT, true));
+        let (none, refused) = ReceivedFiles::new("t").into_parts();
+        assert!(none.is_empty() && !refused);
     }
 
     #[test]

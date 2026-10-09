@@ -40,6 +40,9 @@ pub enum McpServer {
         optional: bool,
         /// `files: true` (an adam extension): the images, audio clips and blobs of its results are
         /// shared with the person as files of the run, instead of being described to the model.
+        /// Left out of the JSON when `false`, so the digest of a folder that does not use it is the
+        /// one it had before the key existed.
+        #[serde(skip_serializing_if = "is_false")]
         files: bool,
     },
     /// A server reached over the network (`type` and `url`).
@@ -57,6 +60,9 @@ pub enum McpServer {
         optional: bool,
         /// `files: true` (an adam extension): the images, audio clips and blobs of its results are
         /// shared with the person as files of the run, instead of being described to the model.
+        /// Left out of the JSON when `false`, so the digest of a folder that does not use it is the
+        /// one it had before the key existed.
+        #[serde(skip_serializing_if = "is_false")]
         files: bool,
     },
 }
@@ -96,6 +102,10 @@ impl McpServer {
                 .collect(),
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A parsed `mcp.json`.

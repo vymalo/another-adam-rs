@@ -501,7 +501,14 @@ auth: bearer:BILLING_AGENT_TOKEN
 * **The result:** `completed` gives the text of the artifacts (else of the status message), cut at 64 KiB;
   `failed`, `canceled` and `rejected` are error results with the remote's message; **`input-required` and
   `auth-required` are error results too**, because nobody can answer a subagent (the message says so and tells
-  the model to call again with the whole task). Files and data parts are described, never stored.
+  the model to call again with the whole task). Data parts are their JSON; a file at a `url` stays a line (it is not
+  fetched); a `raw` file part is described and dropped, unless the file says `files: true`.
+* **`files: true`** in the subagent's file (a browser agent's screenshots) shares each `raw` part of the answer as a
+  **file artifact of the calling run**, through `adam_runtime::ReceivedFiles`, the rule of a `files: true` MCP server
+  ([`adam-mcp`](../adam-mcp/README.md#files-files-true)): the sender's filename (else `<subagent>-<n>.<ext>`), its media
+  type checked against the bytes, the remote artifact's name when the part is its only one, a line for the model in
+  its place; at most 4 MiB a file and 16 a result, the run's 6 MiB being the loop's; a refused file makes the result an
+  error result. The root's go to the person (its A2A client gets them as shared files); a subagent's stay on its run.
 * **Auth.** `auth: bearer:VAR` reads `VAR` at `bind`: `AgentDef::env(VAR, value)` first, then the process
   environment; trimmed; refused as `Error::RemoteAuth { origin, var, problem }` (`Missing`, `Empty`,
   `NotAToken`) without ever showing a value. The token is a `SecretString`, sent as `Authorization: Bearer` on
@@ -716,7 +723,9 @@ place each:
   under the same message id; the wait limit; plain http refused unless local or allowed; clashes with a tool, a
   skill tool and a subagent; the tool's place among the subagents; a remote declared in a local subagent's directory
   is that subagent's tool, and its child run sends (message id from the child's run and call), polls and answers
-  the root with its text.
+  the root with its text; with `files: true` a remote's screenshot is an artifact of the calling run (in its view)
+  and a line for the model, without it a line only. Unit tests in `src/remote.rs`: the parts of a completed task
+  shared (names, types, a `url` part kept as a line), a file over the cap refused as an error result.
 * `tests/skills.rs`: the catalog against `tests/golden/coder-prompt.txt` (the fixture; regenerate with
   `ADAM_UPDATE_GOLDEN=1`) and against a hand-written text with escaping; no skill, no tool; `skills:`
   selection and order; unknown, unselected and unsupplied skills, an over-size skill and a reserved tool

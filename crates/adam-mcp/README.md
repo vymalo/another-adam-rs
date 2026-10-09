@@ -267,7 +267,8 @@ blob resource. A model reads neither, and the person never saw them. A server wh
 `"files": true` hands them to the person instead: each becomes a **file artifact of the run**, the one
 `adam_runtime::Artifact::file` makes and the coder's `share_file` returns, which the A2A server serves as one `raw` part
 with `mediaType` and `filename` ([ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md),
-[ADR 0033](../../docs/decisions/0033-files-from-mcp-results-are-shared-files.md)). `src/tool.rs` (`map_result`, `Sharing`).
+[ADR 0033](../../docs/decisions/0033-files-from-mcp-results-are-shared-files.md)). `src/tool.rs` (`map_result`, `Sharing`), on
+`adam_runtime::ReceivedFiles`, the rule a remote subagent's files follow too.
 
 ```mermaid
 sequenceDiagram
@@ -317,7 +318,7 @@ stateDiagram-v2
   result; a file that is not text is left as it is.
 * **Bounded.** A file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`; a base64 text far over it is refused without being
   decoded), a file that is not base64, and every file after the first **16** of one result are not shared: the line
-  says why (`Not shared: a file (image/png) of 4194305 bytes is over the limit ...: ask the tool for a smaller one,
+  says why (`Not shared: a file (image/png) of 4194305 bytes is over the limit ...: ask for a smaller one,
   or tell the person it is too big to share.`) and the result is an **error result**, since the person did not get
   what the call made. The agent loop (`adam-llm-agent`) then keeps a run within **6 MiB** of files in all
   (`MAX_RUN_FILE_BYTES`) and says so in the result the same way; a `files: true` server is one more source for that

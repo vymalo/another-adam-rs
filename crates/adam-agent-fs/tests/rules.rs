@@ -382,6 +382,15 @@ fn cases() -> Vec<Case> {
             "`auth` needs `a2a`",
         ),
         with_root(
+            "files on a subagent that is not remote",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nfiles: true\n---\nYou do one thing.\n",
+            )],
+            Warning,
+            "`files` is for a remote subagent",
+        ),
+        with_root(
             "local-only key on a remote subagent",
             vec![(
                 "agent/subagents/x.md",
@@ -1132,6 +1141,33 @@ fn files_is_a_boolean_that_defaults_to_false_and_is_no_unknown_key() {
         diagnostics[0].to_string().contains("invalid JSON"),
         "{diagnostics:#?}"
     );
+}
+
+#[test]
+fn files_on_a_remote_subagent_is_read_and_defaults_to_false() {
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        (
+            "agent/subagents/browser.md",
+            "---\ndescription: Reads pages.\na2a: http://browser:8080/.well-known/agent-card.json\n\
+             files: true\n---\n",
+        ),
+        (
+            "agent/subagents/billing.md",
+            "---\ndescription: Bills.\na2a: https://billing.example.com/card\n---\n",
+        ),
+    ]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let files: Vec<(&str, bool)> = report.package.agents[0]
+        .subagents
+        .iter()
+        .map(|s| match s {
+            adam_agent_fs::Subagent::Remote(r) => (r.name.as_str(), r.files),
+            adam_agent_fs::Subagent::Local(l) => panic!("{} is not remote", l.name),
+        })
+        .collect();
+    assert_eq!(files, [("billing", false), ("browser", true)]);
 }
 
 #[test]

@@ -109,7 +109,9 @@ pub use events::{
     EventSink, MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_FILENAME_BYTES, MAX_RUN_FILE_BYTES, NoopSink,
     REPLAY_EVENTS_PER_RUN, REPLAY_MAX_AGE, REPLAY_MAX_RUNS, RunEvent, RunSubscription, SinkEvent,
 };
-pub use file::{checked_media_type, extension_of, sniff_image};
+pub use file::{
+    MAX_FILES_PER_RESULT, ReceivedFiles, checked_media_type, extension_of, sniff_image,
+};
 pub use notify::{Delivery, DynNotifier, LocalNotifier, Notifier, Signal};
 pub use retry::{MAX_RETRY_AFTER, RetryPolicy};
 pub use runtime::{RunView, Runtime, RuntimeBuilder, RuntimeError};

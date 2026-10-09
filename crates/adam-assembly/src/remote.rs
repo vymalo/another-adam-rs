@@ -24,6 +24,7 @@ use adam_llm_agent::{
     RemotePoll, StepIcon, StepKind, StepStyle, Tool, ToolCtx, ToolError, ToolOutput,
 };
 use adam_model::ToolSpec;
+use adam_runtime::ReceivedFiles;
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
@@ -153,6 +154,8 @@ pub(crate) struct RemoteSubagentTool {
     token: Option<SecretString>,
     allow_insecure: bool,
     max_wait: Duration,
+    /// `files: true` in the file: the file parts of the answer are shared, not described.
+    files: bool,
     client: OnceCell<A2AClient<Box<dyn Transport>>>,
 }
 
@@ -217,6 +220,7 @@ impl RemoteSubagentTool {
             token,
             allow_insecure: settings.allow_insecure,
             max_wait: settings.max_wait,
+            files: agent.files,
             client: OnceCell::new(),
         })
     }
@@ -385,23 +389,35 @@ impl RemoteSubagentTool {
         match task.status.state {
             TaskState::Unspecified | TaskState::Submitted | TaskState::Working => Outcome::Working,
             TaskState::Completed => {
+                let mut files = self.files.then(|| ReceivedFiles::new(name));
                 let artifacts: Vec<String> = task
                     .artifacts
                     .iter()
                     .flatten()
-                    .map(|a| parts_text(&a.parts))
+                    .map(|a| {
+                        let one_part = a.parts.len() == 1;
+                        let artifact_name = a.name.as_deref().filter(|_| one_part);
+                        parts_text_sharing(&a.parts, files.as_mut(), artifact_name)
+                    })
                     .filter(|text| !text.trim().is_empty())
                     .collect();
+                // Files of the status message are shared too when nothing else answered.
                 let text = if artifacts.is_empty() {
-                    said
+                    match (&task.status.message, files.as_mut()) {
+                        (Some(message), Some(files)) => {
+                            parts_text_sharing(&message.parts, Some(files), None)
+                        }
+                        _ => said,
+                    }
                 } else {
                     artifacts.join("\n\n")
                 };
-                Outcome::Done(ToolOutput::text(if text.trim().is_empty() {
+                let text = if text.trim().is_empty() {
                     "(the remote agent finished without output)".to_owned()
                 } else {
                     cap_text(text, MAX_RESULT_BYTES)
-                }))
+                };
+                Outcome::Done(with_files(text, files))
             }
             TaskState::Failed => Outcome::Done(ToolOutput::error(format!(
                 "the remote agent `{name}` failed{}",
@@ -439,23 +455,43 @@ enum Outcome {
 /// The text of the parts of a message or an artifact, one per line. Data parts are their JSON; a
 /// file is named, never included.
 fn parts_text(parts: &[Part]) -> String {
+    parts_text_sharing(parts, None, None)
+}
+
+/// [`parts_text`], except that with `files` (a remote subagent with `files: true`) a `raw` part is
+/// shared as a file artifact of the calling run, its line saying so ([`ReceivedFiles`]): the
+/// sender's filename and media type, checked against the bytes, and `artifact_name` when the part is
+/// its artifact's only one. A file at a `url` is not fetched: it stays a line.
+fn parts_text_sharing(
+    parts: &[Part],
+    mut files: Option<&mut ReceivedFiles>,
+    artifact_name: Option<&str>,
+) -> String {
     parts
         .iter()
         .map(|part| match &part.content {
             PartContent::Text(text) => text.clone(),
             PartContent::Data(value) => value.to_string(),
-            PartContent::Raw(bytes) => format!(
-                "[file{} not included: {} bytes{}]",
-                part.filename
-                    .as_deref()
-                    .map(|n| format!(" `{n}`"))
-                    .unwrap_or_default(),
-                bytes.len(),
-                part.media_type
-                    .as_deref()
-                    .map(|m| format!(", {m}"))
-                    .unwrap_or_default()
-            ),
+            PartContent::Raw(bytes) => match files.as_deref_mut() {
+                Some(files) => files.share(
+                    part.media_type.as_deref(),
+                    part.filename.as_deref(),
+                    artifact_name,
+                    bytes.clone(),
+                ),
+                None => format!(
+                    "[file{} not included: {} bytes{}]",
+                    part.filename
+                        .as_deref()
+                        .map(|n| format!(" `{n}`"))
+                        .unwrap_or_default(),
+                    bytes.len(),
+                    part.media_type
+                        .as_deref()
+                        .map(|m| format!(", {m}"))
+                        .unwrap_or_default()
+                ),
+            },
             PartContent::Url(url) => format!(
                 "[file{} at {url}]",
                 part.filename
@@ -470,6 +506,18 @@ fn parts_text(parts: &[Part]) -> String {
 
 fn message_text(message: &Message) -> String {
     parts_text(&message.parts)
+}
+
+/// `text` as the result, with the files shared on the way; an error result when one was refused.
+fn with_files(text: String, files: Option<ReceivedFiles>) -> ToolOutput {
+    let (artifacts, refused) = files.map_or((Vec::new(), false), ReceivedFiles::into_parts);
+    let mut output = if refused {
+        ToolOutput::error(text)
+    } else {
+        ToolOutput::text(text)
+    };
+    output.artifacts = artifacts;
+    output
 }
 
 /// `text`, cut to at most `max` bytes on a character boundary, with a note when it was cut.
@@ -535,14 +583,19 @@ impl Tool for RemoteSubagentTool {
             .await
             .map_err(|e| self.failure("send the message to", &e))?;
         match response {
-            SendMessageResponse::Message(reply) => Ok(ToolOutput::text(
-                match cap_text(message_text(&reply), MAX_RESULT_BYTES) {
+            SendMessageResponse::Message(reply) => {
+                let mut files = self.files.then(|| ReceivedFiles::new(self.name()));
+                let text = match cap_text(
+                    parts_text_sharing(&reply.parts, files.as_mut(), None),
+                    MAX_RESULT_BYTES,
+                ) {
                     text if text.trim().is_empty() => {
                         "(the remote agent answered without text)".to_owned()
                     }
                     text => text,
-                },
-            )),
+                };
+                Ok(with_files(text, files))
+            }
             SendMessageResponse::Task(task) => match self.outcome(&task) {
                 Outcome::Done(output) => Ok(output),
                 Outcome::Working => {
@@ -589,6 +642,7 @@ mod tests {
             description: "Answers billing questions.".into(),
             url: url.into(),
             auth: auth.map(|env| RemoteAuth::Bearer { env: env.into() }),
+            files: false,
             note: String::new(),
             path: "agent/subagents/billing.md".into(),
         }
@@ -877,6 +931,103 @@ mod tests {
             parts_text(&parts),
             "hello\n{\"n\":2}\n[file `report.pdf` not included: 12 bytes, application/pdf]\n\
              [file at https://files.example.com/x]"
+        );
+    }
+
+    /// With `files: true`, the `raw` parts of a completed task are files of the calling run: the
+    /// sender's filename and type (checked against the bytes), the artifact's name when the part is
+    /// its only one, a line each for the model; a `url` part stays a line. Without it, nothing is kept.
+    #[test]
+    fn with_files_the_raw_parts_of_a_completed_task_are_shared() {
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        let mut shot = Part::raw(PNG.to_vec());
+        shot.filename = Some("page.png".into());
+        shot.media_type = Some("image/png".into());
+        let mut pdf = Part::raw(b"%PDF-1.7".to_vec());
+        pdf.media_type = Some("application/pdf".into());
+        let artifact = |name: Option<&str>, parts: Vec<Part>| a2a::Artifact {
+            artifact_id: a2a::new_artifact_id(),
+            name: name.map(str::to_owned),
+            description: None,
+            parts,
+            metadata: None,
+            extensions: None,
+        };
+        let mut done = task(TaskState::Completed, Some("Done."), &[]);
+        done.artifacts = Some(vec![
+            artifact(Some("The page"), vec![shot]),
+            artifact(
+                Some("two parts"),
+                vec![
+                    Part::text("and a PDF:"),
+                    pdf,
+                    Part::url("https://x.example.com/f"),
+                ],
+            ),
+        ]);
+
+        let mut a = agent("https://billing.example.com/card", None);
+        a.files = true;
+        let sharing = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
+        let Outcome::Done(out) = sharing.outcome(&done) else {
+            panic!("the task is over");
+        };
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.content,
+            "Shared page.png (16 bytes, image/png). To show it in your answer, write \
+             ![description](page.png).\n\nand a PDF:\n\
+             Shared billing-2.pdf (8 bytes, application/pdf).\n[file at https://x.example.com/f]"
+        );
+        let names: Vec<(&str, &str)> = out
+            .artifacts
+            .iter()
+            .map(|a| (a.name.as_str(), a.file.as_ref().unwrap().filename.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [("The page", "page.png"), ("billing-2.pdf", "billing-2.pdf")]
+        );
+        assert_eq!(out.artifacts[0].file.as_ref().unwrap().bytes, PNG);
+
+        // The same task to a subagent without the key: described, nothing kept.
+        let Outcome::Done(plain) = tool().outcome(&done) else {
+            panic!("the task is over");
+        };
+        assert!(plain.artifacts.is_empty());
+        assert!(
+            plain
+                .content
+                .starts_with("[file `page.png` not included: 16 bytes, image/png]")
+        );
+    }
+
+    #[test]
+    fn a_remote_file_over_the_cap_is_not_shared_and_the_result_says_so() {
+        let mut big = Part::raw(vec![0; adam_runtime::MAX_ARTIFACT_FILE_BYTES + 1]);
+        big.media_type = Some("application/zip".into());
+        let mut done = task(TaskState::Completed, None, &[]);
+        done.artifacts = Some(vec![a2a::Artifact {
+            artifact_id: a2a::new_artifact_id(),
+            name: None,
+            description: None,
+            parts: vec![big],
+            metadata: None,
+            extensions: None,
+        }]);
+        let mut a = agent("https://billing.example.com/card", None);
+        a.files = true;
+        let tool = RemoteSubagentTool::bind(&origin(), &a, &settings(&[])).unwrap();
+        let Outcome::Done(out) = tool.outcome(&done) else {
+            panic!("the task is over");
+        };
+        assert!(out.is_error);
+        assert!(out.artifacts.is_empty());
+        assert!(
+            out.content
+                .starts_with("Not shared: a file (application/zip) of 4194305 bytes is over"),
+            "{}",
+            out.content
         );
     }
 

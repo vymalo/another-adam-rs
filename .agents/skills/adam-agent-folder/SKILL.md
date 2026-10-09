@@ -49,6 +49,8 @@ before you rely on a detail here.
    the file, and give its token through `auth: bearer:VAR` (a variable of the process, from a Secret; unset is exit
    78). Plain `http` to a service of the same cluster needs `A2A_ALLOW_INSECURE_REMOTES=true` on `adam-agent`. A
    remote under a subagent's directory (`subagents/researcher/subagents/browser.md`) is that subagent's tool.
+   `files: true` in a remote's file shares the file parts of its answer (a browser's screenshot) as files of the
+   calling run; without it they are described and dropped. A subagent's files never reach the person.
    Formats: `docs/reference/agent-files.md`; the short version is `docs/guides/write-an-agent.md`.
 4. **Built-in tools** the agent has without writing any: `ask_user`, `show`, `ui_catalog`
    (`crates/adam-ui/README.md`). Everything else comes from the folder, mainly MCP.
