@@ -11,9 +11,9 @@
 //!   "reasoningTokens": 300, "cachedInputTokens": 38000, "contextWindow": 131072}}
 //! ```
 //!
-//! A task that ended or waits (`completed`, `failed`, `canceled`, `input-required`) carries its
-//! totals in the **task's** `metadata`, for every reader (a poll, `ListTasks`, a stream's snapshot),
-//! from the `usage_totals` its agent keeps in its state:
+//! A task that ended (`completed`, `failed`, `canceled`, `rejected`) or waits (`input-required`,
+//! `auth-required`) carries its totals in the **task's** `metadata`, for every reader (a poll,
+//! `ListTasks`, a stream's snapshot), from the `usage_totals` its agent keeps in its state:
 //!
 //! ```json
 //! {"https://agents.vymalo.com/a2a/extensions/usage/v1": {"totals": [

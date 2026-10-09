@@ -82,6 +82,10 @@ config:
   # model wants. Needed by DeepSeek's thinking mode with tools, which answers a request without it
   # with a 400. On, the reasoning is stored in the run's history and is sent in every later request.
   modelEchoReasoning: ""
+  # MODEL_CONTEXT_WINDOW: the context window of `model`, in tokens, a whole number from 1 to
+  # 9007199254740991 (a number or a string of digits). Each call's usage report says it, so a screen
+  # shows how full the context is. null (default): reports carry no window. Roles that run workers only.
+  modelContextWindow: null
   # URL clients reach the JSON-RPC endpoint at (goes into the agent card).
   # Empty: the in-cluster Service URL.
   publicUrl: ""

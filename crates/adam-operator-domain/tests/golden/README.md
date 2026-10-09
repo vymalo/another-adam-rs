@@ -9,7 +9,7 @@ What the chart [`deploy/coder`](../../../../deploy/coder) of **this repository**
 |---|---|---|
 | `coder.json` | the netcup coder: topology combined, a GitHub App by owners, a per-replica `work` volume, two extra MCP servers, the sidecar | [`tools/adam-operator-parity/cases/coder.yaml`](../../../../tools/adam-operator-parity/cases/coder.yaml), equivalent to `deploy/operator/examples/coder.yaml` |
 | `coder-split.json` | the same, split: a control-plane front (2 replicas, with a budget) and 2 isolated workers | `cases/coder-split.yaml` |
-| `coder-affinity-token.json` | two affinity workers on one shared ReadWriteMany claim, a GitHub token, `createRepoOwners`, a GitHub Enterprise sidecar on port 9090, a literal gateway URL, `extraEnv`, no extra MCP servers | `cases/coder-affinity-token.yaml` |
+| `coder-affinity-token.json` | two affinity workers on one shared ReadWriteMany claim, a GitHub token, `createRepoOwners`, a GitHub Enterprise sidecar on port 9090, a literal gateway URL, the model's extra body, echoed reasoning and context window, `extraEnv`, no extra MCP servers | `cases/coder-affinity-token.yaml` |
 | `chat-env.json` | `adam-agent` for `deploy/operator/examples/chat.yaml`. **Written by hand, not rendered**: the chart renders `adam-coder` only. Derived from `bin/adam-agent/README.md` and `docker/coder/Dockerfile`; *verified 2026-10-05 by reading them, not by running the binary* | |
 
 The chart is in this repository, so the revision of a golden is the one that holds the file. Each rendered golden records

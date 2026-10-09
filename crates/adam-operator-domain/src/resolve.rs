@@ -546,6 +546,9 @@ impl<'a> Cx<'a> {
             if let Some(echo) = spec.model.echo_reasoning {
                 e.push(lit(env::MODEL_ECHO_REASONING, echo.as_str()));
             }
+            if let Some(window) = spec.model.context_window {
+                e.push(lit(env::MODEL_CONTEXT_WINDOW, window.to_string()));
+            }
             if let Some(c) = self.coder {
                 if let Some(m) = &c.opencode_model {
                     e.push(lit(env::OPENCODE_MODEL, m));

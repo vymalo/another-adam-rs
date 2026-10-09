@@ -85,6 +85,7 @@ spec:
     apiKeySecretRef:
       name: coder-secrets
       key: MODEL_API_KEY
+    # contextWindow: 1000000 # MODEL_CONTEXT_WINDOW: the model's window in tokens (1 to 2^53-1), shown with each call's usage; unset: none
   tools:
     githubMcp:
       sidecar: true

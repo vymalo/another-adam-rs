@@ -7,6 +7,9 @@ of the `adam-operator` binary ([`bin/adam-operator`](../../bin/adam-operator/REA
 **one namespace** and serves the agent registry. The CRDs are another chart, [`deploy/operator-crds`](../operator-crds/README.md)
 (a separate Argo CD app); the agents are custom resources of their own ([`examples/`](examples)), not part of this chart.
 To run an agent with it, see the guide [Run agents with the operator](../../docs/guides/run-agents-with-the-operator.md).
+Apply the CRDs chart of the same revision first: a field an older CRD does not know (`model.contextWindow`, say) is refused under
+strict field validation and dropped with a warning otherwise (*verified 2026-10-09* on kube-apiserver 1.35.8; that `kubectl apply`
+asks for strict by default is *unverified* here).
 
 ```mermaid
 flowchart LR

@@ -142,6 +142,7 @@ The values you will actually set:
 | `mcp.websearch.url`, `mcp.context7.enabled` | optional extra MCP servers, off by default |
 | `a2a.push.allowedUrls`, `a2a.cardSigning.secretName` | optional A2A push notifications (the webhooks they may reach) and a signed agent card (a Secret with the key), both off by default ([the chart](../../deploy/coder/README.md#push-notifications-and-the-cards-signature-a2a)) |
 | `config.modelExtraBody`, `config.modelEchoReasoning` | to make a model emit its reasoning |
+| `config.modelContextWindow` | the model's context window in tokens (`MODEL_CONTEXT_WINDOW`), so a screen shows how full the context is |
 | `runPods.enabled` | [below](#run-pods) |
 
 Render-time guards stop a bad combination at `helm template`, not at rollout (`templates/_validate.tpl`).

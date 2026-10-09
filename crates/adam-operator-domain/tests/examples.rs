@@ -422,6 +422,40 @@ fn an_extra_body_and_echoed_reasoning_are_literals_and_off_by_default() {
 }
 
 #[test]
+fn the_context_window_is_a_literal_of_the_workers_and_off_by_default() {
+    for name in ["coder", "chat"] {
+        let r = must_resolve(name, no_change);
+        unset(workload(&r.runtime, name), env::MODEL_CONTEXT_WINDOW);
+
+        let r = must_resolve(name, |_, c| {
+            set(c, "/spec/model/contextWindow", json!(1_000_000))
+        });
+        assert_eq!(
+            lit(workload(&r.runtime, name), env::MODEL_CONTEXT_WINDOW),
+            "1000000"
+        );
+
+        // A control plane runs no model: only the workers read it.
+        let r = must_resolve(name, |s, c| {
+            set(s, "/spec/scaling/topology", json!("split"));
+            set(
+                c,
+                "/spec/model/contextWindow",
+                json!(9_007_199_254_740_991_u64),
+            );
+        });
+        assert_eq!(
+            lit(workload(&r.runtime, name), env::MODEL_CONTEXT_WINDOW),
+            "9007199254740991"
+        );
+        unset(
+            workload(&r.runtime, &format!("{name}-front")),
+            env::MODEL_CONTEXT_WINDOW,
+        );
+    }
+}
+
+#[test]
 fn a_configured_public_url_is_used_everywhere() {
     let r = must_resolve("coder", |s, _| {
         set(

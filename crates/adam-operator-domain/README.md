@@ -56,10 +56,11 @@ replicas); a `split` one has the workers (`<svc>`, role `Worker`) and the front 
   volumes, the sidecar and the key file; the front has `ROLE`, `PUBLIC_URL`, `A2A_BEARER_TOKENS`,
   `DATABASE_URL`, `extraEnv` and (for `adam-agent`) the folder, and nothing else; a worker does not get
   `PUBLIC_URL` or the tokens (§59a, the chart's `statefulset.yaml` and `front-deployment.yaml`).
-* **The model's passthrough.** `spec.model.extraBody` (a JSON object, compact and key-sorted) is `MODEL_EXTRA_BODY` and
-  `spec.model.echoReasoning` is `MODEL_ECHO_REASONING`, both literals and neither set when left out (or `{}`), as the chart's
-  `config.modelExtraBody` and `config.modelEchoReasoning`; `validate` refuses `model`, `messages`, `tools`, `tool_choice` and
-  `stream` in the body, which the process refuses at startup too.
+* **The model's passthrough.** `spec.model.extraBody` (a JSON object, compact and key-sorted) is `MODEL_EXTRA_BODY`,
+  `spec.model.echoReasoning` is `MODEL_ECHO_REASONING` and `spec.model.contextWindow` is `MODEL_CONTEXT_WINDOW` (in
+  decimal), all literals of the workers and none set when left out (or `{}`), as the chart's `config.modelExtraBody`,
+  `config.modelEchoReasoning` and `config.modelContextWindow`; `validate` refuses `model`, `messages`, `tools`,
+  `tool_choice` and `stream` in the body, and a window outside 1 to 2^53 - 1, which the process refuses at startup too.
 * **`adam-coder`** runs the image's entrypoint and has `MCP_ALLOW_STDIO=true`, the coder's variables and
   `GITHUB_MCP_URL`; **`adam-agent`** runs `tini -- adam-agent`, has `ADAM_AGENT_DIR=/etc/adam/agent`, none
   of the coder's variables and no `MCP_ALLOW_STDIO` (the image does not set it, and `adam-agent` must refuse
@@ -111,8 +112,9 @@ checks what the reconciler needs and the schema cannot say:
   would crash-loop; v0 has no other surface. This makes the `Listed: A2ADisabled` reason unreachable in v0
   (see *Deviations*).
 * A header's Secret key must be a variable name, not one the operator sets, and not shared with a different
-  Secret; `extraEnv` names must be variable names the operator does not set; an MCP server's name is letters,
-  digits, `_` and `-` (the model sees `<name>__<tool>`; *unverified* against every gateway).
+  Secret; `extraEnv` names must be variable names the operator does not set (`MODEL_CONTEXT_WINDOW` is one: use
+  `model.contextWindow`); an MCP server's name is letters, digits, `_` and `-` (the model sees `<name>__<tool>`;
+  *unverified* against every gateway).
 * Quantities (volumes, resources, a cluster) parse; mount paths are absolute, not nested in one another or in a
   path the operator mounts; volume names are DNS labels, unique, not the operator's; `scope: agent` only.
 * Folder `files` paths are relative with no `..`, the folder is at most 1 MiB, and holds an
@@ -125,7 +127,8 @@ checks what the reconciler needs and the schema cannot say:
 * The **shape rules of the CRD's CEL** (one of two, a block that goes with a binary, the surfaces v0 does not
   serve, `front` only with `split`) are checked again, because `resolve` relies on them and an object that never
   met an API server's CEL (a test, a CRD installed without the rules) must not be resolved into something
-  half-made. `tests/validate.rs` runs every file of `examples/invalid` through `validate`.
+  half-made. `tests/validate.rs` runs every file of `examples/invalid` through `validate`. The schema's number bounds
+  (`coder.workers`, `model.contextWindow`, ...) are checked again for the same reason.
 
 ## Deviations from §59a
 
@@ -169,7 +172,7 @@ How the goldens are regenerated, and the differences that are intended:
 
 | File | What |
 |---|---|
-| `tests/examples.rs` | every row of §59a's table on `coder` and `chat`, and the variations: split, each placement, a token, a pinned installation, a cluster store, a folder from a ConfigMap, no sidecar |
+| `tests/examples.rs` | every row of §59a's table on `coder` and `chat`, and the variations: split, each placement, a token, a pinned installation, a cluster store, a folder from a ConfigMap, no sidecar, the model's passthrough (a context window on the workers only) |
 | `tests/validate.rs` | each rule refused with the field it is about; the examples accepted; every `examples/invalid` file refused |
 | `tests/digest.rs` | the digest rules above, the pinned digest and the properties |
 | `tests/secrets.rs` | the sentinel walk: no secret value in a spec |

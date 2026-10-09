@@ -22,7 +22,8 @@ GitHub Actions API); this repository holds no production evidence (see the *Amen
 
 An agent that is only a folder is [`deploy/operator/examples/chat.yaml`](../../deploy/operator/examples/chat.yaml);
 the coder is [`coder.yaml`](../../deploy/operator/examples/coder.yaml). Every secret in them is a `{name, key}`
-reference, never a value.
+reference, never a value. The model is the config's `model` block; `model.contextWindow` (tokens, `MODEL_CONTEXT_WINDOW`)
+lets each call's usage report say how full the context is.
 
 ```sh
 kubectl apply -f chat.yaml

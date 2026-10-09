@@ -146,6 +146,16 @@ Roll out the orchestrator that reads reasoning chunks (`kind: "reasoning"` of `t
 startup with the URL in it (`ModelConfig`'s `Debug` prints `base_url`, `crates/adam-service/src/config.rs`), so it reaches the pod's logs. Hiding it
 from the logs would be a Rust change; none is made here. Keep the credential, `MODEL_API_KEY`, in the same place as before.
 
+## The model's context window
+
+Each model call's `usage/v1` report can say the model's window, so a screen shows how full the context is
+([ADR 0032](../../docs/decisions/0032-usage-per-model-call.md)). Rendered only for the roles that run workers; `null` by default
+(nothing is rendered, and the default render is byte for byte `tests/golden/combined.yaml`):
+
+| Value | Variable | What |
+|---|---|---|
+| `config.modelContextWindow` | `MODEL_CONTEXT_WINDOW` | The window of `config.model`, in tokens: a whole number from 1 to 9007199254740991, as a number or a string of digits (written in full, never `1e+06`). The chart refuses anything else, which the binary would refuse at startup (exit 78), and a value given beside `config.extraEnv.MODEL_CONTEXT_WINDOW`. A subagent on another alias and OpenCode report no window |
+
 ## Topology
 
 `topology` chooses how the binary is deployed.
