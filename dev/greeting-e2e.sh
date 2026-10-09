@@ -140,10 +140,11 @@ last_state() {
 words_of() {
   jq -r --arg s "$1" 'select((.result.statusUpdate.status.state // .result.task.status.state) == $s) | [.. | .text? // empty] | join(" ")' "$tmp/events.jsonl" | tail -n 1
 }
-# The names of the artifacts the run made. The `reply` chunks are not among them: they are the
-# words of the answer sent as they are written (`text-stream/v1`), not something a tool made.
+# The names of the artifacts the run made, as updates or in the opening `task` (what the run made
+# before the subscription attached). The `reply` chunks are not among them: they are the words of
+# the answer sent as they are written (`text-stream/v1`), not something a tool made.
 artifact_names() {
-  jq -r 'select(.result.artifactUpdate and .result.artifactUpdate.artifact.name != "reply") | .result.artifactUpdate.artifact.name' "$tmp/events.jsonl" | sort -u | tr '\n' ' '
+  jq -r '(.result.artifactUpdate.artifact // empty), (.result.task.artifacts[]?) | select(.name != "reply") | .name' "$tmp/events.jsonl" | sort -u | tr '\n' ' '
 }
 
 # greets <name> <summary>: the last `send` was "Hi" and the answer is the greeting of that persona.
