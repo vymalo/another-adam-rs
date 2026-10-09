@@ -620,6 +620,133 @@ async fn a_server_that_went_away_is_an_error_result_and_the_run_goes_on() {
     assert!(!text.contains(TOKEN), "{text}");
 }
 
+// --- files ---------------------------------------------------------------------------------
+
+/// A server with `files: true`: the image of a call is a file artifact of the run (durable in its
+/// view, emitted as an event, journaled with the call) and the model reads one line about it.
+#[tokio::test]
+async fn the_files_of_a_server_with_files_true_are_artifacts_of_the_run() {
+    for (backend, store) in stores().await {
+        let server = TestHttpServer::start(Some(TOKEN)).await;
+        let root = uniq("root");
+        let files = root_files(
+            &root,
+            "tools: ['linear__screenshot']",
+            &mcp_json(&server.url(), "LINEAR_TOKEN", r#""files": true"#),
+        );
+        let def = def_of(&files)
+            .env("LINEAR_TOKEN", TOKEN)
+            .connect_mcp(&policy())
+            .await
+            .unwrap();
+        let model = Arc::new(MockModel::new());
+        model
+            .push_tool_calls(vec![call("c1", "linear__screenshot", json!({}))])
+            .push_text("Here is the page.");
+        let assembly = assemble(def, &model);
+        let sink = CollectingSink::new();
+        let rt = assembly
+            .register(Runtime::builder(store.clone()))
+            .poll_interval(std::time::Duration::from_millis(20))
+            .event_sink(sink.clone())
+            .build();
+        let worker = spawn_worker(&rt);
+        let run = rt.start(&root, user_message("go"), None).await.unwrap();
+        let view = wait_done(&rt, run).await;
+        worker.stop().await;
+
+        assert_eq!(
+            last_tool_result(&model.requests()[1], "c1"),
+            (
+                "Shared screenshot-1.png (67 bytes, image/png). To show it in your answer, write \
+                 ![description](screenshot-1.png)."
+                    .into(),
+                false
+            ),
+            "{backend}"
+        );
+        let names: Vec<&str> = view.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["screenshot-1.png"], "{backend}");
+        let file = view.artifacts[0].file.as_ref().unwrap();
+        assert_eq!(file.bytes, adam_mcp_testkit::PNG, "{backend}");
+        assert!(
+            sink.events_for(run).iter().any(|event| matches!(
+                event,
+                adam_runtime::RunEvent::Artifact { name, .. } if name == "screenshot-1.png"
+            )),
+            "{backend}: the artifact was emitted"
+        );
+        // The bytes are in the artifact, never in what the model was sent.
+        let sent = format!("{:?}", model.requests());
+        assert!(
+            !sent.contains("iVBORw0KGgo"),
+            "{backend}: the PNG reached the model"
+        );
+    }
+}
+
+/// The subagent rule of `share_file`: a file a subagent's MCP server hands over is an artifact of the
+/// subagent's own run, counted against that run's budget; only the subagent's text reaches the parent,
+/// so the parent's run (and the person) never gets the file.
+#[tokio::test]
+async fn a_subagents_files_stay_on_the_subagents_run() {
+    let server = TestHttpServer::start(Some(TOKEN)).await;
+    let root = uniq("root");
+    let mut files = vec![(
+        "agent/instructions.md".to_owned(),
+        instructions(&format!("name: {root}\ntools: []"), "You are the root."),
+    )];
+    files.push((
+        "agent/subagents/browser/instructions.md".into(),
+        instructions(
+            "description: Looks at pages.\ntools: ['linear__screenshot']",
+            "You look at pages.",
+        ),
+    ));
+    files.push((
+        "agent/subagents/browser/mcp.json".into(),
+        mcp_json(&server.url(), "LINEAR_TOKEN", r#""files": true"#),
+    ));
+    let def = def_of(&files)
+        .env("LINEAR_TOKEN", TOKEN)
+        .connect_mcp(&policy())
+        .await
+        .unwrap();
+    let model = Arc::new(MockModel::new());
+    model
+        .push_tool_calls(vec![call("c1", "browser", json!({"message": "look"}))])
+        .push_tool_calls(vec![call("s1", "linear__screenshot", json!({}))])
+        .push_text("The page is blank.")
+        .push_text("The browser says the page is blank.");
+    let assembly = assemble(def, &model);
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = common::runtime_on(&assembly, store);
+    let worker = spawn_worker(&rt);
+    let run = rt.start(&root, user_message("go"), None).await.unwrap();
+    let view = wait_done(&rt, run).await;
+    let child = rt
+        .view(adam_runtime::child_run_id(run, "c1"))
+        .await
+        .unwrap()
+        .expect("the subagent's run");
+    worker.stop().await;
+
+    assert_eq!(
+        view.output.as_ref().unwrap()["text"],
+        "The browser says the page is blank."
+    );
+    assert_eq!(
+        last_tool_result(&model.requests()[3], "c1"),
+        ("The page is blank.".into(), false),
+        "only the subagent's text comes back"
+    );
+    let on = |v: &adam_runtime::RunView| -> Vec<String> {
+        v.artifacts.iter().map(|a| a.name.clone()).collect()
+    };
+    assert_eq!(on(&child), ["screenshot-1.png"]);
+    assert!(on(&view).is_empty(), "{:?}", on(&view));
+}
+
 // --- dev reload ----------------------------------------------------------------------------
 
 #[cfg(feature = "dev")]

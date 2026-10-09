@@ -149,6 +149,66 @@ async fn mixed_content_and_is_error() {
     assert_eq!(failed.content, "failed on purpose");
 }
 
+/// A server whose entry says `files: true` hands its images and blobs to the person as files: each is
+/// a file artifact of the result and the model reads one line about it. The same server without the
+/// key describes them and keeps no byte (fail closed).
+#[tokio::test]
+async fn a_server_with_files_true_shares_its_images_and_blobs_as_files() {
+    use adam_mcp_testkit::{PDF, PNG};
+
+    let server = TestHttpServer::start(None).await;
+    let servers = connect(&http_config("browser", &server.url(), r#""files": true"#)).await;
+    let tools = servers.tools();
+
+    let shot = call(&tools, "browser__screenshot", json!({})).await;
+    assert!(!shot.is_error, "{}", shot.content);
+    assert_eq!(
+        shot.content,
+        "Shared screenshot-1.png (67 bytes, image/png). To show it in your answer, write \
+         ![description](screenshot-1.png)."
+    );
+    assert_eq!(shot.artifacts.len(), 1);
+    let artifact = &shot.artifacts[0];
+    assert_eq!(artifact.name, "screenshot-1.png");
+    assert_eq!(artifact.mime_type.as_deref(), Some("image/png"));
+    let file = artifact.file.as_ref().unwrap();
+    assert_eq!(
+        (file.filename.as_str(), file.bytes.as_slice()),
+        ("screenshot-1.png", PNG)
+    );
+
+    let pdf = call(&tools, "browser__pdf", json!({})).await;
+    assert_eq!(
+        pdf.content,
+        format!("Shared pdf-1.pdf ({} bytes, application/pdf).", PDF.len())
+    );
+    assert_eq!(pdf.artifacts[0].file.as_ref().unwrap().bytes, PDF);
+
+    // Over the cap of one file: the model is told, nothing is kept, the result is an error.
+    let big = call(
+        &tools,
+        "browser__png",
+        json!({"bytes": adam_runtime::MAX_ARTIFACT_FILE_BYTES + 1}),
+    )
+    .await;
+    assert!(big.is_error);
+    assert!(big.artifacts.is_empty());
+    assert!(
+        big.content
+            .starts_with("Not shared: a file (image/png) of 4194305 bytes is over the limit"),
+        "{}",
+        big.content
+    );
+    servers.shutdown().await;
+
+    // Without `files`, the same server's files are described and none is kept.
+    let plain = connect(&http_config("browser", &server.url(), "")).await;
+    let shot = call(&plain.tools(), "browser__screenshot", json!({})).await;
+    assert_eq!(shot.content, "[image not included: image/png]");
+    assert!(shot.artifacts.is_empty());
+    plain.shutdown().await;
+}
+
 #[tokio::test]
 async fn big_result_capped() {
     let server = TestHttpServer::start(None).await;
@@ -1322,6 +1382,7 @@ async fn an_optional_server_with_a_mistake_in_its_file_is_still_an_error() {
                 headers: Default::default(),
                 tools: None,
                 optional: true,
+                files: false,
             },
         )]),
     };

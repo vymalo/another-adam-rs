@@ -556,6 +556,71 @@ async fn the_servers_of_mcp_json_give_the_agent_their_tools() {
     worker.stop().await;
 }
 
+/// A server whose `mcp.json` entry says `files: true` (a headless browser's screenshot tool, say):
+/// the image its tool answers with reaches the A2A client as a standard file artifact, one `raw`
+/// part with its media type and filename, the shape `share_file` gives (ADR 0012, ADR 0033), and
+/// the model reads one line about it.
+#[tokio::test]
+async fn a_screenshot_of_a_files_true_server_reaches_the_a2a_client_as_a_file() {
+    let server = TestHttpServer::start(Some(MCP_TOKEN)).await;
+    let folder = chat();
+    std::fs::write(
+        folder.path().join("agent/mcp.json"),
+        format!(
+            r#"{{"mcpServers": {{"browser": {{"type": "http", "url": "{}",
+                "headers": {{"Authorization": "Bearer ${{TEST_MCP_TOKEN}}"}},
+                "tools": ["screenshot"], "files": true}}}}}}"#,
+            server.url()
+        ),
+    )
+    .unwrap();
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "m1".into(),
+        name: "browser__screenshot".into(),
+        arguments: json!({}),
+    }])
+    .push_text("Here is the page.");
+    let model: DynModel = mock.clone();
+    let store = store();
+    let agents = build(def_with_env(&folder, None), None, Some(worker_parts(model)))
+        .await
+        .expect("the folder assembles with its MCP tools");
+    let service = service_over(agents, &store);
+    let worker = Worker::start(&service);
+
+    let done = ask(&service, "show me the page").await;
+    worker.stop().await;
+    assert_eq!(said(&done), Some("Here is the page."));
+    let artifacts = done.artifacts.as_deref().unwrap_or_default();
+    let shot: Vec<&a2a::Artifact> = artifacts
+        .iter()
+        .filter(|a| a.name.as_deref() == Some("screenshot-1.png"))
+        .collect();
+    assert_eq!(shot.len(), 1, "{artifacts:?}");
+    assert_eq!(shot[0].parts.len(), 1);
+    let part = &shot[0].parts[0];
+    assert_eq!(
+        part.content,
+        a2a::PartContent::Raw(adam_mcp_testkit::PNG.to_vec())
+    );
+    assert_eq!(part.media_type.as_deref(), Some("image/png"));
+    assert_eq!(part.filename.as_deref(), Some("screenshot-1.png"));
+    match mock.requests()[1].messages.last().unwrap() {
+        adam_model::Message::Tool {
+            content, is_error, ..
+        } => assert_eq!(
+            (content.as_str(), *is_error),
+            (
+                "Shared screenshot-1.png (67 bytes, image/png). To show it in your answer, \
+                 write ![description](screenshot-1.png).",
+                false
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// What an MCP tool was given and answered is in its step (ADR 0011), under the title its server gave
 /// it, and the process's secrets are scrubbed from both: the model's key (from the configuration), a
 /// variable named like a secret (from the environment) and the token of the MCP server itself.

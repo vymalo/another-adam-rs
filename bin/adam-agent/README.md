@@ -159,6 +159,16 @@ works against a *stateless* server too (`POST /mcp` answered with JSON, no `Mcp-
 * **Which kinds of server are allowed** is the deployment's, not the file's: a local process (`command`) needs
   `MCP_ALLOW_STDIO=true`, plain `http` to another machine needs `MCP_ALLOW_INSECURE=true` (development only);
   `https` and loopback need nothing. `type: sse` is not supported.
+* **Files from a server: `"files": true`.** A server whose answers are pictures or documents (a headless
+  browser's screenshot and PDF tools) says so in its entry. Each image, audio clip and embedded blob of its
+  results is then a **file artifact of the run**, the shape `share_file` gives in `adam-coder` (one A2A `raw`
+  part with `mediaType` and `filename`), named after the tool (`browser_screenshot-1.png`), and the model reads
+  one line,
+  `Shared browser_screenshot-1.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-1.png).`
+  A file is at most 4 MiB and a run shares at
+  most 6 MiB; a subagent's files stay on the subagent's run. Without the key a file is described in a line and
+  no byte of it is kept. [ADR 0033](../../docs/decisions/0033-files-from-mcp-results-are-shared-files.md),
+  rules in [`adam-mcp`](../../crates/adam-mcp/README.md#files-files-true).
 * **A server that is down** at startup stops the process with exit 69, so a supervisor restarts it until the
   server is up; a mistake in the files or in the policy is 78. A tool call that fails later is an error result
   the model reads, not a failed run.
@@ -317,7 +327,9 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
   model is sent the folder's rendered prompt and the screen's three tools only); an edited folder says the edited words; `ask_user`
   parks the run as `input-required` and the answer resumes it; a control plane starts a run that a worker over the
   same store completes; the tools of an `mcp.json` server are offered and a call reaches the server with the
-  token from the environment; `${VAR}` in a URL is refused unless allowed; the exit code of a server that is down
+  token from the environment; **the screenshot of a `files: true` server reaches the A2A client as a file
+  artifact** (one `raw` part, `image/png`, `screenshot-1.png`) while the model reads one line; `${VAR}` in a URL is
+  refused unless allowed; the exit code of a server that is down
   (69), a refused policy and an unset variable (78); a local subagent runs as a child run; an unknown tool, a var
   without a value and a bad alias are refused at assembly; every diagnostic of a broken folder, two agents in one
   folder and a warning. **A researcher** on a stateless web-search MCP server (`tests/common`: `SearchServer`,

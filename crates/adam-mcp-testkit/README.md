@@ -18,6 +18,9 @@ client's own idea of one.
 | `fail` | none | an error result (`isError`) saying `failed on purpose` |
 | `big` | `bytes` | that many `x` (at most 8 MiB) |
 | `mixed` | none | text, an image, an audio clip, an embedded text resource, a blob and a resource link |
+| `screenshot` | none | one image block, a 1x1 PNG (`PNG`), the shape of a headless browser's screenshot tool |
+| `pdf` | none | one embedded blob resource, `application/pdf` (`PDF`), the shape of a headless browser's PDF tool |
+| `png` | `bytes` | one image block of that many bytes that start like a PNG (at most 8 MiB): a file over a cap |
 | `env` | `name` | the value of the variable in the server's environment, or `(unset)` |
 | `pid` | none | the server's process id |
 | `exit` | none | nothing: the process exits during the call |

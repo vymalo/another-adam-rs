@@ -545,6 +545,9 @@ let assembly = AgentDef::from_manifest(AGENT)?
   (the root's for the root, a subagent directory's for that subagent). They are not added to the `ToolSet` given
   to `bind`, so a subagent inherits none of its parent's, and two directories may each have a server called
   `linear`, connected separately with their own headers. `connect_mcp` walks the root and every local subagent.
+* **Files of a `files: true` server** are artifacts of the run that made the call
+  ([`adam-mcp`](../adam-mcp/README.md#files-files-true)): the root's go to the person, a subagent's stay on the
+  subagent's run with its budget, as for every artifact of a child (see *Subagents*).
 
 ### Extra MCP servers (`ADAM_EXTRA_MCP_FILE`)
 
@@ -678,7 +681,9 @@ place each:
   memory and PostgreSQL (the journal has `tool:c1`, the token is in no journal, state, event or `Debug`), a
   committed call is not repeated when a later transition is retried, a transient failure later in the turn calls
   the server again (at-least-once, documented), a server that went away is an error result and the run goes on,
-  and, with `dev`, a reload keeps the connections (one `initialize`) and refuses a changed `mcp.json`.
+  the screenshot of a `files: true` server is an artifact of the run on memory and PostgreSQL (in its view, emitted,
+  never in a model request) and one of a subagent's server stays on the subagent's run while only its text reaches
+  the parent, and, with `dev`, a reload keeps the connections (one `initialize`) and refuses a changed `mcp.json`.
 * `tests/bind.rs` also covers `mcp.json` without the feature: unconnected servers fail closed (root and
   subagent, with the file), tools given by hand bind like connected ones, a foreign tool name is refused, the
   clashes and the unknown agent.

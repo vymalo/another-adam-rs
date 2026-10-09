@@ -61,6 +61,14 @@ before you rely on a detail here.
      that is down is exit 69). A header whose `${VAR}` is empty is an error (a skip when optional).
      Naming a skipped optional server's tools in the agent's `tools:` (`search__*`) makes the folder exit 78,
      so leave an optional server's tools out of `tools:` or make the server required.
+   * `"files": true` on a server (a headless browser's screenshots and PDFs): each image, audio clip and blob
+     of its results becomes a **file artifact of the run**, the shape the coder's `share_file` gives (one A2A
+     `raw` part with `mediaType` and `filename`), named `<tool>-<n>.<ext>`; the model reads
+     `Shared browser_screenshot-1.png (84.0 KiB, image/png).` and, for an image, the Markdown that shows it
+     inline by its file name (tell an agent that shows images to use the file's name, never a path).
+     At most 4 MiB a file, 6 MiB a run; a subagent's
+     files stay on its own run. Without the key a file is described and dropped. Rules:
+     `crates/adam-mcp/README.md` ("Files"), `docs/decisions/0033-files-from-mcp-results-are-shared-files.md`.
    * **More servers without copying the folder**: `ADAM_EXTRA_MCP_FILE=/path/mcp.json`, a file in the same
      shape, is added to the folder's own `mcp.json` at startup by the roles that run workers (`adam-agent` and
      `adam-coder`, which has the shipped `github` server in its embedded copy). A name the folder already has

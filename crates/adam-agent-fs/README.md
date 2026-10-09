@@ -35,7 +35,7 @@ Directory walking uses `std::fs`, so there is no `walkdir` dependency either.
 | `Schedule` | `name` (`a/b` from the path), `cron`, `timezone`, `agent`, `prompt` |
 | `AgentFrontmatter`, `Limits`, `Card`, `ExtendedCard`, `ToolList`, `ModelRef`, `SkillSelection` | the shared agent and subagent schema; unknown keys are kept in `extra`. `Card.extended` (`ExtendedCard`: `description`, `skills`) is what an authenticated A2A caller sees on top of the public card |
 | `SkillFrontmatter`, `ScheduleFrontmatter` | the other two YAML schemas |
-| `McpConfig`, `McpServer`, `RemoteKind`, `EnvRef` | `mcp.json`; `env_references()` lists the `${VAR}` names, never values; `merged_with(extra)` adds the servers of another config and refuses a name both have (it returns the clashing names, nothing merged); `McpServer::is_optional()` is `optional: true` (a server that may be missing at startup; `McpServer`'s variants gained the field `optional`, so a struct pattern without `..` or a literal breaks) |
+| `McpConfig`, `McpServer`, `RemoteKind`, `EnvRef` | `mcp.json`; `env_references()` lists the `${VAR}` names, never values; `merged_with(extra)` adds the servers of another config and refuses a name both have (it returns the clashing names, nothing merged); `McpServer::is_optional()` is `optional: true` (a server that may be missing at startup; `McpServer`'s variants gained the field `optional`, so a struct pattern without `..` or a literal breaks); `McpServer::shares_files()` is `files: true` (the images, audio and blobs of its results are shared as files of the run, see `adam-mcp`). **Breaking:** both variants gained the field `files: bool`, so a literal or a struct pattern without `..` needs it |
 | `split_env_references(text)`, `Segment` | the one grammar of `${VAR}` / `${VAR:-default}`: a text cut into `Literal` and `Ref(EnvRef)` segments (a `${` that is not a reference stays in the literal text). `env_references()` is built on it, and so is the run-time expansion of `adam-mcp`; a property test checks that it agrees with the scanner it replaced and that the segments write back to the text. `EnvRef::written()` is the reference as written |
 | `split(text)` | the frontmatter splitter: `Split { frontmatter, body, .. }` or `SplitError::Unterminated` |
 | `parse_skill`, `parse_mcp` | the pure text-to-value parsers, for callers that hold text and not a directory |
@@ -186,7 +186,8 @@ custom agent (`.github/agents/x.agent.md`) read as subagents when copied into `s
 
 * `tests/rules.rs`: one directory per rule (75), each producing exactly one diagnostic of
   the stated severity; the valid fixture (`tests/fixtures/valid`) with none; ordering, ignore
-  rules, symbolic links, non-UTF-8 files.
+  rules, symbolic links, non-UTF-8 files; `optional` and `files` in `mcp.json` are booleans that
+  default to `false` (a string refuses the file).
 * `tests/conformance.rs`: all 75 vendored `.agents/skills/*/SKILL.md` of this repository parse
   with no error and no warning; a Claude Code agent and two Copilot agents
   (`tests/fixtures/{claude,copilot}-agents`) parse unchanged as subagents.

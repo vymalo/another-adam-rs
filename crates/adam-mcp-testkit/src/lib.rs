@@ -9,6 +9,9 @@
 //! | `fail` | none | an error result (`isError`) saying `failed on purpose` |
 //! | `big` | `bytes` | that many `x` |
 //! | `mixed` | none | text, an image, an audio clip, an embedded text resource, a blob and a resource link |
+//! | `screenshot` | none | one image block, a 1x1 PNG ([`PNG`]), as a browser's screenshot tool answers |
+//! | `pdf` | none | one embedded blob resource, `application/pdf` ([`PDF`]), as a browser's PDF tool answers |
+//! | `png` | `bytes` | one image block of that many bytes that start like a PNG (at most 8 MiB) |
 //! | `env` | `name` | the value of the variable in the server's environment, or `(unset)` |
 //! | `pid` | none | the server's process id |
 //! | `exit` | none | nothing: the process exits during the call |
@@ -24,6 +27,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use base64::Engine as _;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
@@ -41,6 +45,12 @@ mod thread_tools;
 pub use http::TestHttpServer;
 pub use logs::{LogCapture, wait_until};
 pub use thread_tools::{Call, GET_UI_CATALOG, TURN_OUTPUT, ThreadToolsServer};
+
+/// The image the `screenshot` tool answers with: a 1x1 PNG.
+pub const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\0\0\0\nIDATx\x9cc\0\x01\0\0\x05\0\x01\r\n-\xb4\0\0\0\0IEND\xaeB`\x82";
+
+/// The document the `pdf` tool answers with.
+pub const PDF: &[u8] = b"%PDF-1.4\n% a page of the test server\n%%EOF\n";
 
 /// What a server has been asked, shared by every session of it.
 #[derive(Debug, Default)]
@@ -66,7 +76,18 @@ impl TestServer {
     /// The tools this server offers, in the order it lists them.
     pub fn tool_names() -> Vec<&'static str> {
         vec![
-            "echo", "fail", "big", "mixed", "env", "pid", "exit", "slow", "a.b",
+            "echo",
+            "fail",
+            "big",
+            "mixed",
+            "screenshot",
+            "pdf",
+            "png",
+            "env",
+            "pid",
+            "exit",
+            "slow",
+            "a.b",
         ]
     }
 
@@ -100,6 +121,21 @@ impl TestServer {
             ),
             Tool::new("mixed", "Answers with every kind of content block.", none()),
             Tool::new(
+                "screenshot",
+                "Answers with an image of the page, a PNG.",
+                none(),
+            ),
+            Tool::new("pdf", "Answers with the page as a PDF resource.", none()),
+            Tool::new(
+                "png",
+                "Answers with a PNG image of `bytes` bytes.",
+                schema(json!({
+                    "type": "object",
+                    "properties": {"bytes": {"type": "integer"}},
+                    "required": ["bytes"]
+                })),
+            ),
+            Tool::new(
                 "env",
                 "Answers with the value of an environment variable of the server.",
                 schema(json!({
@@ -115,6 +151,10 @@ impl TestServer {
             Tool::new_with_raw("a.b", None, Arc::default()),
         ]
     }
+}
+
+fn base64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn text(text: impl Into<String>) -> CallToolResponse {
@@ -184,6 +224,28 @@ impl ServerHandler for TestServer {
                 }),
                 ContentBlock::resource_link(Resource::new("file:///linked.txt", "linked")),
             ]))),
+            "screenshot" => Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                ContentBlock::image(base64(PNG), "image/png"),
+            ]))),
+            "pdf" => Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                ContentBlock::resource(ResourceContents::BlobResourceContents {
+                    uri: "testkit://capture/page.pdf".into(),
+                    mime_type: Some("application/pdf".into()),
+                    blob: base64(PDF),
+                    meta: None,
+                }),
+            ]))),
+            "png" => {
+                let bytes = args
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| McpError::invalid_params("`bytes` must be an integer", None))?;
+                let mut image = PNG.to_vec();
+                image.resize(usize::try_from(bytes).unwrap_or(usize::MAX).min(8 << 20), 0);
+                Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                    ContentBlock::image(base64(&image), "image/png"),
+                ])))
+            }
             "env" => {
                 let name = string("name")?;
                 Ok(text(

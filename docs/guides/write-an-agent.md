@@ -67,9 +67,10 @@ Rules worth knowing:
 * **The agent already has** `ask_user`, `show` and `ui_catalog` (the person's screen), the tools of its MCP
   servers (`<server>__<tool>`), `load_skill` and `read_skill_file` when it has skills, and one tool per subagent.
 * **MCP**: credentials go in `headers` as `${VAR}`; `tools` is an allow-list; `"optional": true` lets a server be
-  down. Which kinds of server are allowed is the **deployment's** decision (`MCP_ALLOW_STDIO`,
-  `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS`), not the file's. `ADAM_EXTRA_MCP_FILE` adds servers without
-  copying the folder.
+  down; `"files": true` hands the images and documents its tools return (a browser's screenshot and PDF) to the
+  person as files of the run, the model reading one line each. Which kinds of server are allowed is the
+  **deployment's** decision (`MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS`), not the file's.
+  `ADAM_EXTRA_MCP_FILE` adds servers without copying the folder.
 * **Edits apply at the next start.** The folder is read once; restart, no rebuild.
 
 ## When it does not start

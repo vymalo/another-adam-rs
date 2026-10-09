@@ -1090,6 +1090,51 @@ fn optional_is_a_boolean_that_defaults_to_false() {
 }
 
 #[test]
+fn files_is_a_boolean_that_defaults_to_false_and_is_no_unknown_key() {
+    use adam_agent_fs::parse_mcp;
+    use std::path::Path;
+
+    let mut diagnostics = Vec::new();
+    let config = parse_mcp(
+        Path::new("mcp.json"),
+        r#"{"mcpServers":{
+            "browser":{"type":"http","url":"http://127.0.0.1:9222/mcp","files":true},
+            "search":{"type":"http","url":"https://s.example.com","files":false},
+            "local":{"command":"x","files":true},
+            "plain":{"command":"y"}}}"#,
+        &mut diagnostics,
+    )
+    .unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let files: Vec<(&str, bool)> = config
+        .servers
+        .iter()
+        .map(|(name, server)| (name.as_str(), server.shares_files()))
+        .collect();
+    assert_eq!(
+        files,
+        [
+            ("browser", true),
+            ("local", true),
+            ("plain", false),
+            ("search", false)
+        ]
+    );
+
+    let mut diagnostics = Vec::new();
+    let config = parse_mcp(
+        Path::new("mcp.json"),
+        r#"{"mcpServers":{"a":{"type":"http","url":"https://a.example.com","files":"yes"}}}"#,
+        &mut diagnostics,
+    );
+    assert!(config.is_none(), "not a boolean: the file is refused");
+    assert!(
+        diagnostics[0].to_string().contains("invalid JSON"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
 fn merging_adds_servers_and_refuses_a_name_both_have() {
     use adam_agent_fs::parse_mcp;
     use std::path::Path;

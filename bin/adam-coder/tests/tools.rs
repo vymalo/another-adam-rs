@@ -4976,7 +4976,11 @@ async fn share_file_returns_the_file_as_an_artifact_and_tells_the_model_one_line
     assert!(!out.is_error, "{}", out.content);
     assert_eq!(
         out.content,
-        format!("Shared chart.svg ({} bytes, image/svg+xml).", SVG.len())
+        format!(
+            "Shared chart.svg ({} bytes, image/svg+xml). To show it in your answer, write \
+             ![description](chart.svg).",
+            SVG.len()
+        )
     );
     assert_eq!(
         shared(&out),
