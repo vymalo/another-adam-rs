@@ -18,6 +18,7 @@ use adam_error::{Classify, ErrorClass, report};
 
 use crate::agent::{AgentError, Transition};
 use crate::cancel::CancelToken;
+use crate::child::news_since;
 use crate::ctx::{Ctx, CtxOutcome, CtxParts};
 use crate::envelope::Envelope;
 use crate::events::Artifact;
@@ -602,7 +603,7 @@ fn build_update(
     // Messages that arrived while stepping sit after the ones we started
     // with. A parked agent must not sleep through them.
     let arrived = cur.inbox.len() > base_inbox_len;
-    let reopened = reopens(next, arrived);
+    let reopened = reopens(next, cur, base_inbox_len);
     let (status, wake_at) = if reopened || (next.status == RunStatus::Parked && arrived) {
         (RunStatus::Runnable, None)
     } else {
@@ -631,9 +632,9 @@ fn build_update(
 }
 
 /// Whether a `Done` is committed as a step that goes on: the agent asked for it
-/// ([`Ctx::reopen_on_arrival`]) and a message arrived while it stepped.
-fn reopens(next: &Next, arrived: bool) -> bool {
-    next.reopen && arrived && next.status == RunStatus::Done
+/// ([`Ctx::reopen_on_arrival`]) and a message other than a child's notice arrived while it stepped.
+fn reopens(next: &Next, cur: &Envelope, base_inbox_len: usize) -> bool {
+    next.reopen && next.status == RunStatus::Done && news_since(&cur.inbox, base_inbox_len) > 0
 }
 
 /// Commit with CAS. A conflict caused only by messages delivered while we
@@ -672,7 +673,7 @@ async fn commit(
         let update = build_update(next, &cur_env, base.inbox.len(), base.rev)?;
         match inner.store.commit_run(run, cur_rec.version, update).await {
             Ok(rec) => {
-                if reopens(next, cur_env.inbox.len() > base.inbox.len()) {
+                if reopens(next, &cur_env, base.inbox.len()) {
                     tracing::info!(%run, "a message arrived while the run finished: the run goes on instead");
                 }
                 return Ok(Some(rec));

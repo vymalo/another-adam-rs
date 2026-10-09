@@ -11,7 +11,7 @@ use adam_core::{DynStore, JournalEntry, RunId, StoreError};
 
 use crate::agent::{AgentError, Inbound};
 use crate::cancel::CancelToken;
-use crate::child::{ChildStarter, ChildStatus};
+use crate::child::{ChildStarter, ChildStatus, news_since};
 use crate::clock::DynClock;
 use crate::envelope::Envelope;
 use crate::events::{Artifact, DynEventSink, RunEvent};
@@ -346,6 +346,11 @@ impl Ctx {
     /// [`peek_inbox`](Self::peek_inbox) do not show (they show what was there at the start), and
     /// which the next transition reads.
     ///
+    /// A child's [`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND) notice is not counted. It is a hint
+    /// for a parent that waits, and a parent that is finishing has settled its waits, from the
+    /// notice or from the store ([`child_status`](Self::child_status)). The notice still wakes a
+    /// run that parks.
+    ///
     /// **Not journaled**: it is a live read of the run's record, and a replay sees the messages
     /// that are there then. An agent that is about to finish asks it, to answer what a person said
     /// meanwhile instead of ending; [`reopen_on_arrival`](Self::reopen_on_arrival) closes the
@@ -361,7 +366,7 @@ impl Ctx {
         };
         let env = Envelope::decode(self.run, &rec.state)
             .map_err(|e| AgentError::permanent(format!("the run's record is unreadable: {e}")))?;
-        Ok(env.inbox.len().saturating_sub(self.base_inbox))
+        Ok(news_since(&env.inbox, self.base_inbox))
     }
 
     /// Ask the runtime not to finish the run past a message that arrives while this transition
@@ -375,9 +380,10 @@ impl Ctx {
     /// the state `Done` carried (its output is dropped), and the next transition reads the message
     /// before the agent can finish again. The check is made in the commit itself (the commit is a
     /// compare-and-set on the record, which a delivery changes), so no message can slip in between
-    /// the check and the commit. A `Fail`, a `Park` and a `Continue` are committed as always (a
-    /// parked run is woken by a message that arrived, as ever), and a transition that does not
-    /// call this is committed as before.
+    /// the check and the commit. A child's [`RUN_FINISHED_KIND`](crate::RUN_FINISHED_KIND) notice
+    /// does not reopen the run, as for [`arrived`](Self::arrived). A `Fail`, a `Park` and a
+    /// `Continue` are committed as always (a parked run is woken by any message that arrived,
+    /// notices included), and a transition that does not call this is committed as before.
     ///
     /// An agent that calls this promises that its next `step` reads the inbox and that stepping it
     /// again after a `Done` is harmless.

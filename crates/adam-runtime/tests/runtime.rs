@@ -83,6 +83,17 @@ fn inbound() -> Inbound {
     Inbound::new("start", json!({}))
 }
 
+/// A person's message that arrives while a run steps.
+fn late() -> Inbound {
+    Inbound::new("message", json!({"text": "late"}))
+}
+
+/// The notice of a child that finished, as the runtime sends it to the parent.
+fn finished_notice() -> Inbound {
+    Inbound::new(RUN_FINISHED_KIND, json!({"status": "done", "output": "42"}))
+        .with_id(RunId::new().to_string())
+}
+
 type StepResult = Result<Transition<Value>, AgentError>;
 type StepFn = dyn for<'a> Fn(&'a mut Ctx, Value) -> BoxFuture<'a, StepResult> + Send + Sync;
 
@@ -898,14 +909,15 @@ mod cases {
         );
     }
 
-    /// One agent for the three cases below: phase 0 holds at a gate (so a message is delivered
-    /// *during* the step), says what `Ctx::arrived` reported, and returns `Done`; phase 1 reads the
-    /// inbox and returns `Done` with what it read. `reopen` is whether it asked to go on.
+    /// One agent for the cases below: phase 0 holds at a gate (so `deliver` is delivered *during*
+    /// the step), says what `Ctx::arrived` reported, and returns `Done`; phase 1 reads the inbox and
+    /// returns `Done` with the texts it read (a child's notice has none). `reopen` is whether it
+    /// asked to go on.
     async fn finishing_agent(
         store: &DynStore,
         name: &str,
         reopen: bool,
-        deliver: bool,
+        deliver: &[Inbound],
     ) -> (Runtime, RunId, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let phase0_runs = Arc::new(AtomicUsize::new(0));
         let arrived = Arc::new(AtomicUsize::new(usize::MAX));
@@ -944,6 +956,7 @@ mod cases {
                         let texts: Vec<Value> = ctx
                             .take_inbox()
                             .into_iter()
+                            .filter(|m| m.kind != RUN_FINISHED_KIND)
                             .map(|m| m.payload["text"].clone())
                             .collect();
                         Ok(Transition::Done {
@@ -959,10 +972,8 @@ mod cases {
         let run = rt.start(name, inbound(), None).await.expect("start");
         let worker = spawn_worker(&rt);
         notified(&started, "step 0").await;
-        if deliver {
-            rt.deliver(run, Inbound::new("message", json!({"text": "late"})))
-                .await
-                .expect("deliver");
+        for message in deliver {
+            rt.deliver(run, message.clone()).await.expect("deliver");
         }
         gate.notify_one(); // only now may the step return and commit
         wait_done(&rt, run).await;
@@ -976,7 +987,7 @@ mod cases {
     /// `Ctx::arrived` said one message had come meanwhile.
     pub async fn a_done_that_asked_to_reopen_goes_on_when_a_message_arrived(store: DynStore) {
         let name = uniq("reopen");
-        let (rt, run, phase0_runs, arrived) = finishing_agent(&store, &name, true, true).await;
+        let (rt, run, phase0_runs, arrived) = finishing_agent(&store, &name, true, &[late()]).await;
         let view = rt.view(run).await.unwrap().unwrap();
         assert_eq!(view.status, RunStatus::Done);
         assert_eq!(
@@ -996,7 +1007,7 @@ mod cases {
     /// Asking to go on costs nothing when nothing arrived: the `Done` ends the run as always.
     pub async fn a_done_that_asked_to_reopen_finishes_when_nothing_arrived(store: DynStore) {
         let name = uniq("reopen-quiet");
-        let (rt, run, phase0_runs, arrived) = finishing_agent(&store, &name, true, false).await;
+        let (rt, run, phase0_runs, arrived) = finishing_agent(&store, &name, true, &[]).await;
         let view = rt.view(run).await.unwrap().unwrap();
         assert_eq!(view.status, RunStatus::Done);
         assert_eq!(view.output, Some(json!("first")));
@@ -1004,11 +1015,47 @@ mod cases {
         assert_eq!(arrived.load(SeqCst), 0);
     }
 
+    /// A child's notice that lands while the run finishes is not news: the run read its children
+    /// already (from the notice or the store), and the same notice a moment later, after the
+    /// commit, is refused. `Ctx::arrived` does not count it and the commit does not reopen the run,
+    /// so a parent that settled its wait at its timer does not take another turn (a model call)
+    /// because the child's notice raced the timer.
+    pub async fn a_childs_notice_that_lands_while_a_run_finishes_does_not_reopen_it(
+        store: DynStore,
+    ) {
+        let name = uniq("reopen-notice");
+        let (rt, run, phase0_runs, arrived) =
+            finishing_agent(&store, &name, true, &[finished_notice()]).await;
+        let view = rt.view(run).await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(view.output, Some(json!("first")), "the first answer stands");
+        assert_eq!(count(&phase0_runs), 1);
+        assert_eq!(arrived.load(SeqCst), 0, "a notice is not an arrival");
+        assert_eq!(view.pending_inbox, 1, "it stays in a run that is over");
+        let after = rt.deliver(run, finished_notice()).await;
+        assert!(
+            matches!(after, Err(RuntimeError::Finished { .. })),
+            "the same notice after the commit is refused: {after:?}"
+        );
+    }
+
+    /// A notice beside a message does not hide it: the message counts and reopens the run, alone.
+    pub async fn a_message_beside_a_childs_notice_still_reopens_the_run(store: DynStore) {
+        let name = uniq("reopen-both");
+        let (rt, run, phase0_runs, arrived) =
+            finishing_agent(&store, &name, true, &[finished_notice(), late()]).await;
+        let view = rt.view(run).await.unwrap().unwrap();
+        assert_eq!(view.status, RunStatus::Done);
+        assert_eq!(view.output, Some(json!(["late"])));
+        assert_eq!(count(&phase0_runs), 1);
+        assert_eq!(arrived.load(SeqCst), 1, "only the message counts");
+    }
+
     /// An agent that did not ask is committed exactly as before: it finishes, and the message that
     /// arrived meanwhile stays unread in a run that is over.
     pub async fn a_done_that_did_not_ask_finishes_past_a_message(store: DynStore) {
         let name = uniq("reopen-off");
-        let (rt, run, _, _) = finishing_agent(&store, &name, false, true).await;
+        let (rt, run, _, _) = finishing_agent(&store, &name, false, &[late()]).await;
         let view = rt.view(run).await.unwrap().unwrap();
         assert_eq!(view.status, RunStatus::Done);
         assert_eq!(view.output, Some(json!("first")));
@@ -4701,6 +4748,8 @@ macro_rules! runtime_suite {
                 a_done_that_asked_to_reopen_goes_on_when_a_message_arrived,
                 a_done_that_asked_to_reopen_finishes_when_nothing_arrived,
                 a_done_that_did_not_ask_finishes_past_a_message,
+                a_childs_notice_that_lands_while_a_run_finishes_does_not_reopen_it,
+                a_message_beside_a_childs_notice_still_reopens_the_run,
                 timers,
                 timers_with_manual_clock,
                 retries_back_off_then_fail,

@@ -69,9 +69,13 @@ and the next transition reads the message before the agent can finish again. `Fa
 committed as always, and a transition that did not call it is committed as before. The agent promises that its
 next `step` reads the inbox and that stepping it again after a `Done` is harmless. `Ctx::arrived()` is the live
 (not journaled) count of the messages that came during the transition, for an agent that wants to answer them
-in the same step instead of finishing and being reopened. Tests: `a_done_that_asked_to_reopen_goes_on_when_a_message_arrived`,
-`a_done_that_asked_to_reopen_finishes_when_nothing_arrived` and `a_done_that_did_not_ask_finishes_past_a_message`,
-on every store of the suite.
+in the same step instead of finishing and being reopened. Neither counts a child's `adam.run.finished` notice
+(*Child runs*): a run that finishes has settled its waits, and the same notice a moment later is refused, so a
+notice that races a parent's timer does not cost the parent another turn (a parked run is still woken by it).
+Tests: `a_done_that_asked_to_reopen_goes_on_when_a_message_arrived`,
+`a_done_that_asked_to_reopen_finishes_when_nothing_arrived`, `a_done_that_did_not_ask_finishes_past_a_message`,
+`a_childs_notice_that_lands_while_a_run_finishes_does_not_reopen_it` and
+`a_message_beside_a_childs_notice_still_reopens_the_run`, on every store of the suite.
 
 ## Starting without stepping
 

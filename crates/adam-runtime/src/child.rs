@@ -24,6 +24,19 @@ use crate::runtime::{Runtime, RuntimeError};
 /// at-least-once) recognises the second by the id, and its payload is a [`ChildStatus`].
 pub const RUN_FINISHED_KIND: &str = "adam.run.finished";
 
+/// How many of the messages in `inbox` after its first `base` a run that is finishing has to read:
+/// all of them but the [`RUN_FINISHED_KIND`] notices. A notice only saves a waiting parent its
+/// timer. A run that finishes has no wait left (it settled its waits from the notice or from the
+/// store), and the same notice delivered just after its commit is refused, so one that lands during
+/// the step must not keep the run going either.
+pub(crate) fn news_since(inbox: &[Inbound], base: usize) -> usize {
+    inbox
+        .iter()
+        .skip(base)
+        .filter(|i| i.kind != RUN_FINISHED_KIND)
+        .count()
+}
+
 /// The id of the child a parent starts for `key` (typically a tool call id), the same every time.
 ///
 /// The parent starts its child with [`Runtime::start_child`](crate::Runtime::start_child) under this

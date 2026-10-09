@@ -719,6 +719,68 @@ mod cases {
         );
     }
 
+    /// The timer and the message race: the parent wakes at its timer, reads the finished child from
+    /// the store and asks the model for its final answer, and the child's message lands during that
+    /// call. It answers nothing (the wait is settled), so the parent finishes with the answer and the
+    /// model is not asked a third time. `adam-assembly`'s remote tests met this race on PostgreSQL.
+    pub async fn a_notice_that_lands_while_the_parent_finishes_costs_no_model_turn(
+        store: DynStore,
+    ) {
+        let rig = Rig::new();
+        let gate = Arc::new(Gate::default());
+        rig.parent_script("recovered");
+        let model: DynModel = Arc::new(GateModel {
+            inner: rig.parent_mock.clone(),
+            hold_on: 1,
+            calls: AtomicUsize::new(0),
+            armed: AtomicBool::new(true),
+            gate: gate.clone(),
+        });
+        let parent_agent = LlmAgent::builder(&rig.parent_name, model, "m")
+            .tool(rig.spawn_tool(None, false))
+            .build();
+        let child_agent = rig.child("child says 42");
+        let (faulty, dynamic) = faulty(store);
+        let front = rig.front(&dynamic, &parent_agent);
+        let back = rig.back(&dynamic, &child_agent);
+        let parent = front
+            .start(&rig.parent_name, user_message("go"), None)
+            .await
+            .expect("start");
+        let child = child_run_id(parent, "c1");
+        let front_worker = spawn_worker(&front);
+        wait_parked_on_timer(&front, parent).await;
+
+        // The child's own message fails, so the parent learns of the child at its timer.
+        faulty.fail_run(Method::CommitRun, parent, 1);
+        let back_worker = spawn_worker(&back);
+        wait_done(&back, child).await;
+        wait_injected(&faulty, Method::CommitRun, 1, "the message to fail").await;
+        back_worker.stop().await;
+
+        rig.clock.advance(Duration::from_secs(61));
+        notified(&gate.reached, "the parent's final model call").await;
+        front
+            .deliver(parent, notice(child, child_said("child says 42")))
+            .await
+            .expect("the late message");
+        gate.release.notify_one();
+        let end = wait_for(&front, parent, "the end", |v| v.status.is_terminal()).await;
+        front_worker.stop().await;
+
+        assert_eq!(end.status, RunStatus::Done, "{end:#?}");
+        assert_eq!(end.output.clone().expect("output")["text"], "recovered");
+        assert_eq!(
+            rig.parent_mock.requests().len(),
+            2,
+            "the model is not asked again"
+        );
+        assert_eq!(
+            tool_results(&conversation(&end)),
+            vec![("c1".into(), "child says 42".into(), false)]
+        );
+    }
+
     /// A failing child is an error result: the model sees why and the run goes on.
     pub async fn a_failing_child_is_an_error_result(store: DynStore) {
         let rig = Rig::new();
@@ -1251,6 +1313,7 @@ macro_rules! child_suite {
                 a_duplicate_notice_is_ignored,
                 a_lost_notice_is_recovered_when_the_timer_fires,
                 a_lost_terminal_ack_is_recovered_when_the_timer_fires,
+                a_notice_that_lands_while_the_parent_finishes_costs_no_model_turn,
                 a_failing_child_is_an_error_result,
                 a_cancelled_child_is_an_error_result,
                 cancelling_the_parent_leaves_the_child_running,
