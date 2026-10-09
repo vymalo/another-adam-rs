@@ -1,7 +1,7 @@
 # examples/coder.yaml changed to: two workers with workspacePlacement: affinity on one shared
 # ReadWriteMany volume, a GitHub token instead of the App, createRepoOwners, a GitHub Enterprise host
-# for the sidecar on port 9090, a literal gateway URL, a model extra body and echoed reasoning, extraEnv,
-# and no extra MCP servers.
+# for the sidecar on port 9090, a literal gateway URL, a model extra body, echoed reasoning and a context
+# window, extraEnv, and no extra MCP servers.
 fullnameOverride: coder
 image:
   tag: sha-4363924
@@ -17,6 +17,7 @@ config:
     chat_template_kwargs:
       enable_thinking: true
   modelEchoReasoning: reasoning_content
+  modelContextWindow: 1000000
   publicUrl: https://coder.example.com/
   workers: 4
   maxCheckCycles: 3

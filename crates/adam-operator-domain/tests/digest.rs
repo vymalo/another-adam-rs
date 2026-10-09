@@ -183,6 +183,14 @@ fn what_a_pod_runs_rolls_the_pods() {
             Box::new(|_, c| set(c, "/spec/model/model", json!("other"))),
         ),
         (
+            "a context window",
+            Box::new(|_, c| set(c, "/spec/model/contextWindow", json!(1_000_000))),
+        ),
+        (
+            "another context window",
+            Box::new(|_, c| set(c, "/spec/model/contextWindow", json!(131_072))),
+        ),
+        (
             "an MCP server's URL",
             Box::new(|_, c| {
                 set(

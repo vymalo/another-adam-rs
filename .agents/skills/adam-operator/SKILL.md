@@ -54,7 +54,7 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
    `configMapRef`) and no `coder` block. `adam-coder` takes `agent.embedded: {}` and the `coder` block
    (`github.app` or `github.token`, never both): `deploy/operator/examples/coder.yaml`. Optional: `tools`
    (`mcpServers`, `allowInsecureHttp`, `githubMcp`), `environment` (`resources`, `volumes`), `security`,
-   `extraEnv`, `model.extraBody`.
+   `extraEnv`, `model.extraBody`, `model.contextWindow` (the model's window in tokens, `MODEL_CONTEXT_WINDOW`).
 4. **Write the `AgentService`.** Required: `configRef.name` (same namespace) and `store.postgres`;
    `interfaces.a2a` is required (so is `interfaces`), is on unless `enabled: false`, and needs its token: a CEL rule refuses it without `bearerTokensSecretRef`. A folder agent, trimmed from `deploy/operator/examples/chat.yaml`:
 

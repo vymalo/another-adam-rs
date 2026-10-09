@@ -27,9 +27,14 @@ let crds: Vec<CustomResourceDefinition> = adam_operator_api::crds(); // AgentCon
 | `condition_type`, `reason` | The condition types and reasons of §59a, "Status", as constants, so the controller and its tests do not spell them twice |
 | `crds()` | The two `CustomResourceDefinition`s, in a fixed order |
 | `GROUP`, `VERSION` | `agents.vymalo.com`, `v1alpha1` |
+| `MAX_CONTEXT_WINDOW` | 2^53 - 1, the largest `model.contextWindow` |
 
-`spec.model` also carries `extraBody` (a free-form object, `MODEL_EXTRA_BODY`) and `echoReasoning`
-(`reasoning_content` or `reasoning`, `MODEL_ECHO_REASONING`): not secrets, both optional.
+`spec.model` also carries `extraBody` (a free-form object, `MODEL_EXTRA_BODY`), `echoReasoning`
+(`reasoning_content` or `reasoning`, `MODEL_ECHO_REASONING`) and `contextWindow` (the model's window in tokens,
+`MODEL_CONTEXT_WINDOW`): not secrets, all optional. `contextWindow` is a `u64`; in the schema an integer of
+`format: int64` (the CRDs' integers are `int32` or `int64`, not schemars' `uint64`) from `minimum: 1` to `maximum: 9007199254740991`
+(`MAX_CONTEXT_WINDOW`, what adam accepts). Those bounds are the schema's, as for every number of this crate, not CEL
+rules, so they have no invalid example: `kube-cel` does not check them, an API server does.
 
 Optional settings of `adam-coder` are `Option`s: a field left out is not set, and the binary's own
 default applies (the operator does not copy adam's defaults). The defaults the schema does apply
@@ -67,7 +72,8 @@ the `githubMcp` port beyond its 1 to 65535 range (the range is also in the schem
 `cargo test -p adam-operator-api`:
 
 - `tests/crds.rs`: the identity of the two CRDs, every rule above is in the generated schema, the
-  schema has no rule the tests do not know, and no string field is named like a secret.
+  schema has no rule the tests do not know, no string field is named like a secret, and
+  `model.contextWindow` is an optional integer from 1 to 2^53 - 1 that round-trips and is not written when absent.
 - `tests/examples.rs`: the examples round-trip through the types and **lose nothing** (a misspelt
   field would be dropped silently by serde); the valid ones pass every CEL rule; each invalid one
   is refused with the message it states; every rule has an invalid example.

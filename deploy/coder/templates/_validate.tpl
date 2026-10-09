@@ -156,6 +156,15 @@ from service.yaml, which every render contains, so they always run.
 {{- if and .Values.config.modelEchoReasoning (hasKey .Values.config.extraEnv "MODEL_ECHO_REASONING") -}}
 {{- fail "config.modelEchoReasoning is set and config.extraEnv sets MODEL_ECHO_REASONING: set one" -}}
 {{- end -}}
+{{- /* config.modelContextWindow: a whole number of tokens from 1 to 2^53 - 1, which the binary would otherwise refuse with exit 78. */ -}}
+{{- with include "coder.modelContextWindow" . -}}
+{{- if or (not (regexMatch "^[1-9][0-9]{0,15}$" .)) (gt (int64 .) 9007199254740991) -}}
+{{- fail (printf "config.modelContextWindow must be a whole number of tokens from 1 to 9007199254740991, like 1000000, got %q" .) -}}
+{{- end -}}
+{{- if hasKey $.Values.config.extraEnv "MODEL_CONTEXT_WINDOW" -}}
+{{- fail "config.modelContextWindow is set and config.extraEnv sets MODEL_CONTEXT_WINDOW: set one" -}}
+{{- end -}}
+{{- end -}}
 {{- /* config.modelBaseUrlFromSecret: MODEL_BASE_URL from the ExternalSecret, not from config.modelBaseUrl. */ -}}
 {{- if not (kindIs "bool" .Values.config.modelBaseUrlFromSecret) -}}
 {{- fail (printf "config.modelBaseUrlFromSecret must be true or false, got %q" (toString .Values.config.modelBaseUrlFromSecret)) -}}

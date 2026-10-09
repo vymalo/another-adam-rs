@@ -33,6 +33,8 @@ pub mod env {
     pub const MODEL_EXTRA_BODY: &str = "MODEL_EXTRA_BODY";
     /// `reasoning_content` or `reasoning`: send earlier reasoning back under that name.
     pub const MODEL_ECHO_REASONING: &str = "MODEL_ECHO_REASONING";
+    /// The model's context window, in tokens: what each usage report says as its window.
+    pub const MODEL_CONTEXT_WINDOW: &str = "MODEL_CONTEXT_WINDOW";
     /// The alias OpenCode uses.
     pub const OPENCODE_MODEL: &str = "OPENCODE_MODEL";
     /// Runs advanced at once, per process.
@@ -97,6 +99,7 @@ pub mod env {
         MODEL,
         MODEL_EXTRA_BODY,
         MODEL_ECHO_REASONING,
+        MODEL_CONTEXT_WINDOW,
         OPENCODE_MODEL,
         WORKERS,
         MAX_CHECK_CYCLES,

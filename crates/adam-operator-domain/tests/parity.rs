@@ -417,6 +417,7 @@ fn affinity_token(service: &mut Value, config: &mut Value) {
         "/spec/model/echoReasoning",
         json!("reasoning_content"),
     );
+    set(config, "/spec/model/contextWindow", json!(1_000_000));
     set(
         config,
         "/spec/extraEnv",
