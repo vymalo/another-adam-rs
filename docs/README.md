@@ -69,6 +69,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0029](decisions/0029-adam-rs-has-an-operator.md) | adam-rs ships the Kubernetes operator of `AgentService` and `AgentConfig`, moved from the platform repository |
 | [0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md) | A2A push notifications, `ListTasks`, the extended card and card signatures |
 | [0031](decisions/0031-swagger-ui-and-the-a2a-rest-binding.md) | the A2A HTTP+JSON binding beside JSON-RPC, and Swagger UI at `/docs` |
+| [0032](decisions/0032-usage-per-model-call.md) | `usage/v1`: the tokens of each model call, a subagent's apart, and a task's totals |
 
 ## Keeping these docs short and true
 

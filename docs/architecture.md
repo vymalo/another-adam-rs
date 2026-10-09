@@ -368,6 +368,48 @@ Rules this diagram cannot show:
 Follow-ups, `referenceTaskIds`, steering, steps and streamed text are in the
 [A2A server reference](reference/a2a-server.md).
 
+### The tokens of each model call
+
+A completed model call is a `RunEvent::Usage`, sent to the client as a `usage/v1` report when its request activated the
+extension; a subagent's call is an event of the **root** run, under the root's step that started it; the totals ride in the
+agent's state and are written on the task when it ends or waits ([ADR 0032](decisions/0032-usage-per-model-call.md),
+`crates/adam-llm-agent/src/agent.rs`, `crates/adam-a2a-runtime/src/usage.rs`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as A2A client
+    participant B as RuntimeTaskBackend<br/>adam-a2a-runtime
+    participant K as BroadcastSink
+    participant P as LlmAgent, root run
+    participant X as LlmAgent, child run
+    participant M as ModelClient
+    participant DB as Store
+
+    C->>B: SendStreamingMessage, A2A-Extensions usage/v1
+    B->>K: subscribe_run(root)
+    P->>M: stream(request) in the step model:0
+    M-->>P: Finished, with usage
+    P->>DB: journal_put model:0, response and call id
+    P->>K: emit_for(root, Usage)
+    K-->>B: Usage
+    B-->>C: working, no message, report in the event's metadata
+    P->>X: start_child, first message names root_run and root_step
+    X->>M: stream(request) in the step model:0
+    M-->>X: Finished, with usage
+    X->>K: emit_for(root, Usage under root_step)
+    K-->>B: Usage
+    B-->>C: working, report with stepId
+    X->>DB: commit Done, usage_totals in the state
+    P->>DB: child_state(child), its totals added
+    P->>DB: commit Done, usage_totals in the state
+    B->>DB: view(root)
+    B-->>C: completed, and GetTask and ListTasks carry the totals
+```
+
+Nothing new is stored: the totals are the agent's state, which every store keeps. A call of a try that is retried, of a
+turn a cancel drops, of a remote subagent or of OpenCode is in no total (the ADR says why).
+
 ### Swagger UI and the REST binding
 
 Every agent serves A2A 1.0 twice over the same `BackendHandler`: JSON-RPC at `POST /` and HTTP+JSON at the paths of

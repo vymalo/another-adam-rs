@@ -62,7 +62,8 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
 4. **Configuration** is the host's: `adam-host` never reads the environment. With
    `adam-service` the variables are `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS` (fail closed:
    none, no A2A server), `PUBLIC_URL`, `LISTEN_ADDR`, `WORKERS`, `WORKER_ID`, `MODEL_BASE_URL`,
-   `MODEL_API_KEY`, `MODEL` (`crates/adam-service/README.md`, "Environment"). Parse yours with
+   `MODEL_API_KEY`, `MODEL`, and the optional `MODEL_CONTEXT_WINDOW` (the window a `usage/v1` report says for the alias
+   `MODEL`) (`crates/adam-service/README.md`, "Environment"). Parse yours with
    `parse_or`, `parse_flag` into the same list of problems.
 5. **Exit codes**: map a failed `serve` with `adam_service::exit_code` (78 configuration, 69
    dependency down, 71 OS, 70 internal) so a supervisor can tell restartable from not.
@@ -89,6 +90,12 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
 * `ADAM_AGENT_DIR`, `ROLE` and the other variable names belong to the binaries and
   `adam-service`; a host of your own owns its names.
 * A required trait method added at a later rev breaks implementers (`adam-upgrade`).
+* `RunEvent` is not `#[non_exhaustive]`: a host that `match`es the events it observes needs an arm for each new one. Since
+  ADR 0032 that includes `RunEvent::Usage` (one per completed model call); a **subagent's** report is an event of the
+  **root** run (`Emitter::emit_for`), not of the child's, under the root's step it ran under. A model client of your own says
+  its `provider()` and `context_window(alias)` (both default to none), and a hand-written agent that wants the task's totals
+  on its A2A task keeps `usage_totals` (`adam_runtime::UsageTotals`) in its state
+  (`docs/decisions/0032-usage-per-model-call.md`).
 
 ## See also
 
