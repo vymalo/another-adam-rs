@@ -70,6 +70,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md) | A2A push notifications, `ListTasks`, the extended card and card signatures |
 | [0031](decisions/0031-swagger-ui-and-the-a2a-rest-binding.md) | the A2A HTTP+JSON binding beside JSON-RPC, and Swagger UI at `/docs` |
 | [0032](decisions/0032-usage-per-model-call.md) | `usage/v1`: the tokens of each model call, a subagent's apart, and a task's totals |
+| [0033](decisions/0033-files-from-mcp-results-are-shared-files.md) | `files: true` on an MCP server or a remote subagent: the files of its answers are shared files of the calling run |
 
 ## Keeping these docs short and true
 

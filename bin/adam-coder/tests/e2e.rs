@@ -719,7 +719,11 @@ async fn the_coder_shares_the_svg_it_made_as_an_a2a_file_artifact(store: DynStor
         .expect("a result for share_file");
     assert_eq!(
         told,
-        format!("Shared dot.svg ({} bytes, image/svg+xml).", SVG.len())
+        format!(
+            "Shared dot.svg ({} bytes, image/svg+xml). To show it in your answer, write \
+             ![description](dot.svg).",
+            SVG.len()
+        )
     );
     let everything = serde_json::to_string(&requests).unwrap();
     assert!(

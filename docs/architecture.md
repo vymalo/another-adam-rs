@@ -113,6 +113,7 @@ flowchart TB
     asm -.-> a2a
     mcp --> llm
     mcp --> agentfs
+    mcp --> rt
     llm --> rt
     llm --> model
     rt --> core

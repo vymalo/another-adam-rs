@@ -335,6 +335,8 @@ pub struct EmbeddedRemote {
     pub url: &'static str,
     /// Credentials, if the agent needs them.
     pub auth: Option<EmbeddedAuth>,
+    /// `files: true`: the file parts of the agent's answer are shared as files of the calling run.
+    pub files: bool,
     /// The body of the file, which extends the tool description.
     pub note: &'static str,
     /// The file, relative to the source root.
@@ -352,6 +354,7 @@ impl EmbeddedRemote {
                 .map(|EmbeddedAuth::Bearer { env }| RemoteAuth::Bearer {
                     env: env.to_owned(),
                 }),
+            files: self.files,
             note: self.note.to_owned(),
             path: PathBuf::from(self.path),
         }
@@ -592,6 +595,7 @@ mod tests {
                 description: "Bills.",
                 url: "https://billing.example.com/card.json",
                 auth: Some(EmbeddedAuth::Bearer { env: "TOKEN" }),
+                files: true,
                 note: "",
                 path: "agent/subagents/billing.md",
             })],
@@ -621,6 +625,7 @@ mod tests {
                 env: "TOKEN".into()
             })
         );
+        assert!(r.files);
         assert_eq!(agent.schedules[0].name, "daily");
     }
 }

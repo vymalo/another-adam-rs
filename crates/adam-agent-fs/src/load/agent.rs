@@ -58,6 +58,7 @@ pub(crate) enum FileKind {
 pub(crate) struct RemoteSpec {
     pub(crate) url: String,
     pub(crate) auth: Option<RemoteAuth>,
+    pub(crate) files: bool,
 }
 
 /// One agent file, read.
@@ -108,6 +109,13 @@ pub(crate) fn parse_agent_file(
         );
     }
 
+    if fm.files.is_some() && fm.a2a.is_none() {
+        sink.warn(
+            key_line(&split, "files"),
+            "`files` is for a remote subagent (`a2a`) and is ignored here; an MCP server takes \
+             `\"files\": true` in `mcp.json`",
+        );
+    }
     let remote = if kind == FileKind::Sub {
         remote_spec(sink, &split, &fm)
     } else {
@@ -431,5 +439,6 @@ fn remote_spec(
     Some(RemoteSpec {
         url: url.to_owned(),
         auth,
+        files: fm.files.unwrap_or(false),
     })
 }

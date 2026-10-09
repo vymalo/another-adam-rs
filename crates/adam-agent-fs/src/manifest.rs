@@ -93,11 +93,19 @@ pub struct RemoteAgent {
     pub url: String,
     /// Credentials, if the agent needs them.
     pub auth: Option<RemoteAuth>,
+    /// `files: true`: the file parts of the agent's answer are shared as files of the calling run.
+    /// Left out of the JSON (and so of the digest) when `false`.
+    #[serde(skip_serializing_if = "is_false")]
+    pub files: bool,
     /// The body of the file, if any: it extends the tool description.
     pub note: String,
     /// The file, relative to the source root.
     #[serde(serialize_with = "portable_path")]
     pub path: PathBuf,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A subagent: a local agent of its own, or a remote A2A agent.

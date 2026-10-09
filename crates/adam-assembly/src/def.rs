@@ -289,11 +289,14 @@ impl AgentDef {
         self
     }
 
-    /// Allow remote subagents at plain `http` URLs that are not this machine. **Development
-    /// only:** the messages and the bearer token cross the network in the clear. Off by default:
-    /// `bind` refuses such a URL with [`Error::RemoteUrl`], and the client refuses an agent card
-    /// that offers such an interface. `localhost`, `*.localhost` and loopback addresses never need
-    /// it.
+    /// Allow remote subagents at plain `http` URLs that are not this machine: for development, or
+    /// a service of the same cluster (`A2A_ALLOW_INSECURE_REMOTES` in `adam-agent`). **The messages
+    /// and the bearer token cross the network in clear text**, so the network must be trusted on
+    /// its own (a NetworkPolicy that admits only the caller, or a mesh with mTLS). Even then a card
+    /// cannot widen it: an `https` card is never answered with a plain-`http` interface, and plain
+    /// `http` goes only to the card's own host. Off by default: `bind` refuses such a URL with
+    /// [`Error::RemoteUrl`], and the client refuses an agent card that offers such an interface.
+    /// `localhost`, `*.localhost` and loopback addresses never need it.
     #[must_use]
     pub fn allow_insecure_remotes(mut self, allow: bool) -> Self {
         self.remote.allow_insecure = allow;

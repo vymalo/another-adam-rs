@@ -147,6 +147,7 @@ impl McpServers {
             allow,
             call_timeout,
             per_call,
+            files,
         } = plan;
         let name = recipe.server.clone();
         let (target, listed) = match per_call {
@@ -178,6 +179,7 @@ impl McpServers {
                     s.title,
                     target.clone(),
                     call_timeout,
+                    files,
                 ))
             })
             .collect();
@@ -240,6 +242,8 @@ struct Plan {
     call_timeout: std::time::Duration,
     /// Set for a remote server the deployment bound to a bearer per call.
     per_call: Option<PerCall>,
+    /// `files: true`: the files of its results are shared.
+    files: bool,
 }
 
 impl Plan {
@@ -403,6 +407,7 @@ impl Plan {
             allow,
             call_timeout: policy.call_timeout_value(),
             per_call,
+            files: server.shares_files(),
         })
     }
 }
@@ -695,6 +700,7 @@ mod tests {
             headers: Default::default(),
             tools: None,
             optional: false,
+            files: false,
         }
     }
 
@@ -715,6 +721,7 @@ mod tests {
             env: Default::default(),
             tools: None,
             optional: false,
+            files: false,
         };
         // The refusal is a plan error: nothing was started, and the command was never looked up.
         let error = plan_error(stdio, &McpPolicy::default());
@@ -731,6 +738,7 @@ mod tests {
             headers,
             tools: None,
             optional: false,
+            files: false,
         };
         let env = Env::new()
             .var("MCP_TOKEN", "tok-4c1e9d7a")
@@ -798,6 +806,7 @@ mod tests {
             headers,
             tools: None,
             optional: false,
+            files: false,
         };
         assert!(Plan::new("srv", &server, &env, &McpPolicy::default()).is_ok());
     }
@@ -840,6 +849,7 @@ mod tests {
             headers,
             tools: None,
             optional: false,
+            files: false,
         };
         let error = plan_error(server, &McpPolicy::default());
         assert!(matches!(&error, Error::Header { header, .. } if header == "Authorization"));

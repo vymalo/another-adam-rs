@@ -297,7 +297,7 @@ impl Endpoint {
         let _ = service.close_with_timeout(CLOSE_GRACE).await;
         match called {
             Ok(Ok(CallToolResponse::Complete(result))) => {
-                let output = map_result(&result, &self.recipe.redactor);
+                let output = map_result(&result, &self.recipe.redactor, None);
                 let structured = result.structured_content.clone().map(|mut v| {
                     scrub_value(&self.recipe.redactor, &mut v);
                     v

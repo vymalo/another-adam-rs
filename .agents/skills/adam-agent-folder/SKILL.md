@@ -45,6 +45,13 @@ before you rely on a detail here.
 3. **Body**: the system prompt. Optional `skills/<name>/SKILL.md` (Agent Skills format, loaded on
    demand by `load_skill` and `read_skill_file`) and `subagents/` (each one tool of the parent, a
    child run with only the tools it lists and never `ask_user`; registered as `<name>/<subagent>`).
+   A subagent file with `a2a: <agent-card URL>` is a **remote subagent** (another A2A agent): render the URL into
+   the file, and give its token through `auth: bearer:VAR` (a variable of the process, from a Secret; unset is exit
+   78). Plain `http` to a service of the same cluster needs `A2A_ALLOW_INSECURE_REMOTES=true` on `adam-agent`, and
+   then the bearer crosses the pod network in clear text: add a NetworkPolicy or mesh mTLS. A
+   remote under a subagent's directory (`subagents/researcher/subagents/browser.md`) is that subagent's tool.
+   `files: true` in a remote's file shares the file parts of its answer (a browser's screenshot) as files of the
+   calling run; without it they are described and dropped. A subagent's files never reach the person.
    Formats: `docs/reference/agent-files.md`; the short version is `docs/guides/write-an-agent.md`.
 4. **Built-in tools** the agent has without writing any: `ask_user`, `show`, `ui_catalog`
    (`crates/adam-ui/README.md`). Everything else comes from the folder, mainly MCP.
@@ -61,6 +68,14 @@ before you rely on a detail here.
      that is down is exit 69). A header whose `${VAR}` is empty is an error (a skip when optional).
      Naming a skipped optional server's tools in the agent's `tools:` (`search__*`) makes the folder exit 78,
      so leave an optional server's tools out of `tools:` or make the server required.
+   * `"files": true` on a server (a headless browser's screenshots and PDFs): each image, audio clip and blob
+     of its results becomes a **file artifact of the run**, the shape the coder's `share_file` gives (one A2A
+     `raw` part with `mediaType` and `filename`), named `<tool>-<hash>.<ext>`; the model reads
+     `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png).` and, for an image, the Markdown that shows it
+     inline by its file name (tell an agent that shows images to use the file's name, never a path).
+     At most 4 MiB a file, 6 MiB a run; a subagent's
+     files stay on its own run. Without the key a file is described and dropped. Rules:
+     `crates/adam-mcp/README.md` ("Files"), `docs/decisions/0033-files-from-mcp-results-are-shared-files.md`.
    * **More servers without copying the folder**: `ADAM_EXTRA_MCP_FILE=/path/mcp.json`, a file in the same
      shape, is added to the folder's own `mcp.json` at startup by the roles that run workers (`adam-agent` and
      `adam-coder`, which has the shipped `github` server in its embedded copy). A name the folder already has

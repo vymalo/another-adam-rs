@@ -765,6 +765,51 @@ async fn a_run_may_share_only_so_many_bytes_of_files() {
     assert!(told[1].0.contains("6 MiB"), "{told:?}");
 }
 
+/// Every call is told what the run may still share (`ToolCtx::files_left`): the whole 6 MiB at
+/// first, then less what the run kept.
+#[tokio::test]
+async fn a_call_is_told_what_the_run_may_still_share() {
+    use adam_runtime::MAX_RUN_FILE_BYTES;
+
+    let h = Harness::new();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let agent = h
+        .agent()
+        .tool(AsyncTool(move |ctx: ToolCtx| {
+            let record = Arc::clone(&record);
+            async move {
+                let mut seen = record.lock().unwrap();
+                seen.push(ctx.files_left());
+                let nth = seen.len();
+                Ok(ToolOutput::text("a file").with_artifact(
+                    Artifact::file(
+                        format!("f{nth}"),
+                        "application/octet-stream",
+                        format!("f{nth}.bin"),
+                        vec![0; 1024 * 1024],
+                    )
+                    .unwrap(),
+                ))
+            }
+        }))
+        .build();
+    h.mock
+        .push_tool_calls(vec![call("c1", "async_tool", json!({}))])
+        .push_tool_calls(vec![call("c2", "async_tool", json!({}))])
+        .push_text("done");
+    let rt = h.runtime(&agent);
+    let run = rt
+        .start("llm", user_message("two files"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+    let all = MAX_RUN_FILE_BYTES as u64;
+    assert_eq!(*seen.lock().unwrap(), [all, all - 1024 * 1024]);
+}
+
 /// A tool named `async_tool` backed by an async closure.
 struct AsyncTool<F>(F);
 

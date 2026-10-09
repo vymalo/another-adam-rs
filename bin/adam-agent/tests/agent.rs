@@ -556,6 +556,79 @@ async fn the_servers_of_mcp_json_give_the_agent_their_tools() {
     worker.stop().await;
 }
 
+/// A server whose `mcp.json` entry says `files: true` (a headless browser's screenshot tool, say):
+/// the image its tool answers with reaches the A2A client as a standard file artifact, one `raw`
+/// part with its media type and filename, the shape `share_file` gives (ADR 0012, ADR 0033), and
+/// the model reads one line about it.
+#[tokio::test]
+async fn a_screenshot_of_a_files_true_server_reaches_the_a2a_client_as_a_file() {
+    let server = TestHttpServer::start(Some(MCP_TOKEN)).await;
+    let folder = chat();
+    std::fs::write(
+        folder.path().join("agent/mcp.json"),
+        format!(
+            r#"{{"mcpServers": {{"browser": {{"type": "http", "url": "{}",
+                "headers": {{"Authorization": "Bearer ${{TEST_MCP_TOKEN}}"}},
+                "tools": ["screenshot"], "files": true}}}}}}"#,
+            server.url()
+        ),
+    )
+    .unwrap();
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![ToolCall {
+        id: "m1".into(),
+        name: "browser__screenshot".into(),
+        arguments: json!({}),
+    }])
+    .push_text("Here is the page.");
+    let model: DynModel = mock.clone();
+    let store = store();
+    let agents = build(def_with_env(&folder, None), None, Some(worker_parts(model)))
+        .await
+        .expect("the folder assembles with its MCP tools");
+    let service = service_over(agents, &store);
+    let worker = Worker::start(&service);
+
+    let done = ask(&service, "show me the page").await;
+    worker.stop().await;
+    assert_eq!(said(&done), Some("Here is the page."));
+    let artifacts = done.artifacts.as_deref().unwrap_or_default();
+    let shot: Vec<&a2a::Artifact> = artifacts
+        .iter()
+        .filter(|a| {
+            a.name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("screenshot-"))
+        })
+        .collect();
+    assert_eq!(shot.len(), 1, "{artifacts:?}");
+    assert_eq!(shot[0].parts.len(), 1);
+    let part = &shot[0].parts[0];
+    assert_eq!(
+        part.content,
+        a2a::PartContent::Raw(adam_mcp_testkit::PNG.to_vec())
+    );
+    assert_eq!(part.media_type.as_deref(), Some("image/png"));
+    let name = part.filename.clone().unwrap();
+    assert!(name.ends_with(".png") && shot[0].name.as_deref() == Some(name.as_str()));
+    match mock.requests()[1].messages.last().unwrap() {
+        adam_model::Message::Tool {
+            content, is_error, ..
+        } => assert_eq!(
+            (content.as_str(), *is_error),
+            (
+                format!(
+                    "Shared {name} (67 bytes, image/png). To show it in your answer, write \
+                     ![description]({name})."
+                )
+                .as_str(),
+                false
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// What an MCP tool was given and answered is in its step (ADR 0011), under the title its server gave
 /// it, and the process's secrets are scrubbed from both: the model's key (from the configuration), a
 /// variable named like a secret (from the environment) and the token of the MCP server itself.
@@ -1199,6 +1272,55 @@ async fn files_that_disagree_with_the_code_are_refused_at_assembly() {
     let error = refuse(assistant(), "two words").await;
     assert!(matches!(error, AgentError::Assembly(_)), "{error}");
     assert_eq!(exit_code(&error), 78);
+}
+
+/// A remote subagent a deployment points at: the chart renders the folder with the agent's URL in
+/// `a2a:`, and its token comes from the environment through `auth: bearer:VAR`, never from a file.
+/// An unset variable and an in-cluster plain-`http` URL are the deployment's mistakes (78) until it
+/// gives the token and says plain `http` is fine (`A2A_ALLOW_INSECURE_REMOTES`, which `serve` turns
+/// into `AgentDef::allow_insecure_remotes`).
+#[tokio::test]
+async fn a_remote_subagent_a_deployment_points_at() {
+    let folder = chat();
+    std::fs::create_dir_all(folder.path().join("agent/subagents")).unwrap();
+    std::fs::write(
+        folder.path().join("agent/subagents/browser.md"),
+        "---\ndescription: Reads web pages and takes screenshots.\n\
+         a2a: http://browser.agents.svc:8080/.well-known/agent-card.json\n\
+         auth: bearer:BROWSER_A2A_TOKEN\n---\n",
+    )
+    .unwrap();
+    let model: DynModel = Arc::new(MockModel::new());
+    let attempt = |def: AgentDef| {
+        let model = model.clone();
+        async move { build(def, None, Some(worker_parts(model))).await }
+    };
+
+    let error = attempt(def_of(&folder).env("BROWSER_A2A_TOKEN", "tok-browser-1"))
+        .await
+        .expect_err("plain http to another machine is refused");
+    let cause = std::error::Error::source(&error).unwrap().to_string();
+    assert!(
+        cause.contains("browser") && cause.contains("http"),
+        "{cause}"
+    );
+    assert_eq!(exit_code(&error), 78);
+
+    let error = attempt(def_of(&folder).allow_insecure_remotes(true))
+        .await
+        .expect_err("no token, no subagent");
+    let cause = std::error::Error::source(&error).unwrap().to_string();
+    assert!(cause.contains("BROWSER_A2A_TOKEN"), "{cause}");
+    assert_eq!(exit_code(&error), 78);
+
+    let agents = attempt(
+        def_of(&folder)
+            .allow_insecure_remotes(true)
+            .env("BROWSER_A2A_TOKEN", "tok-browser-1"),
+    )
+    .await
+    .expect("the deployment gave the token and allowed the URL");
+    assert_eq!(agents.name, "chat");
 }
 
 /// The class of what a process fails with decides its exit code; the service's own errors keep

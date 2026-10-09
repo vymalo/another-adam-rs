@@ -19,6 +19,7 @@
 //! | `MCP_ALLOW_STDIO` | let the folder's `mcp.json` start local processes (`command` servers) | `false` |
 //! | `MCP_ALLOW_INSECURE` | let it reach plain-`http` MCP servers on other machines (development only) | `false` |
 //! | `MCP_ALLOW_URL_VARS` | let it write `${VAR}` in a server's `url` (headers may always) | `false` |
+//! | `A2A_ALLOW_INSECURE_REMOTES` | let a remote subagent (`a2a:`) be at a plain-`http` URL that is not this machine, such as a Kubernetes service in the same cluster; the messages and the bearer then cross the network in clear text, so protect it (a NetworkPolicy, mesh mTLS) | `false` |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 //!
 //! Every problem is reported at once, so a misconfigured deployment is fixed in one round trip.
@@ -55,7 +56,13 @@ pub struct WorkerConfig {
     /// `ADAM_EXTRA_MCP_FILE`: a file of MCP servers (the shape of `mcp.json`) added to the
     /// folder's own before they connect, an existing file. `None`: only the folder's servers.
     pub extra_mcp_file: Option<PathBuf>,
+    /// `A2A_ALLOW_INSECURE_REMOTES`: a remote subagent (`a2a:`) may be at a plain `http` URL that is
+    /// not this machine (`AgentDef::allow_insecure_remotes`). Off: such a URL stops the process.
+    pub allow_insecure_remotes: bool,
 }
+
+/// The variable that lets a remote subagent be at a plain `http` URL on another machine.
+pub const ALLOW_INSECURE_REMOTES_ENV: &str = "A2A_ALLOW_INSECURE_REMOTES";
 
 impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,6 +80,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("model", &self.model)
             .field("mcp", &self.mcp)
             .field("extra_mcp_file", &self.extra_mcp_file)
+            .field("allow_insecure_remotes", &self.allow_insecure_remotes)
             .finish()
     }
 }
@@ -126,6 +134,11 @@ impl Config {
             extra_mcp_file: adam_service::parse_file(
                 &|name: &str| lookup(name).filter(|v| !v.trim().is_empty()),
                 adam::EXTRA_MCP_FILE_ENV,
+                &mut problems,
+            ),
+            allow_insecure_remotes: adam_service::parse_flag(
+                &|name: &str| lookup(name).filter(|v| !v.trim().is_empty()),
+                ALLOW_INSECURE_REMOTES_ENV,
                 &mut problems,
             ),
         });
@@ -295,6 +308,28 @@ mod tests {
         vars.insert("MCP_ALLOW_URL_VARS".into(), "true".into());
         let mcp = parse(&vars).unwrap().worker.unwrap().mcp;
         assert!(mcp.allow_stdio && mcp.allow_insecure && mcp.allow_url_vars);
+    }
+
+    /// `A2A_ALLOW_INSECURE_REMOTES` is off unless set, read by the workers (who bind the remote
+    /// subagents), and anything but a boolean is a problem.
+    #[test]
+    fn plain_http_remote_subagents_need_the_deployments_say_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = full(dir.path());
+        assert!(!parse(&vars).unwrap().worker.unwrap().allow_insecure_remotes);
+        vars.insert(ALLOW_INSECURE_REMOTES_ENV.into(), "true".into());
+        assert!(parse(&vars).unwrap().worker.unwrap().allow_insecure_remotes);
+        vars.insert(ALLOW_INSECURE_REMOTES_ENV.into(), "yes".into());
+        let problems = problems_of(&vars);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("A2A_ALLOW_INSECURE_REMOTES must be true or false")),
+            "{problems:?}"
+        );
+        // A control plane binds no subagent and does not read it.
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse(&vars).is_ok());
     }
 
     /// `MODEL_CONTEXT_WINDOW` is read with the model: a count of tokens, or a startup error with the

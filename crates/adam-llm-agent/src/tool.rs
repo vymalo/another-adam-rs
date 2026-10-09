@@ -6,8 +6,8 @@ use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
 use adam_model::ToolSpec;
 use adam_runtime::{
-    Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, RunEvent, StepEvent, StepIcon,
-    StepKind, StepState,
+    Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, MAX_RUN_FILE_BYTES, RunEvent,
+    StepEvent, StepIcon, StepKind, StepState,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -431,6 +431,8 @@ pub struct ToolCtx {
     /// What the [`ToolSource`](crate::ToolSource) that offered this tool said about it when it listed
     /// it; `None` for the agent's own tools and for a listing that said nothing.
     note: Option<ToolNote>,
+    /// The bytes of files the run may still share ([`files_left`](Self::files_left)).
+    files_left: u64,
 }
 
 impl ToolCtx {
@@ -465,7 +467,25 @@ impl ToolCtx {
             root_step,
             step,
             note: None,
+            files_left: MAX_RUN_FILE_BYTES as u64,
         }
+    }
+
+    /// Say how many bytes of files the run may still share: what [`files_left`](Self::files_left)
+    /// answers. The agent loop does it for every call.
+    #[must_use]
+    pub fn with_files_left(mut self, bytes: u64) -> Self {
+        self.files_left = bytes.min(MAX_RUN_FILE_BYTES as u64);
+        self
+    }
+
+    /// The bytes of files the run may still share: `MAX_RUN_FILE_BYTES` (6 MiB) less what it kept
+    /// so far, as the turn's call began (the whole cap for a detached context). The loop refuses a
+    /// file of a result that would go over, but only after the result is journaled; a tool that
+    /// returns files it did not choose (an MCP server's images, a remote agent's file parts) keeps
+    /// its result within this, so that one journal entry stays within the run's cap.
+    pub fn files_left(&self) -> u64 {
+        self.files_left
     }
 
     /// Give the call the note its source made about the tool when it listed it

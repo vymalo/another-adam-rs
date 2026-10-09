@@ -297,7 +297,7 @@ async fn a_call_is_sent_with_the_meta_it_was_given_and_a_plain_call_with_none() 
 async fn a_call_waits_as_long_as_its_options_say_and_not_as_long_as_the_policy() {
     let server = ThreadToolsServer::start(&["good-token"]).await;
     server.add_tool("slow", "Slow.", json!({"type": "object"}), "done");
-    server.set_delay("slow", Duration::from_millis(600));
+    server.set_delay("slow", Duration::from_secs(2));
     let short = McpPolicy::default().call_timeout(Duration::from_millis(150));
     let endpoint = Endpoint::new(&server.url("t"), &token("good-token"), &short).unwrap();
 
@@ -305,8 +305,9 @@ async fn a_call_waits_as_long_as_its_options_say_and_not_as_long_as_the_policy()
     let started = std::time::Instant::now();
     let error = endpoint.call_tool("slow", Map::new()).await.unwrap_err();
     assert!(matches!(error, EndpointError::Timeout(150)), "{error:?}");
+    // Well before the tool's 2 s, with room for the connection on a loaded machine.
     assert!(
-        started.elapsed() < Duration::from_millis(550),
+        started.elapsed() < Duration::from_millis(1500),
         "{:?}",
         started.elapsed()
     );

@@ -41,6 +41,8 @@ the crate does the base64.
    the A2A part has, never as an array of numbers. `Artifact::file` is the one place the rules of a file are checked: a
    filename is a name (not empty, at most 255 bytes, no `/`, `\`, control characters, not `.` or `..`), a media type is
    `type/subtype` with no whitespace, and the size is at most the cap (3). `Debug` prints a file's size, not its bytes.
+   *Amended 2026-10-09 ([ADR 0033](0033-files-from-mcp-results-are-shared-files.md)):* a filename may not hold a `:`
+   either, so that a name never reads as a URL (`http:evil.example`) where a screen or a Markdown link resolves it.
 3. **The caps: 4 MiB a file, 6 MiB a run.** The orchestration layer keeps files up to its `artifacts.maxFileBytes`
    (10 MiB); this side stays under it (`MAX_ARTIFACT_FILE_BYTES` = 4 MiB), so an agent never makes a file the other side
    refuses. The number is lower than the limit it must respect because of what a file costs **in the journal**: the bytes,
@@ -64,6 +66,12 @@ the crate does the base64.
    workspace is one directory whatever environment the commands run in
    ([ADR 0010](0010-a-run-works-in-its-repositorys-devcontainer.md)), a file a command made in the devcontainer is shared
    like one the coder wrote. The result is `Shared <filename> (<size>, <type>).`.
+   *Amended 2026-10-09 ([ADR 0033](0033-files-from-mcp-results-are-shared-files.md)):* for an image the line goes on,
+   `To show it in your answer, write ![description](<filename>).`, because a model that wrote the image's workspace path
+   (`![alt](shots/4-matches.png)`) left the person's screen nothing to resolve; the screen resolves an image's source
+   against the files shared in the run, by the share's path and then by the file's name. The line is
+   `adam_runtime::Artifact::shared_line`, and the media-type rule of 6 is `adam_runtime::checked_media_type`, shared with
+   the files of an MCP server's results.
 6. **The media type is derived, and checked for images.** From the extension, against a small table; for an image
    (`png`, `jpeg`, `gif`, `webp`, `svg`) the bytes must agree (the PNG, JPEG, GIF and WebP signatures; an `<svg` element after
    any BOM, XML declaration, doctype or comment). A file whose name and bytes disagree, and a file whose extension the table does not

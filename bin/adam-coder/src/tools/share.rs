@@ -30,9 +30,10 @@
 //!
 //! # What the model is told
 //!
-//! One line: `Shared chart.svg (1.2 KiB, image/svg+xml).` The bytes go only into the artifact; they are
-//! never in the model's history (the loop records a tool's `content` and the artifact's
-//! size, nothing else).
+//! One line: `Shared chart.svg (1.2 KiB, image/svg+xml). To show it in your answer, write
+//! ![description](chart.svg).` ([`Artifact::shared_line`]; the second sentence for an image only).
+//! The bytes go only into the artifact; they are never in the model's history (the loop records a
+//! tool's `content` and the artifact's size, nothing else).
 //!
 //! # Retry safety
 //!
@@ -44,16 +45,13 @@ use std::io::Read as _;
 use std::path::Path;
 
 use adam::prelude::*;
-use adam_runtime::{Artifact, MAX_ARTIFACT_FILE_BYTES};
+use adam_runtime::{Artifact, MAX_ARTIFACT_FILE_BYTES, checked_media_type};
 
 use super::files::{Access, confine};
 use super::{Outcome, ToolEnv, non_empty, notes_error};
 
 /// Longest name of a shared file's artifact, in characters.
 const MAX_NAME_CHARS: usize = 120;
-
-/// How much of a file is looked at for `<svg`.
-const SVG_PROBE_BYTES: usize = 4096;
 
 /// A file read for sharing.
 #[derive(Debug)]
@@ -62,7 +60,7 @@ struct Shared {
     name: String,
     /// The name the file is saved under.
     filename: String,
-    media_type: &'static str,
+    media_type: String,
     bytes: Vec<u8>,
 }
 
@@ -105,13 +103,8 @@ pub async fn share_file(
         Ok(shared) => shared,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
-    let line = format!(
-        "Shared {} ({}, {}).",
-        shared.filename,
-        human_size(shared.bytes.len()),
-        shared.media_type
-    );
-    // The name or the type may still be refused by the artifact (a filename with a control character).
+    // The name or the type may still be refused by the artifact (a filename with a `:` or a control
+    // character).
     let artifact = match Artifact::file(
         shared.name,
         shared.media_type,
@@ -121,6 +114,7 @@ pub async fn share_file(
         Ok(artifact) => artifact,
         Err(e) => return Ok(ToolOutput::error(e.to_string())),
     };
+    let line = artifact.shared_line();
     // The run delivered something: a scratch run that ends here may complete without a pull
     // request (`CoderAgent`). Noted once however often the file is shared. In the notes of the
     // run that shares, not of its root: a subagent's file stays on the subagent's run and the
@@ -200,47 +194,14 @@ fn clean_name(name: &str) -> String {
         .to_owned()
 }
 
-/// `1234` bytes as `1.2 KiB`.
-fn human_size(len: usize) -> String {
-    #[allow(clippy::cast_precision_loss)] // a size of at most 4 MiB
-    let len_f = len as f64;
-    if len < 1024 {
-        format!("{len} bytes")
-    } else if len < 1024 * 1024 {
-        format!("{:.1} KiB", len_f / 1024.0)
-    } else {
-        format!("{:.1} MiB", len_f / (1024.0 * 1024.0))
-    }
-}
-
-/// The media type of the file called `filename` with `bytes` (see the [module docs](self#the-media-type)).
-pub(crate) fn media_type_of(filename: &str, bytes: &[u8]) -> &'static str {
-    const OCTETS: &str = "application/octet-stream";
-    let sniffed = sniff_image(bytes);
+/// The media type of the file called `filename` with `bytes` (see the [module docs](self#the-media-type)):
+/// the type its extension names, checked against its bytes by `adam_runtime::checked_media_type`.
+pub(crate) fn media_type_of(filename: &str, bytes: &[u8]) -> String {
     let by_name = Path::new(filename)
         .extension()
         .and_then(|e| e.to_str())
         .and_then(|e| by_extension(&e.to_ascii_lowercase()));
-    match (by_name, sniffed) {
-        // An image by name must be that image by its bytes.
-        (Some(named), _) if is_image(named) => {
-            if sniffed == Some(named) {
-                named
-            } else {
-                OCTETS
-            }
-        }
-        // Not an image by name, and its bytes say it is one: they disagree.
-        (Some(_), Some(_)) => OCTETS,
-        (Some(named), None) => named,
-        // No name to go by: an image is known by its bytes, the rest is bytes.
-        (None, Some(image)) => image,
-        (None, None) => OCTETS,
-    }
-}
-
-fn is_image(media_type: &str) -> bool {
-    media_type.starts_with("image/")
+    checked_media_type(by_name, bytes)
 }
 
 /// The media type of a file by its extension (lowercase, no dot), when this table knows it.
@@ -266,57 +227,6 @@ fn by_extension(ext: &str) -> Option<&'static str> {
         "tar" => "application/x-tar",
         _ => return None,
     })
-}
-
-/// The image `bytes` are, by their first bytes: PNG, JPEG, GIF, WebP, or SVG (text that holds an
-/// `<svg` element near its start).
-fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else if looks_like_svg(bytes) {
-        Some("image/svg+xml")
-    } else {
-        None
-    }
-}
-
-/// Whether `bytes` are an SVG document: text (no NUL) with an `<svg` element in its first
-/// [`SVG_PROBE_BYTES`] bytes, after any BOM, XML declaration, doctype or comment.
-fn looks_like_svg(bytes: &[u8]) -> bool {
-    let head = &bytes[..bytes.len().min(SVG_PROBE_BYTES)];
-    if head.contains(&0) {
-        return false;
-    }
-    let head = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
-    let text = String::from_utf8_lossy(head).to_ascii_lowercase();
-    let mut rest = text.trim_start();
-    // What may come before the root element: `<?xml ...?>`, `<!DOCTYPE ...>`, `<!-- ... -->`.
-    loop {
-        let skipped = if let Some(after) = rest.strip_prefix("<?") {
-            after.split_once("?>").map(|(_, tail)| tail)
-        } else if let Some(after) = rest.strip_prefix("<!--") {
-            after.split_once("-->").map(|(_, tail)| tail)
-        } else if let Some(after) = rest.strip_prefix("<!") {
-            after.split_once('>').map(|(_, tail)| tail)
-        } else {
-            None
-        };
-        match skipped {
-            Some(tail) => rest = tail.trim_start(),
-            None => break,
-        }
-    }
-    rest.starts_with("<svg")
-        && rest[4..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/')
 }
 
 #[cfg(test)]
@@ -387,15 +297,6 @@ mod tests {
     fn a_file_with_no_name_to_go_by_is_the_image_its_bytes_say() {
         assert_eq!(media_type_of("chart", PNG), "image/png");
         assert_eq!(media_type_of("chart.dat", SVG), "image/svg+xml");
-    }
-
-    #[test]
-    fn sizes_are_said_in_plain_units() {
-        assert_eq!(human_size(0), "0 bytes");
-        assert_eq!(human_size(1023), "1023 bytes");
-        assert_eq!(human_size(1024), "1.0 KiB");
-        assert_eq!(human_size(1536), "1.5 KiB");
-        assert_eq!(human_size(4 * 1024 * 1024), "4.0 MiB");
     }
 
     #[test]

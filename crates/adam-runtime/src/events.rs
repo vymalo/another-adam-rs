@@ -51,9 +51,9 @@ pub enum ArtifactFileError {
         /// The limit.
         max: usize,
     },
-    /// The filename is empty, too long, or holds a path separator or a control character: it is a
-    /// name, not a path.
-    #[error("`{0}` is not a file name (no path, no control characters, at most 255 bytes)")]
+    /// The filename is empty, too long, or holds a path separator, a `:` or a control character: it
+    /// is a name, not a path or a URL.
+    #[error("`{0}` is not a file name (no path, no `:`, no control characters, at most 255 bytes)")]
     BadFilename(String),
     /// The media type is not of the form `type/subtype`.
     #[error("`{0}` is not a media type (type/subtype)")]
@@ -152,14 +152,7 @@ impl Artifact {
                 max: MAX_ARTIFACT_FILE_BYTES,
             });
         }
-        let bad_name = filename.is_empty()
-            || filename.len() > MAX_ARTIFACT_FILENAME_BYTES
-            || filename == "."
-            || filename == ".."
-            || filename
-                .chars()
-                .any(|c| c.is_control() || c == '/' || c == '\\');
-        if bad_name {
+        if !is_file_name(&filename) {
             return Err(ArtifactFileError::BadFilename(filename));
         }
         let bad_type = media_type.split_once('/').is_none_or(|(kind, sub)| {
@@ -184,6 +177,20 @@ impl Artifact {
     pub fn file_len(&self) -> usize {
         self.file.as_ref().map_or(0, |f| f.bytes.len())
     }
+}
+
+/// Whether `filename` is a name a file can be saved under: not empty, at most
+/// [`MAX_ARTIFACT_FILENAME_BYTES`], not `.` or `..`, no path separator, no control character and
+/// no `:` (which would let a name read as a URL, `http:evil.example`, where a screen or a Markdown
+/// link resolves it).
+fn is_file_name(filename: &str) -> bool {
+    !filename.is_empty()
+        && filename.len() <= MAX_ARTIFACT_FILENAME_BYTES
+        && filename != "."
+        && filename != ".."
+        && !filename
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
 }
 
 /// Something observers may want to know about a run.
@@ -842,6 +849,7 @@ mod tests {
             "a/b.txt",
             "a\\b.txt",
             "x\ny.txt",
+            "http:evil.example",
             &"n".repeat(256),
         ] {
             assert!(

@@ -38,6 +38,12 @@ pub enum McpServer {
         /// `optional: true` (an adam extension): a server that cannot be reached at startup is
         /// skipped with a warning instead of stopping the process.
         optional: bool,
+        /// `files: true` (an adam extension): the images, audio clips and blobs of its results are
+        /// shared with the person as files of the run, instead of being described to the model.
+        /// Left out of the JSON when `false`, so the digest of a folder that does not use it is the
+        /// one it had before the key existed.
+        #[serde(skip_serializing_if = "is_false")]
+        files: bool,
     },
     /// A server reached over the network (`type` and `url`).
     Remote {
@@ -52,6 +58,12 @@ pub enum McpServer {
         /// `optional: true` (an adam extension): a server that cannot be reached at startup is
         /// skipped with a warning instead of stopping the process.
         optional: bool,
+        /// `files: true` (an adam extension): the images, audio clips and blobs of its results are
+        /// shared with the person as files of the run, instead of being described to the model.
+        /// Left out of the JSON when `false`, so the digest of a folder that does not use it is the
+        /// one it had before the key existed.
+        #[serde(skip_serializing_if = "is_false")]
+        files: bool,
     },
 }
 
@@ -60,6 +72,13 @@ impl McpServer {
     pub fn is_optional(&self) -> bool {
         match self {
             Self::Stdio { optional, .. } | Self::Remote { optional, .. } => *optional,
+        }
+    }
+
+    /// Whether the files of its results are shared: `files: true` in the file.
+    pub fn shares_files(&self) -> bool {
+        match self {
+            Self::Stdio { files, .. } | Self::Remote { files, .. } => *files,
         }
     }
 
@@ -83,6 +102,10 @@ impl McpServer {
                 .collect(),
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A parsed `mcp.json`.
@@ -252,6 +275,7 @@ pub(crate) struct RawServer {
     pub(crate) headers: BTreeMap<String, String>,
     pub(crate) tools: Option<Vec<String>>,
     pub(crate) optional: Option<bool>,
+    pub(crate) files: Option<bool>,
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
 }

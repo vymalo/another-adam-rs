@@ -1239,7 +1239,8 @@ impl LlmAgent {
 
         let tool_ctx = self
             .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
-            .with_note(note.cloned());
+            .with_note(note.cloned())
+            .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used));
         let args = call.arguments.clone();
         let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
             Some(tool) => {
@@ -1524,14 +1525,18 @@ impl LlmAgent {
             );
             return Ok(Some(StepState::Failed));
         };
-        let tool_ctx = self.tool_ctx(
-            ctx,
-            &state.context,
-            (state.root_run, state.root_step.as_deref()),
-            &state.source_notes,
-            &wait.call_id,
-            &wait.tool,
-        );
+        let tool_ctx = self
+            .tool_ctx(
+                ctx,
+                &state.context,
+                (state.root_run, state.root_step.as_deref()),
+                &state.source_notes,
+                &wait.call_id,
+                &wait.tool,
+            )
+            .with_files_left(
+                (MAX_RUN_FILE_BYTES as u64).saturating_sub(files_kept(&state.artifacts)),
+            );
         let task = wait.task.clone();
         let polled: Result<RemotePoll, ToolError> = ctx
             .step(&format!("poll:{}", wait.call_id), move || async move {

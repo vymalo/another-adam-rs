@@ -121,6 +121,7 @@ Remote subagent (A2A; the body, if any, only extends the tool description):
 description: Handles billing questions for a customer account.
 a2a: https://billing.example.com/.well-known/agent-card.json
 auth: bearer:BILLING_AGENT_TOKEN     # names an environment variable, resolved at startup, fail closed
+files: true                          # optional: the file parts of its answer are shared, not described
 ---
 ```
 
@@ -181,6 +182,8 @@ all of them with no error; that is a conformance test.
 * A `url` without `type` is an error, as in Claude Code. `tools` (an adam extension) is an allow-list.
   The model-facing name is `<server>__<tool>`. `optional: true` (an adam extension) lets a server be missing at
   startup: if it cannot be reached or listed, or its `${VAR}` has no value, it is skipped with a warning.
+  `files: true` (an adam extension, a boolean, default `false`) shares the images, audio clips and blobs of the
+  server's results as files of the run ([below](#files-from-a-server-files-true)).
 * `${VAR}` and `${VAR:-default}` are expanded **at startup only**. A missing variable without a default
   fails startup (fail closed). `build.rs` records the names and never the values.
 * stdio servers spawn processes: allowed only when the composition root opts in (`McpPolicy::allow_stdio`).
@@ -573,8 +576,29 @@ Same shape, name checks and placement as a local subagent's tool; `limits`, `too
   sent as `Authorization: Bearer` on every request, never journaled or logged, and goes **only to the origin of
   the card URL you wrote**: a card that advertises another host is refused, redirects are not followed.
 * **URL.** `https`, or `http` to this machine; anything else is `Error::RemoteUrl` unless
-  `AgentDef::allow_insecure_remotes(true)` (development only). A URL with credentials is always refused.
-* **What does not travel.** Only text; no `contextId`, so every call is a fresh conversation.
+  `AgentDef::allow_insecure_remotes(true)`, which `adam-agent` sets from `A2A_ALLOW_INSECURE_REMOTES` (plain `http` to
+  a service of the same cluster). **Then the messages and the bearer cross the pod network in clear text**: protect
+  that network (a NetworkPolicy that admits only the caller, or mesh mTLS). A card cannot widen the switch: an `https`
+  card's plain-`http` interface is refused, and plain `http` goes only to the card's own host. A card on another
+  machine never points at this one (`localhost`, a loopback address). A URL with credentials is always refused.
+* **What does not travel.** Only text, no `contextId` (every call is a fresh conversation), and no file: a `raw` part
+  is described in a line and dropped, a `url` part stays a line (it is never fetched).
+* **`files: true`** (an adam extension, remote subagents only; on any other file it warns and does nothing): each
+  `raw` part of the answer is shared as a file of the calling run, by the rule of a `files: true` MCP server
+  ([below](#files-from-a-server-files-true)): a name made here from the sender's (`page.png` is `page-<hash>.png`, and
+  the extension follows the bytes), its media type checked against the bytes, at most 4 MiB a file, 16 a result and
+  what the run may still share, a line for the model in its place. A screenshot the browser agent shared reaches
+  Chat's A2A client when Chat calls `browser` itself; a subagent's files stay on its run.
+* **A deployment that points at one.** The URL is the file's and the token the environment's: a chart that renders the
+  folder writes `a2a: http://browser.<namespace>.svc:8080/.well-known/agent-card.json`, sets
+  `A2A_ALLOW_INSECURE_REMOTES=true` for in-cluster `http`, and gives `auth: bearer:BROWSER_A2A_TOKEN` its value from a
+  Secret. An unset variable stops the process (exit 78) naming it. There is no `${VAR}` in `a2a:`: the file is rendered.
+* **Under a local subagent.** A remote declared in a local subagent's directory
+  (`subagents/researcher/subagents/browser.md`) is a tool of that subagent: its child run sends, parks on the remote
+  task and polls it as a root does, and only the researcher's text reaches the root. Each declaration is its own tool
+  with its own `auth` (two may name the same variable); a flat `subagents/<name>.md` has no directory, so give it one
+  (`subagents/<name>/instructions.md`) to nest a remote under it. A subagent never gets a tool it does not declare or
+  list, so the root's `browser` is not the researcher's.
 
 More in the [`adam-assembly` README](../../crates/adam-assembly/README.md#subagents).
 
@@ -630,7 +654,8 @@ stateDiagram-v2
   credentials, an allow-list naming a tool the server lacks.
 * **Names and text.** `<server>__<tool>`; without an allow-list a tool whose name does not fit
   `^[A-Za-z0-9_-]{1,64}$` is skipped with a warning. Descriptions are cut at 8 KiB, answers at 64 KiB; images
-  and blobs are described, never included; `isError` is an error result.
+  and blobs are described, never included (unless the server has `files: true`, below); `isError` is an error
+  result.
 * **At-least-once.** A call runs inside the journaled step, so a replay of a committed call does not call the
   server again, but a transition that fails before it commits calls it again. MCP has no idempotency key, so
   **no failure of an MCP call is `ToolError::Transient`**: a timeout or lost connection is an error result saying
@@ -645,6 +670,32 @@ stateDiagram-v2
   wrong in the files or the policy exits 78.
 * **Not supported**: MCP resources, prompts, sampling, roots, elicitation, OAuth, `type: sse`, `list_changed`,
   MCP tasks, progress notifications, exporting adam's tools as an MCP server.
+
+### Files from a server (`files: true`)
+
+A headless browser answers `screenshot` with an image block and `pdf` with an embedded blob resource. A server whose
+entry says `"files": true` hands these to the person: each image, audio clip and blob of a result becomes a **file
+artifact of the run**, the shape the coder's `share_file` gives (one A2A `raw` part with `mediaType` and `filename`,
+[ADR 0012](../decisions/0012-files-as-a2a-artifacts.md)), so an A2A client, the orchestration layer included,
+stores and shows it as it does a shared file ([ADR 0033](../decisions/0033-files-from-mcp-results-are-shared-files.md)).
+
+```json
+{ "mcpServers": { "browser": { "type": "http", "url": "http://127.0.0.1:9222/mcp",
+                               "tools": ["browser_navigate", "browser_screenshot", "browser_pdf"],
+                               "files": true } } }
+```
+
+| | |
+|---|---|
+| The model reads | `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).` in place of the block (the second sentence for an image only); never the bytes |
+| The file's name | the tool's name on the server, a hash of the bytes (unique within the run, stable on replay), the extension of its checked type |
+| Its media type | the server's, checked against the bytes (`adam_runtime::checked_media_type`): a "PNG" that is not one is `application/octet-stream` |
+| Not shared | over 4 MiB, past the 16th file of a result, or over what the run may still share (checked on the base64's length, before decoding: the result is journaled before the loop's run cap), or not base64: a line says why and the result is an error result |
+| Trust | none: the server's type is checked and the name made here; the bytes are untrusted content, which a client serves as an attachment or sanitizes |
+| A subagent's | stays on the subagent's run, like `share_file`'s: only the subagent's text reaches the parent |
+| Without the key | described in a line, no byte kept (fail closed) |
+
+The sequence and the states are in [`adam-mcp`](../../crates/adam-mcp/README.md#files-files-true).
 
 *Verified 2026-09-29* (<https://docs.rs/rmcp/3.5.0>): `rmcp` 3.5.0 is Apache-2.0 with `rust-version` 1.88; its
 SSE transport was removed in 0.11.0 and the specification calls HTTP+SSE deprecated

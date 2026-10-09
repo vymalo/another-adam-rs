@@ -34,6 +34,8 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 const TOKEN: &str = "tok-7f3a9c2e51d84b06";
+/// The start of a PNG: enough for the bytes to say what they are.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 const VAR: &str = "BILLING_AGENT_TOKEN";
 const NOTE: &str =
     "The agent does not see this conversation; put everything it needs in `message`.";
@@ -260,6 +262,30 @@ impl TaskBackend for Scripted {
         {
             if entry.text.contains("[fail]") {
                 entry.task.status = status(TaskState::Failed, Some("out of budget"));
+            } else if entry.text.contains("[file]") {
+                // A browser's answer: a line and a screenshot, the file `share_file` would make.
+                let mut shot = Part::raw(PNG.to_vec());
+                shot.filename = Some("page.png".into());
+                shot.media_type = Some("image/png".into());
+                entry.task.status = status(TaskState::Completed, None);
+                entry.task.artifacts = Some(vec![
+                    Artifact {
+                        artifact_id: a2a::new_artifact_id(),
+                        name: None,
+                        description: None,
+                        parts: vec![Part::text("The page is blank.")],
+                        metadata: None,
+                        extensions: None,
+                    },
+                    Artifact {
+                        artifact_id: a2a::new_artifact_id(),
+                        name: Some("page.png".into()),
+                        description: None,
+                        parts: vec![shot],
+                        metadata: None,
+                        extensions: None,
+                    },
+                ]);
             } else {
                 entry.task.status = status(TaskState::Completed, None);
                 entry.task.artifacts = Some(vec![Artifact {
@@ -1020,4 +1046,182 @@ fn a_remote_subagent_is_a_tool_in_the_order_of_the_manifest_beside_local_ones() 
     assert_eq!(assembly.info()[0].tools, ["read", "audit", "billing"]);
     // The remote is not an agent of the assembly: nothing to register on the runtime.
     assert_eq!(assembly.agents().len(), 2);
+}
+
+// --- a remote under a local subagent ---------------------------------------------------------
+
+/// A local subagent calls a remote one: the remote is declared under the subagent's own directory
+/// (`subagents/researcher/subagents/browser.md`), so it is a tool of the researcher, with its own
+/// `auth`, and the researcher's child run sends, parks on the remote task, polls it and goes on,
+/// exactly as a root does. Only text travels: the researcher's answer is what the root reads.
+#[tokio::test]
+async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory() {
+    for (backend, store) in stores().await {
+        let root = uniq("root");
+        let memory = InMemoryBackend::new();
+        let server = Server::start(memory.clone(), TOKEN).await;
+        let files: Files = vec![
+            (
+                "agent/instructions.md".into(),
+                instructions(&format!("name: {root}\ntools: []"), "You are the root."),
+            ),
+            (
+                "agent/subagents/researcher/instructions.md".into(),
+                instructions(
+                    "description: Researches a question.\ntools: []",
+                    "You research.",
+                ),
+            ),
+            (
+                "agent/subagents/researcher/subagents/browser.md".into(),
+                format!(
+                    "---\ndescription: Reads web pages.\na2a: {}\nauth: bearer:{VAR}\n---\n",
+                    server.card_url()
+                ),
+            ),
+        ];
+        let model = Arc::new(MockModel::new());
+        model
+            .push_tool_calls(vec![call(
+                "c1",
+                "researcher",
+                json!({"message": "what does example.com say?"}),
+            )])
+            .push_tool_calls(vec![call(
+                "r1",
+                "browser",
+                json!({"message": "read example.com"}),
+            )])
+            .push_text("It says: echo: read example.com")
+            .push_text("The researcher found it.");
+        let assembly = assemble(&files, &model);
+        // The remote is a tool of the subagent whose directory declares it, not of the root.
+        let tools_of = |name: &str| {
+            assembly
+                .info()
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap()
+                .tools
+                .clone()
+        };
+        assert_eq!(tools_of(&root), ["researcher"], "{backend}");
+        assert_eq!(
+            tools_of(&format!("{root}/researcher")),
+            ["browser"],
+            "{backend}"
+        );
+
+        let rt = runtime(&assembly, &store);
+        let worker = spawn_worker(&rt);
+        let run = rt.start(&root, user_message("go"), None).await.unwrap();
+        let view = wait_done(&rt, run).await;
+        worker.stop().await;
+        assert_eq!(
+            view.output.as_ref().unwrap()["text"],
+            "The researcher found it.",
+            "{backend}"
+        );
+
+        let requests = model.requests();
+        assert_eq!(requests.len(), 4, "{backend}");
+        assert_eq!(
+            last_tool_result(&requests[2], "r1"),
+            ("echo: read example.com".into(), false),
+            "{backend}: the researcher read the remote's answer"
+        );
+        assert_eq!(
+            last_tool_result(&requests[3], "c1"),
+            ("It says: echo: read example.com".into(), false),
+            "{backend}: the root read the researcher's text"
+        );
+        // The send and its wait are journaled steps of the researcher's run, under the id derived
+        // from that run and its call.
+        let child = child_run_id(run, "c1");
+        let names: Vec<String> = store
+            .journal_list(child)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "tool:r1"), "{backend}: {names:?}");
+        let ids = memory.task_ids();
+        assert_eq!(ids.len(), 1, "{backend}");
+        let task = memory
+            .get(&Caller::new("token-0"), &ids[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            task.history.as_ref().unwrap()[0].message_id,
+            child_run_id(child, "r1").to_string(),
+            "{backend}"
+        );
+        for header in server.authorization.lock().unwrap().iter() {
+            assert_eq!(header.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
+        }
+    }
+}
+
+// --- files of a remote's answer ------------------------------------------------------------
+
+/// A remote subagent whose file says `files: true` (a browser agent): the screenshot its task
+/// answers with is an artifact of the run that called it (in the run's view, so the parent's A2A
+/// client gets it as it gets a shared file), the model reads a line in its place, and the same remote
+/// without the key keeps nothing.
+#[tokio::test]
+async fn the_files_of_a_remote_with_files_true_are_artifacts_of_the_calling_run() {
+    for files in [true, false] {
+        let scripted = Scripted::new(1);
+        let server = Server::start(scripted.clone(), TOKEN).await;
+        let url = server.card_url();
+        run_case(
+            || {
+                let mut files_of = remote_files("x", &url, Some(VAR));
+                if files {
+                    files_of[1].1 = files_of[1].1.replace("\n---\n", "\nfiles: true\n---\n");
+                }
+                files_of
+            },
+            "screenshot it [file]",
+            async |backend, store, run, requests| {
+                let (text, is_error) = last_tool_result(&requests[1], "c1");
+                assert!(!is_error, "{backend}: {text}");
+                let view = Runtime::builder(store.clone())
+                    .build()
+                    .view(run)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if files {
+                    assert_eq!(view.artifacts.len(), 1, "{backend}");
+                    let artifact = &view.artifacts[0];
+                    let file = artifact.file.as_ref().unwrap();
+                    let name = file.filename.as_str();
+                    assert!(
+                        name.starts_with("page-") && name.ends_with(".png"),
+                        "{name}"
+                    );
+                    assert_eq!(artifact.name, "page.png", "the remote artifact's own name");
+                    assert_eq!(
+                        text,
+                        format!(
+                            "The page is blank.\n\nShared {name} (16 bytes, image/png). To show it \
+                             in your answer, write ![description]({name})."
+                        ),
+                        "{backend}"
+                    );
+                    assert_eq!(file.bytes, PNG);
+                } else {
+                    assert!(
+                        text.ends_with("[file `page.png` not included: 16 bytes, image/png]"),
+                        "{backend}: {text}"
+                    );
+                    assert!(view.artifacts.is_empty(), "{backend}");
+                }
+            },
+        )
+        .await;
+    }
 }

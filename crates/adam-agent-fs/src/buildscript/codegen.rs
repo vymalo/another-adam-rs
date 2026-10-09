@@ -167,6 +167,7 @@ impl Gen<'_> {
                                 ),
                             }
                         ));
+                        self.line(format!("files: {},", r.files));
                         self.line(format!("note: {},", text(&r.note)));
                         self.line(format!("path: {},", self.rel(&r.path)?));
                         self.close("}),");

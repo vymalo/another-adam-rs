@@ -244,6 +244,9 @@ by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A 
   server lacks is `Error::UnknownTool` at startup (fail closed). Without it every tool is kept whose
   `<server>__<tool>` fits `^[A-Za-z0-9_-]{1,64}$`; the others are skipped with a `warn!` (a server cannot break
   startup by having a tool called `a.b`).
+* **`files: true`** (an adam extension, on a `command` or a `url` server) shares the images, audio clips and blobs of
+  the server's results with the person as files of the run, instead of describing them to the model: see
+  [Files](#files-files-true). Without it (or with `files: false`) nothing of a file is kept (fail closed).
 * **Names say whose tool it is.** A server name has no `__` and does not end in `_` (`Error::Name`, also in
   `adam-agent-fs`), and a tool name does not start with `_` (an error in an allow-list, skipped with a warning
   without one): otherwise `a` + `_x` and `a_` + `x` would both be `a___x`, `linear__*` would also select the
@@ -256,6 +259,81 @@ by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A 
   ([ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)); without one the step is
   labelled with the name the model knows. The model never sees the title as a name: it is only the description's fallback,
   as above.
+
+## Files (`files: true`)
+
+A tool can answer with a picture or a document: a headless browser's screenshot is an image block, its PDF an embedded
+blob resource. A model reads neither, and the person never saw them. A server whose entry in `mcp.json` says
+`"files": true` hands them to the person instead: each becomes a **file artifact of the run**, the one
+`adam_runtime::Artifact::file` makes and the coder's `share_file` returns, which the A2A server serves as one `raw` part
+with `mediaType` and `filename` ([ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md),
+[ADR 0033](../../docs/decisions/0033-files-from-mcp-results-are-shared-files.md)). `src/tool.rs` (`map_result`, `Sharing`), on
+`adam_runtime::ReceivedFiles`, the rule a remote subagent's files follow too.
+
+```mermaid
+sequenceDiagram
+    participant L as LlmAgent (journaled step tool:CALL_ID)
+    participant T as McpTool (a server with files: true)
+    participant S as MCP server
+    participant R as Runtime and A2A server
+    L->>T: call(ctx with files_left, args)
+    T->>S: tools/call
+    S-->>T: content: text, an image block, a blob resource
+    Note over T: every cap checked on the base64's length (4 MiB a file, 16 a result, files_left in all),<br/>then decoded, the declared type checked against the bytes, named by the tool and a hash, a text file scrubbed
+    T-->>L: ToolOutput: one line per file, the files as artifacts
+    Note over L: the result is journaled in tool:CALL_ID, then output_message checks the run's 6 MiB again
+    L->>R: RunEvent::Artifact, kept in the run's view
+    R-->>R: an A2A artifact: one raw part with mediaType and filename
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Block: an image, an audio clip or a blob in a result
+    Block --> Described: its server has no files true
+    Block --> Refused: past the 16th file, over 4 MiB, over what the run may still share, or not base64
+    Block --> Shared: a file artifact of the result
+    Shared --> Journaled: the result, files and all, in the step tool:CALL_ID
+    Journaled --> Kept: output_message, within the run's 6 MiB
+    Kept --> [*]: emitted, kept in the run's view, served over A2A
+    Refused --> [*]: a line that says why, the result an error result
+    Described --> [*]: a line, no byte kept
+```
+
+* **What is a file**: an image block, an audio block, and an embedded resource with a `blob`; their bytes are the
+  block's base64 (standard alphabet, padded or not, line breaks ignored). Text, a text resource and a resource link
+  stay text.
+* **Its name** is the tool's name on the server, the first 8 hexadecimal digits of the SHA-256 of its bytes, and the
+  extension of its media type: `browser_screenshot-3fa2c19b.png`, `browser_pdf-9d04e1a7.pdf` (`bin` for a type the table
+  does not know). The artifact's name is the same. Two screenshots of a run never share a name (the inline image of
+  the second never shows the first), and a replay names a file as it did.
+* **Its media type** is the one the server declared, checked against the bytes by `adam_runtime::checked_media_type`,
+  the rule the coder's `share_file` uses: a declared PNG, JPEG, GIF, WebP or SVG must be that image by its bytes,
+  bytes that are an image declared as something else disagree, and both are `application/octet-stream`; a declared
+  type the rule cannot check (`application/pdf`) stands.
+* **What the model reads**: in place of the block, one line,
+  `Shared browser_screenshot-3fa2c19b.png (84.0 KiB, image/png). To show it in your answer, write ![description](browser_screenshot-3fa2c19b.png).`
+  (`Artifact::shared_line`; a file that is not an
+  image gets the first sentence only, and the name is put in `<...>` when a bare Markdown link cannot hold it). The bytes
+  are in the artifact only: never in the history, the step's output or the context window.
+* **Scrubbed**: a file that is valid UTF-8 has the values the server's redactor knows taken out, like the text of the
+  result; a file that is not text is left as it is.
+* **Bounded, before anything is decoded.** A file over **4 MiB** (`MAX_ARTIFACT_FILE_BYTES`), every file after the
+  first **16** of one result, and a file over **what the run may still share** (`ToolCtx::files_left`: 6 MiB,
+  `MAX_RUN_FILE_BYTES`, less what the run kept) are refused on the length of their base64 (whitespace left out), and a
+  text that does not decode is refused too: the line says why (`Not shared: a file (image/png) of 4194305 bytes is over
+  the limit ...: ask for a smaller one, or tell the person it is too big to share.`) and the result is an **error
+  result**, since the person did not get what the call made. The budget matters because the whole result is
+  journaled (`tool:CALL_ID`) before the agent loop applies its own run cap in `output_message`: without it one result
+  of three 4 MiB images would be a 16 MiB journal entry, over MongoDB's document.
+* **A subagent's files stay on the subagent's run**, as for `share_file`: the call is the subagent's, so the artifact
+  and its budget are its run's, and only the subagent's text reaches the parent (and the person).
+* **At-least-once** as any call: the files are part of the journaled result, so a replay re-emits the same artifacts
+  and never calls the server again.
+* **Untrusted content.** What a server says of a file is not believed: its type is checked against the bytes and its
+  name is made here. The bytes are still the server's: a client serves them as an attachment or sanitizes them (a
+  claimed `text/html`, an SVG), as the orchestration layer does.
+* `files` is the file's, not the deployment's: it decides what becomes of a server's answers, never what a server may
+  be. A deployment that adds servers with `ADAM_EXTRA_MCP_FILE` writes it there.
 
 ## Startup
 
@@ -290,7 +368,7 @@ sequenceDiagram
     C-->>T: peer
     T->>S: tools/call, within call_timeout and ctx.cancelled()
     S-->>T: result
-    T-->>L: ToolOutput: the content as text, scrubbed of expanded values, cut at 64 KiB, isError kept
+    T-->>L: ToolOutput: the content as text, scrubbed of expanded values, cut at 64 KiB, isError kept (files: true: its files as artifacts)
     Note over L: the result is journaled, a replay returns it without calling again
 ```
 
@@ -310,7 +388,8 @@ stateDiagram-v2
 * **The answer** is the content blocks joined by newlines: text as it is; an image or audio clip as
   `[image not included: image/png]`; an embedded text resource as its text, a blob as `[binary resource not
   included: <uri> (<type>)]`, a resource link as `[resource link: <uri>]`; anything the SDK adds later as
-  `[unsupported content not included]`. No content falls back to `structuredContent` as JSON, then to `(the tool
+  `[unsupported content not included]`. On a server with `files: true`, an image, an audio clip and a blob are
+  shared instead, each a line `Shared <file> (<size>, <type>).`, which says how to show an image inline ([Files](#files-files-true)). No content falls back to `structuredContent` as JSON, then to `(the tool
   returned no content)`. It is **scrubbed of every value a `${VAR}` put into the server's text** (`[REDACTED]`;
   success text and `isError` text alike) and then cut at 64 KiB on a character boundary with a note. `isError: true` is an error
   *result* (the model reads it and the run goes on).
@@ -369,7 +448,9 @@ stateDiagram-v2
   warn.
 * **Tool descriptions and answers are text the server controls.** They go into the model's context, so a server
   can try to steer the model. The mitigation is the allow-list: name the tools you want under `tools:` and nothing
-  else reaches the model. Only text is passed on; no byte of an image or a blob reaches the context or the journal.
+  else reaches the model. Only text is passed on; no byte of an image or a blob reaches the context, and none is kept
+  unless the server has `files: true`, which keeps them as files of the run (journaled with it, served to the A2A
+  client) and still never puts them in the context.
 * **Fail closed.** No local process unless the deployment says so, no plain http to other machines unless it says
   so, no redirects followed (they could carry the headers somewhere nobody named), a missing variable or a wrong
   token is a startup error.
@@ -397,6 +478,13 @@ found by running the tests:
   `match` here has a wildcard arm, and an unknown block becomes `[unsupported content not included]`.
 * The SDK logs the URL it dials (see *Security*): at `ERROR` ("fail to delete session"), and at `TRACE` for a failed
   request (*found by running the tests*, 2026-09-29).
+* What a file looks like in a result (*verified 2026-10-09* in the specification's `schema/2025-06-18/schema.ts` and
+  `schema/2025-11-25/schema.ts`, <https://github.com/modelcontextprotocol/modelcontextprotocol/tree/main/schema>):
+  `ImageContent` and `AudioContent` have `data` ("base64-encoded", `@format byte`) and a required `mimeType`;
+  `EmbeddedResource.resource` is `TextResourceContents` or `BlobResourceContents`, whose `blob` is "a base64-encoded
+  string" and whose `mimeType` is optional ("if known"). `rmcp` 3.5 carries them as `ImageContent { data, mime_type }`,
+  `AudioContent { data, mime_type }` and `ResourceContents::BlobResourceContents { uri, mime_type, blob }` (*verified
+  2026-10-09* in the crate's `src/model/content.rs`).
 * Custom headers go through `StreamableHttpClientTransportConfig::custom_headers`; `Authorization` is allowed
   there. Its `auth_header` field is not used: the config derives `Debug`, and a sensitive `HeaderValue` shows as
   `Sensitive` while a plain `String` would not. `reinit_on_expired_session` is turned **off**: the SDK would
@@ -418,6 +506,13 @@ which lives there because only the package that owns a binary gets `CARGO_BIN_EX
 are polled with a deadline). Every test passes on its own in its own process (CI runs `cargo nextest`, one process
 per test): none relies on another test's runtime to reap a process or to install a log subscriber.
 
+* Unit, files (`src/tool.rs`): with `files` an image, a PDF blob and an audio clip are shared as artifacts named
+  `<tool>-<hash>.<ext>` and lines, text, text resources and links stay text, and no byte reaches the text; two
+  screenshots have two names and one has the same name twice; a "PNG" that is not one and a blob of no declared type
+  follow the bytes; a file over 4 MiB, and one far over it that is not even base64 (refused on its length, never
+  decoded), are lines and an error result while the next file is shared; three files of about 4 MiB share one, within
+  the run's 6 MiB, and none with 1 KiB left; base64 without padding or with a line break is read and garbage is
+  refused; one result shares 16 files; a text file is scrubbed, a binary one is not; a server's `isError` stays.
 * Unit: expansion (the `Env` before the process environment, defaults for unset and empty, a missing variable names
   only itself, malformed references stay literal), the URL rules and that credentials are refused and never shown,
   `sse` and stdio refusals, the names (`server__tool`, unmappable names skipped, allow-list order), the schema
@@ -427,6 +522,9 @@ per test): none relies on another test's runtime to reap a process or to install
   before the cut (a value that straddles it), header values marked sensitive (`is_sensitive`, and the transport
   configuration's `Debug`), a `${VAR}` in a `url` refused unless the policy allows it, server and tool names that
   would collide (`a_`, `_x`), `Debug` without header values.
+* `tests/http.rs`, `a_server_with_files_true_shares_its_images_and_blobs_as_files`: the testkit's `screenshot` and
+  `pdf` become `screenshot-<hash>.png` and `pdf-<hash>.pdf` with the server's bytes, a `png` of 4 MiB and one byte is a line and
+  an error result, and the same server without `files` describes the image and keeps nothing.
 * `tests/http.rs`: list and call over streamable HTTP; servers connected in name order; the allow-list and a
   listed tool the server lacks; every kind of content and an error result; a big result capped; arguments that are
   not an object and a server's protocol error as error results; the token sent on every request and in no log line
