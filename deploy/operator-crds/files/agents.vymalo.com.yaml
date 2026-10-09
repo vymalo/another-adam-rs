@@ -409,6 +409,16 @@ spec:
                     x-kubernetes-validations:
                     - message: exactly one of model.baseUrl.value and model.baseUrl.secretRef
                       rule: has(self.value) != has(self.secretRef)
+                  contextWindow:
+                    description: |-
+                      The context window of the model `model` names, in tokens (`MODEL_CONTEXT_WINDOW`): what each
+                      usage report of a call on that alias says as its window, so a screen shows how full the context
+                      is. Unset: reports carry no window.
+                    format: int64
+                    maximum: 9007199254740991.0
+                    minimum: 1.0
+                    nullable: true
+                    type: integer
                   echoReasoning:
                     description: The member a model's earlier reasoning is sent back under.
                     enum:

@@ -315,10 +315,10 @@ the report in the **event's** `metadata`, so the task's visible state and text d
 `stepId` only for a subagent's call, the parts and `contextWindow` only when known. A client that did not activate it is sent
 nothing. A resubscribe within the replay window hears a recent report again under the same `call` (the event is the same; the
 orchestrator drops a repeat). **The totals are on the task, for every reader** (`GetTask`, `ListTasks`, a stream's snapshot, a
-blocking send's answer): a task that is `completed`, `failed`, `canceled` or `input-required` carries
-`metadata[URI] = {"totals": [...]}`, one AG-UI `TokenUsage` per provider and model (at most 32), read from the `usage_totals`
-its agent keeps in its state (`adam_runtime::UsageTotals`; `adam-llm-agent`'s `Conversation`); a working task, and a task
-whose agent keeps none, carries none. Nothing is stored for it: the run's state is the record. Counts are at most
+blocking send's answer): a task that ended (`completed`, `failed`, `canceled`, `rejected`) or waits (`input-required`,
+`auth-required`) carries `metadata[URI] = {"totals": [...]}`, one AG-UI `TokenUsage` per provider and model (at most 32),
+read from the `usage_totals` its agent keeps in its state (`adam_runtime::UsageTotals`; `adam-llm-agent`'s `Conversation`);
+a working task, and a task whose agent keeps none, carries none. Nothing is stored for it: the run's state is the record. Counts are at most
 `MAX_TOKEN_COUNT` and consistent (`totalTokens` is the sum, a part never exceeds its total); labels at most 128 bytes. A
 stream's last status update carries no totals: a client reads them from the task. The SDK writes a number of metadata as a
 float on both bindings, a whole one (`41250.0`). Unit tests in `src/usage.rs`; `tests/usage.rs`.

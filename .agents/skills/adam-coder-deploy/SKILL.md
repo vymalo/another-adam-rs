@@ -81,6 +81,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      it on: a missing property fails the whole ExternalSecret sync. Chart only: the binary reads the
      env var either way, so there is no image dependency (chart README, "The model gateway's URL from the
      secret").
+   * `config.modelContextWindow` (null): `MODEL_CONTEXT_WINDOW`, the model's window in tokens, said by each usage report.
    * `mcp.websearch.url` (our web search MCP Service, in cluster) and `mcp.context7.enabled` (hosted
      Context7), both off by default and byte-for-byte invisible when off. With either on, the chart renders
      ONE file of servers (a ConfigMap in the shape of `mcp.json`, no copy of the agent's prompt) and sets

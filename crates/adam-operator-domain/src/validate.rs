@@ -4,7 +4,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use adam_operator_api::{AgentConfig, AgentService, Binary, SecretKeyRef, Topology, VolumeScope};
+use adam_operator_api::{
+    AgentConfig, AgentService, Binary, MAX_CONTEXT_WINDOW, SecretKeyRef, Topology, VolumeScope,
+};
 
 use crate::contract::{self, env};
 use crate::syntax::{
@@ -271,6 +273,14 @@ fn check_config(v: &mut Issues, cfg: &AgentConfig) {
                 );
             }
         }
+    }
+    if let Some(window) = model.context_window
+        && !(1..=MAX_CONTEXT_WINDOW).contains(&window)
+    {
+        v.add(
+            format!("{me} spec.model.contextWindow"),
+            format!("{window}: a number of tokens from 1 to {MAX_CONTEXT_WINDOW} (adam exits 78 on anything else), or leave it out"),
+        );
     }
 
     check_tools(v, cfg);

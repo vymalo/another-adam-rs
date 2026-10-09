@@ -226,6 +226,25 @@ fn the_coder_rules() {
             "extraBody.tools",
             "runtime owns",
         ),
+        // contextWindow: the schema's bounds, again
+        (
+            "a context window of 0",
+            |_, c| set(c, "/spec/model/contextWindow", json!(0)),
+            "spec.model.contextWindow",
+            "from 1 to 9007199254740991",
+        ),
+        (
+            "a context window over 2^53 - 1",
+            |_, c| {
+                set(
+                    c,
+                    "/spec/model/contextWindow",
+                    json!(9_007_199_254_740_992_u64),
+                )
+            },
+            "spec.model.contextWindow",
+            "from 1 to 9007199254740991",
+        ),
         // extraEnv
         (
             "extraEnv names an operator variable",
@@ -237,6 +256,12 @@ fn the_coder_rules() {
             "extraEnv names a variable the operator sets only sometimes",
             |_, c| set(c, "/spec/extraEnv/GITHUB_TOKEN", json!("x")),
             "extraEnv.GITHUB_TOKEN",
+            "operator sets",
+        ),
+        (
+            "extraEnv names the context window, which model.contextWindow sets",
+            |_, c| set(c, "/spec/extraEnv/MODEL_CONTEXT_WINDOW", json!("1000000")),
+            "extraEnv.MODEL_CONTEXT_WINDOW",
             "operator sets",
         ),
         (

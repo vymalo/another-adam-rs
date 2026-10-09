@@ -92,6 +92,20 @@ string is used as written, and empty (or an empty map) is nothing at all.
 {{- end -}}
 
 {{/*
+config.modelContextWindow as the text MODEL_CONTEXT_WINDOW holds: Helm reads the numbers of a values file
+as floats, so a whole one is written in full (1000000, not 1e+06); anything else is written as it is, for
+_validate.tpl to refuse. Null or empty is nothing at all.
+*/}}
+{{- define "coder.modelContextWindow" -}}
+{{- $v := .Values.config.modelContextWindow -}}
+{{- if and (kindIs "float64" $v) (eq $v (floor $v)) -}}
+{{- printf "%.0f" $v -}}
+{{- else if not (kindIs "invalid" $v) -}}
+{{- toString $v | trim -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Whether config.modelBaseUrl holds a URL somebody chose: not empty and not the placeholder above.
 Renders "true" or nothing.
 */}}

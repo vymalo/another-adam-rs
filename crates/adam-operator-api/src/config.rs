@@ -283,7 +283,18 @@ pub struct Model {
     /// (`MODEL_ECHO_REASONING`). Unset: never sent, which is what almost every model wants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub echo_reasoning: Option<EchoReasoning>,
+
+    /// The context window of the model `model` names, in tokens (`MODEL_CONTEXT_WINDOW`): what each
+    /// usage report of a call on that alias says as its window, so a screen shows how full the context
+    /// is. Unset: reports carry no window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = MAX_CONTEXT_WINDOW), extend("format" = "int64"))]
+    pub context_window: Option<u64>,
 }
+
+/// The largest `model.contextWindow`: 2^53 - 1, the largest count a usage report carries (what
+/// `adam_service::MAX_CONTEXT_WINDOW` accepts).
+pub const MAX_CONTEXT_WINDOW: u64 = (1 << 53) - 1;
 
 /// The member a model's earlier reasoning is sent back under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -152,14 +152,19 @@ last_state() {
 words_of() {
   jq -r --arg s "$1" 'select((.result.statusUpdate.status.state // .result.task.status.state) == $s) | [.. | .text? // empty] | join(" ")' "$tmp/events.jsonl" | tail -n 1
 }
+# The `ui` artifacts the stream delivered, one JSON object a line: as artifact updates, and in the
+# opening `task`, which carries what the run made before the subscription attached (the mocks
+# answer fast, so `show` can be done by then) and is then not sent again as an update.
+ui_artifacts() {
+  jq -c '(.result.artifactUpdate.artifact // empty), (.result.task.artifacts[]?) | select(.name == "ui")' \
+    "$tmp/events.jsonl"
+}
 # The A2UI messages of the `ui` artifact (the last one), as one JSON array, or nothing.
 surface() {
-  jq -c 'select(.result.artifactUpdate) | .result.artifactUpdate.artifact
-         | select(.name == "ui") | [.parts[] | select(.mediaType == "application/a2ui+json") | .data] | first // empty' \
-    "$tmp/events.jsonl" | tail -n 1
+  ui_artifacts | jq -c '[.parts[] | select(.mediaType == "application/a2ui+json") | .data] | first // empty' | tail -n 1
 }
 artifact_count() {
-  jq -r 'select(.result.artifactUpdate) | .result.artifactUpdate.artifact | select(.name == "ui") | .artifactId' "$tmp/events.jsonl" | sort -u | wc -l | tr -d ' '
+  ui_artifacts | jq -r '.artifactId' | sort -u | wc -l | tr -d ' '
 }
 
 # --- 0. The agent serves the researcher on the scripted model ----------------------------------

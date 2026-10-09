@@ -194,6 +194,47 @@ fn a_secret_is_never_a_value() {
 }
 
 #[test]
+fn the_context_window_is_an_optional_count_of_tokens_up_to_2_53_minus_1() {
+    let config = schema_of(&AgentConfig::crd());
+    let model = &config["properties"]["spec"]["properties"]["model"];
+    let window = &model["properties"]["contextWindow"];
+    assert_eq!(window["type"], "integer", "{window}");
+    assert_eq!(
+        window["format"], "int64",
+        "like the other integers, not schemars' uint64: {window}"
+    );
+    assert_eq!(window["minimum"], 1.0, "{window}");
+    assert_eq!(window["maximum"], 9_007_199_254_740_991.0, "{window}");
+    assert!(window.get("default").is_none(), "no default: {window}");
+    assert!(
+        !model["required"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "contextWindow")),
+        "{model}"
+    );
+    assert_eq!(adam_operator_api::MAX_CONTEXT_WINDOW, 9_007_199_254_740_991);
+
+    // Absent, it is None and is not written back; set, it round-trips.
+    let mut m = serde_json::json!({
+        "model": "m",
+        "baseUrl": {"value": "https://gateway.example.invalid/v1"},
+        "apiKeySecretRef": {"name": "s", "key": "MODEL_API_KEY"}
+    });
+    let typed: adam_operator_api::Model = serde_json::from_value(m.clone()).unwrap();
+    assert_eq!(typed.context_window, None);
+    assert!(
+        serde_json::to_value(&typed)
+            .unwrap()
+            .get("contextWindow")
+            .is_none()
+    );
+    m["contextWindow"] = serde_json::json!(1_000_000);
+    let typed: adam_operator_api::Model = serde_json::from_value(m.clone()).unwrap();
+    assert_eq!(typed.context_window, Some(1_000_000));
+    assert_eq!(serde_json::to_value(&typed).unwrap(), m);
+}
+
+#[test]
 fn a2a_is_on_unless_said_otherwise_and_interfaces_are_required() {
     let service = schema_of(&AgentService::crd());
     let spec = &service["properties"]["spec"];

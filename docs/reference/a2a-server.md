@@ -255,11 +255,11 @@ orchestration layer's `docs/api/usage-v1.md`, [ADR 0032](../decisions/0032-usage
 in the event's `metadata` under the URI: `call` (unique within the task, the same on a resubscribe), `stepId` for a subagent's
 call (the `tool:<call id>` of the call that started it), `provider` (`openai`), `model` (the alias), `inputTokens`,
 `outputTokens`, `totalTokens`, and, when known, `reasoningTokens`, `cachedInputTokens`, `cacheWriteInputTokens` and
-`contextWindow` (`MODEL_CONTEXT_WINDOW`). Any other request gets nothing of it. A task that is `completed`, `failed`,
-`canceled` or `input-required` carries `metadata[URI] = {"totals": [...]}`, one entry per provider and model, the subagents'
-calls included, **whoever reads it** (`GetTask`, `ListTasks`, a stream's snapshot); a working task carries none. Counts are at
-most 2^53 - 1 and written as whole numbers (the SDK writes them as floats: `41250.0`); labels at most 128 bytes. OpenCode
-reports no tokens. Details: `adam-a2a-runtime`'s README, *Usage*.
+`contextWindow` (`MODEL_CONTEXT_WINDOW`). Any other request gets nothing of it. A task that ended (`completed`, `failed`,
+`canceled`, `rejected`) or waits (`input-required`, `auth-required`) carries `metadata[URI] = {"totals": [...]}`, one entry
+per provider and model, the subagents' calls included, **whoever reads it** (`GetTask`, `ListTasks`, a stream's snapshot); a
+working task carries none. Counts are at most 2^53 - 1 and written as whole numbers (the SDK writes them as floats:
+`41250.0`); labels at most 128 bytes. OpenCode reports no tokens. Details: `adam-a2a-runtime`'s README, *Usage*.
 
 ## Streamed text
 

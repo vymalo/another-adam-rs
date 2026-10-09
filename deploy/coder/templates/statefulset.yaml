@@ -152,6 +152,10 @@ spec:
             - name: MODEL_ECHO_REASONING
               value: {{ . | quote }}
             {{- end }}
+            {{- with include "coder.modelContextWindow" . }}
+            - name: MODEL_CONTEXT_WINDOW
+              value: {{ . | quote }}
+            {{- end }}
             - name: OPENCODE_MODEL
               value: {{ .Values.config.opencodeModel | quote }}
             - name: WORKERS

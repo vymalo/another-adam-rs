@@ -85,6 +85,31 @@ check "modelEchoReasoning other than reasoning_content or reasoning is refused" 
   fails helm_reasoning --set config.modelEchoReasoning=yes
 check "modelEchoReasoning and extraEnv MODEL_ECHO_REASONING together are refused" \
   fails helm_reasoning --set config.modelEchoReasoning=reasoning_content --set-string config.extraEnv.MODEL_ECHO_REASONING=reasoning
+# The model's context window (ADR 0032 of adam-rs): MODEL_CONTEXT_WINDOW, a count of tokens, nothing by default.
+# envval <name> <value>: the StatefulSet sets the variable to that literal.
+envval() { doc StatefulSet | grep -A1 -- "- name: $1\$" | grep -Fq -- "value: \"$2\""; }
+helm_reasoning > "$out"
+check "by default no MODEL_CONTEXT_WINDOW is rendered" lacks 'MODEL_CONTEXT_WINDOW'
+for window in 1000000 9007199254740991 '"131072"'; do
+  printf 'config:\n  modelContextWindow: %s\n' "$window" > "$vals"
+  helm_reasoning -f "$vals" > "$out"
+  # Helm reads the numbers of a values file as floats: 1000000 must not become 1e+06.
+  check "modelContextWindow $window from a values file is MODEL_CONTEXT_WINDOW in full" \
+    envval MODEL_CONTEXT_WINDOW "$(printf '%s' "$window" | tr -d '"')"
+done
+helm_reasoning --set config.modelContextWindow=131072 > "$out"
+check "... and from --set" envval MODEL_CONTEXT_WINDOW 131072
+helm_reasoning --set config.modelContextWindow=131072 --set config.role=control-plane > "$out"
+check "a control plane runs no model: no MODEL_CONTEXT_WINDOW" lacks 'MODEL_CONTEXT_WINDOW'
+helm_reasoning --set config.modelContextWindow=131072 --set topology=split > "$out"
+check "split: the worker StatefulSet has it" envval MODEL_CONTEXT_WINDOW 131072
+check "split: the front has not" dlacks Deployment 'MODEL_CONTEXT_WINDOW'
+for bad in 0 -1 1.5 9007199254740992 lots true; do
+  printf 'config:\n  modelContextWindow: %s\n' "$bad" > "$vals"
+  check "modelContextWindow $bad is refused" fails helm_reasoning -f "$vals"
+done
+check "modelContextWindow and extraEnv MODEL_CONTEXT_WINDOW together are refused" \
+  fails helm_reasoning --set config.modelContextWindow=131072 --set-string config.extraEnv.MODEL_CONTEXT_WINDOW=131072
 # The checks below read the default render again.
 helm_reasoning > "$out"
 
@@ -989,7 +1014,7 @@ check "template: its own name label, not the coder's (the StatefulSet and its Ne
   tpl '^    app.kubernetes.io/name: coder-run$'
 check "template: the run container is named run" tpl '^    - name: run$'
 check "template: the workspace image by tag AND digest" \
-  tpl 'image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a"'
+  tpl 'image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-cfd2917@sha256:ee7e4c7539ad62942e43f9b8ea39d8433617888cac3b0d26a37de3993671786c"'
 check "template: the memory limit is 2Gi" tpl '^        limits:$'
 check "template: memory: 2Gi" tpl '^          memory: 2Gi$'
 check "template: requests 250m and 512Mi" tpl '^          cpu: 250m$'
@@ -1059,7 +1084,7 @@ check "policy: only CREATE of pods" rhas ValidatingAdmissionPolicy "$pn" 'operat
 check "policy: refuses a pod without the run label and the managed-by label" policy_has "$pn" "'adam.vymalo.com/run' in object.metadata.labels"
 check "policy: ... or without the priority class" policy_has "$pn" "object.spec.priorityClassName == 'coder-run'"
 check "policy: ... or with another image (the run image by digest and the coder's)" \
-  policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
+  policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-cfd2917@sha256:ee7e4c7539ad62942e43f9b8ea39d8433617888cac3b0d26a37de3993671786c', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
 check "policy: ... or a hostPath: only emptyDir, the work claim and the one Secret" \
   policy_has "$pn" "has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0') || (has(v.secret) && v.secret.secretName == 'coder')"
 check "policy: ... or a Secret other than the allowed one, by key" policy_has "$pn" "e.valueFrom.secretKeyRef.name == 'coder'"
