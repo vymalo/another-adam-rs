@@ -173,10 +173,9 @@ async fn a_token_the_endpoint_does_not_accept_is_unauthorized_and_the_token_is_n
 
 #[tokio::test]
 async fn an_endpoint_that_is_down_fails_without_the_token() {
-    // A port held by a listener that closes every connection unanswered: no other test's server
-    // can be given a port that is listened on (a socket that was only bound was shared with a
-    // server of another test, run in parallel, which answered 401 there), and the endpoint gets
-    // no answer at all.
+    // A listener that closes every connection unanswered: the endpoint gets no answer at all. The
+    // error's text carries the URL, port included, and must not read as a 401 when the port has
+    // `401` in it.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "http://{}/thread-tools/thread-1/mcp",
