@@ -184,12 +184,14 @@ fn card_for_build(
 /// `card` with the extensions the coder speaks: the screen's (A2UI, `ui-catalog/v1`,
 /// `thread-tools/v1`, `mentions/v1`, `steer/v1`), `steps/v1` (every tool call, and OpenCode's, is reported as a step to a
 /// client that activates it) and `text-stream/v1` (its answers are sent as the model writes them to a
-/// client that activates it: the agent streams its model calls). `build/v1`, which says the build and the
-/// files, is added by [`card_for_build`].
+/// client that activates it: the agent streams its model calls) and `usage/v1` (the tokens of every model
+/// call to a client that activates it, and a task's totals on the task). `build/v1`, which says the build
+/// and the files, is added by [`card_for_build`].
 fn with_extensions(card: AgentCardConfig) -> AgentCardConfig {
     adam_ui::with_card_extensions(card)
         .with_extension(adam_a2a::ExtensionConfig::steps())
         .with_extension(adam_a2a::ExtensionConfig::text_stream())
+        .with_extension(adam_a2a::ExtensionConfig::usage())
 }
 
 #[cfg(test)]

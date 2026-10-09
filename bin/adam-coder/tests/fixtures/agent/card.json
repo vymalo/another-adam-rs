@@ -107,6 +107,12 @@
       "params": {}
     },
     {
+      "uri": "https://agents.vymalo.com/a2a/extensions/usage/v1",
+      "description": "Reports the tokens of each model call and the task's totals.",
+      "required": false,
+      "params": {}
+    },
+    {
       "uri": "https://agents.vymalo.com/a2a/extensions/build/v1",
       "description": "Says which build answers and which agent files it runs",
       "required": false,

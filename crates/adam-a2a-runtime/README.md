@@ -22,6 +22,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `task_id_for(agent, subject, context_id, message_id)` | the task id a new task of `agent` started by that message gets (see *Stable ids*) |
 | `MAX_REFERENCES` | how many of a message's `referenceTaskIds` are looked at (8); see *Continuing a task* |
 | `RuntimeTaskBackend::list` (`TaskBackend::list`), `MAX_SCAN` | `ListTasks`: the caller's tasks, newest update first, by keyset cursor; see *Listing tasks* |
+| `MAX_TOKEN_COUNT` | the largest count a `usage/v1` report or total carries (2^53 - 1); see *Usage* |
 | `RuntimeTaskBackend::push_store()`, `StorePushStore::new(store, agent)` | the `adam_a2a::push::PushStore` over the run `Store`: configs and delivery progress next to the runs, so a restart or another replica loses nothing; see *Push notifications* |
 
 ```rust
@@ -296,6 +297,32 @@ and a client that wants it keeps the pieces. Nothing for a client that did not a
 reads these chunks as a reply of a stream nobody states, so the reader goes first in a rollout. Unit tests in `src/text_stream.rs`
 (`a_reasoning_chunk_is_a_chunk_of_its_own_stream_marked_with_its_kind`) and the subscription test of `tests/text_stream.rs`.
 
+## Usage
+
+`usage/v1` (the contract of `docs/api/usage-v1.md` of `vymalo/another-agentic-system`,
+[ADR 0032](../../docs/decisions/0032-usage-per-model-call.md)): each `RunEvent::Usage` is, **only for a client whose request
+activated it** (`Caller::extensions` has `USAGE_EXTENSION` of `adam-a2a`), a `working` status update with **no message** and
+the report in the **event's** `metadata`, so the task's visible state and text do not change:
+
+```json
+{"statusUpdate": {"taskId": "...", "contextId": "...", "status": {"state": "TASK_STATE_WORKING", "timestamp": "..."},
+  "metadata": {"https://agents.vymalo.com/a2a/extensions/usage/v1": {
+    "call": "<run>-c0-1a2b3c4d", "stepId": "tool:call_2", "provider": "openai", "model": "glm-5.3",
+    "inputTokens": 41250, "outputTokens": 812, "totalTokens": 42062, "reasoningTokens": 300,
+    "cachedInputTokens": 38000, "contextWindow": 131072}}}}
+```
+
+`stepId` only for a subagent's call, the parts and `contextWindow` only when known. A client that did not activate it is sent
+nothing. A resubscribe within the replay window hears a recent report again under the same `call` (the event is the same; the
+orchestrator drops a repeat). **The totals are on the task, for every reader** (`GetTask`, `ListTasks`, a stream's snapshot, a
+blocking send's answer): a task that is `completed`, `failed`, `canceled` or `input-required` carries
+`metadata[URI] = {"totals": [...]}`, one AG-UI `TokenUsage` per provider and model (at most 32), read from the `usage_totals`
+its agent keeps in its state (`adam_runtime::UsageTotals`; `adam-llm-agent`'s `Conversation`); a working task, and a task
+whose agent keeps none, carries none. Nothing is stored for it: the run's state is the record. Counts are at most
+`MAX_TOKEN_COUNT` and consistent (`totalTokens` is the sum, a part never exceeds its total); labels at most 128 bytes. A
+stream's last status update carries no totals: a client reads them from the task. The SDK writes a number of metadata as a
+float on both bindings, a whole one (`41250.0`). Unit tests in `src/usage.rs`; `tests/usage.rs`.
+
 ## Stable ids
 
 Ids are derived, never drawn at random per read, so a consumer that keys on
@@ -382,7 +409,12 @@ the backend whose model is shown the earlier messages (memory and PostgreSQL). U
 messages in `src/vymalo.rs` (each shape of answer, quoting, the cut, the context under every capability key, a catalog
 of another id, a malformed reference, the doubles) and `tests/vymalo.rs` (a real `Runtime` and `LlmAgent`: the
 extensions reaching the run's context, a question with an interface as `input-required` with two parts, and the person's
-answer as the tool result the model reads), and `tests/steer.rs` (a real `Runtime` and `LlmAgent` behind the backend, on memory and PostgreSQL: a steered message is delivered to the working task and the model's next request carries it, once even when sent twice; a `submitted` task takes one, **a task a worker has taken is `working` before its first commit (while the model is at its first call) and takes one, and a subscriber is told so by the live event, not the poll**; without the extension it is `InvalidParams` as before and nothing is delivered; a completed or canceled task is `-32004`, activated or not; an unknown, foreign or other-context task is not found; **a message sent while the model writes the final answer is answered**; and the whole path over HTTP through the real server and the official client, a streaming send whose first event is the working task, the activation by header alone, and the refusals), and `tests/text_stream.rs` (a real `Runtime` and an `LlmAgent` with a model that writes slowly: an activated client reads chunks that begin where the one before ended and add up to the answer, all before the status that ends the turn, and that status carries the stream's id; the words before a tool call are a `working` status with the stream's id as the message id and the answer is another stream; a question that is the streamed reply is stated under its stream; a model that fails in the middle ends the stream abandoned and fails the task as it does without streaming; a client that did not activate reads no chunk and the same reply; a blocking send's task has no chunk; and over HTTP through the SDK the header activates it, the response names it, and `offset` is a whole number on the wire), `src/text_stream.rs` (the chunk, the marker and the stream id as pure functions), and `tests/steps.rs` (a real `Runtime` and an agent that reports a tool call, a command under it that waits and fails, and the end: an activated client reads each step as a report in the metadata beside its line, with the same state held back within a second and a change of state not, one that did not reads every step as a line and nothing else, and another extension activates nothing) with the unit tests of `src/convert.rs` (the state table, a claimed run is `working` before its first commit and a lapsed claim is not, a claim changes no other state and changes the status key), `src/steps.rs` (the metadata, the message, the line of each state) and of the throttle in `src/subscribe.rs` (once a second a state, every change, the end, a retry starting afresh, the bound on what is remembered).
+answer as the tool result the model reads), and `tests/steer.rs` (a real `Runtime` and `LlmAgent` behind the backend, on memory and PostgreSQL: a steered message is delivered to the working task and the model's next request carries it, once even when sent twice; a `submitted` task takes one, **a task a worker has taken is `working` before its first commit (while the model is at its first call) and takes one, and a subscriber is told so by the live event, not the poll**; without the extension it is `InvalidParams` as before and nothing is delivered; a completed or canceled task is `-32004`, activated or not; an unknown, foreign or other-context task is not found; **a message sent while the model writes the final answer is answered**; and the whole path over HTTP through the real server and the official client, a streaming send whose first event is the working task, the activation by header alone, and the refusals), and `tests/text_stream.rs` (a real `Runtime` and an `LlmAgent` with a model that writes slowly: an activated client reads chunks that begin where the one before ended and add up to the answer, all before the status that ends the turn, and that status carries the stream's id; the words before a tool call are a `working` status with the stream's id as the message id and the answer is another stream; a question that is the streamed reply is stated under its stream; a model that fails in the middle ends the stream abandoned and fails the task as it does without streaming; a client that did not activate reads no chunk and the same reply; a blocking send's task has no chunk; and over HTTP through the SDK the header activates it, the response names it, and `offset` is a whole number on the wire), `src/text_stream.rs` (the chunk, the marker and the stream id as pure functions), `tests/usage.rs` (a real `Runtime` and `LlmAgent`s with scripted models: an activated client reads a report per model call
+on a `working` status with no message and the turn ends as before; one that did not reads none and the task still has its
+totals; a subagent's calls carry its step and are in the totals; a resubscribe hears a report again under the same id; a task
+that waits carries its totals, carries none once resumed and covers every call when it ends, in `GetTask` and `ListTasks`; a
+failed and a canceled task carry theirs; and over HTTP, JSON-RPC and REST, with and without the header: the reports reach only
+the client that named the extension, in whole numbers, and `GetTask` says the totals on both bindings), and `tests/steps.rs` (a real `Runtime` and an agent that reports a tool call, a command under it that waits and fails, and the end: an activated client reads each step as a report in the metadata beside its line, with the same state held back within a second and a change of state not, one that did not reads every step as a line and nothing else, and another extension activates nothing) with the unit tests of `src/convert.rs` (the state table, a claimed run is `working` before its first commit and a lapsed claim is not, a claim changes no other state and changes the status key), `src/steps.rs` (the metadata, the message, the line of each state) and of the throttle in `src/subscribe.rs` (once a second a state, every change, the end, a retry starting afresh, the bound on what is remembered).
 
 | Variable | Meaning |
 |---|---|

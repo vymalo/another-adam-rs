@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::conversation::{ROOT_RUN_KEY, user_message};
+use crate::conversation::{ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
 
@@ -422,6 +422,9 @@ pub struct ToolCtx {
     children: Option<ChildStarter>,
     context: Arc<Map<String, Value>>,
     root_run: RunId,
+    /// The step of the root run this run works under, when it is a child (see
+    /// `Conversation::root_step`); `None` for a run that is nobody's child.
+    root_step: Option<String>,
     /// The step of this call (id, kind, label, icon): what [`emit_progress`](Self::emit_progress)
     /// updates and [`report_step`](Self::report_step) nests under.
     step: StepEvent,
@@ -443,6 +446,7 @@ impl ToolCtx {
         children: Option<ChildStarter>,
         context: Arc<Map<String, Value>>,
         root_run: Option<RunId>,
+        root_step: Option<String>,
         step: StepEvent,
     ) -> Self {
         let run_id = emitter.run_id();
@@ -458,6 +462,7 @@ impl ToolCtx {
             children,
             context,
             root_run: root_run.unwrap_or(run_id),
+            root_step,
             step,
             note: None,
         }
@@ -515,6 +520,7 @@ impl ToolCtx {
             Arc::default(),
             None,
             Arc::default(),
+            None,
             None,
             step,
         )
@@ -598,6 +604,11 @@ impl ToolCtx {
     /// [`ToolError::AwaitRun`]. The child starts on the runtime that steps this run, so the agent
     /// must be registered on it (as an agent or a starter).
     ///
+    /// The first message also names the run and the step the child works under, the **root** run's
+    /// ([`root_run_id`](Self::root_run_id), and this call's own step when this run is the root): the
+    /// child reports its model calls to the root's task under that step (`usage/v1`), and hands both
+    /// down to its own children.
+    ///
     /// Idempotent: a call that runs again (a replay, a retry) finds the child it started. One child
     /// per call: starting a second one from the same call would find the first.
     ///
@@ -618,6 +629,13 @@ impl ToolCtx {
             payload.insert(
                 ROOT_RUN_KEY.to_owned(),
                 Value::String(self.root_run.to_string()),
+            );
+            // The step of the root the child works under: this call's own when this run is the
+            // root, the one this run works under when it is a child itself.
+            let root_step = self.root_step.as_deref().unwrap_or(&self.step.id);
+            payload.insert(
+                ROOT_STEP_KEY.to_owned(),
+                Value::String(root_step.to_owned()),
             );
         }
         children

@@ -22,6 +22,7 @@
 //! | `MODEL` | model alias of the agent | required for `all` and `worker` |
 //! | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request, to make a gateway or a model emit its reasoning (`{"reasoning_effort":"medium"}`); **not secret**; an invalid value is a startup error ([`ModelConfig::extra_body`]) | unset (nothing added) |
 //! | `MODEL_ECHO_REASONING` | send the reasoning of earlier turns back, under this member name (`reasoning_content` or `reasoning`), for a provider that requires it (DeepSeek's thinking mode with tools); `false` or unset sends none ([`ModelConfig::echo_reasoning`]) | unset (never sent) |
+//! | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (no `contextWindow`) |
 //! | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the MCP servers of an agent folder may be ([`McpSettings`], feature `mcp`) | `false` each |
 //! | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400; [`McpSettings`], feature `mcp`) | `3600` |
 //!
@@ -532,6 +533,11 @@ pub struct ModelConfig {
     /// `MODEL_ECHO_REASONING`: the member name under which the reasoning of earlier turns is sent
     /// back; `None` (the default) sends none.
     pub echo_reasoning: Option<ReasoningField>,
+    /// `MODEL_CONTEXT_WINDOW`: the context window, in tokens, of the model [`alias`](Self::alias)
+    /// names. The client says it for that alias only ([`OpenAiCompatible::with_context_window`]),
+    /// so a call report says how full the context is; an agent whose files name another alias
+    /// reports none. `None` when unset.
+    pub context_window: Option<u64>,
 }
 
 impl std::fmt::Debug for ModelConfig {
@@ -549,6 +555,7 @@ impl std::fmt::Debug for ModelConfig {
                     .map(|m| m.keys().collect::<Vec<_>>()),
             )
             .field("echo_reasoning", &self.echo_reasoning)
+            .field("context_window", &self.context_window)
             .finish_non_exhaustive()
     }
 }
@@ -582,6 +589,7 @@ impl ModelConfig {
             alias,
             extra_body: parse_extra_body(&get("MODEL_EXTRA_BODY"), problems),
             echo_reasoning: parse_echo_reasoning(&get("MODEL_ECHO_REASONING"), problems),
+            context_window: parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems),
         }
     }
 
@@ -597,6 +605,9 @@ impl ModelConfig {
             self.api_key.clone(),
         ))?
         .with_echo_reasoning(self.echo_reasoning);
+        if let Some(window) = self.context_window {
+            client = client.with_context_window(self.alias.clone(), window);
+        }
         if let Some(extra) = &self.extra_body {
             client = client.with_extra_body(extra.clone())?;
         }
@@ -641,6 +652,24 @@ fn parse_extra_body(
         }
     }
     Some(map).filter(|map| !map.is_empty())
+}
+
+/// The largest `MODEL_CONTEXT_WINDOW`: the largest count a `usage/v1` report may carry (2^53 - 1,
+/// the largest integer a JSON number keeps exactly).
+pub const MAX_CONTEXT_WINDOW: u64 = 9_007_199_254_740_991;
+
+/// `MODEL_CONTEXT_WINDOW`: a whole number of tokens from 1 to [`MAX_CONTEXT_WINDOW`], or a problem.
+fn parse_context_window(raw: &Option<String>, problems: &mut Vec<String>) -> Option<u64> {
+    let raw = raw.as_deref()?.trim();
+    match raw.parse::<u64>() {
+        Ok(window) if (1..=MAX_CONTEXT_WINDOW).contains(&window) => Some(window),
+        _ => {
+            problems.push(format!(
+                "MODEL_CONTEXT_WINDOW must be a whole number of tokens from 1 to {MAX_CONTEXT_WINDOW}, like 131072"
+            ));
+            None
+        }
+    }
 }
 
 /// `MODEL_ECHO_REASONING`: `reasoning_content`, `reasoning`, or off (`false`, `off`, `no`, `0`).
@@ -1264,6 +1293,54 @@ mod tests {
         vars.insert("MODEL_ECHO_REASONING", "yes please");
         let (_, problems) = model_problems(&vars);
         assert!(mentions(&problems, "MODEL_ECHO_REASONING"), "{problems:?}");
+    }
+
+    #[test]
+    fn the_context_window_is_a_positive_count_for_the_models_alias() {
+        use adam_model::ModelClient as _;
+        let mut vars = model_vars();
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(model.context_window, None);
+        let client = model.client().expect("a usable client");
+        assert_eq!(client.context_window("large"), None);
+
+        for (value, want) in [
+            ("131072", 131_072),
+            (" 8192 ", 8192),
+            ("1", 1),
+            ("9007199254740991", MAX_CONTEXT_WINDOW),
+        ] {
+            vars.insert("MODEL_CONTEXT_WINDOW", value);
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{value}: {problems:?}");
+            assert_eq!(model.context_window, Some(want), "{value}");
+            assert!(format!("{model:?}").contains(&want.to_string()));
+            // The client says it for the alias `MODEL` names, and for no other.
+            let client = model.client().expect("a usable client");
+            assert_eq!(client.context_window("large"), Some(want), "{value}");
+            assert_eq!(client.context_window("small"), None);
+            assert_eq!(client.provider(), Some("openai"));
+        }
+        // Blank is unset.
+        vars.insert("MODEL_CONTEXT_WINDOW", "  ");
+        assert!(model_problems(&vars).1.is_empty());
+
+        for bad in [
+            "0",
+            "-1",
+            "128k",
+            "1.5",
+            "131072.0",
+            "9007199254740992",
+            "99999999999999999999999",
+        ] {
+            vars.insert("MODEL_CONTEXT_WINDOW", bad);
+            let (model, problems) = model_problems(&vars);
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert!(mentions(&problems, "MODEL_CONTEXT_WINDOW"), "{problems:?}");
+            assert_eq!(model.context_window, None, "{bad}");
+        }
     }
 
     #[test]

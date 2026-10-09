@@ -247,6 +247,20 @@ The card says which build of the agent answers, so that a thread export can be t
   activate, ignored by a client that does not know it. `adam_a2a::ExtensionConfig::build(revision, folder_digest)` declares it,
   `adam_agent::card_of_folder` and `adam_coder::agent_card_from` add it.
 
+## Tokens of each model call
+
+Every agent's card lists `https://agents.vymalo.com/a2a/extensions/usage/v1` (optional, no `params`; the contract is the
+orchestration layer's `docs/api/usage-v1.md`, [ADR 0032](../decisions/0032-usage-per-model-call.md)). A request that
+**activates it** gets, after each completed model call, a `working` status update with **no message** and the call's report
+in the event's `metadata` under the URI: `call` (unique within the task, the same on a resubscribe), `stepId` for a subagent's
+call (the `tool:<call id>` of the call that started it), `provider` (`openai`), `model` (the alias), `inputTokens`,
+`outputTokens`, `totalTokens`, and, when known, `reasoningTokens`, `cachedInputTokens`, `cacheWriteInputTokens` and
+`contextWindow` (`MODEL_CONTEXT_WINDOW`). Any other request gets nothing of it. A task that is `completed`, `failed`,
+`canceled` or `input-required` carries `metadata[URI] = {"totals": [...]}`, one entry per provider and model, the subagents'
+calls included, **whoever reads it** (`GetTask`, `ListTasks`, a stream's snapshot); a working task carries none. Counts are at
+most 2^53 - 1 and written as whole numbers (the SDK writes them as floats: `41250.0`); labels at most 128 bytes. OpenCode
+reports no tokens. Details: `adam-a2a-runtime`'s README, *Usage*.
+
 ## Streamed text
 
 A model turn streams by default (`LlmAgentBuilder::stream_text`): the journaled step `model:<turn>` calls

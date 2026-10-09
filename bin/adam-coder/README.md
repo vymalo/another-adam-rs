@@ -146,6 +146,17 @@ unchanged. The chunks are live and not stored, like every event: what the run re
 models of `dev/wiremock/mock-openai` answer a stream as they answer a completion, and `dev/coder-e2e.sh` and
 `dev/greeting-e2e.sh` check that the answer arrives as chunks that add up to it.
 
+### Tokens: what each model call cost
+
+The card lists `usage/v1` ([ADR 0032](../../docs/decisions/0032-usage-per-model-call.md); the contract is the orchestration
+layer's `docs/api/usage-v1.md`). A client that activates it reads, after each model call of the coder **and of its subagents**
+(`explorer`, `reviewer`, any `subagents/*.md`, whose reports carry the `stepId` of the call that started them), a `working`
+status with no message and the call's tokens in the event's metadata: provider `openai`, the alias as `model`, the input,
+output, reasoning and cached tokens the gateway says, and `MODEL_CONTEXT_WINDOW` as `contextWindow`. The task carries its
+totals per model when it ends or waits, whoever reads it. **OpenCode reports no tokens**: ACP gives adam no count per model call
+(its `usage_update` is the context used and its size, which `adam-acp` drops, and the turn's `usage` is an unstable feature
+of the protocol that is not on), so the OpenCode step has no report and its calls are in no total.
+
 ### Asking with choices
 
 **Sending while it works** (`steer/v1`, on the card): when a request activates the extension, a message that names the running task
@@ -156,7 +167,7 @@ activation the message is refused as before ([`adam-a2a-runtime`](../../crates/a
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
 (`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
-`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1` and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
+`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1`, `usage/v1` and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, choices? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, and the
 person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
@@ -1506,6 +1517,7 @@ way; every problem is reported at once at startup):
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value; read by the agent's own model calls only, not by OpenCode (`OPENCODE_MODEL`) | unset: nothing is added |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: keep the model's reasoning in the run's history and send it back under that member name. For a provider that requires it (DeepSeek's thinking mode with tools answers a request without it with a 400); `false` or unset sends none, which is what almost every model wants. Anything else: exit 78 | unset: never sent |
+| `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias reports none, and OpenCode reports no usage at all. Anything else: exit 78 | unset: reports carry no window |
 | `OPENCODE_MODEL` | model alias OpenCode uses through the same gateway | `MODEL` |
 | `GITHUB_TOKEN` | push and pull request token (a personal access token); only ever sent to the `ALLOWED_REPO_HOSTS`. Must be unset or empty in App mode | one of this or the App's variables, for `all` and `worker` |
 | `GITHUB_APP_ID` | GitHub App mode: the App's application ID or client ID (the JWT's `iss`). See [GitHub credentials](#github-credentials-a-token-or-an-app-installation) | required in App mode |
@@ -2099,7 +2111,7 @@ database of its own, so the role needs `CREATEDB`):
   another agent's name, a worker whose folder cannot be assembled (exit 78, names the var; Postgres), a control
   plane serving the card of the folder with the `agent files` line and the warning logged (Postgres), and the
   embedded copy logged as `source=embedded`.
-* `src/tools/delegate.rs` (unit): OpenCode's tool calls as child steps (the kind and icon of each ACP kind, the state of each status, a call moved and ended by its updates, what OpenCode says scrubbed and cut, a call that never ended closed with the turn) and `tests/tools.rs`' `delegate_to_opencode_streams_updates_and_returns_the_summary` (the call is a `subagent` step labelled OpenCode, the fake agent's tool call is a child with the edit icon that ends `completed`, its reply is a `message` child and the progress lines are updates of the call's own step); `tests/agent_files.rs` and the card golden pin `steps/v1` and `text-stream/v1` on the card. The tests' models stream too (the agent calls `stream`): a model that does its work in `complete` only is not asked for it any more, so `HangingModel` of `tests/e2e.rs` and the greeting model of `tests/agent_files.rs` do it in `stream` as well.
+* `src/tools/delegate.rs` (unit): OpenCode's tool calls as child steps (the kind and icon of each ACP kind, the state of each status, a call moved and ended by its updates, what OpenCode says scrubbed and cut, a call that never ended closed with the turn) and `tests/tools.rs`' `delegate_to_opencode_streams_updates_and_returns_the_summary` (the call is a `subagent` step labelled OpenCode, the fake agent's tool call is a child with the edit icon that ends `completed`, its reply is a `message` child and the progress lines are updates of the call's own step); `tests/agent_files.rs` and the card golden pin `steps/v1`, `text-stream/v1` and `usage/v1` on the card. The tests' models stream too (the agent calls `stream`): a model that does its work in `complete` only is not asked for it any more, so `HangingModel` of `tests/e2e.rs` and the greeting model of `tests/agent_files.rs` do it in `stream` as well.
 * `src/tools/files.rs` (unit) and `tests/tools.rs`: the file tools. `confine` has a case each for `../`, an absolute path,
   `.git/x` and `.GIT/x`, a symlink to a file outside, a symlinked directory outside, a write through a symlink that
   stays inside, a link into `.git`, a directory and a file in the wrong place; `read_file` (a range with numbers, a

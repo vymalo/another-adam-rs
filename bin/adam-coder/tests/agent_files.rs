@@ -350,6 +350,7 @@ async fn the_assemblys_card_is_the_card_a_control_plane_serves() {
     )
     .with_extension(adam_a2a::ExtensionConfig::steps())
     .with_extension(adam_a2a::ExtensionConfig::text_stream())
+    .with_extension(adam_a2a::ExtensionConfig::usage())
     .with_extension(adam_a2a::ExtensionConfig::build(
         adam_coder::BUILD_REVISION,
         AgentFiles::Embedded.describe().digest,

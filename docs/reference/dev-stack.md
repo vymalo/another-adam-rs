@@ -160,7 +160,11 @@ so every scripted answer above also has an SSE twin, in `mappings/coder-script-s
 `agent-script-stream.json` and `researcher-cards-stream.json`: the same request matchers plus `$.stream == true`, **one priority
 above the original** (so priority 0 for the ones that were 1), and the same answer as a stream: a text in about eight content
 deltas (the greeting and the other answers dribbled over half a second, the coder's last answer over about two seconds, so a
-screen has something to show growing), a tool call in a few argument deltas, the usage chunk and `data: [DONE]`. The off-script
+screen has something to show growing), a tool call in a few argument deltas, the usage chunk and `data: [DONE]`. Every
+scripted answer says its usage the way OpenAI does, in both forms: `prompt_tokens`, `completion_tokens`, and the details
+`prompt_tokens_details.cached_tokens` (64 of 100 prompt tokens) and `completion_tokens_details.reasoning_tokens` (5 of 20),
+which the agents report over `usage/v1` ([ADR 0032](../decisions/0032-usage-per-model-call.md)); the coder's
+`MODEL_CONTEXT_WINDOW` is `131072` in `compose.yaml`. The off-script
 404 and the error scenarios are plain HTTP errors, which a stream request gets as well. `cargo test -p adam-model-openai --test
 wiremock_compose` (CI's `compose` job, `ADAM_TEST_MOCK_OPENAI_URL`) plays every script from the first request to the final
 answer **both ways** and requires the same response (text, tool calls, finish reason, usage), so a twin cannot drift from

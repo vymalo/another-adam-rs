@@ -1,11 +1,11 @@
 ---
 name: adam-a2a-extensions
-description: "Which A2A extensions an adam-rs agent declares and supports (A2UI v0.9.1, ui-catalog/v1, thread-tools/v1, steps/v1, text-stream/v1, mentions/v1, steer/v1), how a client activates them, and how to add or announce one. Use when writing a client or an orchestrator for adam agents, when an agent card lacks an extension, or when adding an extension to adam-rs."
+description: "Which A2A extensions an adam-rs agent declares and supports (A2UI v0.9.1, ui-catalog/v1, thread-tools/v1, steps/v1, text-stream/v1, mentions/v1, steer/v1, usage/v1), how a client activates them, and how to add or announce one. Use when writing a client or an orchestrator for adam agents, when an agent card lacks an extension, or when adding an extension to adam-rs."
 ---
 
 # A2A extensions of an adam agent
 
-An adam agent is a plain A2A 1.0 agent. On top of that it can declare eight optional extensions
+An adam agent is a plain A2A 1.0 agent. On top of that it can declare nine optional extensions
 on its card. A client that does not know one ignores it; every extension is removable without
 breaking plain A2A. The contracts are written in `vymalo/another-agentic-system`
 (its docs/api directory, the `*-v1.md` files); adam-rs holds the agent side.
@@ -15,7 +15,8 @@ by that revision). The source of the list is
 https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-a2a/src/extensions.rs. Contract
 files: https://github.com/vymalo/another-agentic-system/blob/main/docs/api/steer-v1.md and its
 siblings (`ui-catalog-v1.md`, `thread-tools-v1.md`, `steps-v1.md`, `text-stream-v1.md`,
-`mentions-v1.md`; verified to exist on its main on 2026-10-03).
+`mentions-v1.md`; verified to exist on its main on 2026-10-03; `usage-v1.md` is written in the change that implements the
+orchestrator's side, and exists on its main once that change merges).
 
 ## When to use
 
@@ -38,6 +39,7 @@ siblings (`ui-catalog-v1.md`, `thread-tools-v1.md`, `steps-v1.md`, `text-stream-
 | `steps/v1` | `STEPS_EXTENSION` | tool calls and sub-agents' work as nested steps | `adam-agent` and `adam-coder` add it (`ExtensionConfig::steps()`) |
 | `build/v1` | `BUILD_EXTENSION` | information only, nothing to activate: `params` `{revision, folderDigest}` say which build and which agent files answer (ADR 0028) | `adam-agent` (`card_of_folder`) and `adam-coder` (`agent_card_from`) add it (`ExtensionConfig::build(..)`) |
 | `text-stream/v1` | `TEXT_STREAM_EXTENSION` | the reply streamed as the model writes it, then the whole text once; since 2026-10-05 also the model's **reasoning**, as chunks with `kind: "reasoning"` (`TEXT_STREAM_KIND_REASONING`), its own `artifactId`, never stated whole (ADR 0020) | `adam-agent` and `adam-coder` add it (`ExtensionConfig::text_stream()`) |
+| `usage/v1` | `USAGE_EXTENSION` | the tokens of each model call, to a client that activated it: a `working` status update with **no message** and the report in the **event's** `metadata` (`call`, `stepId` for a subagent's call, `provider`, `model`, the AG-UI `TokenUsage` counts, `contextWindow`); and, for every reader, the task's `totals` in the **task's** `metadata` once it ends or waits (ADR 0032) | `adam-agent` and `adam-coder` add it (`ExtensionConfig::usage()`) |
 
 The URIs are `https://agents.vymalo.com/a2a/extensions/<name>/v1` (A2UI has its own URI);
 read the exact strings in the file at your rev.
@@ -52,7 +54,7 @@ read the exact strings in the file at your rev.
 2. **What the agent does** per extension: `adam-ui` (`crates/adam-ui/README.md`) reads the
    screen's catalog and the thread tools and offers `ask_user`, `show`, `ui_catalog`;
    `adam-a2a-runtime` (`crates/adam-a2a-runtime/README.md`) reads the messages a screen sends
-   (`vymalo_inbound`), reports steps and streamed text, and implements steering ("Steering a
+   (`vymalo_inbound`), reports steps, streamed text and tokens ("Usage"), and implements steering ("Steering a
    running task": a message to a finished task is `UnsupportedOperation`, `-32004`; to a working
    task without the activation, `InvalidParams`).
 3. **Release channels** (the agent platform's extension) is not implemented by adam-rs: an
@@ -61,15 +63,16 @@ read the exact strings in the file at your rev.
    implement any extension itself").
 4. **Announce extensions on your own agent**: build the card with `AgentCardConfig`, then
    `adam_ui::with_card_extensions(card)` for the five screen extensions, plus
-   `.with_extension(adam_a2a::ExtensionConfig::steps())` and `::text_stream()` when your agent
-   reports steps and streams text. Wire `Agents::new(..).inbound(vymalo_inbound)` so a screen's
+   `.with_extension(adam_a2a::ExtensionConfig::steps())`, `::text_stream()` and `::usage()` when your agent
+   reports steps, streams text and reports its tokens (an `LlmAgent` does all three; a hand-written agent reports tokens
+   with `RunEvent::Usage` and keeps `usage_totals` in its state, the shape of `adam_runtime::UsageTotals`). Wire `Agents::new(..).inbound(vymalo_inbound)` so a screen's
    messages are read (the "Wiring" section of `crates/adam-ui/README.md`). Declaring an extension
    is a promise: do not declare `steer/v1` for an agent that can lose an accepted message
    (`adam-a2a-runtime` README, "Steering a running task").
 5. **Add a new extension to adam-rs** (the contract is first written in the docs/api
    directory of `vymalo/another-agentic-system`): an ADR in `docs/decisions/` (the existing ones:
    `0006` for A2UI, ui-catalog and thread-tools, `0007` for steps and text-stream, `0011` for step
-   input and output, `0015` for mentions and long tool calls, `0016` for steer), a constant and an
+   input and output, `0015` for mentions and long tool calls, `0016` for steer, `0032` for usage), a constant and an
    `ExtensionConfig` constructor in `crates/adam-a2a/src/extensions.rs`, the card entry
    (`adam_ui::card_extensions()` or the binary's `card_of`), the behaviour in `adam-a2a-runtime`
    or `adam-ui`, and tests (`crates/adam-a2a-runtime/tests/`, `bin/adam-agent/tests/agent.rs`
@@ -81,7 +84,7 @@ read the exact strings in the file at your rev.
   rev the agent runs.
 * Send a request with the header and check the response's `A2A-Extensions` header lists it.
 * In adam-rs: `cargo test -p adam-a2a-runtime --test steer --test steps --test text_stream
-  --test vymalo` and `cargo test -p adam-agent --test agent` (the cases that need PostgreSQL
+  --test usage --test vymalo` and `cargo test -p adam-agent --test agent` (the cases that need PostgreSQL
   skip without `ADAM_TEST_POSTGRES_URL`; `ADAM_TEST_REQUIRE_DB=1` makes a skip a failure).
 * `node tools/docs-check/check-docs.mjs` after editing docs.
 
@@ -128,7 +131,11 @@ card URL of each agent and nothing of its extensions: read the card for those.
 ## Pitfalls
 
 * An extension not named by the client is off: `steps/v1` and `text-stream/v1` send plain text
-  and the whole reply to a client that did not activate them.
+  and the whole reply to a client that did not activate them, and `usage/v1` sends no report (the task's totals are
+  there either way).
+* A `usage/v1` report is a status update **without a message**: a client that shows every status's text must skip it. Its
+  `call` repeats on a resubscribe (drop a call already seen). Counts arrive as whole floats (`41250.0`). OpenCode's calls
+  (the coder's `Hand to OpenCode`) report nothing.
 * A URI with another case, version or trailing slash does not match: copy it from the card.
 * A `text-stream/v1` chunk with `kind: "reasoning"` is the model's reasoning, not the reply: a reader that does not read `kind`
   shows it as a reply, so update the reader before the agents (ADR 0020).
@@ -141,6 +148,8 @@ card URL of each agent and nothing of its extensions: read the card for those.
 * `crates/adam-a2a/README.md`, `crates/adam-a2a-runtime/README.md`, `crates/adam-ui/README.md`,
   `docs/decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md`,
   `docs/decisions/0007-progress-as-steps-and-streamed-text.md`,
-  `docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md`.
+  `docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md`,
+  `docs/decisions/0032-usage-per-model-call.md`
+  (https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0032-usage-per-model-call.md).
 * `adam-agent-folder`, `adam-embed`, `adam-operator`.
 * https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-a2a/src/extensions.rs

@@ -88,6 +88,9 @@ another `v`, or one that does not parse, is ignored (debug log).
   each, is about 6.5 KiB, and a unit test builds the largest of each kind, so it always fits and crosses whole;
 * a `ReasoningDelta` has a `TextDelta`'s bounds (the same piece, the same stream id) and so always fits and crosses whole. A process
   that predates the variant cannot read the event and drops it (debug log), so reasoning is never taken for text in a rolling deploy;
+* a `Usage` (a model call's report, `usage/v1`) holds a call id, a step and two labels of at most 128 bytes each and seven
+  counts: under 4 KiB even of control characters, so it always fits and crosses whole; a process that predates the variant
+  drops it, like a `ReasoningDelta`;
 * any other oversize event (`Progress`, `Custom`, `Artifact`) is not sent to
   other processes (debug log). A file artifact whose bytes alone are over a payload is dropped without being serialized
   (a file is up to 4 MiB; only a tiny one fits); Artifacts still reach subscribers through the
@@ -165,7 +168,7 @@ forwarded to `sqlx`. No environment variables at runtime.
 
 | File | What |
 |---|---|
-| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step and the largest piece of streamed text fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes. Offline |
+| `src/wire.rs`, `src/lib.rs`, `src/error.rs` | unit tests: payload round trip and layout, the size rule (exact limit, multibyte and escaped truncation, drops, the largest step, the largest piece of streamed text and the largest usage report fit), origin filter, no re-publish, prefix validation, queue overflow, the backoff, the error classes. Offline |
 | `tests/conformance.rs` | `adam-notify-testkit`'s `notifier_conformance!` with two `PgNotify` on separate pools, plus one case at the exact 7 999-byte limit |
 | `tests/two_runtimes.rs` | a front (starter only) and a worker, each with its own pools, `PgNotify` and `Runtime`, poll interval 30 s: a start and a deliver wake an idle worker; a step's `Progress` reaches the front exactly once and before the `Parked` status; a cancel reaches the step within 2 s; terminating the listener's backend gives a `Resync` within 5 s, a run started meanwhile completes, and a later signal arrives |
 

@@ -41,12 +41,14 @@ pub fn card_of(def: &AgentDef, public_url: &Url) -> Result<AgentCardConfig, Agen
 }
 
 /// The screen's extensions, `steps/v1` (every tool call is reported as a step to a client that
-/// activates it) and `text-stream/v1` (the model's answers are sent as it writes them, to a client
-/// that activates it).
+/// activates it), `text-stream/v1` (the model's answers are sent as it writes them, to a client
+/// that activates it) and `usage/v1` (the tokens of every model call, to a client that activates it,
+/// and a task's totals on the task).
 fn with_extensions(card: AgentCardConfig) -> AgentCardConfig {
     adam_ui::with_card_extensions(card)
         .with_extension(adam_a2a::ExtensionConfig::steps())
         .with_extension(adam_a2a::ExtensionConfig::text_stream())
+        .with_extension(adam_a2a::ExtensionConfig::usage())
 }
 
 /// [`card_of`] for the folder the process was started with: the same card, and `build/v1` saying

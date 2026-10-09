@@ -90,13 +90,7 @@ async fn text_answer_complete_and_stream_on_both_paths() {
         assert_eq!(resp.finish, FinishReason::Stop, "{base}");
         assert!(resp.message.tool_calls().is_empty());
         assert!(!resp.message.text().is_empty());
-        assert_eq!(
-            resp.usage,
-            Usage {
-                input_tokens: 12,
-                output_tokens: 14
-            }
-        );
+        assert_eq!(resp.usage, Usage::new(12, 14));
 
         let deltas = stream_of(&client, request("hi")).await;
         let text: String = deltas

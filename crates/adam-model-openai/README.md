@@ -16,7 +16,8 @@ never see this crate's types. Retries are not done here: failures map onto
 | Item | What |
 |---|---|
 | `OpenAiConfig` | `base_url`, `api_key: SecretString`, `timeout`, `extra_headers`; `OpenAiConfig::new(base_url, api_key)` |
-| `OpenAiCompatible` | the client: `OpenAiCompatible::new(config)`, `.with_max_tokens_field(field)`, `.with_extra_body(map)` (members merged into every request), `.with_echo_reasoning(Some(field))` (send reasoning back) |
+| `OpenAiCompatible` | the client: `OpenAiCompatible::new(config)`, `.with_max_tokens_field(field)`, `.with_extra_body(map)` (members merged into every request), `.with_echo_reasoning(Some(field))` (send reasoning back), `.with_context_window(alias, tokens)` (what `ModelClient::context_window` answers for that alias; nothing is sent) |
+| `PROVIDER` | `"openai"`: what `ModelClient::provider` says for this client, whatever gateway is behind it |
 | `ReasoningField` | `ReasoningContent` (`reasoning_content`) or `Reasoning` (`reasoning`): the member that carries reasoning when a client echoes it |
 | `MaxTokensField` | `MaxTokens` (default) or `MaxCompletionTokens`, for models that want the newer field name |
 | `OpenAiConfigError` | invalid configuration: `InvalidBaseUrl`, `InvalidHeader`, `InvalidApiKey`, `ReservedBodyKey`, `Client`; see *Errors* |
@@ -87,6 +88,26 @@ Provider facts the parsing rests on, each *verified 2026-10-05* from the page na
 | OpenRouter | `reasoning` (a string) and `reasoning_details` (a structured array) in a message; in a stream's delta the page names `reasoning_details` (`delta.reasoning` as a string is *unverified* from the page, read as the same member) | `{"reasoning": {"effort": "low".."high" or "max_tokens": n or "exclude": true}}` | <https://openrouter.ai/docs/use-cases/reasoning-tokens> |
 | Ollama | the OpenAI-compatible endpoint takes `reasoning_effort` and `reasoning.effort`; the **name of its response field** there is *unverified* (the page says `message.thinking` for the native API only) | `reasoning_effort` | <https://docs.ollama.com/api/openai-compatibility> |
 
+## Usage
+
+The `usage` of a completion, and of the last chunk of a stream (`stream_options.include_usage`: empty
+`choices`, the usage of the whole request; the chunks before it say `"usage": null`), becomes
+`adam_model::Usage`:
+
+| Member | `Usage` |
+|---|---|
+| `prompt_tokens`, `completion_tokens` | `input_tokens`, `output_tokens` |
+| `completion_tokens_details.reasoning_tokens` | `reasoning_tokens` |
+| `prompt_tokens_details.cached_tokens` | `cached_input_tokens` |
+| `prompt_tokens_details.cache_write_tokens` | `cache_write_input_tokens` |
+
+The names and the streaming rule are *verified 2026-10-08* in OpenAI's API reference,
+<https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create>
+("reasoning tokens ... are still counted in the total completion tokens"). A detail that is absent,
+`null` or not a whole number leaves its part `None`. A gateway that reports a part beside a smaller
+total gets it added in (`Usage::accounted`). Which OpenAI-compatible gateways send the details, and
+whether `cache_write_tokens` is disjoint from `cached_tokens` everywhere, is *unverified*.
+
 ## Errors
 
 Failures map onto `adam_model::ModelError`, which is classified (see
@@ -121,8 +142,10 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
   tool calls, error mapping and classes, timeouts, source chains, reasoning in a stream and a completion, the extra body on every request, reasoning sent back only when echoed). Always
   runs, no network.
 * Unit tests: `src/errors.rs` (`status_mapping`), `src/lib.rs`
-  (`config_error_class_table`, `debug_shows_the_gateway_by_scheme_and_host_only`) and `src/wire.rs` (the request shape, including several text parts
-  sent as one string).
+  (`config_error_class_table`, `debug_shows_the_gateway_by_scheme_and_host_only`,
+  `the_provider_is_openai_and_a_window_is_said_for_its_alias_only`) and `src/wire.rs` (the request shape, including several text parts
+  sent as one string; the usage parts of a completion and of a stream's last chunk, absent ones, and reasoning beside a smaller
+  completion count).
 * `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
   streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`)
   played from its first request to its final answer both as a completion and as a stream, which must say the same, with the

@@ -147,12 +147,18 @@ impl Harness {
     }
 
     /// Events of a run without the runtime's own status events, and without the pieces of streamed
-    /// text and the id of the stream in `agent_text` (random, and the subject of `tests/streaming.rs`).
+    /// text and the id of the stream in `agent_text` (random, and the subject of `tests/streaming.rs`),
+    /// and without the usage reports (their ids are random too: `tests/usage.rs`).
     fn events(&self, run: RunId) -> Vec<RunEvent> {
         self.sink
             .events_for(run)
             .into_iter()
-            .filter(|e| !matches!(e, RunEvent::Status { .. } | RunEvent::TextDelta { .. }))
+            .filter(|e| {
+                !matches!(
+                    e,
+                    RunEvent::Status { .. } | RunEvent::TextDelta { .. } | RunEvent::Usage(_)
+                )
+            })
             .map(|mut e| {
                 if let RunEvent::Custom { payload, .. } = &mut e
                     && let Some(fields) = payload.as_object_mut()
@@ -388,10 +394,7 @@ async fn parallel_calls_in_one_message_run_in_order() {
                 reasoning: None,
             },
             finish: adam_model::FinishReason::ToolCalls,
-            usage: adam_model::Usage {
-                input_tokens: 5,
-                output_tokens: 7,
-            },
+            usage: adam_model::Usage::new(5, 7),
             reasoning: None,
         })
         .push_text("ok");

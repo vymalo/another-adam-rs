@@ -13,8 +13,8 @@ pub use adam_model_openai::{OpenAiConfigError, endpoint_for_logs};
 #[cfg(feature = "mcp")]
 pub use config::McpSettings;
 pub use config::{
-    A2aSettings, CardSigning, ConfigError, ModelConfig, PushSettings, ServiceConfig,
-    WorkerSettings, is_worker_id, parse_file, parse_flag, parse_or,
+    A2aSettings, CardSigning, ConfigError, MAX_CONTEXT_WINDOW, ModelConfig, PushSettings,
+    ServiceConfig, WorkerSettings, is_worker_id, parse_file, parse_flag, parse_or,
 };
 pub use exit::{
     EX_CONFIG, EX_GENERAL, EX_OSERR, EX_SOFTWARE, EX_UNAVAILABLE, exit_code, exit_code_with,

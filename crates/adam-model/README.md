@@ -19,13 +19,13 @@ the provider asked to wait, and the runtime owns backoff.
 
 | Item | What |
 |---|---|
-| `ModelClient` (trait) | `complete(ModelRequest) -> ModelResponse` and `stream(ModelRequest) -> BoxStream<ModelDelta>` |
+| `ModelClient` (trait) | `complete(ModelRequest) -> ModelResponse` and `stream(ModelRequest) -> BoxStream<ModelDelta>`; two default methods, `provider() -> Option<&str>` (a label for reports, `openai` for the OpenAI-compatible client) and `context_window(alias) -> Option<u64>` (the window the deployment configured for that alias), both `None` unless the client says |
 | `DynModel` | `Arc<dyn ModelClient>` |
 | `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `metadata`), response and streamed chunks |
 | `Message`, `ContentPart`, `ToolCall`, `ToolSpec`, `Usage`, `FinishReason` | conversation and tool-calling types; all derive `Serialize`/`Deserialize` because a run persists its history |
 | `ModelError` | `RateLimited { retry_after }`, `Transient`, `ContextLength`, `InvalidRequest`, `Auth`, `Protocol`; `#[non_exhaustive]`, see *Errors* |
 | `Classify`, `ErrorClass` | re-exported from `adam-error`: `class()`, `is_retryable()`, `retry_after()` |
-| `MockModel`, `RecordedCall` | scripted `ModelClient` that records requests; always compiled, no feature flag |
+| `MockModel`, `RecordedCall` | scripted `ModelClient` that records requests; always compiled, no feature flag; `.with_provider(label)` and `.with_context_window(alias, n)` say what a real client would |
 
 ```rust
 use adam_model::{Message, MockModel, ModelClient, ModelRequest};
@@ -50,6 +50,19 @@ It is written only when present, so a history stored before it existed and one o
 the same bytes. **Breaking for code that builds these types with struct literals:** `ModelResponse` and
 `Message::Assistant` have a new field, and `ModelDelta` a new variant (`match`es over it need an arm).
 `MockModel::stream` replays `ModelResponse.reasoning` as a `Reasoning` delta before the text.
+
+### Usage
+
+`Usage` follows AG-UI 1.0's `TokenUsage` accounting: `input_tokens` and `output_tokens` are totals,
+and `reasoning_tokens` (part of the output), `cached_input_tokens` and `cache_write_input_tokens`
+(disjoint parts of the input) are optional parts, never additions; a part is `None` when the provider
+did not say. `Usage::accounted()` adds a part that a provider reported beside a smaller total into that
+total (AG-UI's rule for a producer); applying it twice changes nothing. `total_tokens()` and
+`saturating_add(other)` sum without overflowing. A part is written to JSON only when it is `Some`, so a
+usage recorded before the parts existed reads the same. **Breaking:** `Usage` is `#[non_exhaustive]`
+with three new fields, so code outside this crate builds it with `Usage::new(input, output)` and the
+`with_*` methods instead of a struct literal. `ModelClient`'s two new methods have defaults: no
+implementation has to change.
 
 The persisted JSON shapes of `Message` are shown in the crate docs
 (`src/lib.rs`) and are meant to stay stable.
@@ -83,7 +96,8 @@ None.
 Doctests (the crate docs run as tests in CI's `cargo test --doc`) and unit
 tests in `src/error.rs` (`class_table`,
 `retry_after_comes_from_the_rate_limit_only`,
-`a_source_is_kept_and_printed_once`), `src/mock.rs` and `src/types.rs`. No external
+`a_source_is_kept_and_printed_once`), `src/mock.rs` and `src/types.rs` (the usage accounting:
+`a_part_above_its_total_is_added_in_and_one_within_it_is_left`, `usages_add_part_by_part_and_saturate`). No external
 service, no environment variables. [`adam-model-openai`](../adam-model-openai/README.md)
 tests a real implementation against a mock HTTP server.
 

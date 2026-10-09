@@ -6,7 +6,9 @@ use std::time::Duration;
 use a2a::{
     Message, Part, Role, TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
-use adam_a2a::{BackendError, Caller, STEPS_EXTENSION, TEXT_STREAM_EXTENSION, TaskEvent};
+use adam_a2a::{
+    BackendError, Caller, STEPS_EXTENSION, TEXT_STREAM_EXTENSION, TaskEvent, USAGE_EXTENSION,
+};
 use adam_runtime::{AGENT_TEXT_KIND, RunEvent, RunSubscription, RunView, StepEvent, StepState};
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -19,6 +21,7 @@ use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::convert::{StatusKey, artifact_id, artifact_of, status_key, status_of, task_from_view};
 use crate::steps::step_message;
 use crate::text_stream;
+use crate::usage;
 
 /// Consecutive failed reads of the durable run before a subscription gives up.
 const MAX_READ_FAILURES: u32 = 20;
@@ -64,6 +67,9 @@ struct Tracker {
     /// written, and the words before a tool call as a status of their own. Without it the whole
     /// reply arrives with the turn, as it always did.
     text_stream: bool,
+    /// The request activated `usage/v1`: each completed model call is reported as a status update with
+    /// no message. Without it nothing is said of them (the totals are on the task either way).
+    usage: bool,
 }
 
 impl Tracker {
@@ -202,6 +208,12 @@ impl Tracker {
                     Vec::new()
                 }
             }
+            RunEvent::Usage(call) => {
+                if !self.usage {
+                    return Vec::new();
+                }
+                vec![usage::call_report(&self.task_id, &self.context_id, &call)]
+            }
             RunEvent::Status { .. } => Vec::new(),
         }
     }
@@ -274,6 +286,7 @@ async fn pump(
         steps: caller.has_extension(STEPS_EXTENSION),
         reported: HashMap::new(),
         text_stream: caller.has_extension(TEXT_STREAM_EXTENSION),
+        usage: caller.has_extension(USAGE_EXTENSION),
     };
     let ends = task.status.state.is_terminal()
         || matches!(

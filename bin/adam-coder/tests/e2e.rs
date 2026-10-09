@@ -4632,6 +4632,142 @@ async fn a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_
     assert!(!everything.contains(token), "{everything}");
 }
 
+/// A gateway that answers each request with the next reply of a script, as a stream or as JSON as the
+/// request asks: the coder and its subagents call one after the other, so one queue is the script.
+struct Scripted(Mutex<std::collections::VecDeque<serde_json::Value>>);
+
+impl Respond for Scripted {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        match self.0.lock().unwrap().pop_front() {
+            Some(reply) => common::chat_response(request, &reply),
+            None => ResponseTemplate::new(500).set_body_string("script exhausted"),
+        }
+    }
+}
+
+/// `reply` with the usage of `prompt` and `completion` tokens, of which `cached` were read from the
+/// gateway's cache and `reasoning` spent on reasoning, as OpenAI's API says them.
+fn with_usage(
+    mut reply: serde_json::Value,
+    prompt: u64,
+    completion: u64,
+    cached: u64,
+    reasoning: u64,
+) -> serde_json::Value {
+    reply["usage"] = json!({
+        "prompt_tokens": prompt, "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "prompt_tokens_details": {"cached_tokens": cached},
+        "completion_tokens_details": {"reasoning_tokens": reasoning},
+    });
+    reply
+}
+
+/// `usage/v1` end to end, offline: the coder over the OpenAI-compatible client against a scripted
+/// gateway whose answers say their usage (streamed, so the usage is the last chunk's), and its
+/// shipped `explorer`. A client that activated the extension reads one report per model call, on a
+/// `working` status with no message: the coder's own calls with no step, the explorer's under the
+/// step of the coder's call that started it; provider `openai`, the alias as the model, the
+/// reasoning and cached tokens the gateway said, and the window the deployment configured. The task
+/// ends waiting for the person (the coder delivered nothing) and carries its totals.
+#[tokio::test]
+async fn the_tokens_of_the_coder_and_its_explorer_reach_an_activated_client() {
+    use adam_a2a::USAGE_EXTENSION;
+
+    let fx = Fixture::new("hello\n").await;
+    let gateway = MockServer::start().await;
+    let script = vec![
+        with_usage(
+            tool_reply(
+                "x1",
+                "explorer",
+                json!({"message": "where is the greeting?"}),
+            ),
+            1000,
+            50,
+            800,
+            20,
+        ),
+        with_usage(text_reply("README.md:1 says hello."), 300, 10, 0, 4),
+        with_usage(text_reply("The README says hello."), 1100, 12, 1000, 0),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(Scripted(Mutex::new(script.into())))
+        .mount(&gateway)
+        .await;
+    let model: DynModel = Arc::new(
+        OpenAiCompatible::new(OpenAiConfig::new(
+            gateway.uri(),
+            SecretString::from("test-key"),
+        ))
+        .unwrap()
+        .with_context_window("test-model", 131_072),
+    );
+    let coder = Coder::new(
+        Arc::new(MemoryStore::new()),
+        CoderAgent::new(model, "test-model", fx.env.clone()),
+        &options(),
+    );
+    let caller = Caller::new("token-0").with_extensions([USAGE_EXTENSION]);
+    let task = coder
+        .backend
+        .submit(caller.clone(), user("where is the greeting?"), None, None)
+        .await
+        .unwrap();
+    let mut stream = coder.backend.subscribe(&caller, &task.id);
+    let worker = spawn_worker(&coder);
+    let mut reports = Vec::new();
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(60), stream.next())
+        .await
+        .expect("the stream ends")
+    {
+        if let TaskEvent::Status(update) = item.unwrap()
+            && let Some(report) = update
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(USAGE_EXTENSION))
+        {
+            assert_eq!(update.status.state, TaskState::Working);
+            assert!(update.status.message.is_none(), "{update:?}");
+            reports.push(report.clone());
+        }
+    }
+    worker.stop().await;
+
+    assert_eq!(reports.len(), 3, "{reports:#?}");
+    let explorer_step = "tool:x1";
+    assert!(reports[0].get("stepId").is_none(), "{}", reports[0]);
+    assert_eq!(reports[1]["stepId"], explorer_step, "{}", reports[1]);
+    assert!(reports[2].get("stepId").is_none(), "{}", reports[2]);
+    for report in &reports {
+        assert_eq!(report["provider"], "openai");
+        assert_eq!(report["model"], "test-model");
+        assert_eq!(report["contextWindow"], 131_072);
+    }
+    assert_eq!(reports[0]["inputTokens"], 1000);
+    assert_eq!(reports[0]["outputTokens"], 50);
+    assert_eq!(reports[0]["totalTokens"], 1050);
+    assert_eq!(reports[0]["cachedInputTokens"], 800);
+    assert_eq!(reports[0]["reasoningTokens"], 20);
+    let mut ids: Vec<&str> = reports
+        .iter()
+        .map(|r| r["call"].as_str().unwrap())
+        .collect();
+    ids.dedup();
+    assert_eq!(ids.len(), 3);
+
+    let parked = coder.backend.get(&caller, &task.id).await.unwrap().unwrap();
+    assert_eq!(parked.status.state, TaskState::InputRequired);
+    let totals = &parked.metadata.as_ref().expect("the totals")[USAGE_EXTENSION]["totals"];
+    assert_eq!(
+        totals,
+        &json!([{"provider": "openai", "model": "test-model",
+                 "inputTokens": 2400, "outputTokens": 72, "totalTokens": 2472,
+                 "reasoningTokens": 24, "cachedInputTokens": 1800}])
+    );
+}
+
 /// Every case runs once per store: in memory always, and on PostgreSQL when
 /// `ADAM_TEST_POSTGRES_URL` is set (each case gets a private database).
 macro_rules! coder_suite {

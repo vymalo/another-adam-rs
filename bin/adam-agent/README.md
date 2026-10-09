@@ -71,8 +71,8 @@ ending the run, so a message sent during the last model call is answered; a fini
 activation the message is refused as before ([`adam-a2a-runtime`](../../crates/adam-a2a-runtime/README.md#steering-a-running-task),
 [ADR 0016](../../docs/decisions/0016-a-message-sent-to-a-working-task-is-steered-into-it.md)).
 
-The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`, `steps/v1` and
-`text-stream/v1` (`card_of`), and `build/v1` (`card_of_folder`: the build's revision and the folder's digest, [ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
+The card lists A2UI v0.9.1 (with `acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1`, `steps/v1`,
+`text-stream/v1` and `usage/v1` (`card_of`), and `build/v1` (`card_of_folder`: the build's revision and the folder's digest, [ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)), and the service reads A2A messages as ones from a screen (`vymalo_inbound`, set in `agents`); an agent
 whose messages carry none of that is not affected. **Every tool call is a step** (`tool:<call id>`, labelled with a
 title a person reads (`Ask you`, an MCP tool's own `title`, a subagent's name capitalised, [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its-step.md)); running, then completed, failed or waiting for the person; with the
 call's arguments as `input` and its result as `output`, cut to 4 KiB and 8 KiB and **scrubbed of this process's secrets first**: the model's
@@ -84,6 +84,9 @@ orchestration layer's chat does when the card lists it), and a line of text to o
 `ask_user`, and its subagents, which are `subagent` steps. **The model's answer is streamed** (`stream_text` is on, so every model
 call is a stream) to a client that activates `text-stream/v1`: chunks while the model writes, then the whole text under the
 stream's id, and the whole reply with the turn to one that does not (the same ADR; `adam-a2a-runtime`'s README says how).
+**The tokens of every model call are reported** to a client that activates `usage/v1`, a subagent's under its step, and the
+task carries its totals when it ends or waits ([ADR 0032](../../docs/decisions/0032-usage-per-model-call.md)): the provider is
+`openai`, the model the alias, and the context window `MODEL_CONTEXT_WINDOW`.
 
 A folder that follows the **persona convention** (the body opens with `Your name is {{display_name}}.` and a line
 `In one sentence: <summary>.`, the summary without `"` and ending at its first period) is greeted by the mock
@@ -188,6 +191,7 @@ same way; every problem is reported at once at startup):
 | `MODEL` | model alias of the agent | required by `all` and `worker` |
 | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value | unset: nothing is added |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: keep the model's reasoning in the run's history and send it back under that member name. For a provider that requires it (DeepSeek's thinking mode with tools answers a request without it with a 400); `false` or unset sends none, which is what almost every model wants. Anything else: exit 78 | unset: never sent |
+| `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias reports none. Anything else: exit 78 | unset: reports carry no window |
 | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the folder's MCP servers may be (see above) | `false` each |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 | `RUST_LOG` | log filter (JSON logs on stdout); when set it replaces the default whole, so `RUST_LOG=info` shows `rmcp` again | `info,rmcp=warn` (the MCP client library's per-connection lines are quiet; `adam_service::logging`) |
@@ -306,8 +310,9 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 ## Tests
 
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
-  a control plane that needs no model, secrets hidden from `Debug`. 
-* `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's, and lists the screen's three extensions, `steps/v1` and `text-stream/v1`; **a chat
+  a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78), secrets
+  hidden from `Debug`.
+* `tests/agent.rs` (in-process, over the in-memory store, scripted models): the card is the folder's, and lists the screen's three extensions, `steps/v1`, `text-stream/v1` and `usage/v1`; **a chat
   folder answers "hi" in role over A2A** (the task completes with the greeting its two persona lines give, the
   model is sent the folder's rendered prompt and the screen's three tools only); an edited folder says the edited words; `ask_user`
   parks the run as `input-required` and the answer resumes it; a control plane starts a run that a worker over the
