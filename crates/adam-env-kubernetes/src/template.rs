@@ -250,7 +250,7 @@ spec:
       command: [sh, -c, 'cp -L /opt/adam/bin/* /tools/']
   containers:
     - name: run
-      image: ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e
+      image: ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-cfd2917
       command: [tini, --, sleep, infinity]
       env:
         - name: CARGO_BUILD_JOBS
@@ -279,7 +279,7 @@ spec:
         let t = template();
         assert_eq!(
             t.image(),
-            Some("ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e")
+            Some("ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-cfd2917")
         );
         assert_eq!(t.container(), "run");
     }

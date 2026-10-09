@@ -1014,7 +1014,7 @@ check "template: its own name label, not the coder's (the StatefulSet and its Ne
   tpl '^    app.kubernetes.io/name: coder-run$'
 check "template: the run container is named run" tpl '^    - name: run$'
 check "template: the workspace image by tag AND digest" \
-  tpl 'image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a"'
+  tpl 'image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-cfd2917@sha256:ee7e4c7539ad62942e43f9b8ea39d8433617888cac3b0d26a37de3993671786c"'
 check "template: the memory limit is 2Gi" tpl '^        limits:$'
 check "template: memory: 2Gi" tpl '^          memory: 2Gi$'
 check "template: requests 250m and 512Mi" tpl '^          cpu: 250m$'
@@ -1084,7 +1084,7 @@ check "policy: only CREATE of pods" rhas ValidatingAdmissionPolicy "$pn" 'operat
 check "policy: refuses a pod without the run label and the managed-by label" policy_has "$pn" "'adam.vymalo.com/run' in object.metadata.labels"
 check "policy: ... or without the priority class" policy_has "$pn" "object.spec.priorityClassName == 'coder-run'"
 check "policy: ... or with another image (the run image by digest and the coder's)" \
-  policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
+  policy_has "$pn" "c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-cfd2917@sha256:ee7e4c7539ad62942e43f9b8ea39d8433617888cac3b0d26a37de3993671786c', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234']"
 check "policy: ... or a hostPath: only emptyDir, the work claim and the one Secret" \
   policy_has "$pn" "has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0') || (has(v.secret) && v.secret.secretName == 'coder')"
 check "policy: ... or a Secret other than the allowed one, by key" policy_has "$pn" "e.valueFrom.secretKeyRef.name == 'coder'"

@@ -3,7 +3,7 @@
 # The image of the `run-pods` CI job (deploy/coder/tests/kind-run-pods.sh), which plays two parts that the chart
 # gives to two images: the run container (a shell, tini, coreutils) and the coder's image as the init container's
 # source (/opt/adam/bin/adam-exec and an opencode). It is small on purpose: the real run image is the workspace
-# image of another-agentic-images (2.85 GB compressed, verified 2026-10-05) and the real coder image takes a Rust
+# image of another-agentic-images (2.92 GB compressed, verified 2026-10-09) and the real coder image takes a Rust
 # build, and the job tests the chart's objects and the environment, not those images. The opencode here is a stub;
 # adam-exec is the real script (one source with the devcontainer crate). Build from the REPOSITORY ROOT:
 #

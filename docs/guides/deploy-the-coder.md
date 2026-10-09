@@ -77,10 +77,10 @@ flowchart LR
 `docker/coder/Dockerfile`, built from the **repository root**, has three stages: it compiles `adam-coder`,
 `adam-agent` and `adam-kube-exec` on a pinned `rust:1.94-trixie` (tag and digest, so glibc matches the runtime
 image); it takes the official `github-mcp-server` binary (pinned by tag and digest); and the runtime is the
-`workspace` image of `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini, OpenCode), pinned by an
-immutable tag, with those binaries, the devcontainer CLI and Podman's remote client added. It runs as uid 10001,
-listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is `tini -- adam-coder` (`tini` forwards
-SIGTERM and reaps children). Tags are `sha-<7>` of the commit. Both agents' binaries are smoke-tested in CI
+`workspace` image of `vymalo/another-agentic-images` (Rust, Flutter/Dart, Node, git, tini, OpenCode, the obscura
+headless browser), pinned by an immutable tag, with those binaries, the devcontainer CLI and Podman's remote client
+added. It runs as uid 10001, listens on `0.0.0.0:8080`, keeps its files in `/work`, and its entrypoint is
+`tini -- adam-coder` (`tini` forwards SIGTERM and reaps children). Tags are `sha-<7>` of the commit. Both agents' binaries are smoke-tested in CI
 (`docker/coder/test/`).
 
 The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into both binaries. The agent card then says

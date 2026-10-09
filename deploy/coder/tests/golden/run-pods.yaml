@@ -201,7 +201,7 @@ data:
               mountPath: /tools
       containers:
         - name: run
-          image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a"
+          image: "ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-cfd2917@sha256:ee7e4c7539ad62942e43f9b8ea39d8433617888cac3b0d26a37de3993671786c"
           imagePullPolicy: IfNotPresent
           workingDir: /work
           # tini reaps what a killed command leaves; the commands are exec'd into the container by adam-kube-exec.
@@ -331,7 +331,7 @@ spec:
         app.kubernetes.io/name: coder
         app.kubernetes.io/instance: coder
       annotations:
-        checksum/run-pod: 3a7f2c28fd47e769fb5360a032d2b077ca91a847d55a3bbcfb98b6c35936f1e7
+        checksum/run-pod: 96bfdf00bf4d00a080b5c61960021bd7cb6c6890c83f47697bb3986cc79e9053
     spec:
       serviceAccountName: coder
       automountServiceAccountToken: true
@@ -609,7 +609,7 @@ spec:
       message: "a run pod carries the labels app.kubernetes.io/managed-by=adam-coder and adam.vymalo.com/run"
     - expression: "has(object.spec.priorityClassName) && object.spec.priorityClassName == 'coder-run'"
       message: "a run pod has the priority class coder-run, which the quota is scoped to"
-    - expression: "variables.containers.all(c, c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-ee2273e@sha256:9b2670fc45f50b7b7b8f959fe5caa06e630cba86c0229b2a7d33bee7f26d752a', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234'])"
+    - expression: "variables.containers.all(c, c.image in ['ghcr.io/vymalo/another-agentic-images/workspace:1.98.1-cfd2917@sha256:ee7e4c7539ad62942e43f9b8ea39d8433617888cac3b0d26a37de3993671786c', 'ghcr.io/vymalo/another-adam-rs/coder:sha-abc1234'])"
       message: "a run pod uses only the images the chart allows"
     - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'work-coder-0') || (has(v.secret) && v.secret.secretName == 'coder'))"
       message: "a run pod mounts only emptyDir volumes, the claim work-coder-0 and the Secret coder: no hostPath, no other Secret or claim"
