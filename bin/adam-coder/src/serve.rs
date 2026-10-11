@@ -35,6 +35,7 @@ use anyhow::Context as _;
 use secrecy::{ExposeSecret as _, SecretString};
 
 use crate::agent::CoderStarter;
+use crate::config::GitHubAuth;
 use crate::github_mcp::{GitHubReadBearer, SERVER_NAME as GITHUB_SERVER};
 use crate::janitor::Janitor;
 use crate::opencode::OpenCodeLaunch;
@@ -90,6 +91,9 @@ async fn build_agent(
     settings
         .create_repo_owners
         .clone_from(&worker.create_repo_owners);
+    // With no `CREATE_REPO_OWNERS`, a GitHub App creates for the accounts it is installed on (the
+    // access tiers, ADR 0035); a token has no such list and keeps the tool off until owners are named.
+    settings.create_for_installed_owners = matches!(worker.github, GitHubAuth::App(_));
     settings.container_network_none = worker.devcontainer.network == Network::None;
     settings.check_timeout = worker.check_timeout;
     settings.check_output_tail = worker.check_output_tail;
@@ -365,7 +369,10 @@ pub async fn serve(
     }
     // The person's screen is the sender: their answers through a form, and the catalog and the
     // tools of the conversation, reach the run (the extensions the card lists).
-    .inbound(adam_a2a_runtime::vymalo_inbound);
+    .inbound(adam_a2a_runtime::vymalo_inbound)
+    // The card lists `access-tier/v1` with all four tiers: the backend reads the tier a message
+    // names, refuses a bad one and says the tier a task works under.
+    .access_tiers(crate::tier::honoured());
     // The card of the files this process runs, like the workers' agent.
     let card = match &config.service.public_url {
         Some(public_url) => Some(

@@ -1,0 +1,31 @@
+{
+  "name": "merge_pull_request",
+  "description": "Merge a pull request of a repository you work on (one in your workspace, or one the person named). `method` is `squash` (the default), `merge` or `rebase`; with `delete_branch: true` the pull request's branch is deleted afterwards, when it is a branch of that very repository. GitHub's own rules decide whether it merges (branch protection, required checks and reviews, conflicts): if it refuses you get its words, and you tell the person; do not look for another way. It needs the auto access tier or above.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "The repository: its slot's name in your workspace, `owner/name`, or its address"
+      },
+      "number": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "description": "The pull request's number"
+      },
+      "method": {
+        "type": "string",
+        "description": "`squash` (the default), `merge` or `rebase`"
+      },
+      "delete_branch": {
+        "type": "boolean",
+        "description": "Delete the pull request's branch after the merge (only a branch of that repository)"
+      }
+    },
+    "required": [
+      "repo",
+      "number"
+    ]
+  }
+}

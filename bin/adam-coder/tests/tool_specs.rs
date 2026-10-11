@@ -22,7 +22,7 @@ use common::Fixture;
 use serde_json::{Value, json};
 
 /// The tools in the order the model is offered them.
-const TOOLS: [&str; 20] = [
+const TOOLS: [&str; 23] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -40,6 +40,9 @@ const TOOLS: [&str; 20] = [
     "rebuild_environment",
     "commit_and_push",
     "open_pull_request",
+    "merge_pull_request",
+    "rename_repository",
+    "delete_repository",
     "ask_user",
     "show",
     "ui_catalog",
@@ -108,13 +111,15 @@ async fn every_spec_equals_its_snapshot() {
     }
 }
 
-/// With no owner allowed to create repositories (the default: `CREATE_REPO_OWNERS` is empty) the
-/// tool is not offered at all, so the model cannot offer a new repository to the person or call
-/// the tool with an owner of its own making; everything else is offered, in the same order.
+/// With nobody allowed to create repositories (the default: `CREATE_REPO_OWNERS` is empty and the
+/// credentials are not a GitHub App) the tool is not offered at all, so the model cannot offer a new
+/// repository to the person or call the tool with an owner of its own making; everything else is
+/// offered, in the same order.
 #[tokio::test]
 async fn create_repository_is_not_offered_when_no_owner_may_create_one() {
     let fx = Fixture::new("hello\n").await;
     assert!(fx.env.settings.create_repo_owners.is_empty());
+    assert!(!fx.env.settings.create_for_installed_owners);
     let names: Vec<String> = coder_tools(&fx.env)
         .into_iter()
         .map(|t| t.spec().name)
@@ -131,6 +136,36 @@ async fn create_repository_is_not_offered_when_no_owner_may_create_one() {
         .map(|t| t.spec().name)
         .collect();
     assert_eq!(names, TOOLS);
+}
+
+/// A GitHub App needs no `CREATE_REPO_OWNERS`: the accounts it is installed on are the owners, so the
+/// tool is on by default for one (the process sets `create_for_installed_owners`).
+#[tokio::test]
+async fn create_repository_is_on_by_default_for_a_github_app() {
+    let fx = Fixture::with("hello\n", |settings| {
+        settings.create_for_installed_owners = true;
+    })
+    .await;
+    assert!(fx.env.settings.create_repo_owners.is_empty());
+    let names: Vec<String> = coder_tools(&fx.env)
+        .into_iter()
+        .map(|t| t.spec().name)
+        .collect();
+    assert_eq!(names, TOOLS);
+}
+
+/// The set is the same at every access tier: a tool above the tier is held back from the model each
+/// turn and refused when called (`tier`, `tools.rs`), never missing from the set.
+#[tokio::test]
+async fn every_tool_has_its_tier_and_the_new_ones_need_the_high_ones() {
+    use adam_a2a::AccessTier::{Auto, Bypass};
+    for name in TOOLS {
+        assert!(adam_coder::tier::known(name).is_some(), "{name}");
+    }
+    assert_eq!(adam_coder::tier::needs("merge_pull_request"), Auto);
+    assert_eq!(adam_coder::tier::needs("create_repository"), Auto);
+    assert_eq!(adam_coder::tier::needs("rename_repository"), Bypass);
+    assert_eq!(adam_coder::tier::needs("delete_repository"), Bypass);
 }
 
 #[test]
@@ -188,6 +223,8 @@ async fn only_the_optional_arguments_are_nullable() {
             "delegate_to_opencode.repo",
             "edit_file.replace_all",
             "edit_file.repo",
+            "merge_pull_request.delete_branch",
+            "merge_pull_request.method",
             "open_pull_request.accept_red_checks",
             "open_pull_request.repo",
             "prepare_workspace.base_branch",

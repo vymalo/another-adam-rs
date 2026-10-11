@@ -4,6 +4,8 @@
 use std::sync::Arc;
 
 use adam::{AgentDef, Assembly, AssemblyError};
+use adam_a2a::AccessTier;
+use adam_a2a_runtime::CONTEXT_ACCESS_TIER;
 use adam_core::RunId;
 use adam_error::report;
 use adam_llm_agent::{Conversation, DynTool, LlmStarter, PendingWait, ToolSet};
@@ -17,6 +19,7 @@ use serde_json::{Value, json};
 
 use crate::files::AgentFiles;
 use crate::redact::Redactor;
+use crate::tier;
 use crate::tools::consent::{
     Answer, answer_of, asked_by, is_answered_by_the_person, is_consent_tool, is_tools_own_result,
 };
@@ -70,12 +73,21 @@ impl AgentStarter for CoderStarter {
         prior: &Conversation,
         prior_run: RunId,
     ) -> Result<Conversation, AgentError> {
-        LlmStarter::new(AGENT_NAME).init_continuing(input, prior, prior_run)
+        let starter = LlmStarter::new(AGENT_NAME);
+        // A task never inherits the access tier of the task before it: the context is carried, and
+        // this key is left behind, so that the new message's own tier (if it names one) is the only
+        // one, and otherwise the task starts at the default (`access-tier/v1`).
+        if prior.context.contains_key(CONTEXT_ACCESS_TIER) {
+            let mut without = prior.clone();
+            without.context.remove(CONTEXT_ACCESS_TIER);
+            return starter.init_continuing(input, &without, prior_run);
+        }
+        starter.init_continuing(input, prior, prior_run)
     }
 }
 
-/// What the prompt says in place of the folder's `repository_creation` var when no owner may create
-/// repositories (`CREATE_REPO_OWNERS` empty): the tool is not offered then, and the model must not
+/// What the prompt says in place of the folder's `repository_creation` var when nobody may create
+/// repositories (no `CREATE_REPO_OWNERS`, and credentials that are not a GitHub App): the tool is not offered then, and the model must not
 /// offer what it cannot do (a "new repository" among the options of a question, say).
 const REPOSITORY_CREATION_OFF: &str = "Creating a repository is switched off in this deployment: you have no tool for it, and no one can make one through you. If the person has no repository for what you built, ask them to create an empty one themselves and tell you its address, as your final reply or with `ask_user`, and then `publish_scratch` to it as above. Never offer to create a repository, and never offer \"a new repository\" as an option of a question: only repositories that already exist.";
 
@@ -261,7 +273,7 @@ impl CoderAgent {
         };
         // With no owner allowed to create repositories the tool is not offered (`coder_tools`), and
         // the prompt says so instead of describing it. The folder's own text stays for when one is.
-        let def = if env.settings.create_repo_owners.is_empty()
+        let def = if !env.settings.can_create_repositories()
             && def
                 .manifest()
                 .frontmatter
@@ -277,6 +289,8 @@ impl CoderAgent {
             .bind(tools.into_iter().collect::<ToolSet>())?
             // The tools of the conversation's endpoint, offered at every model turn.
             .tool_source(env.ui.source())
+            // The access tier of the message: tools above it are not shown and not run.
+            .tool_source(crate::tier::TierSource)
             .state(env.clone())
             // What a call was given and what it answered go into its step: the process's secrets
             // are scrubbed from both first (ADR 0011).
@@ -343,10 +357,9 @@ impl CoderAgent {
     ) -> Result<(), AgentError> {
         let notes_error = |e| AgentError::transient("cannot read the run notes").with_source(e);
         let host = &self.env.settings.default_repo_host;
-        let named: Vec<String> = person_texts(state, ctx.peek_inbox())
-            .iter()
-            .flat_map(|text| named_in(text, host))
-            .collect();
+        let said = person_texts(state, ctx.peek_inbox());
+        let named: Vec<String> = said.iter().flat_map(|text| named_in(text, host)).collect();
+        let tier = tier_of(state, ctx.peek_inbox());
         let prior = match &state.continued_from {
             Some(prior) => self
                 .env
@@ -364,9 +377,18 @@ impl CoderAgent {
         let consents = consents_in(state, ctx.peek_inbox());
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
         let new_repos = notes.name_repos(named);
+        let new_words = notes.say_words(said);
         let new_consents = notes.record_consents(consents);
         let adopted = self.adopt_scratch(ctx, run, &mut notes).await;
-        if notes.name_pushed_branches(pushed) || new_repos || new_consents || adopted {
+        let new_tier = notes.tier != Some(tier);
+        notes.tier = Some(tier);
+        if notes.name_pushed_branches(pushed)
+            || new_repos
+            || new_words
+            || new_consents
+            || adopted
+            || new_tier
+        {
             self.env
                 .notes
                 .save(run, &notes)
@@ -415,6 +437,24 @@ impl CoderAgent {
             self.env.settings.scratch_check_cycles,
         )
     }
+}
+
+/// The access tier the run works under from this step: the newest message that names one (the ones
+/// waiting in the inbox are read at the start of the step, and the newest wins), else the one the
+/// conversation's context holds, else the default. A message names a tier only through its
+/// context, which the A2A backend filled from a request that activated `access-tier/v1`: what the
+/// model or a tool said is never read.
+fn tier_of(state: &Conversation, inbox: &[Inbound]) -> AccessTier {
+    inbox
+        .iter()
+        .filter(|inbound| {
+            inbound.kind != RUN_FINISHED_KIND
+                // A message the run has read is in its context already (and it is read once).
+                && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
+        })
+        .filter_map(tier::named_by)
+        .next_back()
+        .unwrap_or_else(|| tier::in_context(&state.context))
 }
 
 /// Whether a run that has no pull request delivered what it was asked for anyway: **scratch work
@@ -986,6 +1026,83 @@ fn boundary_error(e: AgentError, redactor: &Redactor) -> AgentError {
         }
         store @ AgentError::Store(_) => store,
         other => AgentError::permanent(redactor.failure_text(report(&other))),
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    //! The tier of a step: the newest message that names one wins, the ones already read and the
+    //! finish notices do not, and a task that continues another does not carry its tier.
+
+    use super::*;
+
+    fn named(id: &str, tier: Option<&str>) -> Inbound {
+        let mut payload = json!({"text": "go"});
+        if let Some(tier) = tier {
+            payload["context"] = json!({CONTEXT_ACCESS_TIER: {"tier": tier}});
+        }
+        Inbound::new("message", payload).with_id(id)
+    }
+
+    fn conversation(tier: Option<&str>) -> Conversation {
+        let mut state = Conversation::new("hi");
+        if let Some(tier) = tier {
+            state
+                .context
+                .insert(CONTEXT_ACCESS_TIER.to_owned(), json!({"tier": tier}));
+        }
+        state
+    }
+
+    #[test]
+    fn the_context_decides_when_no_message_waits_and_the_default_when_it_names_none() {
+        assert_eq!(tier_of(&conversation(None), &[]), AccessTier::Auto);
+        assert_eq!(tier_of(&conversation(Some("plan")), &[]), AccessTier::Plan);
+        // A word that is not a tier is no tier.
+        assert_eq!(tier_of(&conversation(Some("root")), &[]), AccessTier::Auto);
+    }
+
+    #[test]
+    fn the_newest_waiting_message_that_names_a_tier_wins_and_one_that_names_none_changes_nothing() {
+        let state = conversation(Some("plan"));
+        let inbox = [
+            named("a", Some("bypass")),
+            named("b", Some("edits")),
+            named("c", None),
+        ];
+        assert_eq!(tier_of(&state, &inbox), AccessTier::Edits);
+        assert_eq!(tier_of(&state, &[named("c", None)]), AccessTier::Plan);
+    }
+
+    #[test]
+    fn a_message_the_run_has_read_is_not_read_again_and_a_finish_notice_names_nothing() {
+        let mut state = conversation(Some("edits"));
+        state.read_ids.push("old".to_owned());
+        // The one that was read is in the context already (and a newer one may have replaced it).
+        assert_eq!(
+            tier_of(&state, &[named("old", Some("bypass"))]),
+            AccessTier::Edits
+        );
+        let mut finished = named("n", Some("bypass"));
+        finished.kind = RUN_FINISHED_KIND.to_owned();
+        assert_eq!(tier_of(&state, &[finished]), AccessTier::Edits);
+    }
+
+    #[test]
+    fn a_task_that_continues_another_does_not_carry_its_tier() {
+        use adam_runtime::AgentStarter as _;
+        let prior = conversation(Some("plan"));
+        let run = RunId::new();
+        let none = CoderStarter
+            .init_continuing(named("m", None), &prior, run)
+            .unwrap();
+        assert_eq!(tier::in_context(&none.context), AccessTier::Auto);
+        let edits = CoderStarter
+            .init_continuing(named("m", Some("edits")), &prior, run)
+            .unwrap();
+        assert_eq!(tier::in_context(&edits.context), AccessTier::Edits);
+        // The earlier task's state is not touched.
+        assert_eq!(tier::in_context(&prior.context), AccessTier::Plan);
     }
 }
 

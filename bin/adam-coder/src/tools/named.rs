@@ -53,6 +53,22 @@ fn key_of_location(loc: &RepoLocation) -> String {
     }
 }
 
+/// `(host, owner, name)` of a [`key`](key_of_argument): the three parts a key is made of.
+pub fn split_key(key: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = key.splitn(3, '/');
+    Some((parts.next()?, parts.next()?, parts.next()?))
+}
+
+/// The host part of the keys of repositories written as `owner/name` when nothing says otherwise:
+/// `default_host` as the keys spell it (`github.com`, `git.example.com_8443`).
+pub fn default_host_key(default_host: &str) -> String {
+    let key = named_in("o/n", default_host).into_iter().next();
+    key.as_deref().and_then(split_key).map_or_else(
+        || normal_host(default_host, None),
+        |(host, _, _)| host.to_owned(),
+    )
+}
+
 /// `text` without the fenced blocks labelled `untrusted`: what the person wrote themselves.
 ///
 /// A fence is what CommonMark calls one: a line of at least three backticks (or tildes) and a

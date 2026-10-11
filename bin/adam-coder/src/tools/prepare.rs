@@ -25,7 +25,9 @@ use super::{Outcome, ToolEnv, non_empty, notes_error, workspace_error};
 // The repository must be one the person named. The agent records the repositories of the
 // person's own messages in the run notes (`RunNotes::named_repos`) before every step, and the
 // argument is compared with those, never trusted on its own: a model that was given too little
-// (a greeting, a vague task) must ask, not pick a repository.
+// (a greeting, a vague task) must ask, not pick a repository. The access tier the person set
+// widens that, and only that (`ToolEnv::is_granted`): from `auto`, a name the person wrote alone
+// (`widgets`) is named when exactly one owner applies; at `bypass`, any repository the host allows.
 //
 // With `branch` the worktree continues a branch an earlier task of this conversation pushed, so
 // that a rework updates the same pull request. The branch is checked the same way: only one that
@@ -69,7 +71,7 @@ pub async fn prepare_workspace(
     if key.is_some() || continuing.is_some() {
         let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
         if let Some(key) = &key
-            && !notes.named_repos.contains(key)
+            && !env.is_granted(ctx, &notes, key).await
         {
             return Ok(ToolOutput::error(not_named(
                 url,

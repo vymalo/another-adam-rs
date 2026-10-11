@@ -13,10 +13,11 @@ use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::{CoderSettings, Redactor, ToolEnv};
 use adam_model::ToolCall;
 use adam_workspace::{
-    CodeHost, CreatedRepository, DynCodeHost, DynEnvironment, EnvDescription, EnvError, EnvKind,
-    EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec, GitHub, LocalSession,
-    NewPullRequest, NewRepository, OwnerKind, PreparedCommand, PullRequest, RepoRef, RunWorkspace,
-    ScopedToken, SecretRef, WorkspaceError, Workspaces,
+    CodeHost, CreatedRepository, DynCodeHost, DynEnvironment, DynGitCredentials, EnvDescription,
+    EnvError, EnvKind, EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec,
+    GitCredentials, GitHub, LocalSession, MergePullRequest, MergedPullRequest, NewPullRequest,
+    NewRepository, OwnerKind, PreparedCommand, PullRequest, RepoRef, RunWorkspace, ScopedToken,
+    SecretRef, WorkspaceError, Workspaces,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -321,6 +322,68 @@ impl CodeHost for GithubBehindMock {
             .comment_on_pull_request(&self.slug, number, body)
             .await
     }
+
+    async fn merge_pull_request(
+        &self,
+        mut merge: MergePullRequest,
+    ) -> Result<MergedPullRequest, WorkspaceError> {
+        merge.repo = RepoRef::new(self.slug.url.clone(), merge.repo.base_branch.clone());
+        self.inner.merge_pull_request(merge).await
+    }
+}
+
+/// Make the mock GitHub answer for pull request `number` of `slug`, open, from `branch` of that very
+/// repository: the read of it, the merge (`PUT .../merge`, answered with `merge_sha`) and the delete
+/// of its branch.
+pub async fn mount_mergeable(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    merge_sha: &str,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{slug}/pulls/{number}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": number,
+            "html_url": pull_url(number),
+            "state": "open",
+            "merged": false,
+            "head": {"ref": branch, "sha": "abc123", "repo": {"full_name": slug}},
+            "base": {"ref": "main", "repo": {"full_name": slug}},
+        })))
+        .mount(github)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/repos/{slug}/pulls/{number}/merge")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"sha": merge_sha, "merged": true})),
+        )
+        .mount(github)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/repos/{slug}/git/refs/heads/{branch}")))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(github)
+        .await;
+}
+
+/// Credentials that act for a list of accounts (what a GitHub App's are): the fixture's token, and
+/// `acts_for` says `accounts`.
+pub struct ActingFor {
+    pub inner: ScopedToken,
+    pub accounts: Vec<String>,
+}
+
+#[async_trait]
+impl GitCredentials for ActingFor {
+    async fn token_for(&self, repo: &RepoRef) -> Result<secrecy::SecretString, WorkspaceError> {
+        self.inner.token_for(repo).await
+    }
+
+    async fn acts_for(&self) -> Result<Option<Vec<String>>, WorkspaceError> {
+        Ok(Some(self.accounts.clone()))
+    }
 }
 
 /// A code host that can create repositories: every other call goes to the fixture's host, and a
@@ -580,6 +643,44 @@ impl Fixture {
             .expect("the tools are not shared yet")
             .settings
             .create_repo_owners = vec!["acme".to_owned()];
+        self
+    }
+
+    /// The same fixture whose credentials act for `accounts`, as a GitHub App's do
+    /// ([`GitCredentials::acts_for`]): what `create_repository` reads when `CREATE_REPO_OWNERS` is
+    /// empty, and what a bare repository name is resolved against.
+    #[must_use]
+    pub fn acting_for(mut self, accounts: &[&str]) -> Self {
+        let creds: DynGitCredentials = Arc::new(ActingFor {
+            inner: ScopedToken::new("github.com", GITHUB_TOKEN),
+            accounts: accounts.iter().map(|a| (*a).to_owned()).collect(),
+        });
+        let workspaces = Workspaces::new(self.root.clone(), creds)
+            .allow_hosts(["github.com"])
+            .allow_local(true);
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .workspaces = workspaces;
+        self
+    }
+
+    /// The same fixture with its settings adjusted (before anything shares the tools).
+    #[must_use]
+    pub fn tweaked(mut self, tweak: impl FnOnce(&mut CoderSettings)) -> Self {
+        tweak(
+            &mut Arc::get_mut(&mut self.env)
+                .expect("the tools are not shared yet")
+                .settings,
+        );
+        self
+    }
+
+    /// The same fixture whose code host is `host` (a double that records what it is asked).
+    #[must_use]
+    pub fn hosted_by(mut self, host: DynCodeHost) -> Self {
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .code_host = host;
         self
     }
 

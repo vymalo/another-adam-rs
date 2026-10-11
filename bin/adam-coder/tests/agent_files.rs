@@ -52,7 +52,7 @@ const SCRATCH_CYCLES: u32 = 5;
 
 /// What the shipped folder's `repository_creation` var says: the sentence for a deployment where an
 /// owner may create repositories (the folded `vars.repository_creation` of `agent/instructions.md`).
-const CREATION_ON: &str = "If the person has no repository for it and says you may make one (\"create a repository for it\"), use `create_repository` for an owner they name: it asks them, and only a yes creates it. Then `publish_scratch` to the repository it reports, as above.";
+const CREATION_ON: &str = "If the person has no repository for it and says you may make one (\"create a repository for it\"), use `create_repository` for an owner they name (it needs the `auto` tier): it asks them, unless they chose `bypass`, and only a yes creates it. Then `publish_scratch` to the repository it reports, as above.";
 
 /// What the model is sent for `cycles` and the shipped name: the snapshot with both put in. The
 /// snapshot's final newline is dropped, as the loader drops it from every body
@@ -72,7 +72,7 @@ fn expected_prompt(cycles: u32) -> String {
 
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 22] = [
+const TOOLS: [&str; 25] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -90,6 +90,9 @@ const TOOLS: [&str; 22] = [
     "rebuild_environment",
     "commit_and_push",
     "open_pull_request",
+    "merge_pull_request",
+    "rename_repository",
+    "delete_repository",
     "ask_user",
     "show",
     "ui_catalog",
@@ -141,7 +144,7 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
 /// coder's README ("A step's picture"): a tool added later must be put in it, or this test fails.
 #[tokio::test]
 async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
-    use adam_llm_agent::StepIcon::{Edit, Execute, File, Git, OpenCode, Read, Think};
+    use adam_llm_agent::StepIcon::{Delete, Edit, Execute, File, Git, OpenCode, Read, Think};
     let fx = Fixture::with("hello\n", |s| {
         s.create_repo_owners = vec!["acme".to_owned()];
     })
@@ -159,6 +162,9 @@ async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
         ("commit_and_push", Git),
         ("open_pull_request", Git),
         ("create_repository", Git),
+        ("merge_pull_request", Git),
+        ("rename_repository", Git),
+        ("delete_repository", Delete),
         ("start_scratch", File),
         ("publish_scratch", Git),
         ("share_file", File),
@@ -251,9 +257,9 @@ async fn the_prompt_gives_the_agent_a_name_and_asks_for_plain_words() {
         "and never say",
         "A greeting gets a greeting.",
         "\"list your tools\".**",
-        "cannot do, and why:",
-        "you can create one only where this deployment allows it",
-        "Do not list the tools.",
+        "Then say what you cannot do and\n  why:",
+        "you create one only\n  where this deployment allows it",
+        "Do not list the tools; name one only when asked.",
         // A greeting is answered, not treated as a missing task.
         "so do not call a tool for it",
     ] {
@@ -391,7 +397,8 @@ async fn the_assemblys_card_is_the_card_a_control_plane_serves() {
     let (_fx, agent) = coder(3).await;
     let url: url::Url = "https://agents.example.com/coder/".parse().unwrap();
     // The assembly knows nothing of the screen, of steps or of streaming: the card of the process
-    // adds the extensions the screen's tools need, `steps/v1` and `text-stream/v1`.
+    // adds the extensions the screen's tools need, `steps/v1`, `text-stream/v1`, `usage/v1` and
+    // `access-tier/v1`.
     let assembled = adam_ui::with_card_extensions(
         agent
             .assembly()
@@ -401,6 +408,9 @@ async fn the_assemblys_card_is_the_card_a_control_plane_serves() {
     .with_extension(adam_a2a::ExtensionConfig::steps())
     .with_extension(adam_a2a::ExtensionConfig::text_stream())
     .with_extension(adam_a2a::ExtensionConfig::usage())
+    .with_extension(adam_a2a::ExtensionConfig::access_tier(
+        &adam_coder::tier::honoured(),
+    ))
     .with_extension(adam_a2a::ExtensionConfig::build(
         adam_coder::BUILD_REVISION,
         AgentFiles::Embedded.describe().digest,
@@ -465,8 +475,14 @@ async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
     assert_eq!(first.model, "test-model");
     assert_eq!(first.system.as_deref(), Some(expected_prompt(3).as_str()));
     assert_eq!(first.max_output_tokens, Some(8192));
+    // No message named a tier, so the run works under the default, `auto`: the model is not shown the
+    // two tools that need `bypass`. Every other tool is, in the same order.
     let names: Vec<&str> = first.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, TOOLS);
+    let expected: Vec<&str> = TOOLS
+        .into_iter()
+        .filter(|name| !matches!(*name, "rename_repository" | "delete_repository"))
+        .collect();
+    assert_eq!(names, expected);
 
     let journal = store.journal_list(run).await.unwrap();
     let steps: Vec<&str> = journal.iter().map(|e| e.name.as_str()).collect();

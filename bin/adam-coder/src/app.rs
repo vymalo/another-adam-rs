@@ -61,7 +61,9 @@ impl Coder {
     ) -> Self {
         let builder = agent.register(Runtime::builder(store));
         Self::from_service(
-            Service::new_with(builder, AGENT_NAME, options, live).with_inbound(screen_inbound()),
+            Service::new_with(builder, AGENT_NAME, options, live)
+                .with_inbound(screen_inbound())
+                .with_access_tiers(Some(crate::tier::honoured())),
         )
     }
 
@@ -82,7 +84,9 @@ impl Coder {
     ) -> Self {
         let builder = Runtime::builder(store).starter(CoderStarter);
         Self::from_service(
-            Service::new_with(builder, AGENT_NAME, options, live).with_inbound(screen_inbound()),
+            Service::new_with(builder, AGENT_NAME, options, live)
+                .with_inbound(screen_inbound())
+                .with_access_tiers(Some(crate::tier::honoured())),
         )
     }
 
@@ -185,13 +189,17 @@ fn card_for_build(
 /// `thread-tools/v1`, `mentions/v1`, `steer/v1`), `steps/v1` (every tool call, and OpenCode's, is reported as a step to a
 /// client that activates it) and `text-stream/v1` (its answers are sent as the model writes them to a
 /// client that activates it: the agent streams its model calls) and `usage/v1` (the tokens of every model
-/// call to a client that activates it, and a task's totals on the task). `build/v1`, which says the build
-/// and the files, is added by [`card_for_build`].
+/// call to a client that activates it, and a task's totals on the task) and `access-tier/v1` (the
+/// tier the person picks for a message, all four, `auto` by default: [`tier`](crate::tier)). `build/v1`,
+/// which says the build and the files, is added by [`card_for_build`].
 fn with_extensions(card: AgentCardConfig) -> AgentCardConfig {
     adam_ui::with_card_extensions(card)
         .with_extension(adam_a2a::ExtensionConfig::steps())
         .with_extension(adam_a2a::ExtensionConfig::text_stream())
         .with_extension(adam_a2a::ExtensionConfig::usage())
+        .with_extension(adam_a2a::ExtensionConfig::access_tier(
+            &crate::tier::honoured(),
+        ))
 }
 
 #[cfg(test)]

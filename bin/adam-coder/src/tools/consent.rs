@@ -260,7 +260,9 @@ pub async fn request_repository(
 
     let run = ctx.root_run_id().to_string();
     let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
-    if notes.named_repos.contains(&key) {
+    // The person's tier is the consent: at `bypass` no form is shown, and a bare name that the
+    // `auto` tier counts as named needs no question either.
+    if env.is_granted(ctx, &notes, &key).await {
         return Ok(ToolOutput::text(ALREADY_GRANTED));
     }
     if notes.declined(REQUEST_REPOSITORY, &key) {

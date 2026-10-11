@@ -15,6 +15,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use adam_a2a::AccessTier;
 use serde::{Deserialize, Serialize};
 
 use super::checks::ChecksReport;
@@ -278,6 +279,22 @@ pub struct CreationIntent {
     pub private: bool,
 }
 
+/// A repository this run renamed (`rename_repository`): what a repeat of the call is recognised by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenamedRepo {
+    /// The key of the repository before, a [`named`](super::named) key.
+    pub from: String,
+    /// The key it has now (the clone URL the host reported).
+    pub to: String,
+    /// `owner/name` it has now, as the host spells it.
+    pub full_name: String,
+    /// The browser URL it has now.
+    pub html_url: String,
+}
+
+/// The most words of the person's [`RunNotes::said_words`] keeps: past it the newest are not added.
+pub const MAX_SAID_WORDS: usize = 2000;
+
 /// Everything remembered about one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunNotes {
@@ -347,10 +364,37 @@ pub struct RunNotes {
     /// (`RunWorkspace::adopt_scratch`). Done once, in the run's first step, before the model acts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scratch_adopted: bool,
+    /// The access tier the newest message named (`access-tier/v1`), as the agent recorded it before
+    /// the step: the tools check it again here, which is what keeps a subagent to the tier of the
+    /// root run. `None`: no message named one, and the run works under [`crate::tier::DEFAULT`].
+    /// Written by the agent from the conversation, never by a tool and never from the model's words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<AccessTier>,
+    /// The words of the person's own messages that could be the name of a repository (letters,
+    /// digits, `.`, `_`, `-`; lowercase, once each, at most [`MAX_SAID_WORDS`]): what makes a bare
+    /// repository name count as named under the `auto` and `bypass` tiers. Filled by the agent,
+    /// with the repositories the person named, from the person's words only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub said_words: Vec<String>,
+    /// The repositories this run renamed, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed_repos: Vec<RenamedRepo>,
+    /// The repositories this run deleted (`owner/name`, lowercase), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_repos: Vec<String>,
 }
 
 /// Most shared files [`RunNotes::shared`] lists.
 pub const MAX_SHARED: usize = 64;
+
+/// The words of `text` that could be a repository's name: runs of letters, digits, `.`, `_` and `-`
+/// (a trailing `.` is punctuation), lowercase, at least two characters.
+pub(crate) fn repository_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .map(|word| word.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|word| word.len() >= 2 && word.len() <= 100)
+        .collect()
+}
 
 impl RunNotes {
     /// The check that decides for the code with tree id `tree`: **the most recent run, in any
@@ -387,6 +431,35 @@ impl RunNotes {
             }
         }
         added
+    }
+
+    /// The access tier the run works under: the one recorded for the newest message, else the default.
+    pub fn tier(&self) -> AccessTier {
+        self.tier.unwrap_or(crate::tier::DEFAULT)
+    }
+
+    /// Remember the words of the person's messages that could be a repository's name; returns
+    /// whether anything was new.
+    pub fn say_words(&mut self, texts: impl IntoIterator<Item = String>) -> bool {
+        let mut added = false;
+        for text in texts {
+            for word in repository_words(&text) {
+                if self.said_words.len() >= MAX_SAID_WORDS {
+                    return added;
+                }
+                if !self.said_words.contains(&word) {
+                    self.said_words.push(word);
+                    added = true;
+                }
+            }
+        }
+        added
+    }
+
+    /// Whether the person wrote `name` as a word of their own messages (without case).
+    pub fn said(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        self.said_words.contains(&name)
     }
 
     /// Remember the answers `consents` of the person, and grant the repository of every one that

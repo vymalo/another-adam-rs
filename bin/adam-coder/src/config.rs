@@ -22,7 +22,7 @@
 //! | `GITHUB_APP_OWNERS` | the accounts (users and organisations, comma- or space-separated, compared without case) the App may act for, **without a pin**: the installation of each repository's owner is found with the App's JWT. `*` is every account the App is installed on (a startup warning: a public App can be installed by anyone). Refused with a pin and in token mode (exit 78) | App mode: this or `GITHUB_APP_INSTALLATION_ID`, exactly one |
 //! | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 or PKCS#8), as a file or inline (`\n` escapes accepted); exactly one; parsed at startup | one required in App mode |
 //! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them; the first is the host `owner/name` stands for | `github.com` |
-//! | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees; empty turns the tool off | empty (off) |
+//! | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees (not under the `bypass` access tier). A list restricts to exactly these. Empty: a GitHub App creates for the accounts it acts for, a token creates nothing (the tool is off) | empty |
 //! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
 //! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
 //! | `GITHUB_MCP_URL` | where the GitHub MCP server (`github-mcp-server http`, a sidecar of the pod) listens, for the agent folder's `mcp.json`: only the origin counts, and the folder's `github` server must be at it. The coder gives that server the credentials of each call ([`GitHubReadBearer`](crate::GitHubReadBearer)); the server holds none | `http://127.0.0.1:8082` |
@@ -155,8 +155,8 @@ pub struct WorkerConfig {
     pub github: GitHubAuth,
     /// `ALLOWED_REPO_HOSTS`, lowercased.
     pub allowed_repo_hosts: Vec<String>,
-    /// `CREATE_REPO_OWNERS`, lowercased: the owners `create_repository` may create repositories for.
-    /// Empty (the default) turns the tool off.
+    /// `CREATE_REPO_OWNERS`, lowercased: the owners `create_repository` may create repositories for
+    /// (a list restricts to these; empty, a GitHub App's accounts, and nothing for a token).
     pub create_repo_owners: Vec<String>,
     /// `ALLOW_LOCAL_REPOS`.
     pub allow_local_repos: bool,

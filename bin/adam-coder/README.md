@@ -52,7 +52,7 @@ sequenceDiagram
 | `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that sends the model to `run` (to make something with a command) or to the file tools and `delegate_to_opencode` (to change code). Writes to ignored paths (build output) are not changes. **For looking**: see `run` for making and `run_checks` for checking |
 | `run { command, cwd?, repo? }` | **making something with a command, and keeping it**: `npm run render`, `python chart.py`, an install, a build. Runs exactly as `run_command` does (the run's environment, the same shell, `cwd` rule, `CHECK_TIMEOUT_SECS` and output cap, secrets hidden from the child, a missing tool reported as a missing toolchain), but the **files it changes stay**, and the result lists what `git status` shows (files the project ignores are kept too and are not listed). It is **never a check**: no `checks` artifact, no cycle, nothing written to the run's notes, so the gate cannot see it; the files it changed make an earlier green check stale, which the result says. It cannot touch git: the same record as `run_command`'s is compared after the command, minus the files, and a command that changed `HEAD`, the branch, a ref, the `.git` file, the configuration or `info/exclude` is **undone entirely, its files included**, and refused ([below](#making-something-with-a-command)). A timeout kills the process group and what it had written stays. Progress lines: `running: <command>`, then `changed files: <command>` or `ran: <command>` |
 | `request_repository { repo_url, reason }` | **asks the person** whether another repository may join the workspace: the run parks (`input-required`) on a question **the tool writes**, which names the repository and quotes the model's `reason` (one line, at most 300 characters: `May I add the repository acme/lib (https://github.com/acme/lib) to this workspace? The agent says why: "..."`) and offers `Yes, add acme/lib` and `No`, as a form (one `Choices` question, id `consent`) on a screen that can draw it and as text on one that cannot (the same machinery as `ask_user`'s `choices`, [below](#asking-with-choices)). Only a yes adds the repository (it is then **granted**: the model calls `prepare_workspace` with it); the model never grants, see [the rules](#another-repository-only-with-the-persons-yes). A repository already granted is a result that says so (nobody is asked); one the person turned down (an explicit `no`) is an error result that says not to ask again; a message that is neither a yes nor a no (`wait`, `?`) records nothing, and the tool asks again; one the workspace's policy would refuse (its host is not in `ALLOWED_REPO_HOSTS`, or it is a local path) is an error result **before** anyone is asked. `asks_user()` is `true`, so a subagent cannot have it |
-| `create_repository { owner, name, private?, description? }` | creates a new, **empty** repository (no commit: `publish_scratch` gives it its first), and only **after the person agrees, every time**. Off unless `CREATE_REPO_OWNERS` lists the owner (any other owner is an error result that says so; **with the variable empty the tool is not in `coder_tools` at all**, so the model is not offered it, and the tool's own refusal stays as the last line of defence for a caller that composes its own tool set); private unless `private: false`; `name` is `^[A-Za-z0-9._-]{1,100}$`, not `.`/`..`, not ending `.git`; `description` is at most 350 characters. The first call parks the run on a question **the tool writes** (`May I create the repository acme/fib on github.com? It will be private and empty.`, with the description quoted, and the options `Create acme/fib` and `Don't create it`); the answer comes back as that call's result, and **the model calls the tool again** with the same arguments: with a recorded yes for exactly `owner/name` **and that visibility** it creates the repository (a yes to the private one does not cover a public one), waits up to 10 s for it to be reachable over git, and grants it (the key of its clone URL) and records it (`RunNotes::created_repos`); a repeat after that is the same result and creates nothing; after a no it is an error result that says not to ask again. See [below](#a-repository-of-its-own-on-request). `asks_user()` is `true` |
+| `create_repository { owner, name, private?, description? }` | creates a new, **empty** repository (no commit: `publish_scratch` gives it its first), and only **after the person agrees, every time, unless they picked the `bypass` tier for the message**. The owners are `CREATE_REPO_OWNERS` when it lists some (a list restricts to exactly these), else, for a **GitHub App**, the accounts it acts for (`GITHUB_APP_OWNERS` as listed, the pinned installation's account, or every account it is installed on), else none (a token with no list creates nothing); any other owner is an error result that says so; **when nobody may create, the tool is not in `coder_tools` at all**, so the model is not offered it, and the tool's own refusal stays as the last line of defence for a caller that composes its own tool set; it needs the `auto` tier; private unless `private: false`; `name` is `^[A-Za-z0-9._-]{1,100}$`, not `.`/`..`, not ending `.git`; `description` is at most 350 characters. The first call parks the run on a question **the tool writes** (`May I create the repository acme/fib on github.com? It will be private and empty.`, with the description quoted, and the options `Create acme/fib` and `Don't create it`); the answer comes back as that call's result, and **the model calls the tool again** with the same arguments: with a recorded yes for exactly `owner/name` **and that visibility** it creates the repository (a yes to the private one does not cover a public one), waits up to 10 s for it to be reachable over git, and grants it (the key of its clone URL) and records it (`RunNotes::created_repos`); a repeat after that is the same result and creates nothing; after a no it is an error result that says not to ask again. See [below](#a-repository-of-its-own-on-request). `asks_user()` is `true` |
 | `read_file { path, start_line?, end_line?, repo? }` | a text file of the worktree, **confined to it** ([below](#reading-and-changing-files-itself)): the whole file (cut at 256 KiB, the cut marked) or the lines `start_line..=end_line` each behind its number; a binary file (a NUL byte) is "binary file, N bytes, not shown". Progress line: `read <path> (<slot>)` |
 | `write_file { path, content, repo? }` | creates or replaces a file with exactly `content` (at most 1 MiB), creating its parents; written next to its target and renamed over it, so an interrupted write never leaves half a file, and the mode of a replaced file is kept. Refuses a path through a symlink and anything inside `.git`. Progress line: `wrote <path> (<slot>)` |
 | `apply_patch { patch, repo? }` | a unified diff (at most 1 MiB) with `a/` and `b/` before the paths, for one or several files, checked before it is applied and then applied by `git apply`, all or nothing; its result lists the files changed. Progress line: `patched <files> (<slot>)` |
@@ -63,21 +63,23 @@ sequenceDiagram
 | `rebuild_environment { use_default? }` | the way out of a **broken work environment**, once the person has decided ([below](#the-work-environment-the-repositorys-devcontainer)): the run's environment is thrown away and made again now (its steps are shown under this call, and a failure is this call's result), from the repository's file as it is (`{}`) or, with `use_default: true`, from the default image for the rest of the run. The decision is the person's, so the tool is for the model to call only after it has asked (`ask_user`); the choice is kept in the run's notes (`environment.use_default`) and in the environment's own state. With no container runtime there is nothing to rebuild and it says so. Where the commands run in this container it changes nothing |
 | `commit_and_push { message, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository). In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
 | `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
+| `merge_pull_request { repo, number, method?, delete_branch? }` | merges a pull request of a repository **of the workspace or one the person named**, with `squash` (the default), `merge` or `rebase`. The code host reads the pull request first and merges the head it read (`sha`), so a head that moved is refused; a pull request merged already is reported as it is; `delete_branch: true` deletes the head branch only when it is a branch of that very repository and not the base, and a branch GitHub will not delete is a note, never an error. **GitHub's own rules decide at every tier** (branch protection, required checks and reviews, conflicts, the App's permissions): a refusal is the tool's error result **in GitHub's words** with the class of the error (`rejected` for a merge the rules refuse, `unauthenticated` for a permission), and the model tells the person. Needs the `auto` tier ([below](#access-tiers-what-the-person-lets-it-do-alone)). `src/tools/admin.rs` |
+| `rename_repository { repo, new_name }`, `delete_repository { repo, confirm }` | rename a repository, or delete it for good, **only a repository the person named** (their words, a yes to `request_repository`, or a repository this run created: a bare name is never enough for an act that cannot be taken back). `confirm` must be exactly the repository's `owner/name` (without regard to case), checked before the host is asked, so that a slip of the model deletes nothing. A rename grants the new address; both are noted in the run's notes once the host answered, so a repeat is the same answer. Same refusals as the merge. Need the `bypass` tier. `src/tools/admin.rs` |
 | `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions as one form: a title, why the coder asks, radio buttons, checkboxes, a searchable list, a deck of pictures or a typed answer, each option with a label and a description) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). The instructions say the coder MUST ask with `choices` whenever it offers options, never as a list in prose. It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
-folder](#mcp-tools-from-the-folder)); they are not part of the twenty. The shipped folder's own `mcp.json` adds
+folder](#mcp-tools-from-the-folder)); they are not part of the twenty-three. The shipped folder's own `mcp.json` adds
 eleven **read-only** tools of GitHub, `github__get_file_contents`, `github__list_branches` and the
 rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)). A call to one waits as long as the tool says it may take (`_meta["thread-tools/v1"].timeoutSecs`), at most `THREAD_TOOLS_MAX_CALL_SECS`; a tool the orchestrator reports as a step gets no step of the coder's; and a message that mentions agents adds a "Mentioned agents" block to the instructions ([`adam-ui`](../../crates/adam-ui/README.md), [ADR 0015](../../docs/decisions/0015-tools-the-orchestrator-reports-long-calls-and-mentioned-agents.md)).
 
-Fifteen tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the fifteen is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
+Twenty tools are written in this crate; the other three are `adam-ui`'s, built from `ToolEnv::ui`. Each of the twenty is an `async fn` under `#[tool]` (`adam::tool`, see the [`adam` README](../../crates/adam/README.md#tool)) in
 `src/tools/`: the function's doc comment is the description the model reads, the parameter docs are the
 argument descriptions, and `State<ToolEnv>` is the shared environment. `coder_tools(&env)` is
-`tools![..]` wrapped so that everything a tool returns or fails with passes through the `Redactor` (**without `create_repository` when
-`CREATE_REPO_OWNERS` is empty**: the model is not offered a tool that would only refuse, so it cannot offer "a new repository" in a
+`tools![..]` wrapped so that every call is checked against the access tier of the run (`Gated`, [below](#access-tiers-what-the-person-lets-it-do-alone)) and everything a tool returns or fails with passes through the `Redactor` (**without `create_repository` when
+nobody may create repositories** (no `CREATE_REPO_OWNERS`, and credentials that are not a GitHub App): the model is not offered a tool that would only refuse, so it cannot offer "a new repository" in a
 question or call it with an owner of its own making; the prompt says so, see [Where the prompt and the card live](#where-the-prompt-and-the-card-live)), and
 `CoderAgent` gives the agent the `ToolEnv` as state (`LlmAgentBuilder::state`), which is where the tools read it.
 The specs the model sees are pinned by `tests/fixtures/tool-specs/*.json` (see [Tests](#tests)); tool names and the
@@ -114,7 +116,8 @@ bring its title.
 | `read` | `read_file` |
 | `edit` | `write_file`, `edit_file`, `apply_patch` |
 | `execute` | `run_command`, `run`, `run_checks`, `rebuild_environment` |
-| `git` | `prepare_workspace`, `commit_and_push`, `open_pull_request`, `create_repository`, `publish_scratch` |
+| `git` | `prepare_workspace`, `commit_and_push`, `open_pull_request`, `merge_pull_request`, `rename_repository`, `create_repository`, `publish_scratch` |
+| `delete` | `delete_repository` |
 | `file` | `start_scratch`, `share_file` |
 | `think` | `ask_user`, `request_repository` (the tools that ask the person) |
 | `opencode` | `delegate_to_opencode` |
@@ -184,7 +187,7 @@ activation the message is refused as before ([`adam-a2a-runtime`](../../crates/a
 
 The person's screen (the orchestration layer's chat) can draw a form. The coder announces that on its card
 (`adam_ui::with_card_extensions`: A2UI v0.9.1 with `acceptsInlineCatalogs: true`, `ui-catalog/v1`,
-`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1`, `usage/v1` and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
+`thread-tools/v1`, `mentions/v1`, `steer/v1`; `agent_card_from` adds them, with `steps/v1`, `text-stream/v1`, `usage/v1`, `access-tier/v1` ([above](#access-tiers-what-the-person-lets-it-do-alone)) and `build/v1` below, and `tests/fixtures/agent/card.json` pins them all), reads A2A messages as one from
 a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the model `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`:
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, with a title
 and a description of why, and the person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
@@ -780,6 +783,69 @@ is amended by [ADR 0034](../../docs/decisions/0034-a-turn-that-asks-nothing-comp
 so a person who takes the offer starts a follow-up task that continues the conversation, finds the project with
 `start_scratch` and `publish_scratch`es it.
 
+### Access tiers: what the person lets it do alone
+
+The person picks a tier for each message (`access-tier/v1`, [ADR 0035](../../docs/decisions/0035-the-coder-keeps-to-the-access-tier-the-person-picks.md));
+the card lists all four with `default: auto`, and a message that names none works under `auto`.
+
+| Tier | The coder may | Forms |
+|---|---|---|
+| `plan` | read only: `read_file`, `run_command` (its changes are undone), `prepare_workspace`, `share_file`, `rebuild_environment`, the helpers, GitHub and web reads, `ask_user`; the answer is a plan | a repository the person did not name asks |
+| `edits` | also change files (`write_file`, `edit_file`, `apply_patch`, `run`, `run_checks`, `delegate_to_opencode`, `start_scratch`), `publish_scratch`, `commit_and_push`, `open_pull_request` | same; a bare name does **not** count as named |
+| `auto` | also `merge_pull_request` and `create_repository` | a name the person wrote **alone** (`widgets`) counts as named when exactly one owner applies; `create_repository` still asks its yes or no |
+| `bypass` | also `rename_repository` and `delete_repository` | none: any repository the host allows is granted, `create_repository` asks nothing |
+
+GitHub's branch protection, required checks and the permissions the App was granted decide at **every** tier; a tier only narrows.
+
+```mermaid
+sequenceDiagram
+  participant P as the person
+  participant B as RuntimeTaskBackend
+  participant A as CoderAgent (before each step)
+  participant S as TierSource (each model turn, each call)
+  participant M as the model
+  participant T as a tool (Gated)
+  P->>B: message, A2A-Extensions: access-tier/v1, metadata {tier}
+  B->>B: a bad or not honoured tier is InvalidParams, nothing written
+  B->>A: the run's context holds vymalo.accessTier
+  A->>A: notes.tier from the inbox or the context, notes.said_words
+  A->>S: the model turn
+  S-->>M: the tools at or below the tier, and the words of the tier
+  M->>T: a call, maybe to a tool above the tier
+  S-->>T: withhold is read again inside the step of the call
+  T->>T: the tier of the root run's notes is checked again
+  T-->>M: the work, or a refusal that says which tier it needs
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Unnamed: a task starts, and never inherits the tier of the task before
+  [*] --> Named: the first message names a tier
+  Unnamed --> Named: a message names one, from the next step
+  Named --> Named: a newer message names another, or none (it stays)
+  Unnamed --> [*]: the task ends
+  Named --> [*]: the task ends
+```
+
+How it holds, in code: **(1)** `TierSource` (`src/tier.rs`) is a `ToolSource` that offers no tool and, on each model turn, *holds
+back* the tools above the tier of the run's context (`ToolSource::withhold`), the agent's own and an MCP server's alike, and adds
+the words of the tier when a message named one; **(2)** the loop reads `withhold` again inside the journaled step of every call, so
+a call to a tool the model was not shown (or was shown a turn ago) is refused with the reason and the host is never asked;
+**(3)** every tool of `coder_tools` is wrapped (`Gated`) and checks the tier in the notes of the **root** run when it is called, which
+keeps a subagent, whose own context holds no tier, to the tier of the run it serves. The agent writes the tier into the notes before
+each step (`CoderAgent::record_grants`), from the messages waiting in the inbox (the newest that names one wins) or the
+conversation's context, never from the model or a tool; `CoderStarter::init_continuing` leaves the earlier task's tier behind.
+`needs(tool)` is the table: the coder's own tools by name, a server's tool (`<server>__<tool>`) is a read, usable at every tier, when
+its name says so (`get_`, `list_`, `search_`, `web_`, `..._read`), and **anything else is `auto`** (an unknown tool is never offered
+to a person who asked for a plan). Not enforceable: what an asked agent (`ask_agent`) does (asking is reading; the prompt says not to
+ask for a change the tier forbids) and a server's write tool with a reading name.
+
+A **bare name** (`ToolEnv::is_granted`): from `auto`, `prepare_workspace`, `publish_scratch` and `request_repository` treat
+`github.com/<owner>/<name>` as named when `<name>` is a word of the person's own messages (`RunNotes::said_words`, lowercase, once
+each, at most 2000) and `<owner>` is the one owner that applies: the owner of the repositories in the workspace (or created by the
+run) if they are all one, else the one account the credentials act for. Two owners, or none, leave the form. `rename_repository` and
+`delete_repository` never take a bare name.
+
 ### Another repository, only with the person's yes
 
 A task names the repository it is about. When it needs another (to read a shared file from, or to change too),
@@ -854,7 +920,7 @@ sequenceDiagram
   participant H as the code host
   participant S as publish_scratch
   M->>T: owner, name, private?, description?
-  T->>T: CREATE_REPO_OWNERS lists the owner? the name is valid? the host allows it? it can be made for this owner at all?
+  T->>T: the tier is auto or above? the owner is allowed (the list, else the App's accounts)? the name is valid? the host allows it? it can be made for this owner at all?
   T-->>P: May I create acme/fib on github.com? It will be private and empty. [Create acme/fib] [Don't create it]
   Note over T,P: the run waits (input-required), nothing is created
   P-->>A: yes (the result of the call), recorded for acme/fib:private
@@ -868,7 +934,8 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-  [*] --> Refused: the feature is off, the owner or the name is not allowed, the host cannot create for the owner
+  [*] --> Refused: the tier is below auto, the feature is off, the owner or the name is not allowed, the host cannot create for the owner
+  [*] --> Created: the tier is bypass (no question)
   [*] --> Asked: no consent for owner/name:visibility yet
   Asked --> Declined: the person says no (asking again is refused)
   Asked --> Asked: any other answer (nothing is recorded)
@@ -878,9 +945,13 @@ stateDiagram-v2
   Created --> [*]: publish_scratch
 ```
 
-* **Off unless the deployment says for whom.** `CREATE_REPO_OWNERS` names the owners (the chart: `github.createRepoOwners`);
-  empty means the tool refuses every call, and an owner that is not listed is refused with the list. The error
-  tells the model to say it cannot create one and to ask the person to make it and name it.
+* **On for a GitHub App, listed for a token.** `CREATE_REPO_OWNERS` names the owners (the chart: `github.createRepoOwners`) and
+  restricts to exactly them. Empty, a GitHub App creates for the accounts it acts for (`GitCredentials::acts_for`:
+  `GITHUB_APP_OWNERS` as listed, the pinned installation's account, or every account the App is installed on); a token has no
+  such list, so with the variable empty the tool refuses every call. An owner that is not allowed is refused with the list.
+  The error tells the model to say it cannot create one and to ask the person to make it and name it. It needs the `auto`
+  tier, and the tier of a message is the person's word: at `bypass` the yes or no is not asked (the creation is then
+  recorded as before), at `auto` it still is.
 * **Private and empty.** `private` defaults to true, and a public repository is made only when the model passes
   `private: false` (the prompt reserves it for what the person asked); `auto_init` is false, so the repository has no
   commit, no README and no licence: `publish_scratch` gives it the empty first commit and then the project.
@@ -1594,7 +1665,7 @@ way; every problem is reported at once at startup):
 | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them. The first is also the host `owner/name` stands for when the person writes a repository that way | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests and `compose.yaml`: `mock-github`) | `https://api.github.com` |
 | `GITHUB_MCP_URL` | where the GitHub MCP server is (`github-mcp-server http`, the sidecar of the pod): an http(s) URL with no credentials, of which only the origin counts. The agent folder's `github` server has to be at that origin, and the coder gives that server the credentials of each call. The chart sets it from `githubMcp.port`; `compose.yaml` points it at `mock-github-mcp`. Read by the roles that run workers | `http://127.0.0.1:8082` |
-| `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees; empty turns the tool off. The chart's `github.createRepoOwners` | empty (off) |
+| `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees (not asked under the `bypass` tier). A list **restricts** to exactly these owners. Empty: a **GitHub App** creates for the accounts it acts for (`GITHUB_APP_OWNERS`, the pinned installation's account, or every account it is installed on), and a token creates nothing (the tool is off). The chart's `github.createRepoOwners` | empty |
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs ([below](#the-workspace-of-a-run)); `0` turns it off | `300` |
@@ -2032,6 +2103,19 @@ Everything is offline (`cargo test -p adam-coder`; with
 `ADAM_TEST_POSTGRES_URL` set the Postgres variants run too, each case in a
 database of its own, so the role needs `CREATEDB`):
 
+* `tests/tiers.rs` (the access tiers): the tools the model is **shown** on a turn per tier (a real `Runtime`, a scripted model), the
+  tier noted from the message and said to the model, a task that continues another starting at the default, a model that calls a
+  tool above the tier anyway (the host is never asked, the refusal names the tier it needs), every tool checking the root run's
+  notes when called (a subagent's `ToolCtx` included), `merge_pull_request` against the wiremock GitHub (the method, the `sha` of
+  the head it read, the branch deleted) and GitHub's `405`, `409` and `403` reported in its words with their class, only a
+  repository the person gave the run being merged, deleted or renamed, the `confirm` guard of the deletion, a rename that grants
+  the new address, a repeated rename or deletion being the same answer, `create_repository` on by default for a GitHub App (the
+  fixture's credentials `acting_for` accounts), a list still restricting, a token creating nothing, `bypass` asking no question
+  and `auto` asking, the consent form of `request_repository` per tier and bare name, and the coder's own backend (a bad tier is
+  `InvalidParams`, the tier is said on the task, the card lists `access-tier/v1`). Unit tests: `src/tier.rs` (the tier of a
+  context, the table of `needs`, what the source holds back and says), `src/agent.rs` (`tier_tests`: the newest waiting message
+  wins, a read message and a finish notice do not, a continuing task does not inherit) and `src/tools/mod.rs` (`grant_tests`: a
+  bare name per tier, one owner, two owners, none, the words of a message).
 * `tests/e2e.rs`: a real A2A client and server, the scripted `MockModel`, a
   local bare git repository as the remote, the `adam-acp` fake agent as OpenCode
   and a wiremock GitHub. **Every case runs once per store** (`memory::*`, and

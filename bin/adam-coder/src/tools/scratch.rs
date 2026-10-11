@@ -177,7 +177,7 @@ pub async fn publish_scratch(
     // workspace cannot read (not a URL or an absolute path) is its error to report, below.
     let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
     if let Some(key) = key_of_argument(url)
-        && !notes.named_repos.contains(&key)
+        && !env.is_granted(ctx, &notes, &key).await
     {
         return Ok(ToolOutput::error(not_named(
             url,
