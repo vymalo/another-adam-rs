@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::conversation::{ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
+use crate::conversation::{PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY, ROOT_STEP_KEY, user_message};
 use crate::source::ToolNote;
 use crate::state::{Extensions, State, StateKey};
 
@@ -657,6 +657,19 @@ impl ToolCtx {
                 ROOT_STEP_KEY.to_owned(),
                 Value::String(root_step.to_owned()),
             );
+            // A limit the person set on this run (the access tier) is the child's too, and its own
+            // children's: the child's context starts with the protected keys of this one.
+            let inherited: Map<String, Value> = PROTECTED_CONTEXT_KEYS
+                .iter()
+                .filter_map(|key| {
+                    self.context
+                        .get(*key)
+                        .map(|value| ((*key).to_owned(), value.clone()))
+                })
+                .collect();
+            if !inherited.is_empty() {
+                payload.insert("context".to_owned(), Value::Object(inherited));
+            }
         }
         children
             .start(child, agent, first)

@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Conversation, LlmAgent, LlmAgentBuilder, MAX_CONTEXT_BYTES, MAX_SOURCE_TOOLS, PendingQuestion,
-    PendingWait, SourceCtx, Tool, ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
+    ACCESS_TIER_CONTEXT_KEY, Conversation, LlmAgent, LlmAgentBuilder, MAX_CONTEXT_BYTES,
+    MAX_PROTECTED_VALUE_BYTES, MAX_SOURCE_TOOLS, PendingQuestion, PendingWait, SourceCtx, Tool,
+    ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
 };
 use adam_model::{DynModel, Message, MockModel, ToolCall, ToolSpec};
 use adam_runtime::{Inbound, ManualClock, RetryPolicy, RunView, Runtime};
@@ -415,6 +416,64 @@ fn merging_context_follows_the_rules_and_keeps_the_limit() {
     assert!(c.merge_context(&obj(json!({"k": "x".repeat(room)}))));
     assert!(serde_json::to_vec(&c.context).unwrap().len() <= MAX_CONTEXT_BYTES);
     assert!(!c.merge_context(&obj(json!({"k": "x".repeat(room + 1)}))));
+}
+
+#[test]
+fn a_limit_the_person_set_is_kept_when_the_rest_of_the_context_is_dropped() {
+    let obj = |v: Value| v.as_object().cloned().unwrap();
+    let tier = |name: &str| json!({"tier": name});
+    let mut c = Conversation::new("t");
+    assert!(c.merge_context(&obj(
+        json!({"keep": 1, ACCESS_TIER_CONTEXT_KEY: tier("auto")})
+    )));
+    // A large catalog next to a `plan` tier: the catalog is dropped, the tier is not.
+    let update = obj(
+        json!({"catalog": "x".repeat(MAX_CONTEXT_BYTES), ACCESS_TIER_CONTEXT_KEY: tier("plan")}),
+    );
+    assert!(!c.merge_context(&update));
+    assert_eq!(
+        Value::Object(c.context.clone()),
+        json!({"keep": 1, ACCESS_TIER_CONTEXT_KEY: tier("plan")})
+    );
+    // The protected key does not count toward the limit: a context that is full still takes it.
+    let mut full = Conversation::new("t");
+    let room = MAX_CONTEXT_BYTES - serde_json::to_vec(&json!({"k": ""})).unwrap().len();
+    assert!(full.merge_context(&obj(json!({"k": "x".repeat(room)}))));
+    assert!(!full.merge_context(&obj(json!({"more": 1}))));
+    assert!(full.merge_context(&obj(json!({ACCESS_TIER_CONTEXT_KEY: tier("plan")}))));
+    assert_eq!(full.context[ACCESS_TIER_CONTEXT_KEY], tier("plan"));
+    // A value that is too large to be a limit is ignored, in either case.
+    let mut c = Conversation::new("t");
+    let huge = json!({"tier": "x".repeat(MAX_PROTECTED_VALUE_BYTES)});
+    assert!(c.merge_context(&obj(json!({ACCESS_TIER_CONTEXT_KEY: huge, "a": 1}))));
+    assert_eq!(Value::Object(c.context.clone()), json!({"a": 1}));
+    // `null` removes it, like any key.
+    assert!(c.merge_context(&obj(json!({ACCESS_TIER_CONTEXT_KEY: tier("plan")}))));
+    assert!(c.merge_context(&obj(json!({ACCESS_TIER_CONTEXT_KEY: null}))));
+    assert!(!c.context.contains_key(ACCESS_TIER_CONTEXT_KEY));
+}
+
+#[tokio::test]
+async fn a_message_with_a_large_context_and_a_tier_keeps_the_tier() {
+    let h = Harness::new();
+    let agent = h.agent().build();
+    h.mock.push_text("done");
+    let rt = h.runtime(&agent);
+    let context =
+        json!({"big": "x".repeat(MAX_CONTEXT_BYTES), ACCESS_TIER_CONTEXT_KEY: {"tier": "plan"}});
+    let run = rt
+        .start("llm", message_with("hi", context), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    let state = conversation(&view);
+    assert_eq!(
+        Value::Object(state.context.clone()),
+        json!({ACCESS_TIER_CONTEXT_KEY: {"tier": "plan"}})
+    );
+    assert_eq!(state.messages[0], Message::user_text("hi"));
 }
 
 #[test]

@@ -824,6 +824,7 @@ impl LlmAgent {
         let source_ctx = (!sources.is_empty()).then(|| {
             SourceCtx::new(
                 ctx.run_id(),
+                state.root_run.unwrap_or_else(|| ctx.run_id()),
                 ctx.conversation_id().map(str::to_owned),
                 Arc::new(state.context.clone()),
             )
@@ -1259,6 +1260,7 @@ impl LlmAgent {
                 self.sources.clone(),
                 SourceCtx::new(
                     ctx.run_id(),
+                    root.0.unwrap_or_else(|| ctx.run_id()),
                     ctx.conversation_id().map(str::to_owned),
                     Arc::new(context.clone()),
                 ),

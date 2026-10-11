@@ -68,6 +68,20 @@ pub(crate) fn parse_user_text(payload: &Value) -> Result<String, String> {
 /// context is dropped, with a warning.
 pub const MAX_CONTEXT_BYTES: usize = 256 * 1024;
 
+/// The context key under which a message carries the access tier the person picked for it
+/// (`access-tier/v1`): `{"tier": "plan" | "edits" | "auto" | "bypass"}`.
+pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
+
+/// The context keys that carry a **limit the person put on the agent**. A message always sets them,
+/// even when the rest of its context is over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large
+/// catalog next to a `plan` tier would lift the limit), and a child run starts with the ones its
+/// parent has ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
+/// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
+pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[ACCESS_TIER_CONTEXT_KEY];
+
+/// The most serialized JSON, in bytes, that the value of a [`PROTECTED_CONTEXT_KEYS`] key may hold.
+pub const MAX_PROTECTED_VALUE_BYTES: usize = 1024;
+
 /// The context an inbound payload carries: the object under its `"context"` key, or nothing.
 pub(crate) fn parse_context(payload: &Value) -> Option<&Map<String, Value>> {
     payload.get("context").and_then(Value::as_object)
@@ -612,27 +626,51 @@ impl Conversation {
     /// Merge the `update` of one inbound message into [`context`](Self::context): a key it sets
     /// replaces the one before, a key set to `null` is deleted.
     ///
-    /// Returns `false`, and changes nothing, when the merged context would be larger than
-    /// [`MAX_CONTEXT_BYTES`] (a warning says so: the message is still read for its text).
+    /// Returns `false` when the merged context would be larger than [`MAX_CONTEXT_BYTES`] (a warning
+    /// says so: the message is still read for its text). Then **only the update's
+    /// [`PROTECTED_CONTEXT_KEYS`] are merged**, and nothing else changes: a limit the person set is
+    /// never lost to a large context. The protected keys do not count toward the limit.
     pub fn merge_context(&mut self, update: &Map<String, Value>) -> bool {
         if update.is_empty() {
             return true;
         }
-        let mut merged = self.context.clone();
-        for (key, value) in update {
-            if value.is_null() {
-                merged.remove(key);
-            } else {
-                merged.insert(key.clone(), value.clone());
+        let protected = |key: &str, value: &Value| {
+            PROTECTED_CONTEXT_KEYS.contains(&key)
+                && (value.is_null()
+                    || serde_json::to_vec(value).map_or(usize::MAX, |b| b.len())
+                        <= MAX_PROTECTED_VALUE_BYTES)
+        };
+        let is_protected_key = |key: &String| PROTECTED_CONTEXT_KEYS.contains(&key.as_str());
+        let apply = |context: &mut Map<String, Value>, only_protected: bool| {
+            for (key, value) in update {
+                if is_protected_key(key) && !protected(key, value) {
+                    continue;
+                }
+                if only_protected && !is_protected_key(key) {
+                    continue;
+                }
+                if value.is_null() {
+                    context.remove(key);
+                } else {
+                    context.insert(key.clone(), value.clone());
+                }
             }
-        }
-        let size = serde_json::to_vec(&merged).map_or(usize::MAX, |bytes| bytes.len());
+        };
+        let mut merged = self.context.clone();
+        apply(&mut merged, false);
+        let rest: Map<String, Value> = merged
+            .iter()
+            .filter(|(key, _)| !is_protected_key(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let size = serde_json::to_vec(&rest).map_or(usize::MAX, |bytes| bytes.len());
         if size > MAX_CONTEXT_BYTES {
             tracing::warn!(
                 limit = MAX_CONTEXT_BYTES,
                 keys = update.len(),
-                "the context of an inbound message would take the run's context over its limit: it is dropped"
+                "the context of an inbound message would take the run's context over its limit: it is dropped, but for the keys that carry a limit the person set"
             );
+            apply(&mut self.context, true);
             return false;
         }
         self.context = merged;

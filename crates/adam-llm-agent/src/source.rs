@@ -122,6 +122,7 @@ impl Listing {
 #[derive(Debug, Clone)]
 pub struct SourceCtx {
     run_id: RunId,
+    root_run: RunId,
     conversation_id: Option<String>,
     context: Arc<Map<String, Value>>,
 }
@@ -129,11 +130,13 @@ pub struct SourceCtx {
 impl SourceCtx {
     pub(crate) fn new(
         run_id: RunId,
+        root_run: RunId,
         conversation_id: Option<String>,
         context: Arc<Map<String, Value>>,
     ) -> Self {
         Self {
             run_id,
+            root_run,
             conversation_id,
             context,
         }
@@ -142,12 +145,25 @@ impl SourceCtx {
     /// A context detached from any run, for unit-testing a source: a fresh run id, no
     /// conversation, and `context` as the run's inbound context.
     pub fn detached(context: Map<String, Value>) -> Self {
-        Self::new(RunId::new(), None, Arc::new(context))
+        let run = RunId::new();
+        Self::new(run, run, None, Arc::new(context))
+    }
+
+    /// Like [`detached`](Self::detached), for a run that is a child of the run `root`.
+    pub fn detached_under(root: RunId, context: Map<String, Value>) -> Self {
+        Self::new(RunId::new(), root, None, Arc::new(context))
     }
 
     /// The run the model is about to be called for.
     pub fn run_id(&self) -> RunId {
         self.run_id
+    }
+
+    /// The root of that run's parent chain: the run itself when it is not a child run
+    /// ([`ToolCtx::root_run_id`](crate::ToolCtx::root_run_id)). What a source that keeps state per
+    /// task (the tier a person set, the notes of the task) reads for a subagent.
+    pub fn root_run_id(&self) -> RunId {
+        self.root_run
     }
 
     /// The conversation the run belongs to, if any.
