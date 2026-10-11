@@ -183,6 +183,11 @@ pub struct CoderSettings {
     /// left off for a token, which has no list of accounts and keeps the tool off until the
     /// variable names owners.
     pub create_for_installed_owners: bool,
+    /// The highest access tier a run may work under, whatever a message asks for
+    /// (`MAX_ACCESS_TIER`): the tools check it against the tier the notes hold. The default is
+    /// [`DEFAULT_MAX`](crate::tier::DEFAULT_MAX), `auto`: renaming and deleting a repository are
+    /// the deployment's opt-in.
+    pub max_access_tier: AccessTier,
     /// The devcontainers have no network (`DEVCONTAINER_NETWORK=none`): OpenCode, inside one,
     /// cannot reach its model, so `delegate_to_opencode` refuses there and says what to use instead.
     pub container_network_none: bool,
@@ -219,6 +224,7 @@ impl CoderSettings {
             default_repo_host: named::DEFAULT_HOST.to_owned(),
             create_repo_owners: Vec::new(),
             create_for_installed_owners: false,
+            max_access_tier: crate::tier::DEFAULT_MAX,
             container_network_none: false,
         }
     }
@@ -491,6 +497,12 @@ impl ToolEnv {
         Ok(self.workspaces.acts_for().await?.unwrap_or_default())
     }
 
+    /// The access tier the run with `notes` works under now: the one the agent noted for the newest
+    /// message, never above what the deployment allows ([`CoderSettings::max_access_tier`]).
+    pub(crate) fn tier_of(&self, notes: &RunNotes) -> AccessTier {
+        notes.tier().min(self.settings.max_access_tier)
+    }
+
     /// The one owner a bare repository name belongs to, if there is exactly one: the owner of the
     /// repositories already in the run's workspace (or created by the run), else the one account the
     /// credentials act for (a GitHub App installed on one account). Two owners, or none, are
@@ -534,7 +546,7 @@ impl ToolEnv {
         if notes.named_repos.iter().any(|named| named == key) {
             return true;
         }
-        match notes.tier() {
+        match self.tier_of(notes) {
             AccessTier::Plan | AccessTier::Edits => false,
             AccessTier::Bypass => true,
             AccessTier::Auto => {
@@ -760,13 +772,14 @@ impl Tool for Gated {
         // Every tier allows what needs the lowest one: no read of the notes for a look.
         if self.needs > AccessTier::Plan {
             let run = ctx.root_run_id().to_string();
+            // No notes of the root run: nothing recorded a tier, so nothing above a plan is allowed.
             let tier = self
                 .env
                 .notes
-                .load(&run)
+                .load_existing(&run)
                 .await
                 .map_err(|e| notes_error(&e))?
-                .tier();
+                .map_or(AccessTier::Plan, |notes| self.env.tier_of(&notes));
             if self.needs > tier {
                 return Ok(ToolOutput::error(crate::tier::refusal(
                     &self.name, self.needs, tier,
@@ -997,8 +1010,10 @@ mod grant_tests {
         ));
         let workspaces =
             Workspaces::new(root.path().join("work"), creds).allow_hosts(["github.com"]);
-        let settings =
+        let mut settings =
             CoderSettings::new(OpenCodeLaunch::opencode("http://gateway.invalid/v1", "m"));
+        // These tests are about the tier in the notes: the deployment lets a person pick any.
+        settings.max_access_tier = AccessTier::Bypass;
         let env = Arc::new(ToolEnv::new(
             workspaces,
             Arc::new(MemoryCodeHost::new()),
@@ -1018,7 +1033,7 @@ mod grant_tests {
             tier: Some(tier),
             ..RunNotes::default()
         };
-        notes.say_words([said.to_owned()]);
+        notes.set_said_words(said);
         notes
     }
 
@@ -1154,20 +1169,45 @@ mod grant_tests {
     }
 
     #[test]
-    fn the_words_of_a_message_that_could_be_a_repository_are_kept_once_and_without_case() {
+    fn only_the_words_that_stand_alone_in_the_newest_message_could_be_a_repository() {
         let mut notes = RunNotes::default();
-        assert!(notes.say_words(["Fix the typo in Widgets, not in api.v2!".to_owned()]));
+        assert!(notes.set_said_words("Fix the typo in Widgets, not in api.v2!"));
         assert!(notes.said("widgets") && notes.said("API.v2") && notes.said("typo"));
         // A single letter is no repository's name, and punctuation is not part of a word.
         assert!(!notes.said("a") && !notes.said("widgets,"));
-        // The same words again add nothing.
-        assert!(!notes.say_words(["widgets TYPO".to_owned()]));
+        // The same message again changes nothing.
+        assert!(!notes.set_said_words("Fix the typo in Widgets, not in api.v2!"));
+        // The next message replaces the words: what an older one said no longer stands.
+        assert!(notes.set_said_words("thanks, now gadgets"));
+        assert!(notes.said("gadgets") && !notes.said("widgets") && !notes.said("typo"));
+        // A piece of a URL, a path or a query is not a word of its own.
+        notes.set_said_words(
+            "see https://github.com/acme/widgets/issues/3, src/gadgets/main.rs, \
+             github.com/acme/sprockets?name=cogs and git@github.com:acme/bolts.git",
+        );
+        for fragment in [
+            "widgets",
+            "gadgets",
+            "sprockets",
+            "cogs",
+            "bolts",
+            "acme",
+            "github",
+            "main.rs",
+            "issues",
+        ] {
+            assert!(!notes.said(fragment), "{fragment}");
+        }
+        assert!(notes.said("see") && notes.said("and"));
+        // Quotes, backticks and a closing full stop around a word are not part of it.
+        notes.set_said_words("use `widgets`, (gadgets) or \"cogs\".");
+        assert!(notes.said("widgets") && notes.said("gadgets") && notes.said("cogs"));
         // The list is bounded: the first words stay and the newest are not added.
-        let mut full = RunNotes::default();
         let many: Vec<String> = (0..crate::tools::notes::MAX_SAID_WORDS + 50)
             .map(|n| format!("word{n}"))
             .collect();
-        full.say_words([many.join(" ")]);
+        let mut full = RunNotes::default();
+        full.set_said_words(&many.join(" "));
         assert_eq!(full.said_words.len(), crate::tools::notes::MAX_SAID_WORDS);
         assert!(
             full.said("word0")

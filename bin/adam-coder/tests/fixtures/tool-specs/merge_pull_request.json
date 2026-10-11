@@ -1,6 +1,6 @@
 {
   "name": "merge_pull_request",
-  "description": "Merge a pull request of a repository you work on (one in your workspace, or one the person named). `method` is `squash` (the default), `merge` or `rebase`; with `delete_branch: true` the pull request's branch is deleted afterwards, when it is a branch of that very repository. GitHub's own rules decide whether it merges (branch protection, required checks and reviews, conflicts): if it refuses you get its words, and you tell the person; do not look for another way. It needs the auto access tier or above.",
+  "description": "Merge a pull request, only when the person asked for it. The pull request is one this conversation pushed the branch of, or one the person named (its number or URL); its checks have passed (checked here, on the head commit that is merged); and, if it was opened with `accept_red_checks`, the person's newest message names it and says to merge it. `repo` is a repository of your workspace or one the person named. `method` is `squash` (the default), `merge` or `rebase`; with `delete_branch: true` the pull request's branch is deleted afterwards, when it is a branch of that very repository. GitHub's own rules decide too (branch protection, required reviews, conflicts): if it refuses you get its words, and you tell the person; do not look for another way. It needs the auto access tier or above.",
   "parameters": {
     "type": "object",
     "properties": {

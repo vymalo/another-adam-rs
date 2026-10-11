@@ -330,11 +330,21 @@ impl CodeHost for GithubBehindMock {
         merge.repo = RepoRef::new(self.slug.url.clone(), merge.repo.base_branch.clone());
         self.inner.merge_pull_request(merge).await
     }
+
+    async fn pull_request_status(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<adam_workspace::PullRequestStatus, WorkspaceError> {
+        let repo = RepoRef::new(self.slug.url.clone(), repo.base_branch.clone());
+        self.inner.pull_request_status(&repo, number).await
+    }
 }
 
 /// Make the mock GitHub answer for pull request `number` of `slug`, open, from `branch` of that very
-/// repository: the read of it, the merge (`PUT .../merge`, answered with `merge_sha`) and the delete
-/// of its branch.
+/// repository, with every check passed (`mergeable_state` `clean`): the repository itself, the read of
+/// the pull request, the merge (`PUT .../merge`, answered with `merge_sha`) and the delete of its
+/// branch.
 pub async fn mount_mergeable(
     github: &MockServer,
     slug: &str,
@@ -342,6 +352,38 @@ pub async fn mount_mergeable(
     branch: &str,
     merge_sha: &str,
 ) {
+    mount_pull(github, slug, number, branch, "abc123", "clean").await;
+    mount_merge(github, slug, number, branch, merge_sha).await;
+}
+
+/// The repository `slug` and its pull request `number`, open, from `branch` of that very repository,
+/// whose head is `sha` and whose `mergeable_state` is `state`.
+pub async fn mount_pull(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    sha: &str,
+    state: &str,
+) {
+    mount_pull_from(github, slug, number, branch, slug, sha, state).await;
+}
+
+/// [`mount_pull`] for a head that is in the repository `head_repo` (another one: a fork).
+pub async fn mount_pull_from(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    head_repo: &str,
+    sha: &str,
+    state: &str,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{slug}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"full_name": slug})))
+        .mount(github)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("/repos/{slug}/pulls/{number}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -349,11 +391,37 @@ pub async fn mount_mergeable(
             "html_url": pull_url(number),
             "state": "open",
             "merged": false,
-            "head": {"ref": branch, "sha": "abc123", "repo": {"full_name": slug}},
+            "mergeable_state": state,
+            "head": {"ref": branch, "sha": sha, "repo": {"full_name": head_repo}},
             "base": {"ref": "main", "repo": {"full_name": slug}},
         })))
         .mount(github)
         .await;
+}
+
+/// The statuses and check runs the mock GitHub reports for commit `sha` of `slug`.
+pub async fn mount_checks(github: &MockServer, slug: &str, sha: &str, status: Value, runs: Value) {
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{slug}/commits/{sha}/status")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status))
+        .mount(github)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{slug}/commits/{sha}/check-runs")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(runs))
+        .mount(github)
+        .await;
+}
+
+/// The merge of pull request `number` of `slug` (`PUT .../merge`, answered with `merge_sha`) and
+/// the delete of its branch `branch`.
+pub async fn mount_merge(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    merge_sha: &str,
+) {
     Mock::given(method("PUT"))
         .and(path(format!("/repos/{slug}/pulls/{number}/merge")))
         .respond_with(
@@ -621,6 +689,9 @@ impl Fixture {
             .env("FAKE_ACP_WRITE_PATH", "hello.txt")
             .env("FAKE_ACP_WRITE_CONTENT", content);
         let mut settings = CoderSettings::new(launch);
+        // A fixture is a deployment that lets a person pick any tier (`MAX_ACCESS_TIER=bypass`),
+        // so that a test of a tier is a test of the tier; the cap itself is `capped_at`.
+        settings.max_access_tier = adam_a2a::AccessTier::Bypass;
         tweak(&mut settings);
         let env = Arc::new(
             ToolEnv::new(workspaces, code_host, settings).with_redactor(Redactor::new(SECRETS)),
@@ -662,6 +733,26 @@ impl Fixture {
             .expect("the tools are not shared yet")
             .workspaces = workspaces;
         self
+    }
+
+    /// The same fixture that also lets the workspaces use repositories on `hosts` (beside
+    /// `github.com`), as `ALLOWED_REPO_HOSTS` does.
+    #[must_use]
+    pub fn also_allowing(mut self, hosts: &[&str]) -> Self {
+        let creds: DynGitCredentials = Arc::new(ScopedToken::new("github.com", GITHUB_TOKEN));
+        let workspaces = Workspaces::new(self.root.clone(), creds)
+            .allow_hosts(std::iter::once("github.com").chain(hosts.iter().copied()))
+            .allow_local(true);
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .workspaces = workspaces;
+        self
+    }
+
+    /// The same fixture whose deployment caps the access tiers at `max` (`MAX_ACCESS_TIER`).
+    #[must_use]
+    pub fn capped_at(self, max: adam_a2a::AccessTier) -> Self {
+        self.tweaked(|settings| settings.max_access_tier = max)
     }
 
     /// The same fixture with its settings adjusted (before anything shares the tools).

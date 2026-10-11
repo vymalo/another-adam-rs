@@ -34,12 +34,26 @@ use adam_runtime::Inbound;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
+use crate::tools::notes::NotesStore;
+
 /// What the coder works under when a message names no tier. The card says it too.
 pub const DEFAULT: AccessTier = AccessTier::Auto;
 
-/// The tiers the coder honours, and its default: all four, `auto`. The `params` of its card entry.
+/// The highest tier a deployment lets a person pick when it sets none (`MAX_ACCESS_TIER`): `auto`.
+/// `bypass` (renaming and deleting repositories, no consent form) is the deployment's opt-in.
+pub const DEFAULT_MAX: AccessTier = AccessTier::Auto;
+
+/// The tiers the coder honours with no cap set, and its default ([`honoured_up_to`] of
+/// [`DEFAULT_MAX`]).
 pub fn honoured() -> AccessTiers {
-    AccessTiers::all(DEFAULT)
+    honoured_up_to(DEFAULT_MAX)
+}
+
+/// The tiers the coder honours under the cap `max` (`MAX_ACCESS_TIER`): every tier up to it,
+/// working under `auto` when a message names none (or under `max` when that is lower). The `params`
+/// of its card entry, and what the A2A backend refuses a message for.
+pub fn honoured_up_to(max: AccessTier) -> AccessTiers {
+    AccessTiers::up_to(max, DEFAULT)
 }
 
 /// The tier named in a run's context (`vymalo.accessTier`), if one is.
@@ -173,13 +187,42 @@ fn words(tier: AccessTier) -> String {
 }
 
 /// The tier of the run as a [`ToolSource`]: it offers no tool of its own, holds back the tools above
-/// the tier of the run's context, and says the tier when a message named one.
+/// the tier of the run, and says the tier when a message named one.
 ///
-/// Added to the coder's assembly for the root and every subagent. A subagent's context holds no
-/// tier (a child run has its own), so for it the source holds back only what is above the default;
-/// what a subagent may do is kept to the root's tier by the tools themselves.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TierSource;
+/// Added to the coder's assembly for the root and every subagent. The tier of the root run is the
+/// tier of its context. A subagent's is the **root's**: read from the notes of the root run
+/// ([`SourceCtx::root_run_id`]), which is what keeps an MCP server's tool, called in a subagent, to
+/// the tier of the task; notes that are not there are a `plan` (fail closed). Never above the cap
+/// the deployment set.
+#[derive(Debug, Clone)]
+pub struct TierSource {
+    notes: NotesStore,
+    max: AccessTier,
+}
+
+impl TierSource {
+    /// The source for runs whose notes are in `notes`, under the cap `max`.
+    pub fn new(notes: NotesStore, max: AccessTier) -> Self {
+        Self { notes, max }
+    }
+
+    /// The tier the run `ctx` is for works under now.
+    async fn tier_of(&self, ctx: &SourceCtx) -> AccessTier {
+        let tier = if ctx.root_run_id() == ctx.run_id() {
+            in_context(ctx.context_map())
+        } else {
+            match self
+                .notes
+                .load_existing(&ctx.root_run_id().to_string())
+                .await
+            {
+                Ok(Some(notes)) => notes.tier(),
+                _ => AccessTier::Plan,
+            }
+        };
+        tier.min(self.max)
+    }
+}
 
 #[async_trait]
 impl ToolSource for TierSource {
@@ -188,11 +231,11 @@ impl ToolSource for TierSource {
     }
 
     async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
-        named_in_context(ctx.context_map()).map(words)
+        named_in_context(ctx.context_map()).map(|named| words(named.min(self.max)))
     }
 
     async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
-        let tier = in_context(ctx.context_map());
+        let tier = self.tier_of(ctx).await;
         tools
             .iter()
             .filter_map(|tool| {
@@ -216,6 +259,10 @@ impl ToolSource for TierSource {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn source(max: AccessTier) -> TierSource {
+        TierSource::new(NotesStore::new(std::path::Path::new("/nonexistent")), max)
+    }
 
     fn context(tier: Value) -> Map<String, Value> {
         let mut map = Map::new();
@@ -330,7 +377,7 @@ mod tests {
                     .unwrap_or_default(),
             );
             async move {
-                TierSource
+                source(AccessTier::Bypass)
                     .withhold(&ctx, &tools)
                     .await
                     .into_iter()
@@ -367,7 +414,10 @@ mod tests {
         assert!(held(Some("bypass")).await.is_empty());
 
         let ctx = SourceCtx::detached(context(json!({"tier": "auto"})));
-        let reason = &TierSource.withhold(&ctx, &["delete_repository"]).await[0].reason;
+        let reason = &source(AccessTier::Bypass)
+            .withhold(&ctx, &["delete_repository"])
+            .await[0]
+            .reason;
         assert!(
             reason.contains("`delete_repository` needs the bypass access tier")
                 && reason.contains("this message is under auto")
@@ -379,13 +429,16 @@ mod tests {
     #[tokio::test]
     async fn the_model_is_told_the_tier_only_when_the_message_named_one() {
         let named = SourceCtx::detached(context(json!({"tier": "plan"})));
-        let text = TierSource.instructions(&named).await.unwrap();
+        let text = source(AccessTier::Bypass)
+            .instructions(&named)
+            .await
+            .unwrap();
         assert!(
             text.contains("**plan**") && text.contains("Read and propose"),
             "{text}"
         );
         assert!(
-            TierSource
+            source(AccessTier::Bypass)
                 .instructions(&SourceCtx::detached(Map::new()))
                 .await
                 .is_none()
@@ -393,12 +446,84 @@ mod tests {
         for tier in AccessTier::ALL {
             let ctx = SourceCtx::detached(context(json!({"tier": tier.as_str()})));
             assert!(
-                TierSource
+                source(AccessTier::Bypass)
                     .instructions(&ctx)
                     .await
                     .unwrap()
                     .contains(tier.as_str())
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cap_of_the_deployment_is_above_any_tier_a_message_names() {
+        let tools = ["write_file", "merge_pull_request", "delete_repository"];
+        let ctx = SourceCtx::detached(context(json!({"tier": "bypass"})));
+        let held = |max| {
+            let ctx = ctx.clone();
+            async move {
+                source(max)
+                    .withhold(&ctx, &tools)
+                    .await
+                    .into_iter()
+                    .map(|h| h.tool)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert!(held(AccessTier::Bypass).await.is_empty());
+        assert_eq!(held(AccessTier::Auto).await, ["delete_repository"]);
+        assert_eq!(
+            held(AccessTier::Plan).await,
+            ["write_file", "merge_pull_request", "delete_repository"]
+        );
+        // And what the model is told is the tier it works under, not the one asked for.
+        let text = source(AccessTier::Edits).instructions(&ctx).await.unwrap();
+        assert!(text.contains("**edits**"), "{text}");
+        assert_eq!(honoured_up_to(AccessTier::Auto), honoured());
+        assert_eq!(
+            honoured_up_to(AccessTier::Bypass).honoured(),
+            AccessTier::ALL
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subagent_is_held_to_the_tier_in_the_notes_of_the_root_run() {
+        use crate::tools::notes::RunNotes;
+        let dir = tempfile::tempdir().unwrap();
+        let notes = NotesStore::new(dir.path());
+        let root = adam_core::RunId::new();
+        let child = |ctx: Map<String, Value>| SourceCtx::detached_under(root, ctx);
+        let source = TierSource::new(notes.clone(), AccessTier::Bypass);
+        let tools = ["github__get_commit", "github__create_issue", "write_file"];
+        let held = |ctx: SourceCtx| {
+            let source = source.clone();
+            async move {
+                source
+                    .withhold(&ctx, &tools)
+                    .await
+                    .into_iter()
+                    .map(|h| h.tool)
+                    .collect::<Vec<_>>()
+            }
+        };
+        // No notes of the root: nothing is known, so it is a plan.
+        assert_eq!(
+            held(child(Map::new())).await,
+            ["github__create_issue", "write_file"]
+        );
+        for (tier, wanted) in [
+            (AccessTier::Plan, vec!["github__create_issue", "write_file"]),
+            (AccessTier::Edits, vec!["github__create_issue"]),
+            (AccessTier::Auto, vec![]),
+        ] {
+            let run = RunNotes {
+                tier: Some(tier),
+                ..RunNotes::default()
+            };
+            notes.save(&root.to_string(), &run).await.unwrap();
+            // The subagent's own context says `bypass`: the root's notes decide.
+            let own = context(json!({"tier": "bypass"}));
+            assert_eq!(held(child(own)).await, wanted, "{tier}");
         }
     }
 }

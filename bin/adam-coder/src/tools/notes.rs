@@ -292,8 +292,30 @@ pub struct RenamedRepo {
     pub html_url: String,
 }
 
+/// A pull request, as a repository's [`named`](super::named) key (when it is known) and a number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRef {
+    /// The repository, when the words that named the pull request named it (a URL). `None`: only the
+    /// number was written (`#12`), which stands for that pull request of whichever repository the
+    /// tool is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The pull request's number.
+    pub number: u64,
+}
+
+impl PullRef {
+    /// Whether this is pull request `number` of the repository with `key`.
+    fn is(&self, key: &str, number: u64) -> bool {
+        self.number == number && self.repo.as_deref().is_none_or(|repo| repo == key)
+    }
+}
+
 /// The most words of the person's [`RunNotes::said_words`] keeps: past it the newest are not added.
 pub const MAX_SAID_WORDS: usize = 2000;
+
+/// The most pull requests each of the lists of [`RunNotes`] keeps: past it the newest are not added.
+pub const MAX_PULLS: usize = 256;
 
 /// Everything remembered about one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,12 +392,28 @@ pub struct RunNotes {
     /// Written by the agent from the conversation, never by a tool and never from the model's words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<AccessTier>,
-    /// The words of the person's own messages that could be the name of a repository (letters,
-    /// digits, `.`, `_`, `-`; lowercase, once each, at most [`MAX_SAID_WORDS`]): what makes a bare
-    /// repository name count as named under the `auto` and `bypass` tiers. Filled by the agent,
-    /// with the repositories the person named, from the person's words only.
+    /// The words of the person's **newest message** that stand alone and could be the name of a
+    /// repository (letters, digits, `.`, `_`, `-`, between spaces and punctuation: never a piece of a
+    /// URL or a path; lowercase, once each, at most [`MAX_SAID_WORDS`]): what makes a bare repository
+    /// name count as named under the `auto` tier. Replaced each step by the agent from the person's
+    /// words only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub said_words: Vec<String>,
+    /// The pull requests the person named in their own words, ever: a URL, `#12`, `PR 12`. One of
+    /// these is a pull request `merge_pull_request` may touch although this conversation did not push
+    /// its branch. Filled by the agent from the person's words only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named_pulls: Vec<PullRef>,
+    /// The pull requests the person's **newest message** asks to merge (it names the pull request
+    /// and says to merge): the fresh yes a pull request opened with red checks needs. Replaced each
+    /// step by the agent from the person's words only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_asks: Vec<PullRef>,
+    /// The pull requests this conversation opened with `accept_red_checks` that mattered (the checks
+    /// were red), by their repository's key. Written by `open_pull_request`; a run that continues
+    /// another inherits them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub red_pulls: Vec<PullRef>,
     /// The repositories this run renamed, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renamed_repos: Vec<RenamedRepo>,
@@ -387,13 +425,45 @@ pub struct RunNotes {
 /// Most shared files [`RunNotes::shared`] lists.
 pub const MAX_SHARED: usize = 64;
 
-/// The words of `text` that could be a repository's name: runs of letters, digits, `.`, `_` and `-`
-/// (a trailing `.` is punctuation), lowercase, at least two characters.
-pub(crate) fn repository_words(text: &str) -> Vec<String> {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
-        .map(|word| word.trim_end_matches('.').to_ascii_lowercase())
-        .filter(|word| word.len() >= 2 && word.len() <= 100)
+/// The words of `text` that stand alone and could be a repository's name: split at spaces, with
+/// the punctuation around a word taken off (`"widgets."`, `` `widgets`, ``), what is left being
+/// letters, digits, `.`, `_` and `-` only, lowercase, two to a hundred characters. A piece of a URL
+/// or a path (`github.com/acme/widgets`, `src/widgets`, `?name=widgets`) is **not** a word: the
+/// token it is part of has a `/`, `:`, `@`... in it.
+pub(crate) fn standalone_words(text: &str) -> Vec<String> {
+    const AROUND: &[char] = &[
+        '"', '\'', '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', ':', '!', '?', '*',
+    ];
+    text.split_whitespace()
+        .map(|token| {
+            token
+                .trim_start_matches(AROUND)
+                .trim_end_matches(|c: char| AROUND.contains(&c) || c == '.')
+        })
+        .filter(|word| {
+            (2..=100).contains(&word.len())
+                && word.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        })
+        .map(str::to_ascii_lowercase)
         .collect()
+}
+
+/// Add each of `pulls` that `list` does not have, up to [`MAX_PULLS`]; returns whether any was added.
+fn add_pulls(list: &mut Vec<PullRef>, pulls: impl IntoIterator<Item = PullRef>) -> bool {
+    let mut added = false;
+    for pull in pulls {
+        if list.len() >= MAX_PULLS {
+            break;
+        }
+        if !list.contains(&pull) {
+            list.push(pull);
+            added = true;
+        }
+    }
+    added
 }
 
 impl RunNotes {
@@ -438,22 +508,61 @@ impl RunNotes {
         self.tier.unwrap_or(crate::tier::DEFAULT)
     }
 
-    /// Remember the words of the person's messages that could be a repository's name; returns
-    /// whether anything was new.
-    pub fn say_words(&mut self, texts: impl IntoIterator<Item = String>) -> bool {
-        let mut added = false;
-        for text in texts {
-            for word in repository_words(&text) {
-                if self.said_words.len() >= MAX_SAID_WORDS {
-                    return added;
-                }
-                if !self.said_words.contains(&word) {
-                    self.said_words.push(word);
-                    added = true;
-                }
+    /// Make the words of `text`, the person's newest message, the words that stand alone in it
+    /// ([`standalone_words`]) and nothing else; returns whether that changed anything.
+    pub fn set_said_words(&mut self, text: &str) -> bool {
+        let mut words: Vec<String> = Vec::new();
+        for word in standalone_words(text) {
+            if words.len() >= MAX_SAID_WORDS {
+                break;
+            }
+            if !words.contains(&word) {
+                words.push(word);
             }
         }
-        added
+        let changed = words != self.said_words;
+        self.said_words = words;
+        changed
+    }
+
+    /// Remember the pull requests `pulls` the person named; returns whether anything was new.
+    pub fn name_pulls(&mut self, pulls: impl IntoIterator<Item = PullRef>) -> bool {
+        add_pulls(&mut self.named_pulls, pulls)
+    }
+
+    /// Make `pulls`, those the person's newest message asks to merge, the merge asks; returns
+    /// whether that changed anything.
+    pub fn set_merge_asks(&mut self, pulls: Vec<PullRef>) -> bool {
+        let mut asks = Vec::new();
+        add_pulls(&mut asks, pulls);
+        let changed = asks != self.merge_asks;
+        self.merge_asks = asks;
+        changed
+    }
+
+    /// Remember that pull request `pull` was opened with red checks accepted; returns whether it
+    /// was new.
+    pub fn name_red_pulls(&mut self, pulls: impl IntoIterator<Item = PullRef>) -> bool {
+        add_pulls(&mut self.red_pulls, pulls)
+    }
+
+    /// Whether the person named pull request `number` of the repository with `key`.
+    pub fn names_pull(&self, key: &str, number: u64) -> bool {
+        self.named_pulls.iter().any(|p| p.is(key, number))
+    }
+
+    /// Whether the person's newest message asks to merge pull request `number` of the repository
+    /// with `key`.
+    pub fn asks_to_merge(&self, key: &str, number: u64) -> bool {
+        self.merge_asks.iter().any(|p| p.is(key, number))
+    }
+
+    /// Whether pull request `number` of the repository with `key` was opened with red checks
+    /// accepted.
+    pub fn red_accepted(&self, key: &str, number: u64) -> bool {
+        self.red_pulls
+            .iter()
+            .any(|p| p.repo.as_deref() == Some(key) && p.number == number)
     }
 
     /// Whether the person wrote `name` as a word of their own messages (without case).

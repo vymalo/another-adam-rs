@@ -120,8 +120,7 @@
         "tiers": [
           "plan",
           "edits",
-          "auto",
-          "bypass"
+          "auto"
         ],
         "default": "auto"
       }

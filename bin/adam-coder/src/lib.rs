@@ -102,7 +102,8 @@ pub mod tools;
 
 pub use agent::{AGENT_NAME, CoderAgent, CoderStarter};
 pub use app::{
-    BUILD_REVISION, Coder, LiveSignals, RuntimeOptions, agent_card, agent_card_from, build_version,
+    BUILD_REVISION, Coder, LiveSignals, RuntimeOptions, agent_card, agent_card_for,
+    agent_card_from, build_version,
 };
 pub use config::{
     AppInstallations, Config, ConfigError, GitHubAppConfig, GitHubAuth, McpSettings,

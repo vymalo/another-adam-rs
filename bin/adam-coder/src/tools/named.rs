@@ -31,6 +31,8 @@
 
 use adam_workspace::{RepoLocation, RepoRef};
 
+use super::notes::PullRef;
+
 /// The host of a repository written as `owner/name` when nothing says otherwise.
 pub const DEFAULT_HOST: &str = "github.com";
 
@@ -152,7 +154,20 @@ pub fn without_untrusted(text: &str) -> String {
 pub fn named_in(text: &str, default_host: &str) -> Vec<String> {
     let default_host = normal_host(default_host, None);
     let mut keys = Vec::new();
-    for word in text.split(|c: char| {
+    for word in split_words(text) {
+        if let Some(key) = key_of_word(word, &default_host)
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// The words of `text`: what is between white space and the punctuation that surrounds an address
+/// in a sentence (quotes, brackets, commas).
+fn split_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| {
         c.is_whitespace()
             || matches!(
                 c,
@@ -171,14 +186,102 @@ pub fn named_in(text: &str, default_host: &str) -> Vec<String> {
                     | '|'
                     | '*'
             )
-    }) {
-        if let Some(key) = key_of_word(word, &default_host)
-            && !keys.contains(&key)
-        {
-            keys.push(key);
+    })
+}
+
+/// The pull requests `text` names, in order of appearance, without repeats: a URL
+/// (`https://github.com/acme/widgets/pull/12`, the repository known), `acme/widgets#12`, and a
+/// number alone (`#12`, `PR 12`, `pull request 12`, `pull 12`), which names that pull request of
+/// whichever repository a tool is given. `text` must be what the person wrote
+/// ([`without_untrusted`]).
+pub fn pulls_in(text: &str, default_host: &str) -> Vec<PullRef> {
+    let default_host = normal_host(default_host, None);
+    let mut pulls = Vec::new();
+    let mut add = |pull: PullRef| {
+        if !pulls.contains(&pull) {
+            pulls.push(pull);
         }
+    };
+    let number = |digits: &str| -> Option<u64> {
+        let end = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
+        digits[..end].parse().ok().filter(|n| *n > 0)
+    };
+    let mut before = String::new();
+    for word in split_words(text) {
+        let word = word.trim_end_matches(['.', ':', '!', '?']);
+        if let Some((repo, rest)) = word.split_once("/pull/") {
+            if let (Some(n), Some(key)) = (number(rest), key_of_word(repo, &default_host)) {
+                add(PullRef {
+                    repo: Some(key),
+                    number: n,
+                });
+            }
+        } else if let Some((repo, rest)) = word.split_once('#') {
+            if let Some(n) = number(rest) {
+                if repo.is_empty() {
+                    add(PullRef {
+                        repo: None,
+                        number: n,
+                    });
+                } else if let Some(key) = key_of_word(repo, &default_host) {
+                    add(PullRef {
+                        repo: Some(key),
+                        number: n,
+                    });
+                }
+            }
+        } else if matches!(before.as_str(), "pr" | "pull" | "request" | "pull-request")
+            && word.bytes().all(|b| b.is_ascii_digit())
+            && let Some(n) = number(word)
+        {
+            add(PullRef {
+                repo: None,
+                number: n,
+            });
+        }
+        before = word.to_ascii_lowercase();
     }
-    keys
+    pulls
+}
+
+/// Whether `text`, what the person wrote, asks for a merge: the word `merge` (not `merged`, not
+/// `merge conflict`, `merge commit`, `merge queue`), not just after a `not`, `don't`, `never`, `no`
+/// or `without`. A heuristic that errs toward not merging: a pull request that needs the person's
+/// fresh yes is never merged on a word that only looks like one.
+pub fn asks_to_merge(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    words.iter().enumerate().any(|(at, word)| {
+        word == "merge"
+            && !words[at.saturating_sub(2)..at].iter().any(|w| {
+                matches!(
+                    w.as_str(),
+                    "not"
+                        | "dont"
+                        | "don't"
+                        | "never"
+                        | "no"
+                        | "without"
+                        | "cannot"
+                        | "can't"
+                        | "cant"
+                        | "shouldn't"
+                        | "wont"
+                        | "won't"
+                )
+            })
+            && !words.get(at + 1).is_some_and(|next| {
+                matches!(
+                    next.as_str(),
+                    "conflict" | "conflicts" | "commit" | "commits" | "queue" | "base"
+                )
+            })
+    })
 }
 
 /// `host` as the workspace layout spells it, for a word the person wrote: lowercase, the port as

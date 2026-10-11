@@ -115,6 +115,19 @@ impl AccessTiers {
         }
     }
 
+    /// Every tier up to and including `max`, working under `default` when a message names none, or
+    /// under `max` when that is lower: what a deployment that caps the tiers declares. Never empty
+    /// (`plan` is always there).
+    pub fn up_to(max: AccessTier, default: AccessTier) -> Self {
+        Self {
+            honoured: AccessTier::ALL
+                .into_iter()
+                .filter(|tier| *tier <= max)
+                .collect(),
+            default: default.min(max),
+        }
+    }
+
     /// The tiers honoured, lowest first.
     pub fn honoured(&self) -> &[AccessTier] {
         &self.honoured
@@ -191,5 +204,25 @@ mod tests {
             Err(AccessTiersError::DefaultNotHonoured(AccessTier::Auto))
         );
         assert_eq!(AccessTiers::all(AccessTier::Auto).honoured().len(), 4);
+    }
+
+    #[test]
+    fn a_cap_declares_the_tiers_up_to_it_and_never_a_default_above_it() {
+        let auto = AccessTiers::up_to(AccessTier::Auto, AccessTier::Auto);
+        assert_eq!(
+            auto.honoured(),
+            [AccessTier::Plan, AccessTier::Edits, AccessTier::Auto]
+        );
+        assert_eq!(auto.default_tier(), AccessTier::Auto);
+        let edits = AccessTiers::up_to(AccessTier::Edits, AccessTier::Auto);
+        assert_eq!(edits.honoured(), [AccessTier::Plan, AccessTier::Edits]);
+        assert_eq!(edits.default_tier(), AccessTier::Edits);
+        let plan = AccessTiers::up_to(AccessTier::Plan, AccessTier::Bypass);
+        assert_eq!(plan.honoured(), [AccessTier::Plan]);
+        assert_eq!(plan.default_tier(), AccessTier::Plan);
+        assert_eq!(
+            AccessTiers::up_to(AccessTier::Bypass, AccessTier::Auto),
+            AccessTiers::all(AccessTier::Auto)
+        );
     }
 }

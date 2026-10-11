@@ -23,8 +23,10 @@ use crate::tier;
 use crate::tools::consent::{
     Answer, answer_of, asked_by, is_answered_by_the_person, is_consent_tool, is_tools_own_result,
 };
-use crate::tools::named::{key_of_argument, listed, named_in, without_untrusted};
-use crate::tools::notes::{Consent, PushedBranch, RunNotes};
+use crate::tools::named::{
+    asks_to_merge, key_of_argument, listed, named_in, pulls_in, without_untrusted,
+};
+use crate::tools::notes::{Consent, PullRef, PushedBranch, RunNotes};
 use crate::tools::publish::{COMMIT_AND_PUSH, pushed_in};
 use crate::tools::{ToolEnv, coder_tools};
 
@@ -290,13 +292,22 @@ impl CoderAgent {
             // The tools of the conversation's endpoint, offered at every model turn.
             .tool_source(env.ui.source())
             // The access tier of the message: tools above it are not shown and not run.
-            .tool_source(crate::tier::TierSource)
+            .tool_source(crate::tier::TierSource::new(
+                env.notes.clone(),
+                env.settings.max_access_tier,
+            ))
             .state(env.clone())
             // What a call was given and what it answered go into its step: the process's secrets
             // are scrubbed from both first (ADR 0011).
             .step_io(env.redactor.step_io())
             .model(model, model_alias)?;
         Ok(Self { assembly, env })
+    }
+
+    /// The highest access tier the agent's tools allow (`MAX_ACCESS_TIER`): what the A2A backend
+    /// of a process that steps runs declares and refuses a higher tier for.
+    pub fn max_access_tier(&self) -> AccessTier {
+        self.env.settings.max_access_tier
     }
 
     /// The subagents of the folder the agent was assembled from, registered as `coder/<name>`
@@ -359,7 +370,16 @@ impl CoderAgent {
         let host = &self.env.settings.default_repo_host;
         let said = person_texts(state, ctx.peek_inbox());
         let named: Vec<String> = said.iter().flat_map(|text| named_in(text, host)).collect();
-        let tier = tier_of(state, ctx.peek_inbox());
+        let pulls: Vec<PullRef> = said.iter().flat_map(|text| pulls_in(text, host)).collect();
+        // What the newest message says alone: the bare names that count as named, and the pull
+        // requests it asks to merge. Earlier messages do not stand for it.
+        let newest = newest_person_message(state, ctx.peek_inbox());
+        let asks = newest
+            .as_deref()
+            .filter(|text| asks_to_merge(text))
+            .map(|text| pulls_in(text, host))
+            .unwrap_or_default();
+        let tier = tier_of(state, ctx.peek_inbox()).min(self.env.settings.max_access_tier);
         let prior = match &state.continued_from {
             Some(prior) => self
                 .env
@@ -369,15 +389,18 @@ impl CoderAgent {
                 .map_err(notes_error)?,
             None => None,
         };
-        let pushed = match prior {
-            Some(prior) => prior.pushed_branches,
-            None if state.continued_from.is_some() => pushed_branches(state),
-            None => Vec::new(),
+        let (pushed, red) = match prior {
+            Some(prior) => (prior.pushed_branches, prior.red_pulls),
+            None if state.continued_from.is_some() => (pushed_branches(state), Vec::new()),
+            None => (Vec::new(), Vec::new()),
         };
         let consents = consents_in(state, ctx.peek_inbox());
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
         let new_repos = notes.name_repos(named);
-        let new_words = notes.say_words(said);
+        let new_words = notes.set_said_words(newest.as_deref().unwrap_or_default());
+        let new_pulls = notes.name_pulls(pulls);
+        let new_asks = notes.set_merge_asks(asks);
+        let new_red = notes.name_red_pulls(red);
         let new_consents = notes.record_consents(consents);
         let adopted = self.adopt_scratch(ctx, run, &mut notes).await;
         let new_tier = notes.tier != Some(tier);
@@ -385,6 +408,9 @@ impl CoderAgent {
         if notes.name_pushed_branches(pushed)
             || new_repos
             || new_words
+            || new_pulls
+            || new_asks
+            || new_red
             || new_consents
             || adopted
             || new_tier
@@ -704,6 +730,44 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
             .filter_map(inbound_text),
     );
     texts.iter().map(|text| without_untrusted(text)).collect()
+}
+
+/// The newest message the person wrote, as they wrote it: a message waiting in `inbox` that the run
+/// has not read, else the last user message of the conversation (the marker that says turns were
+/// left out is not one). Not what a tool answered for them.
+fn newest_person_message(state: &Conversation, inbox: &[Inbound]) -> Option<String> {
+    let waiting = inbox
+        .iter()
+        .filter(|inbound| {
+            inbound.kind != RUN_FINISHED_KIND
+                && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
+        })
+        .filter_map(inbound_text)
+        .next_back();
+    waiting
+        .or_else(|| {
+            let last = state
+                .messages
+                .iter()
+                .chain(&state.deferred)
+                .enumerate()
+                .filter_map(|(at, message)| match message {
+                    Message::User { content } => Some((at, content)),
+                    _ => None,
+                })
+                .last()?;
+            let (at, content) = last;
+            let texts: Vec<&str> = content
+                .iter()
+                .enumerate()
+                .filter(|(part, _)| {
+                    !(at < state.messages.len() && state.is_omission_marker(at, *part))
+                })
+                .map(|(_, part)| part.as_text())
+                .collect();
+            Some(texts.join("\n"))
+        })
+        .map(|text| without_untrusted(&text))
 }
 
 /// What the person answered to the questions the consent tools wrote (`request_repository`,

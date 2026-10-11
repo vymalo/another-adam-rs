@@ -236,7 +236,7 @@ pub async fn create_repository(
     };
 
     // The person's tier is the consent at `bypass`: no form, whatever the visibility.
-    let standing = notes.tier() == AccessTier::Bypass;
+    let standing = env.tier_of(&notes) == AccessTier::Bypass;
     if !standing && !notes.agreed(CREATE_REPOSITORY, &asked) {
         let visibility = if private {
             "private and empty"
