@@ -27,7 +27,7 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 | `Ui::new(McpPolicy)`, `Ui::with_client(..)` | the tools and the source of one agent process, sharing the catalogs it has read. `McpPolicy` is the deployment's (`MCP_ALLOW_INSECURE` decides whether the thread-tools URL may be plain `http` to another machine; the call timeout, and `thread_tools_max_call`, the cap of `THREAD_TOOLS_MAX_CALL_SECS`) |
 | `Ui::tools() -> ToolSet`, `Ui::with_ask_lead(text)`, `DEFAULT_ASK_LEAD` | `ask_user`, `show`, `ui_catalog`, in that order. `with_ask_lead` opens the description of `ask_user` with the agent's own words about when to ask (the coder names pull requests); what follows, about `choices`, is the same |
 | `Ui::source() -> ThreadTools` | a `ToolSource` that offers **every tool the thread-tools endpoint lists, under its listed name**, listed again at every model turn, **except `get_ui_catalog`** (the model has `ui_catalog`; the relayed tools of attached servers and `ask_agent` appear with no change here), and that **describes `show` with the components of the conversation's screen** (`ToolSource::refine`, from the catalogs this process holds). Add it last among an agent's sources, and register `Ui::tools()` on the same agent |
-| `AskUser`, `ASK_USER` | `ask_user { question, choices? }`: see *The tools* |
+| `AskUser`, `ASK_USER` | `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`: see *The tools* |
 | `Show`, `SHOW`, `MAX_BLOCKS` | `show { blocks, title? }`, at most 16 blocks; refuses a `Choices` block |
 | `UiCatalogTool`, `UI_CATALOG` | `ui_catalog {}` |
 | `ThreadTools`, `ThreadToolsClient`, `META_KEY`, `GET_UI_CATALOG`, `TURN_OUTPUT`, `TURN_OUTPUT_DELIVERED` | the source (`ThreadTools::new` lists everything the endpoint lists; `hiding(name)` leaves one out), and the client behind it and behind the refetch (`with_clock` for tests of the expiry) |
@@ -52,21 +52,49 @@ inbound function reads a screen's action as JSON text.
 
 ## The tools
 
-* **`ask_user { question, choices? }`** is the question every agent has. Without `choices` the run parks as
-  `input-required` with the question as text, as before. With `choices` (at most 8 questions, 2 to 8 options each,
-  `multiple`, `allowOther`, `required`; an option is a label, or `{value, label, description}`; ids and values
-  are made when omitted: `q1`, `q2`, and a slug of the label, made unique) and a screen that has the `Choices`
-  component, the question carries a surface: `createSurface` under the screen's `catalogId` and one `Choices` as
-  the root, **checked against the catalog's schema** (what is wrong comes back to the model with its place,
-  `(at /questions/0/question)`). The person answers all the questions with one action, which comes back as this
-  call's result: `The person answered through the interface:` and one line per question, `- db: pg`. When the
-  screen cannot draw it (no catalog, none with `Choices`, one that cannot be read now) the options are listed in
-  the question's text and the answer is free text. It parks the run, so `asks_user()` is `true` and
-  `adam-assembly` keeps it out of subagents. The constraints are stated where the model reads them, so the first
-  call is right: the description says `question` is required **even with `choices`** (the line that opens the
-  form), that a question needs 2 to 8 options and that ids and values are `^[A-Za-z0-9_.:-]{1,64}$`, with an
-  example; the schema has `required`, `minItems`, `maxItems`, `minLength` and that `pattern` on the places they
-  apply to. A refusal of one option (or none) says to ask a plain question instead.
+* **`ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`** is the question every agent has.
+  Without `choices` the run parks as `input-required` with the question as text, as before (a `title` or a
+  `description` with no `choices` is ignored). Whenever the answer is one of a few options the model is told to pass
+  `choices` and never to list the options in its text ([ADR 0034](../../docs/decisions/0034-questions-carry-a-title-a-description-and-typed-options.md)):
+  one **form** with a `title`, a `description` of why the agent asks, up to 8 questions and an optional `freeInput` box
+  (its words come back as the answer's `note`). A question has a `type` (`single`, the default: radio buttons;
+  `multiple`: checkboxes, with `min` and `max`; `select`: a searchable list; `images`: a deck of pictures;
+  `text` and `longText`: a typed answer), a `help` line, a `default`, `required`, `allowOther`, and `multiple` (the old
+  spelling of type `multiple`; on `select` and `images` it lets several be picked). An option is a label, or
+  `{value, label, description, image, icon, recommended}`: `image` is `{sha256, alt}`, the hash of an image file the
+  agent shared in the conversation (never a URL), `icon` one of the `steps/v1` icon ids. Ids and values are made when
+  omitted: `q1`, `q2`, and a slug of the label, made unique; a `default` may name an option by its value or its label.
+
+  | Limit | |
+  |---|---|
+  | questions | 8 |
+  | options of `single` and `multiple` | 2 to 12 |
+  | options of `select` | 2 to 50 |
+  | options of `images` | 2 to 16, each with an `image` |
+  | options of `text` and `longText` | none |
+
+  These are the rules the web's validator holds a surface to, and the tool refuses what the web would refuse **before** it
+  asks, in words the model can act on (`question \`db\` has 13 options; a radio or checkbox question needs 2 to 12 (use
+  type "select" for up to 50)`). With a screen that has the `Choices` component, the question carries a surface:
+  `createSurface` under the screen's `catalogId` and one `Choices` as the root, **checked against the catalog's schema**
+  (what is wrong comes back to the model with its place, `(at /questions/0/question)`). **Which members are sent depends on the
+  catalog the run received:** from **version 5** all of them; on version 2 to 4 the subset that screen has (the title, radio
+  buttons and checkboxes of at most 8 options, `allowOther`, `required`, the button's words; a `help` goes after the question,
+  a recommended option is marked in its label, a list or a deck is a list of radio buttons or checkboxes, and the
+  `description` goes in the text the person reads first) and, when a question needs more than that (a typed answer), words.
+  The person answers all the questions with one action, which comes back as this call's result:
+  `The person answered through the interface:` and one line per question, `- db: pg`, with typed words as
+  `text: "..."` and a last line `Note: "..."` ([`adam-a2a-runtime`](../adam-a2a-runtime/README.md)). When the
+  screen cannot draw it (no catalog, none with `Choices`, one that cannot be read now) the form is listed in the question's
+  text (description, help, options with their descriptions and marks, typed questions, the free box) and the answer is free
+  text. It parks the run, so `asks_user()` is `true` and `adam-assembly` keeps it out of subagents. The constraints are stated
+  where the model reads them, so the first call is right: the description says `question` is required **even with `choices`**
+  (the line that opens the form), to give the form a title and a description of why, to describe every option, the types and
+  their limits, and that ids and values are `^[A-Za-z0-9_.:-]{1,64}$`, with an example; the schema has `required`, `enum`,
+  `maxItems`, `minLength` and that `pattern` on the places they apply to. A refusal of one option (or none) says to ask a
+  plain question instead. *Verified 2026-10-11* by `tests/ask_v5.rs` against the web's catalog of version 5 (copied into
+  `tests/fixtures`, digest pinned): every type is a valid instance of its schema, and `tests/golden/ask_form_v5.json` is
+  the whole form.
 * **`show { blocks, title? }`** draws blocks of the screen's components one under the other: ids `b1`...`bn`, in a
   `Column` that is the root (a `Text` heading first when there is a title; a single block with no title is the
   root itself). Each block is `{component, ...properties}`, **validated against the component's JSON Schema**

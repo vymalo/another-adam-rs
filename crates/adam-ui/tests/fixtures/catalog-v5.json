@@ -1,0 +1,384 @@
+{
+  "catalogId": "https://agents.vymalo.com/a2ui/catalogs/chat",
+  "components": {
+    "Text": {
+      "type": "object",
+      "description": "Plain text, drawn as text (no HTML, no links).",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Text"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "variant": {
+          "enum": ["h1", "h2", "h3", "h4", "h5", "caption", "body"]
+        }
+      },
+      "required": ["id", "component", "text"],
+      "additionalProperties": false
+    },
+    "Column": {
+      "type": "object",
+      "description": "Stacks its children vertically.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Column"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "children": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "align": {
+          "enum": ["start", "center", "end", "stretch"]
+        }
+      },
+      "required": ["id", "component", "children"],
+      "additionalProperties": false
+    },
+    "Choices": {
+      "type": "object",
+      "description": "ask_user only: use it in the question you ask the person, never in a surface you show with show (nothing waits for its answer, so its form is dead). A form of up to 8 questions answered with one submit: a title, a description of why you ask, and per question a help line and a type: single (radio buttons, the default), multiple (checkboxes), select (a searchable list, up to 50 options), images (a deck of picture tiles, up to 16, each option's image an image file shared in this conversation), text or longText (the person types). An option has a label, a description, an optional image {sha256, alt}, an icon and a recommended badge. freeInput adds an anything-else box. One submit sends one action: name = action.event.name (default \"answer\"), context = {answers:[{id, values:[option value…], other?, text?}], note?} in question order.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Choices"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "freeInput": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 120
+            },
+            "placeholder": {
+              "type": "string",
+              "maxLength": 200
+            }
+          },
+          "additionalProperties": false
+        },
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+              },
+              "question": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              "help": {
+                "type": "string",
+                "maxLength": 300
+              },
+              "type": {
+                "enum": ["single", "multiple", "select", "images", "text", "longText"]
+              },
+              "options": {
+                "type": "array",
+                "maxItems": 50,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+                    },
+                    "label": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 120
+                    },
+                    "description": {
+                      "type": "string",
+                      "maxLength": 300
+                    },
+                    "image": {
+                      "type": "object",
+                      "properties": {
+                        "sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        },
+                        "alt": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 300
+                        }
+                      },
+                      "required": ["sha256", "alt"],
+                      "additionalProperties": false
+                    },
+                    "icon": {
+                      "enum": [
+                        "agent",
+                        "read",
+                        "edit",
+                        "delete",
+                        "move",
+                        "search",
+                        "execute",
+                        "think",
+                        "fetch",
+                        "web",
+                        "git",
+                        "test",
+                        "file",
+                        "tool",
+                        "opencode"
+                      ]
+                    },
+                    "recommended": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["value", "label"],
+                  "additionalProperties": false
+                }
+              },
+              "multiple": {
+                "type": "boolean"
+              },
+              "allowOther": {
+                "type": "boolean"
+              },
+              "required": {
+                "type": "boolean"
+              },
+              "default": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "maxLength": 2000
+                  },
+                  {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_.:-]{1,64}$"
+                    }
+                  }
+                ]
+              },
+              "min": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 50
+              },
+              "max": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50
+              }
+            },
+            "required": ["id", "question"],
+            "additionalProperties": false
+          }
+        },
+        "submitLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "action": {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                }
+              },
+              "required": ["name"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["event"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["id", "component", "questions"],
+      "additionalProperties": false
+    },
+    "Cards": {
+      "type": "object",
+      "description": "A list (or grid) of up to 24 cards: title, optional subtitle, body text, an http(s) link and tags.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Cards"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "layout": {
+          "enum": ["list", "grid"]
+        },
+        "cards": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 24,
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "subtitle": {
+                "type": "string",
+                "maxLength": 200
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 2000
+              },
+              "url": {
+                "type": "string",
+                "maxLength": 2048,
+                "pattern": "^https?://"
+              },
+              "tags": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 40
+                }
+              }
+            },
+            "required": ["title"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["id", "component", "cards"],
+      "additionalProperties": false
+    },
+    "Mermaid": {
+      "type": "object",
+      "description": "A mermaid diagram, drawn as an image (no links, no scripts).",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Mermaid"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20000
+        },
+        "caption": {
+          "type": "string",
+          "maxLength": 500
+        }
+      },
+      "required": ["id", "component", "code"],
+      "additionalProperties": false
+    },
+    "Image": {
+      "type": "object",
+      "description": "A picture from a file of this thread, by its sha256 (the artifact of a file an agent shared); never a URL. alt is required.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "component": {
+          "const": "Image"
+        },
+        "weight": {
+          "type": "number"
+        },
+        "artifact": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "alt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "caption": {
+          "type": "string",
+          "maxLength": 500
+        }
+      },
+      "required": ["id", "component", "artifact", "alt"],
+      "additionalProperties": false
+    }
+  }
+}
