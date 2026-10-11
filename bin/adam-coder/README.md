@@ -105,7 +105,24 @@ by its name; [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its
 | `turn_output` (the endpoint's) | Send the answer | a subagent (`explorer`) | its name capitalised (Explorer) |
 
 `tests/agent_files.rs` (`every_tool_of_the_coder_has_a_title_for_its_step`) fails for a tool with none, so a new tool must
-bring its title. **`delegate_to_opencode` is a `subagent` step titled "Hand to OpenCode"** with its own icon, `opencode`
+bring its title.
+
+**Each step also has a picture**, the `icon` of `steps/v1` (`#[tool(icon = "...")]`), by what the call does:
+
+| Icon | Tools |
+|---|---|
+| `read` | `read_file` |
+| `edit` | `write_file`, `edit_file`, `apply_patch` |
+| `execute` | `run_command`, `run`, `run_checks`, `rebuild_environment` |
+| `git` | `prepare_workspace`, `commit_and_push`, `open_pull_request`, `create_repository`, `publish_scratch` |
+| `file` | `start_scratch`, `share_file` |
+| `think` | `ask_user`, `request_repository` (the tools that ask the person) |
+| `opencode` | `delegate_to_opencode` |
+
+`show` and `ui_catalog` have none, and neither has a call to a GitHub MCP tool (an MCP tool says a title, not a picture).
+The calls of the orchestrator's own tools (web search, reading a page) are steps the orchestrator reports itself
+(`reportsStep`), so their picture is its to choose. `every_tool_of_the_coder_has_an_icon_for_its_step` pins the table.
+**`delegate_to_opencode` is a `subagent` step titled "Hand to OpenCode"** with its own icon, `opencode`
 (`#[tool(step = "subagent", label = "Hand to OpenCode", icon = "opencode")]`), and what OpenCode reports over ACP is the
 tree under it:
 

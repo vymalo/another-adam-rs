@@ -56,7 +56,7 @@ pub(crate) fn pushed_in(text: &str) -> Option<(String, String)> {
 /// Make small, focused commits: call it after each coherent piece of work. With several
 /// repositories in the workspace, say which with `repo`. In a scratch project it only commits,
 /// locally: nothing is pushed.
-#[tool(label = "Commit and push")]
+#[tool(label = "Commit and push", icon = "git")]
 pub async fn commit_and_push(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -268,7 +268,7 @@ fn checks_for_pushed(
 /// results. If you continue a branch that already has an open pull request, this
 /// updates it with your commits (after the same check) instead of opening another. With several
 /// repositories in the workspace, say which one with `repo`.
-#[tool(label = "Open a pull request")]
+#[tool(label = "Open a pull request", icon = "git")]
 pub async fn open_pull_request(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

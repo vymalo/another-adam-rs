@@ -60,7 +60,7 @@ const MAX_LISTED: usize = 20;
 /// A scratch project is temporary: it exists only while this task is open, and nothing in it is
 /// kept unless it is published to a repository the person names, with publish_scratch. Tell the
 /// person so. Calling it again with the same name is harmless.
-#[tool(label = "Start a scratch project")]
+#[tool(label = "Start a scratch project", icon = "file")]
 pub async fn start_scratch(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -123,7 +123,7 @@ pub async fn start_scratch(
 /// result says whether the checks you ran on the project still hold for the code in the
 /// repository: if not, run them again in the new slot, then commit_and_push and
 /// open_pull_request with `repo` set to that slot.
-#[tool(label = "Publish a scratch project")]
+#[tool(label = "Publish a scratch project", icon = "git")]
 pub async fn publish_scratch(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

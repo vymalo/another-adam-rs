@@ -136,6 +136,56 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
     assert_eq!(unique.len(), titles.len(), "two tools share a title");
 }
 
+/// A step is drawn with a picture: every tool of the coder, and `ask_user` of the screen, says which
+/// (`steps/v1` `icon`), by what the call does to the person's work. The table is the contract of the
+/// coder's README ("A step's picture"): a tool added later must be put in it, or this test fails.
+#[tokio::test]
+async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
+    use adam_llm_agent::StepIcon::{Edit, Execute, File, Git, OpenCode, Read, Think};
+    let fx = Fixture::with("hello\n", |s| {
+        s.create_repo_owners = vec!["acme".to_owned()];
+    })
+    .await;
+    let want = [
+        ("read_file", Read),
+        ("write_file", Edit),
+        ("edit_file", Edit),
+        ("apply_patch", Edit),
+        ("run_command", Execute),
+        ("run", Execute),
+        ("run_checks", Execute),
+        ("rebuild_environment", Execute),
+        ("prepare_workspace", Git),
+        ("commit_and_push", Git),
+        ("open_pull_request", Git),
+        ("create_repository", Git),
+        ("start_scratch", File),
+        ("publish_scratch", Git),
+        ("share_file", File),
+        ("request_repository", Think),
+        ("ask_user", Think),
+        ("delegate_to_opencode", OpenCode),
+    ];
+    let tools = coder_tools(&fx.env);
+    let icons: Vec<(String, Option<adam_llm_agent::StepIcon>)> = tools
+        .iter()
+        .map(|tool| (tool.spec().name, tool.step_style().icon))
+        .collect();
+    for (name, icon) in want {
+        let found = icons.iter().find(|(n, _)| n == name);
+        assert_eq!(found.map(|(_, i)| *i), Some(Some(icon)), "{name}");
+    }
+    // The screen's two other tools are not the coder's work and are drawn as plain tools.
+    for (name, icon) in &icons {
+        if !want.iter().any(|(n, _)| n == name) {
+            assert!(
+                matches!(name.as_str(), "show" | "ui_catalog") && icon.is_none(),
+                "`{name}` has no picture in the table"
+            );
+        }
+    }
+}
+
 async fn coder(cycles: u32) -> (Fixture, CoderAgent) {
     // A deployment that allows creating repositories: the tool is offered and the prompt describes it.
     let fx = Fixture::with("hello\n", |s| {
