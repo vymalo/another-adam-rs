@@ -84,7 +84,10 @@ inbound function reads a screen's action as JSON text.
   `description` goes in the text the person reads first) and, when a question needs more than that (a typed answer), words.
   The person answers all the questions with one action, which comes back as this call's result:
   `The person answered through the interface:` and one line per question, `- db: pg`, with typed words as
-  `text: "..."` and a last line `Note: "..."` ([`adam-a2a-runtime`](../adam-a2a-runtime/README.md)). When the
+  `text: "..."` and a last line `Note: "..."` ([`adam-a2a-runtime`](../adam-a2a-runtime/README.md)). The `default` of a typed
+  question comes back as `text: "..."` when the person leaves the box alone: those are the agent's words, so a host that acts
+  on what the person said pairs the answer with the call's `choices` and drops them (the coder does,
+  [ADR 0036](../../docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)). When the
   screen cannot draw it (no catalog, none with `Choices`, one that cannot be read now) the form is listed in the question's
   text (description, help, options with their descriptions and marks, typed questions, the free box) and the answer is free
   text. It parks the run, so `asks_user()` is `true` and `adam-assembly` keeps it out of subagents. The constraints are stated

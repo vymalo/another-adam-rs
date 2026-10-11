@@ -879,8 +879,23 @@ without them) is a follow-up (ADR 0036, decision 6).
 
 **What counts as the person's words** (`RunNotes::hear`, `named::typed_by_the_person`): what they typed, in their messages and in
 the typed parts of a form's answer (`other:`, `text:`, `Note:`). The question ids and the option values of a form are what the
-model wrote when it drew it, so a click names no repository or pull request, asks for no merge and is no bare name. The newest
-words are the last thing they said, an answer included.
+model wrote when it drew it, so a click names no repository or pull request, asks for no merge and is no bare name. Three more
+things are the model's and are not heard:
+
+* **A failed `ask_user`.** Its error repeats the model's own values (``the default `merge acme/widgets#7` of question `q` is not
+  one of its options``): only the result of a call that succeeded can be an answer.
+* **A typed question's `default`.** `ask_user` lets a `text` or `longText` question start with words (`default`), and the web sends
+  them back when the person submits without touching the box. A `text:` part equal to the default of the question it answers
+  (the answer is paired with its own `ask_user` call, in the history and in the inbox of a parked run) is dropped; what the
+  person changes or adds is theirs. A person who types exactly the prefilled words is not heard: they say it in a message. An
+  answer that cannot be paired with a call (a plain message in the shape of one) has every `text:` part dropped.
+* **A form that is not the form's answer.** The A2A layer reads `context.answers` only from the action `answer` of a surface
+  `ask-<call id>` (`vymalo_inbound`); another action, or another surface, is `The person used the interface:` and no answer. It
+  checks the surface's prefix and not the one pending call, because it holds no run state.
+
+The newest words are the last thing they said, an answer included. A message that arrived while a tool result was owed is put
+after the results in the history, so its place among the answers is not known: the ask to merge and the bare names are then
+what **both** it and the last thing before it say, never what only one says.
 
 A **bare name** (`ToolEnv::is_granted`): from `auto`, `prepare_workspace`, `publish_scratch` and `request_repository` treat
 `github.com/<owner>/<name>` as named when `<name>` is a word that stands alone in the **newest typed words of the person that have any**
@@ -2154,7 +2169,12 @@ database of its own, so the role needs `CREATEDB`):
   and pull requests they named, a form whose ids and values are forged naming nothing and asking for nothing, what they type into
   one counting, an answer that names nothing (a click, "no, wait") taking an earlier "merge #7" away, a bare `#7` bound to the one
   repository in play and dropped with two, the bare names, and what a task that continues another inherits (the pushed commits,
-  the pull requests opened red, the commits whose checks passed). Unit tests: `src/tools/named.rs` (`typed_by_the_person`).
+  the pull requests opened red, the commits whose checks passed), **an `ask_user` that failed with the model's own words in its error
+  naming nothing and the merge refused**, **a typed question left as the model prefilled it naming nothing, and one the person
+  edited counting**, and **each default paired with the form that wrote it**. Unit tests: `src/tools/named.rs`
+  (`typed_by_the_person`, with and without the defaults of the question), `src/tools/notes.rs` (the newest words, the bare names)
+  and `src/agent.rs` (`person_sayings`: an error is no answer, an answer is paired with its call's defaults, a message that
+  waited behind an owed result is `Deferred`).
 * `tests/tiers.rs` (the access tiers): the tools the model is **shown** on a turn per tier (a real `Runtime`, a scripted model), the
   tier noted from the message and said to the model, a task that continues another starting at the default, a model that calls a
   tool above the tier anyway (the host is never asked, the refusal names the tier it needs), every tool checking the root run's
@@ -2168,7 +2188,9 @@ database of its own, so the role needs `CREATEDB`):
   same name, checks that failed, still run or never ran, a head that moved after the checks, red checks accepted at the opening
   and no fresh yes, another host, a repository that moved, the tier checked in the tool's own body and the cap above the tier),
   **which layer refuses** (the source before the tool's body runs; a message that lowers the tier refusing the next call; a
-  subagent's MCP tool held to the root's notes), and the coder's own backend (a bad tier is `InvalidParams`, the tier is said on
+  subagent's MCP tool held to the root's notes), **one whole task with no hand-written notes** (`commit_and_push`,
+  `open_pull_request` and `merge_pull_request` against the wiremock GitHub, the merge allowed by the commit the tools noted and
+  sent with the `sha` the host reported), and the coder's own backend (a bad tier is `InvalidParams`, the tier is said on
   the task, the card lists the tiers up to the cap, `bypass` is refused by default). Unit tests: `src/tier.rs` (the tier of a
   context, the table of `needs`, what the source holds back and says), `src/agent.rs` (`tier_tests`: the newest waiting message
   wins, a read message and a finish notice do not, a continuing task does not inherit) and `src/tools/mod.rs` (`grant_tests`: a

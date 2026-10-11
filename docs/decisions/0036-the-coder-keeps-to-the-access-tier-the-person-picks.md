@@ -1,6 +1,6 @@
 # 0036. The coder keeps to the access tier the person picks
 
-Status: **Accepted** (2026-10-11), amended after a security review the same day (*Amended 2026-10-11*, below)
+Status: **Accepted** (2026-10-11), amended after security reviews the same day (*Amended 2026-10-11*, below, twice)
 Implements the A2A extension `https://agents.vymalo.com/a2a/extensions/access-tier/v1`, designed in
 `vymalo/another-agentic-system` ([ADR 0061](https://github.com/vymalo/another-agentic-system/blob/main/docs/decisions/0061-the-person-picks-an-access-tier-for-each-message-the-agent-keeps-to-it.md),
 [`docs/api/access-tier-v1.md`](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/access-tier-v1.md)).
@@ -93,7 +93,7 @@ coder reads, what each tier lets it do, and how that is made to hold, and **wher
         to those for the person (only rule 3 below).
      3. *Red checks need a fresh yes.* A pull request this conversation opened with `accept_red_checks` that mattered
         (`RunNotes::red_pulls`) is merged only when the person's **newest** message names it and says to merge it
-        (`RunNotes::merge_asks`: the word `merge`, not negated, not `merge conflict`, with its number or URL, all typed by them). Then checks that
+        (`RunNotes::merge_asks`: the word `merge`, not negated, not `merge conflict`, with `owner/name#N` or its URL, or `#N` when one repository is in play, all typed by them). Then checks that
         failed or never ran no longer stop it; checks still running do. A pull request that was not opened red is never merged
         on red checks.
      4. *The prompt says so*: merge only when the person asked.
@@ -208,3 +208,32 @@ model's tools and false of a command: decision 6 now says so); that a large cont
 tools were not held to the root's tier; that rename, delete and merge ignored the repository's host and followed redirects; that a
 bare name was any word of any message; and that `bypass` was on for every deployment. Decisions 1, 2, 6, 7, 9, 10, 11, 12 and 13
 are the answers; the known limits and the follow-ups above are what is left.
+
+## Amended 2026-10-11 (a third review)
+
+A third review found two more routes by which the model's text counted as the person's words (decision 4), and two smaller ones.
+All four are closed in `bin/adam-coder/src/agent.rs` (`person_sayings`), `bin/adam-coder/src/tools/named.rs`
+(`typed_by_the_person`), `bin/adam-coder/src/tools/notes.rs` (`RunNotes::hear`) and
+`crates/adam-a2a-runtime/src/vymalo.rs` (`vymalo_inbound`).
+
+* **A failed `ask_user` is not an answer.** Its error repeats the model's own values in its words (``the default `merge
+  acme/widgets#7` of question `q` is not one of its options``), and they became a named repository, a named pull request and an ask
+  to merge. Only the result of a call that did not fail can be an answer, and not a tool's own result.
+* **A typed question's `default` is the model's.** `ask_user` lets a `text` or `longText` question start with words, and the web
+  sends them back when the person submits without touching the box; the A2A layer writes them as `text: "..."`, which
+  `typed_by_the_person` kept. The answer is now paired with its own `ask_user` call (the result by position in the history; the
+  first message of the inbox for the call a parked run waits on) and a `text:` part equal to the default of a typed question of
+  that call is dropped. Where there is no call to pair with, every `text:` part is dropped. *Accepted:* a person who types
+  exactly the words the model prefilled is not heard; they say it in a message. The other way, taking `default` away from typed
+  questions in the coder's `ask_user`, was not needed.
+* **Order.** A message that arrived while a tool result was owed is put after the results in the history, so it can sort after a
+  later click. Its place is not known, so the ask to merge and the bare names are now what **both** it and the last thing before
+  it say (`When::Deferred`), and what waits in the inbox is newer than all the rest (`When::Waiting`).
+* **A card is not the form.** `vymalo_inbound` turned any A2UI action with the shape of `context.answers` into a form's answer.
+  It now takes it only from the action `answer` of a surface whose id starts with `ask-` (the surface `ask_user` draws). It
+  cannot check the one pending call, because it has no run state: the prefix and the name are what it can check.
+* **Wording.** The "fresh yes" the tool asks for names the pull request as `owner/name#N` or by its URL (a bare number needs
+  exactly one repository in play, decision 4), here and in the text the model reads; decision 7 said "its number or URL".
+* **A whole task is tested end to end** (`bin/adam-coder/tests/tiers.rs`): `commit_and_push`, `open_pull_request` and
+  `merge_pull_request` against the wiremock GitHub with no hand-written notes, the merge allowed by the commit the tools
+  themselves noted and sent with the `sha` the host reported.
