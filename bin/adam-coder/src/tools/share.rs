@@ -139,11 +139,14 @@ fn with_picture_hint(artifact: &Artifact) -> String {
         .mime_type
         .as_deref()
         .is_some_and(|t| t.starts_with("image/"));
+    if !is_image {
+        return line;
+    }
     match artifact.file_sha256() {
-        Some(hash) if is_image => format!(
+        Some(hash) => format!(
             "{line} To use it as the picture of an `ask_user` option, pass image {{sha256: \"{hash}\", alt}}."
         ),
-        _ => line,
+        None => line,
     }
 }
 
