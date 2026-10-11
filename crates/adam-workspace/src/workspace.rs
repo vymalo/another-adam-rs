@@ -283,6 +283,16 @@ impl Workspaces {
         }
     }
 
+    /// The accounts the credentials are confined to, if they are
+    /// ([`GitCredentials::acts_for`](crate::GitCredentials::acts_for)): `None` for a token.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the credentials report when they are asked.
+    pub async fn acts_for(&self) -> WorkspaceResult<Option<Vec<String>>> {
+        self.inner.creds.acts_for().await
+    }
+
     /// Accept only repositories on these hosts. An entry is a host name (any
     /// port) or `host:port`, compared case-insensitively; the list replaces an
     /// earlier one, and an empty list accepts nothing.
