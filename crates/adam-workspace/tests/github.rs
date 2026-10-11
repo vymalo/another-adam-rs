@@ -826,12 +826,13 @@ mod create {
 
 mod change {
     use super::*;
-    use adam_workspace::{MergeMethod, MergePullRequest};
+    use adam_workspace::{Checks, MergeMethod, MergePullRequest};
 
     fn merge(method: MergeMethod, delete_branch: bool) -> MergePullRequest {
         MergePullRequest {
             repo: repo(),
             number: 7,
+            expected_sha: None,
             method,
             delete_branch,
         }
@@ -851,7 +852,19 @@ mod change {
         })
     }
 
+    /// `GET /repos/octo/widgets`: what the host says the repository is called, asked before every
+    /// merge, rename and deletion.
+    async fn serve_repo(server: &MockServer, full_name: &str) {
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/widgets"))
+            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"full_name": full_name})))
+            .mount(server)
+            .await;
+    }
+
     async fn serve_pull(server: &MockServer, body: serde_json::Value) {
+        serve_repo(server, "octo/widgets").await;
         Mock::given(method("GET"))
             .and(path("/repos/octo/widgets/pulls/7"))
             .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
@@ -1070,6 +1083,7 @@ mod change {
     #[tokio::test]
     async fn a_rename_patches_the_repository_and_says_what_it_is_called_now() {
         let server = MockServer::start().await;
+        serve_repo(&server, "octo/widgets").await;
         Mock::given(method("PATCH"))
             .and(path("/repos/octo/widgets"))
             .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
@@ -1094,6 +1108,7 @@ mod change {
     #[tokio::test]
     async fn a_name_that_is_taken_is_invalid_and_a_name_that_is_no_name_sends_nothing() {
         let server = MockServer::start().await;
+        serve_repo(&server, "octo/widgets").await;
         Mock::given(method("PATCH"))
             .and(path("/repos/octo/widgets"))
             .respond_with(ResponseTemplate::new(422).set_body_json(json!({
@@ -1122,6 +1137,7 @@ mod change {
     #[tokio::test]
     async fn a_delete_is_a_delete_and_a_refusal_is_the_hosts_words() {
         let server = MockServer::start().await;
+        serve_repo(&server, "octo/widgets").await;
         Mock::given(method("DELETE"))
             .and(path("/repos/octo/widgets"))
             .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
@@ -1132,6 +1148,7 @@ mod change {
         client(&server).delete_repository(&repo()).await.unwrap();
 
         let server = MockServer::start().await;
+        serve_repo(&server, "octo/widgets").await;
         Mock::given(method("DELETE"))
             .and(path("/repos/octo/widgets"))
             .respond_with(
@@ -1150,6 +1167,7 @@ mod change {
         );
 
         let server = MockServer::start().await;
+        serve_repo(&server, "octo/widgets").await;
         Mock::given(method("DELETE"))
             .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "Not Found"})))
             .mount(&server)
@@ -1159,6 +1177,247 @@ mod change {
             .await
             .unwrap_err();
         assert_eq!(err.class(), ErrorClass::NotFound);
+    }
+
+    #[tokio::test]
+    async fn the_merge_is_for_the_head_the_caller_decided_on_and_refused_for_another() {
+        let server = MockServer::start().await;
+        serve_pull(&server, open_pull("octo/widgets")).await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/octo/widgets/pulls/7/merge"))
+            .and(body_json(
+                json!({"merge_method": "squash", "sha": "abc123"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sha": "1"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let host = client(&server);
+        host.merge_pull_request(MergePullRequest {
+            expected_sha: Some("abc123".to_owned()),
+            ..merge(MergeMethod::Squash, false)
+        })
+        .await
+        .unwrap();
+        // The head is another commit than the one that was looked at: nothing is sent.
+        let err = host
+            .merge_pull_request(MergePullRequest {
+                expected_sha: Some("0ldc0mm1t".to_owned()),
+                ..merge(MergeMethod::Squash, false)
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WorkspaceError::Conflict(m) if m.contains("abc123") && m.contains("0ldc0mm1t")),
+            "{err:?}"
+        );
+        assert_eq!(err.class(), ErrorClass::Rejected);
+        // (`expect(1)`: only the first reached the merge endpoint.)
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_moved_or_is_called_otherwise_is_not_acted_on() {
+        for (what, answer) in [
+            (
+                "moved",
+                ResponseTemplate::new(301).insert_header("location", "/repositories/1"),
+            ),
+            (
+                "moved for a method that is repeated",
+                ResponseTemplate::new(307).insert_header("location", "/repositories/1"),
+            ),
+            (
+                "called otherwise",
+                ResponseTemplate::new(200).set_body_json(json!({"full_name": "elsewhere/widgets"})),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/octo/widgets"))
+                .respond_with(answer)
+                .mount(&server)
+                .await;
+            // Nothing that changes or reads a pull request is reached, and no redirect is followed.
+            Mock::given(path("/repositories/1"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"full_name": "octo/widgets"})),
+                )
+                .expect(0)
+                .mount(&server)
+                .await;
+            for any in ["PATCH", "DELETE", "PUT"] {
+                Mock::given(method(any))
+                    .respond_with(ResponseTemplate::new(500))
+                    .expect(0)
+                    .mount(&server)
+                    .await;
+            }
+            let host = client(&server);
+            let errors = [
+                host.rename_repository(&repo(), "gadgets").await.map(|_| ()),
+                host.delete_repository(&repo()).await,
+                host.merge_pull_request(merge(MergeMethod::Squash, true))
+                    .await
+                    .map(|_| ()),
+                host.pull_request_status(&repo(), 7).await.map(|_| ()),
+            ];
+            for err in errors {
+                let err = err.unwrap_err();
+                assert!(
+                    matches!(err, WorkspaceError::Conflict(_)),
+                    "{what}: {err:?}"
+                );
+                assert_eq!(err.class(), ErrorClass::Rejected, "{what}");
+                assert!(
+                    adam_error::report(&err).contains("not the repository that was named"),
+                    "{what}: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_change_itself_follows_no_redirect_either() {
+        // The repository checks out, and then the host redirects the change somewhere else.
+        let server = MockServer::start().await;
+        serve_repo(&server, "octo/widgets").await;
+        Mock::given(method("DELETE"))
+            .and(path("/repos/octo/widgets"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", "/repositories/9"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/repositories/9"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .delete_repository(&repo())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::Http { status: 307, .. }),
+            "{err:?}"
+        );
+    }
+
+    fn pull_with_state(state: &str) -> serde_json::Value {
+        let mut pull = open_pull("octo/widgets");
+        pull["mergeable_state"] = json!(state);
+        pull
+    }
+
+    async fn serve_checks(server: &MockServer, status: serde_json::Value, runs: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/widgets/commits/abc123/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(status))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/widgets/commits/abc123/check-runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(runs))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_status_names_the_head_and_a_clean_pull_request_is_passing() {
+        let server = MockServer::start().await;
+        serve_pull(&server, pull_with_state("clean")).await;
+        // `clean` is enough: the statuses are not even read.
+        Mock::given(path("/repos/octo/widgets/commits/abc123/status"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let status = client(&server)
+            .pull_request_status(&repo(), 7)
+            .await
+            .unwrap();
+        assert_eq!(status.checks, Checks::Passing);
+        assert_eq!(status.head_branch, "agent/018f3a2b");
+        assert_eq!(status.head_repo.as_deref(), Some("octo/widgets"));
+        assert_eq!(status.head_sha, "abc123");
+        assert_eq!(status.base_branch, "main");
+        assert!(status.open && !status.merged && !status.draft);
+        assert_eq!(status.url, "https://github.com/octo/widgets/pull/7");
+    }
+
+    #[tokio::test]
+    async fn checks_are_read_from_the_statuses_and_the_check_runs_of_the_head() {
+        let green = json!({"total_count": 2, "check_runs": [
+            {"name": "build", "status": "completed", "conclusion": "success"},
+            {"name": "lint", "status": "completed", "conclusion": "skipped"},
+        ]});
+        let cases = [
+            (
+                json!({"state": "success", "total_count": 1}),
+                green.clone(),
+                Checks::Passing,
+            ),
+            (
+                json!({"state": "failure", "total_count": 1}),
+                green.clone(),
+                Checks::Failing("commit status: failure".to_owned()),
+            ),
+            (
+                json!({"state": "success", "total_count": 1}),
+                json!({"total_count": 2, "check_runs": [
+                    {"name": "build", "status": "completed", "conclusion": "failure"},
+                    {"name": "lint", "status": "completed", "conclusion": "success"},
+                ]}),
+                Checks::Failing("build: failure".to_owned()),
+            ),
+            (
+                json!({"state": "pending", "total_count": 0}),
+                json!({"total_count": 1, "check_runs": [
+                    {"name": "build", "status": "in_progress", "conclusion": null},
+                ]}),
+                Checks::Pending("build (in_progress)".to_owned()),
+            ),
+        ];
+        for (status, runs, expected) in cases {
+            let server = MockServer::start().await;
+            serve_pull(&server, pull_with_state("blocked")).await;
+            serve_checks(&server, status, runs).await;
+            let got = client(&server)
+                .pull_request_status(&repo(), 7)
+                .await
+                .unwrap();
+            assert_eq!(got.checks, expected);
+        }
+        // Nothing reported and not clean: unreported, never passing.
+        let server = MockServer::start().await;
+        serve_pull(&server, pull_with_state("unstable")).await;
+        serve_checks(
+            &server,
+            json!({"state": "pending", "total_count": 0}),
+            json!({"total_count": 0, "check_runs": []}),
+        )
+        .await;
+        let got = client(&server)
+            .pull_request_status(&repo(), 7)
+            .await
+            .unwrap();
+        assert!(matches!(got.checks, Checks::Unreported(m) if m.contains("unstable")));
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_of_a_fork_says_so() {
+        let server = MockServer::start().await;
+        serve_pull(&server, open_pull("someone/widgets")).await;
+        serve_checks(
+            &server,
+            json!({"state": "success", "total_count": 1}),
+            json!({"total_count": 0, "check_runs": []}),
+        )
+        .await;
+        let status = client(&server)
+            .pull_request_status(&repo(), 7)
+            .await
+            .unwrap();
+        assert_eq!(status.head_repo.as_deref(), Some("someone/widgets"));
     }
 
     #[tokio::test]
@@ -1172,6 +1431,7 @@ mod change {
             host.merge_pull_request(MergePullRequest {
                 repo: local,
                 number: 1,
+                expected_sha: None,
                 method: MergeMethod::Squash,
                 delete_branch: false,
             })

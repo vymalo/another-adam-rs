@@ -76,8 +76,8 @@ mod worktree;
 #[cfg(feature = "test-util")]
 pub use code_host::MemoryCodeHost;
 pub use code_host::{
-    CodeHost, CreatedRepository, DynCodeHost, MergeMethod, MergePullRequest, MergedPullRequest,
-    NewPullRequest, NewRepository, OwnerKind, PullRequest,
+    Checks, CodeHost, CreatedRepository, DynCodeHost, MergeMethod, MergePullRequest,
+    MergedPullRequest, NewPullRequest, NewRepository, OwnerKind, PullRequest, PullRequestStatus,
 };
 pub use credentials::{DynGitCredentials, GitCredentials, HostScoped, ScopedToken, StaticToken};
 pub use environment::{

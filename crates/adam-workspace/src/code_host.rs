@@ -125,6 +125,23 @@ pub trait CodeHost: Send + Sync + 'static {
         ))
     }
 
+    /// What the host says about pull request `number` of `repo`: who owns its head, which commit
+    /// that is, and whether the checks of that commit passed ([`Checks`]). What a caller reads before
+    /// it merges: the merge it then asks for names the commit it looked at
+    /// ([`MergePullRequest::expected_sha`]).
+    ///
+    /// The default is an error, as for [`merge_pull_request`](Self::merge_pull_request).
+    async fn pull_request_status(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequestStatus, WorkspaceError> {
+        let _ = (repo, number);
+        Err(WorkspaceError::Invalid(
+            "this code host cannot report on pull requests".to_owned(),
+        ))
+    }
+
     /// Rename the repository `repo` names to `new_name` (the same owner), and say what it is called
     /// now. The host keeps redirecting the old address.
     ///
@@ -199,6 +216,10 @@ pub struct MergePullRequest {
     pub repo: RepoRef,
     /// The pull request's number.
     pub number: u64,
+    /// The head commit the caller looked at and decided on (see
+    /// [`CodeHost::pull_request_status`]): the merge is refused, as [`WorkspaceError::Conflict`], when
+    /// the pull request's head is another commit. `None`: the head the host shows now.
+    pub expected_sha: Option<String>,
     /// How to merge it.
     pub method: MergeMethod,
     /// Delete the head branch afterwards, when it is a branch of this very repository (never a
@@ -220,6 +241,49 @@ pub struct MergedPullRequest {
     pub deleted_branch: Option<String>,
     /// Why the head branch was kept when the caller asked to delete it, if it was.
     pub branch_note: Option<String>,
+}
+
+/// What a host says about a pull request ([`CodeHost::pull_request_status`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequestStatus {
+    /// Number within the repository.
+    pub number: u64,
+    /// Browser URL.
+    pub url: String,
+    /// The pull request is open (not closed, not merged).
+    pub open: bool,
+    /// The pull request was merged.
+    pub merged: bool,
+    /// It is a draft.
+    pub draft: bool,
+    /// The head branch's name.
+    pub head_branch: String,
+    /// `owner/name` of the repository the head branch is in: the repository itself, or a fork.
+    /// `None` when the host did not say (a fork that was deleted).
+    pub head_repo: Option<String>,
+    /// The head commit the checks below are about.
+    pub head_sha: String,
+    /// The base branch's name.
+    pub base_branch: String,
+    /// Whether the checks of the head commit passed.
+    pub checks: Checks,
+}
+
+/// Whether the checks of a pull request's head commit passed, as the host reports them. Closed on
+/// purpose: a new answer is a decision for every caller that merges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Checks {
+    /// The host reports success: every status and every check run of the head commit is complete
+    /// and successful (a check that was skipped or neutral does not fail a merge), or the host
+    /// calls the pull request clean.
+    Passing,
+    /// A status or a check run failed: what failed, in the host's words.
+    Failing(String),
+    /// A status or a check run has not finished: which.
+    Pending(String),
+    /// The host reports no status and no check run for the head commit, and does not call the pull
+    /// request clean: why.
+    Unreported(String),
 }
 
 /// What owns repositories on a host.
@@ -302,8 +366,8 @@ mod memory {
     use async_trait::async_trait;
 
     use super::{
-        CodeHost, CreatedRepository, MergePullRequest, MergedPullRequest, NewPullRequest,
-        NewRepository, OwnerKind, PullRequest,
+        Checks, CodeHost, CreatedRepository, MergePullRequest, MergedPullRequest, NewPullRequest,
+        NewRepository, OwnerKind, PullRequest, PullRequestStatus,
     };
     use crate::error::WorkspaceError;
     use crate::repo::RepoRef;
@@ -325,12 +389,19 @@ mod memory {
         renamed: Mutex<Vec<(String, String)>>,
         deleted: Mutex<Vec<String>>,
         refusal: Mutex<Option<String>>,
+        checks: Mutex<Option<Checks>>,
     }
 
     impl MemoryCodeHost {
         /// An empty host.
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// The head commit this host gives pull request `number`
+        /// ([`CodeHost::pull_request_status`]).
+        pub fn head_sha_of(number: u64) -> String {
+            format!("{:040x}", 0x1000 + number)
         }
 
         /// Every pull request that was created, in creation order.
@@ -376,6 +447,17 @@ mod memory {
                 .refusal
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.to_owned());
+            self
+        }
+
+        /// Report `checks` for every pull request ([`CodeHost::pull_request_status`]); without it
+        /// they are [`Checks::Passing`].
+        #[must_use]
+        pub fn with_checks(self, checks: Checks) -> Self {
+            *self
+                .checks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(checks);
             self
         }
 
@@ -603,6 +685,13 @@ mod memory {
                         merge.number, merge.repo.url
                     ))
                 })?;
+            if let Some(expected) = &merge.expected_sha
+                && *expected != Self::head_sha_of(merge.number)
+            {
+                return Err(WorkspaceError::Conflict(format!(
+                    "Head branch was modified. Review and try the merge again (expected {expected})"
+                )));
+            }
             let mut merged = self
                 .merged
                 .lock()
@@ -619,6 +708,46 @@ mod memory {
                 already_merged,
                 deleted_branch: (merge.delete_branch && !already_merged).then_some(head),
                 branch_note: None,
+            })
+        }
+
+        async fn pull_request_status(
+            &self,
+            repo: &RepoRef,
+            number: u64,
+        ) -> Result<PullRequestStatus, WorkspaceError> {
+            let (req, pr) = self
+                .lock()
+                .iter()
+                .find(|(req, pr)| req.repo.url == repo.url && pr.number == number)
+                .cloned()
+                .ok_or_else(|| {
+                    WorkspaceError::NotFound(format!("no pull request #{number} in {}", repo.url))
+                })?;
+            let loc = repo.locate()?;
+            let merged = self
+                .merged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|m| m.repo.url == repo.url && m.number == number);
+            let checks = self
+                .checks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or(Checks::Passing);
+            Ok(PullRequestStatus {
+                number,
+                url: pr.url,
+                open: !merged,
+                merged,
+                draft: req.draft,
+                head_branch: pr.head,
+                head_repo: Some(format!("{}/{}", loc.owner, loc.name)),
+                head_sha: Self::head_sha_of(number),
+                base_branch: req.repo.base_branch,
+                checks,
             })
         }
 
@@ -792,6 +921,7 @@ mod memory {
             let merge = MergePullRequest {
                 repo: repo.clone(),
                 number: a.number,
+                expected_sha: None,
                 method: MergeMethod::Squash,
                 delete_branch: true,
             };
@@ -819,6 +949,50 @@ mod memory {
             assert_eq!(host.renames(), [(repo.url.clone(), "q".to_owned())]);
             host.delete_repository(&repo).await.unwrap();
             assert_eq!(host.deletions(), std::slice::from_ref(&repo.url));
+        }
+
+        #[tokio::test]
+        async fn the_status_of_a_pull_request_names_its_head_and_a_merge_of_another_head_is_refused()
+         {
+            use super::super::MergeMethod;
+            let host = MemoryCodeHost::new();
+            let repo = RepoRef::new("https://github.com/o/r.git", "main");
+            let a = host.open_pull_request(new_pr("agent/a")).await.unwrap();
+            let status = host.pull_request_status(&repo, a.number).await.unwrap();
+            assert_eq!(status.head_branch, "agent/a");
+            assert_eq!(status.head_repo.as_deref(), Some("o/r"));
+            assert_eq!(status.head_sha, MemoryCodeHost::head_sha_of(a.number));
+            assert_eq!((status.open, status.merged), (true, false));
+            assert_eq!(status.checks, Checks::Passing);
+            let moved = MergePullRequest {
+                repo: repo.clone(),
+                number: a.number,
+                expected_sha: Some("f".repeat(40)),
+                method: MergeMethod::Squash,
+                delete_branch: false,
+            };
+            assert!(matches!(
+                host.merge_pull_request(moved.clone()).await,
+                Err(WorkspaceError::Conflict(_))
+            ));
+            assert!(host.merges().is_empty());
+            host.merge_pull_request(MergePullRequest {
+                expected_sha: Some(status.head_sha),
+                ..moved
+            })
+            .await
+            .unwrap();
+            let after = host.pull_request_status(&repo, a.number).await.unwrap();
+            assert_eq!((after.open, after.merged), (false, true));
+            let red = MemoryCodeHost::new().with_checks(Checks::Failing("ci: failure".into()));
+            let b = red.open_pull_request(new_pr("agent/b")).await.unwrap();
+            assert_eq!(
+                red.pull_request_status(&repo, b.number)
+                    .await
+                    .unwrap()
+                    .checks,
+                Checks::Failing("ci: failure".into())
+            );
         }
 
         #[tokio::test]
