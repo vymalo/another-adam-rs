@@ -1085,11 +1085,11 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
     }
 }
 
-/// The twelve read tools of the shipped `mcp.json`, in its order: what the model may call of the
+/// The eleven read tools of the shipped `mcp.json`, in its order: what the model may call of the
 /// GitHub MCP server, and all of it (`tools:` is an allow-list, and the server is also started
-/// with `--read-only`).
-const GITHUB_TOOLS: [&str; 12] = [
-    "get_me",
+/// with `--read-only`). `get_me` is not among them: it asks GitHub who the authenticated *user* is,
+/// which a GitHub App is not, so the call could only fail.
+const GITHUB_TOOLS: [&str; 11] = [
     "search_repositories",
     "get_file_contents",
     "list_branches",
@@ -1106,7 +1106,7 @@ const GITHUB_TOOLS: [&str; 12] = [
 /// The shipped `mcp.json` is the official GitHub MCP server over **http**, at the sidecar of the
 /// pod (127.0.0.1:8082), and says nothing about credentials: no `env`, no `headers`, no key or
 /// token (the deployment gives each call its bearer, `GitHubReadBearer`, ADR 0017). It lists the
-/// twelve read tools above and no others; the server itself is started read-only with four
+/// eleven read tools above and no others; the server itself is started read-only with four
 /// toolsets, by the deployment.
 #[test]
 fn the_shipped_mcp_json_names_the_github_server_read_only() {

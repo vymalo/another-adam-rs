@@ -68,7 +68,7 @@ sequenceDiagram
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
 folder](#mcp-tools-from-the-folder)); they are not part of the twenty. The shipped folder's own `mcp.json` adds
-twelve **read-only** tools of GitHub, `github__get_me`, `github__get_file_contents`, `github__list_branches` and the
+eleven **read-only** tools of GitHub, `github__get_file_contents`, `github__list_branches` and the
 rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)). A call to one waits as long as the tool says it may take (`_meta["thread-tools/v1"].timeoutSecs`), at most `THREAD_TOOLS_MAX_CALL_SECS`; a tool the orchestrator reports as a step gets no step of the coder's; and a message that mentions agents adds a "Mentioned agents" block to the instructions ([`adam-ui`](../../crates/adam-ui/README.md), [ADR 0015](../../docs/decisions/0015-tools-the-orchestrator-reports-long-calls-and-mentioned-agents.md)).
@@ -1829,14 +1829,14 @@ decision 8 of [ADR 0009](../../docs/decisions/0009-github-per-installation-read-
 { "mcpServers": { "github": {
   "type": "http",
   "url": "http://127.0.0.1:8082/",
-  "tools": ["get_me", "search_repositories", "get_file_contents", "list_branches", "list_commits", "get_commit",
+  "tools": ["search_repositories", "get_file_contents", "list_branches", "list_commits", "get_commit",
             "search_code", "list_issues", "issue_read", "search_issues", "list_pull_requests", "pull_request_read"] } } }
 ```
 
 * **Read-only twice over.** The sidecar is started with `--read-only` (it offers no write tool) and four toolsets
   (`github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests --listen-host 127.0.0.1 --port
-  8082`: the chart's `githubMcp`, the `github-mcp` service of `compose.yaml`), and the `tools` allow-list names twelve
-  reads, so the model sees `github__get_me`, `github__search_repositories`, `github__get_file_contents`,
+  8082`: the chart's `githubMcp`, the `github-mcp` service of `compose.yaml`), and the `tools` allow-list names eleven
+  reads, so the model sees `github__search_repositories`, `github__get_file_contents`,
   `github__list_branches`, `github__list_commits`, `github__get_commit`, `github__search_code`, `github__list_issues`,
   `github__issue_read`, `github__search_issues`, `github__list_pull_requests` and `github__pull_request_read`, after
   the coder's own tools, and nothing that writes. Pushes and pull requests go through `commit_and_push` and
@@ -1852,13 +1852,14 @@ decision 8 of [ADR 0009](../../docs/decisions/0009-github-per-installation-read-
   the cache are the ones `git` and the REST calls go through**. With a **token** (`GITHUB_TOKEN`, sent as `Bearer` on
   every call) or a **pinned App installation** (the installation token the coder minted, the same one for every
   call) the call's subject only chooses what the credentials look at: one token serves any call, a search that names
-  no account and `get_me` included. A refusal of the credentials (`Auth`, `Invalid`, `NotFound`) is an error result the
+  no account included. A refusal of the credentials (`Auth`, `Invalid`, `NotFound`) is an error result the
   model reads, and nothing is sent to the server; `RateLimited` and `Transient` fail the step transiently and it is
   retried (nothing was sent). **An App by owner** (`GITHUB_APP_OWNERS`, no pin) needs a call to be about **one account**:
   a search that names none or several (`org:a org:b`) is an error result that says to give `owner` (and `repo`) or one
   `org:`, `user:` or `repo:`, and `github__get_me` (the authenticated *user*, which an App is not: the server's `GET /user`
   is a `403` for an installation token) is an error result; neither is sent, and no installation is looked up for a
-  guess. The call's owner then decides the installation, through `GitCredentials::token_for`, so the owner list, the
+  guess. The shipped `mcp.json` does not list `get_me`, so the model is not offered a call that could only fail; the
+  refusal stays for a folder that lists it. The call's owner then decides the installation, through `GitCredentials::token_for`, so the owner list, the
   account cache and the token cache apply. The model's arguments are untrusted: an `owner` or `repo` with a character outside
   `A-Z a-z 0-9 . - _` is never put in a URL.
 * **No credential in the file, none in the server.** A file that gives `github` an `Authorization` header, or points it
@@ -1881,7 +1882,7 @@ decision 8 of [ADR 0009](../../docs/decisions/0009-github-per-installation-read-
   and digest (v1.12.2) and its build and the container smoke test list its tools over stdio, with no credential at all
   (the server lists tools without calling GitHub, *verified*).
 * **Development and the e2e read a mock.** The compose file mounts `dev/coder-agent/mcp.json` over the folder's
-  `mcp.json` (the same twelve tools from `mock-github-mcp`, a WireMock of the server's streamable HTTP endpoint over
+  `mcp.json` (the same eleven tools from `mock-github-mcp`, a WireMock of the server's streamable HTTP endpoint, which lists the server's twelve, `get_me` too, over
   plain `http`, with `MCP_ALLOW_INSECURE=true` and `GITHUB_MCP_URL=http://mock-github-mcp:8080`, and no credential in
   the file). The default script of `mock-coder` reads `github__list_branches` of `local/sandbox` right after
   `prepare_workspace`, and `dev/coder-e2e.sh` asserts the mock saw `initialize`, `tools/list` (with the placeholder) and
@@ -1900,8 +1901,8 @@ sequenceDiagram
   P->>B: for_listing
   B-->>P: ghs_adam_listing_only
   P->>S: initialize, tools/list (that bearer): no request to GitHub
-  S-->>P: 25 tools (read-only, four toolsets): the twelve of the allow-list must all be there
-  Note over P,S: serving: the model is offered the twelve as github__<name>
+  S-->>P: 25 tools (read-only, four toolsets): the eleven of the allow-list must all be there
+  Note over P,S: serving: the model is offered the eleven as github__<name>
   M->>P: github__list_branches {owner, repo}
   P->>B: for_call("list_branches", arguments)
   B->>C: token_for(https://host/owner/repo)
@@ -2085,13 +2086,13 @@ database of its own, so the role needs `CREATEDB`):
   call choose the credentials asked for, on the configured host, for every tool that takes them, and a name that is not
   a URL component never reaches a URL; a search names its account with `repo:`, `org:` or `user:` (negated qualifiers
   and quoted phrases are not read, two owners are two accounts); a token and a pinned installation serve every call
-  (a search with no account, two accounts, `get_me`), a bearer for another host than its credentials refuses; what the
+  (a search with no account, two accounts, `get_me` for a folder that lists it), a bearer for another host than its credentials refuses; what the
   credentials say reaches the call typed (a refusal for the model, a transient failure retried, no token in either); for
   an App by owner (`a_search_with_no_or_several_accounts_is_refused_without_a_pin`, `get_me_is_refused_for_an_app_without_a_pin`)
   a search with no account or several, a call with an owner that is no login, and `get_me` are refused, the credentials
   are not asked, and one account is served from its own installation.
   `tests/agent_files.rs`: the shipped `mcp.json` is the GitHub server over http at `127.0.0.1:8082` with exactly the
-  twelve reads (none starts with a verb that writes) and **no credential of any kind** (no header, no `env`, no
+  eleven reads (none starts with a verb that writes) and **no credential of any kind** (no header, no `env`, no
   `${VAR}`); the embedded files bound to another origin are refused (`Invalid`), and at their own with nothing
   listening are `Transient`. `tests/binary.rs`: the worker on the embedded files stops with 78 when `GITHUB_MCP_URL`
   is another origin than the file's (naming the server and the variable) and with 69 when nothing listens, never with
@@ -2099,12 +2100,12 @@ database of its own, so the role needs `CREATEDB`):
   the Dockerfile pins; the case skips itself without it, and without Postgres), the whole binary connects the **real**
   server in `http` mode, run as the chart runs it with no credential and no environment, on a free port: the mock
   GitHub has received **zero** requests when the coder is ready (the listing uses the placeholder), the model is
-  offered the twelve tools in order after the coder's own and none that writes, `github__get_me` and
-  `github__list_branches` reach the mock carrying the coder's credentials of that call (the token; or the pinned
+  offered the eleven tools in order after the coder's own and none that writes, and two `github__list_branches`
+  calls reach the mock carrying the coder's credentials of that call (the token; or the pinned
   installation's token, minted once for both), never the placeholder, and no secret is in a log. A third mode is an
   App by owner: `list_branches` for `acme` and for `other` are two lookups, two mints and two calls, each with its own
   owner's token; an account the App is not installed on is an error result naming the App and the owner, an owner off the
-  list one naming `GITHUB_APP_OWNERS`, and `get_me` and a search that names no account are error results, none of the four
+  list one naming `GITHUB_APP_OWNERS`, and a search that names no account is an error result, none of the three
   reaching the server or GitHub, and nothing is looked up for the owner that is off the list. The other tests of
   those two files use the shipped folder without its `mcp.json` (`common::plain_folder`), since a test would have to
   run the sidecar; `adam-mcp`'s `wiremock_compose` connects `mock-github-mcp`; `dev/coder-e2e.sh`,

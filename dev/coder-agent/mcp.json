@@ -4,7 +4,6 @@
       "type": "http",
       "url": "http://mock-github-mcp:8080/mcp",
       "tools": [
-        "get_me",
         "search_repositories",
         "get_file_contents",
         "list_branches",

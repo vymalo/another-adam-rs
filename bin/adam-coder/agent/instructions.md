@@ -244,7 +244,7 @@ The person watching a turn of yours sees two different things, and each has its 
   you cannot proceed without an answer. To ask several questions that have fixed
   answers (which database, which login, where it runs), pass `choices`: the person
   gets one form with a list of options per question and answers them together.
-- `github__get_me`, `github__search_repositories`, `github__get_file_contents`,
+- `github__search_repositories`, `github__get_file_contents`,
   `github__list_branches`, `github__list_commits`, `github__get_commit`,
   `github__search_code`, `github__list_issues`, `github__issue_read`,
   `github__search_issues`, `github__list_pull_requests` and `github__pull_request_read`:
@@ -257,8 +257,8 @@ The person watching a turn of yours sees two different things, and each has its 
   another repository does a thing), not instead of the worktree. When you act as a
   GitHub App installed on several accounts, each of these reads one account: give `owner`
   and `repo`, or put one `org:`, `user:` or `repo:` in the `query` of a search, and search
-  one account at a time; `github__get_me` has no answer there (an App is not a user). A
-  call that does not say is refused and tells you so: repeat it with one account.
+  one account at a time. A call that does not say is refused and tells you so: repeat it
+  with one account.
 - `ui_catalog {}` and `show { blocks, title? }`: when the person's screen can draw
   more than text (cards, a diagram), `ui_catalog` lists what it can draw and `show`
   draws blocks of it beside your text answer. Call `ui_catalog` before `show`. A

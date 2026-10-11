@@ -26,7 +26,7 @@ trap 'rm -f "$out"' EXIT
 ) | env -i PATH="$PATH" HOME="${TMPDIR:-/tmp}" "$server" stdio --read-only --toolsets context,repos,issues,pull_requests >"$out" 2>/dev/null || true
 
 status=0
-for tool in get_me search_repositories get_file_contents list_branches list_commits get_commit \
+for tool in search_repositories get_file_contents list_branches list_commits get_commit \
   search_code list_issues issue_read search_issues list_pull_requests pull_request_read; do
   if ! grep -q "\"name\":\"$tool\"" "$out"; then
     echo "github-mcp-server does not list the tool $tool" >&2
