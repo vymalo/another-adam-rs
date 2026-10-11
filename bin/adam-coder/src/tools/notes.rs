@@ -320,6 +320,44 @@ impl PullRef {
     }
 }
 
+/// Where one of the person's sayings stands in the conversation, as far as that is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    /// In the history, in the order it happened.
+    Past,
+    /// A message that arrived while a tool result was owed and waited behind it
+    /// (`Conversation::deferred`): it may be older or newer than the answers beside it.
+    Deferred,
+    /// Delivered and not yet read by the run: newer than all the rest, in arrival order.
+    Waiting,
+}
+
+/// One thing the person said, as the conversation holds it: a message, or the answer to a question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heard {
+    /// The text as it reached the run: for an answer through the interface, the lines the interface
+    /// wrote (see `named::typed_by_the_person`).
+    pub text: String,
+    /// The defaults of the text questions of the `ask_user` call this answers, when it could be paired
+    /// with its call: a typed question's words that are one of them are the model's, not the
+    /// person's. `None`: not an answer to a call, or one that could not be paired; none of its typed
+    /// questions' words count.
+    pub defaults: Option<Vec<String>>,
+    /// Where it stands.
+    pub when: When,
+}
+
+impl Heard {
+    /// `text`, a message the person wrote, in the order it happened.
+    pub fn said(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            defaults: None,
+            when: When::Past,
+        }
+    }
+}
+
 /// The most words of the person's [`RunNotes::said_words`] keeps: past it the newest are not added.
 pub const MAX_SAID_WORDS: usize = 2000;
 
@@ -465,6 +503,16 @@ pub(crate) fn standalone_words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The standalone words (`standalone_words`) that every one of `texts` has, joined by spaces.
+fn shared_words(texts: &[&str]) -> String {
+    let mut shared = standalone_words(texts.first().copied().unwrap_or_default());
+    for text in texts.iter().skip(1) {
+        let words = standalone_words(text);
+        shared.retain(|word| words.contains(word));
+    }
+    shared.join(" ")
+}
+
 /// Add each of `pulls` that `list` does not have, up to [`MAX_PULLS`]; returns whether any was added.
 fn add_pulls(list: &mut Vec<PullRef>, pulls: impl IntoIterator<Item = PullRef>) -> bool {
     let mut added = false;
@@ -592,16 +640,23 @@ impl RunNotes {
     ///   named and created).
     /// * The pull requests their **newest** words ask to merge ([`merge_asks`](Self::merge_asks)):
     ///   the newest is the last thing they said, an answer included, so an answer that asks nothing
-    ///   takes an earlier ask away.
+    ///   takes an earlier ask away. Where the order is not known (a message that arrived while a tool
+    ///   result was owed, [`When::Deferred`], and the last thing in the history) every one of them
+    ///   must ask, or none does.
     /// * The words that stand alone in the newest of their words that have any
     ///   ([`said_words`](Self::said_words)).
-    pub fn hear(&mut self, said: &[String], host: &str, workspace: &[String]) -> bool {
+    pub fn hear(&mut self, said: &[Heard], host: &str, workspace: &[String]) -> bool {
         use super::named::{asks_to_merge, bind_pulls, listed, named_in, pulls_in};
-        let typed: Vec<String> = said
+        let typed: Vec<(String, When)> = said
             .iter()
-            .map(|text| super::named::typed_by_the_person(text))
+            .map(|heard| {
+                (
+                    super::named::typed_by_the_person(&heard.text, heard.defaults.as_deref()),
+                    heard.when,
+                )
+            })
             .collect();
-        let mut changed = self.name_repos(typed.iter().flat_map(|text| named_in(text, host)));
+        let mut changed = self.name_repos(typed.iter().flat_map(|(text, _)| named_in(text, host)));
         let mut in_play: std::collections::BTreeSet<String> = listed(&self.named_repos)
             .into_iter()
             .map(str::to_owned)
@@ -609,21 +664,60 @@ impl RunNotes {
         in_play.extend(self.created_repos.iter().map(|created| created.key.clone()));
         in_play.extend(workspace.iter().cloned());
         let in_play: Vec<String> = in_play.into_iter().collect();
-        let newest = typed.last().map(String::as_str);
-        let newest_pulls = newest.map(|text| pulls_in(text, host)).unwrap_or_default();
-        let asks = if newest.is_some_and(asks_to_merge) {
-            bind_pulls(newest_pulls.clone(), &in_play)
-        } else {
-            Vec::new()
+        // The newest words: the last thing waiting for the run, else the last of the history and
+        // every message that arrived out of order (its place among the answers is not known).
+        let newest: Vec<&str> = match typed.iter().rev().find(|(_, when)| *when == When::Waiting) {
+            Some((text, _)) => vec![text.as_str()],
+            None => typed
+                .iter()
+                .rev()
+                .find(|(_, when)| *when == When::Past)
+                .into_iter()
+                .chain(typed.iter().filter(|(_, when)| *when == When::Deferred))
+                .map(|(text, _)| text.as_str())
+                .collect(),
         };
+        let mut asks: Option<Vec<PullRef>> = None;
+        let mut newest_pulls = Vec::new();
+        for text in &newest {
+            let pulls = pulls_in(text, host);
+            let asked = if asks_to_merge(text) {
+                bind_pulls(pulls.clone(), &in_play)
+            } else {
+                Vec::new()
+            };
+            asks = Some(match asks {
+                None => asked,
+                Some(before) => before
+                    .into_iter()
+                    .filter(|pull| asked.contains(pull))
+                    .collect(),
+            });
+            newest_pulls.extend(pulls);
+        }
         let explicit = typed
             .iter()
-            .flat_map(|text| pulls_in(text, host))
+            .flat_map(|(text, _)| pulls_in(text, host))
             .filter(|pull| pull.repo.is_some());
         changed |= self.name_pulls(explicit.chain(bind_pulls(newest_pulls, &in_play)));
-        changed |= self.set_merge_asks(asks);
-        let words = typed.iter().rev().find(|text| !text.trim().is_empty());
-        changed |= self.set_said_words(words.map_or("", String::as_str));
+        changed |= self.set_merge_asks(asks.unwrap_or_default());
+        // The bare names follow the same order: the words every one of the newest says, else the
+        // last words there are.
+        let spoken: Vec<&str> = newest
+            .iter()
+            .copied()
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+        let words = if spoken.is_empty() {
+            typed
+                .iter()
+                .rev()
+                .find(|(text, _)| !text.trim().is_empty())
+                .map_or_else(String::new, |(text, _)| text.clone())
+        } else {
+            shared_words(&spoken)
+        };
+        changed |= self.set_said_words(&words);
         changed
     }
 
@@ -981,6 +1075,100 @@ mod tests {
             preexisting: false,
             base_commit: None,
         }
+    }
+
+    fn heard(text: &str, when: When) -> Heard {
+        Heard {
+            text: text.to_owned(),
+            defaults: Some(Vec::new()),
+            when,
+        }
+    }
+
+    const MERGE_7: &str = "merge https://github.com/acme/widgets/pull/7";
+
+    #[test]
+    fn the_newest_words_decide_whether_a_merge_is_asked() {
+        let widgets_7 = || PullRef {
+            repo: Some("github.com/acme/widgets".to_owned()),
+            number: 7,
+        };
+        let hear = |said: &[Heard]| {
+            let mut notes = RunNotes::default();
+            notes.hear(said, "github.com", &[]);
+            notes.merge_asks
+        };
+        // The ask stands while nothing newer is said, however many steps the model takes.
+        assert_eq!(hear(&[heard(MERGE_7, When::Past)]), [widgets_7()]);
+        // An answer that asks nothing takes it away, a click that says nothing too.
+        for answer in ["no, wait", ""] {
+            assert!(hear(&[heard(MERGE_7, When::Past), heard(answer, When::Past)]).is_empty());
+        }
+        // What waits for the run is newer than all the rest.
+        assert!(hear(&[heard(MERGE_7, When::Past), heard("", When::Waiting)]).is_empty());
+        assert_eq!(
+            hear(&[heard("no", When::Past), heard(MERGE_7, When::Waiting)]),
+            [widgets_7()]
+        );
+        // A message that waited behind an owed result may be older than the click after it: it
+        // cannot keep the ask alive against it, and cannot be cleared by it alone either.
+        assert!(
+            hear(&[
+                heard("hi", When::Past),
+                heard("", When::Past),
+                heard(MERGE_7, When::Deferred)
+            ])
+            .is_empty()
+        );
+        assert!(hear(&[heard(MERGE_7, When::Past), heard("no", When::Deferred)]).is_empty());
+        assert_eq!(
+            hear(&[heard(MERGE_7, When::Past), heard(MERGE_7, When::Deferred)]),
+            [widgets_7()]
+        );
+    }
+
+    #[test]
+    fn the_bare_names_are_the_words_every_one_of_the_newest_says() {
+        let said = |said: &[Heard]| {
+            let mut notes = RunNotes::default();
+            notes.hear(said, "github.com", &[]);
+            notes.said_words
+        };
+        assert_eq!(
+            said(&[heard("fix widgets", When::Past)]),
+            ["fix", "widgets"]
+        );
+        // A click that says nothing leaves the words before it.
+        assert_eq!(
+            said(&[heard("fix widgets", When::Past), heard("", When::Past)]),
+            ["fix", "widgets"]
+        );
+        // A message that waited behind an owed result may be older than the answer after it: only
+        // what both say stands.
+        assert_eq!(
+            said(&[
+                heard("fix widgets", When::Past),
+                heard("use gadgets", When::Past),
+                heard("fix widgets please", When::Deferred)
+            ]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            said(&[
+                heard("fix widgets", When::Past),
+                heard("", When::Past),
+                heard("then fix gadgets", When::Deferred)
+            ]),
+            ["then", "fix", "gadgets"]
+        );
+        // What waits for the run is the newest alone.
+        assert_eq!(
+            said(&[
+                heard("fix widgets", When::Past),
+                heard("gadgets", When::Waiting)
+            ]),
+            ["gadgets"]
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::tools::consent::{
     Answer, answer_of, asked_by, is_answered_by_the_person, is_consent_tool, is_tools_own_result,
 };
 use crate::tools::named::{key_of_argument, listed, without_untrusted};
-use crate::tools::notes::{Consent, PushedBranch, RunNotes};
+use crate::tools::notes::{Consent, Heard, PushedBranch, RunNotes, When};
 use crate::tools::publish::{COMMIT_AND_PUSH, pushed_in};
 use crate::tools::{ToolEnv, coder_tools};
 
@@ -389,7 +389,7 @@ impl CoderAgent {
         // What the person said, typed (not what the interface made of their clicks): the
         // repositories, the pull requests and the merge they asked for, the bare names.
         let workspace = self.workspace_keys(run).await;
-        let heard = notes.hear(&person_texts(state, ctx.peek_inbox()), host, &workspace);
+        let heard = notes.hear(&person_sayings(state, ctx.peek_inbox()), host, &workspace);
         let new_red = notes.name_red_pulls(red);
         let new_verified = notes.verify_shas(verified);
         let adopted = self.adopt_scratch(ctx, run, &mut notes).await;
@@ -687,7 +687,8 @@ impl<'a> Answers<'a> {
     }
 }
 
-/// What the person said in `state` and `inbox`, oldest first: their messages, and their answers
+/// What the person said in `state` and `inbox`, oldest first (a message that waited behind an owed
+/// result is [`When::Deferred`]; the ones in `inbox` are [`When::Waiting`]): their messages, and their answers
 /// to `ask_user` (which reach the model as that tool's results), each without the blocks
 /// labelled `untrusted` that a message may quote (see [`without_untrusted`]).
 ///
@@ -703,42 +704,101 @@ impl<'a> Answers<'a> {
 /// very message count, and so do those of a `request_repository` call that did not fail (what the
 /// person said to the question the tool wrote; an error result is the tool's own words, and it may
 /// quote the address the model chose). Assistant text and every other tool's result never do.
-fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
-    let mut texts = Vec::new();
+fn person_sayings(state: &Conversation, inbox: &[Inbound]) -> Vec<Heard> {
+    let mut said = Vec::new();
     let mut answers = Answers::new();
     for (at, message) in state.messages.iter().chain(&state.deferred).enumerate() {
+        let when = if at < state.messages.len() {
+            When::Past
+        } else {
+            When::Deferred
+        };
         match message {
             Message::Assistant { tool_calls, .. } => answers.calls(tool_calls),
             Message::User { content } => {
                 for (part, text) in content.iter().enumerate() {
                     let is_marker = at < state.messages.len() && state.is_omission_marker(at, part);
                     if !is_marker {
-                        texts.push(text.as_text().to_owned());
+                        said.push(Heard {
+                            text: without_untrusted(text.as_text()),
+                            defaults: None,
+                            when,
+                        });
                     }
                 }
             }
             Message::Tool { is_error, .. } => {
-                if answers.next().is_some_and(|call| {
-                    is_answered_by_the_person(&call.name)
-                        && (call.name == adam_ui::ASK_USER
-                            || (!*is_error && !is_tools_own_result(&call.name, &message.text())))
-                }) {
-                    texts.push(message.text());
+                // Only an answer counts: not an error (`ask_user` repeats what the model got wrong in
+                // its own words, the values it chose included), not the tool's own result.
+                if let Some(call) = answers.next()
+                    && is_answered_by_the_person(&call.name)
+                    && !*is_error
+                    && !is_tools_own_result(&call.name, &message.text())
+                {
+                    said.push(Heard {
+                        text: without_untrusted(&message.text()),
+                        defaults: Some(text_defaults(call)),
+                        when,
+                    });
                 }
             }
         }
     }
-    // A message the run has read is in its history already (and is not the newest again).
-    texts.extend(
-        inbox
+    // A message the run has read is in its history already (and is not the newest again). The
+    // first of the others answers the question the run is parked on, if it is.
+    let mut question = match &state.pending_wait {
+        Some(PendingWait::Question(asked)) => state
+            .pending_calls
             .iter()
-            .filter(|inbound| {
-                inbound.kind != RUN_FINISHED_KIND
-                    && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
-            })
-            .filter_map(inbound_text),
-    );
-    texts.iter().map(|text| without_untrusted(text)).collect()
+            .find(|call| call.id == asked.call_id && call.name == asked.tool),
+        _ => None,
+    };
+    for inbound in inbox.iter().filter(|inbound| {
+        inbound.kind != RUN_FINISHED_KIND
+            && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
+    }) {
+        let Some(text) = inbound_text(inbound) else {
+            continue;
+        };
+        said.push(Heard {
+            text: without_untrusted(&text),
+            defaults: question.take().map(text_defaults),
+            when: When::Waiting,
+        });
+    }
+    said
+}
+
+/// The defaults of the typed questions of an `ask_user` call: what the model put in the box before
+/// the person saw it (`choices[].default`, a string), trimmed. A consent tool's question has none.
+fn text_defaults(call: &ToolCall) -> Vec<String> {
+    if call.name != adam_ui::ASK_USER {
+        return Vec::new();
+    }
+    call.arguments
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|choice| {
+            matches!(
+                choice.get("type").and_then(Value::as_str),
+                Some("text" | "longText")
+            )
+        })
+        .filter_map(|choice| choice.get("default")?.as_str())
+        .map(|default| default.trim().to_owned())
+        .filter(|default| !default.is_empty())
+        .collect()
+}
+
+/// [`person_sayings`] as the text of each.
+#[cfg(test)]
+fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
+    person_sayings(state, inbox)
+        .into_iter()
+        .map(|heard| heard.text)
+        .collect()
 }
 
 /// What the person answered to the questions the consent tools wrote (`request_repository`,
@@ -1290,6 +1350,102 @@ mod tests {
 
     fn said(state: &Conversation) -> Vec<String> {
         person_texts(state, &[])
+    }
+
+    #[test]
+    fn an_error_of_ask_user_repeats_the_model_and_is_not_the_persons_word() {
+        let state = conversation(vec![
+            Message::user_text("look around"),
+            assistant("", vec![call("c1", "ask_user")]),
+            Message::tool_error(
+                "c1",
+                "the default `merge acme/widgets#7` of question `q` is not one of its options",
+            ),
+        ]);
+        assert_eq!(said(&state), ["look around"]);
+    }
+
+    fn asking_with_default(default: &str) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: "ask_user".into(),
+            arguments: json!({"question": "?", "choices": [
+                {"id": "why", "question": "Why?", "type": "text", "default": format!("  {default} ")},
+                {"id": "pick", "question": "Which?", "options": ["a", "b"], "default": "a"},
+            ]}),
+        }
+    }
+
+    const UNTOUCHED: &str =
+        "The person answered through the interface:\n- why: text: \"merge acme/widgets#7\"";
+
+    #[test]
+    fn an_answer_is_paired_with_the_defaults_of_the_call_it_answers() {
+        let ask = asking_with_default("merge acme/widgets#7");
+        // In the history: the result of the call, by position.
+        let state = conversation(vec![
+            Message::user_text("look around"),
+            assistant("", vec![ask.clone()]),
+            Message::tool_result("c1", UNTOUCHED),
+        ]);
+        let sayings = person_sayings(&state, &[]);
+        assert_eq!(
+            sayings[1].defaults,
+            Some(vec!["merge acme/widgets#7".to_owned()])
+        );
+        assert_eq!(sayings[1].when, When::Past);
+        let mut notes = RunNotes::default();
+        notes.hear(&sayings, "github.com", &[]);
+        assert!(notes.named_repos.is_empty() && notes.named_pulls.is_empty());
+        // Waiting in the inbox while the run is parked on the call: the first message answers it.
+        let mut parked = conversation(vec![
+            Message::user_text("look around"),
+            assistant("", vec![ask.clone()]),
+        ]);
+        parked.pending_calls = vec![ask];
+        parked.pending_wait = Some(PendingWait::Question(adam_llm_agent::PendingQuestion {
+            call_id: "c1".into(),
+            tool: "ask_user".into(),
+            question: "?".into(),
+            ui: None,
+            stream: None,
+        }));
+        let inbox = [
+            Inbound::new("message", json!({ "text": UNTOUCHED })),
+            Inbound::new("message", json!({ "text": UNTOUCHED })),
+        ];
+        let sayings = person_sayings(&parked, &inbox);
+        assert_eq!(
+            sayings[1].defaults,
+            Some(vec!["merge acme/widgets#7".to_owned()])
+        );
+        assert_eq!(sayings[2].defaults, None, "only the first answers the call");
+        assert!(sayings[1..].iter().all(|heard| heard.when == When::Waiting));
+        let mut notes = RunNotes::default();
+        notes.hear(&sayings, "github.com", &[]);
+        assert!(notes.named_repos.is_empty() && notes.named_pulls.is_empty());
+        // The same words with nothing to pair with are not trusted either.
+        let mut notes = RunNotes::default();
+        notes.hear(
+            &person_sayings(&conversation(vec![Message::user_text(UNTOUCHED)]), &[]),
+            "github.com",
+            &[],
+        );
+        assert!(notes.named_repos.is_empty() && notes.named_pulls.is_empty());
+    }
+
+    #[test]
+    fn a_message_that_waited_behind_an_owed_result_is_marked_deferred() {
+        let mut state = conversation(vec![Message::user_text("first")]);
+        state.deferred = vec![Message::user_text("mid-turn")];
+        let sayings = person_sayings(&state, &[]);
+        assert_eq!(
+            sayings
+                .iter()
+                .map(|h| (h.text.as_str(), h.when))
+                .collect::<Vec<_>>(),
+            [("first", When::Past), ("mid-turn", When::Deferred)]
+        );
     }
 
     #[test]

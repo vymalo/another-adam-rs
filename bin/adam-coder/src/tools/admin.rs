@@ -279,7 +279,7 @@ fn stopped_by_checks(
     let red = notes.red_accepted(key, number);
     let asked = notes.asks_to_merge(key, number);
     let fresh_yes = "Do not merge it. Tell the person; if they want it merged anyway they say so in a \
-        new message that names the pull request (its number or URL) and says to merge it.";
+        new message that names the pull request (`owner/name#N` or its URL) and says to merge it.";
     if red && !asked {
         return Some(format!(
             "Pull request #{number} was opened with red checks that the person accepted for opening \
