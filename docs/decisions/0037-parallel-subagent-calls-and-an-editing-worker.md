@@ -225,9 +225,22 @@ stateDiagram-v2
 
 * **Leave it to OpenCode's subagents.** OpenCode has a `General` subagent that can edit and is meant "to run multiple units of
   work in parallel". It stays available, and the prompt already points to it. It is not the answer to "Adam works faster with
-  workers": the whole delegation is one journaled step (a crash runs all of it again), its parts are not durable, they show
-  as ACP tool calls only, OpenCode reports no tokens ([ADR 0032](0032-usage-per-model-call.md)), and whether its subagents
-  share one tree is *unverified*.
+  workers": the whole delegation is one journaled step (a crash runs all of it again), its parts are not durable, and over
+  ACP a child session's steps are dropped. Its subagents share one working tree (`task` makes a child session in the same
+  directory: *verified* 2026-10-11, OpenCode v1.18.33 source).
+* **Integrate OpenCode fully, through a plugin or its HTTP server** (studied 2026-10-11 at the owner's request, against
+  OpenCode v1.18.33 and 1.19.0, *verified* in their source and in `@opencode-ai/plugin` and `@opencode-ai/sdk` 1.18.33).
+  A plugin sees every session's events, subagents included, and the tokens of each model call (`step-finish` parts), and
+  `tool.execute.before` can block or rewrite a call; but `permission.ask` is declared and never called, and a plugin that
+  fails to load is skipped (fail-open). `opencode serve` can abort, fork and steer a session and answer permissions over
+  HTTP, but Adam reaches OpenCode only through the environment's exec (`podman exec`, `pods/exec`), stdin and stdout, so
+  driving it over HTTP needs a relay into every environment. Resuming a session after a crash works (SQLite,
+  `session/resume`), but interrupted calls come back as errors and the model re-plans: resumable, not a deterministic
+  replay. So OpenCode is not the main line. What is worth building while it stays: harden the present path (no project
+  `.opencode/` config or plugins, a password for its loopback server, deny rules in place of its default allow, the
+  model's context limit) and a one-way plugin that writes its child sessions, tool parts and per-call tokens as JSON lines
+  into the run's directory, read into steps and `usage/v1`, failing closed when its first line is missing. The trial in the
+  owner's answer 4 then compares workers and OpenCode on tokens too.
 * **One worker at a time.** An editing worker with today's loop: no change to the journal, and no speed, which is what the
   owner asked for. Slices 5 to 7 without 1 to 3 give exactly this, so it is a step on the way, not the goal.
 * **Remote workers (`a2a:` subagents) on pods of their own.** Each would clone, push its own branch and need GitHub
@@ -305,9 +318,10 @@ Each is testable alone, in this order.
   `parallel_tool_calls` is the schema `ParallelToolCalls`, a boolean with `default: true`.
 * *Verified 2026-10-11*, <https://opencode.ai/docs/agents/> (read through a summariser): three built-in subagents, `General`
   ("Has full tool access, so it can make file changes when needed", "run multiple units of work in parallel"), `Explore`
-  ("Cannot modify files") and `Scout` (read-only). The coder's prompt and README name only `explore` and `general`.
+  ("Cannot modify files") and `Scout` (read-only). The source of v1.18.33 and 1.19.0 has only `general` and `explore`
+  (*verified* the same day): Scout is in the docs only, so the coder's prompt rightly names the two.
 * *Verified 2026-10-11* with git 2.43.0: with a branch `agent/abc`, `git branch agent/abc/w1` fails with "cannot lock ref
   'refs/heads/agent/abc/w1': 'refs/heads/agent/abc' exists".
 * *Unverified:* whether a provider requires tool results in the order of the calls (they are appended in call order
-  anyway); whether the model gateway and models other than OpenAI's ask for several calls per turn; whether OpenCode's
-  subagents share one working tree; `flock` on NFS and Longhorn RWX for the notes lock, as for the workspace locks.
+  anyway); whether the model gateway and models other than OpenAI's ask for several calls per turn; `flock` on NFS and
+  Longhorn RWX for the notes lock, as for the workspace locks.

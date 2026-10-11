@@ -8,6 +8,11 @@ the change. Builds on [ADR 0007](0007-progress-as-steps-and-streamed-text.md) (r
 journaled model step), [ADR 0028](0028-the-card-says-which-build-answers.md) (an extension every card lists) and
 [ADR 0031](0031-swagger-ui-and-the-a2a-rest-binding.md) (two bindings, one handler).
 
+*Amended 2026-10-11 ([ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md)):* OpenCode does send tokens over ACP
+(the last model call's on a turn's response, an unstable field, and `usage_update` only when the model's context limit is
+known, which the coder never sets); adam-acp drops both, and neither is a count per call. The per-call count is OpenCode's
+`step-finish` part, which a plugin can forward (*verified* in OpenCode v1.18.33's source).
+
 ## Context
 
 *Verified 2026-10-08 by reading the code at `61d2ade`:* `adam_model::Usage` held the prompt and completion tokens only, the
