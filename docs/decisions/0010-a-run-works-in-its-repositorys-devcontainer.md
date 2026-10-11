@@ -9,6 +9,11 @@ chosen by the plan, not by the owner. **Built:** the crate `adam-devcontainer` (
 `adam-workspace`), the Podman service of the dev stack, their tests and CI job, and the coder's use of them (its configuration, its
 tools, OpenCode inside, the image, the end to end). The status notes at the end say which change built what.
 
+*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)):* the coder no longer runs
+OpenCode in a devcontainer. The tools directory holds `adam-exec` only, and decision 6's model-key file
+`/run/adam/secrets/model-key` goes: no secret enters a devcontainer. The OpenCode CLI of the image stays on `PATH`, for
+people and repositories that want it.
+
 ## Context
 
 The coder runs every command in its own container: `run_command`, `run_checks`, OpenCode, and every command

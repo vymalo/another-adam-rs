@@ -8,6 +8,10 @@ other side of the contract is the orchestration layer's: its ADR 0025 (nested st
 not stored), its ADR 0008 (an A2A extension is optional, read live from the card, removable) and its pages
 `docs/api/steps-v1.md` and `docs/api/text-stream-v1.md` in `vymalo/another-agentic-system`.
 
+*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)):* decision 7 no longer
+applies: the coder does not drive OpenCode, so no step tree hangs under a `Hand to OpenCode` call; the coder's own tool calls
+are its steps. The `opencode` icon stays in the vocabulary.
+
 ## Context
 
 An agent's work has a shape: the agent, a sub-agent it handed a task to (the coder drives OpenCode over ACP), and the

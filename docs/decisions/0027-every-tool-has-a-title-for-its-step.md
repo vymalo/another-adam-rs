@@ -5,6 +5,9 @@ Builds on [ADR 0007](0007-progress-as-steps-and-streamed-text.md) (steps and the
 [ADR 0011](0011-a-tool-calls-step-carries-its-input-and-output.md) (an MCP tool's `title` is its step's label).
 Amends [ADR 0021](0021-the-coder-is-adam-a-general-agent-that-can-code.md): the label of the OpenCode step.
 
+*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)):* decision 6 no longer
+applies: the `Hand to OpenCode` step went with its tool.
+
 ## Context
 
 The owner exported production threads of Adam (the `adam-coder` binary, image `sha-6478fbc`). The activity panel of the

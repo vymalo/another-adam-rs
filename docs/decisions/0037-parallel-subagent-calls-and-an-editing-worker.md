@@ -7,6 +7,11 @@ refusals of [Child runs](../reference/child-runs.md): "No parallel fan-out yet" 
 [ADR 0036](0036-the-coder-keeps-to-the-access-tier-the-person-picks.md) (access tiers), [ADR 0032](0032-usage-per-model-call.md)
 (usage per step) and [ADR 0016](0016-a-message-sent-to-a-working-task-is-steered-into-it.md) (steering).
 
+*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)):* the owner removed OpenCode
+from the coder. The trial in the owner's answer 4 is moot, and workers are the path for broad changes. The study under
+*Alternatives* is what led there. Decision 1's table and decision 10's list lose `delegate_to_opencode`, which no longer
+exists.
+
 ## Context
 
 In a thread of 2026-10-11 the owner asked Adam to "create sub-agents to work faster" on a React rewrite. Adam said it

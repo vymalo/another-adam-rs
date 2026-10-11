@@ -5,6 +5,10 @@ Builds on [ADR 0004](0004-agent-folders-at-run-time.md) (agent folders are read 
 [ADR 0009](0009-github-per-installation-read-through-mcp.md) (an MCP server kind is allowed by the deployment, not by the
 agent's files; secrets are never in files).
 
+*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)):* `MODEL_API_KEY` is no
+longer exempt in decision 4. Only OpenCode read it, so a `${MODEL_API_KEY}` in an `mcp.json` is hidden from the run's
+processes and redacted like any other secret.
+
 ## Context
 
 The chart of the coder wants to give it two more MCP servers (web search behind our own MCP pod, and the hosted

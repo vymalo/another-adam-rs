@@ -8,6 +8,10 @@ the crate `adam-env-kubernetes` (the `Environment`, and `adam-kube-exec`), the c
 mirrors [ADR 0010](0010-a-run-works-in-its-repositorys-devcontainer.md), which decided the same for a Podman service, and
 amends its decision 9 (see the note there).
 
+*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)):* decision 4's init container
+copies only `adam-exec`, and there is no `tool_path`. OD-K5 is reversed: a run pod gets no model key, and the admission
+policy lets it read no Secret.
+
 ## Context
 
 The coder runs every command of every run in its own container: `run_command`, `run_checks`, OpenCode and every command
