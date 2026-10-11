@@ -1,0 +1,19 @@
+{{- if include "coder.cacheOwnClaim" . }}
+# cache.create: the claim behind /cache (ADR 0040), for this release alone. A cache, not state: it goes with the
+# release (a claim you want to keep or to share between releases is cache.existingClaim).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "coder.cacheClaim" . }}
+  labels:
+    {{- include "coder.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.cache.accessModes | nindent 4 }}
+  {{- with .Values.cache.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.cache.size | quote }}
+{{- end }}

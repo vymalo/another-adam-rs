@@ -295,6 +295,29 @@ of its own, which is today's single-worker render.
 {{- end -}}
 
 {{/*
+The package cache (values `cache`, ADR 0040): one volume at /cache. Configured when cache.existingClaim names a claim or
+cache.create is true (renders "true" or nothing); mounted only by the pods that run toolchains, which is what
+coder.cache says: configured and the role runs workers.
+*/}}
+{{- define "coder.cacheConfigured" -}}
+{{- if or (default "" .Values.cache.existingClaim | toString | trim) (eq (toString .Values.cache.create) "true") -}}true{{- end -}}
+{{- end -}}
+{{- define "coder.cache" -}}
+{{- if and (include "coder.cacheConfigured" .) (include "coder.runsWorkers" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/* Whether the chart makes the cache's claim itself: "true" or nothing. */}}
+{{- define "coder.cacheOwnClaim" -}}
+{{- if and (include "coder.cache" .) (eq (toString .Values.cache.create) "true") -}}true{{- end -}}
+{{- end -}}
+
+{{/* Name of the claim behind /cache: the existing claim, or the one the chart creates. */}}
+{{- define "coder.cacheClaim" -}}
+{{- default (printf "%s-cache" (include "coder.fullname" .) | trunc 63 | trimSuffix "-") (default "" .Values.cache.existingClaim | toString | trim) -}}
+{{- end -}}
+{{- define "coder.cacheDir" -}}/cache{{- end -}}
+
+{{/*
 The extra MCP servers (values `mcp.*`, off by default). websearch is on when its url is set, context7 when
 mcp.context7.enabled is true (the string "false" is off). Each renders "true" or nothing. The binary merges
 them over the agent's own mcp.json at startup (ADAM_EXTRA_MCP_FILE): the chart ships no copy of the agent's files.

@@ -317,6 +317,33 @@ persistence:
   accessModes:
     - ReadWriteOnce
 
+# The package cache (ADR 0040): ONE volume mounted at /cache, where the workspace image keeps the caches of npm
+# (/cache/npm), pnpm (/cache/pnpm-store) and cargo (/cache/cargo: registry and git sources), so that a pod, a run
+# pod or a release does not download again what another one fetched. Off by default, and then invisible: /cache
+# is a directory of the container's own file system, lost with the pod. On, the volume is mounted in the pods that
+# run toolchains (the combined pod, the split worker, and the run pods) and the admission policy of the run pods
+# lets them mount it. The front of `split` and a control plane run none and get none. Installed binaries
+# (`cargo install`) stay private in the home, and no credential is ever written there (ADR 0040: the chart gives
+# a pod no registry token). It is a cache, not state: deleting it only makes the next builds slow.
+#
+# Exactly one of:
+#   existingClaim  the name of a ReadWriteMany claim in this namespace that you manage: the deployment-level volume
+#                  that several releases (and the operator's agents) share. The chart creates nothing.
+#   create: true   the chart makes the claim <release>-cache for this release alone (storageClass, size, accessModes).
+#                  It is deleted with the release.
+# Neither: off. The volume's root must be writable by uid and gid 10001 (podSecurityContext.fsGroup does it where the
+# storage driver supports it; otherwise chown it once). Whether the volume honours flock(2) matters to cargo: it
+# takes no lock at all on an NFS mount (ADR 0040, *verified* in cargo's source). One trust domain: every run reads
+# whatever any run wrote there, so do not share it between deployments that do not trust each other.
+cache:
+  existingClaim: ""
+  create: false
+  # With create: a class that supports ReadWriteMany. Empty: the cluster's default class.
+  storageClass: ""
+  size: 20Gi
+  accessModes:
+    - ReadWriteMany
+
 # A pod of its own for each active run (ADR 0019). Off by default: with it off the render is exactly what it was.
 # On, the coder runs the processes of a run (the project's checks, the commands that look around, OpenCode and
 # everything it starts) in a pod made from the template below, and only the files, git and the credentials stay

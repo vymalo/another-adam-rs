@@ -1298,4 +1298,61 @@ check "... the error lists the tiers" says "$message" 'plan, edits, auto or bypa
 check "refused: the cap in extraEnv beside the value" \
   fails helm template coder "$chart" --namespace coder-ns --set accessTiers.max=edits --set-string config.extraEnv.MAX_ACCESS_TIER=bypass
 
+# The package cache (ADR 0040): one volume at /cache. Off by default and then invisible (the default render
+# equals the golden above); on, mounted by the pods that run toolchains and by nothing else.
+helm_cache() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }
+helm_cache > "$out"
+check "cache off: no cache volume, mount or claim" lacks 'name: cache$|mountPath: /cache|coder-cache'
+helm_cache --set cache.existingClaim=shared-cache > "$out"
+check "cache.existingClaim: the coder container mounts /cache" dhas StatefulSet 'mountPath: /cache$'
+check "cache.existingClaim: ... from that claim" dhas StatefulSet 'claimName: shared-cache$'
+check "cache.existingClaim: /cache is mounted once, by the coder container alone (not the GitHub MCP sidecar)" \
+  dcount StatefulSet 'mountPath: /cache$' 1
+check "cache.existingClaim: the chart creates no claim" lacks '^kind: PersistentVolumeClaim$'
+check "cache.existingClaim: /work is still the per-pod claim" dhas StatefulSet 'name: work$'
+check "cache: the image's own variables are left alone (no CARGO_HOME, no npm cache variable)" \
+  lacks 'CARGO_HOME|npm_config_cache|NPM_CONFIG_CACHE'
+check "cache: no registry credential is rendered for a pod that writes the cache" \
+  lacks 'NPM_TOKEN|NODE_AUTH_TOKEN|CARGO_REGISTRY_TOKEN|CARGO_REGISTRIES_|_authToken'
+helm_cache --set cache.create=true --set cache.storageClass=rwx --set cache.size=50Gi > "$out"
+check "cache.create: one claim, coder-cache" count '^kind: PersistentVolumeClaim$' 1
+check "cache.create: ... named after the release" dhas PersistentVolumeClaim '^  name: coder-cache$'
+check "cache.create: ... ReadWriteMany" dhas PersistentVolumeClaim '^    - ReadWriteMany$'
+check "cache.create: ... of the class and size asked" dhas PersistentVolumeClaim 'storageClassName: "rwx"'
+check "cache.create: ... 50Gi" dhas PersistentVolumeClaim 'storage: "50Gi"'
+check "cache.create: ... not kept when the release goes (a cache is not state)" dlacks PersistentVolumeClaim 'resource-policy'
+check "cache.create: the pod mounts that claim" dhas StatefulSet 'claimName: coder-cache$'
+helm_cache --set cache.create=true > "$out"
+check "cache.create with no class: the cluster's default (no storageClassName)" dlacks PersistentVolumeClaim 'storageClassName'
+helm_cache --set cache.create=true --set cache.storageClass=rwx --set runPods.enabled=true > "$out"
+check "cache with run pods on: the render equals tests/golden/cache.yaml" cmp -s "$out" "$chart/tests/golden/cache.yaml"
+check "cache with run pods: the pod template mounts /cache from the claim" tpl 'mountPath: /cache$'
+check "cache with run pods: ... as a persistentVolumeClaim" tpl 'claimName: coder-cache$'
+check "cache with run pods: the admission policy lets a run pod mount the work claim and the cache claim, no other" \
+  policy_has "$pn" "claimName in ['work-coder-0', 'coder-cache']"
+helm_cache --set runPods.enabled=true --set cache.existingClaim=shared-cache > "$out"
+check "cache.existingClaim with run pods: the policy names that claim" \
+  policy_has "$pn" "claimName in ['work-coder-0', 'shared-cache']"
+helm_cache --set topology=split --set front.replicas=2 --set cache.existingClaim=shared-cache > "$out"
+check "split: the worker mounts the cache" dhas StatefulSet 'mountPath: /cache$'
+check "split: the front, which runs no toolchain, does not" dlacks Deployment 'cache'
+helm_cache --set config.role=control-plane --set cache.create=true > "$out"
+check "control plane: no cache mount and no claim" lacks 'mountPath: /cache|^kind: PersistentVolumeClaim$'
+helm_cache --set cache.create=true --set 'cache.accessModes={ReadWriteOnce}' > "$out"
+check "cache.create ReadWriteOnce is allowed for one coder pod and no run pod" dhas PersistentVolumeClaim '^    - ReadWriteOnce$'
+
+check "refused: cache.existingClaim and cache.create together" fails helm_cache --set cache.existingClaim=x --set cache.create=true
+check "refused: cache.create that is not a boolean" fails helm_cache --set-string cache.create=maybe
+check "refused: a claim name that is not one" fails helm_cache --set cache.existingClaim=Not_A_Claim
+check "refused: a size that is not a quantity" fails helm_cache --set cache.create=true --set cache.size=big
+check "refused: an unknown access mode" fails helm_cache --set cache.create=true --set 'cache.accessModes={Everywhere}'
+check "refused: a claim without ReadWriteMany beside run pods" \
+  fails helm_cache --set cache.create=true --set 'cache.accessModes={ReadWriteOnce}' --set runPods.enabled=true
+check "refused: a claim without ReadWriteMany beside several workers" \
+  fails helm_cache --set cache.create=true --set 'cache.accessModes={ReadWriteOnce}' --set workspace.placement=isolated --set replicaCount=2
+check "refused: CARGO_HOME in extraEnv beside the cache" \
+  fails helm_cache --set cache.existingClaim=shared-cache --set-string config.extraEnv.CARGO_HOME=/elsewhere
+message=$(helm_cache --set cache.existingClaim=x --set cache.create=true 2>&1 || true)
+check "... the error says what to choose" says "$message" 'not both'
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi
