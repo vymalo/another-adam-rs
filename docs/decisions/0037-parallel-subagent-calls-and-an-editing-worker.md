@@ -281,13 +281,23 @@ Each is testable alone, in this order.
    one turn and then merges a conflict.
 8. **A child's steps on the root's task** under the call's step (adam-llm-agent, adam-a2a-runtime).
 
-## Open questions for the owner
+## The owner's answers (2026-10-11)
 
-1. A message sent while workers run waits for the batch. Should it also be handed to each worker that is still working?
-2. How many at once: 4 per turn and `WORKERS=4` per process, in a run pod of 2Gi. Raise the pod, or keep 4?
-3. A worker's dependencies: linked from the root's slot (fast, but an install in one worker writes into the shared
-   `node_modules`), or installed fresh in each worker (slow, disk)?
-4. `delegate_to_opencode` in a worker is off in the first build (one OpenCode process per worker in one pod). Turn it on?
+1. **Steering.** A message sent while workers run waits for the batch and goes to the root, which re-plans with it. It is
+   not handed to the workers.
+2. **How many.** 4 per turn (`max_parallel`) and `WORKERS=4` per process, in the run pod of 2Gi.
+3. **A worker's dependencies are configurable**, per deployment and per repository: `isolated` (the default: each worker
+   installs its own, which the shared package caches in `/cache` make fast, vymalo/another-agentic-images#12) or `shared`
+   (the ignored directories of the root's slot, `node_modules` and the like, are linked into the worker: instant, but an
+   install in one worker writes into the others'). The setting is `AgentConfig`'s `spec.workers.dependencies`, with
+   `spec.workers.repositories[]` (`match`, a repository URL pattern, and `dependencies`) for the exceptions, and
+   `WORKER_DEPENDENCIES` with a chart value where there is no operator. A CRD of its own for per-project policy was
+   considered and deferred until several agents need to share one project policy. Built in slice 6 (worker worktrees).
+4. **OpenCode stays out of workers.** The owner asked whether OpenCode and ACP are still needed at all. Workers do what
+   OpenCode is used for (broad, multi-file changes) in the open: journaled, a step per call, tokens counted, the tier
+   checked at every call, and a crash resumes them; OpenCode's session is none of these. So once workers are built,
+   `delegate_to_opencode` becomes optional behind a deployment setting, and whether it stays on by default is decided
+   after a trial on real tasks (the quality of the coder's own file tools against OpenCode's).
 
 ## Verified and unverified (2026-10-11)
 
