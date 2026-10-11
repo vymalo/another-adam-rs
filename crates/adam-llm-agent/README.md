@@ -36,7 +36,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
 | `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
 | `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
-| `ToolSource`, `DynToolSource`, `SourceCtx`, `LlmAgentBuilder::tool_source`, `MAX_SOURCE_TOOLS` | tools the agent learns about while it runs: a source lists its tools at every model turn (`specs(&SourceCtx)`, or `listing` for the tools **and their notes**), may rewrite how the tools of that turn are described (`refine(&SourceCtx, &mut [ToolSpec])`, default: nothing), may add words to the agent's instructions for the turn (`instructions(&SourceCtx) -> Option<String>`, default: nothing) and answers the calls to them (`call(&ToolCtx, name, args) -> Option<..>`), see *Context and tool sources* |
+| `ToolSource`, `DynToolSource`, `SourceCtx`, `LlmAgentBuilder::tool_source`, `MAX_SOURCE_TOOLS` | tools the agent learns about while it runs: a source lists its tools at every model turn (`specs(&SourceCtx)`, or `listing` for the tools **and their notes**), may rewrite how the tools of that turn are described (`refine(&SourceCtx, &mut [ToolSpec])`, default: nothing), may add words to the agent's instructions for the turn (`instructions(&SourceCtx) -> Option<String>`, default: nothing), **holds tools back** (`withhold(&SourceCtx) -> Vec<Withheld>`, default: none: the named tools, the agent's own and the MCP servers' included, are not shown to the model on that turn, and a call to one is refused with the `Withheld::reason` when it would run) and answers the calls to them (`call(&ToolCtx, name, args) -> Option<..>`), see *Context and tool sources* |
 | `Listing`, `ToolNote`, `Conversation::source_notes` | what a source says about a tool it lists: the system behind it **reports each call as a step itself** (`reports_step`, so the agent reports none), how long a call may run (`timeout_ms`) and what its step is called (`label`); kept in the run's state with the model's answer, so a later call, on another worker, reads it without listing again |
 | `Conversation::context`, `merge_context`, `drop_expired_context`, `MAX_CONTEXT_BYTES` | what the messages of the run say about their sender, merged key by key (`null` deletes), bounded, with expiring entries; see *Context and tool sources* |
 | `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed), `Conversation::root_run` the top of a child run's parent chain (absent for a run that is nobody's child, and in state stored before it existed) |
@@ -170,6 +170,13 @@ has, among which a tool the agent already owns): the omission is then a debug li
 `MAX_SOURCE_TOOLS` (64) are offered, and an agent with no source behaves exactly as before. A source's tool may ask
 the person and wait for a child run, but not wait on a remote task (`AwaitRemote` is answered with an error result:
 the agent polls the tool that started the task, and a source's tool is not known then).
+
+A source can also **hold tools back** (`ToolSource::withhold(&SourceCtx) -> Vec<Withheld>`, each `Withheld { tool, reason }`; the
+default holds nothing, so a source written before it keeps working): the named tools, **whoever offers them** (the agent's own,
+a source's, an MCP server's), are taken out of what the model is shown on that turn, and a call to one is **refused when it
+would run**, inside the journaled step of the call, with the `reason` as its error result. The two moments read the run's context
+as it is then, so a limit a message sets (the coder's access tier) holds from the next model turn and the next call, and a replay
+reads nothing. It is a limit on what the agent may do, not a description: `refine` only rewrites text.
 
 A source can also **refine** the description of the tools the model is about to be shown (`ToolSource::refine`): after
 every source has listed, each gets the turn's tools, the agent's own first, and may rewrite a `description` from what it
@@ -498,7 +505,7 @@ the answer with their stream, a replay after a crash inside the next tool keeps 
 tool again, a message that reaches the run clears it, a final answer ends the turn with no model call after it (and the calls
 of its model message are all answered first, and a refused one ends nothing), and the serde shapes of older journals.
 
-`tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
+`tests/withheld_tools.rs` covers `withhold`: a held-back tool (own or a source's) is not shown and a call to it is refused with the reason while the others run, a limit a later message lifts holds no more from the next turn, and a source that holds nothing changes nothing. `tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
 the context of the start message reaching a tool, replace/delete/keep across messages, a continued run carrying the
 context (and the new message winning), the expiry, the size bound, state stored before the context existed, a question
 that keeps its interface and the frozen shapes of old journals, a source read at every turn (a tool offered since the

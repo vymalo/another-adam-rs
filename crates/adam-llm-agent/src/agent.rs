@@ -25,7 +25,9 @@ use crate::conversation::{
     parse_context, parse_root_run, parse_root_step, parse_user_text,
 };
 use crate::history::fit_history;
-use crate::source::{DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined};
+use crate::source::{
+    DynToolSource, SourceCtx, ToolNote, ToolSource, instructed, offered, refined, withheld,
+};
 use crate::state::Extensions;
 use crate::step_io::StepIo;
 use crate::text_stream;
@@ -843,6 +845,13 @@ impl LlmAgent {
                     request.tools.extend(more);
                     notes = said;
                     refined(&sources, source_ctx, &mut request.tools).await;
+                    // What a source holds back is not shown, the agent's own tools included.
+                    let held = withheld(&sources, source_ctx).await;
+                    if !held.is_empty() {
+                        request
+                            .tools
+                            .retain(|t| !held.iter().any(|h| h.tool == t.name));
+                    }
                     // What the sources add to the instructions (the agents a person mentioned): read
                     // here with the tools, so a replay of a recorded turn reads nothing.
                     if let Some(more) = instructed(&sources, source_ctx).await {
@@ -1242,9 +1251,30 @@ impl LlmAgent {
             .with_note(note.cloned())
             .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used));
         let args = call.arguments.clone();
+        // What a source holds back is refused here too, inside the step that records the answer:
+        // the model was shown the tools of a turn that may be over, or named one it was not shown.
+        let holding = (!self.sources.is_empty()).then(|| {
+            (
+                self.sources.clone(),
+                SourceCtx::new(
+                    ctx.run_id(),
+                    ctx.conversation_id().map(str::to_owned),
+                    Arc::new(context.clone()),
+                ),
+                call.name.clone(),
+            )
+        });
         let outcome: Result<ToolOutput, ToolError> = match self.tool(&call.name).cloned() {
             Some(tool) => {
                 ctx.step(&format!("tool:{}", call.id), move || async move {
+                    if let Some((sources, source_ctx, name)) = &holding
+                        && let Some(held) = withheld(sources, source_ctx)
+                            .await
+                            .into_iter()
+                            .find(|h| h.tool == *name)
+                    {
+                        return Ok(ToolOutput::error(held.reason));
+                    }
                     tool.call(&tool_ctx, args).await
                 })
                 .await?
@@ -1276,6 +1306,14 @@ impl LlmAgent {
                 let name = call.name.clone();
                 let unknown = self.unknown_tool(&call.name);
                 ctx.step(&format!("tool:{}", call.id), move || async move {
+                    if let Some((sources, source_ctx, name)) = &holding
+                        && let Some(held) = withheld(sources, source_ctx)
+                            .await
+                            .into_iter()
+                            .find(|h| h.tool == *name)
+                    {
+                        return Ok(ToolOutput::error(held.reason));
+                    }
                     for source in &sources {
                         if let Some(answer) = source.call(&tool_ctx, &name, args.clone()).await {
                             return answer;

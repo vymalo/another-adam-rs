@@ -166,6 +166,25 @@ impl SourceCtx {
     }
 }
 
+/// A tool a [`ToolSource`] holds back on one turn, and what to tell the model if it calls it anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withheld {
+    /// The tool's name: the agent's own tool or one of a source's.
+    pub tool: String,
+    /// What the model is told when it calls the tool: the result of the call, as an error.
+    pub reason: String,
+}
+
+impl Withheld {
+    /// `tool` is held back; a call to it answers `reason`.
+    pub fn new(tool: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
 /// A group of tools the agent learns about while it runs, not when it is built: what a caller
 /// says it can offer in the messages it sends (the endpoint for a thread's tools, for instance),
 /// read again at every model turn.
@@ -230,6 +249,22 @@ pub trait ToolSource: Send + Sync + 'static {
     /// nothing: a source that cannot tell leaves the descriptions as they are. The default does.
     async fn refine(&self, ctx: &SourceCtx, specs: &mut [ToolSpec]) {
         let _ = (ctx, specs);
+    }
+
+    /// The tools this source holds back on this turn, **whoever offers them**: the agent's own, a
+    /// source's, one of an MCP server's. The agent leaves them out of what the model is shown, and
+    /// **again refuses a call to one of them** at the moment it would run (the model may name a tool
+    /// it was not shown, or one it was shown a turn ago), with the [`Withheld::reason`] as the
+    /// call's error result. For a limit the run's context sets, such as the access tier a person
+    /// picked for a message: the prompt tells the model the limit, this makes it hold.
+    ///
+    /// Read from the run's context at both moments (a limit that changes takes effect on the next
+    /// turn and the next call), inside the journaled step, so a replay reads nothing. It has no
+    /// error to return: a source that cannot tell holds nothing back. The default holds nothing
+    /// back, so a source written before this method keeps working.
+    async fn withhold(&self, ctx: &SourceCtx) -> Vec<Withheld> {
+        let _ = ctx;
+        Vec::new()
     }
 
     /// Whether `name`, a tool this source listed and the agent leaves out because `taken` (the
@@ -322,6 +357,19 @@ fn keep_notes(notes: &mut Vec<ToolNote>, from: Vec<ToolNote>, kept: &[ToolSpec])
             notes.push(note);
         }
     }
+}
+
+/// What `sources` hold back on this turn, in order: the names, each once, with the first reason.
+pub(crate) async fn withheld(sources: &[DynToolSource], ctx: &SourceCtx) -> Vec<Withheld> {
+    let mut held: Vec<Withheld> = Vec::new();
+    for source in sources {
+        for one in source.withhold(ctx).await {
+            if !held.iter().any(|h| h.tool == one.tool) {
+                held.push(one);
+            }
+        }
+    }
+    held
 }
 
 /// What the sources add to the agent's instructions for this turn, in order, as one text (blank-line
