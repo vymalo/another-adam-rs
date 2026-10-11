@@ -518,6 +518,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "rebuild_environment",
             "commit_and_push",
             "open_pull_request",
+            "merge_pull_request",
             "ask_user",
             "show",
             "ui_catalog",
