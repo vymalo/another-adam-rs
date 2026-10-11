@@ -81,7 +81,7 @@ pub fn named_by(inbound: &Inbound) -> Option<AccessTier> {
 ///
 /// The coder's own tools are listed. A tool of a server (`<server>__<tool>`: the GitHub MCP server's,
 /// the web search a conversation attaches) is a read, usable at every tier, when its name says so
-/// ([`reads`]); any other tool the coder does not know is `auto`, never lower: **an unknown tool is
+/// (`reads`); any other tool the coder does not know is `auto`, never lower: **an unknown tool is
 /// not offered to a person who asked only for a plan**.
 pub fn needs(tool: &str) -> AccessTier {
     known(tool).unwrap_or_else(|| match tool.split_once("__") {

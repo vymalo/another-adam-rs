@@ -509,7 +509,7 @@ impl RunNotes {
     }
 
     /// Make the words of `text`, the person's newest message, the words that stand alone in it
-    /// ([`standalone_words`]) and nothing else; returns whether that changed anything.
+    /// (`standalone_words`) and nothing else; returns whether that changed anything.
     pub fn set_said_words(&mut self, text: &str) -> bool {
         let mut words: Vec<String> = Vec::new();
         for word in standalone_words(text) {
