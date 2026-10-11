@@ -436,7 +436,7 @@ struct Rig {
     fx: Fixture,
     ctx: ToolCtx,
     /// What the person has said so far, oldest first.
-    said: std::sync::Mutex<Vec<String>>,
+    said: std::sync::Mutex<Vec<adam_coder::tools::notes::Heard>>,
 }
 
 impl Rig {
@@ -464,7 +464,10 @@ impl Rig {
         let host = self.fx.env.settings.default_repo_host.clone();
         let mut notes = self.fx.env.notes.load(&run).await.unwrap();
         // The earlier words stand as they were said: the conversation so far, then this.
-        self.said.lock().unwrap().push(text.to_owned());
+        self.said
+            .lock()
+            .unwrap()
+            .push(adam_coder::tools::notes::Heard::said(text));
         let said = self.said.lock().unwrap().clone();
         notes.hear(&said, &host, &[]);
         self.fx.env.notes.save(&run, &notes).await.unwrap();
@@ -2111,4 +2114,71 @@ async fn a_subagent_keeps_a_servers_tools_to_the_tier_of_the_root_run() {
         "{refused}"
     );
     assert_eq!(ran.load(SeqCst), 1, "only the read reached the server");
+}
+
+// ------------------------------------------------------------------------------- one whole task
+
+/// The work and the merge in one task, with **no hand-written notes**: the run pushes a commit and
+/// opens its pull request, and the merge is allowed only because the tools themselves noted the
+/// commit they pushed, the very commit the host reports as the pull request's head, which is the one
+/// the merge is told to merge (`expected_sha`). The person named the repository and no pull request.
+#[tokio::test]
+async fn a_task_that_pushes_and_opens_a_pull_request_may_merge_it_on_its_own_notes() {
+    // The fixture's remote is a path: `local` is the host of such a repository.
+    let fx = Fixture::new("hello\n")
+        .await
+        .tweaked(|s| s.default_repo_host = "local".to_owned());
+    let at = RepoRef::new(fx.remote_url(), "main").locate().unwrap();
+    fx.mount_pull_of_the_remote(7, &format!("{}/{}", at.owner, at.name))
+        .await;
+    let url = fx.remote_url();
+    let (requests, _) = drive(
+        &fx,
+        &format!("In {url} (base branch main) add notes.txt and merge it once it is checked"),
+        Some(AccessTier::Auto),
+        |m| {
+            m.push_tool_calls(vec![call(
+                "a1",
+                "prepare_workspace",
+                json!({"repo_url": url, "base_branch": "main"}),
+            )])
+            .push_tool_calls(vec![call(
+                "a2",
+                "write_file",
+                json!({"path": "notes.txt", "content": "notes\n"}),
+            )])
+            .push_tool_calls(vec![call(
+                "a3",
+                "run_checks",
+                json!({"command": "test -s notes.txt"}),
+            )])
+            .push_tool_calls(vec![call(
+                "a4",
+                "commit_and_push",
+                json!({"message": "docs: add notes"}),
+            )])
+            .push_tool_calls(vec![call(
+                "a5",
+                "open_pull_request",
+                json!({"title": "docs: add notes", "body": "Adds notes.txt.\n\n## Verification\n- `test -s notes.txt`: passed"}),
+            )])
+            .push_tool_calls(vec![call(
+                "a6",
+                "merge_pull_request",
+                json!({"repo": url, "number": 7}),
+            )])
+            .push_text("Merged.");
+        },
+    )
+    .await;
+    let last = requests.last().expect("the model was asked");
+    let merged = result_of(last, "a6");
+    assert!(merged.contains("Merged pull request #7"), "{merged}");
+    // The host was told to merge the commit the run pushed, and nothing else.
+    let branches = fx.agent_branches();
+    assert_eq!(branches.len(), 1, "{branches:?}");
+    let pushed = common::git(&fx.remote, &["rev-parse", &branches[0]]);
+    let merges = fx.merge_requests().await;
+    assert_eq!(merges.len(), 1, "{merges:?}");
+    assert_eq!(merges[0]["sha"], pushed.as_str(), "{merges:?}");
 }

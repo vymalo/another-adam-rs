@@ -411,6 +411,38 @@ pub async fn mount_pull_from(
     .await;
 }
 
+/// Pull request `number` of `octo/widgets` as the fixture's remote has it **now**: open, from the
+/// first `agent/` branch there, whose head is that branch's tip, in the repository `head_repo`.
+struct PullOfTheRemote {
+    remote: PathBuf,
+    number: u64,
+    head_repo: String,
+}
+
+impl Respond for PullOfTheRemote {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let branches = git(
+            &self.remote,
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/agent",
+            ],
+        );
+        let branch = branches.lines().next().unwrap_or_default().to_owned();
+        let sha = git(&self.remote, &["rev-parse", &branch]);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "number": self.number,
+            "html_url": pull_url(self.number),
+            "state": "open",
+            "merged": false,
+            "mergeable_state": "clean",
+            "head": {"ref": branch, "sha": sha, "repo": {"full_name": self.head_repo}},
+            "base": {"ref": "main", "repo": {"full_name": "octo/widgets"}},
+        }))
+    }
+}
+
 /// The statuses and check runs the mock GitHub reports for commit `sha` of `slug`.
 pub async fn mount_checks(github: &MockServer, slug: &str, sha: &str, status: Value, runs: Value) {
     mount_checks_at(github, slug, sha, status, runs, 5).await;
@@ -956,6 +988,69 @@ impl Fixture {
         .lines()
         .map(str::to_owned)
         .collect()
+    }
+
+    /// Make the mock GitHub answer for pull request `number` of `octo/widgets` (the one the mock
+    /// gives the first pull request) as the remote has it when asked: from the branch the run pushed,
+    /// with that very commit as its head and every check passed on whatever commit that is, and take
+    /// its merge. `head_repo` is the repository the head is said to be in.
+    pub async fn mount_pull_of_the_remote(&self, number: u64, head_repo: &str) {
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/widgets"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"full_name": "octo/widgets"})),
+            )
+            .mount(&self.github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/octo/widgets/pulls/{number}")))
+            .respond_with(PullOfTheRemote {
+                remote: self.remote.clone(),
+                number,
+                head_repo: head_repo.to_owned(),
+            })
+            .mount(&self.github)
+            .await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/repos/octo/widgets/commits/[0-9a-f]+/status$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"state": "success", "total_count": 1})),
+            )
+            .mount(&self.github)
+            .await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/repos/octo/widgets/commits/[0-9a-f]+/check-runs$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total_count": 1,
+                "check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}],
+            })))
+            .mount(&self.github)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/repos/octo/widgets/pulls/{number}/merge")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"sha": "feedface", "merged": true})),
+            )
+            .mount(&self.github)
+            .await;
+    }
+
+    /// The JSON bodies of every merge the mock GitHub received (`PUT .../merge`).
+    pub async fn merge_requests(&self) -> Vec<Value> {
+        self.github
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("/merge"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap_or(Value::Null))
+            .collect()
     }
 
     /// `hello.txt` as committed on `branch` of the remote.
