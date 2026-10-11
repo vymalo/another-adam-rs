@@ -1295,5 +1295,7 @@ check "a padded, mixed-case cap is read as the word" has 'value: "auto"'
 message=$(helm template coder "$chart" --namespace coder-ns --set accessTiers.max=root 2>&1 || true)
 check "refused: a cap that is not a tier" fails helm template coder "$chart" --namespace coder-ns --set accessTiers.max=root
 check "... the error lists the tiers" says "$message" 'plan, edits, auto or bypass'
+check "refused: the cap in extraEnv beside the value" \
+  fails helm template coder "$chart" --namespace coder-ns --set accessTiers.max=edits --set-string config.extraEnv.MAX_ACCESS_TIER=bypass
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi
