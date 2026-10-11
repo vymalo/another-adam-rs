@@ -1209,7 +1209,8 @@ records nothing, so the pull request is allowed only after `run_checks` has run 
 OpenCode's edits. A file a command made is shared with `share_file`, which reads the workspace's one directory whatever
 ran in it. A screenshot of a web page is one: the prompt names `obscura`, the headless browser of the coder's image and of
 the default environment, with `--allow-private-network` for a page served on 127.0.0.1, and says to delete the picture
-before committing.
+before committing. It names it as part of the environment, for any page, and forbids installing Chromium, Playwright or
+another browser: a check that needs one is a missing toolchain (a live run installed both although obscura was there).
 
 ### A task that continues a task
 
