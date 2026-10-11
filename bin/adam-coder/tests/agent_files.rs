@@ -257,9 +257,9 @@ async fn the_prompt_gives_the_agent_a_name_and_asks_for_plain_words() {
         "and never say",
         "A greeting gets a greeting.",
         "\"list your tools\".**",
-        "Then say what you cannot do and\n  why:",
-        "you create one only\n  where this deployment allows it",
-        "Do not list the tools; name one only when asked.",
+        "cannot do, and why:",
+        "you can create one only where this deployment allows it",
+        "Do not\n  list the tools.",
         // A greeting is answered, not treated as a missing task.
         "so do not call a tool for it",
     ] {
