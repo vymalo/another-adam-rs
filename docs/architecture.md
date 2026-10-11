@@ -622,6 +622,57 @@ sequenceDiagram
 * **Defaults** (`runtime.rs`, `retry.rs`): lease 30 s, poll 250 ms, 4 concurrent runs per worker loop,
   5 tries per transition, backoff 1 s doubling to 60 s.
 
+### The access tier: which tools a step may use
+
+The person picks a tier for each message (`plan`, `edits`, `auto`, `bypass`; the A2A extension `access-tier/v1`, [ADR 0036](decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)).
+The backend reads it (`crates/adam-a2a-runtime/src/tier.rs`), the coder keeps to it for what the **model** does through its tools
+(`bin/adam-coder/src/tier.rs`). It is not a boundary against a command: see the ADR, decision 6.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant B as RuntimeTaskBackend
+    participant A as CoderAgent.step
+    participant S as TierSource
+    participant L as Gated tool and its body
+    participant H as CodeHost
+    C->>B: SendMessage with metadata access-tier = {tier}
+    alt not a tier the card lists (up to MAX_ACCESS_TIER)
+        B-->>C: InvalidParams, nothing is written
+    else
+        B->>A: inbound message, context vymalo.accessTier
+    end
+    A->>A: record_grants: RunNotes.tier = tier of the newest message, never above the cap
+    A->>S: model turn: withhold(tools of the turn)
+    S-->>A: the tools above the tier are not shown
+    A->>S: the model calls a tool anyway: withhold again, inside the step
+    S-->>A: refused with the reason, the tool is not run
+    A->>L: call (a subagent: the root run's notes)
+    L->>L: no notes is a plan, and the tool checks the tier again (merge, rename, delete)
+    L->>H: only what the tier allows
+    H-->>L: GitHub decides, its words come back with an error class
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Auto: a task starts at the default
+    Auto --> Plan: a message names plan
+    Auto --> Edits: a message names edits
+    Auto --> Bypass: a message names bypass (only under MAX_ACCESS_TIER=bypass)
+    Plan --> Auto: a message names auto
+    Plan --> Edits: a message names edits
+    Edits --> Plan: a message names plan
+    Edits --> Auto: a message names auto
+    Bypass --> Auto: a message names auto
+    Auto --> [*]: the task ends (a new task is Auto again)
+```
+
+* **The newest message that names a tier wins**, from the next step; one that names none leaves it. A larger context never
+  drops the tier (`PROTECTED_CONTEXT_KEYS`), and a child run starts with its parent's.
+* **`merge_pull_request` needs more than the tier**: a pull request of this conversation or one the person named, green checks on
+  the commit it merges, and the person's word again for one opened with red checks accepted.
+
 ## The run lifecycle
 
 `RunStatus` (`crates/adam-core/src/store/mod.rs`) has four values: `Runnable`, `Parked`, `Done`,
