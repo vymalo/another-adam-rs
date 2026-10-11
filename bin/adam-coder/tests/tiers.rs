@@ -1,4 +1,4 @@
-//! The access tiers of the coder (`access-tier/v1`, ADR 0035), end to end where it matters and tool
+//! The access tiers of the coder (`access-tier/v1`, ADR 0036), end to end where it matters and tool
 //! by tool where the rule is:
 //!
 //! * the tools the model is **shown** on a turn depend on the tier of the message (a real `Runtime`,

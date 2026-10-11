@@ -326,7 +326,7 @@ float on both bindings, a whole one (`41250.0`). Unit tests in `src/usage.rs`; `
 
 ## The access tier
 
-`access-tier/v1` (the contract of `docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`, ADR 0035 of this repository). With
+`access-tier/v1` (the contract of `docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`, ADR 0036 of this repository). With
 `with_access_tiers(tiers)`, for an agent whose card lists the extension (`ExtensionConfig::access_tier`):
 
 | | |

@@ -83,7 +83,7 @@ pub const USAGE_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/usag
 /// under this URI, `{"tier": "plan" | "edits" | "auto" | "bypass"}`, how much the agent may do alone
 /// for that message. The card's `params` are `{"tiers": [..], "default": ..}`; the agent echoes the
 /// tier it works under in the task's metadata under this URI. The contract is the orchestration
-/// layer's (`docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`); ADR 0035 is this
+/// layer's (`docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`); ADR 0036 is this
 /// repository's side.
 pub const ACCESS_TIER_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/access-tier/v1";
 

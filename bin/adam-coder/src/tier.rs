@@ -1,4 +1,4 @@
-//! The access tier the coder keeps to (`access-tier/v1`, ADR 0035).
+//! The access tier the coder keeps to (`access-tier/v1`, ADR 0036).
 //!
 //! The person picks a tier for each message: `plan`, `edits`, `auto` or `bypass`. The A2A backend
 //! reads it from the message ([`adam_a2a_runtime`]) and hands it to the run as the context key

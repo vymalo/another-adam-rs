@@ -92,7 +92,7 @@ async fn build_agent(
         .create_repo_owners
         .clone_from(&worker.create_repo_owners);
     // With no `CREATE_REPO_OWNERS`, a GitHub App creates for the accounts it is installed on (the
-    // access tiers, ADR 0035); a token has no such list and keeps the tool off until owners are named.
+    // access tiers, ADR 0036); a token has no such list and keeps the tool off until owners are named.
     settings.create_for_installed_owners = matches!(worker.github, GitHubAuth::App(_));
     settings.container_network_none = worker.devcontainer.network == Network::None;
     settings.check_timeout = worker.check_timeout;

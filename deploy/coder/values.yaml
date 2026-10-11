@@ -127,7 +127,7 @@ github:
   #        githubToken entry. The key is read at startup: a rotated key needs a restart.
   auth: token
   # The owners (users or organisations) the coder may create repositories for, after the person it
-  # works with agrees (not under the bypass access tier; ADR 0009, decision 9, ADR 0035). A list
+  # works with agrees (not under the bypass access tier; ADR 0009, decision 9, ADR 0036). A list
   # restricts to exactly these. Empty (default): a GitHub App creates for the accounts it acts for
   # and a token creates nothing (the tool is off). A GitHub App creates for organisations only and
   # needs the Administration permission; a token creates for the person it belongs to and for
