@@ -39,6 +39,7 @@ mod push;
 mod steps;
 mod subscribe;
 mod text_stream;
+mod tier;
 mod usage;
 mod vymalo;
 
@@ -49,6 +50,7 @@ pub use convert::{
 pub use ids::task_id_for;
 pub use list::MAX_SCAN;
 pub use push::StorePushStore;
+pub use tier::CONTEXT_ACCESS_TIER;
 pub use usage::MAX_TOKEN_COUNT;
 pub use vymalo::{
     CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF,

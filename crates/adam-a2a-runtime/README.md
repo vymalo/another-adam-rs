@@ -23,6 +23,7 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `MAX_REFERENCES` | how many of a message's `referenceTaskIds` are looked at (8); see *Continuing a task* |
 | `RuntimeTaskBackend::list` (`TaskBackend::list`), `MAX_SCAN` | `ListTasks`: the caller's tasks, newest update first, by keyset cursor; see *Listing tasks* |
 | `MAX_TOKEN_COUNT` | the largest count a `usage/v1` report or total carries (2^53 - 1); see *Usage* |
+| `RuntimeTaskBackend::with_access_tiers(AccessTiers)`, `CONTEXT_ACCESS_TIER` | `access-tier/v1`: the backend reads the tier of a message that activated the extension, refuses a bad one, and says the tier a task works under; the tier is the run's context key `vymalo.accessTier` = `{"tier": ..}`; see *The access tier* |
 | `RuntimeTaskBackend::push_store()`, `StorePushStore::new(store, agent)` | the `adam_a2a::push::PushStore` over the run `Store`: configs and delivery progress next to the runs, so a restart or another replica loses nothing; see *Push notifications* |
 
 ```rust
@@ -322,6 +323,22 @@ a working task, and a task whose agent keeps none, carries none. Nothing is stor
 `MAX_TOKEN_COUNT` and consistent (`totalTokens` is the sum, a part never exceeds its total); labels at most 128 bytes. A
 stream's last status update carries no totals: a client reads them from the task. The SDK writes a number of metadata as a
 float on both bindings, a whole one (`41250.0`). Unit tests in `src/usage.rs`; `tests/usage.rs`.
+
+## The access tier
+
+`access-tier/v1` (the contract of `docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`, ADR 0035 of this repository). With
+`with_access_tiers(tiers)`, for an agent whose card lists the extension (`ExtensionConfig::access_tier`):
+
+| | |
+|---|---|
+| A message whose request **activated** the extension (`Caller::extensions`) | must carry `metadata[URI] = {"tier": "plan" \| "edits" \| "auto" \| "bypass"}`, a tier the agent honours. Anything else (no entry, an entry that is not an object, a `tier` that is missing, not a string, not exactly one of the four words, or not honoured) is **`InvalidParams`** (A2A `-32602`) with a sentence, **before anything is written**: no task, no run. A tier is never rounded |
+| the tier of an accepted message | the run's inbound context key `vymalo.accessTier` = `{"tier": ..}` (`CONTEXT_ACCESS_TIER`), merged like any key: the **newest message that names one wins** from the agent's next step, and a message that names none leaves it. This holds for a message to an open task too (an answer, a steer) |
+| a message that did **not** activate it | no tier is read, whatever its metadata says; the context is untouched |
+| **A task never inherits** | a new task that continues another starts with the earlier task's context, so **the agent drops the key at `init_continuing`** (the coder's `CoderStarter` does); the backend cannot know which keys an agent keeps |
+| the echo | to a caller that activated it, `metadata[URI] = {"tier": ..}` on the task of `SendMessage`, `GetTask` and a steered message's answer, and on the first frame of a stream; the tier said is the one in the run's state, else the agent's default. A stream says it again, in a status update (the current state, no message), **when the tier of the run changes** (the run committed the step that read the message), once per change |
+| a backend with no `with_access_tiers` | never reads or says a tier |
+
+Unit tests in `src/tier.rs` (the validation sentences, the context) and `tests/access_tier.rs` (a real `Runtime` and `LlmAgent`: the tier reaches the run and the task, the first frame and `GetTask` say it, a caller that did not activate it reads none, every kind of bad tier is `InvalidParams` and writes no run, a message that did not activate it carries no tier and an activated reader is told the default, a backend with no tiers reads none, and a tier changed by a message sent while the task works is said once on the stream).
 
 ## Stable ids
 

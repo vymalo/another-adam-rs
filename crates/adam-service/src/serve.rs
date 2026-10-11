@@ -83,6 +83,11 @@ pub struct Agents {
     /// sets [`vymalo_inbound`](adam_a2a_runtime::vymalo_inbound). Only the roles that serve A2A
     /// use it.
     pub inbound: Option<InboundFn>,
+    /// The access tiers the agent's card declares (`access-tier/v1`), when it does: the backend
+    /// then reads the tier of a message that activated the extension, refuses a bad one and says
+    /// the tier a task works under. `None`: the extension is never read or said. Only the roles
+    /// that serve A2A use it.
+    pub access_tiers: Option<adam_a2a::AccessTiers>,
     /// The components the binary adds to the worker tier ([`Agents::worker_component`]).
     components: Vec<(String, StartComponent)>,
 }
@@ -99,6 +104,7 @@ impl Agents {
             register: Box::new(register),
             options: RuntimeOptions::default(),
             inbound: None,
+            access_tiers: None,
             components: Vec::new(),
         }
     }
@@ -159,6 +165,17 @@ impl Agents {
     }
 }
 
+impl Agents {
+    /// The agent honours `tiers` of `access-tier/v1`: declare them on the card
+    /// ([`ExtensionConfig::access_tier`](adam_a2a::ExtensionConfig::access_tier)) and the backend
+    /// reads and says them. See [`Agents::access_tiers`](struct@Agents#structfield.access_tiers).
+    #[must_use]
+    pub fn access_tiers(mut self, tiers: adam_a2a::AccessTiers) -> Self {
+        self.access_tiers = Some(tiers);
+        self
+    }
+}
+
 impl std::fmt::Debug for Agents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Agents")
@@ -166,6 +183,7 @@ impl std::fmt::Debug for Agents {
             .field("card", &self.card.is_some())
             .field("options", &self.options)
             .field("inbound", &self.inbound.is_some())
+            .field("access_tiers", &self.access_tiers)
             .field(
                 "components",
                 &self
@@ -328,6 +346,7 @@ pub async fn serve(
         register,
         options,
         inbound,
+        access_tiers,
         components,
     } = agents;
     if role.runs_control_plane() && card.is_none() {
@@ -358,7 +377,8 @@ pub async fn serve(
     let worker_id = options.worker_id.clone();
     let component_store = store.clone();
     let service = Service::new_with(register(Runtime::builder(store)), name, &options, live)
-        .with_inbound(inbound);
+        .with_inbound(inbound)
+        .with_access_tiers(access_tiers);
 
     // Bind before anything runs: an address that cannot be bound fails the process at once.
     let listener = TcpListener::bind(config.listen_addr)

@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
 use adam_a2a::{
-    BackendError, Caller, STEER_EXTENSION, TaskBackend, TaskEvent, TaskPage, TaskQuery,
+    ACCESS_TIER_EXTENSION, AccessTiers, BackendError, Caller, STEER_EXTENSION, TaskBackend,
+    TaskEvent, TaskPage, TaskQuery,
 };
 use adam_core::{RunId, StoreError};
 use adam_error::ErrorClass;
@@ -20,6 +21,7 @@ use crate::convert::{
 };
 use crate::ids::task_id_for;
 use crate::subscribe;
+use crate::tier;
 
 /// Default interval at which a subscription re-reads the durable run.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -132,6 +134,18 @@ pub const MAX_REFERENCES: usize = 8;
 /// the backend never guesses "the latest task of the context". Repeating a request (same
 /// `messageId`) is idempotent as ever.
 ///
+/// # The access tier (`access-tier/v1`)
+///
+/// With [`with_access_tiers`](Self::with_access_tiers), a message whose request **activated**
+/// [`ACCESS_TIER_EXTENSION`] must name a tier the agent honours in its metadata under that URI,
+/// or it is refused (`InvalidParams`, before anything is written). The tier reaches the run as the
+/// context key [`CONTEXT_ACCESS_TIER`](crate::CONTEXT_ACCESS_TIER) and the agent keeps to it from
+/// its next step; a message that does not activate the extension carries no tier, whatever its
+/// metadata says. To a caller that activated it, a task says the tier it works under in its
+/// `metadata` (the `SendMessage` answer, `GetTask`, the first frame of a stream) and a stream says
+/// it again in a status update when it changes. The state of the run is the truth: the tier said is
+/// the one in its context, else the agent's default.
+///
 /// "The caller" is the authenticated subject ([`Caller::subject`]). The anonymous caller of an
 /// unauthenticated server is every client at once, so **a message from it never continues
 /// anything**: references are ignored (debug log) and the task starts fresh. With token
@@ -178,6 +192,8 @@ pub struct RuntimeTaskBackend {
     pub(crate) poll: Duration,
     pub(crate) prompt: PromptFn,
     pub(crate) inbound: InboundFn,
+    /// The tiers of `access-tier/v1` this agent honours, when its card declares them.
+    pub(crate) access_tiers: Option<AccessTiers>,
 }
 
 impl std::fmt::Debug for RuntimeTaskBackend {
@@ -199,6 +215,7 @@ impl RuntimeTaskBackend {
             poll: DEFAULT_POLL_INTERVAL,
             prompt: Arc::new(default_prompt),
             inbound: Arc::new(default_inbound),
+            access_tiers: None,
         }
     }
 
@@ -238,6 +255,16 @@ impl RuntimeTaskBackend {
         f: impl Fn(&Message) -> Result<adam_runtime::Inbound, String> + Send + Sync + 'static,
     ) -> Self {
         self.inbound = Arc::new(f);
+        self
+    }
+
+    /// Serve `access-tier/v1` for an agent whose card declares `tiers`
+    /// ([`ExtensionConfig::access_tier`](adam_a2a::ExtensionConfig::access_tier)): see
+    /// "The access tier" in the type's documentation. Without it the extension is never read or
+    /// echoed, whatever a request names.
+    #[must_use]
+    pub fn with_access_tiers(mut self, tiers: AccessTiers) -> Self {
+        self.access_tiers = Some(tiers);
         self
     }
 
@@ -520,6 +547,7 @@ impl RuntimeTaskBackend {
     /// one that vanished is not found.
     async fn steer(
         &self,
+        caller: &Caller,
         run: RunId,
         context: &str,
         inbound: adam_runtime::Inbound,
@@ -539,7 +567,7 @@ impl RuntimeTaskBackend {
         }
         // The delivery is a commit, so a run nobody has stepped yet reads `working` from here on.
         let view = self.view_of(run).await?;
-        Ok(task_from_view(&view, context, &self.prompt))
+        Ok(self.said(caller, &view, task_from_view(&view, context, &self.prompt)))
     }
 
     async fn view_of(&self, run: RunId) -> Result<RunView, BackendError> {
@@ -715,14 +743,26 @@ impl TaskBackend for RuntimeTaskBackend {
         task_id: Option<String>,
         context_id: Option<String>,
     ) -> Result<Task, BackendError> {
-        let inbound = (self.inbound)(&message).map_err(BackendError::InvalidParams)?;
+        let mut inbound = (self.inbound)(&message).map_err(BackendError::InvalidParams)?;
+        // A message that activated the extension names a tier the agent honours, or nothing is
+        // written. One that did not is read as it always was.
+        if let Some(tiers) = &self.access_tiers
+            && caller.has_extension(ACCESS_TIER_EXTENSION)
+        {
+            let named = tier::requested(&message, tiers).map_err(BackendError::InvalidParams)?;
+            tier::put(&mut inbound, named);
+        }
 
         let Some(task_id) = task_id else {
             let (run, context) = self
                 .start_or_join(&caller, &message, inbound, context_id)
                 .await?;
             let view = self.view_of(run).await?;
-            let mut task = task_from_view(&view, &context, &self.prompt);
+            let mut task = self.said(
+                &caller,
+                &view,
+                task_from_view(&view, &context, &self.prompt),
+            );
             let mut first = message;
             first.task_id = Some(task.id.clone());
             first.context_id = Some(context);
@@ -750,7 +790,7 @@ impl TaskBackend for RuntimeTaskBackend {
             )));
         }
         if steering {
-            return self.steer(run, &context, inbound, &task_id).await;
+            return self.steer(&caller, run, &context, inbound, &task_id).await;
         }
         if !view.waiting {
             return Err(BackendError::InvalidParams(format!(
@@ -769,14 +809,16 @@ impl TaskBackend for RuntimeTaskBackend {
             // A working task carries no totals: they are said when it ends or waits again.
             task.metadata = None;
         }
-        Ok(task)
+        Ok(self.said(&caller, &view, task))
     }
 
     async fn get(&self, caller: &Caller, task_id: &str) -> Result<Option<Task>, BackendError> {
         Ok(self
             .owned(caller, task_id)
             .await?
-            .map(|(_, view, context)| task_from_view(&view, &context, &self.prompt)))
+            .map(|(_, view, context)| {
+                self.said(caller, &view, task_from_view(&view, &context, &self.prompt))
+            }))
     }
 
     #[tracing::instrument(skip(self, caller), fields(subject = %caller.subject))]

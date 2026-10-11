@@ -151,6 +151,16 @@ impl Service {
         self
     }
 
+    /// Serve `access-tier/v1` for an agent whose card declares `tiers`
+    /// ([`RuntimeTaskBackend::with_access_tiers`]); `None` changes nothing.
+    #[must_use]
+    pub fn with_access_tiers(mut self, tiers: Option<adam_a2a::AccessTiers>) -> Self {
+        if let Some(tiers) = tiers {
+            self.backend = self.backend.with_access_tiers(tiers);
+        }
+        self
+    }
+
     /// Advance runs until `shutdown` resolves; in-flight steps finish first.
     ///
     /// # Errors
