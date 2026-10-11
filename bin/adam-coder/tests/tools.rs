@@ -2351,6 +2351,7 @@ async fn next_task_with_base(
         branch: (*branch).to_owned(),
         // What `commit_and_push` of the first task recorded, and the next task inherits.
         base: base.map(str::to_owned),
+        shas: Vec::new(),
     }));
     fx.env.notes.save(&run, &notes).await.unwrap();
     ctx

@@ -397,18 +397,43 @@ pub async fn mount_pull_from(
         })))
         .mount(github)
         .await;
+    // A CI that passed, unless a test says otherwise (`mount_checks` wins over this one).
+    mount_checks_at(
+        github,
+        slug,
+        sha,
+        json!({"state": "success", "total_count": 1}),
+        json!({"total_count": 1, "check_runs": [
+            {"name": "build", "status": "completed", "conclusion": "success"}
+        ]}),
+        10,
+    )
+    .await;
 }
 
 /// The statuses and check runs the mock GitHub reports for commit `sha` of `slug`.
 pub async fn mount_checks(github: &MockServer, slug: &str, sha: &str, status: Value, runs: Value) {
+    mount_checks_at(github, slug, sha, status, runs, 5).await;
+}
+
+async fn mount_checks_at(
+    github: &MockServer,
+    slug: &str,
+    sha: &str,
+    status: Value,
+    runs: Value,
+    priority: u8,
+) {
     Mock::given(method("GET"))
         .and(path(format!("/repos/{slug}/commits/{sha}/status")))
         .respond_with(ResponseTemplate::new(200).set_body_json(status))
+        .with_priority(priority)
         .mount(github)
         .await;
     Mock::given(method("GET"))
         .and(path(format!("/repos/{slug}/commits/{sha}/check-runs")))
         .respond_with(ResponseTemplate::new(200).set_body_json(runs))
+        .with_priority(priority)
         .mount(github)
         .await;
 }

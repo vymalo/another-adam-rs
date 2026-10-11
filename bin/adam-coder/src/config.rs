@@ -647,6 +647,10 @@ pub struct GitHubAppConfig {
     pub key: AppKey,
     /// The PEM the key was read from, kept so that the redactor can register it.
     pub pem: SecretString,
+    /// The key came from a file (`GITHUB_APP_PRIVATE_KEY_PATH`), which a command that runs as the
+    /// user that holds it can read. A key given inline (`GITHUB_APP_PRIVATE_KEY`) is hidden from
+    /// the commands of a run (`ExecSpec.hide`).
+    pub key_file: bool,
 }
 
 impl GitHubAuth {
@@ -873,6 +877,7 @@ impl GitHubAuth {
             installations: installations?,
             key: key?,
             pem: SecretString::from(pem),
+            key_file: var == "GITHUB_APP_PRIVATE_KEY_PATH",
         }))
     }
 }
@@ -998,11 +1003,12 @@ impl Config {
 
 impl WorkerConfig {
     /// Whether a command a run starts can read the GitHub App's private key: the credentials are an
-    /// App and the commands run in this container (no run pod, and `DEVCONTAINER_RUNTIME=off`), as
-    /// the user that holds the key. Then any access tier, a `plan` too, can mint an installation
-    /// token and do what the App may. A run pod or a Podman devcontainer has no such file.
+    /// App whose key is a **file** and the commands run in this container (no run pod, and
+    /// `DEVCONTAINER_RUNTIME=off`), as the user that holds the file. Then any access tier, a `plan`
+    /// too, can mint an installation token and do what the App may. A run pod or a Podman
+    /// devcontainer has no such file, and a key given inline is hidden from the commands.
     pub fn commands_can_read_the_app_key(&self) -> bool {
-        matches!(self.github, GitHubAuth::App(_))
+        matches!(&self.github, GitHubAuth::App(app) if app.key_file)
             && matches!(self.run_environment, RunEnvironment::Local)
             && self.devcontainer.runtime == Runtime::Off
     }
@@ -3099,5 +3105,15 @@ mod tests {
                 .commands_can_read_the_app_key(),
             "a token is in the environment, which the commands do not get"
         );
+        // A key given inline is in the environment, which the commands do not get either.
+        let key = TestAppKey::generate();
+        let mut inline = without_token(&[
+            ("GITHUB_APP_ID", "12345".to_owned()),
+            ("GITHUB_APP_OWNERS", "acme".to_owned()),
+            ("GITHUB_APP_PRIVATE_KEY", key.pkcs8_pem.clone()),
+        ]);
+        inline.remove("GITHUB_TOKEN");
+        let inline = parse_owned(&inline).unwrap().worker.unwrap();
+        assert!(!inline.commands_can_read_the_app_key());
     }
 }

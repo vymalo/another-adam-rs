@@ -226,7 +226,15 @@ pub struct PushedBranch {
     /// not open a second against another base. Absent in notes written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// The commits this conversation pushed for the branch (newest last, at most
+    /// [`MAX_PUSHED_SHAS`]): what makes a pull request whose head is one of them the conversation's
+    /// own, and not just one that has a branch of the same name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shas: Vec<String>,
 }
+
+/// The most commits [`PushedBranch::shas`] keeps.
+pub const MAX_PUSHED_SHAS: usize = 64;
 
 /// What the person answered to a question a tool wrote for them (see [`consent`](super::consent)):
 /// the answer to `request_repository` ("may this repository join the workspace?").
@@ -295,9 +303,8 @@ pub struct RenamedRepo {
 /// A pull request, as a repository's [`named`](super::named) key (when it is known) and a number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRef {
-    /// The repository, when the words that named the pull request named it (a URL). `None`: only the
-    /// number was written (`#12`), which stands for that pull request of whichever repository the
-    /// tool is given.
+    /// The repository, as a key. `None`: only the number was written (`#12`) and no repository could be
+    /// told (see `named::bind_pulls`): it is no pull request of any repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// The pull request's number.
@@ -305,9 +312,11 @@ pub struct PullRef {
 }
 
 impl PullRef {
-    /// Whether this is pull request `number` of the repository with `key`.
+    /// Whether this is pull request `number` of the repository with `key`. One that names no
+    /// repository is no pull request of any (`named::bind_pulls` gives it the one repository in play,
+    /// or drops it).
     fn is(&self, key: &str, number: u64) -> bool {
-        self.number == number && self.repo.as_deref().is_none_or(|repo| repo == key)
+        self.number == number && self.repo.as_deref() == Some(key)
     }
 }
 
@@ -414,6 +423,11 @@ pub struct RunNotes {
     /// another inherits them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub red_pulls: Vec<PullRef>,
+    /// The commits this conversation pushed whose code passed the run's own checks when
+    /// `open_pull_request` let it in (the gate): what stands in for a CI on a pull request that no CI
+    /// ever checked. Written by `open_pull_request`; a run that continues another inherits them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_shas: Vec<String>,
     /// The repositories this run renamed, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renamed_repos: Vec<RenamedRepo>,
@@ -565,6 +579,54 @@ impl RunNotes {
             .any(|p| p.repo.as_deref() == Some(key) && p.number == number)
     }
 
+    /// Take in what the person said, `said` in order (messages and the answers they gave, as the
+    /// conversation holds them, the oldest first), and return whether the notes changed. Only what
+    /// they **typed** counts ([`typed_by_the_person`](super::named::typed_by_the_person)): what the
+    /// interface made of a click is what the model wrote into the form.
+    ///
+    /// * The repositories they named ([`named_repos`](Self::named_repos)).
+    /// * The pull requests they named, ever ([`named_pulls`](Self::named_pulls)): one with its
+    ///   repository (a URL, `owner/name#12`) as it is, a bare `#12` or `PR 12` **only in their newest
+    ///   words**, and only as the pull request of **the** repository in play when there is exactly
+    ///   one (`workspace` are the keys of the repositories in the run's workspace, beside the ones
+    ///   named and created).
+    /// * The pull requests their **newest** words ask to merge ([`merge_asks`](Self::merge_asks)):
+    ///   the newest is the last thing they said, an answer included, so an answer that asks nothing
+    ///   takes an earlier ask away.
+    /// * The words that stand alone in the newest of their words that have any
+    ///   ([`said_words`](Self::said_words)).
+    pub fn hear(&mut self, said: &[String], host: &str, workspace: &[String]) -> bool {
+        use super::named::{asks_to_merge, bind_pulls, listed, named_in, pulls_in};
+        let typed: Vec<String> = said
+            .iter()
+            .map(|text| super::named::typed_by_the_person(text))
+            .collect();
+        let mut changed = self.name_repos(typed.iter().flat_map(|text| named_in(text, host)));
+        let mut in_play: std::collections::BTreeSet<String> = listed(&self.named_repos)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        in_play.extend(self.created_repos.iter().map(|created| created.key.clone()));
+        in_play.extend(workspace.iter().cloned());
+        let in_play: Vec<String> = in_play.into_iter().collect();
+        let newest = typed.last().map(String::as_str);
+        let newest_pulls = newest.map(|text| pulls_in(text, host)).unwrap_or_default();
+        let asks = if newest.is_some_and(asks_to_merge) {
+            bind_pulls(newest_pulls.clone(), &in_play)
+        } else {
+            Vec::new()
+        };
+        let explicit = typed
+            .iter()
+            .flat_map(|text| pulls_in(text, host))
+            .filter(|pull| pull.repo.is_some());
+        changed |= self.name_pulls(explicit.chain(bind_pulls(newest_pulls, &in_play)));
+        changed |= self.set_merge_asks(asks);
+        let words = typed.iter().rev().find(|text| !text.trim().is_empty());
+        changed |= self.set_said_words(words.map_or("", String::as_str));
+        changed
+    }
+
     /// Whether the person wrote `name` as a word of their own messages (without case).
     pub fn said(&self, name: &str) -> bool {
         let name = name.to_ascii_lowercase();
@@ -640,7 +702,8 @@ impl RunNotes {
             .is_some_and(|c| !c.agreed)
     }
 
-    /// Remember the branches `pushed` names; returns whether anything was new.
+    /// Remember the branches `pushed` names, and the commits pushed for them; returns whether anything
+    /// was new.
     pub fn name_pushed_branches(&mut self, pushed: impl IntoIterator<Item = PushedBranch>) -> bool {
         let mut added = false;
         for one in pushed {
@@ -649,12 +712,23 @@ impl RunNotes {
                 .iter_mut()
                 .find(|p| p.repo == one.repo && p.branch == one.branch)
             {
-                // Known: only a base it did not have yet is new.
-                Some(known) if known.base.is_none() && one.base.is_some() => {
-                    known.base = one.base;
-                    added = true;
+                Some(known) => {
+                    // A base it did not have yet is new, and so is each commit it did not have.
+                    if known.base.is_none() && one.base.is_some() {
+                        known.base = one.base;
+                        added = true;
+                    }
+                    for sha in one.shas {
+                        if !known.shas.contains(&sha) {
+                            known.shas.push(sha);
+                            added = true;
+                        }
+                    }
+                    if known.shas.len() > MAX_PUSHED_SHAS {
+                        let excess = known.shas.len() - MAX_PUSHED_SHAS;
+                        known.shas.drain(..excess);
+                    }
                 }
-                Some(_) => {}
                 None => {
                     self.pushed_branches.push(one);
                     added = true;
@@ -662,6 +736,39 @@ impl RunNotes {
             }
         }
         added
+    }
+
+    /// Remember that the code of the commit `sha` passed the run's checks when it was let in.
+    pub fn verify_sha(&mut self, sha: &str) -> bool {
+        if self.verified_shas.iter().any(|known| known == sha) {
+            return false;
+        }
+        if self.verified_shas.len() >= MAX_PUSHED_SHAS {
+            self.verified_shas.remove(0);
+        }
+        self.verified_shas.push(sha.to_owned());
+        true
+    }
+
+    /// Remember the commits `shas`, verified by an earlier run of the conversation.
+    pub fn verify_shas(&mut self, shas: impl IntoIterator<Item = String>) -> bool {
+        let mut added = false;
+        for sha in shas {
+            added |= self.verify_sha(&sha);
+        }
+        added
+    }
+
+    /// Whether the code of `sha` passed the run's checks when it was let into a pull request.
+    pub fn is_verified(&self, sha: &str) -> bool {
+        self.verified_shas.iter().any(|known| known == sha)
+    }
+
+    /// Whether this conversation pushed the commit `sha` for `branch` of the repository `repo`.
+    pub fn pushed_commit(&self, repo: &str, branch: &str, sha: &str) -> bool {
+        self.pushed_branches
+            .iter()
+            .any(|p| p.repo == repo && p.branch == branch && p.shas.iter().any(|s| s == sha))
     }
 
     /// The base branch recorded for `branch` of `repo`, if one was.

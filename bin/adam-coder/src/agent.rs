@@ -23,10 +23,8 @@ use crate::tier;
 use crate::tools::consent::{
     Answer, answer_of, asked_by, is_answered_by_the_person, is_consent_tool, is_tools_own_result,
 };
-use crate::tools::named::{
-    asks_to_merge, key_of_argument, listed, named_in, pulls_in, without_untrusted,
-};
-use crate::tools::notes::{Consent, PullRef, PushedBranch, RunNotes};
+use crate::tools::named::{key_of_argument, listed, without_untrusted};
+use crate::tools::notes::{Consent, PushedBranch, RunNotes};
 use crate::tools::publish::{COMMIT_AND_PUSH, pushed_in};
 use crate::tools::{ToolEnv, coder_tools};
 
@@ -368,17 +366,6 @@ impl CoderAgent {
     ) -> Result<(), AgentError> {
         let notes_error = |e| AgentError::transient("cannot read the run notes").with_source(e);
         let host = &self.env.settings.default_repo_host;
-        let said = person_texts(state, ctx.peek_inbox());
-        let named: Vec<String> = said.iter().flat_map(|text| named_in(text, host)).collect();
-        let pulls: Vec<PullRef> = said.iter().flat_map(|text| pulls_in(text, host)).collect();
-        // What the newest message says alone: the bare names that count as named, and the pull
-        // requests it asks to merge. Earlier messages do not stand for it.
-        let newest = newest_person_message(state, ctx.peek_inbox());
-        let asks = newest
-            .as_deref()
-            .filter(|text| asks_to_merge(text))
-            .map(|text| pulls_in(text, host))
-            .unwrap_or_default();
         let tier = tier_of(state, ctx.peek_inbox()).min(self.env.settings.max_access_tier);
         let prior = match &state.continued_from {
             Some(prior) => self
@@ -389,28 +376,29 @@ impl CoderAgent {
                 .map_err(notes_error)?,
             None => None,
         };
-        let (pushed, red) = match prior {
-            Some(prior) => (prior.pushed_branches, prior.red_pulls),
-            None if state.continued_from.is_some() => (pushed_branches(state), Vec::new()),
-            None => (Vec::new(), Vec::new()),
+        let (pushed, red, verified) = match prior {
+            Some(prior) => (prior.pushed_branches, prior.red_pulls, prior.verified_shas),
+            None if state.continued_from.is_some() => {
+                (pushed_branches(state), Vec::new(), Vec::new())
+            }
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
         let consents = consents_in(state, ctx.peek_inbox());
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
-        let new_repos = notes.name_repos(named);
-        let new_words = notes.set_said_words(newest.as_deref().unwrap_or_default());
-        let new_pulls = notes.name_pulls(pulls);
-        let new_asks = notes.set_merge_asks(asks);
-        let new_red = notes.name_red_pulls(red);
         let new_consents = notes.record_consents(consents);
+        // What the person said, typed (not what the interface made of their clicks): the
+        // repositories, the pull requests and the merge they asked for, the bare names.
+        let workspace = self.workspace_keys(run).await;
+        let heard = notes.hear(&person_texts(state, ctx.peek_inbox()), host, &workspace);
+        let new_red = notes.name_red_pulls(red);
+        let new_verified = notes.verify_shas(verified);
         let adopted = self.adopt_scratch(ctx, run, &mut notes).await;
         let new_tier = notes.tier != Some(tier);
         notes.tier = Some(tier);
         if notes.name_pushed_branches(pushed)
-            || new_repos
-            || new_words
-            || new_pulls
-            || new_asks
+            || heard
             || new_red
+            || new_verified
             || new_consents
             || adopted
             || new_tier
@@ -422,6 +410,23 @@ impl CoderAgent {
                 .map_err(|e| AgentError::transient("cannot write the run notes").with_source(e))?;
         }
         Ok(())
+    }
+
+    /// The keys of the repositories in the run's workspace.
+    async fn workspace_keys(&self, run: &str) -> Vec<String> {
+        let Ok(workspace) = self.env.workspaces.run(run) else {
+            return Vec::new();
+        };
+        let Ok(slots) = workspace.slots().await else {
+            return Vec::new();
+        };
+        slots
+            .iter()
+            .filter_map(|slot| {
+                slot.worktree()
+                    .and_then(|worktree| key_of_argument(&worktree.repo().url))
+            })
+            .collect()
     }
 
     /// Take over the scratch projects the earlier tasks of this conversation left, once, before the
@@ -723,51 +728,17 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
             }
         }
     }
+    // A message the run has read is in its history already (and is not the newest again).
     texts.extend(
         inbox
             .iter()
-            .filter(|inbound| inbound.kind != RUN_FINISHED_KIND)
+            .filter(|inbound| {
+                inbound.kind != RUN_FINISHED_KIND
+                    && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
+            })
             .filter_map(inbound_text),
     );
     texts.iter().map(|text| without_untrusted(text)).collect()
-}
-
-/// The newest message the person wrote, as they wrote it: a message waiting in `inbox` that the run
-/// has not read, else the last user message of the conversation (the marker that says turns were
-/// left out is not one). Not what a tool answered for them.
-fn newest_person_message(state: &Conversation, inbox: &[Inbound]) -> Option<String> {
-    let waiting = inbox
-        .iter()
-        .filter(|inbound| {
-            inbound.kind != RUN_FINISHED_KIND
-                && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
-        })
-        .filter_map(inbound_text)
-        .next_back();
-    waiting
-        .or_else(|| {
-            let last = state
-                .messages
-                .iter()
-                .chain(&state.deferred)
-                .enumerate()
-                .filter_map(|(at, message)| match message {
-                    Message::User { content } => Some((at, content)),
-                    _ => None,
-                })
-                .last()?;
-            let (at, content) = last;
-            let texts: Vec<&str> = content
-                .iter()
-                .enumerate()
-                .filter(|(part, _)| {
-                    !(at < state.messages.len() && state.is_omission_marker(at, *part))
-                })
-                .map(|(_, part)| part.as_text())
-                .collect();
-            Some(texts.join("\n"))
-        })
-        .map(|text| without_untrusted(&text))
 }
 
 /// What the person answered to the questions the consent tools wrote (`request_repository`,
@@ -875,6 +846,7 @@ fn pushed_branches(state: &Conversation) -> Vec<PushedBranch> {
                         repo,
                         branch,
                         base: None,
+                        shas: Vec::new(),
                     });
                 }
             }
@@ -1175,6 +1147,7 @@ mod tests {
     use super::*;
     use crate::tools::consent::REQUEST_REPOSITORY;
     use crate::tools::create::CREATE_REPOSITORY;
+    use crate::tools::named::named_in;
     use adam_error::Classify;
     use std::time::Duration;
 
@@ -1930,6 +1903,7 @@ mod tests {
                 repo: "github.com/acme/widgets".into(),
                 branch: "agent/one".into(),
                 base: None,
+                shas: Vec::new(),
             }]
         );
     }
@@ -1998,6 +1972,7 @@ mod tests {
                 repo: "github.com/acme/widgets".into(),
                 branch: "agent/two".into(),
                 base: None,
+                shas: Vec::new(),
             }],
             "the second result is the push's, the first is run_checks's"
         );
@@ -2181,6 +2156,7 @@ mod tests {
             repo: "github.com/acme/widgets".into(),
             branch: "agent/abc".into(),
             base: None,
+            shas: Vec::new(),
         }]);
         assert!(!delivered_a_result(&pushed, true));
         let mut continues = shared;

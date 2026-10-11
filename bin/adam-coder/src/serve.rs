@@ -60,11 +60,11 @@ async fn build_agent(
     let model: DynModel = worker.model.client().context("building the model client")?;
     if worker.commands_can_read_the_app_key() {
         tracing::warn!(
-            "GitHub App mode, and the commands of a run (run_command, run, run_checks, OpenCode) run in \
-             this container as the user that holds the App's private key: a command can read the key \
-             and mint installation tokens, so NO access tier holds against a command, a `plan` included. \
-             Run the commands in run pods (RUN_ENVIRONMENT=kubernetes) or in Podman devcontainers \
-             (DEVCONTAINER_RUNTIME=podman), or use a token with the permissions you can live with"
+            "GitHub App mode with the private key in a file (GITHUB_APP_PRIVATE_KEY_PATH), and the commands of a run \
+             (run_command, run, run_checks, OpenCode) run in this container as the user that can read it: a \
+             command can read the key and mint installation tokens, so NO access tier holds against a command, \
+             a `plan` included. Run the commands in run pods (RUN_ENVIRONMENT=kubernetes) or in Podman \
+             devcontainers (DEVCONTAINER_RUNTIME=podman), or use a token with the permissions you can live with"
         );
     }
 

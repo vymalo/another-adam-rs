@@ -435,13 +435,19 @@ async fn every_tool_checks_the_tier_in_the_notes_of_the_root_run_when_it_is_call
 struct Rig {
     fx: Fixture,
     ctx: ToolCtx,
+    /// What the person has said so far, oldest first.
+    said: std::sync::Mutex<Vec<String>>,
 }
 
 impl Rig {
     fn new(fx: Fixture) -> Self {
         let ctx = ToolCtx::detached("tool", "call-1", Arc::new(CollectingSink::new()))
             .with_state(fx.env.clone());
-        Self { fx, ctx }
+        Self {
+            fx,
+            ctx,
+            said: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     async fn tier(&self, tier: AccessTier) {
@@ -451,32 +457,34 @@ impl Rig {
         self.fx.env.notes.save(&run, &notes).await.unwrap();
     }
 
-    /// The person says `text`, their newest message: what the agent records before a step. The
-    /// repositories and pull requests it names are named, its words are the bare names, and the
-    /// pull requests it asks to merge are the merge asks.
+    /// The person says `text`, their newest words: what the agent records before a step
+    /// (`RunNotes::hear`), from what they typed.
     async fn say(&self, text: &str) {
         let run = self.ctx.run_id().to_string();
-        let host = &self.fx.env.settings.default_repo_host;
+        let host = self.fx.env.settings.default_repo_host.clone();
         let mut notes = self.fx.env.notes.load(&run).await.unwrap();
-        notes.name_repos(adam_coder::tools::named::named_in(text, host));
-        notes.name_pulls(adam_coder::tools::named::pulls_in(text, host));
-        notes.set_said_words(text);
-        notes.set_merge_asks(if adam_coder::tools::named::asks_to_merge(text) {
-            adam_coder::tools::named::pulls_in(text, host)
-        } else {
-            Vec::new()
-        });
+        // The earlier words stand as they were said: the conversation so far, then this.
+        self.said.lock().unwrap().push(text.to_owned());
+        let said = self.said.lock().unwrap().clone();
+        notes.hear(&said, &host, &[]);
         self.fx.env.notes.save(&run, &notes).await.unwrap();
     }
 
-    /// A run of the conversation pushed `branch` of the repository `slug` (`owner/name`).
+    /// A run of the conversation pushed the commit `abc123`, the head the mock gives its pull
+    /// requests, to `branch` of the repository `slug` (`owner/name`).
     async fn pushed(&self, slug: &str, branch: &str) {
+        self.pushed_sha(slug, branch, "abc123").await;
+    }
+
+    /// A run of the conversation pushed the commit `sha` to `branch` of `slug`.
+    async fn pushed_sha(&self, slug: &str, branch: &str, sha: &str) {
         let run = self.ctx.run_id().to_string();
         let mut notes = self.fx.env.notes.load(&run).await.unwrap();
         notes.name_pushed_branches([adam_coder::tools::notes::PushedBranch {
             repo: format!("github.com/{slug}"),
             branch: branch.to_owned(),
             base: Some("main".to_owned()),
+            shas: vec![sha.to_owned()],
         }]);
         self.fx.env.notes.save(&run, &notes).await.unwrap();
     }
@@ -658,7 +666,7 @@ async fn only_a_pull_request_of_a_repository_the_person_gave_the_run_is_merged()
         .await
         .unwrap();
     assert!(
-        out.is_error && out.content.contains("is not a repository the person named"),
+        out.is_error && out.content.contains("is not one to merge"),
         "{}",
         out.content
     );
@@ -869,8 +877,10 @@ async fn a_pull_request_whose_checks_did_not_pass_is_not_merged() {
 async fn a_head_that_moved_after_the_checks_were_read_is_not_merged() {
     let rig = Rig::new(Fixture::new("hello\n").await);
     rig.say("work on octo/widgets").await;
-    rig.pushed("octo/widgets", "agent/x").await;
+    rig.pushed_sha("octo/widgets", "agent/x", "aaa").await;
     let github = &rig.fx.github;
+    let (status, runs) = green();
+    common::mount_checks(github, "octo/widgets", "aaa", status, runs).await;
     // The first read of the pull request (the checks') shows `aaa`; the next (the merge's) `bbb`.
     let pull = |sha: &str| {
         wiremock::ResponseTemplate::new(200).set_body_json(json!({
@@ -1002,6 +1012,194 @@ async fn a_pull_request_opened_with_red_checks_needs_a_fresh_yes_to_be_merged() 
         "{}",
         out.content
     );
+}
+
+/// The pull request must be one whose head is a commit **this conversation pushed**, not just a
+/// branch of a name it used.
+#[tokio::test]
+async fn a_branch_somebody_pushed_to_since_is_not_the_conversations() {
+    let rig = Rig::new(Fixture::new("hello\n").await);
+    common::mount_pull(
+        &rig.fx.github,
+        "octo/widgets",
+        7,
+        "agent/x",
+        "f00d",
+        "clean",
+    )
+    .await;
+    common::mount_merge(&rig.fx.github, "octo/widgets", 7, "agent/x", "1").await;
+    rig.say("work on octo/widgets").await;
+    // The branch is the run's, but the commit the pull request has now (`f00d`) is not one it pushed.
+    rig.pushed_sha("octo/widgets", "agent/x", "abc123").await;
+    let out = rig.merge().await;
+    assert!(
+        out.is_error && out.content.contains("somebody pushed to it since"),
+        "{}",
+        out.content
+    );
+    assert!(rig.requests("PUT").await.is_empty());
+    rig.pushed_sha("octo/widgets", "agent/x", "f00d").await;
+    assert!(!rig.merge().await.is_error);
+}
+
+/// A pull request nothing ever checked (no status, no check run) is the host's `clean` and no more:
+/// the run's own checks must have passed on that commit, unless the person named the pull request.
+#[tokio::test]
+async fn a_pull_request_no_ci_ever_checked_needs_the_checks_the_run_ran() {
+    let no_ci = (
+        json!({"state": "pending", "total_count": 0}),
+        json!({"total_count": 0, "check_runs": []}),
+    );
+    // The conversation's own pull request: the run's checks passed on the commit, or it is not merged.
+    let rig = Rig::new(Fixture::new("hello\n").await);
+    common::mount_pull(
+        &rig.fx.github,
+        "octo/widgets",
+        7,
+        "agent/x",
+        "abc123",
+        "clean",
+    )
+    .await;
+    common::mount_merge(&rig.fx.github, "octo/widgets", 7, "agent/x", "1").await;
+    common::mount_checks(
+        &rig.fx.github,
+        "octo/widgets",
+        "abc123",
+        no_ci.0.clone(),
+        no_ci.1.clone(),
+    )
+    .await;
+    rig.say("work on octo/widgets").await;
+    rig.pushed("octo/widgets", "agent/x").await;
+    let out = rig.merge().await;
+    assert!(
+        out.is_error && out.content.contains("Nothing has checked the head"),
+        "{}",
+        out.content
+    );
+    assert!(rig.requests("PUT").await.is_empty());
+    // `open_pull_request` let this commit in because the run's checks passed on it.
+    let run = rig.ctx.run_id().to_string();
+    let mut notes = rig.fx.env.notes.load(&run).await.unwrap();
+    notes.verify_sha("abc123");
+    rig.fx.env.notes.save(&run, &notes).await.unwrap();
+    assert!(!rig.merge().await.is_error);
+
+    // One the person named, with its repository in full: the host's word is theirs to rely on.
+    let rig = Rig::new(Fixture::new("hello\n").await);
+    common::mount_pull(
+        &rig.fx.github,
+        "octo/widgets",
+        7,
+        "feature/theirs",
+        "abc123",
+        "clean",
+    )
+    .await;
+    common::mount_merge(&rig.fx.github, "octo/widgets", 7, "feature/theirs", "1").await;
+    common::mount_checks(&rig.fx.github, "octo/widgets", "abc123", no_ci.0, no_ci.1).await;
+    rig.say("merge https://github.com/octo/widgets/pull/7")
+        .await;
+    assert!(!rig.merge().await.is_error);
+}
+
+/// Checks of a pull request that was not opened red must pass: nobody is told to ask for a yes that
+/// the code would not honour.
+#[tokio::test]
+async fn failing_checks_of_a_pull_request_not_opened_red_are_not_a_question_for_the_person() {
+    let rig = rig_with_a_pull_request_of_the_run("blocked").await;
+    common::mount_checks(
+        &rig.fx.github,
+        "octo/widgets",
+        "abc123",
+        json!({"state": "success", "total_count": 1}),
+        json!({"total_count": 1, "check_runs": [
+            {"name": "build", "status": "completed", "conclusion": "failure"}
+        ]}),
+    )
+    .await;
+    rig.say("merge #7 now, whatever the checks say").await;
+    let out = rig.merge().await;
+    assert!(
+        out.is_error
+            && out.content.contains("did not pass: build: failure")
+            && out.content.contains("merged only when they pass")
+            && !out.content.contains("new message"),
+        "{}",
+        out.content
+    );
+}
+
+/// A slot that came from a bare name, and a bare number, are no grant for a merge.
+#[tokio::test]
+async fn a_bare_name_and_a_bare_number_do_not_make_a_pull_request_one_to_merge() {
+    let rig = Rig::new(Fixture::new("hello\n").await.acting_for(&["octo"]));
+    common::mount_pull(
+        &rig.fx.github,
+        "octo/widgets",
+        7,
+        "feature/theirs",
+        "abc123",
+        "clean",
+    )
+    .await;
+    common::mount_merge(&rig.fx.github, "octo/widgets", 7, "feature/theirs", "1").await;
+    rig.tier(AccessTier::Auto).await;
+    // `widgets` alone is a bare name (a workspace may hold it), `#7` alone is bound to no repository.
+    rig.say("fix widgets and merge #7").await;
+    let out = rig.merge().await;
+    assert!(
+        out.is_error && out.content.contains("is not one to merge"),
+        "{}",
+        out.content
+    );
+    assert!(rig.requests("PUT").await.is_empty());
+}
+
+/// With no notes of the run nothing was recorded, so it is a plan: the tools check it themselves.
+#[tokio::test]
+async fn the_admin_tools_take_missing_notes_for_a_plan() {
+    let rig = Rig::new(Fixture::new("hello\n").await);
+    assert!(
+        rig.fx
+            .env
+            .notes
+            .load_existing(&rig.ctx.run_id().to_string())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for (tool, args, needs) in [
+        (
+            &adam_coder::tools::admin::MergePullRequest as &dyn adam_llm_agent::Tool,
+            json!({"repo": "octo/widgets", "number": 7}),
+            "auto",
+        ),
+        (
+            &adam_coder::tools::admin::RenameRepository,
+            json!({"repo": "octo/widgets", "new_name": "gadgets"}),
+            "bypass",
+        ),
+        (
+            &adam_coder::tools::admin::DeleteRepository,
+            json!({"repo": "octo/widgets", "confirm": "octo/widgets"}),
+            "bypass",
+        ),
+    ] {
+        let out = direct(&rig, tool, args).await;
+        assert!(
+            out.is_error
+                && out
+                    .content
+                    .contains(&format!("needs the {needs} access tier"))
+                && out.content.contains("this message is under plan"),
+            "{}",
+            out.content
+        );
+    }
+    assert!(rig.fx.github.received_requests().await.unwrap().is_empty());
 }
 
 /// A call of `tool` itself, without the set's own check of the tier (`Gated`).

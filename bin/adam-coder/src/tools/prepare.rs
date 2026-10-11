@@ -324,11 +324,13 @@ mod tests {
                 repo: "github.com/a/b".into(),
                 branch: "agent/one".into(),
                 base: None,
+                shas: Vec::new(),
             },
             PushedBranch {
                 repo: "github.com/c/d".into(),
                 branch: "agent/other".into(),
                 base: None,
+                shas: Vec::new(),
             },
         ]);
         let some = not_pushed("agent/x", "https://github.com/a/b", &notes, a_b);

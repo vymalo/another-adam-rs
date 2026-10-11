@@ -15,11 +15,16 @@
 //! **A merge needs more than the tier.** All of these hold, each checked here from what the host
 //! says and from what the person wrote, never from what the model says:
 //!
-//! 1. *The pull request is one this conversation may touch*: its head branch is in this repository
-//!    and one a run of the conversation pushed (`RunNotes::pushed_branches`, an earlier task's too),
-//!    or the person named the pull request (its number or URL, `RunNotes::named_pulls`).
+//! 1. *The pull request is one this conversation may touch*: **either** the person named the
+//!    repository in full (`RunNotes::named_repos`; a slot that a bare name gave is not that) and the
+//!    pull request (`owner/name#12`, its URL, or `#12` when it is the one repository in play:
+//!    `RunNotes::named_pulls`), **or** its head is in this very repository and is a commit the
+//!    conversation pushed for that branch (`RunNotes::pushed_commit`, an earlier task's too).
 //! 2. *The checks passed* on the head commit ([`Checks::Passing`](adam_workspace::Checks)), and that
-//!    very commit is the one merged (`MergePullRequest::expected_sha`).
+//!    very commit is the one merged (`MergePullRequest::expected_sha`). Where the host reports no
+//!    check at all, a pull request of the conversation's needs the run's own checks to have passed
+//!    on that commit (`RunNotes::verified_shas`); a pull request the person named may rely on the
+//!    host's word.
 //! 3. *Red checks need a fresh yes*: a pull request this conversation opened with
 //!    `accept_red_checks` (`RunNotes::red_pulls`) is merged only when the person's **newest**
 //!    message names it and says to merge it (`RunNotes::merge_asks`); with that message, checks that
@@ -82,20 +87,30 @@ fn address_of(repo: &str, default_host: &str) -> Option<String> {
         .then(|| format!("https://{default_host}/{owner}/{name}"))
 }
 
-/// The repository `repo` names, checked against the policy of the workspace and against what the
-/// person gave this run: with `in_workspace`, a repository that has a slot in the workspace is
-/// enough; otherwise (and for any other repository) the person must have named it, agreed to add it
-/// or had it created by this run (`RunNotes::named_repos`). A refusal is the result for the model.
+/// What a tool does with the repository it is given.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Use {
+    /// A merge: `repo` may be the name of a slot of the workspace, and whether the repository is
+    /// one to merge in is decided with the pull request (it is named in full, or the pull request is
+    /// one this conversation pushed): a slot that came from a bare name is no grant.
+    Merge,
+    /// A rename or a deletion: the repository must be one the person named, agreed to add or had
+    /// the run create (`RunNotes::named_repos`).
+    Change,
+}
+
+/// The repository `repo` names, checked against the policy of the workspace, the code host's own
+/// host and what the person gave this run (see [`Use`]). A refusal is the result for the model.
 async fn target(
     env: &ToolEnv,
     ctx: &ToolCtx,
     notes: &RunNotes,
     repo: &str,
-    in_workspace: bool,
+    using: Use,
 ) -> Result<Target, ToolOutput> {
     let host = &env.settings.default_repo_host;
     let mut address = None;
-    if in_workspace
+    if using == Use::Merge
         && let Ok(workspace) = env.workspaces.run(&ctx.root_run_id().to_string())
         && let Ok(slots) = workspace.slots().await
         && let Ok(slot) = resolve_slot(slots, non_empty(repo), host)
@@ -132,9 +147,7 @@ async fn target(
              renamed or deleted anywhere else"
         )));
     }
-    let in_a_slot = address_in_slots(env, ctx, &key).await;
-    let granted = notes.named_repos.contains(&key) || (in_workspace && in_a_slot);
-    if !granted {
+    if using == Use::Change && !notes.named_repos.contains(&key) {
         return Err(ToolOutput::error(not_named(
             &address,
             &notes.named_repos,
@@ -146,21 +159,6 @@ async fn target(
         full_name: format!("{}/{}", loc.owner, loc.name),
         repo: at,
         key,
-    })
-}
-
-/// Whether some slot of the run's workspace is the repository with `key`.
-async fn address_in_slots(env: &ToolEnv, ctx: &ToolCtx, key: &str) -> bool {
-    let Ok(workspace) = env.workspaces.run(&ctx.root_run_id().to_string()) else {
-        return false;
-    };
-    let Ok(slots) = workspace.slots().await else {
-        return false;
-    };
-    slots.iter().any(|slot| {
-        slot.worktree()
-            .and_then(|wt| key_of_argument(&wt.repo().url))
-            .is_some_and(|k| k == key)
     })
 }
 
@@ -192,6 +190,19 @@ fn refused(what: &str, permission: &str, e: &WorkspaceError) -> Outcome {
     )))
 }
 
+/// The notes of the run, as the tools read them to decide: **no notes are a plan**, as in `Gated`.
+async fn run_notes(env: &ToolEnv, run: &str) -> Result<RunNotes, ToolError> {
+    Ok(env
+        .notes
+        .load_existing(run)
+        .await
+        .map_err(|e| notes_error(&e))?
+        .unwrap_or_else(|| RunNotes {
+            tier: Some(AccessTier::Plan),
+            ..RunNotes::default()
+        }))
+}
+
 /// The refusal for the model when the run works under a tier below `needs` for `tool`, read from the
 /// notes of the run.
 fn below(env: &ToolEnv, notes: &RunNotes, tool: &str, needs: AccessTier) -> Option<ToolOutput> {
@@ -199,43 +210,72 @@ fn below(env: &ToolEnv, notes: &RunNotes, tool: &str, needs: AccessTier) -> Opti
     (needs > tier).then(|| ToolOutput::error(crate::tier::refusal(tool, needs, tier)))
 }
 
-/// Why pull request `number` of the repository with `key` is not one to touch, or `None` when it is:
-/// its head branch is in this very repository and one this conversation pushed, or the person named
-/// the pull request.
-fn untouchable(
+/// How a pull request came to be one to touch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Via {
+    /// The person named the repository in full and the pull request: the host's word on its checks
+    /// is enough.
+    Named,
+    /// This conversation pushed the very commit that is its head.
+    Pushed,
+}
+
+/// How pull request `number` of `target` is one to touch, or why it is not: **either** the person
+/// named the repository in full (`RunNotes::named_repos`: not a slot that a bare name gave) and the
+/// pull request (`RunNotes::named_pulls`), **or** its head branch is in this very repository and its
+/// head is a commit this conversation pushed for that branch (`RunNotes::pushed_commit`): a branch of
+/// the same name that somebody else pushed to is not that.
+fn how_touchable(
     notes: &RunNotes,
     target: &Target,
     status: &PullRequestStatus,
     number: u64,
-) -> Option<String> {
+) -> Result<Via, String> {
+    if notes.named_repos.contains(&target.key) && notes.names_pull(&target.key, number) {
+        return Ok(Via::Named);
+    }
     let in_this_repository = status
         .head_repo
         .as_deref()
         .is_some_and(|head| head.eq_ignore_ascii_case(&target.full_name));
-    if in_this_repository && notes.has_pushed(&target.key, &status.head_branch) {
-        return None;
+    if in_this_repository && notes.pushed_commit(&target.key, &status.head_branch, &status.head_sha)
+    {
+        return Ok(Via::Pushed);
     }
-    if notes.names_pull(&target.key, number) {
-        return None;
-    }
-    Some(format!(
-        "Pull request #{number} of {} is not one to merge: its branch `{}` was not pushed by this \
-         conversation{}, and the person has not named the pull request (its number or its URL in \
-         their words). Do not merge it. Tell the person what it is and ask them to say, in a message \
-         that names #{number}, that it should be merged.",
+    let what = if !in_this_repository {
+        format!(
+            "its branch `{}` comes from another repository, a fork",
+            status.head_branch
+        )
+    } else if notes.has_pushed(&target.key, &status.head_branch) {
+        format!(
+            "its head is not a commit this conversation pushed to `{}` (somebody pushed to it since)",
+            status.head_branch
+        )
+    } else {
+        format!(
+            "its branch `{}` was not pushed by this conversation",
+            status.head_branch
+        )
+    };
+    Err(format!(
+        "Pull request #{number} of {} is not one to merge: {what}, and the person has not named both \
+         the repository (in full) and the pull request (`owner/name#{number}` or its URL, or `#{number}` \
+         when it is the one repository in play). Do not merge it. Tell the person what it is and ask \
+         them to say, in a message that names it, that it should be merged.",
         target.full_name,
-        status.head_branch,
-        if in_this_repository {
-            ""
-        } else {
-            " (it comes from another repository, a fork)"
-        }
     ))
 }
 
 /// Why the checks of pull request `number` of the repository with `key` stop the merge, or `None`
 /// when they do not (rules 2 and 3 of the module docs).
-fn stopped_by_checks(notes: &RunNotes, key: &str, number: u64, checks: &Checks) -> Option<String> {
+fn stopped_by_checks(
+    notes: &RunNotes,
+    key: &str,
+    number: u64,
+    status: &PullRequestStatus,
+    via: Via,
+) -> Option<String> {
     let red = notes.red_accepted(key, number);
     let asked = notes.asks_to_merge(key, number);
     let fresh_yes = "Do not merge it. Tell the person; if they want it merged anyway they say so in a \
@@ -246,34 +286,51 @@ fn stopped_by_checks(notes: &RunNotes, key: &str, number: u64, checks: &Checks) 
              it, not for merging it. {fresh_yes}"
         ));
     }
-    match checks {
-        Checks::Passing => None,
-        Checks::Failing(why) | Checks::Unreported(why) if red => {
-            tracing::info!(number, %why, "merging a pull request with red checks: the person said to");
-            None
-        }
-        Checks::Failing(why) => Some(format!(
-            "The checks of pull request #{number} did not pass: {why}. {fresh_yes}"
-        )),
-        Checks::Unreported(why) => Some(format!(
-            "No check passed for pull request #{number}: {why}. {fresh_yes}"
-        )),
+    match &status.checks {
         Checks::Pending(which) => Some(format!(
             "The checks of pull request #{number} have not finished: {which}. Do not merge it yet: \
              wait for them and look again, or tell the person they are still running."
         )),
+        // Opened with red checks accepted, and the person has just said to merge it.
+        Checks::Failing(why) | Checks::Unreported(why) if red => {
+            tracing::info!(number, %why, "merging a pull request with red checks: the person said to");
+            None
+        }
+        // Nobody can say yes to these for the person: the checks must pass.
+        Checks::Failing(why) => Some(format!(
+            "The checks of pull request #{number} did not pass: {why}. It is merged only when they \
+             pass: do not merge it. Tell the person which failed."
+        )),
+        Checks::Unreported(why) => Some(format!(
+            "No check passed for pull request #{number}: {why}. It is merged only when its checks \
+             pass: do not merge it. Tell the person."
+        )),
+        Checks::Passing => {
+            let nothing_checked_it = !status.ci_reported
+                && via == Via::Pushed
+                && !red
+                && !notes.is_verified(&status.head_sha);
+            nothing_checked_it.then(|| {
+                format!(
+                    "Nothing has checked the head of pull request #{number}: the host reports no \
+                     check for it and the checks you ran did not pass on this very commit. Run the \
+                     project's checks on it (`run_checks`, `commit_and_push`, `open_pull_request`), or \
+                     tell the person."
+                )
+            })
+        }
     }
 }
 
-/// Merge a pull request, only when the person asked for it. The pull request is one this
-/// conversation pushed the branch of, or one the person named (its number or URL); its checks have
-/// passed (checked here, on the head commit that is merged); and, if it was opened with
-/// `accept_red_checks`, the person's newest message names it and says to merge it. `repo` is a
-/// repository of your workspace or one the person named. `method` is `squash` (the default), `merge`
-/// or `rebase`; with `delete_branch: true` the pull request's branch is deleted afterwards, when it
-/// is a branch of that very repository. GitHub's own rules decide too (branch protection, required
-/// reviews, conflicts): if it refuses you get its words, and you tell the person; do not look for
-/// another way. It needs the auto access tier or above.
+/// Merge a pull request, only when the person asked for it. It must be a pull request of this
+/// conversation (its head is a commit you pushed) or one the person named, with its repository in
+/// full; its checks must have passed on the head commit that is merged (checked here); and, if it was
+/// opened with `accept_red_checks`, the person's newest message must name it and say to merge it.
+/// `repo` is a repository of your workspace or one the person named. `method` is `squash` (the
+/// default), `merge` or `rebase`; with `delete_branch: true` the pull request's branch is deleted
+/// afterwards, when it is a branch of that very repository. GitHub's own rules decide too (branch
+/// protection, required reviews, conflicts): if it refuses you get its words, and you tell the
+/// person; do not look for another way. It needs the auto access tier or above.
 #[tool(label = "Merge a pull request", icon = "git")]
 pub async fn merge_pull_request(
     env: State<ToolEnv>,
@@ -298,11 +355,11 @@ pub async fn merge_pull_request(
         },
     };
     let run = ctx.root_run_id().to_string();
-    let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    let notes = run_notes(&env, &run).await?;
     if let Some(refusal) = below(&env, &notes, MERGE_PULL_REQUEST, AccessTier::Auto) {
         return Ok(refusal);
     }
-    let target = match target(&env, ctx, &notes, &repo, true).await {
+    let target = match target(&env, ctx, &notes, &repo, Use::Merge).await {
         Ok(target) => target,
         Err(refusal) => return Ok(refusal),
     };
@@ -319,9 +376,10 @@ pub async fn merge_pull_request(
         Ok(status) => status,
         Err(e) => return refused(&what, MERGE_PERMISSION, &e),
     };
-    if let Some(why) = untouchable(&notes, &target, &status, number) {
-        return Ok(ToolOutput::error(why));
-    }
+    let via = match how_touchable(&notes, &target, &status, number) {
+        Ok(via) => via,
+        Err(why) => return Ok(ToolOutput::error(why)),
+    };
     if status.merged {
         return Ok(ToolOutput::text(format!(
             "Pull request #{number} of {} was merged already: nothing was done now.\npull request: {}",
@@ -334,7 +392,7 @@ pub async fn merge_pull_request(
             target.full_name
         )));
     }
-    if let Some(why) = stopped_by_checks(&notes, &target.key, number, &status.checks) {
+    if let Some(why) = stopped_by_checks(&notes, &target.key, number, &status, via) {
         return Ok(ToolOutput::error(why));
     }
     ctx.emit_progress(format!("merging #{number} of {}", target.full_name))
@@ -401,11 +459,11 @@ pub async fn rename_repository(
         )));
     }
     let run = ctx.root_run_id().to_string();
-    let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    let notes = run_notes(&env, &run).await?;
     if let Some(refusal) = below(&env, &notes, RENAME_REPOSITORY, AccessTier::Bypass) {
         return Ok(refusal);
     }
-    let target = match target(&env, ctx, &notes, &repo, false).await {
+    let target = match target(&env, ctx, &notes, &repo, Use::Change).await {
         Ok(target) => target,
         Err(refusal) => return Ok(refusal),
     };
@@ -474,11 +532,11 @@ pub async fn delete_repository(
         return Err(cancelled("nothing was deleted"));
     }
     let run = ctx.root_run_id().to_string();
-    let notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+    let notes = run_notes(&env, &run).await?;
     if let Some(refusal) = below(&env, &notes, DELETE_REPOSITORY, AccessTier::Bypass) {
         return Ok(refusal);
     }
-    let target = match target(&env, ctx, &notes, &repo, false).await {
+    let target = match target(&env, ctx, &notes, &repo, Use::Change).await {
         Ok(target) => target,
         Err(refusal) => return Ok(refusal),
     };
