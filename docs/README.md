@@ -72,6 +72,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0032](decisions/0032-usage-per-model-call.md) | `usage/v1`: the tokens of each model call, a subagent's apart, and a task's totals |
 | [0033](decisions/0033-files-from-mcp-results-are-shared-files.md) | `files: true` on an MCP server or a remote subagent: the files of its answers are shared files of the calling run |
 | [0034](decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md) | a turn that asks nothing completes the task, and a scratch project lives for the thread (`SCRATCH_IDLE_DAYS`) |
+| [0035](decisions/0035-questions-carry-a-title-a-description-and-typed-options.md) | `ask_user` forms: a title, a description of why, typed questions (radio, checkboxes, list, picture deck, typed), options with a label and a description; the screen's catalog decides what is sent |
 
 ## Keeping these docs short and true
 

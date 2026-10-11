@@ -1,6 +1,6 @@
 {
   "name": "ask_user",
-  "description": "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific. `question` is always required, with or without `choices`: it is the sentence the person reads first. To ask several questions with fixed answers at once, also pass `choices`: the person gets one form with a list of options per question and answers them together; their answers come back as the result. Each entry of `choices` needs its own `question` and `options`, and every question needs 2 to 8 options (with a single possible answer, or none that you know, do not use `choices`: ask a plain question); there are at most 8 questions. An `id` or option `value` is 1 to 64 characters of letters, digits and `- _ . :`. Example: {\"question\": \"A few things I need before I start.\", \"choices\": [{\"id\": \"db\", \"question\": \"Which database?\", \"options\": [\"Postgres\", \"MongoDB\"]}]} Without `choices` the question is plain text.",
+  "description": "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific. `question` is always required, with or without `choices`: it is the sentence the person reads first. Whenever the answer is one of a few options, pass `choices` and never write the options as a list in your text: the person gets one form with a list of options per question and answers them together; their answers come back as the result, so \"yes\" is never ambiguous. Give the form a short `title` and a `description` of why you ask (a sentence or two of plain text). Each entry of `choices` needs its own `question`; give every option a short `label` and a `description` that says what it means or what it costs, and mark the one you recommend with `recommended: true`. A question's `type` is `single` (radio buttons, the default; 2 to 12 options), `multiple` (checkboxes; 2 to 12; `min` and `max` say how many), `select` (a searchable list; 2 to 50 options), `images` (a deck of pictures; 2 to 16 options, each with `image` {sha256, alt}: the sha256 of an image file you shared in this conversation, never a URL) or `text` / `longText` (the person types the answer; no options). `help` is a line under the question, `default` is what is chosen at first, `allowOther` offers an \"Other\" the person can write, `freeInput` adds an \"anything else\" box. With a single possible answer, or none that you know, do not use `choices`: ask a plain question. There are at most 8 questions. An `id` or option `value` is 1 to 64 characters of letters, digits and `- _ . :`. Example: {\"question\": \"A few things I need before I start.\", \"title\": \"Before I start\", \"description\": \"The migration depends on the database, so I need to know which one.\", \"choices\": [{\"id\": \"db\", \"question\": \"Which database?\", \"options\": [{\"label\": \"Postgres\", \"description\": \"Relational, the default\", \"recommended\": true}, {\"label\": \"MongoDB\", \"description\": \"Documents, no schema\"}]}]} Without `choices` the question is plain text.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -9,10 +9,18 @@
         "minLength": 1,
         "description": "Required, even when `choices` is given: what you need to know, or the sentence that opens the form"
       },
+      "title": {
+        "type": "string",
+        "description": "The form's heading: a few words (with `choices`)"
+      },
+      "description": {
+        "type": "string",
+        "description": "Why you are asking, in a sentence or two of plain text, no Markdown (with `choices`)"
+      },
       "choices": {
         "type": "array",
         "maxItems": 8,
-        "description": "Questions with fixed answers, asked together as one form (at most 8). Each needs `question` and `options` (2 to 8). Omit for an open question.",
+        "description": "Questions with fixed answers, asked together as one form (at most 8). Each needs `question` and, unless it is a typed answer, `options`. Omit for an open question.",
         "items": {
           "type": "object",
           "properties": {
@@ -26,11 +34,25 @@
               "minLength": 1,
               "description": "Required: the question"
             },
+            "help": {
+              "type": "string",
+              "description": "A line under the question: what the options mean, or what the answer is for"
+            },
+            "type": {
+              "enum": [
+                "single",
+                "multiple",
+                "select",
+                "images",
+                "text",
+                "longText"
+              ],
+              "description": "How it is answered: single (radio buttons, the default), multiple (checkboxes), select (a searchable list), images (a deck of pictures), text (a short typed answer), longText (a longer one)"
+            },
             "options": {
               "type": "array",
-              "minItems": 2,
-              "maxItems": 8,
-              "description": "Required: the answers to pick from, 2 to 8 of them (a question with fewer than 2 or more than 8 is refused), each a label or {value, label, description}",
+              "maxItems": 50,
+              "description": "The answers to pick from, each a label or {value, label, description, image, icon, recommended}: 2 to 12 for single and multiple, 2 to 50 for select, 2 to 16 for images (each with an image); none for text and longText",
               "items": {
                 "anyOf": [
                   {
@@ -46,10 +68,55 @@
                       },
                       "label": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "The option's title: a few words"
                       },
                       "description": {
-                        "type": "string"
+                        "type": "string",
+                        "description": "The option's subtitle: what it means or what it costs, in a short sentence"
+                      },
+                      "image": {
+                        "type": "object",
+                        "description": "A picture of the option, for type \"images\": the sha256 of an image file you shared in this conversation, never a URL",
+                        "properties": {
+                          "sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$"
+                          },
+                          "alt": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "What the picture shows, in words"
+                          }
+                        },
+                        "required": [
+                          "sha256",
+                          "alt"
+                        ]
+                      },
+                      "icon": {
+                        "enum": [
+                          "agent",
+                          "read",
+                          "edit",
+                          "delete",
+                          "move",
+                          "search",
+                          "execute",
+                          "think",
+                          "fetch",
+                          "web",
+                          "git",
+                          "test",
+                          "file",
+                          "tool",
+                          "opencode"
+                        ],
+                        "description": "An icon beside the label"
+                      },
+                      "recommended": {
+                        "type": "boolean",
+                        "description": "Mark this option as the one you recommend"
                       }
                     },
                     "required": [
@@ -61,7 +128,7 @@
             },
             "multiple": {
               "type": "boolean",
-              "description": "Several options may be picked"
+              "description": "Several options may be picked (the same as type \"multiple\"; with select and images it lets several be picked)"
             },
             "allowOther": {
               "type": "boolean",
@@ -70,13 +137,61 @@
             "required": {
               "type": "boolean",
               "description": "The person must answer this one (the default)"
+            },
+            "default": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "description": "What is chosen at first: an option's value or label, or a list of them for several; the words a typed question starts with"
+            },
+            "min": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "The fewest options to pick, when several may be picked"
+            },
+            "max": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "The most options to pick, when several may be picked"
             }
           },
           "required": [
-            "question",
-            "options"
+            "question"
           ]
         }
+      },
+      "freeInput": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "description": "What the box is called"
+              },
+              "placeholder": {
+                "type": "string",
+                "description": "The hint inside the box"
+              }
+            }
+          }
+        ],
+        "description": "Add an \"anything else\" box to the form; its words come back as the note of the answer"
+      },
+      "submitLabel": {
+        "type": "string",
+        "description": "The words of the button (at most 40 characters)"
       }
     },
     "required": [

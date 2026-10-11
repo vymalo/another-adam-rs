@@ -723,13 +723,20 @@ async fn the_coder_shares_the_svg_it_made_as_an_a2a_file_artifact(store: DynStor
             _ => None,
         })
         .expect("a result for share_file");
-    assert_eq!(
-        told,
-        format!(
-            "Shared dot.svg ({} bytes, image/svg+xml). To show it in your answer, write \
-             ![description](dot.svg).",
-            SVG.len()
-        )
+    // The line every shared image has, and then the file's hash, for a picture in a form.
+    let line = format!(
+        "Shared dot.svg ({} bytes, image/svg+xml). To show it in your answer, write \
+         ![description](dot.svg).",
+        SVG.len()
+    );
+    let hint = told
+        .strip_prefix(&line)
+        .unwrap_or_else(|| panic!("the line of a shared image: {told}"));
+    assert!(
+        hint.starts_with(
+            " To use it as the picture of an `ask_user` option, pass image {sha256: \""
+        ),
+        "{hint}"
     );
     let everything = serde_json::to_string(&requests).unwrap();
     assert!(

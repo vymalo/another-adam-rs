@@ -7,7 +7,7 @@
 //!
 //! | You get | What it is |
 //! |---|---|
-//! | [`AskUser`] (`ask_user { question, choices? }`) | the plain question every agent has; with `choices`, one form (radio lists, checkboxes) and the person's answers as the result; as text when the screen cannot draw it |
+//! | [`AskUser`] (`ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`) | the plain question every agent has; with `choices`, one form (a title, why the agent asks, questions of type radio, checkboxes, a searchable list, a deck of pictures or a typed answer, options with a label, a description and a recommended mark) and the person's answers as the result; the subset an older screen has, or text, when the screen cannot draw it |
 //! | [`Show`] (`show { blocks, title? }`) | draws blocks of the screen's components, each checked against the catalog's schema; the A2UI surface goes out as a run artifact |
 //! | [`UiCatalogTool`] (`ui_catalog {}`) | the components, what they are for, and their schemas |
 //! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, listed again at every model turn; a successful `turn_output { text }` makes `text` the run's answer; a tool the orchestrator reports as a step (`reportsStep`) gets no step of the agent's, a call waits as long as the tool's `timeoutSecs` (capped by `THREAD_TOOLS_MAX_CALL_SECS`) and carries a stable `callId`; with mentions in the run's context it adds a "Mentioned agents" block to the instructions |

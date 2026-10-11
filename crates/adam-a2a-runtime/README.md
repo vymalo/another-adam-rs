@@ -173,7 +173,7 @@ sends it (contracts: `docs/api/ui-catalog-v1.md`, `docs/api/thread-tools-v1.md` 
 | In the message | In the run |
 |---|---|
 | text parts | the text |
-| an A2UI action part (`application/a2ui+json`, in `mediaType` or in `metadata.mimeType`) with Choices answers (`context.answers`: `[{id, values, other?}]`) | `The person answered through the interface:` then one line per question, `- db: pg`, `- auth: other: "Keycloak"` (what the person typed is JSON-quoted); it is the result of the `ask_user` call that parked the run |
+| an A2UI action part (`application/a2ui+json`, in `mediaType` or in `metadata.mimeType`) with Choices answers (`context.answers`: `[{id, values, other?, text?}]`, and `context.note`) | `The person answered through the interface:` then one line per question, `- db: pg`, `- auth: other: "Keycloak"`, `- name: text: "Quokka"`, and a last line `Note: "by Friday"` when the form's free box was used (what the person typed is always JSON-quoted after its label, so it can never pass for an option's value); a question with nothing chosen reads `(nothing chosen)`; it is the result of the `ask_user` call that parked the run |
 | any other A2UI action | `The person used the interface: action "<name>" on surface "<id>" with context <JSON, cut at 4096 characters>` |
 | `metadata[ui-catalog/v1]` | `Conversation::context["vymalo.ui.ref"]` = `{catalogId, version, digest}` |
 | an inline catalog with that `catalogId` in the renderer's capabilities (`a2uiClientCapabilities` under `v0.9.1`, else `v0.9`; `a2uiRendererCapabilities` under `v1.0`) | `context["vymalo.ui.catalog"]` = `{catalogId, version, digest, catalog}`; an inline catalog of another id is ignored |

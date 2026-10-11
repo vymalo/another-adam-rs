@@ -177,6 +177,19 @@ impl Artifact {
     pub fn file_len(&self) -> usize {
         self.file.as_ref().map_or(0, |f| f.bytes.len())
     }
+
+    /// The SHA-256 of the file's bytes, as 64 lower-case hexadecimal digits: the name the person's
+    /// screen keeps the file under, and what a form's picture of it (`ask_user`'s `image.sha256`)
+    /// refers to. `None` for a JSON artifact.
+    pub fn file_sha256(&self) -> Option<String> {
+        use sha2::Digest as _;
+        self.file.as_ref().map(|f| {
+            sha2::Sha256::digest(&f.bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        })
+    }
 }
 
 /// Whether `filename` is a name a file can be saved under: not empty, at most

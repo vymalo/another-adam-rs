@@ -5018,11 +5018,15 @@ async fn share_file_returns_the_file_as_an_artifact_and_tells_the_model_one_line
         .await
         .unwrap();
     assert!(!out.is_error, "{}", out.content);
+    // The line for any shared image, then the file's hash: how an `ask_user` option names a picture.
+    let hash = out.artifacts[0].file_sha256().expect("a file artifact");
+    assert_eq!(hash.len(), 64);
     assert_eq!(
         out.content,
         format!(
             "Shared chart.svg ({} bytes, image/svg+xml). To show it in your answer, write \
-             ![description](chart.svg).",
+             ![description](chart.svg). To use it as the picture of an `ask_user` option, pass \
+             image {{sha256: \"{hash}\", alt}}.",
             SVG.len()
         )
     );
