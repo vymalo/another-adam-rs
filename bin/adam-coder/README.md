@@ -663,6 +663,10 @@ stateDiagram-v2
 `explorer` answers where and how questions about a repository with file paths and line numbers; `reviewer` reads
 `git diff origin/<base>...HEAD` and returns findings by severity with file and line. The prompt says when to use them
 (a large or unfamiliar repository; once before `open_pull_request`), and what they say is advice: the gates decide.
+They run one at a time: the agent loop runs a turn's tool calls in order (`crates/adam-llm-agent/src/agent.rs`), so two
+subagent calls never overlap, and no subagent edits. The prompt says so, and that OpenCode has subagents of its own
+(`explore`, `general`): for a change with independent parts the coder asks OpenCode, in `delegate_to_opencode`'s
+instructions, to split them across those, and checks the whole result itself.
 
 A child run has an id of its own, so the tools key by the **root run** (`ToolCtx::root_run_id()`, carried down by
 `ToolCtx::start_child`: [ADR 0021](../../docs/decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)). Per place:
