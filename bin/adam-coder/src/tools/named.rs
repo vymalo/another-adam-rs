@@ -29,9 +29,9 @@
 //! findings of tools and reviewers in fences labelled `untrusted`; [`without_untrusted`] removes
 //! those before [`named_in`] reads a word of it.
 
+use adam_a2a_runtime::form_answer_surface;
+use adam_ui::comparable;
 use adam_workspace::{RepoLocation, RepoRef};
-
-use super::notes::PullRef;
 
 /// The host of a repository written as `owner/name` when nothing says otherwise.
 pub const DEFAULT_HOST: &str = "github.com";
@@ -140,8 +140,6 @@ pub fn without_untrusted(text: &str) -> String {
     kept
 }
 
-/// What the interface wrote when the person answered a form.
-const ANSWER_HEADER: &str = "The person answered through the interface:";
 /// What the interface wrote for any other action of the person.
 const ACTION_PREFIX: &str = "The person used the interface:";
 
@@ -150,11 +148,14 @@ const ACTION_PREFIX: &str = "The person used the interface:";
 /// strings), and **not** what the interface made of their clicks.
 ///
 /// `defaults` are the defaults of the text questions of the form the answer is for, when the
-/// answer could be paired with its `ask_user` call (`None`: it could not). A `text:` part that is one
-/// of them is dropped, and with `None` every `text:` part is: the model can pre-fill a typed question
-/// (`default`), the page sends the pre-filled words on an untouched submit, and they are the model's.
+/// answer could be paired with its `ask_user` call (`None`: it could not, or it is for a form that
+/// call did not draw). A `text:` part that is one of them is dropped (compared as
+/// [`comparable`] has it: a page may trim, or keep, what is not visible), and
+/// with `None` every `text:` part is: the model can pre-fill a typed question (`default`), the page
+/// sends the pre-filled words on an untouched submit, and they are the model's.
 ///
-/// A form's answer reads `The person answered through the interface:`, a line `- <id>: <value>, ...`
+/// A form's answer reads `The person answered through the interface (form <surface>):`
+/// ([`form_answer_surface`]), a line `- <id>: <value>, ...`
 /// for each question, and a `Note:`. The question ids and the option values are what **the model**
 /// wrote when it drew the form (the person sees labels), so they are not the person's words: a model
 /// that offers an option whose value is `merge #7` or `acme/widgets` has said nothing for the person
@@ -167,7 +168,7 @@ pub fn typed_by_the_person(text: &str, defaults: Option<&[String]>) -> String {
     let mut answering = false;
     for line in text.lines() {
         let line = line.trim_end();
-        if line == ANSWER_HEADER {
+        if form_answer_surface(line).is_some() {
             answering = true;
             continue;
         }
@@ -231,7 +232,10 @@ fn typed_in_answer(line: &str, defaults: Option<&[String]>) -> Vec<String> {
                 Some((value, end)) => {
                     // A typed question's words are the person's only if they are not the model's default.
                     let prefilled = label == "text: "
-                        && defaults.is_none_or(|d| d.iter().any(|d| d.trim() == value.trim()));
+                        && defaults.is_none_or(|d| {
+                            let value = comparable(&value);
+                            d.iter().any(|d| comparable(d) == value)
+                        });
                     if !prefilled {
                         typed.push(value);
                     }
@@ -252,25 +256,6 @@ fn typed_in_answer(line: &str, defaults: Option<&[String]>) -> Vec<String> {
             None => return typed,
         }
     }
-}
-
-/// `pulls` with each one that names no repository bound to **the** repository in play, `in_play`
-/// (the keys of the repositories named so far, in the workspace or created by the run), when there
-/// is exactly one: `#12` of a conversation about one repository is that repository's. With none or
-/// several it stands for no pull request, and the person must write `owner/name#12` or the pull
-/// request's URL.
-pub fn bind_pulls(pulls: Vec<PullRef>, in_play: &[String]) -> Vec<PullRef> {
-    pulls
-        .into_iter()
-        .filter_map(|pull| match (&pull.repo, in_play) {
-            (Some(_), _) => Some(pull),
-            (None, [only]) => Some(PullRef {
-                repo: Some(only.clone()),
-                number: pull.number,
-            }),
-            (None, _) => None,
-        })
-        .collect()
 }
 
 /// The keys of every repository `text` names, in order of appearance, without repeats;
@@ -319,101 +304,6 @@ fn split_words(text: &str) -> impl Iterator<Item = &str> {
                     | '|'
                     | '*'
             )
-    })
-}
-
-/// The pull requests `text` names, in order of appearance, without repeats: a URL
-/// (`https://github.com/acme/widgets/pull/12`, the repository known), `acme/widgets#12`, and a
-/// number alone (`#12`, `PR 12`, `pull request 12`, `pull 12`), which names no repository: it is
-/// [bound](bind_pulls) to the one repository in play, or it names nothing. `text` must be what the
-/// person typed ([`typed_by_the_person`]).
-pub fn pulls_in(text: &str, default_host: &str) -> Vec<PullRef> {
-    let default_host = normal_host(default_host, None);
-    let mut pulls = Vec::new();
-    let mut add = |pull: PullRef| {
-        if !pulls.contains(&pull) {
-            pulls.push(pull);
-        }
-    };
-    let number = |digits: &str| -> Option<u64> {
-        let end = digits
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(digits.len());
-        digits[..end].parse().ok().filter(|n| *n > 0)
-    };
-    let mut before = String::new();
-    for word in split_words(text) {
-        let word = word.trim_end_matches(['.', ':', '!', '?']);
-        if let Some((repo, rest)) = word.split_once("/pull/") {
-            if let (Some(n), Some(key)) = (number(rest), key_of_word(repo, &default_host)) {
-                add(PullRef {
-                    repo: Some(key),
-                    number: n,
-                });
-            }
-        } else if let Some((repo, rest)) = word.split_once('#') {
-            if let Some(n) = number(rest) {
-                if repo.is_empty() {
-                    add(PullRef {
-                        repo: None,
-                        number: n,
-                    });
-                } else if let Some(key) = key_of_word(repo, &default_host) {
-                    add(PullRef {
-                        repo: Some(key),
-                        number: n,
-                    });
-                }
-            }
-        } else if matches!(before.as_str(), "pr" | "pull" | "request" | "pull-request")
-            && word.bytes().all(|b| b.is_ascii_digit())
-            && let Some(n) = number(word)
-        {
-            add(PullRef {
-                repo: None,
-                number: n,
-            });
-        }
-        before = word.to_ascii_lowercase();
-    }
-    pulls
-}
-
-/// Whether `text`, what the person wrote, asks for a merge: the word `merge` (not `merged`, not
-/// `merge conflict`, `merge commit`, `merge queue`), not just after a `not`, `don't`, `never`, `no`
-/// or `without`. A heuristic that errs toward not merging: a pull request that needs the person's
-/// fresh yes is never merged on a word that only looks like one.
-pub fn asks_to_merge(text: &str) -> bool {
-    let words: Vec<String> = text
-        .split(|c: char| !(c.is_alphanumeric() || c == '\''))
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect();
-    words.iter().enumerate().any(|(at, word)| {
-        word == "merge"
-            && !words[at.saturating_sub(2)..at].iter().any(|w| {
-                matches!(
-                    w.as_str(),
-                    "not"
-                        | "dont"
-                        | "don't"
-                        | "never"
-                        | "no"
-                        | "without"
-                        | "cannot"
-                        | "can't"
-                        | "cant"
-                        | "shouldn't"
-                        | "wont"
-                        | "won't"
-                )
-            })
-            && !words.get(at + 1).is_some_and(|next| {
-                matches!(
-                    next.as_str(),
-                    "conflict" | "conflicts" | "commit" | "commits" | "queue" | "base"
-                )
-            })
     })
 }
 
@@ -601,27 +491,31 @@ mod tests {
             ),
             ""
         );
+        // A page may drop what is not visible (a JavaScript `trim()` takes U+FEFF), or keep it when
+        // the default had none: the same default either way.
+        let hidden = ["\u{feff}merge acme/widgets#7".to_owned()];
+        for (default, sent) in [
+            (&hidden, "merge acme/widgets#7"),
+            (&defaults, "\u{feff}merge acme/widgets#7"),
+            (&hidden, "merge\u{200b} acme/widgets#7\u{202e}"),
+            (&defaults, "MERGE acme/widgets#7"),
+        ] {
+            let answer = format!(
+                "The person answered through the interface (form ask-1):\n- why: text: {}",
+                serde_json::Value::String(sent.to_owned())
+            );
+            assert_eq!(typed_by_the_person(&answer, Some(default)), "", "{sent:?}");
+        }
+        // Words that differ are the person's.
+        assert_eq!(
+            typed_by_the_person(
+                "The person answered through the interface (form ask-1):\n- why: text: \"merge acme/widgets#8\"",
+                Some(&defaults)
+            ),
+            "merge acme/widgets#8"
+        );
         // Not paired with a call: no typed question's words are trusted, an other is.
         assert_eq!(typed_by_the_person(untouched, None), "my own");
-    }
-
-    #[test]
-    fn a_bare_number_is_bound_to_the_one_repository_in_play_or_dropped() {
-        let bare = |number| PullRef { repo: None, number };
-        let full = PullRef {
-            repo: Some("github.com/o/r".to_owned()),
-            number: 1,
-        };
-        let one = ["github.com/acme/widgets".to_owned()];
-        let two = [one[0].clone(), "github.com/acme/gadgets".to_owned()];
-        let bound = bind_pulls(vec![bare(7), full.clone()], &one);
-        assert_eq!(bound[0].repo.as_deref(), Some("github.com/acme/widgets"));
-        assert_eq!(bound[1], full);
-        assert_eq!(
-            bind_pulls(vec![bare(7), full.clone()], &two),
-            std::slice::from_ref(&full)
-        );
-        assert_eq!(bind_pulls(vec![bare(7), full.clone()], &[]), [full]);
     }
 
     #[test]

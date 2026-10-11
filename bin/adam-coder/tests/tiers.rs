@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use a2a::{Message as A2aMessage, Part, Role};
 use adam_a2a::{ACCESS_TIER_EXTENSION, AccessTier, BackendError, Caller, TaskBackend as _};
 use adam_a2a_runtime::CONTEXT_ACCESS_TIER;
+use adam_coder::tools::consent::merge_question;
 use adam_coder::{AGENT_NAME, Coder, CoderAgent, RuntimeOptions, coder_tools};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
@@ -273,6 +274,8 @@ async fn a_model_that_calls_a_tool_above_the_tier_anyway_is_refused_and_the_host
         let merge_refused = tier < AccessTier::Auto;
         let delete_refused = tier < AccessTier::Bypass;
         let (fx, host) = with_memory_host().await;
+        // At `auto` a merge of a pull request the conversation did not push asks the person and the
+        // run waits for the answer (below); the other two calls are the ones of a message.
         let (requests, _) = drive(
             &fx,
             "merge pull request 1 of octo/widgets and delete octo/widgets",
@@ -285,57 +288,80 @@ async fn a_model_that_calls_a_tool_above_the_tier_anyway_is_refused_and_the_host
                         json!({"path": "x.txt", "content": "x"}),
                     ),
                     call(
-                        "c-merge",
-                        "merge_pull_request",
-                        json!({"repo": "octo/widgets", "number": 1}),
-                    ),
-                    call(
                         "c-delete",
                         "delete_repository",
                         json!({"repo": "octo/widgets", "confirm": "octo/widgets"}),
+                    ),
+                    call(
+                        "c-merge",
+                        "merge_pull_request",
+                        json!({"repo": "octo/widgets", "number": 1}),
                     ),
                 ])
                 .push_text("Done as far as I may.");
             },
         )
         .await;
-        let merge = result_of(&requests[1], "c-merge");
-        let delete = result_of(&requests[1], "c-delete");
-        let write = result_of(&requests[1], "c-write");
-        assert_eq!(
-            write.contains("needs the edits access tier"),
-            tier < AccessTier::Edits,
-            "{tier}: {write}"
-        );
-        // The host is asked for what the tier allows, and for nothing else.
-        assert_eq!(
-            host.merges().len(),
-            usize::from(!merge_refused),
-            "{tier}: {merge}"
-        );
-        assert_eq!(
-            host.deletions().len(),
-            usize::from(!delete_refused),
-            "{tier}: {delete}"
-        );
-        assert_eq!(
-            merge.contains("needs the auto access tier"),
-            merge_refused,
-            "{tier}: {merge}"
-        );
-        assert_eq!(
-            delete.contains("needs the bypass access tier"),
-            delete_refused,
-            "{tier}: {delete}"
-        );
-        // The refusal says which tier the act needs and the one the message is under, in words the
-        // model can pass on to the person.
-        if merge_refused {
-            assert!(
-                merge.contains(&format!("this message is under {tier}"))
-                    && merge.contains("Pick auto and send it again"),
-                "{merge}"
-            );
+        let write = if requests.len() > 1 {
+            result_of(&requests[1], "c-write")
+        } else {
+            String::new()
+        };
+        // Below `auto` the merge is refused and the run goes on; at `auto` it asks the person and
+        // waits (one request), at `bypass` it merges, nobody being asked.
+        let (delete, merge) = if requests.len() > 1 {
+            (
+                result_of(&requests[1], "c-delete"),
+                result_of(&requests[1], "c-merge"),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        match tier {
+            AccessTier::Auto => {
+                assert_eq!(requests.len(), 1, "the run waits for the person's answer");
+                assert!(
+                    host.merges().is_empty(),
+                    "{tier}: nothing is merged unasked"
+                );
+                assert!(host.deletions().is_empty(), "{tier}");
+            }
+            _ => {
+                assert_eq!(
+                    write.contains("needs the edits access tier"),
+                    tier < AccessTier::Edits,
+                    "{tier}: {write}"
+                );
+                assert_eq!(
+                    host.merges().len(),
+                    usize::from(!merge_refused),
+                    "{tier}: {merge}"
+                );
+                assert_eq!(
+                    host.deletions().len(),
+                    usize::from(!delete_refused),
+                    "{tier}: {delete}"
+                );
+                assert_eq!(
+                    merge.contains("needs the auto access tier"),
+                    merge_refused,
+                    "{tier}: {merge}"
+                );
+                assert_eq!(
+                    delete.contains("needs the bypass access tier"),
+                    delete_refused,
+                    "{tier}: {delete}"
+                );
+                // The refusal says which tier the act needs and the one the message is under, in
+                // words the model can pass on to the person.
+                if merge_refused {
+                    assert!(
+                        merge.contains(&format!("this message is under {tier}"))
+                            && merge.contains("Pick auto and send it again"),
+                        "{merge}"
+                    );
+                }
+            }
         }
     }
 }
@@ -469,7 +495,7 @@ impl Rig {
             .unwrap()
             .push(adam_coder::tools::notes::Heard::said(text));
         let said = self.said.lock().unwrap().clone();
-        notes.hear(&said, &host, &[]);
+        notes.hear(&said, &host);
         self.fx.env.notes.save(&run, &notes).await.unwrap();
     }
 
@@ -497,20 +523,54 @@ impl Rig {
         let run = self.ctx.run_id().to_string();
         let mut notes = self.fx.env.notes.load(&run).await.unwrap();
         notes.name_red_pulls([adam_coder::tools::notes::PullRef {
-            repo: Some(format!("github.com/{slug}")),
+            repo: format!("github.com/{slug}"),
             number,
         }]);
         self.fx.env.notes.save(&run, &notes).await.unwrap();
     }
 
-    /// The tool `merge_pull_request` on pull request 7 of `octo/widgets`.
-    async fn merge(&self) -> ToolOutput {
+    /// The person answered the tool's form for pull request 7 of `octo/widgets` at its head `sha`
+    /// (a squash that keeps the branch; `red`: with checks accepted that did not pass): `merge` is
+    /// the option they chose. The agent writes this into the notes from the answer of the form's
+    /// own surface (`CoderAgent::record_grants`); the run-level tests below drive that part.
+    async fn answered(&self, sha: &str, red: bool, merge: bool) {
+        let run = self.ctx.run_id().to_string();
+        let mut notes = self.fx.env.notes.load(&run).await.unwrap();
+        let n = notes.consents.len();
+        notes.record_consents([adam_coder::tools::notes::Consent {
+            call_id: format!("m{n}"),
+            tool: "merge_pull_request".to_owned(),
+            subject: merge_question("github.com/octo/widgets", 7, sha, red, "squash", false),
+            agreed: merge,
+        }]);
+        self.fx.env.notes.save(&run, &notes).await.unwrap();
+    }
+
+    /// The tool `merge_pull_request` on pull request 7 of `octo/widgets`, as the tool answers.
+    async fn merge_raw(&self) -> Result<ToolOutput, ToolError> {
         self.call(
             "merge_pull_request",
             json!({"repo": "octo/widgets", "number": 7}),
         )
         .await
-        .unwrap()
+    }
+
+    /// The tool `merge_pull_request` on pull request 7 of `octo/widgets`, answered with a result.
+    async fn merge(&self) -> ToolOutput {
+        self.merge_raw().await.unwrap()
+    }
+
+    /// The question the tool put to the person when called: its words and the form, as one string.
+    async fn asked(&self) -> String {
+        match self.merge_raw().await {
+            Err(ToolError::NeedsInput { question, ui }) => {
+                format!(
+                    "{question}\n{}",
+                    ui.map(|ui| ui.to_string()).unwrap_or_default()
+                )
+            }
+            other => panic!("the tool should have asked the person: {other:?}"),
+        }
     }
 
     async fn call(&self, name: &'static str, args: Value) -> Result<ToolOutput, ToolError> {
@@ -545,11 +605,13 @@ impl Rig {
     }
 }
 
+/// Path A: the conversation pushed the head commit and its checks passed: merged at `auto` with no
+/// question, the way the model asked for, on the commit that was read.
 #[tokio::test]
-async fn a_pull_request_is_merged_through_github_with_the_method_and_the_head_it_read() {
+async fn a_pull_request_the_conversation_pushed_is_merged_through_github_with_the_method_and_the_head_it_read()
+ {
     let rig = Rig::new(Fixture::new("hello\n").await);
     common::mount_mergeable(&rig.fx.github, "octo/widgets", 7, "agent/x", "9f8e7d").await;
-    rig.say("merge octo/widgets").await;
     rig.pushed("octo/widgets", "agent/x").await;
     let out = rig
         .call(
@@ -579,7 +641,6 @@ async fn a_pull_request_is_merged_through_github_with_the_method_and_the_head_it
     // The default is a squash, and the branch stays unless asked.
     let rig = Rig::new(Fixture::new("hello\n").await);
     common::mount_mergeable(&rig.fx.github, "octo/widgets", 7, "agent/x", "1").await;
-    rig.say("merge octo/widgets").await;
     rig.pushed("octo/widgets", "agent/x").await;
     let out = rig
         .call(
@@ -626,7 +687,6 @@ async fn what_github_refuses_is_the_tools_error_in_githubs_words_with_the_class(
             .with_priority(1)
             .mount(&rig.fx.github)
             .await;
-        rig.say("merge octo/widgets").await;
         rig.pushed("octo/widgets", "agent/x").await;
         let out = rig
             .call(
@@ -656,23 +716,23 @@ async fn what_github_refuses_is_the_tools_error_in_githubs_words_with_the_class(
     }
 }
 
+/// A pull request the conversation did not push is put to the person, in the tool's own form, and
+/// nothing is merged; what is not a repository, a method or a host the workspace allows is refused
+/// before anybody is asked.
 #[tokio::test]
-async fn only_a_pull_request_of_a_repository_the_person_gave_the_run_is_merged() {
+async fn a_pull_request_the_conversation_did_not_push_is_put_to_the_person_and_not_merged() {
     let rig = Rig::new(Fixture::new("hello\n").await);
     common::mount_mergeable(&rig.fx.github, "octo/widgets", 7, "agent/x", "1").await;
-    // Nobody named it: refused before GitHub is asked.
-    let out = rig
-        .call(
-            "merge_pull_request",
-            json!({"repo": "octo/widgets", "number": 7}),
-        )
-        .await
-        .unwrap();
+    // Nobody pushed it: the person is asked, the host is not.
+    let asked = rig.asked().await;
     assert!(
-        out.is_error && out.content.contains("is not one to merge"),
-        "{}",
-        out.content
+        asked.contains("Merge octo/widgets#7 into main?")
+            && asked.contains("Merge it")
+            && asked.contains("Not now")
+            && asked.contains("Branch agent/x, commit abc123. Checks: passed. Method: squash."),
+        "{asked}"
     );
+    assert!(rig.requests("PUT").await.is_empty());
     // Not a repository at all, a bad method, and a host the workspace does not allow.
     for (args, needle) in [
         (
@@ -715,8 +775,24 @@ async fn rig_with_a_pull_request_of_the_run(state: &str) -> Rig {
     )
     .await;
     common::mount_merge(&rig.fx.github, "octo/widgets", 7, "agent/x", "9f8e7d").await;
-    rig.say("work on octo/widgets").await;
     rig.pushed("octo/widgets", "agent/x").await;
+    rig
+}
+
+/// The mock GitHub with pull request 7 of `octo/widgets` from somebody else's branch, whose head is
+/// `abc123`: what a merge of a pull request nobody here pushed is.
+async fn rig_with_a_pull_request_of_somebody_else() -> Rig {
+    let rig = Rig::new(Fixture::new("hello\n").await);
+    common::mount_pull(
+        &rig.fx.github,
+        "octo/widgets",
+        7,
+        "feature/theirs",
+        "abc123",
+        "clean",
+    )
+    .await;
+    common::mount_merge(&rig.fx.github, "octo/widgets", 7, "feature/theirs", "1").await;
     rig
 }
 
@@ -729,82 +805,86 @@ fn green() -> (Value, Value) {
     )
 }
 
-/// Rule 1: a pull request is merged when this conversation pushed its branch, or the person named it.
+/// Path B: any other pull request is merged only on the person's yes to the tool's own question,
+/// and that yes is to exactly that pull request, that head commit, that method and those checks.
 #[tokio::test]
-async fn a_pull_request_nobody_here_pushed_and_the_person_did_not_name_is_not_merged() {
-    // A pull request of somebody else's branch.
-    let rig = Rig::new(Fixture::new("hello\n").await);
-    common::mount_pull(
-        &rig.fx.github,
-        "octo/widgets",
-        7,
-        "feature/theirs",
-        "abc123",
-        "clean",
-    )
-    .await;
-    common::mount_merge(&rig.fx.github, "octo/widgets", 7, "feature/theirs", "1").await;
-    rig.say("work on octo/widgets").await;
-    rig.pushed("octo/widgets", "agent/x").await;
+async fn another_pull_request_is_merged_on_the_persons_yes_to_the_tools_own_question() {
+    let rig = rig_with_a_pull_request_of_somebody_else().await;
+    rig.asked().await;
+    assert!(rig.requests("PUT").await.is_empty());
+    // A yes to the question of another commit (the head moved since), another method, checks accepted
+    // red, or another pull request is not this one's.
+    rig.answered("f00d", false, true).await;
+    rig.answered("abc123", true, true).await;
+    rig.asked().await;
+    let run = rig.ctx.run_id().to_string();
+    let mut notes = rig.fx.env.notes.load(&run).await.unwrap();
+    notes.record_consents([adam_coder::tools::notes::Consent {
+        call_id: "x".into(),
+        tool: "merge_pull_request".into(),
+        subject: merge_question(
+            "github.com/octo/widgets",
+            8,
+            "abc123",
+            false,
+            "squash",
+            false,
+        ),
+        agreed: true,
+    }]);
+    notes.record_consents([adam_coder::tools::notes::Consent {
+        call_id: "y".into(),
+        tool: "merge_pull_request".into(),
+        subject: merge_question(
+            "github.com/octo/widgets",
+            7,
+            "abc123",
+            false,
+            "rebase",
+            false,
+        ),
+        agreed: true,
+    }]);
+    rig.fx.env.notes.save(&run, &notes).await.unwrap();
+    rig.asked().await;
+    assert!(rig.requests("PUT").await.is_empty());
+    // A yes to this one: merged, and the commit that was asked about is the one merged.
+    rig.answered("abc123", false, true).await;
     let out = rig.merge().await;
     assert!(
-        out.is_error
-            && out.content.contains("is not one to merge")
-            && out.content.contains("feature/theirs")
-            && out.content.contains("ask them to say"),
+        !out.is_error && out.content.starts_with("Merged pull request #7"),
         "{}",
         out.content
     );
-    assert!(rig.requests("PUT").await.is_empty());
-    // The person names the pull request, by its number in a sentence that says to merge it: now it is.
-    rig.say("merge pull request 7 please").await;
-    let out = rig.merge().await;
-    assert!(!out.is_error, "{}", out.content);
+    let puts = rig.requests("PUT").await;
+    assert_eq!(puts.len(), 1);
+    let body: Value = serde_json::from_slice(&puts[0].body).unwrap();
+    assert_eq!(body, json!({"merge_method": "squash", "sha": "abc123"}));
+    // A later "not now" to the same question takes the yes away.
+    rig.answered("abc123", false, false).await;
+    rig.asked().await;
     assert_eq!(rig.requests("PUT").await.len(), 1);
-
-    // Naming another number, another repository's pull request or a repository alone is not naming it.
-    for words in [
-        "merge #8",
-        "merge https://github.com/other/widgets/pull/7",
-        "merge octo/widgets",
-        "merge the one with 7 files",
-    ] {
-        let rig = Rig::new(Fixture::new("hello\n").await);
-        common::mount_pull(
-            &rig.fx.github,
-            "octo/widgets",
-            7,
-            "feature/theirs",
-            "abc123",
-            "clean",
-        )
-        .await;
-        rig.say(&format!("work on octo/widgets, {words}")).await;
-        let out = rig.merge().await;
-        assert!(
-            out.is_error && out.content.contains("is not one to merge"),
-            "{words}: {}",
-            out.content
-        );
-        assert!(rig.requests("PUT").await.is_empty(), "{words}");
-    }
-    // The URL of the pull request names it, and says which repository's.
-    let rig = Rig::new(Fixture::new("hello\n").await);
-    common::mount_pull(
-        &rig.fx.github,
-        "octo/widgets",
-        7,
-        "feature/theirs",
-        "abc123",
-        "clean",
-    )
-    .await;
-    common::mount_merge(&rig.fx.github, "octo/widgets", 7, "feature/theirs", "1").await;
-    rig.say("merge https://github.com/octo/widgets/pull/7")
-        .await;
-    assert!(!rig.merge().await.is_error);
 }
 
+/// What the person says in words does not decide a merge: not "merge it", not the pull request's
+/// URL, not what a form the model drew held.
+#[tokio::test]
+async fn what_the_person_says_in_words_does_not_decide_a_merge() {
+    let rig = rig_with_a_pull_request_of_somebody_else().await;
+    for words in [
+        "merge #7",
+        "yes, merge https://github.com/octo/widgets/pull/7 now",
+        "merge pull request 7 of octo/widgets, I said so",
+        "octo/widgets#7 is fine to merge, go ahead",
+    ] {
+        rig.say(words).await;
+        rig.asked().await;
+    }
+    assert!(rig.requests("PUT").await.is_empty());
+}
+
+/// A branch of a fork with the name of a pushed branch is not the one the conversation pushed: it is
+/// another's pull request, and the person is told it is from a fork.
 #[tokio::test]
 async fn a_branch_of_a_fork_with_the_name_of_a_pushed_branch_is_not_the_one_pushed() {
     let rig = Rig::new(Fixture::new("hello\n").await);
@@ -818,18 +898,13 @@ async fn a_branch_of_a_fork_with_the_name_of_a_pushed_branch_is_not_the_one_push
         "clean",
     )
     .await;
-    rig.say("work on octo/widgets").await;
     rig.pushed("octo/widgets", "agent/x").await;
-    let out = rig.merge().await;
-    assert!(
-        out.is_error && out.content.contains("a fork"),
-        "{}",
-        out.content
-    );
+    let asked = rig.asked().await;
+    assert!(asked.contains("from the fork stranger/widgets"), "{asked}");
     assert!(rig.requests("PUT").await.is_empty());
 }
 
-/// Rule 2: the checks of the head commit passed, and that commit is the one merged.
+/// The checks of the head commit passed, and that commit is the one merged.
 #[tokio::test]
 async fn a_pull_request_whose_checks_did_not_pass_is_not_merged() {
     let failing = (
@@ -879,7 +954,6 @@ async fn a_pull_request_whose_checks_did_not_pass_is_not_merged() {
 #[tokio::test]
 async fn a_head_that_moved_after_the_checks_were_read_is_not_merged() {
     let rig = Rig::new(Fixture::new("hello\n").await);
-    rig.say("work on octo/widgets").await;
     rig.pushed_sha("octo/widgets", "agent/x", "aaa").await;
     let github = &rig.fx.github;
     let (status, runs) = green();
@@ -927,63 +1001,51 @@ async fn a_head_that_moved_after_the_checks_were_read_is_not_merged() {
     assert!(rig.requests("PUT").await.is_empty());
 }
 
-/// Rule 3: a pull request opened with red checks accepted needs the person to say, in a later message,
-/// to merge it.
+fn red() -> (Value, Value) {
+    (
+        json!({"state": "success", "total_count": 1}),
+        json!({"total_count": 1, "check_runs": [
+            {"name": "build", "status": "completed", "conclusion": "failure"}
+        ]}),
+    )
+}
+
+/// A red-checks override: a pull request this conversation opened with red checks accepted is
+/// merged on the person's yes to the tool's own question, that says the checks are red, and not on
+/// the acceptance that opened it.
 #[tokio::test]
-async fn a_pull_request_opened_with_red_checks_needs_a_fresh_yes_to_be_merged() {
-    let red = || {
-        (
-            json!({"state": "success", "total_count": 1}),
-            json!({"total_count": 1, "check_runs": [
-                {"name": "build", "status": "completed", "conclusion": "failure"}
-            ]}),
-        )
-    };
-    // Accepted red, and the checks are red: no merge until the person says so.
+async fn a_pull_request_opened_with_red_checks_is_put_to_the_person_before_it_is_merged() {
+    // Accepted red, and the checks are red: the person is asked, the question says so.
     let rig = rig_with_a_pull_request_of_the_run("blocked").await;
     let (status, runs) = red();
     common::mount_checks(&rig.fx.github, "octo/widgets", "abc123", status, runs).await;
     rig.opened_red("octo/widgets", 7).await;
-    let out = rig.merge().await;
+    let asked = rig.asked().await;
     assert!(
-        out.is_error && out.content.contains("not for merging it"),
-        "{}",
-        out.content
+        asked.contains("FAILED, build: failure") && asked.contains("separate yes"),
+        "{asked}"
     );
-    // A message that does not name the pull request, or does not say to merge, is not that yes.
-    for words in [
-        "ok, go on",
-        "merge it",
-        "what about #7?",
-        "do not merge #7",
-        "fix the merge conflict in #7",
-        "merged #7 already?",
-    ] {
-        rig.say(words).await;
-        let out = rig.merge().await;
-        assert!(out.is_error, "{words}: {}", out.content);
-    }
-    assert!(rig.requests("PUT").await.is_empty());
-    // Newest message, named and asked: the fresh yes. The red checks no longer stop it.
+    // Nothing the person says in words is that yes, and a yes to the question of green checks (the
+    // pull request as it was) is not a yes to merging it red.
     rig.say("yes, merge #7").await;
+    rig.answered("abc123", false, true).await;
+    rig.asked().await;
+    assert!(rig.requests("PUT").await.is_empty());
+    // The yes to the question that says the checks are red: merged.
+    rig.answered("abc123", true, true).await;
     let out = rig.merge().await;
     assert!(!out.is_error, "{}", out.content);
     assert_eq!(rig.requests("PUT").await.len(), 1);
-    // A later message that does not repeat it takes the yes away again.
-    rig.say("thanks!").await;
-    let out = rig.merge().await;
-    assert!(out.is_error, "{}", out.content);
 
-    // Opened with red accepted, green now: still needs the person's word.
+    // Opened with red accepted, green now: the override is not needed, and it is merged as any
+    // pull request of the conversation's is.
     let rig = rig_with_a_pull_request_of_the_run("blocked").await;
     let (status, runs) = green();
     common::mount_checks(&rig.fx.github, "octo/widgets", "abc123", status, runs).await;
     rig.opened_red("octo/widgets", 7).await;
-    assert!(rig.merge().await.is_error);
-    rig.say("merge pull request 7").await;
     assert!(!rig.merge().await.is_error);
 
-    // Checks that have not finished are waited for, whatever the person said.
+    // Checks that have not finished are waited for, whatever the person answered.
     let rig = rig_with_a_pull_request_of_the_run("blocked").await;
     common::mount_checks(
         &rig.fx.github,
@@ -996,7 +1058,8 @@ async fn a_pull_request_opened_with_red_checks_needs_a_fresh_yes_to_be_merged() 
     )
     .await;
     rig.opened_red("octo/widgets", 7).await;
-    rig.say("merge #7").await;
+    rig.answered("abc123", true, true).await;
+    rig.answered("abc123", false, true).await;
     let out = rig.merge().await;
     assert!(
         out.is_error && out.content.contains("have not finished"),
@@ -1004,21 +1067,82 @@ async fn a_pull_request_opened_with_red_checks_needs_a_fresh_yes_to_be_merged() 
         out.content
     );
 
-    // A pull request that was not opened red is not merged on red checks because the person asks.
+    // A pull request that was not opened red is not merged on red checks, whatever was answered.
     let rig = rig_with_a_pull_request_of_the_run("blocked").await;
     let (status, runs) = red();
     common::mount_checks(&rig.fx.github, "octo/widgets", "abc123", status, runs).await;
-    rig.say("merge #7").await;
+    rig.answered("abc123", true, true).await;
+    rig.answered("abc123", false, true).await;
     let out = rig.merge().await;
     assert!(
         out.is_error && out.content.contains("did not pass"),
         "{}",
         out.content
     );
+    assert!(rig.requests("PUT").await.is_empty());
 }
 
-/// The pull request must be one whose head is a commit **this conversation pushed**, not just a
-/// branch of a name it used.
+/// At `bypass` nothing is asked: another's pull request and a red-checks override are merged after
+/// the same checks of the host, the repository and the commit; the checks that did not pass still
+/// stop a pull request that was not opened red, and one still running is waited for.
+#[tokio::test]
+async fn at_bypass_a_pull_request_is_merged_without_a_question_after_the_same_checks() {
+    // Somebody else's, green.
+    let rig = rig_with_a_pull_request_of_somebody_else().await;
+    rig.tier(AccessTier::Bypass).await;
+    let out = rig.merge().await;
+    assert!(!out.is_error, "{}", out.content);
+    let body: Value = serde_json::from_slice(&rig.requests("PUT").await[0].body).unwrap();
+    assert_eq!(body["sha"], "abc123");
+
+    // Opened red, red now: the override needs no question at `bypass`.
+    let rig = rig_with_a_pull_request_of_the_run("blocked").await;
+    let (status, runs) = red();
+    common::mount_checks(&rig.fx.github, "octo/widgets", "abc123", status, runs).await;
+    rig.opened_red("octo/widgets", 7).await;
+    rig.tier(AccessTier::Bypass).await;
+    assert!(!rig.merge().await.is_error);
+
+    // Somebody else's, with checks that did not pass, or still running: stopped, asked about nothing.
+    for (checks, said) in [
+        (red(), "did not pass"),
+        (
+            (
+                json!({"state": "pending", "total_count": 0}),
+                json!({"total_count": 1, "check_runs": [
+                    {"name": "build", "status": "queued", "conclusion": null}
+                ]}),
+            ),
+            "have not finished",
+        ),
+    ] {
+        let rig = rig_with_a_pull_request_of_somebody_else().await;
+        common::mount_checks(&rig.fx.github, "octo/widgets", "abc123", checks.0, checks.1).await;
+        rig.tier(AccessTier::Bypass).await;
+        let out = rig.merge().await;
+        assert!(
+            out.is_error && out.content.contains(said),
+            "{said}: {}",
+            out.content
+        );
+        assert!(rig.requests("PUT").await.is_empty(), "{said}");
+    }
+
+    // The host and the repository are checked at `bypass` too (the tests below hold for every tier).
+    let rig = rig_with_a_pull_request_of_somebody_else().await;
+    rig.tier(AccessTier::Bypass).await;
+    let out = rig
+        .call(
+            "merge_pull_request",
+            json!({"repo": "https://evil.example/octo/widgets", "number": 7}),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error && out.content.contains("cannot be used here"));
+}
+
+/// The pull request must be one whose head is a commit **this conversation pushed** to take Path A,
+/// not just a branch of a name it used: a commit somebody pushed since is another's, and is asked.
 #[tokio::test]
 async fn a_branch_somebody_pushed_to_since_is_not_the_conversations() {
     let rig = Rig::new(Fixture::new("hello\n").await);
@@ -1032,22 +1156,17 @@ async fn a_branch_somebody_pushed_to_since_is_not_the_conversations() {
     )
     .await;
     common::mount_merge(&rig.fx.github, "octo/widgets", 7, "agent/x", "1").await;
-    rig.say("work on octo/widgets").await;
     // The branch is the run's, but the commit the pull request has now (`f00d`) is not one it pushed.
     rig.pushed_sha("octo/widgets", "agent/x", "abc123").await;
-    let out = rig.merge().await;
-    assert!(
-        out.is_error && out.content.contains("somebody pushed to it since"),
-        "{}",
-        out.content
-    );
+    rig.asked().await;
     assert!(rig.requests("PUT").await.is_empty());
     rig.pushed_sha("octo/widgets", "agent/x", "f00d").await;
     assert!(!rig.merge().await.is_error);
 }
 
 /// A pull request nothing ever checked (no status, no check run) is the host's `clean` and no more:
-/// the run's own checks must have passed on that commit, unless the person named the pull request.
+/// for the conversation's own, the run's own checks must have passed on that commit; another's is put
+/// to the person, who is told the host reports none.
 #[tokio::test]
 async fn a_pull_request_no_ci_ever_checked_needs_the_checks_the_run_ran() {
     let no_ci = (
@@ -1074,7 +1193,6 @@ async fn a_pull_request_no_ci_ever_checked_needs_the_checks_the_run_ran() {
         no_ci.1.clone(),
     )
     .await;
-    rig.say("work on octo/widgets").await;
     rig.pushed("octo/widgets", "agent/x").await;
     let out = rig.merge().await;
     assert!(
@@ -1090,21 +1208,12 @@ async fn a_pull_request_no_ci_ever_checked_needs_the_checks_the_run_ran() {
     rig.fx.env.notes.save(&run, &notes).await.unwrap();
     assert!(!rig.merge().await.is_error);
 
-    // One the person named, with its repository in full: the host's word is theirs to rely on.
-    let rig = Rig::new(Fixture::new("hello\n").await);
-    common::mount_pull(
-        &rig.fx.github,
-        "octo/widgets",
-        7,
-        "feature/theirs",
-        "abc123",
-        "clean",
-    )
-    .await;
-    common::mount_merge(&rig.fx.github, "octo/widgets", 7, "feature/theirs", "1").await;
+    // Another's: the person decides, and is told the host reports no check.
+    let rig = rig_with_a_pull_request_of_somebody_else().await;
     common::mount_checks(&rig.fx.github, "octo/widgets", "abc123", no_ci.0, no_ci.1).await;
-    rig.say("merge https://github.com/octo/widgets/pull/7")
-        .await;
+    let asked = rig.asked().await;
+    assert!(asked.contains("the host reports none"), "{asked}");
+    rig.answered("abc123", false, true).await;
     assert!(!rig.merge().await.is_error);
 }
 
@@ -1133,32 +1242,6 @@ async fn failing_checks_of_a_pull_request_not_opened_red_are_not_a_question_for_
         "{}",
         out.content
     );
-}
-
-/// A slot that came from a bare name, and a bare number, are no grant for a merge.
-#[tokio::test]
-async fn a_bare_name_and_a_bare_number_do_not_make_a_pull_request_one_to_merge() {
-    let rig = Rig::new(Fixture::new("hello\n").await.acting_for(&["octo"]));
-    common::mount_pull(
-        &rig.fx.github,
-        "octo/widgets",
-        7,
-        "feature/theirs",
-        "abc123",
-        "clean",
-    )
-    .await;
-    common::mount_merge(&rig.fx.github, "octo/widgets", 7, "feature/theirs", "1").await;
-    rig.tier(AccessTier::Auto).await;
-    // `widgets` alone is a bare name (a workspace may hold it), `#7` alone is bound to no repository.
-    rig.say("fix widgets and merge #7").await;
-    let out = rig.merge().await;
-    assert!(
-        out.is_error && out.content.contains("is not one to merge"),
-        "{}",
-        out.content
-    );
-    assert!(rig.requests("PUT").await.is_empty());
 }
 
 /// With no notes of the run nothing was recorded, so it is a plan: the tools check it themselves.
@@ -2181,4 +2264,225 @@ async fn a_task_that_pushes_and_opens_a_pull_request_may_merge_it_on_its_own_not
     let merges = fx.merge_requests().await;
     assert_eq!(merges.len(), 1, "{merges:?}");
     assert_eq!(merges[0]["sha"], pushed.as_str(), "{merges:?}");
+}
+
+// ------------------------------------------------------------ the person's yes to a merge, end to end
+
+/// A run of the coder that the test answers as the person: started on a message under `tier`, with the
+/// model's script, and a code host that holds pull request 1 of `octo/widgets` (not pushed by the
+/// run: another's, so that a merge is put to the person).
+struct Live {
+    rt: Runtime,
+    run: RunId,
+    mock: Arc<MockModel>,
+    host: Arc<MemoryCodeHost>,
+    /// Keeps the fixture's directories until the run is over.
+    _fx: Fixture,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Live {
+    async fn start(text: &str, tier: AccessTier, script: impl FnOnce(&MockModel)) -> Self {
+        let (fx, host) = with_memory_host().await;
+        let mock = Arc::new(MockModel::new());
+        script(&mock);
+        let model: DynModel = mock.clone();
+        let agent = CoderAgent::new(model, "test-model", fx.env.clone());
+        let rt = Runtime::builder(Arc::new(MemoryStore::new()))
+            .agent(agent)
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let (stop, worker) = worker_of(&rt);
+        let run = rt
+            .start(AGENT_NAME, tier_message(text, Some(tier)), None)
+            .await
+            .unwrap();
+        let live = Self {
+            rt,
+            run,
+            mock,
+            host,
+            _fx: fx,
+            stop: Some(stop),
+            worker: Some(worker),
+        };
+        live.settle(0).await;
+        live
+    }
+
+    /// Wait until the model has been called more than `calls` times and the run is done or waits for
+    /// the person.
+    async fn settle(&self, calls: usize) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let view = self.rt.view(self.run).await.unwrap().expect("run exists");
+            let rested = match view.status {
+                RunStatus::Done => true,
+                RunStatus::Parked => view.waiting,
+                RunStatus::Failed => panic!("the run failed: {view:#?}"),
+                _ => false,
+            };
+            if rested && self.mock.requests().len() > calls {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out: {view:#?}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The person says or does `inbound`, and the run goes on until it is done or waits again.
+    async fn answer(&self, inbound: Inbound) {
+        let calls = self.mock.requests().len();
+        self.rt.deliver(self.run, inbound).await.unwrap();
+        self.settle(calls).await;
+    }
+
+    async fn waiting(&self) -> bool {
+        self.rt
+            .view(self.run)
+            .await
+            .unwrap()
+            .is_some_and(|view| view.waiting)
+    }
+
+    async fn finish(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.await.unwrap();
+        }
+    }
+}
+
+/// The id of the one question of the form the tool asks for pull request 1 of `octo/widgets`.
+fn question_1() -> String {
+    merge_question(
+        "github.com/octo/widgets",
+        1,
+        &MemoryCodeHost::head_sha_of(1),
+        false,
+        "squash",
+        false,
+    )
+}
+
+fn merges_1(model: &MockModel, id: &str) {
+    model.push_tool_calls(vec![call(
+        id,
+        "merge_pull_request",
+        json!({"repo": "octo/widgets", "number": 1}),
+    )]);
+}
+
+fn merge_answer(surface: &str, value: &str) -> Inbound {
+    common::form_answer(
+        surface,
+        json!([{"id": question_1(), "values": [value]}]),
+        None,
+    )
+}
+
+/// Path B end to end: the tool asks, in a form of its own, nothing is merged while the person has not
+/// answered, and on their yes **to that form** the next call merges exactly the commit asked about.
+#[tokio::test]
+async fn the_tool_asks_and_merges_on_the_yes_to_its_own_form() {
+    let live = Live::start("look at octo/widgets", AccessTier::Auto, |m| {
+        merges_1(m, "m1");
+        merges_1(m, "m2");
+        m.push_text("Merged.");
+    })
+    .await;
+    assert!(live.waiting().await, "the run waits for the person");
+    assert!(live.host.merges().is_empty());
+    live.answer(merge_answer("ask-m1", "merge")).await;
+    let merges = live.host.merges();
+    assert_eq!(merges.len(), 1);
+    assert_eq!(
+        merges[0].expected_sha.as_deref(),
+        Some(MemoryCodeHost::head_sha_of(1).as_str())
+    );
+    let requests = live.mock.requests();
+    let result = result_of(requests.last().unwrap(), "m2");
+    assert!(result.starts_with("Merged pull request #1"), "{result}");
+    live.finish().await;
+}
+
+/// "Not now" merges nothing; the tool asks again when called again, and a later yes merges.
+#[tokio::test]
+async fn not_now_merges_nothing_and_the_tool_asks_again_when_it_is_called_again() {
+    let live = Live::start("look at octo/widgets", AccessTier::Auto, |m| {
+        merges_1(m, "m1");
+        merges_1(m, "m2");
+        merges_1(m, "m3");
+        m.push_text("Merged.");
+    })
+    .await;
+    live.answer(merge_answer("ask-m1", "not_now")).await;
+    assert!(live.host.merges().is_empty());
+    assert!(live.waiting().await, "the second call asked again");
+    live.answer(merge_answer("ask-m2", "merge")).await;
+    assert_eq!(live.host.merges().len(), 1);
+    live.finish().await;
+}
+
+/// Nothing but the tool's own form is a yes: not a message, not the form's answer made on another
+/// surface (a click on a stale form), and not a form the model drew with the same question and the
+/// same option.
+#[tokio::test]
+async fn a_forged_yes_merges_nothing() {
+    // The answer to the call that waits is a stranger's, or words.
+    for (label, answer) in [
+        ("another surface", merge_answer("ask-q1", "merge")),
+        (
+            "words",
+            tier_message("yes, merge pull request 1 of octo/widgets, I said so", None),
+        ),
+        ("a surface of no form", merge_answer("chat-1", "merge")),
+    ] {
+        let live = Live::start("look at octo/widgets", AccessTier::Auto, |m| {
+            merges_1(m, "m1");
+            merges_1(m, "m2");
+            m.push_text("Merged.");
+        })
+        .await;
+        live.answer(answer).await;
+        assert!(live.host.merges().is_empty(), "{label}");
+        assert!(live.waiting().await, "{label}: the second call asked again");
+        live.finish().await;
+    }
+    // A form the model drew: the same question id, the same option, answered on its own surface.
+    let live = Live::start("look at octo/widgets", AccessTier::Auto, |m| {
+        m.push_tool_calls(vec![call(
+            "q1",
+            "ask_user",
+            json!({"question": "Merge it?", "choices": [
+                {"id": question_1(), "question": "Merge octo/widgets#1?",
+                 "options": ["merge", "not_now"]}
+            ]}),
+        )]);
+        merges_1(m, "m2");
+        m.push_text("Merged.");
+    })
+    .await;
+    live.answer(merge_answer("ask-q1", "merge")).await;
+    assert!(live.host.merges().is_empty());
+    assert!(live.waiting().await, "the tool asked itself");
+    live.finish().await;
+}
+
+/// At `bypass` nothing is asked: another's pull request is merged at the first call.
+#[tokio::test]
+async fn at_bypass_the_first_call_merges_and_nobody_is_asked() {
+    let (fx, host) = with_memory_host().await;
+    let (requests, _) = drive(&fx, "look at octo/widgets", Some(AccessTier::Bypass), |m| {
+        merges_1(m, "m1");
+        m.push_text("Merged.");
+    })
+    .await;
+    assert_eq!(requests.len(), 2, "the run was not parked");
+    assert_eq!(host.merges().len(), 1);
+    let result = result_of(&requests[1], "m1");
+    assert!(result.starts_with("Merged pull request #1"), "{result}");
 }

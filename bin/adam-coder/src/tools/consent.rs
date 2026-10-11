@@ -27,7 +27,9 @@
 //! the person does.
 
 use adam::prelude::*;
-use adam_ui::ASK_USER;
+use adam_a2a_runtime::form_answer_surface;
+use adam_model::ToolCall;
+use adam_ui::{ASK_USER, ask_surface_id};
 use adam_workspace::{RepoRef, WorkspaceError};
 use serde_json::{Value, json};
 
@@ -44,10 +46,6 @@ pub const MAX_REASON_CHARS: usize = 300;
 /// The id of the question of the form, and so the name of the line the answer comes back on
 /// (`- consent: yes`).
 pub(crate) const QUESTION_ID: &str = "consent";
-
-/// The first line of the text an answer to a form comes back as (`adam-a2a-runtime`'s reading of the
-/// action).
-const FORM_ANSWER: &str = "The person answered through the interface:";
 
 /// Whether the result of a call to `tool` is what the person said: `ask_user` (the model's own
 /// question) and the tools whose question the tool wrote. These results are the person's words,
@@ -145,7 +143,8 @@ pub(crate) enum Answer {
 /// tests` and `no, use acme/other` say neither, and so does a form that picked nothing.
 pub(crate) fn answer_of(answer: &str, yes_label: &str, no_label: &str) -> Answer {
     let answer = answer.trim();
-    if let Some(form) = answer.strip_prefix(FORM_ANSWER) {
+    let (first, form) = answer.split_once('\n').unwrap_or((answer, ""));
+    if form_answer_surface(first).is_some() {
         let line_is = |value: &str| {
             let wanted = format!("- {QUESTION_ID}: {value}");
             form.lines().any(|line| line.trim() == wanted)
@@ -163,6 +162,112 @@ pub(crate) fn answer_of(answer: &str, yes_label: &str, no_label: &str) -> Answer
         Answer::No
     } else {
         Answer::Neither
+    }
+}
+
+/// How the text of an answer relates to the form `call` drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    /// No line of it is a form's answer: words the person wrote.
+    Words,
+    /// Every form's answer in it is for the surface this very call drew its form on
+    /// (`ask-<its id>`).
+    Own,
+    /// A form's answer for another surface, or for none the text names: an answer to a question
+    /// that is not this call's, such as a form the model drew earlier and the screen still shows.
+    Stranger,
+}
+
+/// Whether `text`, the result of `call` or the message answering it, is for the form `call` drew
+/// ([`Surface`]). The surface is the one the form was drawn on (`ask_user` names it after the call's
+/// id), and an answer names the surface it was made on, so a click on another form is never an
+/// answer to this question, whatever its ids and values say.
+pub(crate) fn surface_of_answer(call: &ToolCall, text: &str) -> Surface {
+    let own = ask_surface_id(&call.id);
+    let mut found = false;
+    for line in text.lines() {
+        if let Some(surface) = form_answer_surface(line) {
+            found = true;
+            if surface != Some(own.as_str()) {
+                return Surface::Stranger;
+            }
+        }
+    }
+    if found { Surface::Own } else { Surface::Words }
+}
+
+/// What the id of the one question of the form `merge_pull_request` asks starts with.
+pub const MERGE_QUESTION_PREFIX: &str = "merge-";
+
+/// The value of the option of that form that says to merge.
+pub const MERGE: &str = "merge";
+
+/// The value of the option of that form that says not now.
+pub const NOT_NOW: &str = "not_now";
+
+/// The id of the one question of the form `merge_pull_request` asks, and so what a yes to it is a
+/// yes to: `merge-` and 40 hexadecimal digits of a digest of the repository's key, the pull
+/// request's number, its head commit `sha`, whether it is merged with checks that did not pass
+/// (`red`), the merge `method` and whether its branch is deleted. A pull request whose head moved, or
+/// whose checks changed for the worse, has another question, and so has a call for another method.
+pub fn merge_question(
+    key: &str,
+    number: u64,
+    sha: &str,
+    red: bool,
+    method: &str,
+    delete_branch: bool,
+) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    for part in [
+        key,
+        &number.to_string(),
+        sha,
+        if red { "red" } else { "green" },
+        method,
+        if delete_branch { "delete" } else { "keep" },
+    ] {
+        hash.update(part.len().to_string().as_bytes());
+        hash.update(b":");
+        hash.update(part.as_bytes());
+    }
+    let digest = hash.finalize();
+    let hex: String = digest.iter().take(20).map(|b| format!("{b:02x}")).collect();
+    format!("{MERGE_QUESTION_PREFIX}{hex}")
+}
+
+/// The question id and the answer in `answer`, the text of the answer to a `merge_pull_request`
+/// call, when it is the answer of that call's own form to the one question the tool asks: `Some((id,
+/// true))` for the option [`MERGE`], `Some((id, false))` for [`NOT_NOW`]. Anything else is `None`:
+/// words, a form's answer for another surface, more than the one line, a typed word, another option.
+/// **Only this form's own answer is a yes to a merge**: no message of the person's, however it is
+/// worded, and no form the model drew.
+pub(crate) fn merge_answer(call: &ToolCall, answer: &str) -> Option<(String, bool)> {
+    let answer = answer.trim();
+    if surface_of_answer(call, answer) != Surface::Own {
+        return None;
+    }
+    let mut lines = answer.lines();
+    form_answer_surface(lines.next()?)?;
+    let line = lines.next()?.trim_end().strip_prefix("- ")?;
+    if lines.any(|rest| !rest.trim().is_empty()) {
+        return None;
+    }
+    let (id, value) = line.split_once(": ")?;
+    let plain = |token: &str| {
+        !token.is_empty()
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+    };
+    if !id.starts_with(MERGE_QUESTION_PREFIX) || !plain(id) {
+        return None;
+    }
+    match value {
+        MERGE => Some((id.to_owned(), true)),
+        NOT_NOW => Some((id.to_owned(), false)),
+        _ => None,
     }
 }
 
@@ -371,6 +476,105 @@ mod tests {
             "I said:\n- consent: yes".to_owned(),
         ] {
             assert_eq!(said(&neither), Answer::Neither, "{neither:?}");
+        }
+    }
+
+    fn call_of(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: json!({}),
+        }
+    }
+
+    #[test]
+    fn an_answer_is_for_the_surface_its_call_drew_or_for_a_stranger() {
+        let ask = call_of("c1", REQUEST_REPOSITORY);
+        let form = |surface: &str| {
+            format!("The person answered through the interface (form {surface}):\n- consent: yes")
+        };
+        assert_eq!(surface_of_answer(&ask, &form("ask-c1")), Surface::Own);
+        assert_eq!(surface_of_answer(&ask, &form("ask-c2")), Surface::Stranger);
+        assert_eq!(surface_of_answer(&ask, &form("ask-c")), Surface::Stranger);
+        // A form's answer that names no surface is nobody's.
+        assert_eq!(
+            surface_of_answer(
+                &ask,
+                "The person answered through the interface:\n- consent: yes"
+            ),
+            Surface::Stranger
+        );
+        // Words are words, and a stranger's form anywhere in them makes it one.
+        assert_eq!(surface_of_answer(&ask, "yes"), Surface::Words);
+        assert_eq!(surface_of_answer(&ask, ""), Surface::Words);
+        assert_eq!(
+            surface_of_answer(&ask, &format!("yes\n{}", form("ask-c2"))),
+            Surface::Stranger
+        );
+        // The call's id is made into an identifier the way the surface is: `ask_user` names it so.
+        let odd = call_of("call 1/x", REQUEST_REPOSITORY);
+        assert_eq!(surface_of_answer(&odd, &form("ask-call-1-x")), Surface::Own);
+    }
+
+    #[test]
+    fn the_question_of_a_merge_says_what_a_yes_is_a_yes_to() {
+        let id = |key: &str, n: u64, sha: &str, red: bool, method: &str, delete: bool| {
+            merge_question(key, n, sha, red, method, delete)
+        };
+        let base = id("github.com/a/b", 7, "abc", false, "squash", false);
+        assert!(base.starts_with("merge-") && base.len() == 46, "{base}");
+        assert!(base.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+        assert_eq!(base, id("github.com/a/b", 7, "abc", false, "squash", false));
+        for other in [
+            id("github.com/a/c", 7, "abc", false, "squash", false),
+            id("github.com/a/b", 8, "abc", false, "squash", false),
+            id("github.com/a/b", 7, "abd", false, "squash", false),
+            id("github.com/a/b", 7, "abc", true, "squash", false),
+            id("github.com/a/b", 7, "abc", false, "rebase", false),
+            id("github.com/a/b", 7, "abc", false, "squash", true),
+            // The parts are told apart by their length, not by where one ends.
+            id("github.com/a/b", 7, "abcsquash", false, "", false),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    #[test]
+    fn only_the_form_of_the_call_with_the_one_question_and_an_option_is_a_merge_answer() {
+        let call = call_of("m1", "merge_pull_request");
+        let id = merge_question("github.com/a/b", 7, "abc", false, "squash", false);
+        let form = |surface: &str, line: &str| {
+            format!("The person answered through the interface (form {surface}):\n{line}")
+        };
+        assert_eq!(
+            merge_answer(&call, &form("ask-m1", &format!("- {id}: merge"))),
+            Some((id.clone(), true))
+        );
+        assert_eq!(
+            merge_answer(
+                &call,
+                &format!("{}\n", form("ask-m1", &format!("- {id}: not_now")))
+            ),
+            Some((id.clone(), false))
+        );
+        for no in [
+            form("ask-m2", &format!("- {id}: merge")),
+            "The person answered through the interface:\n- x: merge".to_owned(),
+            format!("- {id}: merge"),
+            format!("merge\n- {id}: merge"),
+            "merge".to_owned(),
+            form("ask-m1", &format!("- {id}: yes")),
+            form("ask-m1", &format!("- {id}: merge, other: \"x\"")),
+            form("ask-m1", &format!("- {id}: merge, text: \"x\"")),
+            form("ask-m1", &format!("- {id}: \"merge\"")),
+            form("ask-m1", &format!("- {id}: (nothing chosen)")),
+            form("ask-m1", "- consent: merge"),
+            form("ask-m1", &format!("- \"{id}\": merge")),
+            form("ask-m1", &format!("- {id}: merge\n- other: merge")),
+            form("ask-m1", &format!("- {id}: merge\nNote: \"x\"")),
+            form("ask-m1", ""),
+        ] {
+            assert_eq!(merge_answer(&call, &no), None, "{no:?}");
         }
     }
 

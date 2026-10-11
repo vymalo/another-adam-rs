@@ -20,8 +20,10 @@ use serde_json::{Value, json};
 use crate::files::AgentFiles;
 use crate::redact::Redactor;
 use crate::tier;
+use crate::tools::admin::MERGE_PULL_REQUEST;
 use crate::tools::consent::{
-    Answer, answer_of, asked_by, is_answered_by_the_person, is_consent_tool, is_tools_own_result,
+    Answer, Surface, answer_of, asked_by, is_answered_by_the_person, is_consent_tool,
+    is_tools_own_result, merge_answer, surface_of_answer,
 };
 use crate::tools::named::{key_of_argument, listed, without_untrusted};
 use crate::tools::notes::{Consent, Heard, PushedBranch, RunNotes, When};
@@ -66,7 +68,7 @@ impl AgentStarter for CoderStarter {
     /// A task that continues another (an A2A message that references a finished task of the same
     /// context) starts from that task's conversation: what the person asked, what was done, and
     /// the branches that were pushed. The rules that read the person's words read this history
-    /// too (`person_texts`).
+    /// too (`person_sayings`).
     fn init_continuing(
         &self,
         input: Inbound,
@@ -348,7 +350,8 @@ impl CoderAgent {
     /// repository: one found in a README is not one the person asked for.
     ///
     /// An agreement is the person's yes ([`answer_of`]) to a `request_repository` question, the
-    /// result of that call (paired with it by position, as [`person_texts`] pairs answers) or, while
+    /// result of that call (paired with it by position, as [`person_sayings`] pairs answers, and an answer to a form counting
+    /// only when it names the surface the call drew) or, while
     /// the run is parked on it, the message waiting in the inbox. It grants the repository named in
     /// **that call's** argument, which is the one the question the tool wrote names, and never
     /// anything the model said or another tool's result.
@@ -387,9 +390,8 @@ impl CoderAgent {
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
         let new_consents = notes.record_consents(consents);
         // What the person said, typed (not what the interface made of their clicks): the
-        // repositories, the pull requests and the merge they asked for, the bare names.
-        let workspace = self.workspace_keys(run).await;
-        let heard = notes.hear(&person_sayings(state, ctx.peek_inbox()), host, &workspace);
+        // repositories they named, the bare names.
+        let heard = notes.hear(&person_sayings(state, ctx.peek_inbox()), host);
         let new_red = notes.name_red_pulls(red);
         let new_verified = notes.verify_shas(verified);
         let adopted = self.adopt_scratch(ctx, run, &mut notes).await;
@@ -410,23 +412,6 @@ impl CoderAgent {
                 .map_err(|e| AgentError::transient("cannot write the run notes").with_source(e))?;
         }
         Ok(())
-    }
-
-    /// The keys of the repositories in the run's workspace.
-    async fn workspace_keys(&self, run: &str) -> Vec<String> {
-        let Ok(workspace) = self.env.workspaces.run(run) else {
-            return Vec::new();
-        };
-        let Ok(slots) = workspace.slots().await else {
-            return Vec::new();
-        };
-        slots
-            .iter()
-            .filter_map(|slot| {
-                slot.worktree()
-                    .and_then(|worktree| key_of_argument(&worktree.repo().url))
-            })
-            .collect()
     }
 
     /// Take over the scratch projects the earlier tasks of this conversation left, once, before the
@@ -735,9 +720,10 @@ fn person_sayings(state: &Conversation, inbox: &[Inbound]) -> Vec<Heard> {
                     && !*is_error
                     && !is_tools_own_result(&call.name, &message.text())
                 {
+                    let text = without_untrusted(&message.text());
                     said.push(Heard {
-                        text: without_untrusted(&message.text()),
-                        defaults: Some(text_defaults(call)),
+                        defaults: defaults_of_answer(call, &text),
+                        text,
                         when,
                     });
                 }
@@ -760,36 +746,45 @@ fn person_sayings(state: &Conversation, inbox: &[Inbound]) -> Vec<Heard> {
         let Some(text) = inbound_text(inbound) else {
             continue;
         };
+        let text = without_untrusted(&text);
         said.push(Heard {
-            text: without_untrusted(&text),
-            defaults: question.take().map(text_defaults),
+            defaults: question
+                .take()
+                .and_then(|call| defaults_of_answer(call, &text)),
+            text,
             when: When::Waiting,
         });
     }
     said
 }
 
-/// The defaults of the typed questions of an `ask_user` call: what the model put in the box before
-/// the person saw it (`choices[].default`, a string), trimmed. A consent tool's question has none.
-fn text_defaults(call: &ToolCall) -> Vec<String> {
-    if call.name != adam_ui::ASK_USER {
-        return Vec::new();
+/// The defaults of the typed questions of the call `call`, for the answer `text` that is paired with
+/// it ([`Heard::defaults`]): `Some` only for an `ask_user` call and an answer that is for the form it
+/// drew (a form's answer that names another surface is a stranger's: the model drew that form, or
+/// an earlier one, and the screen still showed it). They are what the model put in the boxes before
+/// the person saw them (`choices[].default`, a string of a `text` or `longText` question), with no
+/// default that reads as nothing.
+fn defaults_of_answer(call: &ToolCall, text: &str) -> Option<Vec<String>> {
+    if call.name != adam_ui::ASK_USER || surface_of_answer(call, text) == Surface::Stranger {
+        return None;
     }
-    call.arguments
-        .get("choices")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|choice| {
-            matches!(
-                choice.get("type").and_then(Value::as_str),
-                Some("text" | "longText")
-            )
-        })
-        .filter_map(|choice| choice.get("default")?.as_str())
-        .map(|default| default.trim().to_owned())
-        .filter(|default| !default.is_empty())
-        .collect()
+    Some(
+        call.arguments
+            .get("choices")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|choice| {
+                matches!(
+                    choice.get("type").and_then(Value::as_str),
+                    Some("text" | "longText")
+                )
+            })
+            .filter_map(|choice| choice.get("default")?.as_str())
+            .filter(|default| !adam_ui::comparable(default).is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
 }
 
 /// [`person_sayings`] as the text of each.
@@ -801,22 +796,42 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
         .collect()
 }
 
-/// What the person answered to the questions the consent tools wrote (`request_repository`,
-/// `create_repository`), oldest first: one [`Consent`] per call, for what **that call's arguments**
-/// asked about (the repository, or `owner/name` and its visibility).
+/// What the person answered to the questions the tools wrote for them (`request_repository`,
+/// `create_repository` and `merge_pull_request`), oldest first: one [`Consent`] per call.
+///
+/// For the first two it is for what **that call's arguments** asked about (the repository, or
+/// `owner/name` and its visibility); for a merge it is for the question the tool put in its form,
+/// whose id says which pull request, which commit and whether red checks were accepted
+/// ([`merge_answer`]).
 ///
 /// The answer is the result of the call (it did not fail), paired with the call by position
 /// ([`Answers`]: ids cannot be relied on), or, while the run is parked on the call, the message
-/// waiting in `inbox`. It is read without the blocks marked `untrusted`, and [`answer_of`] says
-/// what it is: a yes (which includes the form's yes), a no (an explicit one: `no`, `n`, the no
-/// option's label, the form's no) or neither. **Only a yes or a no is a consent**: any other text
-/// (`wait`, `?`, a question back) records nothing, so the question can be asked again, while the
-/// model still gets the person's words as the call's result. A call with an argument that is not a
-/// repository address asked nothing, so nothing was answered.
+/// waiting in `inbox`. **A form's answer counts only when it names the surface that call drew its
+/// form on** ([`surface_of_answer`]): a click on a form the model drew, or on one the screen still
+/// shows from an earlier question, is not this question's answer, whatever its ids say. It is read
+/// without the blocks marked `untrusted`, and [`answer_of`] says what the words of one of the first
+/// two are: a yes (which includes the form's yes), a no (an explicit one: `no`, `n`, the no option's
+/// label, the form's no) or neither. **Only a yes or a no is a consent**: any other text (`wait`,
+/// `?`, a question back) records nothing, so the question can be asked again, while the model still
+/// gets the person's words as the call's result. A merge is answered by its form alone. A call with
+/// an argument that is not a repository address asked nothing, so nothing was answered.
 fn consents_in(state: &Conversation, inbox: &[Inbound]) -> Vec<Consent> {
     let consent = |call: &ToolCall, answer: &str| -> Option<Consent> {
+        let answer = without_untrusted(answer);
+        if call.name == MERGE_PULL_REQUEST {
+            let (subject, agreed) = merge_answer(call, &answer)?;
+            return Some(Consent {
+                call_id: call.id.clone(),
+                tool: call.name.clone(),
+                subject,
+                agreed,
+            });
+        }
+        if surface_of_answer(call, &answer) == Surface::Stranger {
+            return None;
+        }
         let asked = asked_by(&call.name, &call.arguments)?;
-        let agreed = match answer_of(&without_untrusted(answer), &asked.yes, &asked.no) {
+        let agreed = match answer_of(&answer, &asked.yes, &asked.no) {
             Answer::Yes => true,
             Answer::No => false,
             Answer::Neither => return None,
@@ -835,7 +850,7 @@ fn consents_in(state: &Conversation, inbox: &[Inbound]) -> Vec<Consent> {
             Message::Assistant { tool_calls, .. } => answers.calls(tool_calls),
             Message::Tool { is_error, .. } => {
                 if let Some(call) = answers.next()
-                    && is_consent_tool(&call.name)
+                    && (is_consent_tool(&call.name) || call.name == MERGE_PULL_REQUEST)
                     && !*is_error
                     && !is_tools_own_result(&call.name, &message.text())
                 {
@@ -847,7 +862,7 @@ fn consents_in(state: &Conversation, inbox: &[Inbound]) -> Vec<Consent> {
     }
     // The run is parked on a question of the tool: the first message of the inbox is its answer.
     if let Some(PendingWait::Question(asked)) = &state.pending_wait
-        && is_consent_tool(&asked.tool)
+        && (is_consent_tool(&asked.tool) || asked.tool == MERGE_PULL_REQUEST)
         && let Some(call) = state
             .pending_calls
             .iter()
@@ -1376,62 +1391,124 @@ mod tests {
         }
     }
 
-    const UNTOUCHED: &str =
-        "The person answered through the interface:\n- why: text: \"merge acme/widgets#7\"";
+    /// The answer of the form of the call `c1`, untouched: the box still holds the model's default.
+    fn untouched(surface: &str) -> String {
+        format!(
+            "The person answered through the interface (form {surface}):\n- why: text: \"merge acme/widgets#7\""
+        )
+    }
 
-    #[test]
-    fn an_answer_is_paired_with_the_defaults_of_the_call_it_answers() {
-        let ask = asking_with_default("merge acme/widgets#7");
-        // In the history: the result of the call, by position.
-        let state = conversation(vec![
-            Message::user_text("look around"),
-            assistant("", vec![ask.clone()]),
-            Message::tool_result("c1", UNTOUCHED),
-        ]);
-        let sayings = person_sayings(&state, &[]);
-        assert_eq!(
-            sayings[1].defaults,
-            Some(vec!["merge acme/widgets#7".to_owned()])
-        );
-        assert_eq!(sayings[1].when, When::Past);
-        let mut notes = RunNotes::default();
-        notes.hear(&sayings, "github.com", &[]);
-        assert!(notes.named_repos.is_empty() && notes.named_pulls.is_empty());
-        // Waiting in the inbox while the run is parked on the call: the first message answers it.
+    fn parked_on_call(ask: &ToolCall) -> Conversation {
         let mut parked = conversation(vec![
             Message::user_text("look around"),
             assistant("", vec![ask.clone()]),
         ]);
-        parked.pending_calls = vec![ask];
+        parked.pending_calls = vec![ask.clone()];
         parked.pending_wait = Some(PendingWait::Question(adam_llm_agent::PendingQuestion {
-            call_id: "c1".into(),
-            tool: "ask_user".into(),
+            call_id: ask.id.clone(),
+            tool: ask.name.clone(),
             question: "?".into(),
             ui: None,
             stream: None,
         }));
+        parked
+    }
+
+    fn named_by(sayings: &[Heard]) -> Vec<String> {
+        let mut notes = RunNotes::default();
+        notes.hear(sayings, "github.com");
+        notes.named_repos
+    }
+
+    #[test]
+    fn an_answer_is_paired_with_the_defaults_of_the_call_it_answers() {
+        let ask = asking_with_default("merge acme/widgets#7");
+        let defaults = Some(vec!["  merge acme/widgets#7 ".to_owned()]);
+        // In the history: the result of the call, by position, made on the call's own surface.
+        let state = |answer: &str| {
+            conversation(vec![
+                Message::user_text("look around"),
+                assistant("", vec![ask.clone()]),
+                Message::tool_result("c1", answer),
+            ])
+        };
+        let sayings = person_sayings(&state(&untouched("ask-c1")), &[]);
+        assert_eq!(sayings[1].defaults, defaults);
+        assert_eq!(sayings[1].when, When::Past);
+        assert!(named_by(&sayings).is_empty());
+        // Waiting in the inbox while the run is parked on the call: the first message answers it.
         let inbox = [
-            Inbound::new("message", json!({ "text": UNTOUCHED })),
-            Inbound::new("message", json!({ "text": UNTOUCHED })),
+            Inbound::new("message", json!({ "text": untouched("ask-c1") })),
+            Inbound::new("message", json!({ "text": untouched("ask-c1") })),
         ];
-        let sayings = person_sayings(&parked, &inbox);
-        assert_eq!(
-            sayings[1].defaults,
-            Some(vec!["merge acme/widgets#7".to_owned()])
-        );
+        let sayings = person_sayings(&parked_on_call(&ask), &inbox);
+        assert_eq!(sayings[1].defaults, defaults);
         assert_eq!(sayings[2].defaults, None, "only the first answers the call");
         assert!(sayings[1..].iter().all(|heard| heard.when == When::Waiting));
-        let mut notes = RunNotes::default();
-        notes.hear(&sayings, "github.com", &[]);
-        assert!(notes.named_repos.is_empty() && notes.named_pulls.is_empty());
+        assert!(named_by(&sayings).is_empty());
         // The same words with nothing to pair with are not trusted either.
-        let mut notes = RunNotes::default();
-        notes.hear(
-            &person_sayings(&conversation(vec![Message::user_text(UNTOUCHED)]), &[]),
-            "github.com",
-            &[],
+        let loose = conversation(vec![Message::user_text(untouched("ask-c1"))]);
+        assert!(named_by(&person_sayings(&loose, &[])).is_empty());
+    }
+
+    /// A form the model drew earlier is still on the screen when a later call waits: its answer
+    /// names that form's surface, so it is no answer to the call that waits.
+    #[test]
+    fn an_answer_to_another_form_is_not_paired_with_the_call_that_waits() {
+        let ask = asking_with_default("merge acme/widgets#7");
+        for surface in ["ask-old", "ask-c10", "ask-c"] {
+            let history = conversation(vec![
+                Message::user_text("look around"),
+                assistant("", vec![ask.clone()]),
+                Message::tool_result("c1", untouched(surface)),
+            ]);
+            let sayings = person_sayings(&history, &[]);
+            assert_eq!(sayings[1].defaults, None, "{surface}");
+            let inbox = [Inbound::new(
+                "message",
+                json!({ "text": untouched(surface) }),
+            )];
+            let sayings = person_sayings(&parked_on_call(&ask), &inbox);
+            assert_eq!(sayings[1].defaults, None, "{surface} in the inbox");
+        }
+        // An answer that names no surface (the older line) is for none.
+        let old =
+            "The person answered through the interface:\n- why: text: \"merge acme/widgets#7\"";
+        let inbox = [Inbound::new("message", json!({ "text": old }))];
+        assert_eq!(
+            person_sayings(&parked_on_call(&ask), &inbox)[1].defaults,
+            None
         );
-        assert!(notes.named_repos.is_empty() && notes.named_pulls.is_empty());
+        // Not paired: the model's words are dropped, so they name nothing.
+        assert!(named_by(&person_sayings(&parked_on_call(&ask), &inbox)).is_empty());
+    }
+
+    /// The page may take what is not visible out of the words it sends back (a JavaScript `trim()`
+    /// removes U+FEFF), and the model may have put it in the default.
+    #[test]
+    fn a_default_with_an_invisible_character_is_still_the_models() {
+        let ask = asking_with_default("\u{feff}merge acme/widgets#7");
+        let history = conversation(vec![
+            Message::user_text("look around"),
+            assistant("", vec![ask]),
+            Message::tool_result("c1", untouched("ask-c1")),
+        ]);
+        let sayings = person_sayings(&history, &[]);
+        assert!(named_by(&sayings).is_empty(), "{:?}", named_by(&sayings));
+        // The person's own edit of it is theirs.
+        let edited = untouched("ask-c1").replace("7\"", "7 please\"");
+        let history = conversation(vec![
+            Message::user_text("look around"),
+            assistant(
+                "",
+                vec![asking_with_default("\u{feff}merge acme/widgets#7")],
+            ),
+            Message::tool_result("c1", edited),
+        ]);
+        assert_eq!(
+            named_by(&person_sayings(&history, &[])),
+            ["github.com/acme/widgets"]
+        );
     }
 
     #[test]
@@ -1588,7 +1665,7 @@ mod tests {
             "Yes",
             "y",
             "Yes, add acme/lib",
-            "The person answered through the interface:\n- consent: yes",
+            "The person answered through the interface (form ask-c1):\n- consent: yes",
         ] {
             let consents = consents_in(&answered(LIB, yes), &[]);
             assert_eq!(agreed(&consents), [(LIB_KEY, true)], "{yes:?}");
@@ -1599,7 +1676,7 @@ mod tests {
             "no",
             "No",
             "n",
-            "The person answered through the interface:\n- consent: no",
+            "The person answered through the interface (form ask-c1):\n- consent: no",
         ] {
             let consents = consents_in(&answered(LIB, no), &[]);
             assert_eq!(agreed(&consents), [(LIB_KEY, false)], "{no:?}");
@@ -1616,7 +1693,7 @@ mod tests {
             "yes please",
             "no, use acme/other",
             "",
-            "The person answered through the interface:\n- consent: (nothing chosen)",
+            "The person answered through the interface (form ask-c1):\n- consent: (nothing chosen)",
         ] {
             assert_eq!(consents_in(&answered(LIB, neither), &[]), [], "{neither:?}");
         }
@@ -1756,7 +1833,7 @@ mod tests {
             ),
             Message::tool_result(
                 "c3",
-                "The person answered through the interface:\n- consent: no",
+                "The person answered through the interface (form ask-c3):\n- consent: no",
             ),
             // Nothing that could have been asked: nothing was answered.
             assistant("", vec![create("c4", json!({"owner": "a/b", "name": "x"}))]),
@@ -1862,6 +1939,133 @@ mod tests {
             stream: None,
         }));
         assert_eq!(consents_in(&state, &inbox("yes")), []);
+    }
+
+    /// A form still on the screen from an earlier question: the person answers it while the tool's
+    /// own question waits. It names its own surface, so it is not the answer to the call that waits.
+    #[test]
+    fn a_form_of_another_question_is_no_consent_for_the_call_that_waits() {
+        let stale = |question: &str, value: &str| {
+            format!(
+                "The person answered through the interface (form ask-q1):\n- {question}: {value}"
+            )
+        };
+        // The model drew a form whose question is called `consent`, the id the tool's own form has,
+        // and the person answers it while `request_repository` waits.
+        let state = parked_on(LIB);
+        for answer in [stale("consent", "yes"), stale("consent", "no")] {
+            assert_eq!(consents_in(&state, &inbox(&answer)), [], "{answer}");
+        }
+        // The same in the history: the answer is the call's result, and it is not its form's.
+        assert_eq!(
+            consents_in(&answered(LIB, &stale("consent", "yes")), &[]),
+            []
+        );
+        // An answer that names no surface (the older line) is no form's.
+        let nameless = "The person answered through the interface:\n- consent: yes";
+        assert_eq!(consents_in(&parked_on(LIB), &inbox(nameless)), []);
+        assert_eq!(consents_in(&answered(LIB, nameless), &[]), []);
+        // The call's own form is, and so are the person's own words.
+        let own = "The person answered through the interface (form ask-c1):\n- consent: yes";
+        assert_eq!(
+            agreed(&consents_in(&parked_on(LIB), &inbox(own))),
+            [(LIB_KEY, true)]
+        );
+        // The form of a call with another id is not this call's, even for the same repository.
+        let other = own.replace("ask-c1", "ask-c2");
+        assert_eq!(consents_in(&parked_on(LIB), &inbox(&other)), []);
+    }
+
+    /// `merge_pull_request` asks with a form of its own, and only that form's answer is a yes.
+    #[test]
+    fn a_merge_is_agreed_to_by_its_own_form_alone() {
+        use crate::tools::consent::{MERGE, NOT_NOW, merge_question};
+        let merge = |id: &str| ToolCall {
+            id: id.into(),
+            name: MERGE_PULL_REQUEST.into(),
+            arguments: json!({"repo": "acme/widgets", "number": 7}),
+        };
+        let question = merge_question(
+            "github.com/acme/widgets",
+            7,
+            "abc123",
+            false,
+            "squash",
+            false,
+        );
+        let form = |surface: &str, value: &str| {
+            format!(
+                "The person answered through the interface (form {surface}):\n- {question}: {value}"
+            )
+        };
+        let history = |answer: String| {
+            conversation(vec![
+                Message::user_text("merge acme/widgets#7"),
+                assistant("", vec![merge("m1")]),
+                Message::tool_result("m1", answer),
+            ])
+        };
+        let agreed_to = |consents: &[Consent]| -> Vec<(String, bool)> {
+            consents
+                .iter()
+                .map(|c| (c.subject.clone(), c.agreed))
+                .collect()
+        };
+        // The form's own answer: a yes, or a no.
+        let yes = consents_in(&history(form("ask-m1", MERGE)), &[]);
+        assert_eq!(agreed_to(&yes), [(question.clone(), true)]);
+        assert_eq!(yes[0].tool, MERGE_PULL_REQUEST);
+        let no = consents_in(&history(form("ask-m1", NOT_NOW)), &[]);
+        assert_eq!(agreed_to(&no), [(question.clone(), false)]);
+        // Nothing else is: not the person's words, however they put it, and not a form of another
+        // surface (the model's own, with the same question id and the same option).
+        for answer in [
+            "yes".to_owned(),
+            "merge it".to_owned(),
+            format!("merge\n- {question}: {MERGE}"),
+            form("ask-q1", MERGE),
+            format!("The person answered through the interface:\n- {question}: {MERGE}"),
+            format!("{}, other: \"x\"", form("ask-m1", MERGE)),
+            format!("{}\n- other: yes", form("ask-m1", MERGE)),
+            form("ask-m1", "yes"),
+            format!("The person answered through the interface (form ask-m1):\n- consent: {MERGE}"),
+        ] {
+            assert_eq!(consents_in(&history(answer.clone()), &[]), [], "{answer}");
+        }
+        // While the run is parked on the call, the first message of the inbox is the answer.
+        let mut parked = conversation(vec![
+            Message::user_text("merge acme/widgets#7"),
+            assistant("", vec![merge("m1")]),
+        ]);
+        parked.pending_calls = vec![merge("m1")];
+        parked.pending_wait = Some(PendingWait::Question(adam_llm_agent::PendingQuestion {
+            call_id: "m1".into(),
+            tool: MERGE_PULL_REQUEST.into(),
+            question: "Merge?".into(),
+            ui: None,
+            stream: None,
+        }));
+        assert_eq!(
+            agreed_to(&consents_in(&parked, &inbox(&form("ask-m1", MERGE)))),
+            [(question.clone(), true)]
+        );
+        assert_eq!(consents_in(&parked, &inbox(&form("ask-q1", MERGE))), []);
+        assert_eq!(consents_in(&parked, &inbox("merge")), []);
+        // The tool's own result ("Merged ...") is no answer, and the answer is not the person's
+        // words: it says nothing for them.
+        let merged = history("Merged pull request #7 of acme/widgets (squash).".to_owned());
+        assert_eq!(consents_in(&merged, &[]), []);
+        assert_eq!(
+            said(&history(form("ask-m1", MERGE))),
+            ["merge acme/widgets#7"]
+        );
+        // A later no revokes an earlier yes to the same question, even when the provider sends the
+        // same call id again.
+        let mut notes = RunNotes::default();
+        notes.record_consents(yes);
+        assert!(notes.agreed(MERGE_PULL_REQUEST, &question));
+        notes.record_consents(no);
+        assert!(!notes.agreed(MERGE_PULL_REQUEST, &question));
     }
 
     /// Replaying the run gives the same grants: the consents are read from the history again at

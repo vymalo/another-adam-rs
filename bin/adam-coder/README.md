@@ -63,7 +63,7 @@ sequenceDiagram
 | `rebuild_environment { use_default? }` | the way out of a **broken work environment**, once the person has decided ([below](#the-work-environment-the-repositorys-devcontainer)): the run's environment is thrown away and made again now (its steps are shown under this call, and a failure is this call's result), from the repository's file as it is (`{}`) or, with `use_default: true`, from the default image for the rest of the run. The decision is the person's, so the tool is for the model to call only after it has asked (`ask_user`); the choice is kept in the run's notes (`environment.use_default`) and in the environment's own state. With no container runtime there is nothing to rebuild and it says so. Where the commands run in this container it changes nothing |
 | `commit_and_push { message, repo? }` | in a **scratch project**: a commit, locally, and nothing else (no push, no `branch`, no bound `checks`; it says nothing is published until the person names a repository). In a repository: `commit_all` + `push` to **the run's own branch** `agent/<run>` (also for a run that continues a branch, which this tool never touches); artifacts `checks` (bound to the pushed commit, see [Artifacts](#artifacts)) then `branch`. It records the line of work in the run notes itself (`RunNotes::pushed_branches`), and its text ends with `repository: <url>` and `branch: <name>` lines (the last two lines: the fallback by which a later task learns which branches exist when the notes are not at hand) |
 | `open_pull_request { title, body, accept_red_checks?, repo? }` | a scratch project has no remote: it is a result that sends the model to `publish_scratch`. In a repository, after the gate (below), moves the branch the run continues to the pushed commit (`Worktree::publish`: `git push origin <own>:<continued>`, never forced), then reports the pull request already open for the branch ("was already open", title and description unchanged) or opens one with `CodeHost::open_pull_request`; on an already open pull request with accepted red checks it adds a comment with the note; artifact `pull_request`: a data part (`url`, `number` as a string, `branch`, `repository`) followed by an A2A `url` part with the pull request's URL (`Part.url`, so a chat UI shows a link) |
-| `merge_pull_request { repo, number, method?, delete_branch? }` | merges a pull request of a repository **of the workspace or one the person named**, with `squash` (the default), `merge` or `rebase`. The code host reads the pull request first and merges the head it read (`sha`), so a head that moved is refused; a pull request merged already is reported as it is; `delete_branch: true` deletes the head branch only when it is a branch of that very repository and not the base, and a branch GitHub will not delete is a note, never an error. **GitHub's own rules decide at every tier** (branch protection, required checks and reviews, conflicts, the App's permissions): a refusal is the tool's error result **in GitHub's words** with the class of the error (`rejected` for a merge the rules refuse, `unauthenticated` for a permission), and the model tells the person. Needs the `auto` tier ([below](#access-tiers-what-the-person-lets-it-do-alone)). `src/tools/admin.rs` |
+| `merge_pull_request { repo, number, method?, delete_branch? }` | merges a pull request, with `squash` (the default), `merge` or `rebase`: one **this conversation pushed** whose checks passed, at once; **any other**, or a red-checks override, only on the person's yes to a **form this tool draws itself** ("Merge owner/name#N into base?", "Merge it" or "Not now"; at `bypass` nothing is asked). The tool is `asks_user`, so a subagent has no `merge_pull_request`. The code host reads the pull request first and merges the head it read (`sha`), so a head that moved is refused; a pull request merged already is reported as it is; `delete_branch: true` deletes the head branch only when it is a branch of that very repository and not the base, and a branch GitHub will not delete is a note, never an error. **GitHub's own rules decide at every tier** (branch protection, required checks and reviews, conflicts, the App's permissions): a refusal is the tool's error result **in GitHub's words** with the class of the error (`rejected` for a merge the rules refuse, `unauthenticated` for a permission), and the model tells the person. Needs the `auto` tier ([below](#access-tiers-what-the-person-lets-it-do-alone)). `src/tools/admin.rs` |
 | `rename_repository { repo, new_name }`, `delete_repository { repo, confirm }` | rename a repository, or delete it for good, **only a repository the person named** (their words, a yes to `request_repository`, or a repository this run created: a bare name is never enough for an act that cannot be taken back). `confirm` must be exactly the repository's `owner/name` (without regard to case), checked before the host is asked, so that a slip of the model deletes nothing. A rename grants the new address; both are noted in the run's notes once the host answered, so a repeat is the same answer. Same refusals as the merge. Need the `bypass` tier. `src/tools/admin.rs` |
 | `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }` | `ToolError::NeedsInput`: the run parks, A2A reports `input-required` with the question. With `choices` (up to 8 questions as one form: a title, why the coder asks, radio buttons, checkboxes, a searchable list, a deck of pictures or a typed answer, each option with a label and a description) and a screen that can draw it, the question carries an A2UI surface and the person's answers come back as the result; see [Asking with choices](#asking-with-choices). The instructions say the coder MUST ask with `choices` whenever it offers options, never as a list in prose. It is [`adam-ui`](../../crates/adam-ui/README.md)'s tool under the coder's own words about when to ask, and `asks_user()` is `true`, so `adam-assembly` refuses to give it to a subagent |
 | `show { blocks, title? }`, `ui_catalog {}` | the screen's components as tools ([`adam-ui`](../../crates/adam-ui/README.md)): `ui_catalog` lists what the person's screen can draw, `show` draws blocks of it beside the text answer. A coding task does not need them; they answer "answer in text" when the screen sent no catalog |
@@ -803,24 +803,41 @@ tier, and the tools check it again against the tier in the notes.
 
 GitHub's branch protection, required checks and the permissions the App was granted decide at **every** tier; a tier only narrows.
 
-**`merge_pull_request` merges only when** (`src/tools/admin.rs`; each is read from the host and from the person's words, not from
-the model): *(1)* **either** the person named the repository in full (`RunNotes::named_repos`; a workspace slot that a bare name
-gave is not that) and the pull request (`owner/name#12` or its URL; a bare `#12` or `PR 12` only in their newest words, and only
-as the pull request of **the** repository in play when there is exactly one: `RunNotes::named_pulls`), **or** the pull request's
-head is in the repository itself and is a commit the conversation pushed for that branch (`PushedBranch::shas`, an earlier
-task's too: a branch of the same name that somebody pushed to since is not that); *(2)* the host says the checks passed on the
-head commit (`CodeHost::pull_request_status`: `Checks::Passing`, no status or check run failed or unfinished, `neutral` and
-`skipped` counting as passing, and the host calls it `clean` or reports some that passed) and **that very commit is the one
-merged** (`MergePullRequest::expected_sha`); where the host reports no check at all (`PullRequestStatus::ci_reported` is
-`false`), a pull request of the conversation's needs the run's own checks to have passed on that commit when
-`open_pull_request` let it in (`RunNotes::verified_shas`), one the person named may rely on the host; checks that failed stop
-a merge and nobody can say yes to them for the person; *(3)* a pull request
-opened with `accept_red_checks` that mattered (`RunNotes::red_pulls`) needs the person's **newest** message to name it and say to
-merge it (`RunNotes::merge_asks`: the word `merge`, not negated, not `merge conflict`; **their newest words**, an answer to a
-question included, so "no, wait" takes the ask away); with that, checks that failed or never
-ran no longer stop it, checks still running do; *(4)* the prompt says to merge only when the person asked. A repository on
-another host than the code host's (`ALLOWED_REPO_HOSTS`, the first) is refused, and the host is asked for the repository by its
-address first, with no redirect followed (a repository that was renamed or transferred is not acted on through its old address).
+**`merge_pull_request` never reads the person's words** (`src/tools/admin.rs`): what they typed is text and a model can put words
+in a form, so no rule guesses at what they meant. It decides from what the host says, from the commits the tools themselves
+recorded and from the answer to its own question.
+
+* *The checks* must have passed on the head commit (`CodeHost::pull_request_status`: `Checks::Passing`, no status or check run
+  failed or unfinished, `neutral` and `skipped` counting as passing, and the host calls it `clean` or reports some that
+  passed), and **that very commit is the one merged** (`MergePullRequest::expected_sha`). Checks still running are waited for,
+  always. Checks that failed, or that nobody ran, stop a merge, **unless** the conversation opened the pull request with
+  `accept_red_checks` that mattered (`RunNotes::red_pulls`): that is an override, Path B below.
+* **Path A, the conversation's own pull request.** Its head is in the repository itself and is a commit the conversation pushed
+  for that branch (`PushedBranch::shas`, an earlier task's too: a branch of the same name that somebody pushed to since, or a
+  fork's, is not that); where the host reports no check at all (`PullRequestStatus::ci_reported` is `false`) the run's own checks
+  passed on that commit when `open_pull_request` let it in (`RunNotes::verified_shas`). It is merged at `auto` and above with
+  **no question**.
+* **Path B, any other pull request, or a red-checks override.** At `auto` the tool asks the person itself, with a `NeedsInput`
+  like `request_repository`: a form with a fixed question (the repository in full, the number, the base branch), the facts the
+  host gave (head branch, a fork if it is one, the commit, the checks in the host's words, the method, whether the branch is
+  deleted, the red override) and **two fixed options**, `merge` and `not_now`. The form's one question has the id
+  `merge-<digest>` (`consent::merge_question`), a digest of the repository, the number, the head commit, the method, the
+  branch deletion and whether the checks are accepted red; so a yes is a yes to **that** and nothing else, and a head that moved,
+  a checks state that changed for the worse or another method is another question. Only that form's own answer counts: the
+  agent records the answer to a `merge_pull_request` call (`Consent`, tool `merge_pull_request`, subject the question id) when it
+  names the surface the call drew its form on (`ask-<call id>`) and is exactly the one line `- merge-<digest>: merge` (or
+  `not_now`, which is recorded as a no; the latest answer to a question decides). A message in words, a form the model drew (with
+  the same question id and option), a click on a form still on the screen from an earlier question: none is a yes. After the
+  yes the model calls the tool again with the same arguments and it merges exactly that commit. After `not_now` it asks again if
+  called again; the prompt tells the model not to unless the person asks. **At `bypass` nothing is asked** (that is what the tier
+  means): Path B merges after the same checks of the host, the repository and the commit, red override included.
+* A repository on another host than the code host's (`ALLOWED_REPO_HOSTS`, the first) is refused, and the host is asked for the
+  repository by its address first, with no redirect followed (a repository that was renamed or transferred is not acted on
+  through its old address). The prompt says to merge only when the person asked, and that the tool asks for itself.
+* *Limits.* A screen that cannot draw the form (the question comes as text) cannot answer it: below `bypass` a Path B merge
+  then waits for a screen that can. A provider that sends no call ids repeats them (`call_0`), and a form of an earlier turn has
+  the same surface id as the form of this one: it is the form the screen shows now.
+
 A merge reads the pull request, the combined status and the check runs of its head: the App needs **Pull requests**, **Commit
 statuses** and **Checks** (read) beside **Contents** (write) (`deploy/coder/README.md`).
 
@@ -878,24 +895,37 @@ pods or Podman devcontainers to confine them; the real fix (a uid that cannot re
 without them) is a follow-up (ADR 0036, decision 6).
 
 **What counts as the person's words** (`RunNotes::hear`, `named::typed_by_the_person`): what they typed, in their messages and in
-the typed parts of a form's answer (`other:`, `text:`, `Note:`). The question ids and the option values of a form are what the
-model wrote when it drew it, so a click names no repository or pull request, asks for no merge and is no bare name. Three more
-things are the model's and are not heard:
+the typed parts of a form's answer (`other:`, `text:`, `Note:`). They name **repositories** (`RunNotes::named_repos`, which
+`prepare_workspace`, `rename_repository` and `delete_repository` read) and the **bare names** below; they do not decide a merge.
+The question ids and the option values of a form are what the model wrote when it drew it, so a click names no repository and is
+no bare name. More things are the model's and are not heard:
 
 * **A failed `ask_user`.** Its error repeats the model's own values (``the default `merge acme/widgets#7` of question `q` is not
   one of its options``): only the result of a call that succeeded can be an answer.
 * **A typed question's `default`.** `ask_user` lets a `text` or `longText` question start with words (`default`), and the web sends
   them back when the person submits without touching the box. A `text:` part equal to the default of the question it answers
-  (the answer is paired with its own `ask_user` call, in the history and in the inbox of a parked run) is dropped; what the
-  person changes or adds is theirs. A person who types exactly the prefilled words is not heard: they say it in a message. An
-  answer that cannot be paired with a call (a plain message in the shape of one) has every `text:` part dropped.
+  is dropped; what the person changes or adds is theirs. "Equal" is `adam_ui::comparable`: without whitespace and without any
+  control or format character (U+FEFF, the zero-width and bidirectional marks), and without case, because a page may trim or keep
+  what is not visible. `ask_user` refuses a typed default that has such a character. A person who types exactly the prefilled
+  words is not heard: they say it in a message.
+* **An answer is for its own call.** The A2A layer writes the surface a form's answer was made on into its first line
+  (`The person answered through the interface (form ask-<call id>):`, `adam_a2a_runtime::form_answer_surface`), and `ask_user`
+  draws its form on `ask-<its call id>` (`adam_ui::ask_surface_id`; the consent tools and `merge_pull_request` draw through
+  `ask_user`, so on their own call's). An answer counts for a call only when it is the answer to the form that call drew and the
+  call is the one it is paired with (by position in the history, or the first message of the inbox for the call a parked run
+  waits on). **A form's answer made on another surface** (a form the model drew, or one the screen still shows from an earlier
+  question) is a stranger's: for `ask_user` it has no default to match, so every `text:` part of it is dropped, and for
+  `request_repository`, `create_repository` and `merge_pull_request` it is **no consent**, whatever question id and option it
+  holds. A form's answer that names no surface (the older line) is a stranger's too. The person's own words (not a form's answer)
+  to `request_repository` and `create_repository` still count as before (`yes`, `no`), because they are what they typed.
 * **A form that is not the form's answer.** The A2A layer reads `context.answers` only from the action `answer` of a surface
-  `ask-<call id>` (`vymalo_inbound`); another action, or another surface, is `The person used the interface:` and no answer. It
-  checks the surface's prefix and not the one pending call, because it holds no run state.
+  `ask-<identifier>` (`vymalo_inbound`); another action, or another surface, is `The person used the interface:` and no answer.
 
-The newest words are the last thing they said, an answer included. A message that arrived while a tool result was owed is put
-after the results in the history, so its place among the answers is not known: the ask to merge and the bare names are then
-what **both** it and the last thing before it say, never what only one says.
+The newest words are the last thing they said, an answer included. A message that arrived while a tool result was owed
+(`Conversation::deferred`) waits behind the results and is put into the history after them, so a click that answers a later
+question can come after it though the person sent it first, and the history keeps no arrival time to tell. Only the bare names
+read the newest words now, and while such a message still waits they are what **both** it and the last thing before it say; once
+it is in the history the order is the history's, and both are the person's words.
 
 A **bare name** (`ToolEnv::is_granted`): from `auto`, `prepare_workspace`, `publish_scratch` and `request_repository` treat
 `github.com/<owner>/<name>` as named when `<name>` is a word that stands alone in the **newest typed words of the person that have any**
@@ -1351,7 +1381,7 @@ A rework or a follow-up is a new A2A task in the same `contextId` that names the
 run starts from the conversation of the referenced run (see
 [ADR 0003](../../docs/decisions/0003-a-new-task-continues-the-task-it-references.md)). Three things follow:
 
-* **The person's words are all of the conversation's.** `person_texts` reads the user messages of the
+* **The person's words are all of the conversation's.** `person_sayings` reads the user messages of the
   whole carried conversation, so a repository named in the first task is named in the second. A continued
   user message can have several text parts (the task, the marker that says older turns were left out, the
   next message), so they are read **part by part**, skipping the marker (`Conversation::is_omission_marker`,
@@ -2166,27 +2196,35 @@ Everything is offline (`cargo test -p adam-coder`; with
 database of its own, so the role needs `CREATEDB`):
 
 * `tests/hearing.rs` (what the coder takes from the person's words, through a real `CoderAgent` on a `Runtime`): the repositories
-  and pull requests they named, a form whose ids and values are forged naming nothing and asking for nothing, what they type into
-  one counting, an answer that names nothing (a click, "no, wait") taking an earlier "merge #7" away, a bare `#7` bound to the one
-  repository in play and dropped with two, the bare names, and what a task that continues another inherits (the pushed commits,
-  the pull requests opened red, the commits whose checks passed), **an `ask_user` that failed with the model's own words in its error
-  naming nothing and the merge refused**, **a typed question left as the model prefilled it naming nothing, and one the person
-  edited counting**, and **each default paired with the form that wrote it**. Unit tests: `src/tools/named.rs`
-  (`typed_by_the_person`, with and without the defaults of the question), `src/tools/notes.rs` (the newest words, the bare names)
-  and `src/agent.rs` (`person_sayings`: an error is no answer, an answer is paired with its call's defaults, a message that
-  waited behind an owed result is `Deferred`).
+  they named, a form whose ids and values are forged naming nothing, what they type into one counting, the bare names, and what
+  a task that continues another inherits (the pushed commits, the pull requests opened red, the commits whose checks passed), an
+  `ask_user` that failed with the model's own words in its error naming nothing, **a typed question left as the model prefilled
+  it naming nothing** (the page trimming, upper-casing or adding what is not visible), one the person edited counting, a default
+  with an invisible character refused, **an answer to an earlier form that is not the answer to the one that waits**, and **a
+  form the model drew with the question id `consent` granting nothing while `request_repository` waits** (and the tool's own
+  form granting). Unit tests: `src/tools/named.rs` (`typed_by_the_person`, with and without the defaults of the question),
+  `src/tools/notes.rs` (the bare names), `src/tools/consent.rs` (the surface of an answer, the merge question, the merge
+  answer) and `src/agent.rs` (`person_sayings`: an error is no answer, an answer is paired with its call's defaults only on its
+  own surface, a message that waited behind an owed result is `Deferred`; `consents_in`: a stranger's form is no consent for the
+  call that waits, a merge is agreed to by its own form alone).
 * `tests/tiers.rs` (the access tiers): the tools the model is **shown** on a turn per tier (a real `Runtime`, a scripted model), the
   tier noted from the message and said to the model, a task that continues another starting at the default, a model that calls a
   tool above the tier anyway (the host is never asked, the refusal names the tier it needs), every tool checking the root run's
   notes when called (a subagent's `ToolCtx` included), `merge_pull_request` against the wiremock GitHub (the method, the `sha` of
   the head it read, the branch deleted) and GitHub's `405`, `409` and `403` reported in its words with their class, only a
-  repository the person gave the run being merged, deleted or renamed, the `confirm` guard of the deletion, a rename that grants
+  repository the person named being deleted or renamed, the `confirm` guard of the deletion, a rename that grants
   the new address, a repeated rename or deletion being the same answer, `create_repository` on by default for a GitHub App (the
   fixture's credentials `acting_for` accounts), a list still restricting, a token creating nothing, `bypass` asking no question
   and `auto` asking, the consent form of `request_repository` per tier and bare name (a bare name is a standalone word of the newest
-  message, never a fragment of a URL), **one test for each refusal of a merge** (a branch nobody here pushed, a fork's branch of the
-  same name, checks that failed, still run or never ran, a head that moved after the checks, red checks accepted at the opening
-  and no fresh yes, another host, a repository that moved, the tier checked in the tool's own body and the cap above the tier),
+  message, never a fragment of a URL), **Path A** (the conversation's own pull request merged with no question; a branch somebody
+  pushed to since, and a fork's branch of the same name, are another's), **Path B** (any other pull request put to the person in the
+  tool's own form, and merged only on the yes to that question: not another commit, method or red state, not words, and a later
+  "not now" taking it away), **the red-checks override** (asked as red, a yes to the green question not covering it, no override
+  for a pull request that was not opened red, running checks always waited for), **`bypass`** (no question, the same checks),
+  **the run level** (the tool asks and the next call merges on the yes to its form; "not now" merges nothing and the next call asks
+  again; an answer on another surface, words, and a form the model drew with the same question and option merge nothing),
+  **one test for each refusal of a merge** (checks that failed, still run or never ran, a head that moved after the checks,
+  another host, a repository that moved, the tier checked in the tool's own body and the cap above the tier),
   **which layer refuses** (the source before the tool's body runs; a message that lowers the tier refusing the next call; a
   subagent's MCP tool held to the root's notes), **one whole task with no hand-written notes** (`commit_and_push`,
   `open_pull_request` and `merge_pull_request` against the wiremock GitHub, the merge allowed by the commit the tools noted and

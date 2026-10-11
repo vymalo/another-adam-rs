@@ -42,6 +42,7 @@ futures.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "signal"] }
 tokio-util.workspace = true

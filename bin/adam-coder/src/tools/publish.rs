@@ -462,7 +462,7 @@ pub async fn open_pull_request(
     // (`merge_pull_request` asks the person again).
     if red && let Some(repo) = key_of_argument(&wt.repo().url) {
         notes.name_red_pulls([PullRef {
-            repo: Some(repo),
+            repo,
             number: pr.number,
         }]);
     }

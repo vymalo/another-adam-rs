@@ -1,22 +1,24 @@
 //! What the coder takes from the person's words, through a real `CoderAgent` on a `Runtime`: the
-//! repositories and the pull requests they named, the merge they asked for, the bare names, and what a
-//! run inherits from the one it continues (`RunNotes::hear`, `CoderAgent::record_grants`).
+//! repositories they named, the bare names, the consents they gave, and what a run inherits from the
+//! one it continues (`RunNotes::hear`, `CoderAgent::record_grants`).
 //!
-//! The rule under test is that only what the person **typed** counts. A form's answer reaches the run
-//! as `The person answered through the interface:` and a line per question, whose ids and option values
-//! are what the *model* wrote when it drew the form: a click names nothing, asks for nothing and says
-//! no bare name. The answers here are made by the A2A layer itself (`vymalo_inbound`) from A2UI actions.
+//! Two rules are under test. Only what the person **typed** counts: a form's answer reaches the run as
+//! `The person answered through the interface (form <surface>):` and a line per question, whose ids
+//! and option values are what the *model* wrote when it drew the form (a click names nothing and says
+//! no bare name), and so are the words a typed question started with (`default`). And an answer
+//! belongs to **its own call**: it names the surface its form was drawn on (`ask-<call id>`), and an
+//! answer made on another surface (a form the model drew, or one the screen still shows from an earlier
+//! question) is nobody's answer to the call that waits. The answers here are made by the A2A layer
+//! itself (`vymalo_inbound`) from A2UI actions.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use a2a::{Message as A2aMessage, Part, Role};
-use adam_a2a::{A2UI_MEDIA_TYPE, AccessTier};
-use adam_a2a_runtime::{CONTEXT_ACCESS_TIER, vymalo_inbound};
+use adam_a2a::AccessTier;
+use adam_a2a_runtime::CONTEXT_ACCESS_TIER;
 use adam_coder::tools::notes::{PullRef, PushedBranch, RunNotes};
 use adam_coder::{AGENT_NAME, CoderAgent};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
@@ -28,10 +30,12 @@ use serde_json::{Value, json};
 
 const WIDGETS: &str = "github.com/acme/widgets";
 const GADGETS: &str = "github.com/acme/gadgets";
+const LIB: &str = "https://github.com/acme/lib";
+const LIB_KEY: &str = "github.com/acme/lib";
 
 fn pull(repo: &str, number: u64) -> PullRef {
     PullRef {
-        repo: Some(repo.to_owned()),
+        repo: repo.to_owned(),
         number,
     }
 }
@@ -67,24 +71,9 @@ async fn with_a_pull_request() -> (Fixture, Arc<MemoryCodeHost>) {
     (Fixture::new("hello\n").await.hosted_by(dyn_host), host)
 }
 
-/// The person acts on a form the model drew: the answer as the A2A layer writes it.
+/// The answer to the form of the call `q1`, which is what the model asks with in these tests.
 fn answered(answers: Value, note: Option<&str>) -> Inbound {
-    let mut context = json!({ "answers": answers });
-    if let Some(note) = note {
-        context["note"] = json!(note);
-    }
-    let action = json!({
-        "name": "answer", "surfaceId": "ask-1", "sourceComponentId": "root",
-        "timestamp": "2026-10-11T10:00:00Z", "context": context,
-    });
-    let mut part = Part::data(json!([{ "version": "v0.9.1", "action": action }]))
-        .with_media_type(A2UI_MEDIA_TYPE);
-    part.metadata = Some(HashMap::from([(
-        "mimeType".to_owned(),
-        json!(A2UI_MEDIA_TYPE),
-    )]));
-    let message = A2aMessage::new(Role::User, vec![part]);
-    vymalo_inbound(&message).expect("an answer reads as text")
+    common::form_answer("ask-q1", answers, note)
 }
 
 /// A coder on a `Runtime`, one run of it, and the model's script.
@@ -213,29 +202,26 @@ fn asks_then_ends(model: &MockModel) {
 }
 
 #[tokio::test]
-async fn what_the_person_says_names_the_repositories_and_pull_requests_they_wrote() {
+async fn what_the_person_says_names_the_repositories_they_wrote() {
     let fx = Fixture::new("hello\n").await;
     let s = Session::start(
         fx,
         |m| {
             m.push_text("Understood.");
         },
-        words("Please merge https://github.com/acme/widgets/pull/7, and look at acme/gadgets#3"),
+        words("Please look at https://github.com/acme/widgets/pull/7, and acme/gadgets#3"),
     )
     .await;
     s.settle(s.run).await;
     let notes = s.notes_of(s.run).await;
     assert_eq!(notes.named_repos, [WIDGETS, GADGETS]);
-    assert_eq!(notes.named_pulls, [pull(WIDGETS, 7), pull(GADGETS, 3)]);
-    // A message that says to merge asks about each pull request it names.
-    assert_eq!(notes.merge_asks, [pull(WIDGETS, 7), pull(GADGETS, 3)]);
     s.finish().await;
 }
 
 /// A form's click is what the model wrote, not what the person said: nothing in the ids and values
-/// below names a repository or a pull request, asks for a merge or is a bare name.
+/// below names a repository or is a bare name.
 #[tokio::test]
-async fn a_form_the_model_wrote_names_nothing_and_asks_for_nothing() {
+async fn a_form_the_model_wrote_names_nothing_and_says_nothing() {
     let s = Session::start(
         Fixture::new("hello\n").await,
         asks_then_ends,
@@ -255,8 +241,6 @@ async fn a_form_the_model_wrote_names_nothing_and_asks_for_nothing() {
         ))
         .await;
     assert!(notes.named_repos.is_empty(), "{:?}", notes.named_repos);
-    assert!(notes.named_pulls.is_empty(), "{:?}", notes.named_pulls);
-    assert!(notes.merge_asks.is_empty(), "{:?}", notes.merge_asks);
     // The bare names are the words of the person's last message that has any, not the model's.
     assert!(notes.said("look") && !notes.said("forged") && !notes.said("widgets"));
     s.finish().await;
@@ -277,134 +261,10 @@ async fn what_the_person_types_into_a_form_counts() {
             json!([
                 {"id": "forged", "values": ["acme/gadgets"], "other": "https://github.com/acme/widgets/pull/9"}
             ]),
-            Some("please merge it, thanks"),
+            Some("use acme/cogs, thanks"),
         ))
         .await;
-    assert_eq!(notes.named_repos, [WIDGETS]);
-    assert_eq!(notes.named_pulls, [pull(WIDGETS, 9)]);
-    // The note says to merge and the other names the pull request: both are theirs.
-    assert_eq!(notes.merge_asks, [pull(WIDGETS, 9)]);
-    s.finish().await;
-
-    // Without the note it names the pull request and does not ask for the merge.
-    let s = Session::start(
-        Fixture::new("hello\n").await,
-        asks_then_ends,
-        words("Look around, please"),
-    )
-    .await;
-    s.settle(s.run).await;
-    let notes = s
-        .then(answered(
-            json!([{"id": "forged", "values": [], "other": "https://github.com/acme/widgets/pull/9"}]),
-            None,
-        ))
-        .await;
-    assert_eq!(notes.named_pulls, [pull(WIDGETS, 9)]);
-    assert!(notes.merge_asks.is_empty(), "{:?}", notes.merge_asks);
-    s.finish().await;
-}
-
-/// The person's newest words include their latest answer: "merge #7", the model asks to be sure, and
-/// "no, wait" takes the ask away, as does a click that says nothing.
-#[tokio::test]
-async fn an_answer_that_names_nothing_takes_an_earlier_ask_away() {
-    let first = "In https://github.com/acme/widgets merge #7";
-    for (label, answer) in [
-        (
-            "typed no",
-            answered(
-                json!([{"id": "sure", "values": ["no"], "other": "no, wait"}]),
-                None,
-            ),
-        ),
-        (
-            "a click",
-            answered(json!([{"id": "sure", "values": ["no"]}]), None),
-        ),
-        ("typed in a reply", words("no, wait")),
-    ] {
-        let s = Session::start(Fixture::new("hello\n").await, asks_then_ends, words(first)).await;
-        s.settle(s.run).await;
-        let before = s.notes_of(s.run).await;
-        assert_eq!(
-            before.merge_asks,
-            [pull(WIDGETS, 7)],
-            "{label}: the first message asks"
-        );
-        assert_eq!(before.named_pulls, [pull(WIDGETS, 7)], "{label}");
-        let after = s.then(answer).await;
-        assert!(
-            after.merge_asks.is_empty(),
-            "{label}: {:?}",
-            after.merge_asks
-        );
-        // What was named stays named: it is the person's, and no one took it back.
-        assert_eq!(after.named_pulls, [pull(WIDGETS, 7)], "{label}");
-        s.finish().await;
-    }
-    // And an answer that says it again puts it back.
-    let s = Session::start(Fixture::new("hello\n").await, asks_then_ends, words(first)).await;
-    s.settle(s.run).await;
-    let after = s
-        .then(answered(
-            json!([{"id": "sure", "values": ["yes"], "other": "yes, merge #7"}]),
-            None,
-        ))
-        .await;
-    assert_eq!(after.merge_asks, [pull(WIDGETS, 7)]);
-    s.finish().await;
-}
-
-/// A bare `#N` is the pull request of the one repository in play, in the newest words; with two
-/// repositories it names none.
-#[tokio::test]
-async fn a_bare_number_is_the_pull_request_of_the_one_repository_in_play() {
-    for (said, named, asks) in [
-        // One repository in the same message.
-        (
-            "In acme/widgets merge #7 and PR 8",
-            vec![pull(WIDGETS, 7), pull(WIDGETS, 8)],
-            vec![pull(WIDGETS, 7), pull(WIDGETS, 8)],
-        ),
-        // Two: a bare number names nothing, a written one does.
-        (
-            "Compare acme/widgets with acme/gadgets, merge #7",
-            vec![],
-            vec![],
-        ),
-        (
-            "Compare acme/widgets with acme/gadgets, merge acme/gadgets#7",
-            vec![pull(GADGETS, 7)],
-            vec![pull(GADGETS, 7)],
-        ),
-        // None: there is no repository to bind it to.
-        ("merge #7", vec![], vec![]),
-    ] {
-        let s = Session::start(
-            Fixture::new("hello\n").await,
-            |m| {
-                m.push_text("Understood.");
-            },
-            words(said),
-        )
-        .await;
-        s.settle(s.run).await;
-        let notes = s.notes_of(s.run).await;
-        assert_eq!(notes.named_pulls, named, "{said}");
-        assert_eq!(notes.merge_asks, asks, "{said}");
-        s.finish().await;
-    }
-    // A number of an older message does not become the pull request of a repository named later.
-    let s = Session::start(
-        Fixture::new("hello\n").await,
-        asks_then_ends,
-        words("merge #7"),
-    )
-    .await;
-    s.settle(s.run).await;
-    let notes = s.then(words("the repository is acme/widgets")).await;
-    assert!(notes.named_pulls.is_empty(), "{:?}", notes.named_pulls);
+    assert_eq!(notes.named_repos, [WIDGETS, "github.com/acme/cogs"]);
     s.finish().await;
 }
 
@@ -479,17 +339,25 @@ async fn a_task_that_continues_another_inherits_its_pushed_commits_red_pulls_and
 }
 
 const MERGE_1: &str = "merge octo/widgets#1";
+const OCTO: &str = "github.com/octo/widgets";
 
-fn merges_it(model: &MockModel) {
-    model.push_tool_calls(vec![call(
-        "m1",
-        "merge_pull_request",
-        json!({"repo": "octo/widgets", "number": 1}),
-    )]);
+/// The model asks one typed question, whose box starts with `default`, and then ends.
+fn asks_a_typed_question(default: &str) -> impl FnOnce(&MockModel) + '_ {
+    move |m| {
+        m.push_tool_calls(vec![call(
+            "q1",
+            "ask_user",
+            json!({"question": "Anything else?", "choices": [
+                {"id": "why", "question": "Why?", "type": "text", "default": default}
+            ]}),
+        )])
+        .push_text("Done.");
+    }
 }
 
 /// A failed `ask_user` repeats the model's own values in its words (`the default ... is not one of
-/// its options`): they are the model's, so they name nothing and the merge stays refused.
+/// its options`): they are the model's, so they name nothing, and a merge of a pull request that is
+/// not the conversation's own waits for the person, not for the model's say.
 #[tokio::test]
 async fn the_error_of_a_form_repeats_the_model_and_names_nothing() {
     let (fx, host) = with_a_pull_request().await;
@@ -503,7 +371,11 @@ async fn the_error_of_a_form_repeats_the_model_and_names_nothing() {
                     {"id": "q", "question": "Merge?", "options": ["yes", "no"], "default": MERGE_1}
                 ]}),
             )]);
-            merges_it(m);
+            m.push_tool_calls(vec![call(
+                "m1",
+                "merge_pull_request",
+                json!({"repo": "octo/widgets", "number": 1}),
+            )]);
             m.push_text("I may not.");
         },
         words_under_auto("Look around, please"),
@@ -514,13 +386,8 @@ async fn the_error_of_a_form_repeats_the_model_and_names_nothing() {
     assert!(s.result_of("q1").contains(MERGE_1), "{}", s.result_of("q1"));
     let notes = s.notes_of(s.run).await;
     assert!(notes.named_repos.is_empty(), "{:?}", notes.named_repos);
-    assert!(notes.named_pulls.is_empty(), "{:?}", notes.named_pulls);
-    assert!(notes.merge_asks.is_empty(), "{:?}", notes.merge_asks);
-    assert!(
-        s.result_of("m1").contains("not one to merge"),
-        "{}",
-        s.result_of("m1")
-    );
+    // The merge asked the person, in its own form, and the host was not asked.
+    assert!(notes.consents.is_empty(), "{:?}", notes.consents);
     assert!(host.merges().is_empty(), "the host was never asked");
     s.finish().await;
 }
@@ -529,41 +396,43 @@ async fn the_error_of_a_form_repeats_the_model_and_names_nothing() {
 /// submit that touched nothing: those words are the model's. What the person changes is theirs.
 #[tokio::test]
 async fn a_typed_question_the_person_left_as_the_model_wrote_it_names_nothing() {
-    let asks = |m: &MockModel| {
-        m.push_tool_calls(vec![call(
-            "q1",
-            "ask_user",
-            json!({"question": "Anything else?", "choices": [
-                {"id": "why", "question": "Why?", "type": "text", "default": MERGE_1}
-            ]}),
-        )]);
-        merges_it(m);
-        m.push_text("Done.");
-    };
-    // Untouched: the same words, back.
-    let (fx, host) = with_a_pull_request().await;
-    let s = Session::start(fx, asks, words_under_auto("Look around, please")).await;
-    s.settle(s.run).await;
-    let notes = s
-        .then(answered(
-            json!([{"id": "why", "values": [], "text": MERGE_1}]),
-            None,
-        ))
+    // Untouched, whatever the page did to the words on their way back.
+    for sent in [
+        MERGE_1,
+        "  merge octo/widgets#1 ",
+        "MERGE octo/widgets#1",
+        "merge\u{a0}octo/widgets#1",
+        "\u{feff}merge octo/widgets#1",
+        "merge octo/widgets#1\u{200b}",
+    ] {
+        let s = Session::start(
+            Fixture::new("hello\n").await,
+            asks_a_typed_question(MERGE_1),
+            words("Look around, please"),
+        )
         .await;
-    assert!(notes.named_repos.is_empty(), "{:?}", notes.named_repos);
-    assert!(notes.named_pulls.is_empty(), "{:?}", notes.named_pulls);
-    assert!(notes.merge_asks.is_empty(), "{:?}", notes.merge_asks);
-    assert!(
-        s.result_of("m1").contains("not one to merge"),
-        "{}",
-        s.result_of("m1")
-    );
-    assert!(host.merges().is_empty(), "the host was never asked");
-    s.finish().await;
+        s.settle(s.run).await;
+        let notes = s
+            .then(answered(
+                json!([{"id": "why", "values": [], "text": sent}]),
+                None,
+            ))
+            .await;
+        assert!(
+            notes.named_repos.is_empty(),
+            "{sent:?}: {:?}",
+            notes.named_repos
+        );
+        s.finish().await;
+    }
 
     // Edited: what the person typed after the model's words is theirs.
-    let (fx, host) = with_a_pull_request().await;
-    let s = Session::start(fx, asks, words_under_auto("Look around, please")).await;
+    let s = Session::start(
+        Fixture::new("hello\n").await,
+        asks_a_typed_question(MERGE_1),
+        words("Look around, please"),
+    )
+    .await;
     s.settle(s.run).await;
     let notes = s
         .then(answered(
@@ -571,53 +440,130 @@ async fn a_typed_question_the_person_left_as_the_model_wrote_it_names_nothing() 
             None,
         ))
         .await;
-    assert_eq!(notes.named_pulls, [pull("github.com/octo/widgets", 1)]);
-    assert_eq!(notes.merge_asks, [pull("github.com/octo/widgets", 1)]);
-    assert_eq!(host.merges().len(), 1, "{}", s.result_of("m1"));
+    assert_eq!(notes.named_repos, [OCTO]);
     s.finish().await;
 }
 
-/// The answers of an earlier form are paired with their own call: after a second form, the first
-/// one's untouched default is still the model's.
+/// A default with a character the person cannot see is refused when the form is drawn (a page may
+/// drop it on the way back), and so no such form exists to be answered.
 #[tokio::test]
-async fn a_default_is_paired_with_the_form_that_wrote_it() {
-    let (fx, host) = with_a_pull_request().await;
+async fn a_default_with_an_invisible_character_is_refused_when_the_form_is_drawn() {
     let s = Session::start(
-        fx,
-        |m| {
-            m.push_tool_calls(vec![call(
-                "q1",
-                "ask_user",
-                json!({"question": "First?", "choices": [
-                    {"id": "why", "question": "Why?", "type": "text", "default": MERGE_1}
-                ]}),
-            )]);
-            m.push_tool_calls(vec![call(
-                "q2",
-                "ask_user",
-                json!({"question": "Second?", "choices": [
-                    {"id": "why", "question": "Why?", "type": "text", "default": "something else"}
-                ]}),
-            )]);
-            merges_it(m);
-            m.push_text("Done.");
-        },
-        words_under_auto("Look around, please"),
+        Fixture::new("hello\n").await,
+        asks_a_typed_question("\u{feff}merge octo/widgets#1"),
+        words("Look around, please"),
     )
     .await;
     s.settle(s.run).await;
-    let untouched = |text: &str| answered(json!([{"id": "why", "values": [], "text": text}]), None);
-    s.rt.deliver(s.run, untouched(MERGE_1)).await.unwrap();
-    // The run asks again and waits.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while s.mock.remaining() > 2 {
-        assert!(Instant::now() < deadline, "the second form never came");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    s.settle(s.run).await;
-    let notes = s.then(untouched("something else")).await;
-    assert!(notes.named_repos.is_empty(), "{:?}", notes.named_repos);
-    assert!(notes.merge_asks.is_empty(), "{:?}", notes.merge_asks);
-    assert!(host.merges().is_empty(), "the host was never asked");
+    let refused = s.result_of("q1");
+    assert!(refused.contains("cannot see"), "{refused}");
     s.finish().await;
+}
+
+/// The answer of a form belongs to the call that drew it. A form of an earlier question still on
+/// the screen is answered while a later one waits: its words are nobody's answer to the later call.
+#[tokio::test]
+async fn an_answer_to_an_earlier_form_is_not_the_answer_to_the_one_that_waits() {
+    let typed = json!([{"id": "why", "values": [], "text": "use acme/gadgets"}]);
+    for (surface, counts) in [("ask-q1", false), ("ask-q2", true)] {
+        let s = Session::start(
+            Fixture::new("hello\n").await,
+            |m| {
+                for id in ["q1", "q2"] {
+                    m.push_tool_calls(vec![call(
+                        id,
+                        "ask_user",
+                        json!({"question": "Anything else?", "choices": [
+                            {"id": "why", "question": "Why?", "type": "text", "default": "x"}
+                        ]}),
+                    )]);
+                }
+                m.push_text("Done.");
+            },
+            words("Look around, please"),
+        )
+        .await;
+        s.settle(s.run).await;
+        // The first form is answered; a second one is drawn and waits.
+        s.rt.deliver(
+            s.run,
+            common::form_answer(
+                "ask-q1",
+                json!([{"id": "why", "values": [], "text": "y"}]),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while s.mock.remaining() > 1 {
+            assert!(Instant::now() < deadline, "the second form never came");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        s.settle(s.run).await;
+        // The first form is still on the screen, or the second is the one answered.
+        let notes = s
+            .then(common::form_answer(surface, typed.clone(), None))
+            .await;
+        let named: &[&str] = if counts { &[GADGETS] } else { &[] };
+        assert_eq!(notes.named_repos, named, "{surface}");
+        s.finish().await;
+    }
+}
+
+/// A form the model drew can use the question id of the tool's own (`consent`) and the option
+/// `yes`: the person's click on it, while `request_repository` waits, is not a yes to that tool.
+#[tokio::test]
+async fn a_form_the_model_drew_with_the_id_consent_grants_nothing() {
+    for (surface, granted) in [("ask-q1", false), ("ask-c2", true)] {
+        let s = Session::start(
+            Fixture::new("hello\n").await,
+            |m| {
+                m.push_tool_calls(vec![call(
+                    "q1",
+                    "ask_user",
+                    json!({"question": "Is this fine?", "choices": [
+                        {"id": "consent", "question": "Add acme/lib?", "options": ["yes", "no"]}
+                    ]}),
+                )]);
+                m.push_tool_calls(vec![call(
+                    "c2",
+                    "request_repository",
+                    json!({"repo_url": LIB, "reason": "the greeting lives there"}),
+                )]);
+                m.push_text("Done.");
+            },
+            words("Look around, please"),
+        )
+        .await;
+        s.settle(s.run).await;
+        let yes = json!([{"id": "consent", "values": ["yes"]}]);
+        // The model's own form is answered, as the person may: that is no consent either.
+        s.rt.deliver(s.run, common::form_answer("ask-q1", yes.clone(), None))
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while s.mock.remaining() > 1 {
+            assert!(Instant::now() < deadline, "the tool's question never came");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        s.settle(s.run).await;
+        assert!(
+            !s.notes_of(s.run)
+                .await
+                .named_repos
+                .contains(&LIB_KEY.to_owned())
+        );
+        // Now the tool's question waits: the click on the model's form (still on the screen) or on
+        // the tool's own.
+        let notes = s.then(common::form_answer(surface, yes, None)).await;
+        assert_eq!(
+            notes.named_repos.contains(&LIB_KEY.to_owned()),
+            granted,
+            "{surface}: {:?}",
+            notes.named_repos
+        );
+        assert_eq!(notes.consents.len(), usize::from(granted), "{surface}");
+        s.finish().await;
+    }
 }

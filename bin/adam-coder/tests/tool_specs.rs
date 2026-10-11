@@ -251,9 +251,9 @@ async fn only_the_optional_arguments_are_nullable() {
     );
 }
 
-/// `ask_user`, `request_repository` and `create_repository` are the coder's tools that ask the person, and the redacting
-/// wrapper says so too: `adam-assembly` refuses to give such a tool to a subagent (nobody could
-/// answer it).
+/// `ask_user`, `request_repository`, `create_repository` and `merge_pull_request` are the coder's
+/// tools that ask the person, and the redacting wrapper says so too: `adam-assembly` refuses to give
+/// such a tool to a subagent (nobody could answer it).
 #[tokio::test]
 async fn only_the_tools_that_ask_the_person_are_marked_so() {
     let fx = Fixture::new("hello\n").await.offering_creation();
@@ -262,11 +262,17 @@ async fn only_the_tools_that_ask_the_person_are_marked_so() {
         .filter(|tool| tool.asks_user())
         .map(|tool| tool.spec().name)
         .collect();
-    // `request_repository` and `create_repository` ask the person a question of their own writing; a subagent may have
-    // neither (it would wait for ever for an answer only the coder's caller can give).
+    // `request_repository`, `create_repository` and `merge_pull_request` ask the person a question of
+    // their own writing; a subagent may have none of them (it would wait for ever for an answer only
+    // the coder's caller can give).
     assert_eq!(
         asking,
-        ["request_repository", "create_repository", "ask_user"]
+        [
+            "request_repository",
+            "create_repository",
+            "merge_pull_request",
+            "ask_user"
+        ]
     );
 }
 

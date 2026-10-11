@@ -4066,7 +4066,7 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
         mock.requests()[1].messages.last(),
         Some(&adam_model::Message::tool_result(
             "choices-call-1",
-            "The person answered through the interface:\n- db: pg\n- auth: keycloak\n- deploy: compose"
+            "The person answered through the interface (form ask-choices-call-1):\n- db: pg\n- auth: keycloak\n- deploy: compose"
         ))
     );
     let parts = status_parts(&server, &seen.task_id).await;
@@ -4335,7 +4335,7 @@ async fn another_repository_joins_the_workspace_when_the_person_says_yes_on_the_
 
     assert_eq!(
         result_of(&mock, "r2").0,
-        "The person answered through the interface:\n- consent: yes"
+        "The person answered through the interface (form ask-r2):\n- consent: yes"
     );
     let (added, is_error) = result_of(&mock, "r3");
     assert!(!is_error && added.contains("slot: library"), "{added}");

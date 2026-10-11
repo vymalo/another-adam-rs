@@ -9,7 +9,7 @@
 //! | `plan` | read-only tools; the answer is a plan |
 //! | `edits` | edit files, commit, push branches, open pull requests |
 //! | `auto` (the default) | `edits`, and `merge_pull_request`, `create_repository` (when the deployment allows it), a bare repository name counts as named |
-//! | `bypass` | `auto`, and `rename_repository`, `delete_repository`; no consent form for a repository |
+//! | `bypass` | `auto`, and `rename_repository`, `delete_repository`; no consent form for a repository or for a merge |
 //!
 //! It is **enforced in code, not asked of the model**, at three places:
 //!

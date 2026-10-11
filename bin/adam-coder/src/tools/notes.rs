@@ -300,24 +300,13 @@ pub struct RenamedRepo {
     pub html_url: String,
 }
 
-/// A pull request, as a repository's [`named`](super::named) key (when it is known) and a number.
+/// A pull request: its repository, as a [`named`](super::named) key, and its number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRef {
-    /// The repository, as a key. `None`: only the number was written (`#12`) and no repository could be
-    /// told (see `named::bind_pulls`): it is no pull request of any repository.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    /// The repository, as a key.
+    pub repo: String,
     /// The pull request's number.
     pub number: u64,
-}
-
-impl PullRef {
-    /// Whether this is pull request `number` of the repository with `key`. One that names no
-    /// repository is no pull request of any (`named::bind_pulls` gives it the one repository in play,
-    /// or drops it).
-    fn is(&self, key: &str, number: u64) -> bool {
-        self.number == number && self.repo.as_deref() == Some(key)
-    }
 }
 
 /// Where one of the person's sayings stands in the conversation, as far as that is known.
@@ -338,10 +327,11 @@ pub struct Heard {
     /// The text as it reached the run: for an answer through the interface, the lines the interface
     /// wrote (see `named::typed_by_the_person`).
     pub text: String,
-    /// The defaults of the text questions of the `ask_user` call this answers, when it could be paired
-    /// with its call: a typed question's words that are one of them are the model's, not the
-    /// person's. `None`: not an answer to a call, or one that could not be paired; none of its typed
-    /// questions' words count.
+    /// The defaults of the text questions of the `ask_user` call this answers, when it is the answer
+    /// to that call's own form (paired with the call by position, and naming the surface the call drew
+    /// its form on): a typed question's words that are one of them are the model's, not the
+    /// person's. `None`: not an answer to a call, or one that is not to that call's form; none of its
+    /// typed questions' words count.
     pub defaults: Option<Vec<String>>,
     /// Where it stands.
     pub when: When,
@@ -361,7 +351,7 @@ impl Heard {
 /// The most words of the person's [`RunNotes::said_words`] keeps: past it the newest are not added.
 pub const MAX_SAID_WORDS: usize = 2000;
 
-/// The most pull requests each of the lists of [`RunNotes`] keeps: past it the newest are not added.
+/// The most pull requests [`RunNotes::red_pulls`] keeps: past it the newest are not added.
 pub const MAX_PULLS: usize = 256;
 
 /// Everything remembered about one run.
@@ -446,16 +436,6 @@ pub struct RunNotes {
     /// words only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub said_words: Vec<String>,
-    /// The pull requests the person named in their own words, ever: a URL, `#12`, `PR 12`. One of
-    /// these is a pull request `merge_pull_request` may touch although this conversation did not push
-    /// its branch. Filled by the agent from the person's words only.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub named_pulls: Vec<PullRef>,
-    /// The pull requests the person's **newest message** asks to merge (it names the pull request
-    /// and says to merge): the fresh yes a pull request opened with red checks needs. Replaced each
-    /// step by the agent from the person's words only.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub merge_asks: Vec<PullRef>,
     /// The pull requests this conversation opened with `accept_red_checks` that mattered (the checks
     /// were red), by their repository's key. Written by `open_pull_request`; a run that continues
     /// another inherits them.
@@ -587,36 +567,10 @@ impl RunNotes {
         changed
     }
 
-    /// Remember the pull requests `pulls` the person named; returns whether anything was new.
-    pub fn name_pulls(&mut self, pulls: impl IntoIterator<Item = PullRef>) -> bool {
-        add_pulls(&mut self.named_pulls, pulls)
-    }
-
-    /// Make `pulls`, those the person's newest message asks to merge, the merge asks; returns
-    /// whether that changed anything.
-    pub fn set_merge_asks(&mut self, pulls: Vec<PullRef>) -> bool {
-        let mut asks = Vec::new();
-        add_pulls(&mut asks, pulls);
-        let changed = asks != self.merge_asks;
-        self.merge_asks = asks;
-        changed
-    }
-
     /// Remember that pull request `pull` was opened with red checks accepted; returns whether it
     /// was new.
     pub fn name_red_pulls(&mut self, pulls: impl IntoIterator<Item = PullRef>) -> bool {
         add_pulls(&mut self.red_pulls, pulls)
-    }
-
-    /// Whether the person named pull request `number` of the repository with `key`.
-    pub fn names_pull(&self, key: &str, number: u64) -> bool {
-        self.named_pulls.iter().any(|p| p.is(key, number))
-    }
-
-    /// Whether the person's newest message asks to merge pull request `number` of the repository
-    /// with `key`.
-    pub fn asks_to_merge(&self, key: &str, number: u64) -> bool {
-        self.merge_asks.iter().any(|p| p.is(key, number))
     }
 
     /// Whether pull request `number` of the repository with `key` was opened with red checks
@@ -624,7 +578,7 @@ impl RunNotes {
     pub fn red_accepted(&self, key: &str, number: u64) -> bool {
         self.red_pulls
             .iter()
-            .any(|p| p.repo.as_deref() == Some(key) && p.number == number)
+            .any(|p| p.repo == key && p.number == number)
     }
 
     /// Take in what the person said, `said` in order (messages and the answers they gave, as the
@@ -633,20 +587,15 @@ impl RunNotes {
     /// interface made of a click is what the model wrote into the form.
     ///
     /// * The repositories they named ([`named_repos`](Self::named_repos)).
-    /// * The pull requests they named, ever ([`named_pulls`](Self::named_pulls)): one with its
-    ///   repository (a URL, `owner/name#12`) as it is, a bare `#12` or `PR 12` **only in their newest
-    ///   words**, and only as the pull request of **the** repository in play when there is exactly
-    ///   one (`workspace` are the keys of the repositories in the run's workspace, beside the ones
-    ///   named and created).
-    /// * The pull requests their **newest** words ask to merge ([`merge_asks`](Self::merge_asks)):
-    ///   the newest is the last thing they said, an answer included, so an answer that asks nothing
-    ///   takes an earlier ask away. Where the order is not known (a message that arrived while a tool
-    ///   result was owed, [`When::Deferred`], and the last thing in the history) every one of them
-    ///   must ask, or none does.
     /// * The words that stand alone in the newest of their words that have any
-    ///   ([`said_words`](Self::said_words)).
-    pub fn hear(&mut self, said: &[Heard], host: &str, workspace: &[String]) -> bool {
-        use super::named::{asks_to_merge, bind_pulls, listed, named_in, pulls_in};
+    ///   ([`said_words`](Self::said_words)). The newest is what waits for the run, else the last
+    ///   thing in the history together with the messages that arrived while a tool result was owed
+    ///   (their place among the answers is not known, [`When::Deferred`]): then only the words every
+    ///   one of them has stand.
+    ///
+    /// What the person says does not decide a merge: `merge_pull_request` asks them itself.
+    pub fn hear(&mut self, said: &[Heard], host: &str) -> bool {
+        use super::named::named_in;
         let typed: Vec<(String, When)> = said
             .iter()
             .map(|heard| {
@@ -657,15 +606,6 @@ impl RunNotes {
             })
             .collect();
         let mut changed = self.name_repos(typed.iter().flat_map(|(text, _)| named_in(text, host)));
-        let mut in_play: std::collections::BTreeSet<String> = listed(&self.named_repos)
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        in_play.extend(self.created_repos.iter().map(|created| created.key.clone()));
-        in_play.extend(workspace.iter().cloned());
-        let in_play: Vec<String> = in_play.into_iter().collect();
-        // The newest words: the last thing waiting for the run, else the last of the history and
-        // every message that arrived out of order (its place among the answers is not known).
         let newest: Vec<&str> = match typed.iter().rev().find(|(_, when)| *when == When::Waiting) {
             Some((text, _)) => vec![text.as_str()],
             None => typed
@@ -677,32 +617,6 @@ impl RunNotes {
                 .map(|(text, _)| text.as_str())
                 .collect(),
         };
-        let mut asks: Option<Vec<PullRef>> = None;
-        let mut newest_pulls = Vec::new();
-        for text in &newest {
-            let pulls = pulls_in(text, host);
-            let asked = if asks_to_merge(text) {
-                bind_pulls(pulls.clone(), &in_play)
-            } else {
-                Vec::new()
-            };
-            asks = Some(match asks {
-                None => asked,
-                Some(before) => before
-                    .into_iter()
-                    .filter(|pull| asked.contains(pull))
-                    .collect(),
-            });
-            newest_pulls.extend(pulls);
-        }
-        let explicit = typed
-            .iter()
-            .flat_map(|(text, _)| pulls_in(text, host))
-            .filter(|pull| pull.repo.is_some());
-        changed |= self.name_pulls(explicit.chain(bind_pulls(newest_pulls, &in_play)));
-        changed |= self.set_merge_asks(asks.unwrap_or_default());
-        // The bare names follow the same order: the words every one of the newest says, else the
-        // last words there are.
         let spoken: Vec<&str> = newest
             .iter()
             .copied()
@@ -729,8 +643,10 @@ impl RunNotes {
 
     /// Remember the answers `consents` of the person, and grant the repository of every one that
     /// agreed to `request_repository`'s question; returns whether anything was new. A consent is
-    /// the same as one already held when its call, tool and subject are, so recording the answers
-    /// of the whole conversation again at every step changes nothing.
+    /// the same as one already held when its call, tool, subject and answer are, so recording the
+    /// answers of the whole conversation again at every step changes nothing, and an answer that
+    /// differs from an earlier one to the same question (a provider may send the same call id
+    /// again) is recorded after it: the latest decides ([`agreed`](Self::agreed)).
     pub fn record_consents(&mut self, consents: impl IntoIterator<Item = Consent>) -> bool {
         let mut added = false;
         for consent in consents {
@@ -741,6 +657,7 @@ impl RunNotes {
                 c.call_id == consent.call_id
                     && c.tool == consent.tool
                     && c.subject == consent.subject
+                    && c.agreed == consent.agreed
             });
             if !known {
                 self.consents.push(consent);
@@ -1085,45 +1002,24 @@ mod tests {
         }
     }
 
-    const MERGE_7: &str = "merge https://github.com/acme/widgets/pull/7";
-
     #[test]
-    fn the_newest_words_decide_whether_a_merge_is_asked() {
-        let widgets_7 = || PullRef {
-            repo: Some("github.com/acme/widgets".to_owned()),
-            number: 7,
-        };
+    fn what_the_person_typed_names_the_repositories_and_a_click_names_none() {
         let hear = |said: &[Heard]| {
             let mut notes = RunNotes::default();
-            notes.hear(said, "github.com", &[]);
-            notes.merge_asks
+            notes.hear(said, "github.com");
+            notes.named_repos
         };
-        // The ask stands while nothing newer is said, however many steps the model takes.
-        assert_eq!(hear(&[heard(MERGE_7, When::Past)]), [widgets_7()]);
-        // An answer that asks nothing takes it away, a click that says nothing too.
-        for answer in ["no, wait", ""] {
-            assert!(hear(&[heard(MERGE_7, When::Past), heard(answer, When::Past)]).is_empty());
-        }
-        // What waits for the run is newer than all the rest.
-        assert!(hear(&[heard(MERGE_7, When::Past), heard("", When::Waiting)]).is_empty());
         assert_eq!(
-            hear(&[heard("no", When::Past), heard(MERGE_7, When::Waiting)]),
-            [widgets_7()]
+            hear(&[heard("see acme/widgets", When::Past)]),
+            ["github.com/acme/widgets"]
         );
-        // A message that waited behind an owed result may be older than the click after it: it
-        // cannot keep the ask alive against it, and cannot be cleared by it alone either.
+        // The ids and the values of a form are the model's.
         assert!(
-            hear(&[
-                heard("hi", When::Past),
-                heard("", When::Past),
-                heard(MERGE_7, When::Deferred)
-            ])
+            hear(&[heard(
+                "The person answered through the interface (form ask-1):\n- acme/widgets: gadgets/cogs",
+                When::Past
+            )])
             .is_empty()
-        );
-        assert!(hear(&[heard(MERGE_7, When::Past), heard("no", When::Deferred)]).is_empty());
-        assert_eq!(
-            hear(&[heard(MERGE_7, When::Past), heard(MERGE_7, When::Deferred)]),
-            [widgets_7()]
         );
     }
 
@@ -1131,7 +1027,7 @@ mod tests {
     fn the_bare_names_are_the_words_every_one_of_the_newest_says() {
         let said = |said: &[Heard]| {
             let mut notes = RunNotes::default();
-            notes.hear(said, "github.com", &[]);
+            notes.hear(said, "github.com");
             notes.said_words
         };
         assert_eq!(

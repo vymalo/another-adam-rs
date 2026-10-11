@@ -3,15 +3,19 @@
 //! to script the model. Everything is offline.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use a2a::{Message as A2aMessage, Part, Role};
+use adam_a2a::A2UI_MEDIA_TYPE;
+use adam_a2a_runtime::vymalo_inbound;
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::{CoderSettings, Redactor, ToolEnv};
 use adam_model::ToolCall;
+use adam_runtime::Inbound;
 use adam_workspace::{
     CodeHost, CreatedRepository, DynCodeHost, DynEnvironment, DynGitCredentials, EnvDescription,
     EnvError, EnvKind, EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec,
@@ -26,6 +30,26 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 pub mod pg;
+
+/// The person answers the form drawn on `surface`: the answer as the A2A layer writes it.
+pub fn form_answer(surface: &str, answers: Value, note: Option<&str>) -> Inbound {
+    let mut context = json!({ "answers": answers });
+    if let Some(note) = note {
+        context["note"] = json!(note);
+    }
+    let action = json!({
+        "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
+        "timestamp": "2026-10-11T10:00:00Z", "context": context,
+    });
+    let mut part = Part::data(json!([{ "version": "v0.9.1", "action": action }]))
+        .with_media_type(A2UI_MEDIA_TYPE);
+    part.metadata = Some(HashMap::from([(
+        "mimeType".to_owned(),
+        json!(A2UI_MEDIA_TYPE),
+    )]));
+    let message = A2aMessage::new(Role::User, vec![part]);
+    vymalo_inbound(&message).expect("an answer reads as text")
+}
 
 /// A check command that fails in a run's worktree and passes on the checkout of the base
 /// (`.adam-base`), so that its failure is the run's and costs a check cycle: `then` is what it

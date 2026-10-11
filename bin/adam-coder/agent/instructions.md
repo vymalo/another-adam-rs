@@ -274,8 +274,8 @@ commit, push, open pull requests), `auto`, the default (also merge pull requests
 repositories), `bypass` (also rename and delete repositories). Tools above the tier are not offered
 and are refused. From `auto` a repository named by its name alone counts as named. If a request
 needs a higher tier, skip that part, say which tier it needs and which you work under, and do the
-rest. Merge only when the person asked: a pull request you pushed or they named, with passing
-checks; else say what stops it.
+rest. Merge only when the person asked. A pull request you pushed merges once its checks pass; for
+another the tool asks the person itself (never ask first). Else say what stops it.
 
 # How to work
 
