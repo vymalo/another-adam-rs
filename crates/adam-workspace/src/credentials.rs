@@ -18,6 +18,16 @@ use crate::repo::RepoRef;
 pub trait GitCredentials: Send + Sync + 'static {
     /// Short-lived token for this repo (static in the MVP; a broker later).
     async fn token_for(&self, repo: &RepoRef) -> Result<SecretString, WorkspaceError>;
+
+    /// The accounts (logins, in the case the host spells them) these credentials act for, when they
+    /// are confined to some: the accounts a GitHub App is installed on and the deployment allows.
+    /// `None`, the default, for credentials that are not confined to accounts (a personal access
+    /// token reaches whatever its owner does, and nothing here can list it).
+    ///
+    /// A provided method, so a `GitCredentials` of yours keeps compiling.
+    async fn acts_for(&self) -> Result<Option<Vec<String>>, WorkspaceError> {
+        Ok(None)
+    }
 }
 
 /// Shared handle to a [`GitCredentials`] implementation.
@@ -202,6 +212,10 @@ impl<C: GitCredentials> GitCredentials for HostScoped<C> {
     async fn token_for(&self, repo: &RepoRef) -> Result<SecretString, WorkspaceError> {
         check_host(&self.hosts, repo)?;
         self.inner.token_for(repo).await
+    }
+
+    async fn acts_for(&self) -> Result<Option<Vec<String>>, WorkspaceError> {
+        self.inner.acts_for().await
     }
 }
 

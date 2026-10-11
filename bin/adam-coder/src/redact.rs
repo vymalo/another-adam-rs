@@ -328,6 +328,10 @@ impl GitCredentials for RedactingCredentials {
         self.redactor.add(token.expose_secret());
         Ok(token)
     }
+
+    async fn acts_for(&self) -> Result<Option<Vec<String>>, WorkspaceError> {
+        self.inner.acts_for().await
+    }
 }
 
 /// `%XX` decoding, enough for a password in a URL (no extra dependency).

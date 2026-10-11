@@ -126,6 +126,10 @@ pub const MAX_CACHED_INSTALLATIONS: usize = 64;
 /// How many accounts' installations a [`GitHubApp`] remembers (four for each installation it keeps
 /// a token for, since an account that is not installed takes a place too).
 const MAX_CACHED_ACCOUNTS: usize = 4 * MAX_CACHED_INSTALLATIONS;
+/// How many installations one page of `GET /app/installations` holds (GitHub's largest).
+const INSTALLATIONS_PER_PAGE: usize = 100;
+/// How many pages of installations [`GitHubApp::accounts`] reads: 300 accounts.
+const MAX_INSTALLATION_PAGES: usize = 3;
 /// How long "the App is not installed on this account" is believed before GitHub is asked again.
 const NOT_INSTALLED_FOR: TimeDelta = TimeDelta::seconds(60);
 
@@ -418,6 +422,86 @@ impl GitHubApp {
         match self.mode {
             Mode::Pinned(id) => Some(id),
             Mode::Discovering(_) => None,
+        }
+    }
+
+    /// The accounts this App acts for, lowercased and sorted: the account of the pinned
+    /// installation (`GET /app/installations/{id}`); the accounts of `GITHUB_APP_OWNERS` as they are
+    /// listed (nothing is asked of GitHub: a listed account the App is not installed on fails where
+    /// it is used); or, for [`AppOwners::Any`], every account the App is installed on
+    /// (`GET /app/installations`, at most 300 of them, those that are suspended left out).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkspaceError::Auth`] when GitHub refuses the App's credentials,
+    /// [`WorkspaceError::RateLimited`] and [`WorkspaceError::Transient`] when it could not answer.
+    #[tracing::instrument(skip(self))]
+    pub async fn accounts(&self) -> WorkspaceResult<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Body {
+            account: Option<Account>,
+            suspended_at: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Account {
+            login: Option<String>,
+        }
+        let login = |body: Body| {
+            body.account
+                .and_then(|a| a.login)
+                .filter(|_| body.suspended_at.is_none())
+                .map(|l| l.to_ascii_lowercase())
+        };
+        let unreadable = |_| {
+            WorkspaceError::transient(
+                "GitHub answered the installation request with a success status and an \
+                 unreadable body",
+            )
+        };
+        match &self.mode {
+            Mode::Discovering(AppOwners::Only(owners)) => Ok(owners.iter().cloned().collect()),
+            Mode::Pinned(id) => {
+                let jwt = self.jwt((self.clock)())?;
+                let response = self
+                    .send_as_app(
+                        Method::GET,
+                        &format!("/app/installations/{id}"),
+                        &jwt,
+                        "the GitHub App's installation was not read",
+                    )
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(self.refused(response, &jwt).await);
+                }
+                let body: Body = response.json().await.map_err(unreadable)?;
+                Ok(login(body).into_iter().collect())
+            }
+            Mode::Discovering(AppOwners::Any) => {
+                let jwt = self.jwt((self.clock)())?;
+                let mut found = BTreeSet::new();
+                for page in 1..=MAX_INSTALLATION_PAGES {
+                    let response = self
+                        .send_as_app(
+                            Method::GET,
+                            &format!(
+                                "/app/installations?per_page={INSTALLATIONS_PER_PAGE}&page={page}"
+                            ),
+                            &jwt,
+                            "the GitHub App's installations were not listed",
+                        )
+                        .await?;
+                    if !response.status().is_success() {
+                        return Err(self.refused(response, &jwt).await);
+                    }
+                    let bodies: Vec<Body> = response.json().await.map_err(unreadable)?;
+                    let last = bodies.len() < INSTALLATIONS_PER_PAGE;
+                    found.extend(bodies.into_iter().filter_map(login));
+                    if last {
+                        break;
+                    }
+                }
+                Ok(found.into_iter().collect())
+            }
         }
     }
 
@@ -861,6 +945,10 @@ impl GitCredentials for GitHubApp {
             }
             Err(failure) => Err(failure.error),
         }
+    }
+
+    async fn acts_for(&self) -> Result<Option<Vec<String>>, WorkspaceError> {
+        self.accounts().await.map(Some)
     }
 }
 
