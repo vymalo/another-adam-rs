@@ -154,7 +154,7 @@ and its plan as they are, and `Hand to OpenCode: done` when the call ends (`test
 The coder **streams its model calls** (`LlmAgentBuilder::stream_text`, on by default), and its card lists `text-stream/v1`
 ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md); the contract is the orchestration layer's
 `docs/api/text-stream-v1.md`). A client that activates it reads each answer as chunks while the model writes (artifact updates
-named `reply`, each with where it begins in UTF-8 bytes, the last marked `lastChunk`), then the status that ends the turn (`completed`, or `input-required` for a reply that delivers nothing, which the coder
+named `reply`, each with where it begins in UTF-8 bytes, the last marked `lastChunk`), then the status that ends the turn (`completed`, or `input-required` for a reply that asks something, which the coder
 turns into a question: `PendingQuestion::stream` says which stream the question is), whose message is the whole text
 and names the stream (`metadata["https://agents.vymalo.com/a2a/extensions/text-stream/v1"] =
 {"streamId": ..}`); the words the model writes before a tool call are stated by a `working` status of their own, the same
@@ -346,22 +346,34 @@ make them hold:
   completing, whatever the model says. So does a run that ends without a pull
   request because GitHub or git rejected the credentials (the model cannot fix a
   bad token, or an App that is not installed there): the error names `GITHUB_TOKEN`, or the `GITHUB_APP_*`
-  variables in App mode. Anything else is a **question,
-  not a completion** (red checks with cycles left included: fixing or asking is
-  the model's call): the model
-  that answers "Hi! I need a repository and a task" in plain text asked
+  variables in App mode. **A reply that asks something is a question,
+  not a completion**: the model
+  that answers "Hi! Which repository should I work on?" in plain text asked
   something, and the run parks exactly as if it had called `ask_user`: A2A
   reports `input-required` with the model's text (trimmed; a fixed sentence when
   there is none) as the question, the run waits with no timer, and the next
-  delivered message resumes it. The conversation is made to say what happened:
+  delivered message resumes it. What asks is read from the words (`asks_the_person`
+  in `src/agent.rs`): a sentence that ends in a question mark (`?`, `？`, `؟`, with
+  closing quotes or emphasis after it) in the **last paragraph**, outside code spans,
+  code blocks and links. A rhetorical question earlier in a long answer does not make
+  the reply a question, and a request that is no question ("Tell me the repository")
+  is not read as one: the instructions tell the model to ask, or to use `ask_user`.
+  A reply with no words and one cut by the model's length limit (`output.truncated`) wait
+  too, as does **any reply while repository work is left undelivered** (`owes_delivery`):
+  a worktree with changes nobody committed, commits nobody pushed, a push with no
+  pull request, or a rework that did not update the pull request it continues (red checks with cycles left included: fixing or asking is the model's
+  call). **Every other reply completes the task**: an answer, a report, "Merged - main is
+  at 1912174" ask nothing, so the thread shows the work as done, not as blocked
+  (it used to wait whatever the reply said, [ADR 0034](../../docs/decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md)),
+  and the person's next message starts the next task, which continues the conversation. The conversation is made to say what happened:
   the model's last message gets an `ask_user` call carrying that text, and the
   person's answer is that call's result, as for a real `ask_user`, so the
   history stays valid for every provider; its id is `stop` and the turn as five
   digits, nine alphanumeric characters, which the strictest providers accept. The
   turn and check-cycle limits and CancelTask apply to a parked run as to any other.
-  **A run with nothing to deliver never completes on its own**, and there is no
+  **A run with repository work to deliver never completes on its own**, and there is no
   limit on how often it asks: it is a chat, and the person can answer, say
-  something else or stop it. The exits are a pull request, a failure (the rules
+  something else or stop it. The exits are a pull request, an answer that asks nothing, a failure (the rules
   above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
   and CancelTask (a chat's Stop).
 * **A scratch project is temporary, and what is published is what was checked.** It lives as long as the run (the
@@ -442,7 +454,8 @@ stateDiagram-v2
   Stepping --> Stopped: the model stops (a turn without tool calls)
   Stopped --> Completed: a pull request was opened
   Stopped --> Failed: red checks with no cycles left, or the credentials were rejected
-  Stopped --> InputRequired: anything else, the model's text is the question
+  Stopped --> Completed: the reply asks nothing and no repository work is left undelivered
+  Stopped --> InputRequired: the reply asks, is empty or cut off, or repository work is undelivered
   Stepping --> InputRequired: ask_user
   InputRequired --> Stepping: the person answers
   InputRequired --> Canceled: CancelTask
@@ -1274,7 +1287,7 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
   [`adam-ui`](../../crates/adam-ui/README.md) makes them (`show` refuses a `Choices` form: ask with `ask_user`).
 * **A greeting gets a greeting**: "hi" is answered with a short greeting that says the name and what the agent does
   in one sentence (the second persona line, `In one sentence: <summary>.`) and asks one open question, what it can help with. It is not a task with something missing, so no tool is called
-  and nothing is asked for "the task" or for a repository. The run waits for the answer (A2A `input-required`, as for any plain-text stop that delivers nothing).
+  and nothing is asked for "the task" or for a repository. The run waits for the answer (A2A `input-required`, as for any plain-text reply that asks).
 * **"What can you do?" and "list your tools"** are answered in plain words first: answer and explain, research when it has research tools, write a report, plan or chart
   and share it as a file, plan a large request and confirm it, make a change to a repository the person names (look around,
   run its checks, push a branch, open a pull request), ask when unsure. Then what
@@ -1996,7 +2009,7 @@ database of its own, so the role needs `CREATEDB`):
   and a wiremock GitHub. **Every case runs once per store** (`memory::*`, and
   `postgres::*` when the variable is set): the happy path (working, progress,
   checks, artifacts (`checks`, the `checks` bound to the pushed commit, `branch`, `pull_request`), completed, branch on the remote, PR request at the mock),
-  the `input-required` round trip, a plain-text stop that delivered nothing (the
+  the `input-required` round trip, a plain-text reply that asks (the
   owner's "Hi": `input-required` with the text as the question, the answer reaches the
   model and the run goes on to a pull request; no text at all; checks then text;
   a message in the context of a parked run continues it; cancel while parked), an invented

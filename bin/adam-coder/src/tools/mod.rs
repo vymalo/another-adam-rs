@@ -104,7 +104,7 @@ pub mod create;
 pub mod delegate;
 pub mod environment;
 pub mod files;
-mod gitcli;
+pub(crate) mod gitcli;
 pub mod inspect;
 pub mod make;
 pub mod named;

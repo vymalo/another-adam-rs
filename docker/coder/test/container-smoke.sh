@@ -1,7 +1,7 @@
 #!/bin/sh
 # Container smoke test of the coder image: it starts as uid 10001 under tini
 # with the tools on PATH, serves A2A with fail-closed auth, takes a task to
-# input-required against a stub model, and exits 0 on SIGTERM within 15 s.
+# completed against a stub model, and exits 0 on SIGTERM within 15 s.
 #
 #   container-smoke.sh <image>
 #
@@ -72,7 +72,7 @@ docker run -d --name "$name" --network host \
   -e LISTEN_ADDR="127.0.0.1:$coder_port" \
   "$image" >/dev/null
 
-# Liveness, the card, 401 without a token, and a task that waits for the person.
+# Liveness, the card, 401 without a token, and a task that the stub model answers.
 sh "$here/http-smoke.sh" "http://127.0.0.1:$coder_port" "$token" || fail=1
 
 # The runtime user and the tools the agent shells out to.

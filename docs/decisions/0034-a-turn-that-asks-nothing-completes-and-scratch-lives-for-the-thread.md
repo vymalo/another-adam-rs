@@ -28,7 +28,8 @@ The owner tested Adam in production on a thread of seven jobs (2026-10-11). Two 
      (`asks_the_person`); a question written with `ask_user` always waits;
    * the reply is **empty** or was **cut by the length limit**;
    * **repository work is left undelivered** (`owes_delivery`): a repository's worktree has changes nobody committed or
-     commits nobody pushed, or the run pushed and opened no pull request. Scratch projects do not count: they stay for the
+     commits nobody pushed, the run pushed and opened no pull request, or it continues a branch whose pull request it has
+     not updated. Scratch projects do not count: they stay for the
      thread (decision 2), so what was not shared is still there for the next message.
 
    The next message of the thread starts the next task, which continues the conversation (ADR 0003), so a completed task

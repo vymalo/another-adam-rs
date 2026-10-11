@@ -178,7 +178,9 @@ if [ -n "$task" ] && [ -n "$surface_id" ]; then
           mediaType: "application/a2ui+json",
           metadata: {mimeType: "application/a2ui+json"}}]}}}')
   send "$answer"
-  said=$(jq -r 'select((.result.statusUpdate.status.state // .result.task.status.state) == "TASK_STATE_INPUT_REQUIRED") | [.. | .text? // empty] | join(" ")' "$tmp/events.jsonl" | tail -n 1)
+  # The coder's next words end the turn: they ask nothing, so the task completes with them (a reply
+  # that asked would end INPUT_REQUIRED with the same text).
+  said=$(jq -r 'select((.result.statusUpdate.status.state // .result.task.status.state) | IN("TASK_STATE_COMPLETED", "TASK_STATE_INPUT_REQUIRED")) | (.result.statusUpdate.status // .result.task.status) | [.message.parts[]? | .text? // empty] | join(" ")' "$tmp/events.jsonl" | tail -n 1)
   case "$said" in
     *"Going with Postgres, Keycloak and Compose."*) ok "the coder's next words quote the answers: Postgres, Keycloak and Compose" ;;
     *) bad "the coder's next words are '$said', not the ones the answers should bring" ;;

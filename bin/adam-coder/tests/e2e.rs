@@ -210,6 +210,12 @@ async fn wait_for(
     }
 }
 
+/// A run with nothing more to do: it waits for the person (its last reply asked, or it called
+/// `ask_user`), or it is over (its reply asked nothing, and no repository work was left).
+fn settled(view: &RunView) -> bool {
+    view.waiting || view.status.is_terminal()
+}
+
 fn run_id(task_id: &str) -> RunId {
     RunId(task_id.parse().expect("task id is a run id"))
 }
@@ -1104,8 +1110,9 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
         panic!("a task expected")
     };
     worker.stop().await;
-    // The model's last reply is text and nothing was delivered, so it is a question again.
-    assert_eq!(task.status.state, TaskState::InputRequired);
+    // The model's last reply asks nothing and no repository work is left, so the task is complete
+    // (it used to wait for the person again, whatever the reply said).
+    assert_eq!(task.status.state, TaskState::Completed);
     assert_eq!(
         task.status.message.as_ref().and_then(|m| m.text()),
         Some("Understood: main.")
@@ -1121,14 +1128,15 @@ async fn ask_user_parks_and_an_a2a_follow_up_resumes(store: DynStore) {
 // ----------------------------------------------- a stop with nothing delivered
 
 /// The owner's report: the person typed "Hi", the model answered in plain text without calling
-/// `ask_user`. That text is a question, not a completion: the task is `input-required` with the
-/// text as the question, the run waits with no timer, and the answer resumes it (the model sees
-/// it, names the repository, and the run goes on to a pull request).
+/// `ask_user`. A text that asks something is a question, not a completion: the task is
+/// `input-required` with the text as the question, the run waits with no timer, and the answer
+/// resumes it (the model sees it, names the repository, and the run goes on to a pull request).
+/// What does not ask is a completed turn: see `an_answer_that_asks_nothing_completes_the_task`.
 async fn a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run(store: DynStore) {
     let fx = Fixture::new("hello\n").await;
     let mock = Arc::new(MockModel::new());
     let greeting =
-        "Hi! I'm ready to help. I need: 1. the repository 2. the base branch 3. the task.";
+        "Hi! I'm ready to help. Which repository, which base branch and what is the task?";
     mock.push_text(greeting);
     happy_script(&mock, &fx.remote_url());
     let server = Server::start(coder_with(&fx, &mock, store)).await;
@@ -1208,11 +1216,117 @@ async fn a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run(store: D
     assert_eq!(fx.agent_branches().len(), 1);
 }
 
+/// The owner's job 7: the final answer ("Merged - main is at 1912174") asks nothing, so the task is
+/// complete, not `input-required` (the thread showed it as blocked). The workspace was only looked at,
+/// so no repository work is left; the thread's next message starts the next task, which continues the
+/// conversation.
+async fn an_answer_that_asks_nothing_completes_the_task(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "m1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_text("Merged - main is at 1912174")
+    // A statement of what is missing, with no question in it, is not read as one either.
+    .push_text("I need the repository and the task. Tell me both.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let mut first_message = user(&format!(
+        "Is the pull request of {} merged? (base branch main)",
+        fx.remote_url()
+    ));
+    first_message.context_id = Some("ctx-merged".into());
+    let first = run_message(&server, first_message).await;
+    assert_eq!(
+        first.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        first.labels
+    );
+    assert!(
+        first.saw_message("Merged - main is at 1912174"),
+        "{:#?}",
+        first.messages
+    );
+    assert!(
+        !first.labels.iter().any(|l| l.contains("InputRequired")),
+        "never blocked: {:?}",
+        first.labels
+    );
+    let view = server
+        .coder
+        .runtime
+        .view(run_id(&first.task_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(view.status, RunStatus::Done);
+    assert!(!view.waiting);
+
+    // The next message of the thread is the next task.
+    let second = run_message(
+        &server,
+        follow_up("And the other one?", "ctx-merged", &first.task_id),
+    )
+    .await;
+    worker.stop().await;
+    assert_ne!(second.task_id, first.task_id, "a new task of the context");
+    assert_eq!(
+        second.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        second.labels
+    );
+}
+
+/// What the person is owed is not a statement: a worktree with changes nobody committed or pushed
+/// keeps the run waiting, whatever the last reply says or does not ask.
+async fn work_left_in_a_worktree_is_not_finished_by_a_statement(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "w1",
+        "prepare_workspace",
+        json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
+    )])
+    .push_tool_calls(vec![call(
+        "w2",
+        "write_file",
+        json!({"path": "hello.txt", "content": "hello\n"}),
+    )])
+    .push_text("I changed hello.txt.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let seen = run_to_end(
+        &server,
+        &format!("In {} (base branch main), add hello.txt.", fx.remote_url()),
+    )
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::InputRequired),
+        "an unpushed change is owed: {:?}",
+        seen.labels
+    );
+    assert!(
+        seen.saw_message("I changed hello.txt."),
+        "{:#?}",
+        seen.messages
+    );
+    assert!(fx.created_pulls().await.is_empty());
+}
+
 /// The owner's live thread, end to end: the repository is given, the model guessed a base branch
 /// the repository does not have (its default is `master`), then looked around with commands: a
 /// missing file, a toolchain the image lacks. None of it is a check: no cycle, no `checks`
 /// artifact, nothing failed. A question ("List all branches") is answered in plain text, which
-/// parks the run as a question with no pull request, and the chat goes on.
+/// completes the task with no pull request (the answer asks nothing), and the chat goes on in the
+/// next task.
 async fn a_question_is_answered_from_a_look_around_and_costs_no_check_cycles(store: DynStore) {
     let fx = Fixture::with("hello\n", |s| s.max_check_cycles = 1).await;
     common::git(&fx.remote, &["branch", "master", "refs/heads/main"]);
@@ -1263,8 +1377,8 @@ async fn a_question_is_answered_from_a_look_around_and_costs_no_check_cycles(sto
     worker.stop().await;
     assert_eq!(
         seen.last_state,
-        Some(TaskState::InputRequired),
-        "an answer parks the run, it does not fail it: {:?} {:#?}",
+        Some(TaskState::Completed),
+        "an answer that asks nothing completes the task, it neither fails nor blocks it: {:?} {:#?}",
         seen.labels,
         seen.messages
     );
@@ -1277,7 +1391,7 @@ async fn a_question_is_answered_from_a_look_around_and_costs_no_check_cycles(sto
         !seen.labels.iter().any(|l| l == "artifact:checks"
             || l == "artifact:pull_request"
             || l.contains("Failed")
-            || l.contains("Completed")),
+            || l.contains("InputRequired")),
         "{:?}",
         seen.labels
     );
@@ -1592,7 +1706,7 @@ async fn a_repository_in_quoted_findings_is_not_named(store: DynStore) {
         "prepare_workspace",
         json!({"repo_url": fx.remote_url(), "base_branch": "main"}),
     )])
-    .push_text("Ready.");
+    .push_text("Ready. What should I change?");
     let server = Server::start(coder_with(&fx, &mock, store)).await;
     let worker = spawn_worker(&server.coder);
     let rework = format!(
@@ -3852,8 +3966,8 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
         .unwrap();
     assert!(matches!(response, SendMessageResponse::Task(_)));
     let run = run_id(&seen.task_id);
-    let view = wait_for(&server.coder.runtime, run, "the run waits again", |v| {
-        v.waiting && v.version > 3
+    let view = wait_for(&server.coder.runtime, run, "the run settles again", |v| {
+        settled(v) && v.version > 3
     })
     .await;
     worker.stop().await;
@@ -4124,8 +4238,8 @@ async fn another_repository_joins_the_workspace_when_the_person_says_yes_on_the_
         )))
         .await
         .unwrap();
-    wait_for(&server.coder.runtime, run, "the run waits again", |v| {
-        v.waiting && v.version > parked.version && mock.requests().len() == 5
+    wait_for(&server.coder.runtime, run, "the run settles again", |v| {
+        settled(v) && v.version > parked.version && mock.requests().len() == 5
     })
     .await;
     worker.stop().await;
@@ -4199,8 +4313,8 @@ async fn an_answer_that_is_not_a_yes_adds_nothing_and_is_not_asked_again(store: 
     let mut follow = user("no");
     follow.task_id = Some(seen.task_id.clone());
     server.client.send_message(&request(follow)).await.unwrap();
-    wait_for(&server.coder.runtime, run, "the run waits again", |v| {
-        v.waiting && v.version > parked.version && mock.requests().len() == 4
+    wait_for(&server.coder.runtime, run, "the run settles again", |v| {
+        settled(v) && v.version > parked.version && mock.requests().len() == 4
     })
     .await;
     worker.stop().await;
@@ -4268,8 +4382,8 @@ async fn a_wait_is_no_answer_and_the_question_is_asked_again(store: DynStore) {
     let mut follow = user("wait");
     follow.task_id = Some(seen.task_id.clone());
     server.client.send_message(&request(follow)).await.unwrap();
-    wait_for(&server.coder.runtime, run, "the run waits again", |v| {
-        v.waiting && v.version > parked.version && mock.requests().len() == 3
+    wait_for(&server.coder.runtime, run, "the run settles again", |v| {
+        settled(v) && v.version > parked.version && mock.requests().len() == 3
     })
     .await;
     worker.stop().await;
@@ -4334,8 +4448,8 @@ async fn a_yes_to_a_question_the_model_wrote_grants_nothing(store: DynStore) {
     let mut follow = user("yes");
     follow.task_id = Some(seen.task_id.clone());
     server.client.send_message(&request(follow)).await.unwrap();
-    wait_for(&server.coder.runtime, run, "the run waits again", |v| {
-        v.waiting && v.version > parked.version && mock.requests().len() == 3
+    wait_for(&server.coder.runtime, run, "the run settles again", |v| {
+        settled(v) && v.version > parked.version && mock.requests().len() == 3
     })
     .await;
     worker.stop().await;
@@ -4520,8 +4634,8 @@ async fn a_no_to_creating_a_repository_creates_nothing(store: DynStore) {
     let mut no = user("No");
     no.task_id = Some(seen.task_id.clone());
     server.client.send_message(&request(no)).await.unwrap();
-    wait_for(&server.coder.runtime, run, "the run waits again", |v| {
-        v.waiting && v.version > parked.version && mock.requests().len() == 3
+    wait_for(&server.coder.runtime, run, "the run settles again", |v| {
+        settled(v) && v.version > parked.version && mock.requests().len() == 3
     })
     .await;
     worker.stop().await;
@@ -4586,11 +4700,9 @@ async fn a_steps_input_and_output_carry_the_call_and_never_a_secret_the_process_
                 .await;
         })
     };
-    // The coder's last words are no pull request, so the run waits for the person: that is its end here.
-    wait_for(&runtime, run, "the run to wait for the person", |v| {
-        v.status == RunStatus::Parked
-    })
-    .await;
+    // The coder's last words ("done") ask nothing and nothing is left undelivered in a repository, so
+    // the run is complete: that is its end here.
+    wait_for(&runtime, run, "the run to end", |v| v.status.is_terminal()).await;
     let _ = stop.send(());
     worker.await.unwrap();
 
@@ -4761,9 +4873,11 @@ async fn the_tokens_of_the_coder_and_its_explorer_reach_an_activated_client() {
     ids.dedup();
     assert_eq!(ids.len(), 3);
 
-    let parked = coder.backend.get(&caller, &task.id).await.unwrap().unwrap();
-    assert_eq!(parked.status.state, TaskState::InputRequired);
-    let totals = &parked.metadata.as_ref().expect("the totals")[USAGE_EXTENSION]["totals"];
+    // "The README says hello." asks nothing, so the task is complete; it carries the totals as a
+    // task that waits does.
+    let ended = coder.backend.get(&caller, &task.id).await.unwrap().unwrap();
+    assert_eq!(ended.status.state, TaskState::Completed);
+    let totals = &ended.metadata.as_ref().expect("the totals")[USAGE_EXTENSION]["totals"];
     assert_eq!(
         totals,
         &json!([{"provider": "openai", "model": "test-model",
@@ -4788,6 +4902,8 @@ macro_rules! coder_suite {
                 ask_user_parks_and_an_a2a_follow_up_resumes,
                 a_plain_text_stop_is_a_question_and_the_answer_resumes_the_run,
                 a_question_is_answered_from_a_look_around_and_costs_no_check_cycles,
+                an_answer_that_asks_nothing_completes_the_task,
+                work_left_in_a_worktree_is_not_finished_by_a_statement,
                 a_stop_without_text_asks_what_to_do,
                 an_empty_stop_after_work_does_not_ask_for_the_repository,
                 red_checks_with_cycles_left_then_text_is_a_question,

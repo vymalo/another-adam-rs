@@ -85,10 +85,9 @@ const REPOSITORY_CREATION_OFF: &str = "Creating a repository is switched off in 
 /// `max_check_cycles` var) and the [`coder_tools`]; this type adds the one thing files cannot say,
 /// the policy below (see the README, "Where the prompt and the card live").
 ///
-/// When the model stops (a turn without tool calls) the run completes only if it
-/// delivered: it opened a pull request, or it did the one other thing that is delivery
-/// (`delivered_a_result`): in scratch work, with no repository in play, it shared a file the
-/// person asked for. Otherwise:
+/// When the model stops (a turn without tool calls) the run completes if it delivered: it opened a
+/// pull request, or it did the one other thing that is delivery (`delivered_a_result`): in scratch
+/// work, with no repository in play, it shared a file the person asked for. Otherwise:
 ///
 /// * A run that ends with the last check run red, the check-cycle budget used up
 ///   and no pull request fails, with the findings as the error. That is what "at
@@ -98,13 +97,20 @@ const REPOSITORY_CREATION_OFF: &str = "Creating a repository is switched off in 
 /// * The same goes for a run whose credentials were rejected (GitHub or git
 ///   answered 401/403): the model cannot fix a bad token, so ending without a
 ///   pull request is a failure that names the token, not a completed task.
-/// * Anything else is a question, not a completion: a model that answers "Hi! I
-///   need a repository and a task" in plain text asked something, and the run
-///   parks exactly as if it had called `ask_user` (see `stop_as_question`). The
-///   person's answer resumes the run.
+/// * A reply that asks something is a question, not a completion: a model that answers "Hi! Which
+///   repository should I work on?" in plain text asked, and the run parks exactly as
+///   if it had called `ask_user` (see `stop_as_question`). The person's answer resumes the run.
+///   So does a reply with nothing to say, one cut by the length limit, and any reply while
+///   repository work is left undelivered (`owes_delivery`): changes nobody committed, commits
+///   nobody pushed, a push with no pull request.
+/// * **Any other reply completes the task.** A final answer that asks nothing (a report, an
+///   answer to a question, "Merged, main is at 1912174") is a finished turn, not a request for
+///   input; the thread then shows it as done, not as blocked, and the person's next message
+///   starts the next task, which continues this conversation. What asks is read from the words
+///   (`asks_the_person`): a sentence ending in `?` in the last paragraph.
 ///
-/// So a run that has nothing to deliver never completes on its own. It ends with a pull
-/// request, with a result shared from scratch work, with a failure (the two rules above, a model or tool error that is not retried,
+/// So a run that has repository work to deliver does not complete on its own. It ends with a pull
+/// request, with a failure (the two rules above, a model or tool error that is not retried,
 /// `max_turns` or `max_tool_calls`), or when the caller cancels it (A2A `CancelTask`); until then
 /// it waits for the person, who can say something else or stop it. There is no limit on how
 /// often it asks.
@@ -403,6 +409,111 @@ fn delivered_a_result(notes: &RunNotes, scratch_only: bool) -> bool {
         && notes.created_repos.is_empty()
         && notes.pushed_branches.is_empty()
         && notes.continues.is_none()
+}
+
+/// Whether the model's last words ask the person something: they are a question, and the run waits
+/// for the answer. Only a question does that. A reply that asks nothing (a report, an answer, "Merged,
+/// main is at 1912174") ends the turn, and the person writes again whenever they like.
+///
+/// What counts as asking, read from `output.text` and nothing the model says about itself:
+///
+/// * the last paragraph, without its code (a fenced block, an inline span) and its links, has a
+///   sentence that ends in a question mark (`?`, `？`, `؟`, possibly followed by a closing quote,
+///   bracket or emphasis mark). A question mark inside a word or an address (`a?b`, `?page=2`) is not
+///   one, and a rhetorical question earlier in a long answer does not make the whole reply a
+///   question: whoever asks ends with the question, or uses `ask_user`;
+/// * no words at all (the model stopped with nothing to say) is asked of the person, as ever;
+/// * a reply cut by the model's length limit (`output.truncated`) is unfinished, not an answer.
+fn asks_the_person(output: &Value) -> bool {
+    if output.get("truncated").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let text = output
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return true;
+    }
+    ends_with_a_question(&without_code_and_links(text))
+}
+
+/// `text` without fenced code blocks, inline code spans and links (`http://...`, `https://...`).
+fn without_code_and_links(text: &str) -> String {
+    let mut kept = String::with_capacity(text.len());
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut in_span = false;
+        let mut cleaned = String::with_capacity(line.len());
+        for piece in line.split('`') {
+            if !in_span {
+                cleaned.push_str(piece);
+            }
+            in_span = !in_span;
+        }
+        let words: Vec<&str> = cleaned
+            .split(' ')
+            .filter(|w| !(w.contains("http://") || w.contains("https://")))
+            .collect();
+        kept.push_str(&words.join(" "));
+        kept.push('\n');
+    }
+    kept
+}
+
+/// Whether the last paragraph of `text` (after the last blank line) has a sentence that ends in a
+/// question mark: one followed by the end, a space, or closing marks and then one of those.
+fn ends_with_a_question(text: &str) -> bool {
+    let paragraph = text.trim_end().rsplit("\n\n").next().unwrap_or_default();
+    let chars: Vec<char> = paragraph.chars().collect();
+    chars.iter().enumerate().any(|(at, c)| {
+        matches!(c, '?' | '\u{ff1f}' | '\u{061f}')
+            && chars[at + 1..]
+                .iter()
+                .find(|next| {
+                    !matches!(
+                        next,
+                        '"' | '\'' | '\u{201d}' | '\u{2019}' | ')' | ']' | '*' | '_' | '?'
+                    )
+                })
+                .is_none_or(|next| next.is_whitespace())
+    })
+}
+
+/// Whether the run leaves repository work undelivered, so that stopping is not finishing: it pushed
+/// a commit and opened no pull request, it continues a branch whose pull request it has not updated,
+/// or a repository's worktree holds changes nobody committed or commits nobody pushed. Scratch
+/// projects are not counted (they live for the conversation, and what was not shared is still there
+/// for the next message), and a worktree that cannot be read is owed: when it cannot be told, the
+/// run waits, as it always did.
+async fn owes_delivery(notes: &RunNotes, slots: &[adam_workspace::Slot]) -> bool {
+    // A rework that set out to update a pull request and has not is owed, whatever its worktree holds.
+    if notes.pushed_sha.is_some() || (notes.continues.is_some() && !notes.published) {
+        return true;
+    }
+    for wt in slots.iter().filter_map(adam_workspace::Slot::worktree) {
+        match wt.status().await {
+            Ok(changed) if changed.is_empty() => {}
+            Ok(_) | Err(_) => return true,
+        }
+        // A run that continues a branch starts with that branch's commits: only its own pushes count,
+        // which `pushed_sha` has said.
+        if wt.continues().is_none()
+            && crate::tools::gitcli::commits_ahead(wt.path(), &wt.repo().base_branch)
+                .await
+                .is_none_or(|ahead| ahead > 0)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// [`CoderAgent::verdict`] for run `notes` and the budgets of `max` check cycles in repositories
@@ -794,8 +905,12 @@ impl Agent for CoderAgent {
                         if delivered_a_result(&notes, scratch_only) {
                             // Shared from scratch work: what was asked for is handed over.
                             Transition::Done { state, output }
-                        } else {
+                        } else if asks_the_person(&output) || owes_delivery(&notes, &slots).await {
                             stop_as_question(ctx, state, output, !slots.is_empty()).await
+                        } else {
+                            // An answer that asks nothing, with no repository work left undelivered:
+                            // the turn is over, and the person's next message starts the next one.
+                            Transition::Done { state, output }
                         }
                     }
                 })
@@ -1858,6 +1973,47 @@ mod tests {
         let mut continues = shared;
         continues.continues = Some("agent/abc".into());
         assert!(!delivered_a_result(&continues, true));
+    }
+
+    fn reply_saying(text: &str) -> Value {
+        json!({ "text": text })
+    }
+
+    /// What a final answer asks is read from its last paragraph, outside code and links; an answer that
+    /// asks nothing ends the task (the owner's "Merged - main is at 1912174" left a thread blocked).
+    #[test]
+    fn a_reply_asks_when_its_last_paragraph_ends_a_sentence_with_a_question_mark() {
+        for asks in [
+            "Which repository should I work on?",
+            "Done with the checks. Want me to open the pull request?",
+            "I found two options.\n\nShall I use **the first one?**",
+            "Which one? (a or b?)",
+            "Quel dépôt ?",
+            "¿Qué repositorio?",
+            "Which one\u{ff1f}",
+            "Open it \"now?\"",
+            "Look at `src/main.rs`.\n\nShould it be public?\n\n```sh\ncargo run\n```",
+        ] {
+            assert!(asks_the_person(&reply_saying(asks)), "{asks:?}");
+        }
+        for tells in [
+            "Merged - main is at 1912174",
+            "The pull request is merged. Nothing else to do.",
+            "Why did the build fail? The lockfile was stale.\n\nI regenerated it and the checks pass.",
+            "See https://example.com/search?q=rust and `a ? b : c`.",
+            "The pattern is `^a?b$`.\n\n```\nwho?\n```",
+            "Use `?page=2` and then x?y=1 for the next page",
+            "Version 2 of the API is live.",
+        ] {
+            assert!(!asks_the_person(&reply_saying(tells)), "{tells:?}");
+        }
+        // No words, and a reply the model's length limit cut: not an answer.
+        assert!(asks_the_person(&reply_saying("")));
+        assert!(asks_the_person(&reply_saying("  \n ")));
+        assert!(asks_the_person(&json!({})));
+        assert!(asks_the_person(
+            &json!({ "text": "The migration is done and", "truncated": true })
+        ));
     }
 
     #[test]

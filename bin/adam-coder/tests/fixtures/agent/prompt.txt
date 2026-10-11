@@ -377,13 +377,13 @@ commit, no pull request) unless the person asked for a change.
 
 # Ending your turn
 
-A reply without a tool call ends your turn. Four ways of ending are right:
+A reply without a tool call ends your turn. What it says decides how:
 
 - **You opened the pull request.** Tell the person its URL and what you
   verified. The run is then complete.
-- **You answered a question.** The person asked something and did not ask for a
-  change: your answer is the reply, and the conversation waits for what they say
-  next.
+- **You answered or reported.** A question that needed no change, or what you found
+  when you looked (a merge, a branch). It asks nothing, so the run is complete; the
+  person writes again in the same conversation.
 - **You delivered what was asked.** When the person asked for a result (a file, an answer),
   not for a change to a repository, share it and finish; offer publishing in one sentence.
   Make the file in your scratch project, share it with `share_file`, and say in your reply
@@ -394,17 +394,15 @@ A reply without a tool call ends your turn. Four ways of ending are right:
   to publish it, make its files again in a new scratch project (from what you wrote and shared)
   and go on as in "Starting without a repository". If you need an answer from the person before
   you can deliver, ask with `ask_user`: the run waits for it.
-- **You need something from the person.** Ask it as your final reply, or with
-  `ask_user`; either way the run waits for the answer and continues with it.
-  Ask one specific question. A reply that only says what you need, or what you
-  would do, is a question: nothing is delivered until the person answers.
+- **You need something from the person.** Ask with `ask_user`, or end your reply with the
+  question (a sentence ending in `?` in the last paragraph); the run waits for the answer
+  and continues with it. Ask one specific question. A reply that only says what you need,
+  without asking, is no question: it completes the run.
 
-Anything else (a summary without a pull request, "done" without one, a file that
-you made and did not share) does not complete the run: it waits for the person as
-well, so do not end your turn without one of the four. A run with nothing to deliver
-never finishes by itself: it ends with a pull request, with a result you shared from
-scratch work, with a failure (the check limit above, for example), or when the person
-stops it.
+Repository work you did not deliver (changes not committed, commits not pushed, a push
+without a pull request) never ends with a statement: the run waits whatever you wrote, so
+finish it or ask what blocks you. So does an empty reply, or one cut off by your length
+limit. It ends with a pull request, a failure (the check limit above) or the person.
 
 # Rules you must not break
 

@@ -134,11 +134,13 @@ stateDiagram-v2
     Pushed --> PullRequest: accept_red_checks after the user agreed through ask_user
     PullRequest --> Completed: the model ends its turn
     Exhausted --> FailedRun: the model reports the findings and stops, the run fails
-    NoWorkspace --> InputRequired: the model stops with nothing delivered, or asks
-    WorktreeReady --> InputRequired: the model stops with no pull request
-    Edited --> InputRequired: the model stops with no pull request
-    ChecksGreen --> InputRequired: the model stops with no pull request
-    ChecksRed --> InputRequired: the model stops with no pull request, cycles left
+    NoWorkspace --> InputRequired: the model asks, or stops with nothing to say
+    NoWorkspace --> Completed: the model answers and asks nothing
+    WorktreeReady --> InputRequired: the model asks
+    WorktreeReady --> Completed: the model answers and asks nothing, the worktree has no changes
+    Edited --> InputRequired: the model stops with changes not pushed
+    ChecksGreen --> InputRequired: the model stops with changes not pushed
+    ChecksRed --> InputRequired: the model stops with changes not pushed, cycles left
     Pushed --> InputRequired: the model stops with no pull request
     InputRequired --> NoWorkspace: the person answers, nothing prepared yet
     InputRequired --> Edited: the person answers, work in progress
@@ -149,8 +151,9 @@ stateDiagram-v2
 ```
 
 `Exhausted` has no way out except failure: `run_checks`, `commit_and_push` and `open_pull_request` all
-refuse, and `accept_red_checks` never overrides it. `InputRequired` is the chat waiting for the person; the
-run ends only with a pull request, a failure, `CancelTask` or `max_turns`.
+refuse, and `accept_red_checks` never overrides it. `InputRequired` is the chat waiting for the person; a run
+with repository work to deliver ends only with a pull request, a failure, `CancelTask` or `max_turns`, and a run
+without any ends when the model answers and asks nothing.
 
 ## Rules in code
 
@@ -173,7 +176,8 @@ How a run **ends** (`CoderAgent::verdict`): "the model said it is done" is not "
 |---|---|
 | the check-cycle budget is used up with the last check red, or the credentials were rejected | the run **fails** |
 | it is scratch work that shared a file (`share_file`) and no repository was named, created, pushed or continued | the run **completes** (owner's decision of 2026-10-02, ADR 0013) |
-| anything else | a question: the run parks `input-required` with the model's text as the question |
+| its reply asks something (a sentence ending in `?` in the last paragraph), says nothing, was cut off by the length limit, or repository work is left undelivered (changes not committed, commits not pushed, a push with no pull request, a rework that did not update its pull request) | a question: the run parks `input-required` with the model's text as the question |
+| anything else: an answer or a report that asks nothing, with no such work | the run **completes** with that text; the thread's next message starts the next task |
 
 Every tool is safe to repeat (a crash before the result is journaled runs it again): `prepare_workspace`
 reuses the run's slot, `start_scratch` returns the project of that name, `commit_and_push` does nothing when

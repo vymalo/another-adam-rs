@@ -7,15 +7,15 @@
 #   http-smoke.sh <base-url> <bearer-token>
 #
 # The model behind the agent must be docker/coder/test/fake-model.py, which
-# answers "Nothing to do." without calling a tool. For the coder, a run that stops with text
-# and no pull request has delivered nothing, so the task waits for the person
-# (input-required) with that text as the question; it does not complete. A general agent
-# (adam-agent) answers: its task completes with that text.
+# answers "Nothing to do." without calling a tool. That reply asks nothing and the coder has no
+# repository work to deliver, so the task completes with that text (a reply that asks, or work left
+# undelivered in a repository, would wait for the person: input-required). A general agent
+# (adam-agent) answers the same way.
 #
 # What the agent is says what is expected (the defaults are the coder's):
 #   EXPECT_NAME   Adam                         the name on the agent card
 #   EXPECT_SKILL  coding-task                  a skill id the card lists
-#   EXPECT_STATE  TASK_STATE_INPUT_REQUIRED    the state the task reaches
+#   EXPECT_STATE  TASK_STATE_COMPLETED         the state the task reaches
 #   EXPECT_REVISION  (unset)                   the commit the image was built from (its build argument
 #                                              ADAM_BUILD_REVISION): the card's version must end with
 #                                              +<its first 7 characters> and `build/v1` must say it whole.
@@ -31,7 +31,7 @@ base=${1%/}
 token=$2
 expect_name=${EXPECT_NAME:-Adam}
 expect_skill=${EXPECT_SKILL:-coding-task}
-expect_state=${EXPECT_STATE:-TASK_STATE_INPUT_REQUIRED}
+expect_state=${EXPECT_STATE:-TASK_STATE_COMPLETED}
 fail=0
 body=$(mktemp)
 trap 'rm -f "$body"' EXIT
@@ -137,8 +137,8 @@ if [ "$code" = 200 ]; then ok "GET /tasks (HTTP+JSON) with the token is 200"; el
 code=$(status "$base/some/other/path")
 if [ "$code" = 401 ] || [ "$code" = 404 ]; then ok "an unknown route is not served ($code)"; else bad "an unknown route is $code"; fi
 
-# A task with the token: the text-only model answers. The coder delivered nothing, so its task asks;
-# a general agent is done.
+# A task with the token: the text-only model answers, asks nothing and leaves no work behind, so the
+# task is done (the coder's and a general agent's alike).
 code=$(status -X POST -H 'Content-Type: application/json' -H "Authorization: Bearer $token" -d "$rpc" "$base/")
 state=$(jq -r '.result.task.status.state // .result.status.state // empty' "$body" 2>/dev/null || true)
 text=$(jq -r '[.. | .text? // empty] | join(" ")' "$body" 2>/dev/null || true)

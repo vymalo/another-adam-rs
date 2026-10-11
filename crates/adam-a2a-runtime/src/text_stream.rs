@@ -186,7 +186,7 @@ pub(crate) fn words_of(payload: &Value) -> Option<(&str, &str)> {
 ///
 /// * `completed`: the run's `output.stream`, the answer that ended it (`text` is the output's text);
 /// * `input-required`: the question's own `pending_wait.stream`, set by an agent that turns the
-///   model's reply into the question (the coder does, for a reply that delivers nothing), when
+///   model's reply into the question (the coder does, for a reply that asks), when
 ///   `text` is that question: a custom [`PromptFn`](crate::PromptFn) that says something else says
 ///   something that was not streamed.
 ///

@@ -447,10 +447,9 @@ async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
     loop {
         let view = rt.view(run).await.unwrap().expect("run exists");
         match view.status {
-            // The model stopped with text and nothing delivered: that is a question, so the run
-            // waits for the person instead of completing.
-            RunStatus::Parked if view.waiting => break,
-            RunStatus::Done => panic!("a stop that delivered nothing completed: {view:#?}"),
+            // The model stopped with a reply that asks nothing, with no repository work behind
+            // it: the turn is over and the task is complete (it used to wait for the person).
+            RunStatus::Done => break,
             RunStatus::Failed => panic!("the run failed: {view:#?}"),
             _ => {}
         }
@@ -496,9 +495,10 @@ fn coder_from(files: &AgentFiles, fx: &Fixture, mock: &Arc<MockModel>) -> CoderA
         .expect("the files assemble")
 }
 
-/// Start a run on `coder` with `text` and wait until it waits for the person (the model stopped
-/// with nothing to deliver, so the run asks).
-async fn run_to_a_question(coder: &Coder, text: &str) -> RunId {
+/// Start a run on `coder` with `text` and wait until it has nothing more to do: it waits for the
+/// person (its last reply asked) or it is complete (the reply asked nothing: the tests' models
+/// answer in plain text).
+async fn run_to_a_stop(coder: &Coder, text: &str) -> RunId {
     let (stop, rx) = tokio::sync::oneshot::channel::<()>();
     let worker = {
         let runtime = coder.runtime.clone();
@@ -520,7 +520,8 @@ async fn run_to_a_question(coder: &Coder, text: &str) -> RunId {
         let view = coder.runtime.view(run).await.unwrap().expect("run exists");
         match view.status {
             RunStatus::Parked if view.waiting => break,
-            RunStatus::Done | RunStatus::Failed => panic!("the run ended: {view:#?}"),
+            RunStatus::Done => break,
+            RunStatus::Failed => panic!("the run failed: {view:#?}"),
             _ => {}
         }
         assert!(Instant::now() < deadline, "timed out: {view:#?}");
@@ -584,7 +585,7 @@ async fn editing_the_folder_changes_what_the_model_is_sent() {
     mock.push_text("Bonjour.");
     let agent = coder_from(&files, &fx, &mock);
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-    run_to_a_question(&coder, "hi").await;
+    run_to_a_stop(&coder, "hi").await;
 
     let system = mock.requests()[0].system.clone().unwrap();
     assert!(system.ends_with("\n\nAlways answer in French."), "{system}");
@@ -742,7 +743,7 @@ async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
     .push_text("The README says widgets.");
     let agent = coder_from(&AgentFiles::Embedded, &fx, &mock);
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-    run_to_a_question(&coder, &format!("In {url}, what does the README say?")).await;
+    run_to_a_stop(&coder, &format!("In {url}, what does the README say?")).await;
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 5, "{requests:#?}");
@@ -811,7 +812,7 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
     assert_eq!(info[0].tools.last().map(String::as_str), Some("summariser"));
 
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-    run_to_a_question(&coder, "have it summarised").await;
+    run_to_a_stop(&coder, "have it summarised").await;
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
@@ -919,7 +920,7 @@ async fn a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says() {
             )
             .unwrap();
             let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-            let run = run_to_a_question(&coder, "hi").await;
+            let run = run_to_a_stop(&coder, "hi").await;
             let view = coder.runtime.view(run).await.unwrap().unwrap();
             assert!(view.artifacts.is_empty(), "no tool ran: {view:#?}");
             let answers = model.answers();
@@ -1054,7 +1055,7 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
     assert_eq!(&tools[own + 1..], &TOOLS[own..]);
 
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-    run_to_a_question(&coder, "echo ping").await;
+    run_to_a_stop(&coder, "echo ping").await;
 
     assert_eq!(server.calls(), 1, "the call reached the server");
     assert!(
