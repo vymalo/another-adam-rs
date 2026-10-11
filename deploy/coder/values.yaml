@@ -331,13 +331,13 @@ persistence:
 runPods:
   enabled: false
   # The run container's image: the workspace image of another-agentic-images (the toolchains, user 10001, /work),
-  # by tag AND digest. *Verified 2026-10-09*: an anonymous ghcr.io token and a manifest request for the tag
+  # by tag AND digest. *Verified 2026-10-11*: an anonymous ghcr.io token and a manifest request for the tag
   # returned this digest (a single linux/amd64 manifest of 2.92 GB compressed, config `User: agent`,
-  # `Entrypoint: [tini, --]`). It is the image the coder is built on. A node pulls it once: `readyTimeoutSecs`.
+  # `Entrypoint: [tini, --]`, `CARGO_HOME=/cache/cargo`: the package caches are under /cache, ADR 0040). It is the image the coder is built on. A node pulls it once: `readyTimeoutSecs`.
   image:
     repository: ghcr.io/vymalo/another-agentic-images/workspace
-    tag: 1.98.1-cfd2917
-    digest: sha256:ee7e4c7539ad62942e43f9b8ea39d8433617888cac3b0d26a37de3993671786c
+    tag: 1.98.1-e6a528f
+    digest: sha256:d2aae762ecad2c13bb697332507d236a75d8233d061f38cc97dc9227192b0797
     pullPolicy: IfNotPresent
   # The init container copies adam-exec and the native OpenCode out of the coder's image (/opt/adam/bin) into the
   # pod: empty is `image.repository:image.tag` of the coder above.
