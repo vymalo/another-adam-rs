@@ -138,13 +138,24 @@ impl ToolSource for Holds {
     async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
         vec![spec("extra")]
     }
-    async fn withhold(&self, ctx: &SourceCtx) -> Vec<Withheld> {
-        ctx.context("held")
+    async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
+        let held: Vec<&str> = ctx
+            .context("held")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .map(|tool| Withheld::new(tool, format!("{tool} is held back for this message")))
+            .collect();
+        // Of the tools asked about, the ones the context names; and one that was not asked about,
+        // which the agent must not take for held.
+        tools
+            .iter()
+            .filter(|tool| held.contains(tool))
+            .map(|tool| Withheld::new(*tool, format!("{tool} is held back for this message")))
+            .chain(std::iter::once(Withheld::new(
+                "never-asked-about",
+                "not among the tools",
+            )))
             .collect()
     }
     async fn call(

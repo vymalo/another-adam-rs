@@ -846,7 +846,8 @@ impl LlmAgent {
                     notes = said;
                     refined(&sources, source_ctx, &mut request.tools).await;
                     // What a source holds back is not shown, the agent's own tools included.
-                    let held = withheld(&sources, source_ctx).await;
+                    let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+                    let held = withheld(&sources, source_ctx, &names).await;
                     if !held.is_empty() {
                         request
                             .tools
@@ -1268,10 +1269,10 @@ impl LlmAgent {
             Some(tool) => {
                 ctx.step(&format!("tool:{}", call.id), move || async move {
                     if let Some((sources, source_ctx, name)) = &holding
-                        && let Some(held) = withheld(sources, source_ctx)
+                        && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
                             .await
                             .into_iter()
-                            .find(|h| h.tool == *name)
+                            .next()
                     {
                         return Ok(ToolOutput::error(held.reason));
                     }
@@ -1307,10 +1308,10 @@ impl LlmAgent {
                 let unknown = self.unknown_tool(&call.name);
                 ctx.step(&format!("tool:{}", call.id), move || async move {
                     if let Some((sources, source_ctx, name)) = &holding
-                        && let Some(held) = withheld(sources, source_ctx)
+                        && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
                             .await
                             .into_iter()
-                            .find(|h| h.tool == *name)
+                            .next()
                     {
                         return Ok(ToolOutput::error(held.reason));
                     }
