@@ -5,6 +5,11 @@ plan: "the coder may finish without a PR when a result was asked for; it shares 
 sentence." The owner's words that started it: "Not bad, but not complete. The agent doesn't have enough freedom." **Built:**
 the tools, the completion rule, the two budgets of check cycles, the instructions and the tests.
 
+*Amended 2026-10-11 by [ADR 0034](0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md):* a stop with
+no pull request is no longer always a question (decision 4's "anything else" and the consequence "a scratch run that answered
+a question and shared nothing still waits"): a reply that asks nothing completes the task, unless repository work is left
+undelivered; and a scratch project is no longer deleted when its run completes (it lives for the conversation).
+
 ## Context
 
 The owner's coder chat of 2026-10-02 showed three blockers, all in the coder and none in the model:

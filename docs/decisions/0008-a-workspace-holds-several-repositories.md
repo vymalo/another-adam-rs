@@ -6,6 +6,11 @@ the workspace model, which `adam-workspace` builds. The coder's use of it (a sec
 janitor, the scratch tools) is built by changes of the slice, and the status notes at the end say
 which are.
 
+*Amended 2026-10-11 by [ADR 0034](0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md):* decision 5's
+"it is deleted with the workspace" and the alternative "a workspace per conversation" change in one respect: a scratch project
+records its conversation, the next task of the conversation takes it over (it moves into that run's workspace), and the janitor
+keeps it until the conversation has been idle for `SCRATCH_IDLE_DAYS` (7 by default). The workspace is still per run.
+
 ## Context
 
 The owner's words, 2026-10-01: the coder must be useful from the first message, so it has to start

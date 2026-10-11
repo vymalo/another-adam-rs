@@ -71,6 +71,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0031](decisions/0031-swagger-ui-and-the-a2a-rest-binding.md) | the A2A HTTP+JSON binding beside JSON-RPC, and Swagger UI at `/docs` |
 | [0032](decisions/0032-usage-per-model-call.md) | `usage/v1`: the tokens of each model call, a subagent's apart, and a task's totals |
 | [0033](decisions/0033-files-from-mcp-results-are-shared-files.md) | `files: true` on an MCP server or a remote subagent: the files of its answers are shared files of the calling run |
+| [0034](decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md) | a turn that asks nothing completes the task, and a scratch project lives for the thread (`SCRATCH_IDLE_DAYS`) |
 
 ## Keeping these docs short and true
 
