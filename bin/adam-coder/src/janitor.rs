@@ -16,7 +16,13 @@
 //!   container), **then** its workspace is removed, every slot of it. A release that fails leaves the
 //!   workspace for the next sweep: an environment that still holds the files is not left without
 //!   them. The run's notes stay (`<root>/coder/<run>.json`) and so do its `agent/*` branches in the
-//!   mirrors, the only copy of any unpushed commit;
+//!   mirrors, the only copy of any unpushed commit. **Its scratch projects stay**, though, while
+//!   its conversation is alive (`SCRATCH_IDLE_DAYS`, [`Janitor::with_scratch_idle`]): a scratch
+//!   project lives for the thread, the next task of the conversation takes it over
+//!   ([`RunWorkspace::adopt_scratch`](adam_workspace::RunWorkspace::adopt_scratch)), and it is
+//!   removed once the conversation has had no task for the idle time (an open task, or one that
+//!   finished recently, keeps it). A run the store does not know has no conversation to ask about,
+//!   and a project made without one belongs to its run: both go with it;
 //! * a directory whose name is not a run id is not the janitor's and is left alone.
 //!
 //! After that the sweep asks the environment what it still holds
@@ -28,10 +34,10 @@
 //! `adam-service`), so it runs in the `all` and `worker` roles and stops with the workers.
 
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use adam_core::{RunId, Store, StoreError};
+use adam_core::{ConversationScope, RunId, RunQuery, RunRecord, Store, StoreError};
 use adam_error::BoxError;
 use adam_workspace::{DynEnvironment, Local, Workspaces};
 use tokio_util::sync::CancellationToken;
@@ -45,6 +51,9 @@ pub struct Sweep {
     pub kept: usize,
     /// The runs the sweep could not decide, release or remove (the error is in the log).
     pub failed: Vec<String>,
+    /// The finished runs whose worktrees were removed and whose scratch projects stay, because their
+    /// conversation is still alive. (Not in `kept`, which counts runs the sweep left whole.)
+    pub kept_scratch: Vec<String>,
     /// The runs whose environment was released although the run has no workspace on this volume
     /// (what a crash left behind).
     pub orphans: Vec<String>,
@@ -56,6 +65,11 @@ pub struct Janitor {
     workspaces: Workspaces,
     every: Option<Duration>,
     environment: DynEnvironment,
+    scratch_idle: Option<Duration>,
+    /// Runs whose environment was released and whose scratch projects stayed, so that the sweeps
+    /// after the first do not ask the environment again. Lost with the process, which only costs
+    /// one more (idempotent) release.
+    released: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for Janitor {
@@ -63,6 +77,7 @@ impl std::fmt::Debug for Janitor {
         f.debug_struct("Janitor")
             .field("workspaces", &self.workspaces)
             .field("every", &self.every)
+            .field("scratch_idle", &self.scratch_idle)
             .finish_non_exhaustive()
     }
 }
@@ -75,7 +90,18 @@ impl Janitor {
             workspaces,
             every,
             environment: Arc::new(Local),
+            scratch_idle: None,
+            released: Arc::default(),
         }
+    }
+
+    /// Keep the scratch projects of a finished run while its conversation has had a task within
+    /// `idle` (`SCRATCH_IDLE_DAYS`), and remove them when it has not. `None`, the default, removes a
+    /// scratch project with its run.
+    #[must_use]
+    pub fn with_scratch_idle(mut self, idle: Option<Duration>) -> Self {
+        self.scratch_idle = idle;
+        self
     }
 
     /// Release what `environment` holds for a run before its workspace is removed, and sweep what
@@ -104,31 +130,43 @@ impl Janitor {
             if stop.is_cancelled() {
                 break;
             }
-            match is_over(store, &run).await {
+            match standing(store, &run).await {
                 // A directory that is not a run id is not ours.
-                Ok(None) => report.kept += 1,
-                Ok(Some(false)) => report.kept += 1,
+                Ok(Standing::NotARun | Standing::Open) => report.kept += 1,
                 Err(e) => {
                     tracing::warn!(%run, error = %adam_error::report(&e), "cannot ask the store about a run; its workspace stays");
                     report.failed.push(run);
                 }
-                Ok(Some(true)) => {
+                Ok(Standing::Over(record)) => {
                     // What the environment holds goes first, and a workspace it could not let go of
                     // stays for the next sweep.
-                    if let Err(e) = self.environment.release(&run).await {
+                    if !self.was_released(&run)
+                        && let Err(e) = self.environment.release(&run).await
+                    {
                         tracing::warn!(%run, error = %adam_error::report(&e), "cannot release the environment of a finished run; its workspace stays");
                         report.failed.push(run);
                         continue;
                     }
                     released.insert(run.clone());
+                    let keep_scratch = match &record {
+                        Some(record) => self.conversation_is_alive(store, record).await,
+                        None => false,
+                    };
                     let removed = match self.workspaces.run(&run) {
-                        Ok(workspace) => workspace.remove().await,
+                        Ok(workspace) if keep_scratch => workspace.remove_keeping_scratch().await,
+                        Ok(workspace) => workspace.remove().await.map(|()| 0),
                         Err(e) => Err(e),
                     };
                     match removed {
-                        Ok(()) => {
+                        Ok(0) => {
                             tracing::info!(%run, "removed the workspace of a finished run");
+                            self.forget_released(&run);
                             report.removed.push(run);
+                        }
+                        Ok(scratch) => {
+                            tracing::debug!(%run, scratch, "kept the scratch projects of a finished run");
+                            self.remember_released(&run);
+                            report.kept_scratch.push(run);
                         }
                         Err(e) => {
                             tracing::warn!(%run, error = %adam_error::report(&e), "cannot remove the workspace of a finished run");
@@ -141,6 +179,75 @@ impl Janitor {
         self.release_orphans(store, stop, &released, &mut report)
             .await;
         report
+    }
+
+    /// Whether the conversation of the finished run `record` may go on, so that its scratch projects
+    /// stay: a task of it is open, or the newest one was last touched within the idle time. When the
+    /// store cannot say, the projects stay (they are removed at a later sweep, never by a guess).
+    async fn conversation_is_alive(&self, store: &dyn Store, record: &RunRecord) -> bool {
+        let Some(idle) = self.scratch_idle else {
+            return false;
+        };
+        let Some(conversation) = record.conversation_id.as_deref() else {
+            return false;
+        };
+        let newest = async {
+            if store
+                .open_run_for_conversation(&record.agent, conversation)
+                .await?
+                .is_some()
+            {
+                return Ok::<_, StoreError>(None);
+            }
+            let query = RunQuery::new(
+                record.agent.clone(),
+                ConversationScope::Exact(conversation.to_owned()),
+                1,
+            );
+            let latest = store.list_runs(&query).await?;
+            Ok(Some(
+                latest
+                    .first()
+                    .map_or(record.updated_at, |run| {
+                        run.updated_at.max(record.updated_at)
+                    })
+                    .timestamp_millis(),
+            ))
+        }
+        .await;
+        match newest {
+            // An open task: the conversation goes on.
+            Ok(None) => true,
+            Ok(Some(last_ms)) => {
+                let age = now_ms().saturating_sub(last_ms);
+                u128::try_from(age).is_ok_and(|age| age < idle.as_millis())
+            }
+            Err(e) => {
+                tracing::warn!(run = %record.id, error = %adam_error::report(&e), "cannot ask the store about the conversation of a finished run; its scratch projects stay");
+                true
+            }
+        }
+    }
+
+    fn was_released(&self, run: &str) -> bool {
+        self.released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(run)
+    }
+
+    fn remember_released(&self, run: &str) {
+        self.released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(run.to_owned());
+    }
+
+    fn forget_released(&self, run: &str) {
+        self.released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(run);
     }
 
     /// Release what the environment holds for runs that are over and that the loop above did not
@@ -221,14 +328,41 @@ impl Janitor {
     }
 }
 
+/// What the store says of a directory of the workspace volume.
+enum Standing {
+    /// The name is not a run id.
+    NotARun,
+    /// The run is `runnable` or `parked`.
+    Open,
+    /// The run is finished, or the store does not know it (`None`).
+    Over(Option<RunRecord>),
+}
+
+/// What the store says of `run`.
+async fn standing(store: &dyn Store, run: &str) -> Result<Standing, StoreError> {
+    let Some(id) = run.parse().ok().map(RunId) else {
+        return Ok(Standing::NotARun);
+    };
+    Ok(match store.load_run(id).await? {
+        Some(record) if record.status.is_terminal() => Standing::Over(Some(record)),
+        Some(_) => Standing::Open,
+        None => Standing::Over(None),
+    })
+}
+
 /// Whether `run` is over: `Some(true)` when it is finished or the store does not know it,
 /// `Some(false)` when it is open (`runnable` or `parked`), `None` when `run` is not a run id.
 async fn is_over(store: &dyn Store, run: &str) -> Result<Option<bool>, StoreError> {
-    let Some(id) = run.parse().ok().map(RunId) else {
-        return Ok(None);
-    };
-    Ok(Some(match store.load_run(id).await? {
-        Some(record) => record.status.is_terminal(),
-        None => true,
-    }))
+    Ok(match standing(store, run).await? {
+        Standing::NotARun => None,
+        Standing::Open => Some(false),
+        Standing::Over(_) => Some(true),
+    })
+}
+
+/// Now, in milliseconds since the Unix epoch.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }

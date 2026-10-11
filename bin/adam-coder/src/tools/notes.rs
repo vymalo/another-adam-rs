@@ -343,6 +343,10 @@ pub struct RunNotes {
     /// end without a pull request (see `CoderAgent`); sharing one file again notes it once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared: Vec<String>,
+    /// The run took over the scratch projects that the earlier tasks of its conversation left
+    /// (`RunWorkspace::adopt_scratch`). Done once, in the run's first step, before the model acts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scratch_adopted: bool,
 }
 
 /// Most shared files [`RunNotes::shared`] lists.

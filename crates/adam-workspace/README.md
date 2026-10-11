@@ -20,7 +20,7 @@ authentication behave like the real tool.
 | Item | What |
 |---|---|
 | `Workspaces` | `new(root, creds)`, `allow_hosts(..)`, `allow_local(bool)`, **`check_repository(&RepoRef)`** (whether the policy accepts a repository: nothing is spawned, requested or written), **`run(run)`** (a run's workspace, below), **`runs()`** (the runs that have one on disk), **`remote_is_empty(url)`**, **`initialize_empty(&RepoRef, &GitIdentity)`**, **`wait_reachable(url, Duration)`**, `default_branch(url)`, `remove(run)` (everything of the run's workspace, the legacy worktree included), and the single-repository helpers `prepare(&RepoRef, run)`, `prepare_continuing(&RepoRef, run, existing)`, `open_existing(run)`. One shared bare mirror per repository; each run gets a worktree on `agent/<run>`. `default_branch` is what the remote's `HEAD` names (`git ls-remote --symref <url> HEAD`); a remote whose `HEAD` names none is `NoDefaultBranch` (class `NotFound`: a caller that solves it by naming a branch matches this variant and no other). A base branch the remote does not have is `NotFound` and the error lists the remote's branches (the first 30) |
-| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, `remove()`; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)`, `files()`, `status()`, `published_to()` and `set_published_to(url)` |
+| `RunWorkspace`, `Slot`, `SlotKind`, `Scratch` | a run's workspace: `slots()`, `slots_in_join_order()`, `slot(dir)`, `slot_for(&RepoRef)`, `add_repository(&RepoRef)`, `add_repository_continuing(&RepoRef, branch)`, `add_scratch(dir, &GitIdentity)`, **`add_scratch_for(dir, &GitIdentity, Option<&str>)`** (for a conversation), **`adopt_scratch(conversation)`**, `remove()`, **`remove_keeping_scratch()`**; a `Slot` has `dir()`, `path()`, `seq()`, `kind()` (`SlotKind::Repository(Worktree)` or `SlotKind::Scratch(Scratch)`), `worktree()`, `scratch()`; a `Scratch` has `path()`, `dir()`, `commit_all(message, &GitIdentity)`, `files()`, `status()`, `published_to()`, `set_published_to(url)` and **`conversation()`** |
 | `copy_into(&Scratch, &Worktree, path, overwrite)`, `CopyReport`, `Collision` | the files of a scratch project into a worktree, all or nothing: `copied`, `unchanged`, `collisions` |
 | `Environment` (trait), `DynEnvironment`, `Local` | where a run's processes run: `ensure(&RunWorkspace, &dyn EnvProgress)` gives the run's `EnvSession` (made on first need, then the same), `release(run)` (idempotent), `held_runs()`, `rebuild(run, use_default)` (throw the run's environment away and make it again on the next `ensure`; `false` where there is nothing of its own to make again). `Local` is the caller's own container and holds nothing |
 | `HidingEnvironment` | `HidingEnvironment::new(inner, names)`: an `Environment` that adds `names` to the `hide` list of **every** `ExecSpec` its sessions prepare, so a process that holds secrets keeps them from the code it runs for others (the coder passes the variables its `mcp.json` files read as `${VAR}`) without every caller having to remember them; everything else (`describe`, `kill`, `tool_path`, `secret_ref`, `release`, `held_runs`, `rebuild`) is the inner environment's. `hidden()` lists the names |
@@ -136,7 +136,7 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
 <root>/workspaces/<run>.lock            the run's lock, beside its directory
 <root>/meta/<run>/<dir>.json            the slot's metadata, version 2: dir, seq, kind ("repo" | "scratch"),
                                         for a repository url, base_branch, branch, remote_branch, for a scratch
-                                        project published_to (no secrets)
+                                        project published_to and conversation (no secrets)
 <root>/worktrees/<run>                  legacy (one worktree per run): read as a slot, removed by remove(),
 <root>/meta/<run>.json                  made only by prepare / prepare_continuing
 ```
@@ -154,6 +154,13 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
   under the run's lock, the repository the project's files were last copied into (a later call replaces it; it survives a
   restart and `add_scratch` of the same name), and **`published_to()`** says it as the slot was listed: what a caller tells
   a model that goes on editing the project, whose changes no longer reach that repository.
+* **A scratch project can live for a conversation.** `add_scratch_for(dir, identity, Some(conversation))` is `add_scratch`
+  that also records the conversation of the run (the caller's key, in the slot's metadata; a project that is already there
+  without one is given it). **`adopt_scratch(conversation)`** *moves* every scratch project that **other** runs'
+  workspaces hold for that conversation into this run's: the directory is renamed, the metadata is rewritten for this run
+  (`published_to` and the history come along), under the locks of both runs, taken in the order of their paths. A project
+  whose name the run already has stays where it is; a second call finds nothing; a run whose metadata cannot be read is
+  skipped. This is how a conversation's later tasks find the files the earlier ones made.
 * **Order.** Every slot records `seq`, the place it joined the run, from 1; the legacy worktree is 0.
   `slots()` lists the legacy worktree first and then by directory; `slots_in_join_order()` by `seq`, whose first
   element is "the first repository". A slot whose directory is gone is not listed.
@@ -170,7 +177,9 @@ A run's files are `Workspaces::run(run)`: a directory of **slots** ([ADR 0008](.
   (backoff from 250 ms to 2 s; not found, a network failure and a rate limit are tried again, anything else fails at once).
 * **`remove()`** deletes every slot (a worktree with its uncommitted changes, a scratch project), the legacy worktree, the
   metadata and the directory, idempotently, under the run's lock and each mirror's; the `agent/*` branches stay. A workspace
-  with unreadable metadata is removed anyway. **`Workspaces::runs()`** lists the runs that have anything on disk, in either
+  with unreadable metadata is removed anyway. **`remove_keeping_scratch()`** is the same except for the scratch projects that
+  have a conversation (they, their metadata and the directory stay for a later `adopt_scratch`); it returns how many stay,
+  and with none it is `remove`. **`Workspaces::runs()`** lists the runs that have anything on disk, in either
   layout, a partly removed one too, so a sweep of finished runs can finish the job.
 
 ```mermaid
@@ -426,7 +435,9 @@ A run's workspace has a lock of its own, `<root>/workspaces/<run>.lock`, taken t
 exclusive `flock` on the file beside the directory), by the operations that change its set of slots: `add_repository`,
 `add_scratch` (which choose a directory and a `seq` that no other slot of the run has) and `remove` (which deletes the lock
 file with the workspace). **The run's lock is taken before a mirror's, never the other way round, and never while holding
-another run's**, so the locks cannot wait on each other in a circle.
+another run's**, so the locks cannot wait on each other in a circle. The one exception is `adopt_scratch`, which moves a
+project from one run to another and holds both runs' locks, **in the order of their paths** and no mirror's: two such calls
+cannot wait on each other either.
 
 ## Errors
 
@@ -491,7 +502,9 @@ Offline. The `git` CLI must be on `PATH`.
   scratch (a repository on `main` with one root commit by the given identity, no sample hooks, `files` without ignored or
   deleted files, `commit_all` once and then nothing, idempotent, bad names, a name that is a repository's, a lost root
   commit made again; `status`, and `published_to` kept in the metadata across a new handle on the root and across
-  `add_scratch`, replaced by a later publication, and refused for a workspace that was removed); `remote_is_empty` and `initialize_empty` (the empty tree, `Initial commit`, a `Conflict` the second
+  `add_scratch`, replaced by a later publication, and refused for a workspace that was removed; a project of a conversation
+  taken over by a later run with its files, history and `published_to`, left alone when the name is taken, taken again
+  by the run after that; `remove_keeping_scratch` keeps only the projects that have a conversation); `remote_is_empty` and `initialize_empty` (the empty tree, `Initial commit`, a `Conflict` the second
   time and for a remote with refs, also under another base, nothing forced, a worktree of it from the new base);
   `wait_reachable` (found at once, `NotFound` after the time, found when the repository appears meanwhile, a refused URL at
   once); `copy_into` (files, the executable bit, a link kept, ignored files left, no temporary file, again all unchanged;

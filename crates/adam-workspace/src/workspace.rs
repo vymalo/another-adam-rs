@@ -80,7 +80,9 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// The same pair of locks, on `<root>/workspaces/<run>.lock`, makes **one run's workspace** change
 /// by one at a time: adding a slot (which picks its directory and its place in the order slots
 /// joined), and removing the workspace. The run's lock is taken before the mirror's, never the
-/// other way round, and never while holding another run's.
+/// other way round, and never while holding another run's, except by
+/// [`RunWorkspace::adopt_scratch`], which holds two runs' locks in the order of their paths (and
+/// no mirror's) while a scratch project moves from one to the other.
 ///
 /// A root used by one process pays for one uncontended `flock` per operation.
 /// The volume must honour file locks. *Unverified* for NFS and for Longhorn RWX:
@@ -94,7 +96,8 @@ const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// the scratch projects and the metadata, but deliberately keeps the
 /// local `agent/*` branches: they are the only copy of any unpushed commits. A branch
 /// stays owned by its run (`branch.<b>.adam-run` in the mirror's
-/// config), so preparing the same run again re-attaches it.
+/// config), so preparing the same run again re-attaches it. [`RunWorkspace::remove_keeping_scratch`]
+/// leaves the scratch projects of a conversation behind, for a later run of it to take over.
 ///
 /// Background `gc` is disabled for every command; nothing here needs it, and a
 /// concurrent repack must not race with worktree operations.
@@ -218,6 +221,12 @@ pub(crate) struct ScratchMeta {
     /// caller wrote it, never a credential). Absent for a project that was never published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) published_to: Option<String>,
+    /// The conversation of the run that made the project, as the caller named it: what lets a later
+    /// run of the same conversation take the project over ([`RunWorkspace::adopt_scratch`]). Absent
+    /// for a project made without one (and in metadata written before it existed): such a project
+    /// stays with its run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) conversation: Option<String>,
 }
 
 /// What one metadata file of a slot says.

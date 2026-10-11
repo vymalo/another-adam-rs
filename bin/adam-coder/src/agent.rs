@@ -365,7 +365,8 @@ impl CoderAgent {
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
         let new_repos = notes.name_repos(named);
         let new_consents = notes.record_consents(consents);
-        if notes.name_pushed_branches(pushed) || new_repos || new_consents {
+        let adopted = self.adopt_scratch(ctx, run, &mut notes).await;
+        if notes.name_pushed_branches(pushed) || new_repos || new_consents || adopted {
             self.env
                 .notes
                 .save(run, &notes)
@@ -373,6 +374,37 @@ impl CoderAgent {
                 .map_err(|e| AgentError::transient("cannot write the run notes").with_source(e))?;
         }
         Ok(())
+    }
+
+    /// Take over the scratch projects the earlier tasks of this conversation left, once, before the
+    /// run's first step does anything else: a scratch project lives for the thread, and a run is one
+    /// task of it (`RunWorkspace::adopt_scratch`). Returns whether the notes changed. A workspace
+    /// that cannot be read is no reason to stop the run: the model starts a project of its own and
+    /// the next step tries again.
+    async fn adopt_scratch(&self, ctx: &Ctx, run: &str, notes: &mut RunNotes) -> bool {
+        let Some(conversation) = ctx.conversation_id() else {
+            return false;
+        };
+        if notes.scratch_adopted {
+            return false;
+        }
+        let taken = match self.env.workspaces.run(run) {
+            Ok(workspace) => workspace.adopt_scratch(conversation).await,
+            Err(e) => Err(e),
+        };
+        match taken {
+            Ok(names) => {
+                if !names.is_empty() {
+                    tracing::info!(%run, projects = ?names, "took over the scratch projects of the conversation");
+                }
+                notes.scratch_adopted = true;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(%run, error = %report(&e), "cannot take over the scratch projects of the conversation");
+                false
+            }
+        }
     }
 
     /// Why the run must fail instead of completing, if it must.

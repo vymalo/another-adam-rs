@@ -1006,7 +1006,11 @@ async fn a_scratch_project_is_published_to_the_repository_the_person_names(store
             })
             .unwrap_or_else(|| panic!("no result for {id}"))
     };
-    assert!(result_of("s1").contains("temporary"), "{}", result_of("s1"));
+    assert!(
+        result_of("s1").contains("stays for this conversation"),
+        "{}",
+        result_of("s1")
+    );
     for (id, file) in [("s2", "fib.sh"), ("s3", "check.sh")] {
         assert!(
             result_of(id).starts_with(&format!("Created {file} (")),
@@ -1280,6 +1284,83 @@ async fn an_answer_that_asks_nothing_completes_the_task(store: DynStore) {
         "{:?}",
         second.labels
     );
+}
+
+/// A scratch project lives for the thread: the site made in one task is found, with its files, by the
+/// next task of the conversation (it used to be deleted with the first, and made again). The second
+/// task's workspace holds it, the first's no longer does, and a conversation of another context
+/// finds nothing.
+async fn a_scratch_project_is_found_again_by_the_next_task_of_the_conversation(store: DynStore) {
+    let fx = Fixture::new("never used\n").await;
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call("t1", "start_scratch", json!({"name": "site"}))])
+        .push_tool_calls(vec![call(
+            "t2",
+            "write_file",
+            json!({"path": "index.html", "content": "<p>hi</p>\n"}),
+        )])
+        .push_text("The site is built in the scratch project.")
+        .push_tool_calls(vec![call("t3", "start_scratch", json!({"name": "site"}))])
+        .push_tool_calls(vec![call("t4", "read_file", json!({"path": "index.html"}))])
+        .push_text("It is still there.")
+        .push_tool_calls(vec![call("t5", "start_scratch", json!({"name": "site"}))])
+        .push_text("Nothing here.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let mut first_message = user("Build me a one-page site.");
+    first_message.context_id = Some("ctx-site".into());
+    let first = run_message(&server, first_message).await;
+    assert_eq!(
+        first.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        first.labels
+    );
+    let second = run_message(
+        &server,
+        follow_up("Is the page still there?", "ctx-site", &first.task_id),
+    )
+    .await;
+    assert_eq!(
+        second.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        second.labels
+    );
+    let mut elsewhere = user("Build me a one-page site.");
+    elsewhere.context_id = Some("ctx-other".into());
+    let third = run_message(&server, elsewhere).await;
+    worker.stop().await;
+
+    let results: Vec<_> = mock
+        .requests()
+        .iter()
+        .flat_map(|request| tool_results(&request.messages))
+        .collect();
+    let by_id = |id: &str| results.iter().find(|(c, _, _)| c == id).unwrap().clone();
+    let (_, found, is_error) = by_id("t3");
+    assert!(
+        !is_error && found.contains("already holds 1 file(s)") && found.contains("index.html"),
+        "the next task finds the project and what it holds: {found}"
+    );
+    assert_eq!(by_id("t4").1, "<p>hi</p>\n");
+    let (_, other, _) = by_id("t5");
+    assert!(
+        !other.contains("already holds"),
+        "another conversation has its own project: {other}"
+    );
+    let workspaces = fx.root.join("workspaces");
+    let home = |task: &str| workspaces.join(task).join("site/index.html");
+    assert!(
+        !home(&first.task_id).exists(),
+        "the first task's workspace let it go"
+    );
+    assert!(
+        home(&second.task_id).is_file(),
+        "the second task's workspace has it"
+    );
+    assert!(!home(&third.task_id).exists());
 }
 
 /// What the person is owed is not a statement: a worktree with changes nobody committed or pushed
@@ -4904,6 +4985,7 @@ macro_rules! coder_suite {
                 a_question_is_answered_from_a_look_around_and_costs_no_check_cycles,
                 an_answer_that_asks_nothing_completes_the_task,
                 work_left_in_a_worktree_is_not_finished_by_a_statement,
+                a_scratch_project_is_found_again_by_the_next_task_of_the_conversation,
                 a_stop_without_text_asks_what_to_do,
                 an_empty_stop_after_work_does_not_ask_for_the_repository,
                 red_checks_with_cycles_left_then_text_is_a_question,

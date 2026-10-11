@@ -47,7 +47,7 @@ sequenceDiagram
 | Tool | Does |
 |---|---|
 | `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository that is granted**: one the person named in their own messages of the run, or agreed to add when `request_repository` asked (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `request_repository` (or to `ask_user`, when it has no repository to ask about). Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. **A repository with no ref at all (just created) is a normal start, not an error**: the call completes and says the repository is empty and that no worktree was made, with the way on (`start_scratch`, then `publish_scratch`, which gives the repository its first commit); it is told the same with or without a `base_branch`, and nothing is written to the repository. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
-| `start_scratch { name? }` | `RunWorkspace::add_scratch` for the run (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. The result says the project is **temporary** (it exists only while the task is open, nothing is kept unless it is published) and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
+| `start_scratch { name? }` | `RunWorkspace::add_scratch_for` for the run and its conversation (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. A project the conversation's earlier tasks made is returned with the files it holds listed. The result says the project **stays for the conversation** (the next tasks find it; it goes after days with no task in it) and that nothing reaches a repository unless it is published, and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
 | `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **that is granted** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
 | `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that sends the model to `run` (to make something with a command) or to the file tools and `delegate_to_opencode` (to change code). Writes to ignored paths (build output) are not changes. **For looking**: see `run` for making and `run_checks` for checking |
 | `run { command, cwd?, repo? }` | **making something with a command, and keeping it**: `npm run render`, `python chart.py`, an install, a build. Runs exactly as `run_command` does (the run's environment, the same shell, `cwd` rule, `CHECK_TIMEOUT_SECS` and output cap, secrets hidden from the child, a missing tool reported as a missing toolchain), but the **files it changes stay**, and the result lists what `git status` shows (files the project ignores are kept too and are not listed). It is **never a check**: no `checks` artifact, no cycle, nothing written to the run's notes, so the gate cannot see it; the files it changed make an earlier green check stale, which the result says. It cannot touch git: the same record as `run_command`'s is compared after the command, minus the files, and a command that changed `HEAD`, the branch, a ref, the `.git` file, the configuration or `info/exclude` is **undone entirely, its files included**, and refused ([below](#making-something-with-a-command)). A timeout kills the process group and what it had written stays. Progress lines: `running: <command>`, then `changed files: <command>` or `ran: <command>` |
@@ -376,8 +376,9 @@ make them hold:
   something else or stop it. The exits are a pull request, an answer that asks nothing, a failure (the rules
   above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
   and CancelTask (a chat's Stop).
-* **A scratch project is temporary, and what is published is what was checked.** It lives as long as the run (the
-  janitor deletes it with the rest of the workspace; the instructions and the tool's result tell the model to say so),
+* **A scratch project lives for the thread, and what is published is what was checked.** It stays for the conversation:
+  the next task takes it over, and the janitor removes it once the conversation has had no task for `SCRATCH_IDLE_DAYS`
+  (7 by default; the instructions and the tool's result tell the model to say so; [Scratch projects](#scratch-projects)),
   `commit_and_push` there is a local commit and `open_pull_request` is refused, so nothing leaves the process until
   `publish_scratch` copies the files into a repository the person named. The gate does not change: the checks that ran
   on the project are bound to the pushed commit only when its tree is the same ([below](#scratch-projects)).
@@ -601,7 +602,9 @@ slot, and may be joined by others.
   (`Workspaces::runs`), a run the store reports `done` or `failed` (a cancel is `failed`), or does not know, has what its
   environment holds released (`Environment::release`; nothing for `Local`; a release that fails leaves the workspace for
   the next sweep) and **then** loses its
-  workspace (`RunWorkspace::remove`: every slot, the legacy worktree, the metadata); the sweep then asks the environment what
+  workspace (`RunWorkspace::remove`: every slot, the legacy worktree, the metadata, **except the scratch projects of a
+  conversation that is still alive**, which stay with `RunWorkspace::remove_keeping_scratch`; `Sweep::kept_scratch`
+  lists those runs, [Scratch projects](#scratch-projects)); the sweep then asks the environment what
   it still holds (`held_runs`) and releases what belongs to runs that are over or unknown even though they have no workspace
   here (`Sweep::orphans`); a **`runnable` or `parked` run is
   never swept**, so a run waiting a week for an answer keeps its files; a directory that is not a run id is left alone.
@@ -629,7 +632,7 @@ sequenceDiagram
   loop every WORKSPACE_SWEEP_SECS
     J->>S: load_run for each run with a workspace
     S-->>J: open, finished or unknown
-    J->>W: remove, for a finished or unknown run
+    J->>W: remove (a finished run keeps the scratch projects of a live conversation), for a finished or unknown run
   end
 ```
 
@@ -687,6 +690,21 @@ project into it:
    the code that will be pushed, so `commit_and_push` binds it to the pushed commit and the pull request is allowed;
    any other tree is *not checked* until `run_checks` runs in the new slot, and the result says so.
 
+**A scratch project lives for the thread** (the owner's decision of 2026-10-11, [ADR 0034](../../docs/decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md)):
+the tasks of one A2A context are one thread, and A2A has no "delete the thread". `start_scratch` records the
+conversation of the run in the project's metadata (`add_scratch_for`), and:
+
+* **The next task takes it over.** In its first step the agent moves the scratch projects that other runs' workspaces hold
+  for the same conversation into its own workspace (`RunWorkspace::adopt_scratch`: the directory is renamed, the
+  metadata rewritten, under both runs' locks, once per run: `RunNotes::scratch_adopted`). The model asks `start_scratch`
+  for its name and gets the project back, with the files it holds listed. A name the run already has is left where it is.
+* **The janitor keeps it.** A finished run's worktrees and environment are released as before, but its projects stay
+  while the conversation is alive: a task of it is open, or the newest one was touched within `SCRATCH_IDLE_DAYS`
+  (default **7**, measured from the store, so the thread's activity decides, not the run's). After that the next sweep removes
+  the rest. `SCRATCH_IDLE_DAYS=0` is the old rule: the project goes with its run. A project made without a conversation
+  (before this) and a run the store does not know go with their run.
+* **The disk holds them.** A retained project is files on the worker's volume (`WORKSPACE_ROOT`) for up to the idle time.
+
 The project is left as it is and remembers where it went (`published_to`); the tools that change it afterwards
 (`write_file`, `apply_patch`, `commit_and_push`, `start_scratch` again) say that the change does not reach the repository,
 and a second `publish_scratch` copies it again (a file that differs needs `overwrite`). The scratch history is **not**
@@ -726,8 +744,10 @@ stateDiagram-v2
   Scratch --> Published: publish_scratch (named; empty, or path / overwrite)
   Published --> Pushed: run_checks if the tree changed, commit_and_push, open_pull_request in the new slot
   Scratch --> Delivered: share_file, then the model stops (no repository named, created or published)
-  Delivered --> Deleted: the run is done, with no pull request (the janitor)
-  Scratch --> Deleted: the run ends, nothing published (the janitor)
+  Delivered --> Kept: the run is done, with no pull request (the janitor keeps the project)
+  Scratch --> Kept: the run ends, nothing published (the janitor keeps the project)
+  Kept --> Scratch: the next task of the conversation takes it over
+  Kept --> Deleted: the conversation was idle for SCRATCH_IDLE_DAYS
   Published --> Released: the run ends (the janitor), the pushed branch stays
   Deleted --> [*]
   Pushed --> Released
@@ -747,12 +767,13 @@ an answer that nobody needed to give. When the model stops with no pull request,
   `src/main.rs` that only reads like one), created, pushed or continued.
 
 A run that must fail (rejected credentials, a spent budget with the last check red) fails first, whatever it shared. Anything
-else is as before: the stop is a question and the run waits, so a scratch run that answered and shared nothing still waits,
-and a model that needs an answer before it can deliver asks with `ask_user`. The prompt tells the model to share the result,
-to say what it is and to offer publishing in one sentence. **The scratch project is deleted with the completed run**
-([ADR 0008](../../docs/decisions/0008-a-workspace-holds-several-repositories.md)), so a person who takes the offer starts a
-follow-up task that continues the conversation, and the coder makes the project again in a new scratch project before
-`publish_scratch` (the prompt says so).
+else is judged by its words: a reply that asks waits, one that asks nothing completes (the completion policy above), and a
+model that needs an answer before it can deliver asks with `ask_user`. The prompt tells the model to share the result,
+to say what it is and to offer publishing in one sentence. **The scratch project stays for the conversation** (it used to be
+deleted with the completed run; decision 5 of [ADR 0008](../../docs/decisions/0008-a-workspace-holds-several-repositories.md)
+is amended by [ADR 0034](../../docs/decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md)),
+so a person who takes the offer starts a follow-up task that continues the conversation, finds the project with
+`start_scratch` and `publish_scratch`es it.
 
 ### Another repository, only with the person's yes
 
@@ -1571,6 +1592,7 @@ way; every problem is reported at once at startup):
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs ([below](#the-workspace-of-a-run)); `0` turns it off | `300` |
+| `SCRATCH_IDLE_DAYS` | how many days a scratch project outlives the last task of its conversation before the janitor removes it ([Scratch projects](#scratch-projects)); `0`: it goes with its run | `7` |
 | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` (`a2a-only` is refused; see [Workspace placement](#workspace-placement)) | `shared` |
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
@@ -2221,7 +2243,7 @@ database of its own, so the role needs `CREATEDB`):
   several; `a_cancelled_run_publishes_nothing`; `the_history_of_the_project_is_not_carried_into_the_repository`),
   `tests/e2e.rs`' `a_scratch_project_is_published_to_the_repository_the_person_names` (per store: build and check, the run parks
   on the question with nothing pushed, the answer names an empty repository, publish, push, pull request),
-  `tests/janitor.rs`' `a_scratch_project_goes_with_its_run_unless_the_run_is_waiting`, and the compose scenario
+  `tests/janitor.rs`' `a_scratch_project_goes_with_its_run_unless_the_run_is_waiting` (a project without a conversation), `a_scratch_project_outlives_its_run_while_the_conversation_is_alive`, `a_scratch_project_goes_when_its_conversation_has_been_idle` and `without_an_idle_time_a_scratch_project_goes_with_its_run`, `tests/e2e.rs`' `a_scratch_project_is_found_again_by_the_next_task_of_the_conversation`, and the compose scenario
   `SCENARIO=scratch sh dev/coder-e2e.sh` (the `[mock:scratch]` script, which `wiremock_compose` of `adam-model-openai` plays
   against a real WireMock).
 * `tests/tools.rs`: each tool against real worktrees, including the hostile

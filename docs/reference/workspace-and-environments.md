@@ -67,7 +67,10 @@ repository on the run's branch `agent/<run-short-id>`, or a **scratch project**:
 with an empty root commit, where work can start before anyone names a repository. A run has at most one
 slot per repository; slots keep the order they joined.
 
-* The workspace lives as long as the run and is deleted when it ends (the janitor). The run's notes and the
+* The workspace lives as long as the run and is deleted when it ends (the janitor), **except its scratch projects**:
+  a scratch project lives for the conversation. The next task of the same A2A context takes it over (its first step
+  moves the project into its own workspace), and the janitor keeps a finished run's projects until the conversation has
+  had no task for `SCRATCH_IDLE_DAYS` (7 by default, `0` for the old rule). The run's notes and the
   `agent/*` branches in the mirrors stay: they are the only copy of an unpushed commit.
 * `copy_into` is the only way a scratch project's files reach a repository, all or nothing.
   `initialize_empty` gives an empty repository its first commit, the only push outside `agent/*`.
@@ -82,7 +85,8 @@ stateDiagram-v2
     Empty --> RepoBacked: add_repository
     Scratch --> RepoBacked: add_repository, copy_into
     RepoBacked --> RepoBacked: add_repository (another repository, a new slot)
-    Scratch --> Removed: remove, nothing was published
+    Scratch --> Scratch: the run ends, the conversation is alive, the next task takes it over
+    Scratch --> Removed: remove, nothing was published, or the conversation was idle for SCRATCH_IDLE_DAYS
     RepoBacked --> Removed: remove, pushed branches remain
     Removed --> [*]
 ```
@@ -91,7 +95,8 @@ The janitor (`bin/adam-coder/src/janitor.rs`, a worker component) sweeps at star
 `WORKSPACE_SWEEP_SECS` (default 300; `0` is off): it removes the workspace of a run that is `done`,
 `failed` (a cancel included) or unknown to the store, after releasing what the run's environment holds. A
 run that is `runnable` or `parked` keeps its workspace however long the person takes to answer. A store
-that does not answer leaves it alone.
+that does not answer leaves it alone. For a finished run whose conversation is alive (a task open, or the newest one
+within `SCRATCH_IDLE_DAYS`) it removes everything but the scratch projects.
 
 ## Environments: where a run's processes run
 

@@ -126,6 +126,7 @@ pub struct Scratch {
     dir: String,
     path: PathBuf,
     published_to: Option<String>,
+    conversation: Option<String>,
 }
 
 impl fmt::Debug for Scratch {
@@ -147,6 +148,12 @@ impl Scratch {
     /// The slot's directory name.
     pub fn dir(&self) -> &str {
         &self.dir
+    }
+
+    /// The conversation of the run that made the project (see [`RunWorkspace::add_scratch_for`]), as
+    /// it was named then; `None` for a project made without one.
+    pub fn conversation(&self) -> Option<&str> {
+        self.conversation.as_deref()
     }
 
     /// The repository the project's files were last copied into
@@ -317,6 +324,7 @@ impl RunWorkspace {
                         dir: m.dir.clone(),
                         path: path.clone(),
                         published_to: m.published_to.clone(),
+                        conversation: m.conversation.clone(),
                     }),
                     path,
                 }))
@@ -508,23 +516,56 @@ impl RunWorkspace {
 
     /// Add a scratch project called `dir`: a local git repository (branch `main`) with an empty
     /// root commit by `identity`. **Idempotent**: a scratch project that is already there is
-    /// returned. `dir` is `^[a-z0-9][a-z0-9._-]{0,63}$` and does not end with `.git`.
+    /// returned. `dir` is `^[a-z0-9][a-z0-9._-]{0,63}$` and does not end with `.git`. The project
+    /// has no conversation: it stays with this run ([`add_scratch_for`](Self::add_scratch_for)).
     ///
     /// # Errors
     ///
     /// [`WorkspaceError::Invalid`] for a bad `dir` or identity; [`WorkspaceError::Conflict`] when
     /// a repository slot is already called `dir`; git and I/O failures.
-    #[tracing::instrument(skip(self, identity), fields(run = %self.run))]
     pub async fn add_scratch(&self, dir: &str, identity: &GitIdentity) -> WorkspaceResult<Slot> {
+        self.add_scratch_for(dir, identity, None).await
+    }
+
+    /// [`add_scratch`](Self::add_scratch) for a run of `conversation`: the project remembers it, so
+    /// that a later run of the same conversation takes the project over
+    /// ([`adopt_scratch`](Self::adopt_scratch)) instead of finding nothing, and the janitor of the
+    /// coder keeps it while the conversation has tasks. A project that is already there without a
+    /// conversation is given this one.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_scratch`](Self::add_scratch).
+    #[tracing::instrument(skip(self, identity), fields(run = %self.run))]
+    pub async fn add_scratch_for(
+        &self,
+        dir: &str,
+        identity: &GitIdentity,
+        conversation: Option<&str>,
+    ) -> WorkspaceResult<Slot> {
         validate_scratch_dir(dir)?;
         identity.validate()?;
         let inner = self.inner();
         let _run = inner.lock_path(&self.path).await?;
         let metas = inner.read_slot_metas(&self.run).await?;
         let legacy = inner.read_meta(&self.run).await?;
-        let seq = if let Some(known) = metas.iter().find(|m| m.dir() == dir) {
+        let known = metas.iter().find(|m| m.dir() == dir);
+        let (seq, kept_conversation) = if let Some(known) = known {
             match known {
-                SlotMeta::Scratch(m) => m.seq,
+                SlotMeta::Scratch(m) => {
+                    if m.conversation.is_none()
+                        && let Some(conversation) = conversation
+                    {
+                        let mut meta = m.clone();
+                        meta.conversation = Some(conversation.to_owned());
+                        inner
+                            .write_meta_at(&inner.slot_meta_path(&self.run, dir), &meta)
+                            .await?;
+                        (m.seq, Some(conversation.to_owned()))
+                    } else {
+                        (m.seq, m.conversation.clone())
+                    }
+                }
                 SlotMeta::Repo(_) => {
                     return Err(WorkspaceError::Conflict(format!(
                         "a repository of this workspace is already called {dir}"
@@ -549,11 +590,12 @@ impl RunWorkspace {
                 seq,
                 kind: "scratch".to_owned(),
                 published_to: None,
+                conversation: conversation.map(str::to_owned),
             };
             inner
                 .write_meta_at(&inner.slot_meta_path(&self.run, dir), &meta)
                 .await?;
-            seq
+            (seq, meta.conversation)
         };
         let path = inner.slot_path(&self.run, dir);
         let published_to = metas.iter().find_map(|m| match m {
@@ -566,6 +608,7 @@ impl RunWorkspace {
             dir: dir.to_owned(),
             path: path.clone(),
             published_to,
+            conversation: kept_conversation,
         };
         scratch.init(identity).await?;
         Ok(Slot {
@@ -574,6 +617,97 @@ impl RunWorkspace {
             seq,
             kind: SlotKind::Scratch(scratch),
         })
+    }
+
+    /// Take over the scratch projects that other runs' workspaces hold for `conversation`: each is
+    /// **moved** (its directory renamed, its metadata rewritten for this run) into this workspace,
+    /// so a conversation's tasks go on with the files the earlier tasks made. A project whose name
+    /// this workspace already has stays where it is. Returns the names taken, in the order they
+    /// were found.
+    ///
+    /// The two runs' locks are held, in the order of their paths, while a project moves; no other
+    /// operation holds more than one run's lock, so two calls cannot wait for each other. A run
+    /// whose metadata cannot be read is skipped. Idempotent: a second call finds nothing to take.
+    ///
+    /// # Errors
+    ///
+    /// I/O failures (what was moved before stays moved).
+    #[tracing::instrument(skip(self), fields(run = %self.run))]
+    pub async fn adopt_scratch(&self, conversation: &str) -> WorkspaceResult<Vec<String>> {
+        let inner = self.inner();
+        let mut taken = Vec::new();
+        for run in self.ws.runs().await? {
+            if run == self.run {
+                continue;
+            }
+            // A look without the lock: most runs hold nothing of this conversation.
+            let holds = match inner.read_slot_metas(&run).await {
+                Ok(metas) => metas.iter().any(|m| {
+                    matches!(m, SlotMeta::Scratch(s) if s.conversation.as_deref() == Some(conversation))
+                }),
+                Err(_) => false,
+            };
+            if holds {
+                taken.extend(self.take_scratch_from(&run, conversation).await?);
+            }
+        }
+        Ok(taken)
+    }
+
+    /// Move the scratch projects of `conversation` from the workspace of `from` into this one.
+    async fn take_scratch_from(
+        &self,
+        from: &str,
+        conversation: &str,
+    ) -> WorkspaceResult<Vec<String>> {
+        let inner = self.inner();
+        let from_dir = inner.run_dir(from);
+        let (first, second) = if from_dir < self.path {
+            (&from_dir, &self.path)
+        } else {
+            (&self.path, &from_dir)
+        };
+        let _first = inner.lock_path(first).await?;
+        let _second = inner.lock_path(second).await?;
+        let theirs = inner.read_slot_metas(from).await?;
+        let mine = inner.read_slot_metas(&self.run).await?;
+        let legacy = inner.read_meta(&self.run).await?;
+        let mut names = self.taken_names(&mine, legacy.as_ref()).await?;
+        let mut seq = mine.iter().map(SlotMeta::seq).max().unwrap_or(0);
+        let mut moved = Vec::new();
+        for meta in theirs {
+            let SlotMeta::Scratch(m) = meta else {
+                continue;
+            };
+            if m.conversation.as_deref() != Some(conversation) || names.contains(&m.dir) {
+                continue;
+            }
+            let source = inner.slot_path(from, &m.dir);
+            if !exists(&source.join(".git")).await? {
+                continue;
+            }
+            seq += 1;
+            let new_meta = ScratchMeta {
+                run: self.run.clone(),
+                seq,
+                ..m.clone()
+            };
+            let new_meta_path = inner.slot_meta_path(&self.run, &m.dir);
+            inner.write_meta_at(&new_meta_path, &new_meta).await?;
+            let renamed = async {
+                tokio::fs::create_dir_all(&self.path).await?;
+                tokio::fs::rename(&source, inner.slot_path(&self.run, &m.dir)).await
+            }
+            .await;
+            if let Err(e) = renamed {
+                remove_file_if_exists(&new_meta_path).await?;
+                return Err(WorkspaceError::io("cannot move a scratch project", e));
+            }
+            remove_file_if_exists(&inner.slot_meta_path(from, &m.dir)).await?;
+            names.insert(m.dir.clone());
+            moved.push(m.dir);
+        }
+        Ok(moved)
     }
 
     /// Delete the whole workspace: every slot (a worktree with its uncommitted changes, a scratch
@@ -586,8 +720,32 @@ impl RunWorkspace {
     /// I/O or git failures.
     #[tracing::instrument(skip(self), fields(run = %self.run))]
     pub async fn remove(&self) -> WorkspaceResult<()> {
+        self.remove_slots(false).await.map(drop)
+    }
+
+    /// [`remove`](Self::remove) except for the scratch projects that have a conversation
+    /// ([`add_scratch_for`](Self::add_scratch_for)): the worktrees, the legacy worktree, the projects
+    /// without one and their metadata go; those projects (their directories and metadata) and the
+    /// workspace that holds them stay, for a later run of the conversation to take over
+    /// ([`adopt_scratch`](Self::adopt_scratch)). Returns how many projects stay; with none, this is
+    /// `remove`. Metadata that cannot be read is no reason to keep anything: the workspace is
+    /// removed whole, as `remove` does. **Idempotent.**
+    ///
+    /// What the coder's janitor calls for a finished run whose conversation may go on
+    /// ([`adopt_scratch`](Self::adopt_scratch)).
+    ///
+    /// # Errors
+    ///
+    /// I/O or git failures.
+    #[tracing::instrument(skip(self), fields(run = %self.run))]
+    pub async fn remove_keeping_scratch(&self) -> WorkspaceResult<usize> {
+        self.remove_slots(true).await
+    }
+
+    async fn remove_slots(&self, keep_scratch: bool) -> WorkspaceResult<usize> {
         let inner = self.inner();
         let _run = inner.lock_path(&self.path).await?;
+        let mut kept = 0;
         match inner.read_slot_metas(&self.run).await {
             Ok(metas) => {
                 for meta in &metas {
@@ -602,6 +760,11 @@ impl RunWorkspace {
                                 }
                                 Err(_) => remove_dir_if_exists(&path).await?,
                             }
+                        }
+                        // Only a project with a conversation can be taken over by a later run.
+                        SlotMeta::Scratch(m) if keep_scratch && m.conversation.is_some() => {
+                            kept += 1;
+                            continue;
                         }
                         SlotMeta::Scratch(m) => {
                             remove_dir_if_exists(&inner.slot_path(&self.run, &m.dir)).await?;
@@ -618,12 +781,15 @@ impl RunWorkspace {
             Err(e) => return Err(e),
         }
         inner.remove_legacy(&self.run).await?;
+        if kept > 0 {
+            return Ok(kept);
+        }
         remove_dir_if_exists(&inner.slot_meta_dir(&self.run)).await?;
         remove_dir_if_exists(&self.path).await?;
         // The run is over: its lock goes with it.
         let _ = tokio::fs::remove_file(crate::workspace::lock_file_of(&self.path)).await;
         inner.forget_lock(&self.path);
-        Ok(())
+        Ok(0)
     }
 }
 

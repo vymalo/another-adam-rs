@@ -176,9 +176,11 @@ async fn build_agent(
     // either is a startup error, not a panic. The error is unboxed so its class (exit 78 for a
     // mistake in the files) reaches `exit_code`.
     let tools = coder_tools(&env);
-    // The workspaces of finished runs are swept from this worker's volume.
+    // The workspaces of finished runs are swept from this worker's volume; their scratch projects
+    // stay until their conversation has been idle for `SCRATCH_IDLE_DAYS`.
     let janitor = Janitor::new(env.workspaces.clone(), worker.workspace_sweep)
-        .with_environment(env.environment.clone());
+        .with_environment(env.environment.clone())
+        .with_scratch_idle(worker.scratch_idle);
     let agent = CoderAgent::try_from_def(def, model, worker.model.alias.clone(), env, tools)
         .map_err(|e| *e)
         .context("assembling the coder agent")?;

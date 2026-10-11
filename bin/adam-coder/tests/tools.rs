@@ -3830,8 +3830,9 @@ async fn a_scratch_project_is_built_checked_and_committed_locally() {
         started.content
     );
     assert!(
-        started.content.contains("temporary") && started.content.contains("publish_scratch"),
-        "the model is told it is temporary: {}",
+        started.content.contains("stays for this conversation")
+            && started.content.contains("publish_scratch"),
+        "the model is told how long it stays: {}",
         started.content
     );
     let dir = slot_of(&rig, "fib");
