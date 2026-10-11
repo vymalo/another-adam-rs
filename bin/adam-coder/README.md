@@ -189,7 +189,7 @@ a screen (`vymalo_inbound`, set by `Coder::new_with` and `serve`), and gives the
 three questions at once (a database, a login, where it runs) become **one Choices surface** beside the question, with a title
 and a description of why, and the person's answers come back as the tool result, `- db: pg` per question, which the model quotes in its next words.
 The screen's catalog says what the form may hold: from catalog version 5 all of it (types, pictures, the free box), on an older one the subset it
-has, and in words where nothing can be drawn ([`adam-ui`](../../crates/adam-ui/README.md#the-tools), [ADR 0034](../../docs/decisions/0034-questions-carry-a-title-a-description-and-typed-options.md)).
+has, and in words where nothing can be drawn ([`adam-ui`](../../crates/adam-ui/README.md#the-tools), [ADR 0035](../../docs/decisions/0035-questions-carry-a-title-a-description-and-typed-options.md)).
 The two consent forms (`request_repository`, `create_repository`) set a title and put the reason in the form's description; on a screen that
 cannot draw it the description follows the question's first line, so the words are the same. `share_file` tells the model an image's SHA-256,
 which is how an option of a form names it as its picture.

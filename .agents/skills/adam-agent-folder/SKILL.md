@@ -54,7 +54,10 @@ before you rely on a detail here.
    calling run; without it they are described and dropped. A subagent's files never reach the person.
    Formats: `docs/reference/agent-files.md`; the short version is `docs/guides/write-an-agent.md`.
 4. **Built-in tools** the agent has without writing any: `ask_user`, `show`, `ui_catalog`
-   (`crates/adam-ui/README.md`). Everything else comes from the folder, mainly MCP.
+   (`crates/adam-ui/README.md`). Everything else comes from the folder, mainly MCP. Tell the agent in its
+   instructions to offer options with `ask_user` and `choices` (a `title`, a `description` of why it asks,
+   options that each have a `label` and a `description`) and never as a list in its reply: a prose list gets
+   answers like "yes, add that" that cannot be told apart (`docs/decisions/0035-questions-carry-a-title-a-description-and-typed-options.md`).
 5. **MCP servers**: `agent/mcp.json` with `{"mcpServers": {...}}`; tools are named
    `<server>__<tool>`, `tools` in a server entry is the allow-list. Credentials go in `headers`
    as `${VAR}` (unset without default: exit 78 naming the variable). What kinds of server are

@@ -55,7 +55,7 @@ inbound function reads a screen's action as JSON text.
 * **`ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`** is the question every agent has.
   Without `choices` the run parks as `input-required` with the question as text, as before (a `title` or a
   `description` with no `choices` is ignored). Whenever the answer is one of a few options the model is told to pass
-  `choices` and never to list the options in its text ([ADR 0034](../../docs/decisions/0034-questions-carry-a-title-a-description-and-typed-options.md)):
+  `choices` and never to list the options in its text ([ADR 0035](../../docs/decisions/0035-questions-carry-a-title-a-description-and-typed-options.md)):
   one **form** with a `title`, a `description` of why the agent asks, up to 8 questions and an optional `freeInput` box
   (its words come back as the answer's `note`). A question has a `type` (`single`, the default: radio buttons;
   `multiple`: checkboxes, with `min` and `max`; `select`: a searchable list; `images`: a deck of pictures;

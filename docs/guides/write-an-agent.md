@@ -20,7 +20,8 @@ Your name is Chat.
 In one sentence: I talk things through with you.
 
 Answer in short, plain sentences. If you cannot answer without something from the person, ask for
-exactly that with `ask_user`.
+exactly that with `ask_user`. When the answer is one of a few options, pass `choices` (a title, a
+description of why you ask, options with a label and a description) and never list the options in your reply.
 ```
 
 Serve it:
@@ -114,6 +115,6 @@ completion rule). The full contract: [Agent files and `#[tool]`](../reference/ag
 | Formats, validation, skills, subagents, MCP, dev reload | [Agent files](../reference/agent-files.md) |
 | What a binary does with a folder | [`bin/adam-agent`](../../bin/adam-agent/README.md) |
 | Every variable | [Environment](../reference/environment.md) |
-| The screen's tools (`ask_user` with `choices`, `show`) | [`adam-ui`](../../crates/adam-ui/README.md) |
+| The screen's tools (`ask_user` with `choices`: a title, why, typed questions, pictures; `show`) | [`adam-ui`](../../crates/adam-ui/README.md) |
 | Deploying a folder agent | [Deploy the coder](deploy-the-coder.md#a-folder-agent-instead-of-the-coder) |
 | For an AI assistant working on this | the `adam-agent-folder` skill |
