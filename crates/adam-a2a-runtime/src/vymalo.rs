@@ -149,11 +149,24 @@ fn action_texts(data: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The name of the action the Choices form submits its answers with.
+const ANSWER_ACTION: &str = "answer";
+/// What the id of the surface of a form starts with: `ask-` and the id of the `ask_user` call.
+const ANSWER_SURFACE_PREFIX: &str = "ask-";
+
 /// One action as what the model reads.
 fn action_text(action: &Value) -> String {
-    if let Some(answers) = action
-        .pointer("/context/answers")
-        .and_then(|answers| answers_text(answers, action.pointer("/context/note")))
+    // Only the form's own submit is an answer: the action `answer` on a surface `ask_user` drew
+    // (`ask-<call id>`). Any other action whose context has that shape is generic.
+    let submits_a_form = action.get("name").and_then(Value::as_str) == Some(ANSWER_ACTION)
+        && action
+            .get("surfaceId")
+            .and_then(Value::as_str)
+            .is_some_and(|surface| surface.starts_with(ANSWER_SURFACE_PREFIX));
+    if submits_a_form
+        && let Some(answers) = action
+            .pointer("/context/answers")
+            .and_then(|answers| answers_text(answers, action.pointer("/context/note")))
     {
         return answers;
     }
@@ -555,7 +568,7 @@ mod tests {
     #[test]
     fn an_answer_with_a_value_that_is_not_a_plain_token_is_quoted() {
         let m = action_message(json!({
-            "name": "answer", "surfaceId": "s", "sourceComponentId": "c", "timestamp": "t",
+            "name": "answer", "surfaceId": "ask-s", "sourceComponentId": "c", "timestamp": "t",
             "context": {"answers": [{"id": "a\nb", "values": ["x y", "ok-1"]}]}
         }));
         assert_eq!(
@@ -593,7 +606,7 @@ mod tests {
     fn an_empty_or_missing_note_adds_no_line_and_a_note_that_is_not_text_is_the_generic_reading() {
         let with = |note: Value| {
             action_message(json!({
-                "name": "answer", "surfaceId": "s", "sourceComponentId": "c", "timestamp": "t",
+                "name": "answer", "surfaceId": "ask-s", "sourceComponentId": "c", "timestamp": "t",
                 "context": {"answers": [{"id": "a", "values": ["x"]}], "note": note}
             }))
         };
@@ -613,7 +626,7 @@ mod tests {
         );
         // A typed answer that is not text is not an answer of the Choices shape either.
         let m = action_message(json!({
-            "name": "answer", "surfaceId": "s", "sourceComponentId": "c", "timestamp": "t",
+            "name": "answer", "surfaceId": "ask-s", "sourceComponentId": "c", "timestamp": "t",
             "context": {"answers": [{"id": "a", "values": [], "text": 3}]}
         }));
         let text = vymalo_inbound(&m).unwrap().payload["text"]
@@ -648,6 +661,41 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn only_the_answer_action_of_an_ask_surface_is_a_forms_answer() {
+        let answers = json!({"answers": [{"id": "a", "values": ["x"]}]});
+        // The right shape, the wrong action or the wrong surface: the generic reading, which says
+        // what the model drew and is not the person's answer.
+        for (name, surface) in [
+            ("go", "ask-1"),
+            ("answer", "chat-1"),
+            ("answer", "ask"),
+            ("Answer", "ask-1"),
+            ("answer", "x-ask-1"),
+        ] {
+            let m = action_message(json!({
+                "name": name, "surfaceId": surface, "sourceComponentId": "c", "timestamp": "t",
+                "context": answers
+            }));
+            let text = vymalo_inbound(&m).unwrap().payload["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                text.starts_with("The person used the interface: action "),
+                "{name} on {surface}: {text}"
+            );
+        }
+        let m = action_message(json!({
+            "name": "answer", "surfaceId": "ask-call_1", "sourceComponentId": "c", "timestamp": "t",
+            "context": answers
+        }));
+        assert_eq!(
+            vymalo_inbound(&m).unwrap().payload["text"],
+            "The person answered through the interface:\n- a: x"
+        );
     }
 
     #[test]
