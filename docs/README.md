@@ -74,6 +74,7 @@ ADRs are history: a change to a past decision is a dated *Amended* note, never a
 | [0034](decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md) | a turn that asks nothing completes the task, and a scratch project lives for the thread (`SCRATCH_IDLE_DAYS`) |
 | [0035](decisions/0035-questions-carry-a-title-a-description-and-typed-options.md) | `ask_user` forms: a title, a description of why, typed questions (radio, checkboxes, list, picture deck, typed), options with a label and a description; the screen's catalog decides what is sent |
 | [0036](decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md) | the person picks an access tier for each message (`plan`, `edits`, `auto`, `bypass`, capped by `MAX_ACCESS_TIER`, default `auto`); the coder keeps to it in code (not against a command that can read the App's key), and gets `merge_pull_request` (checked, and asked for itself when it is not the conversation's own), `rename_repository`, `delete_repository` and `create_repository` |
+| [0037](decisions/0037-parallel-subagent-calls-and-an-editing-worker.md) | the calls of one turn that say `Tool::concurrent` run side by side, each journaled at a seq reserved in call order, one park for all their children; a cancelled parent stops its children; the coder gets `worker`, an editing subagent in a worktree and branch of its own that Adam merges, the gates staying on Adam (not built yet) |
 
 ## Keeping these docs short and true
 
