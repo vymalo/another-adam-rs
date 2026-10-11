@@ -140,6 +140,49 @@ async fn prepare_workspace_reports_a_bad_repository_to_the_model() {
     );
 }
 
+/// A repository that was just created has no commit and no branch: preparing a workspace for it is a
+/// normal start, so the step completes and says so (it used to fail, and the model called the failure
+/// "as expected"). Nothing is written to the repository and no worktree is made; the way on is a
+/// scratch project, which `publish_scratch` gives the repository its first commit from.
+#[tokio::test]
+async fn prepare_workspace_on_an_empty_repository_completes_and_says_it_is_empty() {
+    let rig = Rig::new().await;
+    let empty = rig.fx.empty_remote("fresh");
+    let url = empty.to_string_lossy().into_owned();
+    rig.say(&url).await;
+
+    // With no base branch (the repository's default is asked) and with one the model guessed.
+    for args in [
+        json!({"repo_url": url}),
+        json!({"repo_url": url, "base_branch": "main"}),
+    ] {
+        let out = PrepareWorkspace.call(&rig.ctx, args).await.unwrap();
+        assert!(
+            !out.is_error,
+            "an empty repository is not a failure: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("is empty") && out.content.contains("publish_scratch"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("not an error"),
+            "the model is told not to report a failure: {}",
+            out.content
+        );
+    }
+    assert!(
+        common::git(&empty, &["for-each-ref"]).is_empty(),
+        "preparing wrote nothing to the repository"
+    );
+    assert!(
+        !slot_of(&rig, "fresh").exists(),
+        "there is nothing to check out, so no worktree was made"
+    );
+}
+
 /// The production policy (only `github.com`, no local paths): a hostile or
 /// careless `repo_url` is reported to the model before any git call, and the
 /// GitHub token never leaves for the host the model named.

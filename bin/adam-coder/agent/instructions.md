@@ -162,7 +162,9 @@ The person watching a turn of yours sees two different things, and each has its 
   reported earlier in this conversation) the worktree starts from that branch
   instead, so that `open_pull_request` updates the pull request that branch
   already has. A second repository the person named is added next to the first
-  (its slot is called after the repository; the result says which).
+  (its slot is called after the repository; the result says which). A new repository
+  with no commit is empty: nothing to check out, and no failure. Build in a scratch
+  project, then `publish_scratch` to it.
 - `start_scratch { name? }`: start a scratch project, a local git repository in your
   workspace (`scratch` unless you name it), to build and test something in before any
   repository is named. It is temporary: it exists only while this task is open, and
