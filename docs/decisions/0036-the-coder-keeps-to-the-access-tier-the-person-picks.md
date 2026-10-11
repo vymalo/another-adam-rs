@@ -40,6 +40,11 @@ coder reads, what each tier lets it do, and how that is made to hold, and **wher
    task is the orchestrator's to send with a tier: see decision 13.)
 4. **Only a message sets the tier.** The agent writes it into the run's notes before each step, from the conversation and the
    messages waiting in the inbox, never from the model or a tool result, and never above the cap.
+   **Only what the person typed counts as theirs.** The repositories and pull requests they named, the merge they asked for and
+   the bare names are read from their messages and from the typed parts of a form's answer (`other:`, `text:`, `Note:`), never
+   from the question ids and option values of a form (`typed_by_the_person`): the person sees labels, and the ids and values are
+   what the model wrote when it drew the form, so a click names nothing and asks for nothing. The person's **newest** words are
+   the last thing they said, an answer included: an answer that asks nothing takes an earlier ask away.
 5. **The mapping of the coder's tools** (the owner's choice; `bin/adam-coder/src/tier.rs`, `needs`):
 
    | Tier | Tools | Forms |
@@ -62,26 +67,33 @@ coder reads, what each tier lets it do, and how that is made to hold, and **wher
    (d) `merge_pull_request`, `rename_repository` and `delete_repository` check it again in their own body.
    **What this does not do.** In the default deployment (`runPods.enabled: false`, `DEVCONTAINER_RUNTIME=off`) `run_command`,
    `run`, `run_checks` and OpenCode run in the coder's own container, as the user that holds the GitHub App's private key (a
-   file, `GITHUB_APP_PRIVATE_KEY_PATH`; with the inline variable, the environment of the process). A command can read it, mint an
-   installation token and do whatever the App may, at any tier, a `plan` included. The tier is a promise the coder keeps for what
+   file, `GITHUB_APP_PRIVATE_KEY_PATH`; a key given inline, `GITHUB_APP_PRIVATE_KEY`, is hidden from the commands and is not this
+   exposure). A command can read the file, mint an installation token and do whatever the App may, at any tier, a `plan` included. The tier is a promise the coder keeps for what
    the **model** does through its tools; it does not confine a command. The coder logs a startup warning when it runs with an App
-   and the commands run locally (`WorkerConfig::commands_can_read_the_app_key`). A deployment that needs a boundary runs the
+   whose key is a file and the commands run locally (`WorkerConfig::commands_can_read_the_app_key`). A deployment that needs a boundary runs the
    commands in run pods (`runPods.enabled`) or in Podman devcontainers (`DEVCONTAINER_RUNTIME=podman`), or gives the App only the
    permissions it can live with. **Follow-up (the real fix, not done here):** run the coder's local commands as a uid that cannot
    read `/var/run/secrets`, or refuse App mode unless the commands run in run pods or Podman.
 7. **The new tools** (`bin/adam-coder/src/tools/admin.rs`, each a `#[tool]`):
    * `merge_pull_request { repo, number, method: squash | merge | rebase = squash, delete_branch? }`, icon `git`. **It merges only
      when all of these hold**, each read from what the host says and from what the person wrote, never from what the model says:
-     1. *The pull request is one this conversation may touch*: its head branch is in the repository itself (not a fork) and one a
-        run of the conversation pushed (`RunNotes::pushed_branches`, an earlier task's too), or the person named the pull request
-        (its URL, `#12`, `PR 12`: `RunNotes::named_pulls`).
+     1. *The pull request is one this conversation may touch*: **either** the person named the repository in full
+        (`RunNotes::named_repos`; a workspace slot that a bare name gave is not that) **and** the pull request (`owner/name#12`
+        or its URL; a bare `#12` or `PR 12` only in their newest words and only as the pull request of **the** repository in
+        play when there is exactly one: `RunNotes::named_pulls`), **or** its head is in the repository itself (not a fork) and is
+        **a commit this conversation pushed** for that branch (`PushedBranch::shas`, an earlier task's too): a branch of the same
+        name that somebody else pushed to is not that.
      2. *The checks passed* on the head commit: the host reports every status and every check run complete and successful
         (`neutral` and `skipped` do not fail a merge), or calls the pull request `clean`
         (`CodeHost::pull_request_status`, `Checks::Passing`); and **that very commit is the one merged**
-        (`MergePullRequest::expected_sha`, sent as the merge's `sha`).
+        (`MergePullRequest::expected_sha`, sent as the merge's `sha`). Where the host reports **no check at all** (a repository with
+        no CI: `PullRequestStatus::ci_reported`), a pull request of the conversation's needs the run's own checks to have passed
+        on that commit when `open_pull_request` let it in (`RunNotes::verified_shas`); one the person named may rely on the
+        host's word. Checks that failed, or that nobody ran and the host does not call clean, stop a merge; nobody can say yes
+        to those for the person (only rule 3 below).
      3. *Red checks need a fresh yes.* A pull request this conversation opened with `accept_red_checks` that mattered
         (`RunNotes::red_pulls`) is merged only when the person's **newest** message names it and says to merge it
-        (`RunNotes::merge_asks`: the word `merge`, not negated, not `merge conflict`, with its number or URL). Then checks that
+        (`RunNotes::merge_asks`: the word `merge`, not negated, not `merge conflict`, with its number or URL, all typed by them). Then checks that
         failed or never ran no longer stop it; checks still running do. A pull request that was not opened red is never merged
         on red checks.
      4. *The prompt says so*: merge only when the person asked.
@@ -104,8 +116,9 @@ coder reads, what each tier lets it do, and how that is made to hold, and **wher
    the variable names owners).
 10. **A bare repository name counts as named** from `auto` when exactly one owner applies: the owner of the repositories already in
     the workspace (or created by the run), else the one account the credentials act for. The name must be **a word that stands
-    alone in the person's newest message** (`RunNotes::said_words`; never a piece of a URL, a path or a query, and not a word of
-    an earlier message), on the default host. Two owners, or none, leave the form as it is.
+    alone in the newest typed words of the person that have any** (`RunNotes::said_words`; never a piece of a URL, a path or a
+    query, never an option value of a form, and not a word of an earlier message), on the default host. A bare name does not make
+    a repository one to merge (decision 7). Two owners, or none, leave the form as it is.
 11. **Rename, delete, merge and the checks follow no redirect and ask first.** A repository that was renamed or transferred
     answers its old address with a redirect, and an address that is free again can be somebody else's. The code host reads
     `GET /repos/{owner}/{name}` on a client that follows no redirect and acts only when the answer names exactly that repository
@@ -147,7 +160,8 @@ coder reads, what each tier lets it do, and how that is made to hold, and **wher
   `Workspaces::acts_for`, `GitHubApp::accounts`, `AccessTier`, `AccessTiers`, `ExtensionConfig::access_tier`,
   `RuntimeTaskBackend::with_access_tiers`, `Agents::access_tiers` and `Service::with_access_tiers` are new, all additive.
   `CoderSettings` gains `create_for_installed_owners` and `max_access_tier`, `Config` gains `max_access_tier`, `RunNotes` gains
-  `tier`, `said_words`, `named_pulls`, `merge_asks`, `red_pulls`, `renamed_repos`, `deleted_repos`.
+  `tier`, `said_words`, `named_pulls`, `merge_asks`, `red_pulls`, `verified_shas`, `renamed_repos`, `deleted_repos`;
+  `PushedBranch` gains `shas`; `PullRequestStatus` gains `ci_reported`.
 * **Not done here:** `adam-agent` (an agent folder) does not list the extension: it has no tool that a tier would limit, and a card
   that lists a tier nothing enforces would be a false promise.
 * **The limit of a name:** `ask_agent` is allowed at every tier (asking is reading); the prompt says not to ask for a change the
@@ -187,7 +201,9 @@ them on as they come).
 ## Amended 2026-10-11 (a security review)
 
 A review of the first version found that `merge_pull_request` merged any pull request of a named repository without looking at the
-checks; that a command could read the App's key (this ADR said a tier could not be exceeded "by text it read", which is true of the
+checks (and a second review, that the person's "named" and "fresh yes" could be forged through a form the model drew, that an
+answer did not replace an earlier ask, that a bare `#12` named that pull request of every repository, that a branch name was
+taken for the conversation's, and that a `clean` pull request with no CI passed: decisions 4 and 7); that a command could read the App's key (this ADR said a tier could not be exceeded "by text it read", which is true of the
 model's tools and false of a command: decision 6 now says so); that a large context could drop the tier; that a subagent's MCP
 tools were not held to the root's tier; that rename, delete and merge ignored the repository's host and followed redirects; that a
 bare name was any word of any message; and that `bypass` was on for every deployment. Decisions 1, 2, 6, 7, 9, 10, 11, 12 and 13

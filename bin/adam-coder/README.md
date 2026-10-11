@@ -804,13 +804,20 @@ tier, and the tools check it again against the tier in the notes.
 GitHub's branch protection, required checks and the permissions the App was granted decide at **every** tier; a tier only narrows.
 
 **`merge_pull_request` merges only when** (`src/tools/admin.rs`; each is read from the host and from the person's words, not from
-the model): *(1)* the pull request's head branch is in the repository itself and one a run of the conversation pushed
-(`RunNotes::pushed_branches`, an earlier task's too), or the person named the pull request (a URL, `#12`, `PR 12`:
-`RunNotes::named_pulls`); *(2)* the host says the checks passed on the head commit (`CodeHost::pull_request_status`:
-`Checks::Passing`, every status and check run finished and successful, `neutral` and `skipped` counting as passing, or
-`mergeable_state` `clean`) and **that very commit is the one merged** (`MergePullRequest::expected_sha`); *(3)* a pull request
+the model): *(1)* **either** the person named the repository in full (`RunNotes::named_repos`; a workspace slot that a bare name
+gave is not that) and the pull request (`owner/name#12` or its URL; a bare `#12` or `PR 12` only in their newest words, and only
+as the pull request of **the** repository in play when there is exactly one: `RunNotes::named_pulls`), **or** the pull request's
+head is in the repository itself and is a commit the conversation pushed for that branch (`PushedBranch::shas`, an earlier
+task's too: a branch of the same name that somebody pushed to since is not that); *(2)* the host says the checks passed on the
+head commit (`CodeHost::pull_request_status`: `Checks::Passing`, no status or check run failed or unfinished, `neutral` and
+`skipped` counting as passing, and the host calls it `clean` or reports some that passed) and **that very commit is the one
+merged** (`MergePullRequest::expected_sha`); where the host reports no check at all (`PullRequestStatus::ci_reported` is
+`false`), a pull request of the conversation's needs the run's own checks to have passed on that commit when
+`open_pull_request` let it in (`RunNotes::verified_shas`), one the person named may rely on the host; checks that failed stop
+a merge and nobody can say yes to them for the person; *(3)* a pull request
 opened with `accept_red_checks` that mattered (`RunNotes::red_pulls`) needs the person's **newest** message to name it and say to
-merge it (`RunNotes::merge_asks`: the word `merge`, not negated, not `merge conflict`); with that, checks that failed or never
+merge it (`RunNotes::merge_asks`: the word `merge`, not negated, not `merge conflict`; **their newest words**, an answer to a
+question included, so "no, wait" takes the ask away); with that, checks that failed or never
 ran no longer stop it, checks still running do; *(4)* the prompt says to merge only when the person asked. A repository on
 another host than the code host's (`ALLOWED_REPO_HOSTS`, the first) is refused, and the host is asked for the repository by its
 address first, with no redirect followed (a repository that was renamed or transferred is not acted on through its old address).
@@ -863,14 +870,20 @@ to a person who asked for a plan). Not enforceable: what an asked agent (`ask_ag
 ask for a change the tier forbids) and a server's write tool with a reading name.
 
 **The tier is not a boundary against a command.** `run_command`, `run`, `run_checks` and OpenCode run in the coder's own container
-when there are no run pods and `DEVCONTAINER_RUNTIME=off` (the default), as the user that holds the GitHub App's private key: a
-command can read it, mint an installation token and act as the App at any tier, a `plan` included. The coder logs a **startup
-warning** when it is an App and the commands run locally (`WorkerConfig::commands_can_read_the_app_key`). Run the commands in run
+when there are no run pods and `DEVCONTAINER_RUNTIME=off` (the default), as the user that can read the GitHub App's private key
+**file** (`GITHUB_APP_PRIVATE_KEY_PATH`; a key given inline is hidden from the commands): a command can read it, mint an
+installation token and act as the App at any tier, a `plan` included. The coder logs a **startup warning** when it is an App with
+a key file and the commands run locally (`WorkerConfig::commands_can_read_the_app_key`). Run the commands in run
 pods or Podman devcontainers to confine them; the real fix (a uid that cannot read `/var/run/secrets`, or refusing App mode
 without them) is a follow-up (ADR 0036, decision 6).
 
+**What counts as the person's words** (`RunNotes::hear`, `named::typed_by_the_person`): what they typed, in their messages and in
+the typed parts of a form's answer (`other:`, `text:`, `Note:`). The question ids and the option values of a form are what the
+model wrote when it drew it, so a click names no repository or pull request, asks for no merge and is no bare name. The newest
+words are the last thing they said, an answer included.
+
 A **bare name** (`ToolEnv::is_granted`): from `auto`, `prepare_workspace`, `publish_scratch` and `request_repository` treat
-`github.com/<owner>/<name>` as named when `<name>` is a word that stands alone in the person's **newest** message
+`github.com/<owner>/<name>` as named when `<name>` is a word that stands alone in the **newest typed words of the person that have any**
 (`RunNotes::set_said_words`: split at spaces, punctuation around it taken off, letters, digits, `.`, `_` and `-` only, so
 never a piece of a URL, a path or a query; lowercase, at most 2000; an earlier message's words do not stand for it) and `<owner>` is the one owner that applies: the owner of the repositories in the workspace (or created by the
 run) if they are all one, else the one account the credentials act for. Two owners, or none, leave the form. `rename_repository` and
@@ -2137,6 +2150,11 @@ Everything is offline (`cargo test -p adam-coder`; with
 `ADAM_TEST_POSTGRES_URL` set the Postgres variants run too, each case in a
 database of its own, so the role needs `CREATEDB`):
 
+* `tests/hearing.rs` (what the coder takes from the person's words, through a real `CoderAgent` on a `Runtime`): the repositories
+  and pull requests they named, a form whose ids and values are forged naming nothing and asking for nothing, what they type into
+  one counting, an answer that names nothing (a click, "no, wait") taking an earlier "merge #7" away, a bare `#7` bound to the one
+  repository in play and dropped with two, the bare names, and what a task that continues another inherits (the pushed commits,
+  the pull requests opened red, the commits whose checks passed). Unit tests: `src/tools/named.rs` (`typed_by_the_person`).
 * `tests/tiers.rs` (the access tiers): the tools the model is **shown** on a turn per tier (a real `Runtime`, a scripted model), the
   tier noted from the message and said to the model, a task that continues another starting at the default, a model that calls a
   tool above the tier anyway (the host is never asked, the refusal names the tier it needs), every tool checking the root run's

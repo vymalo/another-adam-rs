@@ -422,11 +422,12 @@ The person picks an access tier for each message (`plan`, `edits`, `auto`, `bypa
 `MAX_ACCESS_TIER`, every role; empty is `auto` and renders nothing) is the highest tier the deployment allows: the card lists the
 tiers up to it, a message that names a higher one is refused, and the tools check it again. **`bypass` (renaming and deleting
 repositories, no consent form for a repository) is opt-in**: set `accessTiers.max: bypass` only for a deployment whose GitHub
-credentials you are willing to see used that way.
+credentials you are willing to see used that way. Do not also set `config.extraEnv.MAX_ACCESS_TIER`: the chart refuses the render
+(it would override the cap).
 
 **The tier is not a boundary against a command.** With `runPods.enabled: false` and no Podman devcontainers (the default),
 `run_command`, `run`, `run_checks` and OpenCode run **in the coder's own container**, as the user that holds the GitHub App's
-private key (a mounted file, `/var/run/secrets/github-app/private-key.pem`). A command can read it, mint an installation token
+private key (a mounted file, `/var/run/secrets/github-app/private-key.pem`; the chart always uses the file form). A command can read it, mint an installation token
 and do whatever the App may, at any tier, a `plan` included. The coder logs a startup warning when it is an App and the commands
 run locally. If that is not acceptable: run the commands in run pods (`runPods.enabled: true`, [below](#run-pods)) or in Podman
 devcontainers (`DEVCONTAINER_RUNTIME=podman`), or grant the App only what you can live with. (A follow-up, not done: run local
