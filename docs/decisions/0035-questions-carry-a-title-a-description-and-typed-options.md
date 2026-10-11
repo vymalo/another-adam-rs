@@ -53,6 +53,10 @@ is still valid, and the catalog the screen sends says which version it has.
    `- <id>: <values>`, an "other" as `other: "<text>"`, a typed word as `text: "<text>"`, and a last line
    `Note: "<text>"`. Anything the person typed is a JSON string after its label, so it can never pass for an option's value
    or start a line of its own (the coder's consent answers are matched on `- consent: yes`).
+   *Amended 2026-10-11 ([ADR 0036](0036-the-coder-keeps-to-the-access-tier-the-person-picks.md), a fourth review):* the first line
+   of the answer names the surface it was made on, `The person answered through the interface (form ask-<call id>):`, and an
+   answer counts for a call only when it is the surface that call drew; `ask_user` refuses a typed default with a character
+   the person cannot see.
 7. **When Adam offers options it must ask with `ask_user` and `choices`**, with a title, a description of why, and options
    that each have a label and a description; never a list in prose, and free text only when there is nothing to choose
    from. The rule is in `ask_user`'s description (every agent has it) and in the coder's instructions (`# Asking the

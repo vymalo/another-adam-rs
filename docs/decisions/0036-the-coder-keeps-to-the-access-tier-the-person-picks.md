@@ -40,11 +40,11 @@ coder reads, what each tier lets it do, and how that is made to hold, and **wher
    task is the orchestrator's to send with a tier: see decision 13.)
 4. **Only a message sets the tier.** The agent writes it into the run's notes before each step, from the conversation and the
    messages waiting in the inbox, never from the model or a tool result, and never above the cap.
-   **Only what the person typed counts as theirs.** The repositories and pull requests they named, the merge they asked for and
-   the bare names are read from their messages and from the typed parts of a form's answer (`other:`, `text:`, `Note:`), never
-   from the question ids and option values of a form (`typed_by_the_person`): the person sees labels, and the ids and values are
-   what the model wrote when it drew the form, so a click names nothing and asks for nothing. The person's **newest** words are
-   the last thing they said, an answer included: an answer that asks nothing takes an earlier ask away.
+   **Only what the person typed counts as theirs.** The repositories they named and the bare names are read from their messages
+   and from the typed parts of a form's answer (`other:`, `text:`, `Note:`), never from the question ids and option values of a
+   form (`typed_by_the_person`): the person sees labels, and the ids and values are what the model wrote when it drew the form,
+   so a click names nothing. *Amended 2026-10-11 (a fourth review):* a merge no longer reads the person's words at all (decision
+   7), an answer counts only for the call whose form it answers, and the words a typed question started with are the model's.
 5. **The mapping of the coder's tools** (the owner's choice; `bin/adam-coder/src/tier.rs`, `needs`):
 
    | Tier | Tools | Forms |
@@ -75,31 +75,36 @@ coder reads, what each tier lets it do, and how that is made to hold, and **wher
    permissions it can live with. **Follow-up (the real fix, not done here):** run the coder's local commands as a uid that cannot
    read `/var/run/secrets`, or refuse App mode unless the commands run in run pods or Podman.
 7. **The new tools** (`bin/adam-coder/src/tools/admin.rs`, each a `#[tool]`):
-   * `merge_pull_request { repo, number, method: squash | merge | rebase = squash, delete_branch? }`, icon `git`. **It merges only
-     when all of these hold**, each read from what the host says and from what the person wrote, never from what the model says:
-     1. *The pull request is one this conversation may touch*: **either** the person named the repository in full
-        (`RunNotes::named_repos`; a workspace slot that a bare name gave is not that) **and** the pull request (`owner/name#12`
-        or its URL; a bare `#12` or `PR 12` only in their newest words and only as the pull request of **the** repository in
-        play when there is exactly one: `RunNotes::named_pulls`), **or** its head is in the repository itself (not a fork) and is
-        **a commit this conversation pushed** for that branch (`PushedBranch::shas`, an earlier task's too): a branch of the same
-        name that somebody else pushed to is not that.
-     2. *The checks passed* on the head commit: the host reports every status and every check run complete and successful
+   * `merge_pull_request { repo, number, method: squash | merge | rebase = squash, delete_branch? }`, icon `git`, `asks_user`.
+     *Amended 2026-10-11 (a fourth review):* **it never reads the person's words.** Three reviews each found another way for the
+     model's text to count as theirs (a form's ids and values, an error that repeats the model, a typed question's prefilled
+     words, a stale form), so the gate that guessed at what they meant ("named", "asks to merge") was replaced by a rule that
+     needs no guess. It decides from what the host says, from the commits the tools wrote down and from the answer to its own
+     question:
+     1. *The checks passed* on the head commit: the host reports every status and every check run complete and successful
         (`neutral` and `skipped` do not fail a merge), or calls the pull request `clean`
         (`CodeHost::pull_request_status`, `Checks::Passing`); and **that very commit is the one merged**
-        (`MergePullRequest::expected_sha`, sent as the merge's `sha`). Where the host reports **no check at all** (a repository with
-        no CI: `PullRequestStatus::ci_reported`), a pull request of the conversation's needs the run's own checks to have passed
-        on that commit when `open_pull_request` let it in (`RunNotes::verified_shas`); one the person named may rely on the
-        host's word. Checks that failed, or that nobody ran and the host does not call clean, stop a merge; nobody can say yes
-        to those for the person (only rule 3 below).
-     3. *Red checks need a fresh yes.* A pull request this conversation opened with `accept_red_checks` that mattered
-        (`RunNotes::red_pulls`) is merged only when the person's **newest** message names it and says to merge it
-        (`RunNotes::merge_asks`: the word `merge`, not negated, not `merge conflict`, with `owner/name#N` or its URL, or `#N` when one repository is in play, all typed by them). Then checks that
-        failed or never ran no longer stop it; checks still running do. A pull request that was not opened red is never merged
-        on red checks.
-     4. *The prompt says so*: merge only when the person asked.
-     The tool is on a repository of the workspace or one the person named, **on the code host's own host** (the first of
-     `ALLOWED_REPO_HOSTS`); a bare name is never a grant for it. The code host merges the commit that was checked and deletes the
-     branch only when it is the repository's own and not the base.
+        (`MergePullRequest::expected_sha`, sent as the merge's `sha`). Checks still running are waited for, always. Checks that
+        failed, or that nobody ran and the host does not call clean, stop a merge, **unless** the conversation opened the pull
+        request with `accept_red_checks` that mattered (`RunNotes::red_pulls`): an override, step 3.
+     2. *Path A, the conversation's own pull request*: its head is in the repository itself (not a fork) and is **a commit this
+        conversation pushed** for that branch (`PushedBranch::shas`, an earlier task's too; a branch of the same name that
+        somebody else pushed to is not that); where the host reports **no check at all** (a repository with no CI:
+        `PullRequestStatus::ci_reported`) the run's own checks passed on that commit when `open_pull_request` let it in
+        (`RunNotes::verified_shas`). It is merged at `auto` and above with **no question**.
+     3. *Path B, any other pull request, or a red-checks override*: at `auto` the tool asks the person itself (`NeedsInput`, as
+        `request_repository` does) in a form it draws: a fixed question ("Merge owner/name#N into base?"), the facts the host
+        gave, and two fixed options, `merge` and `not_now`. The form's one question has the id `merge-<digest>`, a digest of the
+        repository, the number, the head commit, the method, the branch deletion and the red state, so a yes is to **that** and
+        nothing else (a head that moved, or checks that changed for the worse, are another question). Only the answer of **that
+        form on that call's surface** is a yes (decision 4's amendment, `consent::merge_answer`): not a message, not a form the
+        model drew with the same id and option, not a click on a form still on the screen from an earlier question. The next
+        call, with the same arguments, merges exactly that commit. **At `bypass` nothing is asked** (that is what the tier
+        means) and Path B merges after the same checks of the host, the repository and the commit.
+     4. *The prompt says so*: merge only when the person asked, and the tool asks for itself.
+     The tool is on a repository of the workspace or any on the code host's own host (the first of `ALLOWED_REPO_HOSTS`): whose
+     it is no longer matters, because the person's yes decides for a pull request that is not the conversation's. The code host
+     merges the commit that was checked and deletes the branch only when it is the repository's own and not the base.
    * `rename_repository { repo, new_name }`, icon `git`, and `delete_repository { repo, confirm }`, icon `delete`. Only on a
      repository the person named (their words, a consent, or a repository the run created), on the code host's own host: a bare
      name is never enough for an act that cannot be taken back. `confirm` must equal `owner/name`, checked before the host is asked.
@@ -160,7 +165,8 @@ coder reads, what each tier lets it do, and how that is made to hold, and **wher
   `Workspaces::acts_for`, `GitHubApp::accounts`, `AccessTier`, `AccessTiers`, `ExtensionConfig::access_tier`,
   `RuntimeTaskBackend::with_access_tiers`, `Agents::access_tiers` and `Service::with_access_tiers` are new, all additive.
   `CoderSettings` gains `create_for_installed_owners` and `max_access_tier`, `Config` gains `max_access_tier`, `RunNotes` gains
-  `tier`, `said_words`, `named_pulls`, `merge_asks`, `red_pulls`, `verified_shas`, `renamed_repos`, `deleted_repos`;
+  `tier`, `said_words`, `red_pulls`, `verified_shas`, `renamed_repos`, `deleted_repos` (and `named_pulls` and `merge_asks`, removed by
+  the fourth amendment);
   `PushedBranch` gains `shas`; `PullRequestStatus` gains `ci_reported`.
 * **Not done here:** `adam-agent` (an agent folder) does not list the extension: it has no tool that a tier would limit, and a card
   that lists a tier nothing enforces would be a false promise.
@@ -211,6 +217,8 @@ are the answers; the known limits and the follow-ups above are what is left.
 
 ## Amended 2026-10-11 (a third review)
 
+*Superseded in part by the fourth review below: the merge's use of the person's words, and the `Order` bullet.*
+
 A third review found two more routes by which the model's text counted as the person's words (decision 4), and two smaller ones.
 All four are closed in `bin/adam-coder/src/agent.rs` (`person_sayings`), `bin/adam-coder/src/tools/named.rs`
 (`typed_by_the_person`), `bin/adam-coder/src/tools/notes.rs` (`RunNotes::hear`) and
@@ -237,3 +245,40 @@ All four are closed in `bin/adam-coder/src/agent.rs` (`person_sayings`), `bin/ad
 * **A whole task is tested end to end** (`bin/adam-coder/tests/tiers.rs`): `commit_and_push`, `open_pull_request` and
   `merge_pull_request` against the wiremock GitHub with no hand-written notes, the merge allowed by the commit the tools
   themselves noted and sent with the `sha` the host reported.
+
+## Amended 2026-10-11 (a fourth review)
+
+The fourth review found two more bypasses of the typed-question default (a default with U+FEFF, which a page's `trim()` removes
+and Rust's does not; and an answer to a form that is not the one the run waits on), and the same shape in the consent tools
+(a form the model drew with the question id `consent`, answered while `request_repository` waits). Three rounds had chased "guess
+the person's intent from text", so the design changed instead of being patched again. In `bin/adam-coder`
+(`src/agent.rs`, `src/tools/{admin,consent,named,notes}.rs`), `crates/adam-a2a-runtime/src/vymalo.rs` and `crates/adam-ui`.
+
+* **A merge reads no words** (decision 7): Path A (the conversation's own pull request) merges with no question; Path B (any
+  other, or a red-checks override) is put to the person in the tool's own form and merges on the yes to that form. `merge_asks`,
+  `named_pulls` and the code that read pull requests and "merge" out of text (`pulls_in`, `bind_pulls`, `asks_to_merge`) are
+  deleted. The text-inference gate was replaced, not fixed, because a model can put words in anything the person sees and clicks;
+  only an answer to a question the tool wrote itself, on the surface it drew, cannot be had by writing text. A pull request
+  opened red and green now is Path A (the override is for checks that are not green).
+* **An answer is for its own call.** The A2A layer writes the surface a form's answer was made on into its first line
+  (`The person answered through the interface (form ask-<call id>):`; `form_answer_surface`), and `ask_user` draws its form on
+  `ask-<call id>` (`ask_surface_id`). `person_sayings` and `consents_in` accept a form's answer for a call only when it names
+  that call's surface. Otherwise it is unpaired: for `ask_user` no default matches, so every `text:` part is dropped; for
+  `request_repository`, `create_repository` and `merge_pull_request` it is no consent. The person's own words to the first two
+  (`yes`, `no`) still count: they are what they typed. *Accepted limits:* a provider that sends no call ids repeats them
+  (`call_0`), and then a form of an earlier turn has the same surface id as the one on the screen now; and a screen that cannot
+  draw a form cannot answer a Path B merge below `bypass`.
+* **Defaults are compared as a person reads them**: without whitespace and without control or format characters (Unicode Cc and
+  Cf), in lowercase (`adam_ui::comparable`). `ask_user` refuses a typed default that has such a character (a tab and a line
+  break are words). *Verified 2026-10-11*: the Cf ranges against Python 3's `unicodedata` (Unicode 14.0), widened for later
+  versions; a character a later version adds elsewhere is not covered. *Unverified:* what each web client does to the words on
+  their way back; the comparison does not depend on it.
+* **Order (corrects the third amendment's bullet).** A message that arrived while a tool result was owed is put into the
+  history after the results, and the history keeps no arrival time, so a click that answers a later question can come after a
+  message the person sent first. Only the bare names read the newest words now (the merge does not), and the code marks such a
+  message `Deferred` only while it waits: then the bare names are what both it and the last thing before it say. Once it is in
+  the history the order is the history's. An arrival marker that survives the move (`Conversation::deferred` into `messages`)
+  would be a change in `adam-llm-agent` and was not made: both messages are the person's words.
+* **Not changed:** `rename_repository` and `delete_repository` (bypass only) still need the person to have named the repository
+  in words (`RunNotes::named_repos`), now with the hardening above. A form of their own is a follow-up if that is judged too
+  weak.
