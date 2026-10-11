@@ -267,6 +267,10 @@ pub struct PullRequestStatus {
     pub base_branch: String,
     /// Whether the checks of the head commit passed.
     pub checks: Checks,
+    /// The host reports at least one status or check run for the head commit. `false` with
+    /// [`Checks::Passing`] is a pull request the host calls ready that **nothing ever checked**: a
+    /// repository with no CI.
+    pub ci_reported: bool,
 }
 
 /// Whether the checks of a pull request's head commit passed, as the host reports them. Closed on
@@ -390,6 +394,7 @@ mod memory {
         deleted: Mutex<Vec<String>>,
         refusal: Mutex<Option<String>>,
         checks: Mutex<Option<Checks>>,
+        no_ci: Mutex<bool>,
     }
 
     impl MemoryCodeHost {
@@ -458,6 +463,17 @@ mod memory {
                 .checks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(checks);
+            self
+        }
+
+        /// Report no status and no check run for any pull request
+        /// ([`PullRequestStatus::ci_reported`] is `false`): a repository with no CI.
+        #[must_use]
+        pub fn without_ci(self) -> Self {
+            *self
+                .no_ci
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
             self
         }
 
@@ -748,6 +764,10 @@ mod memory {
                 head_sha: Self::head_sha_of(number),
                 base_branch: req.repo.base_branch,
                 checks,
+                ci_reported: !*self
+                    .no_ci
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
             })
         }
 
@@ -964,6 +984,7 @@ mod memory {
             assert_eq!(status.head_sha, MemoryCodeHost::head_sha_of(a.number));
             assert_eq!((status.open, status.merged), (true, false));
             assert_eq!(status.checks, Checks::Passing);
+            assert!(status.ci_reported);
             let moved = MergePullRequest {
                 repo: repo.clone(),
                 number: a.number,
@@ -984,6 +1005,15 @@ mod memory {
             .unwrap();
             let after = host.pull_request_status(&repo, a.number).await.unwrap();
             assert_eq!((after.open, after.merged), (false, true));
+            let bare = MemoryCodeHost::new().without_ci();
+            let c = bare.open_pull_request(new_pr("agent/c")).await.unwrap();
+            assert!(
+                !bare
+                    .pull_request_status(&repo, c.number)
+                    .await
+                    .unwrap()
+                    .ci_reported
+            );
             let red = MemoryCodeHost::new().with_checks(Checks::Failing("ci: failure".into()));
             let b = red.open_pull_request(new_pr("agent/b")).await.unwrap();
             assert_eq!(

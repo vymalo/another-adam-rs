@@ -174,18 +174,16 @@ impl GitHub {
             .map_err(|e| decode_error(e, token))
     }
 
-    /// What the host reports for the checks of commit `sha`, as [`Checks`]: the combined status and
-    /// every check run, or `clean` as the pull request's `mergeable_state` says.
+    /// What the host reports for the checks of commit `sha`: the combined status and every check run
+    /// as [`Checks`], and whether it reported any at all. `mergeable_state` `clean` is the host calling
+    /// the pull request ready, which stands in for success when nothing was reported.
     async fn checks_of(
         &self,
         token: &SecretString,
         (owner, name): (&str, &str),
         sha: &str,
         mergeable_state: Option<&str>,
-    ) -> WorkspaceResult<Checks> {
-        if mergeable_state == Some("clean") {
-            return Ok(Checks::Passing);
-        }
+    ) -> WorkspaceResult<(Checks, bool)> {
         if sha.is_empty() || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(WorkspaceError::Invalid(format!(
                 "{sha:?} is not a commit id"
@@ -233,7 +231,11 @@ impl GitHub {
             }
             truncated = page == MAX_CHECK_RUN_PAGES;
         }
-        Ok(classify_checks(mergeable_state, &status, &runs, truncated))
+        let reported = status.total_count > 0 || !runs.is_empty();
+        Ok((
+            classify_checks(mergeable_state, &status, &runs, truncated),
+            reported,
+        ))
     }
 
     /// The open pull request from `head`; against `repo.base_branch` when `on_base`, against any
@@ -562,7 +564,7 @@ impl CodeHost for GitHub {
             )));
         };
         let head_sha = head.sha.unwrap_or_default();
-        let checks = self
+        let (checks, ci_reported) = self
             .checks_of(
                 &token,
                 (&owner, &name),
@@ -581,6 +583,7 @@ impl CodeHost for GitHub {
             head_sha,
             base_branch: pull.base.map(|b| b.branch).unwrap_or_default(),
             checks,
+            ci_reported,
         })
     }
 
@@ -776,7 +779,7 @@ struct ApiCheckRun {
 
 /// The checks of a commit as [`Checks`]: a status that failed or errored, or a check run that
 /// finished with anything but success, neutral or skipped, is failing; one that has not finished is
-/// pending; none at all, with the pull request not clean, is unreported.
+/// pending; none reported, with the pull request not `clean`, is unreported; anything else passes.
 fn classify_checks(
     mergeable_state: Option<&str>,
     status: &ApiCombinedStatus,
@@ -814,7 +817,7 @@ fn classify_checks(
         Checks::Failing(failing.join("; "))
     } else if !pending.is_empty() {
         Checks::Pending(pending.join("; "))
-    } else if status.total_count == 0 && runs.is_empty() {
+    } else if status.total_count == 0 && runs.is_empty() && mergeable_state != Some("clean") {
         Checks::Unreported(format!(
             "the host reports no status and no check run for this commit, and the pull request is \
              {}",
@@ -1142,6 +1145,17 @@ mod tests {
         assert!(matches!(
             classify_checks(Some("unstable"), &combined("pending", 0), &[], false),
             Checks::Unreported(m) if m.contains("unstable")
+        ));
+        // A pull request the host calls clean with nothing reported passes (the caller is told that
+        // nothing was reported), and one with a failure does not, whatever the host calls it.
+        assert_eq!(
+            classify_checks(Some("clean"), &combined("pending", 0), &[], false),
+            Checks::Passing
+        );
+        let red = [run("build", "completed", Some("failure"))];
+        assert!(matches!(
+            classify_checks(Some("clean"), &combined("success", 1), &red, false),
+            Checks::Failing(_)
         ));
     }
 

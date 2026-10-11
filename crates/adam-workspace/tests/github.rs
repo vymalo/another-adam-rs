@@ -1322,26 +1322,46 @@ mod change {
     }
 
     #[tokio::test]
-    async fn the_status_names_the_head_and_a_clean_pull_request_is_passing() {
+    async fn the_status_names_the_head_and_a_clean_pull_request_with_no_ci_is_passing_but_unreported()
+     {
         let server = MockServer::start().await;
         serve_pull(&server, pull_with_state("clean")).await;
-        // `clean` is enough: the statuses are not even read.
-        Mock::given(path("/repos/octo/widgets/commits/abc123/status"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
+        serve_checks(
+            &server,
+            json!({"state": "pending", "total_count": 0}),
+            json!({"total_count": 0, "check_runs": []}),
+        )
+        .await;
         let status = client(&server)
             .pull_request_status(&repo(), 7)
             .await
             .unwrap();
         assert_eq!(status.checks, Checks::Passing);
+        assert!(!status.ci_reported, "nothing ever checked it");
         assert_eq!(status.head_branch, "agent/018f3a2b");
         assert_eq!(status.head_repo.as_deref(), Some("octo/widgets"));
         assert_eq!(status.head_sha, "abc123");
         assert_eq!(status.base_branch, "main");
         assert!(status.open && !status.merged && !status.draft);
         assert_eq!(status.url, "https://github.com/octo/widgets/pull/7");
+
+        // Clean with a check run that passed: reported.
+        let server = MockServer::start().await;
+        serve_pull(&server, pull_with_state("clean")).await;
+        serve_checks(
+            &server,
+            json!({"state": "pending", "total_count": 0}),
+            json!({"total_count": 1, "check_runs": [
+                {"name": "build", "status": "completed", "conclusion": "success"}
+            ]}),
+        )
+        .await;
+        let status = client(&server)
+            .pull_request_status(&repo(), 7)
+            .await
+            .unwrap();
+        assert_eq!(status.checks, Checks::Passing);
+        assert!(status.ci_reported);
     }
 
     #[tokio::test]
