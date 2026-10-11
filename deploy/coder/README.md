@@ -408,10 +408,32 @@ refused before git runs. For GitHub Enterprise add its host and set
 exposed by the chart.
 
 `github.createRepoOwners` (default empty; env `CREATE_REPO_OWNERS`, workers only) lists the owners the coder may
-create repositories for. Empty turns the `create_repository` tool off. With owners listed it still asks the person
-before every creation, makes the repository private and empty unless asked otherwise, and refuses an owner that is
-not in the list. A GitHub App creates for organisations only and needs the **Administration** permission on the
-organisation; a token needs the `repo` scope.
+create repositories for, and **restricts** it to exactly those. Empty, a **GitHub App** creates for the accounts it acts
+for (`github.app.owners` as listed, the pinned installation's account, or every account it is installed on), and a
+**token** creates nothing: the `create_repository` tool is off. The coder asks the person before every creation (not under
+the `bypass` access tier below), makes the repository private and empty unless asked otherwise, and refuses an owner that
+is not allowed. A GitHub App creates for organisations only; a token needs the `repo` scope.
+
+### What the GitHub App must be granted
+
+The person picks an access tier for each message (`plan`, `edits`, `auto`, `bypass`; the default is `auto`;
+[ADR 0036](../../docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)), and what the coder may do
+alone depends on it. **GitHub's own rules decide at every tier**: an App without a permission is refused by GitHub, and the coder
+tells the person what GitHub said. Grant the App what the tiers you want need:
+
+| Repository permission | Level | The coder needs it to | Tier |
+|---|---|---|---|
+| Contents | write | push branches; merge a pull request; delete its head branch | `edits`, `auto` |
+| Pull requests | write | open pull requests, comment on them | `edits` |
+| Workflows | write | push a branch that changes `.github/workflows/*` | `edits` |
+| Administration | write | create (`POST /orgs/{org}/repos`, `POST /user/repos`), rename and delete a repository | `auto` (create), `bypass` (rename, delete) |
+
+*Verified 2026-10-11* against `docs.github.com/en/rest/overview/permissions-required-for-github-apps`: `PATCH` and `DELETE
+/repos/{owner}/{repo}` and the two repository-creation endpoints are under **Administration** (write); the merge endpoint and the
+deletion of a ref are under **Contents** (write); **Workflows** and **Repository creation** are permissions of their own on that
+page. *Unverified:* that **Workflows** is what GitHub checks for a push under `.github/workflows` (the page names the permission and
+not the path), and whether creating a repository needs **Repository creation** in addition to **Administration**. A token needs the
+`repo` scope for all of this, and `delete_repo` to delete (*verified 2026-10-11*, `docs.github.com/en/rest/repos/repos`).
 
 ## Agent files
 

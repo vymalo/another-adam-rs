@@ -785,7 +785,7 @@ so a person who takes the offer starts a follow-up task that continues the conve
 
 ### Access tiers: what the person lets it do alone
 
-The person picks a tier for each message (`access-tier/v1`, [ADR 0035](../../docs/decisions/0035-the-coder-keeps-to-the-access-tier-the-person-picks.md));
+The person picks a tier for each message (`access-tier/v1`, [ADR 0036](../../docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md));
 the card lists all four with `default: auto`, and a message that names none works under `auto`.
 
 | Tier | The coder may | Forms |

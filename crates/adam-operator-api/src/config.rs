@@ -190,7 +190,7 @@ pub struct Coder {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_author: Option<GitAuthor>,
 
-    /// `CREATE_REPO_OWNERS`. Empty: the tool stays off.
+    /// `CREATE_REPO_OWNERS`. Empty: the accounts a GitHub App acts for; a token creates nothing.
     #[serde(default)]
     pub create_repo_owners: Vec<String>,
 

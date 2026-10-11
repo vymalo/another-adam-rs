@@ -1,11 +1,11 @@
 ---
 name: adam-a2a-extensions
-description: "Which A2A extensions an adam-rs agent declares and supports (A2UI v0.9.1, ui-catalog/v1, thread-tools/v1, steps/v1, text-stream/v1, mentions/v1, steer/v1, usage/v1), how a client activates them, and how to add or announce one. Use when writing a client or an orchestrator for adam agents, when an agent card lacks an extension, or when adding an extension to adam-rs."
+description: "Which A2A extensions an adam-rs agent declares and supports (A2UI v0.9.1, ui-catalog/v1, thread-tools/v1, steps/v1, text-stream/v1, mentions/v1, steer/v1, usage/v1, access-tier/v1), how a client activates them, and how to add or announce one. Use when writing a client or an orchestrator for adam agents, when an agent card lacks an extension, or when adding an extension to adam-rs."
 ---
 
 # A2A extensions of an adam agent
 
-An adam agent is a plain A2A 1.0 agent. On top of that it can declare nine optional extensions
+An adam agent is a plain A2A 1.0 agent. On top of that it can declare ten optional extensions
 on its card. A client that does not know one ignores it; every extension is removable without
 breaking plain A2A. The contracts are written in `vymalo/another-agentic-system`
 (its docs/api directory, the `*-v1.md` files); adam-rs holds the agent side.
@@ -40,6 +40,7 @@ orchestrator's side, and exists on its main once that change merges).
 | `build/v1` | `BUILD_EXTENSION` | information only, nothing to activate: `params` `{revision, folderDigest}` say which build and which agent files answer (ADR 0028) | `adam-agent` (`card_of_folder`) and `adam-coder` (`agent_card_from`) add it (`ExtensionConfig::build(..)`) |
 | `text-stream/v1` | `TEXT_STREAM_EXTENSION` | the reply streamed as the model writes it, then the whole text once; since 2026-10-05 also the model's **reasoning**, as chunks with `kind: "reasoning"` (`TEXT_STREAM_KIND_REASONING`), its own `artifactId`, never stated whole (ADR 0020) | `adam-agent` and `adam-coder` add it (`ExtensionConfig::text_stream()`) |
 | `usage/v1` | `USAGE_EXTENSION` | the tokens of each model call, to a client that activated it: a `working` status update with **no message** and the report in the **event's** `metadata` (`call`, `stepId` for a subagent's call, `provider`, `model`, the AG-UI `TokenUsage` counts, `contextWindow`); and, for every reader, the task's `totals` in the **task's** `metadata` once it ends or waits (ADR 0032) | `adam-agent` and `adam-coder` add it (`ExtensionConfig::usage()`) |
+| `access-tier/v1` | `ACCESS_TIER_EXTENSION` | the person picks, per message, how much the agent may do alone (`plan`, `edits`, `auto`, `bypass`): an activated message carries `metadata[URI] = {"tier": ...}`, a missing, unknown or not honoured tier is `InvalidParams` before anything is written, the newest message sets the tier from the agent's next step, a new task starts at the card's `default`, and the task says the tier it works under in its `metadata`; `params` are `{tiers, default}` (`AccessTier`, `AccessTiers`, ADR 0035) | `adam-coder` (`ExtensionConfig::access_tier`); `adam-agent` does not list it |
 
 The URIs are `https://agents.vymalo.com/a2a/extensions/<name>/v1` (A2UI has its own URI);
 read the exact strings in the file at your rev.

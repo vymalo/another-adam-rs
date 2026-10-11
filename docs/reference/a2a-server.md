@@ -247,6 +247,20 @@ The card says which build of the agent answers, so that a thread export can be t
   activate, ignored by a client that does not know it. `adam_a2a::ExtensionConfig::build(revision, folder_digest)` declares it,
   `adam_agent::card_of_folder` and `adam_coder::agent_card_from` add it.
 
+## The access tier
+
+An agent whose card lists `https://agents.vymalo.com/a2a/extensions/access-tier/v1` (the coder: `params`
+`{"tiers": ["plan", "edits", "auto", "bypass"], "default": "auto"}`; the contract is the orchestration layer's
+`docs/api/access-tier-v1.md`, [ADR 0036](../decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)) works under the
+tier the person picks **for each message**. A request that **activates** it must carry
+`metadata[URI] = {"tier": "plan" | "edits" | "auto" | "bypass"}` on the message, or it is `InvalidParams` (`-32602`) and nothing is
+written: that includes a tier that is missing, written in another case, or not one the card lists. A message that does not
+activate it carries no tier, whatever its metadata says. The newest message that names a tier sets it from the agent's next
+step; a new task in the same context starts at `default`, not at the tier of the task before. To a caller that activated it, a
+task says `metadata[URI] = {"tier": ..}`: on the answer of `SendMessage`, on `GetTask`, on the first frame of a stream, and in a
+status update when it changes. `RuntimeTaskBackend::with_access_tiers` is the backend side; what the coder does with each tier is
+its README, *Access tiers*.
+
 ## Tokens of each model call
 
 Every agent's card lists `https://agents.vymalo.com/a2a/extensions/usage/v1` (optional, no `params`; the contract is the

@@ -230,3 +230,9 @@ task; **any other message** (`wait`, `?`, a question back, `yes please`) records
 nor refuses, and the question can be asked again. The model still gets the person's words as the call's result.
 Before, any text that was not a yes was recorded as a refusal, which made a "wait" a permanent "do not ask again".
 `create_repository` follows the same rule, and is now safe to repeat (ADR 0009).*
+
+*Amended 2026-10-11 ([ADR 0036](0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)): the person's access tier widens who
+grants a repository. From `auto`, a repository the person wrote by its name alone counts as named when exactly one owner applies
+(the owner of the workspace's repositories, else the one account a GitHub App acts for); at `bypass`, any repository the host allows.
+Below that, and for any other repository, the rule above stands: named, or agreed to when `request_repository` asked. The model
+still never grants: the tier is a message's, set by the person.*

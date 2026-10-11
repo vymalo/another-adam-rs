@@ -218,7 +218,7 @@ spec:
                             type: integer
                           createRepoOwners:
                             default: []
-                            description: '`CREATE_REPO_OWNERS`. Empty: the tool stays off.'
+                            description: '`CREATE_REPO_OWNERS`. Empty: the accounts a GitHub App acts for; a token creates nothing.'
                             items:
                               type: string
                             type: array

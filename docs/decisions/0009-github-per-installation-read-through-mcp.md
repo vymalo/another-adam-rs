@@ -284,3 +284,9 @@ the roles that run workers (`MCP_ALLOW_STDIO: "true"` in the StatefulSet, none i
 no MCP server; its render check and golden follow), `compose.yaml` on the `coder` service, and the container smoke test, which
 also checks that the image itself sets nothing. An `adam-agent` run from the image refuses local-process servers (the default,
 `false`) unless its own deployment opts in. Nothing else in decision 8 changes.*
+
+*Amended 2026-10-11 ([ADR 0036](0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)): `create_repository` is no longer off
+unless `CREATE_REPO_OWNERS` names the owner. With a GitHub App and no variable, the owners are the accounts the App acts for; a list
+still restricts; a token keeps the old rule. The tool needs the `auto` access tier the person picks per message, and the `bypass`
+tier asks no question. Nothing else in the decision changes: private and empty by default, a yes or no that the tool writes
+below `bypass`, safe to repeat.*
