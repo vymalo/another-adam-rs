@@ -1232,19 +1232,29 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
             })
             .await
             .unwrap();
+        // The answer asks nothing, so the task completes (ADR 0034).
         let mut last = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while last != Some(TaskState::InputRequired) {
+        while !matches!(
+            last,
+            Some(TaskState::Completed | TaskState::InputRequired | TaskState::Failed)
+        ) {
             match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(Some(Ok(StreamResponse::StatusUpdate(u)))) => last = Some(u.status.state),
                 Ok(Some(Ok(StreamResponse::Task(t)))) => last = Some(t.status.state),
                 Ok(Some(Ok(_))) => {}
                 other => panic!(
-                    "{mode}: the task did not wait for the person: {other:?}\n{}",
+                    "{mode}: the task did not settle: {other:?}\n{}",
                     coder.logs()
                 ),
             }
         }
+        assert_eq!(
+            last,
+            Some(TaskState::Completed),
+            "{mode}: an answer that asks nothing completes\n{}",
+            coder.logs()
+        );
         drop(stream);
 
         // The model was offered the twelve tools after the coder's own, and nothing that writes.
