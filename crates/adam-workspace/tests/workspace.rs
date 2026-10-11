@@ -2001,6 +2001,144 @@ async fn a_scratch_project_that_lost_its_root_commit_gets_one_again() {
     assert_eq!(git(again.path(), &["rev-list", "--count", "HEAD"]), "1");
 }
 
+/// A scratch project lives for its conversation: the run that made it records the conversation, a
+/// later run of the same conversation takes the project over (its files, its history and what it
+/// says of where it was published come with it), and another conversation's projects stay put.
+#[tokio::test]
+async fn a_later_run_of_the_conversation_takes_the_scratch_projects_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let first = ws.run("run-1").unwrap();
+    let site = first
+        .add_scratch_for("site", &me(), Some("c1"))
+        .await
+        .unwrap();
+    std::fs::write(site.path().join("index.html"), "<p>hi</p>\n").unwrap();
+    site.scratch()
+        .unwrap()
+        .commit_all("page", &me())
+        .await
+        .unwrap();
+    site.scratch()
+        .unwrap()
+        .set_published_to("https://github.com/acme/site")
+        .await
+        .unwrap();
+    first
+        .add_scratch_for("other", &me(), Some("c2"))
+        .await
+        .unwrap();
+    first.add_scratch("plain", &me()).await.unwrap();
+    assert_eq!(
+        first
+            .slot("site")
+            .await
+            .unwrap()
+            .unwrap()
+            .scratch()
+            .unwrap()
+            .conversation(),
+        Some("c1")
+    );
+
+    let second = ws.run("run-2").unwrap();
+    assert_eq!(second.adopt_scratch("c1").await.unwrap(), ["site"]);
+    let taken = second
+        .slot("site")
+        .await
+        .unwrap()
+        .expect("the project moved");
+    let project = taken.scratch().unwrap();
+    assert_eq!(project.path(), second.path().join("site"));
+    assert_eq!(project.conversation(), Some("c1"));
+    assert_eq!(project.published_to(), Some("https://github.com/acme/site"));
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("index.html")).unwrap(),
+        "<p>hi</p>\n"
+    );
+    assert_eq!(git(project.path(), &["rev-list", "--count", "HEAD"]), "2");
+    // It is the second run's now, and not the first's; what is of another conversation, or of none, stays.
+    assert!(first.slot("site").await.unwrap().is_none());
+    assert!(!first.path().join("site").exists());
+    assert!(first.slot("other").await.unwrap().is_some());
+    assert!(first.slot("plain").await.unwrap().is_some());
+    // A repeat finds nothing, and the project can be written to as any slot of the run.
+    assert!(second.adopt_scratch("c1").await.unwrap().is_empty());
+    assert_eq!(second.adopt_scratch("c2").await.unwrap(), ["other"]);
+    std::fs::write(project.path().join("more.txt"), "more\n").unwrap();
+    assert_eq!(project.status().await.unwrap().len(), 1);
+    // The thread goes on: the next run takes the project from the run that holds it, work in
+    // progress included.
+    let third = ws.run("run-3").unwrap();
+    assert_eq!(third.adopt_scratch("c1").await.unwrap(), ["site"]);
+    assert!(second.slot("site").await.unwrap().is_none());
+    assert!(third.path().join("site/more.txt").is_file());
+}
+
+/// A project whose name the run already has is not replaced: the run's own wins, and the other stays
+/// with its run.
+#[tokio::test]
+async fn taking_over_never_replaces_a_project_the_run_already_has() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = workspaces(tmp.path());
+    let first = ws.run("run-1").unwrap();
+    let old = first
+        .add_scratch_for("site", &me(), Some("c1"))
+        .await
+        .unwrap();
+    std::fs::write(old.path().join("old.txt"), "old\n").unwrap();
+    let second = ws.run("run-2").unwrap();
+    let own = second
+        .add_scratch_for("site", &me(), Some("c1"))
+        .await
+        .unwrap();
+    std::fs::write(own.path().join("own.txt"), "own\n").unwrap();
+
+    assert!(second.adopt_scratch("c1").await.unwrap().is_empty());
+    assert!(second.path().join("site/own.txt").is_file());
+    assert!(!second.path().join("site/old.txt").exists());
+    assert!(
+        first.path().join("site/old.txt").is_file(),
+        "left where it was"
+    );
+    assert!(first.slot("site").await.unwrap().is_some());
+}
+
+/// The janitor's removal of a finished run keeps the projects a later task may take over, and nothing
+/// else; once nothing is kept it is `remove`.
+#[tokio::test]
+async fn remove_keeping_scratch_keeps_only_the_projects_of_a_conversation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, repo) = remote_with(tmp.path(), "acme", "web", &[("web.txt", "base\n")]);
+    let ws = workspaces(tmp.path());
+    let run = ws.run(RUN).unwrap();
+    let worktree = run.add_repository(&repo).await.unwrap();
+    run.add_scratch_for("site", &me(), Some("c1"))
+        .await
+        .unwrap();
+    run.add_scratch("plain", &me()).await.unwrap();
+
+    assert_eq!(run.remove_keeping_scratch().await.unwrap(), 1);
+    assert!(!worktree.path().exists(), "the worktree is gone");
+    let slots = run.slots().await.unwrap();
+    assert_eq!(
+        slots.iter().map(|s| s.dir().to_owned()).collect::<Vec<_>>(),
+        ["site"]
+    );
+    assert!(run.path().join("site/.git").is_dir());
+    assert!(!run.path().join("plain").exists());
+    // Idempotent, and a later full removal takes the rest.
+    assert_eq!(run.remove_keeping_scratch().await.unwrap(), 1);
+    run.remove().await.unwrap();
+    assert!(!run.path().exists());
+    assert!(!tmp.path().join("root/meta").join(RUN).exists());
+    // A workspace with nothing to keep is removed whole.
+    let other = ws.run("run-9").unwrap();
+    other.add_scratch("plain", &me()).await.unwrap();
+    assert_eq!(other.remove_keeping_scratch().await.unwrap(), 0);
+    assert!(!other.path().exists());
+}
+
 /// A check can be run on the code the run started from: a detached checkout of `origin/<base>`
 /// next to the slot, with the installed (ignored) files of the slot linked in, and nothing of the
 /// run's changes. It is a worktree of the same repository, and removing it leaves the run alone.

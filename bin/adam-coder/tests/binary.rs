@@ -1007,8 +1007,8 @@ const OTHER_TOKEN: &str = "ghs_binaryOtherInstallationToken012345678";
 /// * With owners, `list_branches` for `acme` and for `other` are two lookups, two mints and two
 ///   calls, each with its own token; an account the App is not installed on is an error result that
 ///   names the App and the owner, one that is not on `GITHUB_APP_OWNERS` an error result that names
-///   the variable, `get_me` and a search that names no account are error results too, and **none of
-///   these four reaches the server or GitHub**, and no installation is looked up for the account
+///   the variable, and a search that names no account is an error result too, and **none of
+///   these three reaches the server or GitHub**, and no installation is looked up for the account
 ///   that is not on the list.
 /// * No credential is in the logs.
 ///
@@ -1143,19 +1143,22 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
                     "github__list_branches",
                     json!({"owner": "outsider", "repo": "x"}),
                 ),
-                tool_reply("g5", "github__get_me", json!({})),
-                tool_reply("g6", "github__search_code", json!({"query": "fn main"})),
+                tool_reply("g5", "github__search_code", json!({"query": "fn main"})),
                 text_reply("Read acme/widgets and other/gadgets."),
             ]
         } else {
             vec![
-                tool_reply("g1", "github__get_me", json!({})),
+                tool_reply(
+                    "g1",
+                    "github__list_branches",
+                    json!({"owner": "acme", "repo": "widgets"}),
+                ),
                 tool_reply(
                     "g2",
                     "github__list_branches",
                     json!({"owner": "acme", "repo": "widgets"}),
                 ),
-                text_reply("You are octocat, and acme/widgets has trunk-of-widgets."),
+                text_reply("acme/widgets has trunk-of-widgets."),
             ]
         };
         let model = MockServer::start().await;
@@ -1229,19 +1232,29 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
             })
             .await
             .unwrap();
+        // The answer asks nothing, so the task completes (ADR 0034).
         let mut last = None;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while last != Some(TaskState::InputRequired) {
+        while !matches!(
+            last,
+            Some(TaskState::Completed | TaskState::InputRequired | TaskState::Failed)
+        ) {
             match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(Some(Ok(StreamResponse::StatusUpdate(u)))) => last = Some(u.status.state),
                 Ok(Some(Ok(StreamResponse::Task(t)))) => last = Some(t.status.state),
                 Ok(Some(Ok(_))) => {}
                 other => panic!(
-                    "{mode}: the task did not wait for the person: {other:?}\n{}",
+                    "{mode}: the task did not settle: {other:?}\n{}",
                     coder.logs()
                 ),
             }
         }
+        assert_eq!(
+            last,
+            Some(TaskState::Completed),
+            "{mode}: an answer that asks nothing completes\n{}",
+            coder.logs()
+        );
         drop(stream);
 
         // The model was offered the twelve tools after the coder's own, and nothing that writes.
@@ -1261,7 +1274,6 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
         assert_eq!(
             github_tools,
             [
-                "github__get_me",
                 "github__search_repositories",
                 "github__get_file_contents",
                 "github__list_branches",
@@ -1307,12 +1319,9 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
         match auth {
             Auth::Token | Auth::Pinned => {
                 assert_eq!(results.len(), 2, "{mode}: {results:?}");
-                assert!(results[0].contains("octocat"), "{mode}: {}", results[0]);
-                assert!(
-                    results[1].contains("trunk-of-widgets"),
-                    "{mode}: {}",
-                    results[1]
-                );
+                for result in &results {
+                    assert!(result.contains("trunk-of-widgets"), "{mode}: {result}");
+                }
                 // The credentials the server called GitHub with are the coder's own, one per call,
                 // in the mode it runs in: never the listing's placeholder.
                 let want = if auth == Auth::Pinned {
@@ -1320,13 +1329,11 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
                 } else {
                     format!("Bearer {GITHUB_TOKEN}")
                 };
-                for api_path in ["/api/v3/user", "/api/v3/repos/acme/widgets/branches"] {
-                    assert_eq!(
-                        bearer_of(api_path),
-                        std::slice::from_ref(&want),
-                        "{mode} {api_path}\n{logs}"
-                    );
-                }
+                assert_eq!(
+                    bearer_of("/api/v3/repos/acme/widgets/branches"),
+                    [want.clone(), want],
+                    "{mode}\n{logs}"
+                );
                 if auth == Auth::Pinned {
                     // One mint serves both calls (the second is the cached token), by the coder and
                     // not by the server, which holds no key.
@@ -1345,7 +1352,7 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
                 assert_eq!(mints.load(std::sync::atomic::Ordering::SeqCst), 0, "{mode}");
             }
             Auth::Owners => {
-                assert_eq!(results.len(), 6, "{mode}: {results:?}");
+                assert_eq!(results.len(), 5, "{mode}: {results:?}");
                 // Two owners, two installations, two tokens: each call has its own owner's.
                 assert!(
                     results[0].contains("trunk-of-widgets"),
@@ -1407,9 +1414,9 @@ async fn the_embedded_agent_connects_the_real_github_mcp_server() {
                     seen.iter().all(|r| !r.url.path().contains("outsider")),
                     "{mode}: GitHub heard of the account that is not on the list: {seen:?}"
                 );
-                // `get_me` and a search that names no account: said why, and not sent.
-                assert!(results[4].contains("not a user"), "{mode}: {}", results[4]);
-                assert!(results[5].contains("one account"), "{mode}: {}", results[5]);
+                // A search that names no account: said why, and not sent. `get_me` is not offered
+                // (an App is not a user), so nothing asks GitHub who the caller is.
+                assert!(results[4].contains("one account"), "{mode}: {}", results[4]);
                 assert!(bearer_of("/api/v3/user").is_empty(), "{seen:?}");
             }
         }

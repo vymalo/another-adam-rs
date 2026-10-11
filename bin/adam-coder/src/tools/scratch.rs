@@ -57,10 +57,11 @@ const MAX_LISTED: usize = 20;
 /// something in when the person has named no repository yet (or before one exists). Write the
 /// files with write_file, apply_patch or delegate_to_opencode and run the real checks with
 /// run_checks, passing `repo` with the project's name when the workspace has more than one slot.
-/// A scratch project is temporary: it exists only while this task is open, and nothing in it is
-/// kept unless it is published to a repository the person names, with publish_scratch. Tell the
-/// person so. Calling it again with the same name is harmless.
-#[tool(label = "Start a scratch project")]
+/// A scratch project stays for this conversation: the next tasks of it find the project again, and it
+/// goes after days with no task in the conversation. Nothing in it reaches a repository unless it
+/// is published to one the person names, with publish_scratch. Tell the person so. Calling it again
+/// with the same name returns the project and what it holds.
+#[tool(label = "Start a scratch project", icon = "file")]
 pub async fn start_scratch(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -70,7 +71,10 @@ pub async fn start_scratch(
     let name = name.as_deref().and_then(non_empty).unwrap_or(DEFAULT_NAME);
     let run = ctx.root_run_id().to_string();
     let workspace = env.workspaces.run(&run).map_err(|e| workspace_error(&e))?;
-    let slot = match workspace.add_scratch(name, &env.settings.identity).await {
+    let slot = match workspace
+        .add_scratch_for(name, &env.settings.identity, ctx.conversation_id())
+        .await
+    {
         Ok(slot) => slot,
         Err(e @ (WorkspaceError::Invalid(_) | WorkspaceError::Conflict(_))) => {
             return Ok(ToolOutput::error(format!(
@@ -84,13 +88,35 @@ pub async fn start_scratch(
     let mut text = format!(
         "Scratch project ready.\nslot: {}\npath: {}\nWrite files in it with write_file, \
          apply_patch or delegate_to_opencode, and run its checks with run_checks (say \
-         `repo: {}` when the workspace has more than one slot).\nIt is temporary: it exists only \
-         while this task is open, and nothing in it is kept unless it is published to a \
-         repository the person names (publish_scratch). Tell the person that.",
+         `repo: {}` when the workspace has more than one slot).\nIt stays for this conversation: \
+         the next tasks of it find the project again, and it goes after days with no task in the \
+         conversation. Nothing in it reaches a repository unless it is published to one the \
+         person names (publish_scratch). Tell the person that.",
         slot.dir(),
         slot.path().display(),
         slot.dir()
     );
+    if let Some(project) = slot.scratch()
+        && let Ok(files) = project.files().await
+        && !files.is_empty()
+    {
+        let shown: Vec<String> = files
+            .iter()
+            .take(MAX_LISTED)
+            .map(|f| f.display().to_string())
+            .collect();
+        let more = files.len().saturating_sub(MAX_LISTED);
+        text.push_str(&format!(
+            "\nIt already holds {} file(s) (from this task or an earlier one of the conversation): {}{}.",
+            files.len(),
+            shown.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
     if let Some(note) = published_note(&slot) {
         text.push('\n');
         text.push_str(&note);
@@ -123,7 +149,7 @@ pub async fn start_scratch(
 /// result says whether the checks you ran on the project still hold for the code in the
 /// repository: if not, run them again in the new slot, then commit_and_push and
 /// open_pull_request with `repo` set to that slot.
-#[tool(label = "Publish a scratch project")]
+#[tool(label = "Publish a scratch project", icon = "git")]
 pub async fn publish_scratch(
     env: State<ToolEnv>,
     ctx: &ToolCtx,

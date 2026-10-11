@@ -46,8 +46,8 @@ sequenceDiagram
 
 | Tool | Does |
 |---|---|
-| `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository that is granted**: one the person named in their own messages of the run, or agreed to add when `request_repository` asked (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `request_repository` (or to `ask_user`, when it has no repository to ask about). Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
-| `start_scratch { name? }` | `RunWorkspace::add_scratch` for the run (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. The result says the project is **temporary** (it exists only while the task is open, nothing is kept unless it is published) and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
+| `prepare_workspace { repo_url, base_branch?, branch? }` | `RunWorkspace::add_repository` for the run: **a slot of the run's workspace** (a worktree named after the repository: `slot: <dir>` in the result), idempotent per repository, so a restart or a repeated call reuses it and a second repository is added next to the first ([below](#the-workspace-of-a-run)). **Only for a repository that is granted**: one the person named in their own messages of the run, or agreed to add when `request_repository` asked (see [the rules](#the-rules-in-code)); any other is a tool error that sends the model to `request_repository` (or to `ask_user`, when it has no repository to ask about). Without `base_branch` the worktree starts from the repository's default branch (`Workspaces::default_branch`, what the remote's `HEAD` names; a repeated call in a prepared workspace reuses its base without asking the remote). A `base_branch` the remote does not have is a tool error that lists the remote's branches (the first 30) so the model can pick one or ask. **A repository with no ref at all (just created) is a normal start, not an error**: the call completes and says the repository is empty and that no worktree was made, with the way on (`start_scratch`, then `publish_scratch`, which gives the repository its first commit); it is told the same with or without a `base_branch`, and nothing is written to the repository. With `branch` (a branch an earlier `commit_and_push` of the conversation reported for this repository), `Workspaces::prepare_continuing`: the worktree starts from that branch, and `open_pull_request` later adds the run's commits to it and so updates its pull request (see [A task that continues a task](#a-task-that-continues-a-task)) |
+| `start_scratch { name? }` | `RunWorkspace::add_scratch_for` for the run and its conversation (`scratch` unless named; `^[a-z0-9][a-z0-9._-]{0,63}$`, not ending `.git`): **a scratch slot**, a local git repository with an empty root commit, to build and test something in before any repository is named. Idempotent per name; a name a repository's slot has, or a bad one, is a result that says so. A project the conversation's earlier tasks made is returned with the files it holds listed. The result says the project **stays for the conversation** (the next tasks find it; it goes after days with no task in it) and that nothing reaches a repository unless it is published, and that the model must tell the person ([below](#scratch-projects)). Every tool that works in a slot works in it: the file tools, `run_command`, `run_checks`, `delegate_to_opencode` |
 | `publish_scratch { repo_url, scratch?, base_branch?, path?, overwrite? }` | puts the files of a scratch project into a repository **that is granted** (the same rule and the same refusal as `prepare_workspace`, checked before anything talks to a remote): the repository's slot is found or made, an **empty** remote (no ref at all) first gets an empty-tree `Initial commit` on its base branch (`Workspaces::initialize_empty`: the only push outside `agent/*`, never forced; `main` unless `base_branch`), a repository that **already has files** needs `path` (a directory of it) or `overwrite: true` (the person's to decide: the result tells the model to ask), then `copy_into` (all or nothing, collisions listed). The project remembers where it went (`published_to`). The result says which slot to use next and whether the checks that ran on the project hold for this code ([below](#scratch-projects)) |
 | `run_command { command, cwd?, repo? }` | **looking around**: `git branch -r`, `ls`, `cat README.md`, `git log`. Run in the run's environment ([below](#where-the-processes-of-a-run-run)) with the same shell, `cwd` rule, timeout and output cap as `run_checks`, but it emits **no** `checks` artifact, uses **no** check cycle, and a non-zero exit is a plain answer, not a failure. It is not an editing path: `HEAD`, the branch, the tree of the worktree (what `commit_and_push` would commit), the refs and the git configuration (see [below](#looking-around-and-what-it-may-not-do)) are recorded before the command, and a command after which any of them differs is **undone** (`git reset --hard`, `clean`, `read-tree`: uncommitted work of the run comes back exactly) and refused, with a message that sends the model to `run` (to make something with a command) or to the file tools and `delegate_to_opencode` (to change code). Writes to ignored paths (build output) are not changes. **For looking**: see `run` for making and `run_checks` for checking |
 | `run { command, cwd?, repo? }` | **making something with a command, and keeping it**: `npm run render`, `python chart.py`, an install, a build. Runs exactly as `run_command` does (the run's environment, the same shell, `cwd` rule, `CHECK_TIMEOUT_SECS` and output cap, secrets hidden from the child, a missing tool reported as a missing toolchain), but the **files it changes stay**, and the result lists what `git status` shows (files the project ignores are kept too and are not listed). It is **never a check**: no `checks` artifact, no cycle, nothing written to the run's notes, so the gate cannot see it; the files it changed make an earlier green check stale, which the result says. It cannot touch git: the same record as `run_command`'s is compared after the command, minus the files, and a command that changed `HEAD`, the branch, a ref, the `.git` file, the configuration or `info/exclude` is **undone entirely, its files included**, and refused ([below](#making-something-with-a-command)). A timeout kills the process group and what it had written stays. Progress lines: `running: <command>`, then `changed files: <command>` or `ran: <command>` |
@@ -68,7 +68,7 @@ sequenceDiagram
 
 A folder's `mcp.json` adds the tools of its MCP servers to these, named `<server>__<tool>` (see [MCP tools from the
 folder](#mcp-tools-from-the-folder)); they are not part of the twenty. The shipped folder's own `mcp.json` adds
-twelve **read-only** tools of GitHub, `github__get_me`, `github__get_file_contents`, `github__list_branches` and the
+eleven **read-only** tools of GitHub, `github__get_file_contents`, `github__list_branches` and the
 rest (see [GitHub over MCP](#github-over-mcp-read-only)). The tools the conversation's endpoint lists
 (`thread-tools/v1`) are offered too, at every model turn, under their listed names: a `ToolSource`, not a tool of
 this crate (see [Asking with choices](#asking-with-choices)). A call to one waits as long as the tool says it may take (`_meta["thread-tools/v1"].timeoutSecs`), at most `THREAD_TOOLS_MAX_CALL_SECS`; a tool the orchestrator reports as a step gets no step of the coder's; and a message that mentions agents adds a "Mentioned agents" block to the instructions ([`adam-ui`](../../crates/adam-ui/README.md), [ADR 0015](../../docs/decisions/0015-tools-the-orchestrator-reports-long-calls-and-mentioned-agents.md)).
@@ -105,7 +105,24 @@ by its name; [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its
 | `turn_output` (the endpoint's) | Send the answer | a subagent (`explorer`) | its name capitalised (Explorer) |
 
 `tests/agent_files.rs` (`every_tool_of_the_coder_has_a_title_for_its_step`) fails for a tool with none, so a new tool must
-bring its title. **`delegate_to_opencode` is a `subagent` step titled "Hand to OpenCode"** with its own icon, `opencode`
+bring its title.
+
+**Each step also has a picture**, the `icon` of `steps/v1` (`#[tool(icon = "...")]`), by what the call does:
+
+| Icon | Tools |
+|---|---|
+| `read` | `read_file` |
+| `edit` | `write_file`, `edit_file`, `apply_patch` |
+| `execute` | `run_command`, `run`, `run_checks`, `rebuild_environment` |
+| `git` | `prepare_workspace`, `commit_and_push`, `open_pull_request`, `create_repository`, `publish_scratch` |
+| `file` | `start_scratch`, `share_file` |
+| `think` | `ask_user`, `request_repository` (the tools that ask the person) |
+| `opencode` | `delegate_to_opencode` |
+
+`show` and `ui_catalog` have none, and neither has a call to a GitHub MCP tool (an MCP tool says a title, not a picture).
+The calls of the orchestrator's own tools (web search, reading a page) are steps the orchestrator reports itself
+(`reportsStep`), so their picture is its to choose. `every_tool_of_the_coder_has_an_icon_for_its_step` pins the table.
+**`delegate_to_opencode` is a `subagent` step titled "Hand to OpenCode"** with its own icon, `opencode`
 (`#[tool(step = "subagent", label = "Hand to OpenCode", icon = "opencode")]`), and what OpenCode reports over ACP is the
 tree under it:
 
@@ -137,7 +154,7 @@ and its plan as they are, and `Hand to OpenCode: done` when the call ends (`test
 The coder **streams its model calls** (`LlmAgentBuilder::stream_text`, on by default), and its card lists `text-stream/v1`
 ([ADR 0007](../../docs/decisions/0007-progress-as-steps-and-streamed-text.md); the contract is the orchestration layer's
 `docs/api/text-stream-v1.md`). A client that activates it reads each answer as chunks while the model writes (artifact updates
-named `reply`, each with where it begins in UTF-8 bytes, the last marked `lastChunk`), then the status that ends the turn (`completed`, or `input-required` for a reply that delivers nothing, which the coder
+named `reply`, each with where it begins in UTF-8 bytes, the last marked `lastChunk`), then the status that ends the turn (`completed`, or `input-required` for a reply that asks something, which the coder
 turns into a question: `PendingQuestion::stream` says which stream the question is), whose message is the whole text
 and names the stream (`metadata["https://agents.vymalo.com/a2a/extensions/text-stream/v1"] =
 {"streamId": ..}`); the words the model writes before a tool call are stated by a `working` status of their own, the same
@@ -329,26 +346,39 @@ make them hold:
   completing, whatever the model says. So does a run that ends without a pull
   request because GitHub or git rejected the credentials (the model cannot fix a
   bad token, or an App that is not installed there): the error names `GITHUB_TOKEN`, or the `GITHUB_APP_*`
-  variables in App mode. Anything else is a **question,
-  not a completion** (red checks with cycles left included: fixing or asking is
-  the model's call): the model
-  that answers "Hi! I need a repository and a task" in plain text asked
+  variables in App mode. **A reply that asks something is a question,
+  not a completion**: the model
+  that answers "Hi! Which repository should I work on?" in plain text asked
   something, and the run parks exactly as if it had called `ask_user`: A2A
   reports `input-required` with the model's text (trimmed; a fixed sentence when
   there is none) as the question, the run waits with no timer, and the next
-  delivered message resumes it. The conversation is made to say what happened:
+  delivered message resumes it. What asks is read from the words (`asks_the_person`
+  in `src/agent.rs`): a sentence that ends in a question mark (`?`, `？`, `؟`, with
+  closing quotes or emphasis after it) in the **last paragraph**, outside code spans,
+  code blocks and links. A rhetorical question earlier in a long answer does not make
+  the reply a question, and a request that is no question ("Tell me the repository")
+  is not read as one: the instructions tell the model to ask, or to use `ask_user`.
+  A reply with no words and one cut by the model's length limit (`output.truncated`) wait
+  too, as does **any reply while repository work is left undelivered** (`owes_delivery`):
+  a worktree with changes nobody committed, commits nobody pushed, a push with no
+  pull request, or a rework that did not update the pull request it continues (red checks with cycles left included: fixing or asking is the model's
+  call). **Every other reply completes the task**: an answer, a report, "Merged - main is
+  at 1912174" ask nothing, so the thread shows the work as done, not as blocked
+  (it used to wait whatever the reply said, [ADR 0034](../../docs/decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md)),
+  and the person's next message starts the next task, which continues the conversation. The conversation is made to say what happened:
   the model's last message gets an `ask_user` call carrying that text, and the
   person's answer is that call's result, as for a real `ask_user`, so the
   history stays valid for every provider; its id is `stop` and the turn as five
   digits, nine alphanumeric characters, which the strictest providers accept. The
   turn and check-cycle limits and CancelTask apply to a parked run as to any other.
-  **A run with nothing to deliver never completes on its own**, and there is no
+  **A run with repository work to deliver never completes on its own**, and there is no
   limit on how often it asks: it is a chat, and the person can answer, say
-  something else or stop it. The exits are a pull request, a failure (the rules
+  something else or stop it. The exits are a pull request, an answer that asks nothing, a failure (the rules
   above, `max_turns`, `max_tool_calls`, a model or tool error that is not retried)
   and CancelTask (a chat's Stop).
-* **A scratch project is temporary, and what is published is what was checked.** It lives as long as the run (the
-  janitor deletes it with the rest of the workspace; the instructions and the tool's result tell the model to say so),
+* **A scratch project lives for the thread, and what is published is what was checked.** It stays for the conversation:
+  the next task takes it over, and the janitor removes it once the conversation has had no task for `SCRATCH_IDLE_DAYS`
+  (7 by default; the instructions and the tool's result tell the model to say so; [Scratch projects](#scratch-projects)),
   `commit_and_push` there is a local commit and `open_pull_request` is refused, so nothing leaves the process until
   `publish_scratch` copies the files into a repository the person named. The gate does not change: the checks that ran
   on the project are bound to the pushed commit only when its tree is the same ([below](#scratch-projects)).
@@ -425,7 +455,8 @@ stateDiagram-v2
   Stepping --> Stopped: the model stops (a turn without tool calls)
   Stopped --> Completed: a pull request was opened
   Stopped --> Failed: red checks with no cycles left, or the credentials were rejected
-  Stopped --> InputRequired: anything else, the model's text is the question
+  Stopped --> Completed: the reply asks nothing and no repository work is left undelivered
+  Stopped --> InputRequired: the reply asks, is empty or cut off, or repository work is undelivered
   Stepping --> InputRequired: ask_user
   InputRequired --> Stepping: the person answers
   InputRequired --> Canceled: CancelTask
@@ -571,7 +602,9 @@ slot, and may be joined by others.
   (`Workspaces::runs`), a run the store reports `done` or `failed` (a cancel is `failed`), or does not know, has what its
   environment holds released (`Environment::release`; nothing for `Local`; a release that fails leaves the workspace for
   the next sweep) and **then** loses its
-  workspace (`RunWorkspace::remove`: every slot, the legacy worktree, the metadata); the sweep then asks the environment what
+  workspace (`RunWorkspace::remove`: every slot, the legacy worktree, the metadata, **except the scratch projects of a
+  conversation that is still alive**, which stay with `RunWorkspace::remove_keeping_scratch`; `Sweep::kept_scratch`
+  lists those runs, [Scratch projects](#scratch-projects)); the sweep then asks the environment what
   it still holds (`held_runs`) and releases what belongs to runs that are over or unknown even though they have no workspace
   here (`Sweep::orphans`); a **`runnable` or `parked` run is
   never swept**, so a run waiting a week for an answer keeps its files; a directory that is not a run id is left alone.
@@ -599,7 +632,7 @@ sequenceDiagram
   loop every WORKSPACE_SWEEP_SECS
     J->>S: load_run for each run with a workspace
     S-->>J: open, finished or unknown
-    J->>W: remove, for a finished or unknown run
+    J->>W: remove (a finished run keeps the scratch projects of a live conversation), for a finished or unknown run
   end
 ```
 
@@ -657,6 +690,21 @@ project into it:
    the code that will be pushed, so `commit_and_push` binds it to the pushed commit and the pull request is allowed;
    any other tree is *not checked* until `run_checks` runs in the new slot, and the result says so.
 
+**A scratch project lives for the thread** (the owner's decision of 2026-10-11, [ADR 0034](../../docs/decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md)):
+the tasks of one A2A context are one thread, and A2A has no "delete the thread". `start_scratch` records the
+conversation of the run in the project's metadata (`add_scratch_for`), and:
+
+* **The next task takes it over.** In its first step the agent moves the scratch projects that other runs' workspaces hold
+  for the same conversation into its own workspace (`RunWorkspace::adopt_scratch`: the directory is renamed, the
+  metadata rewritten, under both runs' locks, once per run: `RunNotes::scratch_adopted`). The model asks `start_scratch`
+  for its name and gets the project back, with the files it holds listed. A name the run already has is left where it is.
+* **The janitor keeps it.** A finished run's worktrees and environment are released as before, but its projects stay
+  while the conversation is alive: a task of it is open, or the newest one was touched within `SCRATCH_IDLE_DAYS`
+  (default **7**, measured from the store, so the thread's activity decides, not the run's). After that the next sweep removes
+  the rest. `SCRATCH_IDLE_DAYS=0` is the old rule: the project goes with its run. A project made without a conversation
+  (before this) and a run the store does not know go with their run.
+* **The disk holds them.** A retained project is files on the worker's volume (`WORKSPACE_ROOT`) for up to the idle time.
+
 The project is left as it is and remembers where it went (`published_to`); the tools that change it afterwards
 (`write_file`, `apply_patch`, `commit_and_push`, `start_scratch` again) say that the change does not reach the repository,
 and a second `publish_scratch` copies it again (a file that differs needs `overwrite`). The scratch history is **not**
@@ -696,8 +744,10 @@ stateDiagram-v2
   Scratch --> Published: publish_scratch (named; empty, or path / overwrite)
   Published --> Pushed: run_checks if the tree changed, commit_and_push, open_pull_request in the new slot
   Scratch --> Delivered: share_file, then the model stops (no repository named, created or published)
-  Delivered --> Deleted: the run is done, with no pull request (the janitor)
-  Scratch --> Deleted: the run ends, nothing published (the janitor)
+  Delivered --> Kept: the run is done, with no pull request (the janitor keeps the project)
+  Scratch --> Kept: the run ends, nothing published (the janitor keeps the project)
+  Kept --> Scratch: the next task of the conversation takes it over
+  Kept --> Deleted: the conversation was idle for SCRATCH_IDLE_DAYS
   Published --> Released: the run ends (the janitor), the pushed branch stays
   Deleted --> [*]
   Pushed --> Released
@@ -717,12 +767,13 @@ an answer that nobody needed to give. When the model stops with no pull request,
   `src/main.rs` that only reads like one), created, pushed or continued.
 
 A run that must fail (rejected credentials, a spent budget with the last check red) fails first, whatever it shared. Anything
-else is as before: the stop is a question and the run waits, so a scratch run that answered and shared nothing still waits,
-and a model that needs an answer before it can deliver asks with `ask_user`. The prompt tells the model to share the result,
-to say what it is and to offer publishing in one sentence. **The scratch project is deleted with the completed run**
-([ADR 0008](../../docs/decisions/0008-a-workspace-holds-several-repositories.md)), so a person who takes the offer starts a
-follow-up task that continues the conversation, and the coder makes the project again in a new scratch project before
-`publish_scratch` (the prompt says so).
+else is judged by its words: a reply that asks waits, one that asks nothing completes (the completion policy above), and a
+model that needs an answer before it can deliver asks with `ask_user`. The prompt tells the model to share the result,
+to say what it is and to offer publishing in one sentence. **The scratch project stays for the conversation** (it used to be
+deleted with the completed run; decision 5 of [ADR 0008](../../docs/decisions/0008-a-workspace-holds-several-repositories.md)
+is amended by [ADR 0034](../../docs/decisions/0034-a-turn-that-asks-nothing-completes-and-scratch-lives-for-the-thread.md)),
+so a person who takes the offer starts a follow-up task that continues the conversation, finds the project with
+`start_scratch` and `publish_scratch`es it.
 
 ### Another repository, only with the person's yes
 
@@ -1257,7 +1308,7 @@ The coder has a name and talks like a colleague, not like its tool schemas (adam
   [`adam-ui`](../../crates/adam-ui/README.md) makes them (`show` refuses a `Choices` form: ask with `ask_user`).
 * **A greeting gets a greeting**: "hi" is answered with a short greeting that says the name and what the agent does
   in one sentence (the second persona line, `In one sentence: <summary>.`) and asks one open question, what it can help with. It is not a task with something missing, so no tool is called
-  and nothing is asked for "the task" or for a repository. The run waits for the answer (A2A `input-required`, as for any plain-text stop that delivers nothing).
+  and nothing is asked for "the task" or for a repository. The run waits for the answer (A2A `input-required`, as for any plain-text reply that asks).
 * **"What can you do?" and "list your tools"** are answered in plain words first: answer and explain, research when it has research tools, write a report, plan or chart
   and share it as a file, plan a large request and confirm it, make a change to a repository the person names (look around,
   run its checks, push a branch, open a pull request), ask when unsure. Then what
@@ -1541,6 +1592,7 @@ way; every problem is reported at once at startup):
 | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories. **Development and tests only** | `false` |
 | `WORKSPACE_ROOT` | mirrors, the workspaces of runs, run notes | `/work` |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs ([below](#the-workspace-of-a-run)); `0` turns it off | `300` |
+| `SCRATCH_IDLE_DAYS` | how many days a scratch project outlives the last task of its conversation before the janitor removes it ([Scratch projects](#scratch-projects)); `0`: it goes with its run | `7` |
 | `WORKSPACE_PLACEMENT` | where the files of a run live: `shared`, `affinity` or `isolated` (`a2a-only` is refused; see [Workspace placement](#workspace-placement)) | `shared` |
 | `WORKER_ID` | stable identity of this worker (lease identity, and run owner when pinned): 1 to 128 of letters, digits, `.`, `_`, `-`, not starting with `.` | random per process; **required** by `affinity` and `isolated` |
 | `WORKERS` | runs advanced concurrently | `4` |
@@ -1812,14 +1864,14 @@ decision 8 of [ADR 0009](../../docs/decisions/0009-github-per-installation-read-
 { "mcpServers": { "github": {
   "type": "http",
   "url": "http://127.0.0.1:8082/",
-  "tools": ["get_me", "search_repositories", "get_file_contents", "list_branches", "list_commits", "get_commit",
+  "tools": ["search_repositories", "get_file_contents", "list_branches", "list_commits", "get_commit",
             "search_code", "list_issues", "issue_read", "search_issues", "list_pull_requests", "pull_request_read"] } } }
 ```
 
 * **Read-only twice over.** The sidecar is started with `--read-only` (it offers no write tool) and four toolsets
   (`github-mcp-server http --read-only --toolsets context,repos,issues,pull_requests --listen-host 127.0.0.1 --port
-  8082`: the chart's `githubMcp`, the `github-mcp` service of `compose.yaml`), and the `tools` allow-list names twelve
-  reads, so the model sees `github__get_me`, `github__search_repositories`, `github__get_file_contents`,
+  8082`: the chart's `githubMcp`, the `github-mcp` service of `compose.yaml`), and the `tools` allow-list names eleven
+  reads, so the model sees `github__search_repositories`, `github__get_file_contents`,
   `github__list_branches`, `github__list_commits`, `github__get_commit`, `github__search_code`, `github__list_issues`,
   `github__issue_read`, `github__search_issues`, `github__list_pull_requests` and `github__pull_request_read`, after
   the coder's own tools, and nothing that writes. Pushes and pull requests go through `commit_and_push` and
@@ -1835,13 +1887,14 @@ decision 8 of [ADR 0009](../../docs/decisions/0009-github-per-installation-read-
   the cache are the ones `git` and the REST calls go through**. With a **token** (`GITHUB_TOKEN`, sent as `Bearer` on
   every call) or a **pinned App installation** (the installation token the coder minted, the same one for every
   call) the call's subject only chooses what the credentials look at: one token serves any call, a search that names
-  no account and `get_me` included. A refusal of the credentials (`Auth`, `Invalid`, `NotFound`) is an error result the
+  no account included. A refusal of the credentials (`Auth`, `Invalid`, `NotFound`) is an error result the
   model reads, and nothing is sent to the server; `RateLimited` and `Transient` fail the step transiently and it is
   retried (nothing was sent). **An App by owner** (`GITHUB_APP_OWNERS`, no pin) needs a call to be about **one account**:
   a search that names none or several (`org:a org:b`) is an error result that says to give `owner` (and `repo`) or one
   `org:`, `user:` or `repo:`, and `github__get_me` (the authenticated *user*, which an App is not: the server's `GET /user`
   is a `403` for an installation token) is an error result; neither is sent, and no installation is looked up for a
-  guess. The call's owner then decides the installation, through `GitCredentials::token_for`, so the owner list, the
+  guess. The shipped `mcp.json` does not list `get_me`, so the model is not offered a call that could only fail; the
+  refusal stays for a folder that lists it. The call's owner then decides the installation, through `GitCredentials::token_for`, so the owner list, the
   account cache and the token cache apply. The model's arguments are untrusted: an `owner` or `repo` with a character outside
   `A-Z a-z 0-9 . - _` is never put in a URL.
 * **No credential in the file, none in the server.** A file that gives `github` an `Authorization` header, or points it
@@ -1864,7 +1917,7 @@ decision 8 of [ADR 0009](../../docs/decisions/0009-github-per-installation-read-
   and digest (v1.12.2) and its build and the container smoke test list its tools over stdio, with no credential at all
   (the server lists tools without calling GitHub, *verified*).
 * **Development and the e2e read a mock.** The compose file mounts `dev/coder-agent/mcp.json` over the folder's
-  `mcp.json` (the same twelve tools from `mock-github-mcp`, a WireMock of the server's streamable HTTP endpoint over
+  `mcp.json` (the same eleven tools from `mock-github-mcp`, a WireMock of the server's streamable HTTP endpoint, which lists the server's twelve, `get_me` too, over
   plain `http`, with `MCP_ALLOW_INSECURE=true` and `GITHUB_MCP_URL=http://mock-github-mcp:8080`, and no credential in
   the file). The default script of `mock-coder` reads `github__list_branches` of `local/sandbox` right after
   `prepare_workspace`, and `dev/coder-e2e.sh` asserts the mock saw `initialize`, `tools/list` (with the placeholder) and
@@ -1883,8 +1936,8 @@ sequenceDiagram
   P->>B: for_listing
   B-->>P: ghs_adam_listing_only
   P->>S: initialize, tools/list (that bearer): no request to GitHub
-  S-->>P: 25 tools (read-only, four toolsets): the twelve of the allow-list must all be there
-  Note over P,S: serving: the model is offered the twelve as github__<name>
+  S-->>P: 25 tools (read-only, four toolsets): the eleven of the allow-list must all be there
+  Note over P,S: serving: the model is offered the eleven as github__<name>
   M->>P: github__list_branches {owner, repo}
   P->>B: for_call("list_branches", arguments)
   B->>C: token_for(https://host/owner/repo)
@@ -1978,7 +2031,7 @@ database of its own, so the role needs `CREATEDB`):
   and a wiremock GitHub. **Every case runs once per store** (`memory::*`, and
   `postgres::*` when the variable is set): the happy path (working, progress,
   checks, artifacts (`checks`, the `checks` bound to the pushed commit, `branch`, `pull_request`), completed, branch on the remote, PR request at the mock),
-  the `input-required` round trip, a plain-text stop that delivered nothing (the
+  the `input-required` round trip, a plain-text reply that asks (the
   owner's "Hi": `input-required` with the text as the question, the answer reaches the
   model and the run goes on to a pull request; no text at all; checks then text;
   a message in the context of a parked run continues it; cancel while parked), an invented
@@ -2068,13 +2121,13 @@ database of its own, so the role needs `CREATEDB`):
   call choose the credentials asked for, on the configured host, for every tool that takes them, and a name that is not
   a URL component never reaches a URL; a search names its account with `repo:`, `org:` or `user:` (negated qualifiers
   and quoted phrases are not read, two owners are two accounts); a token and a pinned installation serve every call
-  (a search with no account, two accounts, `get_me`), a bearer for another host than its credentials refuses; what the
+  (a search with no account, two accounts, `get_me` for a folder that lists it), a bearer for another host than its credentials refuses; what the
   credentials say reaches the call typed (a refusal for the model, a transient failure retried, no token in either); for
   an App by owner (`a_search_with_no_or_several_accounts_is_refused_without_a_pin`, `get_me_is_refused_for_an_app_without_a_pin`)
   a search with no account or several, a call with an owner that is no login, and `get_me` are refused, the credentials
   are not asked, and one account is served from its own installation.
   `tests/agent_files.rs`: the shipped `mcp.json` is the GitHub server over http at `127.0.0.1:8082` with exactly the
-  twelve reads (none starts with a verb that writes) and **no credential of any kind** (no header, no `env`, no
+  eleven reads (none starts with a verb that writes) and **no credential of any kind** (no header, no `env`, no
   `${VAR}`); the embedded files bound to another origin are refused (`Invalid`), and at their own with nothing
   listening are `Transient`. `tests/binary.rs`: the worker on the embedded files stops with 78 when `GITHUB_MCP_URL`
   is another origin than the file's (naming the server and the variable) and with 69 when nothing listens, never with
@@ -2082,12 +2135,12 @@ database of its own, so the role needs `CREATEDB`):
   the Dockerfile pins; the case skips itself without it, and without Postgres), the whole binary connects the **real**
   server in `http` mode, run as the chart runs it with no credential and no environment, on a free port: the mock
   GitHub has received **zero** requests when the coder is ready (the listing uses the placeholder), the model is
-  offered the twelve tools in order after the coder's own and none that writes, `github__get_me` and
-  `github__list_branches` reach the mock carrying the coder's credentials of that call (the token; or the pinned
+  offered the eleven tools in order after the coder's own and none that writes, and two `github__list_branches`
+  calls reach the mock carrying the coder's credentials of that call (the token; or the pinned
   installation's token, minted once for both), never the placeholder, and no secret is in a log. A third mode is an
   App by owner: `list_branches` for `acme` and for `other` are two lookups, two mints and two calls, each with its own
   owner's token; an account the App is not installed on is an error result naming the App and the owner, an owner off the
-  list one naming `GITHUB_APP_OWNERS`, and `get_me` and a search that names no account are error results, none of the four
+  list one naming `GITHUB_APP_OWNERS`, and a search that names no account is an error result, none of the three
   reaching the server or GitHub, and nothing is looked up for the owner that is off the list. The other tests of
   those two files use the shipped folder without its `mcp.json` (`common::plain_folder`), since a test would have to
   run the sidecar; `adam-mcp`'s `wiremock_compose` connects `mock-github-mcp`; `dev/coder-e2e.sh`,
@@ -2190,7 +2243,7 @@ database of its own, so the role needs `CREATEDB`):
   several; `a_cancelled_run_publishes_nothing`; `the_history_of_the_project_is_not_carried_into_the_repository`),
   `tests/e2e.rs`' `a_scratch_project_is_published_to_the_repository_the_person_names` (per store: build and check, the run parks
   on the question with nothing pushed, the answer names an empty repository, publish, push, pull request),
-  `tests/janitor.rs`' `a_scratch_project_goes_with_its_run_unless_the_run_is_waiting`, and the compose scenario
+  `tests/janitor.rs`' `a_scratch_project_goes_with_its_run_unless_the_run_is_waiting` (a project without a conversation), `a_scratch_project_outlives_its_run_while_the_conversation_is_alive`, `a_scratch_project_goes_when_its_conversation_has_been_idle` and `without_an_idle_time_a_scratch_project_goes_with_its_run`, `tests/e2e.rs`' `a_scratch_project_is_found_again_by_the_next_task_of_the_conversation`, and the compose scenario
   `SCENARIO=scratch sh dev/coder-e2e.sh` (the `[mock:scratch]` script, which `wiremock_compose` of `adam-model-openai` plays
   against a real WireMock).
 * `tests/tools.rs`: each tool against real worktrees, including the hostile

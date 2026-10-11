@@ -4,7 +4,6 @@
       "type": "http",
       "url": "http://127.0.0.1:8082/",
       "tools": [
-        "get_me",
         "search_repositories",
         "get_file_contents",
         "list_branches",

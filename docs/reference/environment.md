@@ -76,6 +76,7 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `WORKSPACE_ROOT` | mirrors, run workspaces, run notes | `/work` |
 | `WORKSPACE_PLACEMENT` | `shared`, `affinity` or `isolated` ([placement](workspace-and-environments.md#placement-which-worker-holds-a-runs-files)) | `shared` |
 | `WORKSPACE_SWEEP_SECS` | how often the janitor removes finished runs' workspaces; `0` is off | `300` |
+| `SCRATCH_IDLE_DAYS` | days a scratch project is kept after the last task of its conversation; `0`: it goes with its run ([thread-long scratch](workspace-and-environments.md#a-runs-workspace)) | `7` |
 | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
 | `SCRATCH_CHECK_CYCLES` | the same for a scratch project, counted apart | `5` |
 | `CHECK_TIMEOUT_SECS`, `CHECK_OUTPUT_TAIL_BYTES` | limits of one `run_checks`, `run_command` or `run` | `900`, `16384` |

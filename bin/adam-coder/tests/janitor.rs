@@ -19,12 +19,17 @@ use tokio_util::sync::CancellationToken;
 
 /// A run in `store` with `status`.
 async fn run_in(store: &DynStore, status: RunStatus) -> RunId {
+    run_of(store, status, None).await
+}
+
+/// A run in `store` with `status`, a task of `conversation`.
+async fn run_of(store: &DynStore, status: RunStatus, conversation: Option<&str>) -> RunId {
     let id = RunId::new();
     store
         .create_run(NewRun {
             id,
             agent: "coder".to_owned(),
-            conversation_id: None,
+            conversation_id: conversation.map(str::to_owned),
             parent_id: None,
             status,
             state: json!({}),
@@ -51,9 +56,9 @@ fn workspace_dir(fx: &Fixture, run: &str) -> std::path::PathBuf {
     fx.root.join("workspaces").join(run)
 }
 
-/// A scratch project is lost with its run on purpose (it is not kept unless it was published):
-/// a cancelled (failed) run's project is deleted, a parked run's is kept with its files, and what
-/// was published stays on the remote.
+/// A scratch project made without a conversation belongs to its run (nothing could take it over): a
+/// cancelled (failed) run's project is deleted, a parked run's is kept with its files, and what was
+/// published stays on the remote. (A project of a conversation lives for the thread: see below.)
 #[tokio::test]
 async fn a_scratch_project_goes_with_its_run_unless_the_run_is_waiting() {
     let fx = Fixture::new("hello\n").await;
@@ -91,6 +96,151 @@ async fn a_scratch_project_goes_with_its_run_unless_the_run_is_waiting() {
         "a run that waits for the person keeps its project"
     );
     assert!(workspace_dir(&fx, &parked).join("fib/.git").is_dir());
+}
+
+/// A scratch project lives for the thread: when its run is over, its worktrees go and the project
+/// stays for as long as the conversation has a task within the idle time, whatever sweeps happen.
+#[tokio::test]
+async fn a_scratch_project_outlives_its_run_while_the_conversation_is_alive() {
+    let fx = Fixture::new("hello\n").await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let done = run_of(&store, RunStatus::Done, Some("caller:thread-1"))
+        .await
+        .to_string();
+    let workspace = fx.env.workspaces.run(&done).unwrap();
+    let slot = workspace
+        .add_scratch_for("site", &fx.env.settings.identity, Some("caller:thread-1"))
+        .await
+        .unwrap();
+    std::fs::write(slot.path().join("index.html"), "<p>hi</p>\n").unwrap();
+    workspace_of(&fx, &done).await;
+    let environment = FakeEnvironment::new(Some(&fx.root));
+
+    let janitor = Janitor::new(fx.env.workspaces.clone(), Some(Duration::from_secs(300)))
+        .with_environment(environment.clone())
+        .with_scratch_idle(Some(Duration::from_secs(7 * 86_400)));
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert!(
+        report.removed.is_empty() && report.failed.is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(
+        report.kept_scratch,
+        std::slice::from_ref(&done),
+        "{report:?}"
+    );
+    assert!(
+        !workspace_dir(&fx, &done).join("remote").exists(),
+        "the repository's worktree went with the run"
+    );
+    assert!(
+        workspace_dir(&fx, &done).join("site/index.html").is_file(),
+        "the project stayed"
+    );
+    assert_eq!(
+        environment.released.lock().unwrap().len(),
+        1,
+        "the environment was released once"
+    );
+
+    // The next sweeps leave it, and do not ask the environment again.
+    for _ in 0..2 {
+        let again = janitor
+            .sweep(store.as_ref(), &CancellationToken::new())
+            .await;
+        assert_eq!(again.kept_scratch, std::slice::from_ref(&done), "{again:?}");
+        assert!(again.removed.is_empty(), "{again:?}");
+    }
+    assert_eq!(environment.released.lock().unwrap().len(), 1);
+
+    // A task of the conversation takes the project over: nothing is left of the finished run.
+    let next = run_of(&store, RunStatus::Parked, Some("caller:thread-1"))
+        .await
+        .to_string();
+    let taken = fx
+        .env
+        .workspaces
+        .run(&next)
+        .unwrap()
+        .adopt_scratch("caller:thread-1")
+        .await
+        .unwrap();
+    assert_eq!(taken, ["site"]);
+    let last = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert_eq!(last.removed, std::slice::from_ref(&done), "{last:?}");
+    assert!(!workspace_dir(&fx, &done).exists());
+    assert!(
+        workspace_dir(&fx, &next).join("site/index.html").is_file(),
+        "the open run has the project, and the sweep leaves an open run alone"
+    );
+}
+
+/// The project goes once the conversation has had no task for the idle time, measured from its
+/// newest task, and an open task keeps it however old the finished one is.
+#[tokio::test]
+async fn a_scratch_project_goes_when_its_conversation_has_been_idle() {
+    let fx = Fixture::new("hello\n").await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let idle = run_of(&store, RunStatus::Done, Some("caller:idle"))
+        .await
+        .to_string();
+    let busy = run_of(&store, RunStatus::Done, Some("caller:busy"))
+        .await
+        .to_string();
+    for (run, conversation) in [(&idle, "caller:idle"), (&busy, "caller:busy")] {
+        fx.env
+            .workspaces
+            .run(run)
+            .unwrap()
+            .add_scratch_for("site", &fx.env.settings.identity, Some(conversation))
+            .await
+            .unwrap();
+    }
+    // The busy conversation has a task open.
+    run_of(&store, RunStatus::Parked, Some("caller:busy")).await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let janitor = Janitor::new(fx.env.workspaces.clone(), None)
+        .with_scratch_idle(Some(Duration::from_millis(30)));
+    let report = janitor
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert_eq!(report.removed, std::slice::from_ref(&idle), "{report:?}");
+    assert_eq!(
+        report.kept_scratch,
+        std::slice::from_ref(&busy),
+        "{report:?}"
+    );
+    assert!(!workspace_dir(&fx, &idle).exists());
+    assert!(workspace_dir(&fx, &busy).join("site/.git").is_dir());
+}
+
+/// `SCRATCH_IDLE_DAYS=0` is the old rule: the project goes with its run, conversation or not.
+#[tokio::test]
+async fn without_an_idle_time_a_scratch_project_goes_with_its_run() {
+    let fx = Fixture::new("hello\n").await;
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let done = run_of(&store, RunStatus::Done, Some("caller:thread-1"))
+        .await
+        .to_string();
+    fx.env
+        .workspaces
+        .run(&done)
+        .unwrap()
+        .add_scratch_for("site", &fx.env.settings.identity, Some("caller:thread-1"))
+        .await
+        .unwrap();
+    let report = Janitor::new(fx.env.workspaces.clone(), None)
+        .with_scratch_idle(None)
+        .sweep(store.as_ref(), &CancellationToken::new())
+        .await;
+    assert_eq!(report.removed, std::slice::from_ref(&done), "{report:?}");
+    assert!(report.kept_scratch.is_empty());
+    assert!(!workspace_dir(&fx, &done).exists());
 }
 
 #[tokio::test]

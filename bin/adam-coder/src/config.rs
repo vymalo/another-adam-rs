@@ -33,6 +33,7 @@
 //! | `MAX_CHECK_CYCLES` | failed `run_checks` in a repository before the agent must stop | `3` |
 //! | `SCRATCH_CHECK_CYCLES` | the same for a scratch project, counted apart | `5` |
 //! | `WORKSPACE_SWEEP_SECS` | how often the janitor removes the workspaces of finished runs; `0` turns it off | `300` |
+//! | `SCRATCH_IDLE_DAYS` | how many days a scratch project is kept after the last task of its conversation: a project lives for the thread, and the janitor removes it once the conversation has had no task for this long; `0` removes it with its run, as it was before | `7` |
 //! | `CHECK_TIMEOUT_SECS` | time limit of one `run_checks` command | `900` |
 //! | `CHECK_OUTPUT_TAIL_BYTES` | output tail `run_checks` returns | `16384` |
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
@@ -180,6 +181,9 @@ pub struct WorkerConfig {
     /// `WORKSPACE_SWEEP_SECS`: how often the janitor sweeps the workspaces of finished runs;
     /// `None` (the variable is `0`) turns it off.
     pub workspace_sweep: Option<Duration>,
+    /// `SCRATCH_IDLE_DAYS`: how long a scratch project outlives the last task of its conversation
+    /// before the janitor removes it; `None` (the variable is `0`) removes it with its run.
+    pub scratch_idle: Option<Duration>,
     /// `CHECK_TIMEOUT_SECS`.
     pub check_timeout: Duration,
     /// `CHECK_OUTPUT_TAIL_BYTES`.
@@ -890,6 +894,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("max_check_cycles", &self.max_check_cycles)
             .field("scratch_check_cycles", &self.scratch_check_cycles)
             .field("workspace_sweep", &self.workspace_sweep)
+            .field("scratch_idle", &self.scratch_idle)
             .field("check_timeout", &self.check_timeout)
             .field("check_output_tail", &self.check_output_tail)
             .field("pr_draft", &self.pr_draft)
@@ -1024,6 +1029,10 @@ impl WorkerConfig {
         // The janitor of the workspaces of finished runs: every five minutes, `0` is off.
         let workspace_sweep =
             Some(parse_or(get, "WORKSPACE_SWEEP_SECS", 300u64, problems)).filter(|secs| *secs > 0);
+        // A scratch project lives for the thread: a week after the conversation's last task, by default.
+        let scratch_idle = Some(parse_or(get, "SCRATCH_IDLE_DAYS", 7u64, problems))
+            .filter(|days| *days > 0)
+            .map(|days| Duration::from_secs(days.saturating_mul(86_400)));
         let check_timeout =
             Duration::from_secs(parse_or(get, "CHECK_TIMEOUT_SECS", 900u64, problems).max(1));
         let check_output_tail =
@@ -1140,6 +1149,7 @@ impl WorkerConfig {
             max_check_cycles,
             scratch_check_cycles,
             workspace_sweep: workspace_sweep.map(Duration::from_secs),
+            scratch_idle,
             check_timeout,
             check_output_tail,
             git_author_name: get("GIT_AUTHOR_NAME").unwrap_or_else(|| "adam-coder".to_owned()),
@@ -1307,6 +1317,37 @@ mod tests {
         let mut vars = full();
         vars.insert("ROLE", "control-plane");
         vars.insert("WORKSPACE_SWEEP_SECS", "often");
+        assert!(parse(&vars).is_ok());
+    }
+
+    #[test]
+    fn a_scratch_project_is_kept_seven_days_by_default_and_zero_removes_it_with_its_run() {
+        let idle = |value: Option<&'static str>| {
+            let mut vars = full();
+            if let Some(value) = value {
+                vars.insert("SCRATCH_IDLE_DAYS", value);
+            }
+            parse(&vars).map(|c| c.worker.unwrap().scratch_idle)
+        };
+        let days = |n: u64| Some(Duration::from_secs(n * 86_400));
+        assert_eq!(idle(None).unwrap(), days(7), "a week by default");
+        assert_eq!(idle(Some("30")).unwrap(), days(30));
+        assert_eq!(idle(Some("1")).unwrap(), days(1));
+        assert_eq!(idle(Some("0")).unwrap(), None, "zero: with its run");
+        for bad in ["week", "-1", "1.5"] {
+            let err = idle(Some(bad)).unwrap_err();
+            assert!(
+                err.problems
+                    .iter()
+                    .any(|p| p.starts_with("SCRATCH_IDLE_DAYS")),
+                "{bad:?}: {:?}",
+                err.problems
+            );
+        }
+        // A control plane runs no workers, so it does not read it.
+        let mut vars = full();
+        vars.insert("ROLE", "control-plane");
+        vars.insert("SCRATCH_IDLE_DAYS", "week");
         assert!(parse(&vars).is_ok());
     }
 

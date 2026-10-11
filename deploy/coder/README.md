@@ -293,6 +293,9 @@ binary as `WORKSPACE_PLACEMENT` (`bin/adam-coder/README.md`, "Workspace placemen
   creates no claim. The claim it does create is annotated `helm.sh/resource-policy: keep`.
   The volume must be writable by uid/gid 10001: the chart sets `fsGroup: 10001`, which some
   network file systems ignore, so check the mount if a worker cannot create its folder.
+  A scratch project outlives its run (it lives for the conversation), so the volume also holds the projects of
+  conversations idle for less than `SCRATCH_IDLE_DAYS` (7 by default; `config.extraEnv.SCRATCH_IDLE_DAYS`, `0` deletes a
+  project with its run). Size `size` for them.
 * **Switching placement changes the volumes.** `volumeClaimTemplates` are immutable: going
   between the per-pod volume (empty, `isolated`) and the shared one (`shared`, `affinity`)
   needs `kubectl delete statefulset <release>-coder --cascade=orphan` before `helm upgrade`. The

@@ -136,6 +136,56 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
     assert_eq!(unique.len(), titles.len(), "two tools share a title");
 }
 
+/// A step is drawn with a picture: every tool of the coder, and `ask_user` of the screen, says which
+/// (`steps/v1` `icon`), by what the call does to the person's work. The table is the contract of the
+/// coder's README ("A step's picture"): a tool added later must be put in it, or this test fails.
+#[tokio::test]
+async fn every_tool_of_the_coder_has_an_icon_for_its_step() {
+    use adam_llm_agent::StepIcon::{Edit, Execute, File, Git, OpenCode, Read, Think};
+    let fx = Fixture::with("hello\n", |s| {
+        s.create_repo_owners = vec!["acme".to_owned()];
+    })
+    .await;
+    let want = [
+        ("read_file", Read),
+        ("write_file", Edit),
+        ("edit_file", Edit),
+        ("apply_patch", Edit),
+        ("run_command", Execute),
+        ("run", Execute),
+        ("run_checks", Execute),
+        ("rebuild_environment", Execute),
+        ("prepare_workspace", Git),
+        ("commit_and_push", Git),
+        ("open_pull_request", Git),
+        ("create_repository", Git),
+        ("start_scratch", File),
+        ("publish_scratch", Git),
+        ("share_file", File),
+        ("request_repository", Think),
+        ("ask_user", Think),
+        ("delegate_to_opencode", OpenCode),
+    ];
+    let tools = coder_tools(&fx.env);
+    let icons: Vec<(String, Option<adam_llm_agent::StepIcon>)> = tools
+        .iter()
+        .map(|tool| (tool.spec().name, tool.step_style().icon))
+        .collect();
+    for (name, icon) in want {
+        let found = icons.iter().find(|(n, _)| n == name);
+        assert_eq!(found.map(|(_, i)| *i), Some(Some(icon)), "{name}");
+    }
+    // The screen's two other tools are not the coder's work and are drawn as plain tools.
+    for (name, icon) in &icons {
+        if !want.iter().any(|(n, _)| n == name) {
+            assert!(
+                matches!(name.as_str(), "show" | "ui_catalog") && icon.is_none(),
+                "`{name}` has no picture in the table"
+            );
+        }
+    }
+}
+
 async fn coder(cycles: u32) -> (Fixture, CoderAgent) {
     // A deployment that allows creating repositories: the tool is offered and the prompt describes it.
     let fx = Fixture::with("hello\n", |s| {
@@ -397,10 +447,9 @@ async fn a_run_sends_the_old_request_and_journals_the_old_step_names() {
     loop {
         let view = rt.view(run).await.unwrap().expect("run exists");
         match view.status {
-            // The model stopped with text and nothing delivered: that is a question, so the run
-            // waits for the person instead of completing.
-            RunStatus::Parked if view.waiting => break,
-            RunStatus::Done => panic!("a stop that delivered nothing completed: {view:#?}"),
+            // The model stopped with a reply that asks nothing, with no repository work behind
+            // it: the turn is over and the task is complete (it used to wait for the person).
+            RunStatus::Done => break,
             RunStatus::Failed => panic!("the run failed: {view:#?}"),
             _ => {}
         }
@@ -446,9 +495,10 @@ fn coder_from(files: &AgentFiles, fx: &Fixture, mock: &Arc<MockModel>) -> CoderA
         .expect("the files assemble")
 }
 
-/// Start a run on `coder` with `text` and wait until it waits for the person (the model stopped
-/// with nothing to deliver, so the run asks).
-async fn run_to_a_question(coder: &Coder, text: &str) -> RunId {
+/// Start a run on `coder` with `text` and wait until it has nothing more to do: it waits for the
+/// person (its last reply asked) or it is complete (the reply asked nothing: the tests' models
+/// answer in plain text).
+async fn run_to_a_stop(coder: &Coder, text: &str) -> RunId {
     let (stop, rx) = tokio::sync::oneshot::channel::<()>();
     let worker = {
         let runtime = coder.runtime.clone();
@@ -470,7 +520,8 @@ async fn run_to_a_question(coder: &Coder, text: &str) -> RunId {
         let view = coder.runtime.view(run).await.unwrap().expect("run exists");
         match view.status {
             RunStatus::Parked if view.waiting => break,
-            RunStatus::Done | RunStatus::Failed => panic!("the run ended: {view:#?}"),
+            RunStatus::Done => break,
+            RunStatus::Failed => panic!("the run failed: {view:#?}"),
             _ => {}
         }
         assert!(Instant::now() < deadline, "timed out: {view:#?}");
@@ -534,7 +585,7 @@ async fn editing_the_folder_changes_what_the_model_is_sent() {
     mock.push_text("Bonjour.");
     let agent = coder_from(&files, &fx, &mock);
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-    run_to_a_question(&coder, "hi").await;
+    run_to_a_stop(&coder, "hi").await;
 
     let system = mock.requests()[0].system.clone().unwrap();
     assert!(system.ends_with("\n\nAlways answer in French."), "{system}");
@@ -692,7 +743,7 @@ async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
     .push_text("The README says widgets.");
     let agent = coder_from(&AgentFiles::Embedded, &fx, &mock);
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-    run_to_a_question(&coder, &format!("In {url}, what does the README say?")).await;
+    run_to_a_stop(&coder, &format!("In {url}, what does the README say?")).await;
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 5, "{requests:#?}");
@@ -761,7 +812,7 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
     assert_eq!(info[0].tools.last().map(String::as_str), Some("summariser"));
 
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-    run_to_a_question(&coder, "have it summarised").await;
+    run_to_a_stop(&coder, "have it summarised").await;
 
     let requests = mock.requests();
     assert_eq!(requests.len(), 3);
@@ -869,7 +920,7 @@ async fn a_greeting_gets_a_greeting_and_the_folder_changes_what_it_says() {
             )
             .unwrap();
             let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-            let run = run_to_a_question(&coder, "hi").await;
+            let run = run_to_a_stop(&coder, "hi").await;
             let view = coder.runtime.view(run).await.unwrap().unwrap();
             assert!(view.artifacts.is_empty(), "no tool ran: {view:#?}");
             let answers = model.answers();
@@ -1004,7 +1055,7 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
     assert_eq!(&tools[own + 1..], &TOOLS[own..]);
 
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
-    run_to_a_question(&coder, "echo ping").await;
+    run_to_a_stop(&coder, "echo ping").await;
 
     assert_eq!(server.calls(), 1, "the call reached the server");
     assert!(
@@ -1035,11 +1086,11 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
     }
 }
 
-/// The twelve read tools of the shipped `mcp.json`, in its order: what the model may call of the
+/// The eleven read tools of the shipped `mcp.json`, in its order: what the model may call of the
 /// GitHub MCP server, and all of it (`tools:` is an allow-list, and the server is also started
-/// with `--read-only`).
-const GITHUB_TOOLS: [&str; 12] = [
-    "get_me",
+/// with `--read-only`). `get_me` is not among them: it asks GitHub who the authenticated *user* is,
+/// which a GitHub App is not, so the call could only fail.
+const GITHUB_TOOLS: [&str; 11] = [
     "search_repositories",
     "get_file_contents",
     "list_branches",
@@ -1056,7 +1107,7 @@ const GITHUB_TOOLS: [&str; 12] = [
 /// The shipped `mcp.json` is the official GitHub MCP server over **http**, at the sidecar of the
 /// pod (127.0.0.1:8082), and says nothing about credentials: no `env`, no `headers`, no key or
 /// token (the deployment gives each call its bearer, `GitHubReadBearer`, ADR 0017). It lists the
-/// twelve read tools above and no others; the server itself is started read-only with four
+/// eleven read tools above and no others; the server itself is started read-only with four
 /// toolsets, by the deployment.
 #[test]
 fn the_shipped_mcp_json_names_the_github_server_read_only() {

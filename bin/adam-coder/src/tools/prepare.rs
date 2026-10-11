@@ -43,7 +43,7 @@ use super::{Outcome, ToolEnv, non_empty, notes_error, workspace_error};
 /// you ask the person which one with ask_user. To carry on with work an earlier
 /// task of this conversation pushed (a rework, a follow-up), pass that branch as
 /// `branch`: the worktree starts from it and open_pull_request updates its pull request.
-#[tool(label = "Prepare the workspace")]
+#[tool(label = "Prepare the workspace", icon = "git")]
 pub async fn prepare_workspace(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -135,6 +135,13 @@ pub async fn prepare_workspace(
             | adam_workspace::WorkspaceError::NotFound(_)
             | adam_workspace::WorkspaceError::Conflict(_)),
         ) => {
+            // A branch that does not exist in a repository with no branch at all: the repository is
+            // new, which is a start, not a failure.
+            if matches!(e, adam_workspace::WorkspaceError::NotFound(_))
+                && let Some(empty) = empty_repository(&env, url).await
+            {
+                return Ok(empty);
+            }
             // The model gave a bad repository or branch: tell it, do not fail.
             // The base of a continued branch is the base of its pull request: when that branch is
             // gone upstream, choosing another is not the way out.
@@ -201,13 +208,38 @@ async fn default_base(env: &ToolEnv, ctx: &ToolCtx, url: &str) -> Result<String,
     }
     match env.workspaces.default_branch(url).await {
         Ok(base) => Ok(base),
-        Err(e) => match default_branch_refusal(
-            &e,
-            "Pass base_branch, or ask the person which branch to start from with ask_user.",
-        ) {
-            Some(said) => Err(Ok(ToolOutput::error(said))),
-            None => Err(Err(env.delivery_error(ctx, &e).await)),
-        },
+        Err(e) => {
+            if matches!(e, WorkspaceError::NoDefaultBranch(_))
+                && let Some(empty) = empty_repository(env, url).await
+            {
+                return Err(Ok(empty));
+            }
+            match default_branch_refusal(
+                &e,
+                "Pass base_branch, or ask the person which branch to start from with ask_user.",
+            ) {
+                Some(said) => Err(Ok(ToolOutput::error(said))),
+                None => Err(Err(env.delivery_error(ctx, &e).await)),
+            }
+        }
+    }
+}
+
+/// What a brand-new repository answers, when `url` has no refs at all: a normal start, not a failure.
+/// There is no branch to check out, so no worktree is made, and the model is told the way on
+/// (a scratch project, then `publish_scratch`, which gives the repository its first commit). `None`
+/// when the repository is not empty, or the remote cannot say (the caller reports its own error).
+async fn empty_repository(env: &ToolEnv, url: &str) -> Option<ToolOutput> {
+    match env.workspaces.remote_is_empty(url).await {
+        Ok(true) => Some(ToolOutput::text(format!(
+            "{url} is empty: it has no commits and no branch yet, so there is nothing to check out \
+             and no worktree was made. That is how a new repository starts, not an error: do not \
+             report it as a failure. Build in a scratch project: start_scratch, write the files, \
+             run_checks, then publish_scratch with this repository's url, which gives it its first \
+             commit (an empty one, the base of the pull request) and copies the files in; \
+             commit_and_push and open_pull_request then work as usual."
+        ))),
+        _ => None,
     }
 }
 

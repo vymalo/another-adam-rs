@@ -6,7 +6,7 @@
 //! `http://127.0.0.1:8085/mcp`); otherwise it passes without doing anything. Start the mock with
 //! `docker compose up -d --wait mock-github-mcp`. The mock is stateless (JSON answers, no session
 //! id, no standalone stream), and what this proves is that the client of this crate, `rmcp`,
-//! accepts that framing: it connects, lists the twelve tools of the coder's allow-list in order,
+//! accepts that framing: it connects, lists the twelve tools the mock serves in order,
 //! calls one, and is turned away without a bearer.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
@@ -17,7 +17,9 @@ use adam_mcp::{Env, McpPolicy, McpServers};
 use common::{call, http_config};
 use serde_json::json;
 
-/// The allow-list of the coder's `mcp.json`, in the order it lists them.
+/// The twelve tools the mock lists, in order: the coder's allow-list plus the server's `get_me`, which
+/// the coder no longer lists (an App is not a user) and the mock still serves, so the allow-list check
+/// has a tool to find.
 const GITHUB_TOOLS: [&str; 12] = [
     "get_me",
     "search_repositories",

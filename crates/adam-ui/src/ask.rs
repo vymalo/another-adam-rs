@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use adam_llm_agent::{StepStyle, Tool, ToolCtx, ToolError, ToolOutput, parse_args};
+use adam_llm_agent::{StepIcon, StepStyle, Tool, ToolCtx, ToolError, ToolOutput, parse_args};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -315,9 +315,11 @@ impl AskUser {
 
 #[async_trait]
 impl Tool for AskUser {
-    /// The step of a call is called "Ask you".
+    /// The step of a call is called "Ask you", and drawn as thinking.
     fn step_style(&self) -> StepStyle {
-        StepStyle::default().with_label("Ask you")
+        StepStyle::default()
+            .with_label("Ask you")
+            .with_icon(StepIcon::Think)
     }
 
     fn spec(&self) -> ToolSpec {

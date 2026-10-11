@@ -20,7 +20,7 @@
 //!
 //! | Module | What |
 //! |---|---|
-//! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks or rejected credentials and no PR = failed; any other stop without a PR = a question, `input-required`) and the record of the repositories the person named; [`CoderStarter`]: its start-only half |
+//! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks or rejected credentials and no PR = failed; a reply that asks, or repository work left undelivered = a question, `input-required`; any other reply = completed) and the record of the repositories the person named; [`CoderStarter`]: its start-only half |
 //! | [`tools`] | the nine tools of the coder (`#[tool]` functions reading [`ToolEnv`] from the agent's state; the screen's three, `ask_user`, `show` and `ui_catalog`, are `adam-ui`'s) and [`CoderSettings`] |
 //! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`, or read at startup from the folder `ADAM_AGENT_DIR` names) |
 //! | [`files`] | [`AgentFiles`]: where those files come from, the embedded copy or a folder read once at startup, and why a folder is refused ([`AgentFilesError`]) |
