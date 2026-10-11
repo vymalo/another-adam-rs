@@ -113,6 +113,15 @@ config:
   # Extra environment variables, as a name -> value map.
   extraEnv: {}
 
+# The access tiers a person may pick for each message (access-tier/v1, ADR 0036). Every role.
+accessTiers:
+  # The highest tier the deployment allows (MAX_ACCESS_TIER): plan, edits, auto or bypass. The card
+  # lists the tiers up to it, a message that names a higher one is refused, and the tools check it
+  # again. Empty (default): auto, which is also the coder's own default, so nothing is rendered.
+  # `bypass` (renaming and deleting repositories, no consent form for a repository) is opt-in: set
+  # it only for a deployment whose GitHub credentials you are willing to see used that way.
+  max: ""
+
 # How the coder authenticates to GitHub (ADR 0009). Roles that run workers only: a control
 # plane renders none of it.
 github:
@@ -129,7 +138,7 @@ github:
   # The owners (users or organisations) the coder may create repositories for, after the person it
   # works with agrees (not under the bypass access tier; ADR 0009, decision 9, ADR 0036). A list
   # restricts to exactly these. Empty (default): a GitHub App creates for the accounts it acts for
-  # and a token creates nothing (the tool is off). A GitHub App creates for organisations only and
+  # (not with github.app.owners=["*"]: list the owners here) and a token creates nothing (the tool is off). A GitHub App creates for organisations only and
   # needs the Administration permission; a token creates for the person it belongs to and for
   # organisations it can, with the `repo` scope.
   createRepoOwners: []

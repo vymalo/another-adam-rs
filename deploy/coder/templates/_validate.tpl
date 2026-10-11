@@ -23,6 +23,9 @@ from service.yaml, which every render contains, so they always run.
 {{- if not (has $placement (list "" "shared" "affinity" "isolated")) -}}
 {{- fail (printf "workspace.placement must be one of shared, affinity or isolated (or empty for the single-worker default), got %q" $placement) -}}
 {{- end -}}
+{{- if not (has (include "coder.maxAccessTier" .) (list "" "plan" "edits" "auto" "bypass")) -}}
+{{- fail (printf "accessTiers.max must be plan, edits, auto or bypass (or empty for auto), got %q" (include "coder.maxAccessTier" .)) -}}
+{{- end -}}
 {{- if not (has (toString .Values.github.auth) (list "token" "app")) -}}
 {{- fail (printf "github.auth must be token or app, got %q" (toString .Values.github.auth)) -}}
 {{- end -}}

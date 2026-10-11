@@ -43,7 +43,7 @@ Dependency direction, as §59a's table has it: `adam-operator-domain` depends on
 | `resolve(service, config, owner)` | `validate`, then the specs. The owner is the opaque handle the controller got from the object; it is copied into the specs unread and is not part of the digest |
 | `ResolvedAgent { id, store_id, runtime, store, digest, public_url }` | what the controller needs to reconcile. `runtime.digest == digest` |
 | `spec_digest(&RuntimeSpec)`, `digest_json`, `canonical_json` | the digest and the canonical serialisation it is of, so a provider or a test can recompute it |
-| `contract` | the names, paths, ports, probe periods, sidecar command and defaults of adam, as constants (`contract::env::OPERATOR_SET` lists every variable the operator may set) |
+| `contract` | the names, paths, ports, probe periods, sidecar command and defaults of adam, as constants (`contract::env::OPERATOR_SET` lists every variable the operator may set, `MAX_ACCESS_TIER` among them: set on every role when `coder.maxAccessTier` is, covered by a test of `tests/examples.rs`, not a golden) |
 
 ## What `resolve` makes
 

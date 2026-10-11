@@ -519,6 +519,13 @@ impl<'a> Cx<'a> {
         if serves_a2a {
             e.push(lit(env::PUBLIC_URL, &self.public_url));
         }
+        // Every role reads the cap: the control plane declares the tiers up to it and refuses a
+        // higher one, a worker's tools check it again. Nothing is set for the default (`auto`).
+        if self.is_coder
+            && let Some(max) = self.coder.and_then(|c| c.max_access_tier)
+        {
+            e.push(lit(env::MAX_ACCESS_TIER, max.as_str()));
+        }
         if self.config.spec.harness.adam.agent.folder.is_some() {
             e.push(lit(env::ADAM_AGENT_DIR, contract::AGENT_DIR));
         }

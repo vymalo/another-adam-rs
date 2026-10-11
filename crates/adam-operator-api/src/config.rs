@@ -190,9 +190,15 @@ pub struct Coder {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_author: Option<GitAuthor>,
 
-    /// `CREATE_REPO_OWNERS`. Empty: the accounts a GitHub App acts for; a token creates nothing.
+    /// `CREATE_REPO_OWNERS`. Empty: the accounts a GitHub App acts for (not with `github.app.owners`
+    /// of `*`: list the owners here); a token creates nothing.
     #[serde(default)]
     pub create_repo_owners: Vec<String>,
+
+    /// `MAX_ACCESS_TIER`: the highest access tier a person may pick for a message, on every role.
+    /// Unset: `auto`. `bypass` (renaming and deleting repositories) is the deployment's opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_access_tier: Option<AccessTierCap>,
 
     /// `OPENCODE_MODEL`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +206,33 @@ pub struct Coder {
 
     /// How the coder authenticates to GitHub.
     pub github: Github,
+}
+
+/// The highest access tier a deployment lets a person pick (`access-tier/v1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessTierCap {
+    /// Read and plan only.
+    Plan,
+    /// Also change files, commit, push and open pull requests.
+    Edits,
+    /// Also merge pull requests and create repositories (the coder's default).
+    Auto,
+    /// Also rename and delete repositories, with no consent form for a repository.
+    Bypass,
+}
+
+impl AccessTierCap {
+    /// The value of `MAX_ACCESS_TIER`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Edits => "edits",
+            Self::Auto => "auto",
+            Self::Bypass => "bypass",
+        }
+    }
 }
 
 /// The author of the coder's commits.

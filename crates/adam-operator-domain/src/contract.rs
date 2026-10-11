@@ -67,6 +67,8 @@ pub mod env {
     pub const GITHUB_API_URL: &str = "GITHUB_API_URL";
     /// Owners `create_repository` may create for, comma-joined.
     pub const CREATE_REPO_OWNERS: &str = "CREATE_REPO_OWNERS";
+    /// The highest access tier a person may pick, read by every role.
+    pub const MAX_ACCESS_TIER: &str = "MAX_ACCESS_TIER";
     /// GitHub App mode: the App's id.
     pub const GITHUB_APP_ID: &str = "GITHUB_APP_ID";
     /// App mode: one pinned installation.
@@ -116,6 +118,7 @@ pub mod env {
         ALLOWED_REPO_HOSTS,
         GITHUB_API_URL,
         CREATE_REPO_OWNERS,
+        MAX_ACCESS_TIER,
         GITHUB_APP_ID,
         GITHUB_APP_INSTALLATION_ID,
         GITHUB_APP_OWNERS,

@@ -541,7 +541,7 @@ fn a_folder_agent_matches_the_hand_written_golden() {
 #[test]
 fn every_variable_of_the_contract_is_covered_by_a_golden_or_a_test() {
     // The names the operator can set (contract::env::OPERATOR_SET) that no coder golden sets are the
-    // ones this crate's other tests cover (GITHUB_APP_INSTALLATION_ID, MCP_ALLOW_INSECURE off, …).
+    // ones this crate's other tests cover (GITHUB_APP_INSTALLATION_ID, MAX_ACCESS_TIER, MCP_ALLOW_INSECURE off, …).
     // This lists them, so a new variable added to the contract cannot be forgotten silently.
     let mut seen = std::collections::BTreeSet::new();
     for case in ["coder", "coder-split", "coder-affinity-token"] {
@@ -557,7 +557,11 @@ fn every_variable_of_the_contract_is_covered_by_a_golden_or_a_test() {
         .collect();
     assert_eq!(
         unseen,
-        vec![&"ADAM_AGENT_DIR", &"GITHUB_APP_INSTALLATION_ID"],
+        vec![
+            &"ADAM_AGENT_DIR",
+            &"MAX_ACCESS_TIER",
+            &"GITHUB_APP_INSTALLATION_ID"
+        ],
         "the contract names a variable no golden sets: cover it in tests/examples.rs"
     );
 }

@@ -36,6 +36,10 @@ let crds: Vec<CustomResourceDefinition> = adam_operator_api::crds(); // AgentCon
 (`MAX_CONTEXT_WINDOW`, what adam accepts). Those bounds are the schema's, as for every number of this crate, not CEL
 rules, so they have no invalid example: `kube-cel` does not check them, an API server does.
 
+`coder.maxAccessTier` (`AccessTierCap`: `plan`, `edits`, `auto`, `bypass`; `MAX_ACCESS_TIER`) caps the access tiers a person may
+pick (ADR 0036 of adam-rs). Unset: `auto`, the binary's own default, and nothing is set. `bypass` (rename and delete
+repositories) is the deployment's opt-in. The operator sets it on every role.
+
 Optional settings of `adam-coder` are `Option`s: a field left out is not set, and the binary's own
 default applies (the operator does not copy adam's defaults). The defaults the schema does apply
 are the platform's own: `scaling` (`combined`, 1 worker), `suspend: false`, `deletionPolicy:
