@@ -27,7 +27,9 @@ use crate::backend::RuntimeTaskBackend;
 
 /// The context key under which the tier of the **latest message that named one** is kept:
 /// `{"tier": "plan" | "edits" | "auto" | "bypass"}`. Set from the message's metadata under
-/// [`ACCESS_TIER_EXTENSION`] when the request activated the extension.
+/// [`ACCESS_TIER_EXTENSION`] when the request activated the extension. The run keeps it even when
+/// the rest of a message's context is too large and dropped (`adam_llm_agent::PROTECTED_CONTEXT_KEYS`
+/// names this key; a test keeps the two equal).
 pub const CONTEXT_ACCESS_TIER: &str = "vymalo.accessTier";
 
 /// The tier `message` names in its metadata under the extension's URI, checked against `tiers`.
@@ -69,18 +71,27 @@ pub(crate) fn requested(message: &Message, tiers: &AccessTiers) -> Result<Access
 }
 
 /// Put `tier` into the context `inbound` carries to the run.
-pub(crate) fn put(inbound: &mut Inbound, tier: AccessTier) {
+///
+/// # Errors
+///
+/// The sentence for the A2A error when the payload cannot carry a context (it is neither text nor an
+/// object) or its `context` is not an object: the tier is never dropped silently.
+pub(crate) fn put(inbound: &mut Inbound, tier: AccessTier) -> Result<(), String> {
     if let Value::String(text) = &inbound.payload {
         inbound.payload = json!({ "text": text });
     }
-    if let Some(payload) = inbound.payload.as_object_mut() {
-        let context = payload
-            .entry("context")
-            .or_insert_with(|| Value::Object(Default::default()));
-        if let Some(context) = context.as_object_mut() {
-            context.insert(CONTEXT_ACCESS_TIER.to_owned(), json!({ "tier": tier }));
-        }
-    }
+    let payload = inbound.payload.as_object_mut().ok_or_else(|| {
+        "the message cannot carry an access tier: its payload is not text".to_owned()
+    })?;
+    let context = payload
+        .entry("context")
+        .or_insert_with(|| Value::Object(Default::default()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            "the message cannot carry an access tier: its context is not an object".to_owned()
+        })?;
+    context.insert(CONTEXT_ACCESS_TIER.to_owned(), json!({ "tier": tier }));
+    Ok(())
 }
 
 /// The tier a run works under: the one in its state's context, else `tiers`' default.
@@ -185,25 +196,49 @@ mod tests {
     #[test]
     fn the_tier_goes_into_the_context_of_the_inbound_whatever_its_payload() {
         let mut inbound = Inbound::new("message", json!({"text": "hi"}));
-        put(&mut inbound, AccessTier::Edits);
+        put(&mut inbound, AccessTier::Edits).unwrap();
         assert_eq!(
             inbound.payload,
             json!({"text": "hi", "context": {"vymalo.accessTier": {"tier": "edits"}}})
         );
         // Beside what the context already holds.
         let mut inbound = Inbound::new("message", json!({"text": "hi", "context": {"a": 1}}));
-        put(&mut inbound, AccessTier::Plan);
+        put(&mut inbound, AccessTier::Plan).unwrap();
         assert_eq!(
             inbound.payload["context"],
             json!({"a": 1, "vymalo.accessTier": {"tier": "plan"}})
         );
         // A bare string payload becomes an object.
         let mut inbound = Inbound::new("message", json!("hi"));
-        put(&mut inbound, AccessTier::Auto);
+        put(&mut inbound, AccessTier::Auto).unwrap();
         assert_eq!(inbound.payload["text"], "hi");
         assert_eq!(
             inbound.payload["context"]["vymalo.accessTier"]["tier"],
             "auto"
         );
+    }
+
+    #[test]
+    fn the_key_is_one_the_run_never_loses_to_a_large_context() {
+        assert_eq!(CONTEXT_ACCESS_TIER, adam_llm_agent::ACCESS_TIER_CONTEXT_KEY);
+        assert!(adam_llm_agent::PROTECTED_CONTEXT_KEYS.contains(&CONTEXT_ACCESS_TIER));
+    }
+
+    #[test]
+    fn a_payload_that_cannot_carry_a_tier_is_an_error_and_never_a_silent_drop() {
+        for payload in [
+            json!(3),
+            json!([1]),
+            json!(null),
+            json!({"text": "hi", "context": "no"}),
+            json!({"text": "hi", "context": [1]}),
+        ] {
+            let mut inbound = Inbound::new("message", payload.clone());
+            let err = put(&mut inbound, AccessTier::Plan).unwrap_err();
+            assert!(
+                err.contains("cannot carry an access tier"),
+                "{payload}: {err}"
+            );
+        }
     }
 }

@@ -750,7 +750,7 @@ impl TaskBackend for RuntimeTaskBackend {
             && caller.has_extension(ACCESS_TIER_EXTENSION)
         {
             let named = tier::requested(&message, tiers).map_err(BackendError::InvalidParams)?;
-            tier::put(&mut inbound, named);
+            tier::put(&mut inbound, named).map_err(BackendError::InvalidParams)?;
         }
 
         let Some(task_id) = task_id else {
