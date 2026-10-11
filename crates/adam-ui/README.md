@@ -35,6 +35,8 @@ connection), and it is used by [`adam-coder`](../../bin/adam-coder/README.md) an
 | `CatalogCache`, `MAX_CACHED_CATALOGS` | the catalogs this process holds, by digest (8, the oldest dropped) |
 | `card_extensions()`, `with_card_extensions(card)` | the card entries: A2UI v0.9.1 (`acceptsInlineCatalogs: true`), `ui-catalog/v1`, `thread-tools/v1`, `mentions/v1`, `steer/v1` (the host's promise that a message sent to a running task is read and never lost; `adam-llm-agent` keeps it) |
 | `A2UI_VERSION` | `v0.9.1`: the version the surfaces are written for |
+| `ask_surface_id(call_id)` | the id of the surface `ask_user` draws its form on for a call: `ask-` and the call's id as an identifier (at most 64 characters). A form's answer names it (`(form ask-<id>)`), so a host that holds the call can tell whether the answer is for the question it asked |
+| `comparable(text)`, `is_format_or_control(c)` | `text` as it is compared with a typed question's default: without whitespace and without control or format characters (U+FEFF, the zero-width and bidirectional marks), in lowercase; the characters are those of Unicode categories Cc and Cf (*verified 2026-10-11*, Python 3's `unicodedata`, Unicode 14.0, widened for later versions) |
 
 ## Wiring
 
@@ -83,11 +85,14 @@ inbound function reads a screen's action as JSON text.
   a recommended option is marked in its label, a list or a deck is a list of radio buttons or checkboxes, and the
   `description` goes in the text the person reads first) and, when a question needs more than that (a typed answer), words.
   The person answers all the questions with one action, which comes back as this call's result:
-  `The person answered through the interface:` and one line per question, `- db: pg`, with typed words as
+  `The person answered through the interface (form ask-<call id>):` and one line per question, `- db: pg`, with typed words as
   `text: "..."` and a last line `Note: "..."` ([`adam-a2a-runtime`](../adam-a2a-runtime/README.md)). The `default` of a typed
   question comes back as `text: "..."` when the person leaves the box alone: those are the agent's words, so a host that acts
-  on what the person said pairs the answer with the call's `choices` and drops them (the coder does,
-  [ADR 0036](../../docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)). When the
+  on what the person said pairs the answer with the call's `choices` (on the surface the answer names) and drops them, comparing
+  them with `comparable` (the coder does,
+  [ADR 0036](../../docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)). A typed default with a
+  character the person cannot see (a control or format character other than a tab or line break) is refused when the form is
+  drawn: a page may drop it on the way back, and the words that came back would no longer be the default's. When the
   screen cannot draw it (no catalog, none with `Choices`, one that cannot be read now) the form is listed in the question's
   text (description, help, options with their descriptions and marks, typed questions, the free box) and the answer is free
   text. It parks the run, so `asks_user()` is `true` and `adam-assembly` keeps it out of subagents. The constraints are stated
@@ -221,7 +226,9 @@ stateDiagram-v2
 * `src/catalog.rs`: the known-answer vector (canonical form and digest), whole doubles hashing as integers, what the
   canonical form refuses, a digest that is not the claimed one, a document that is not the catalog it says, a schema
   that does not compile, an oversized catalog, validation messages for the model. `src/ask.rs`: slugs, uniqueness,
-  the model's mistakes, the instance, the text form. `src/thread_tools.rs`: the grant and its expiry (with a clock),
+  the model's mistakes (a typed default with a character the person cannot see among them), the instance, the text form.
+  `src/words.rs`: which characters are controls or formats and what two spellings of the same words have in common
+  (U+FEFF, the zero-width and bidirectional marks, case, U+212A). `src/thread_tools.rs`: the grant and its expiry (with a clock),
   the answer of `get_ui_catalog`, the listing at every turn against the fake endpoint, a call, and every way a call
   degrades with the token never shown.
 * `tests/tools.rs`: the three tools against the web's real catalog: the digest of the fixture is the web's lock;

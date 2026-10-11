@@ -26,7 +26,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::resolve::{Resolved, UiState};
-use crate::surface::{safe_id, surface};
+use crate::surface::{ask_surface_id, surface};
+use crate::words::is_format_or_control;
 
 /// The tool's name.
 pub const ASK_USER: &str = "ask_user";
@@ -456,6 +457,16 @@ fn normalize_question(
                 ));
             };
             let text = text.trim().to_owned();
+            if let Some(hidden) = text
+                .chars()
+                .find(|c| !matches!(c, '\t' | '\n' | '\r') && is_format_or_control(*c))
+            {
+                return Err(format!(
+                    "the default of question `{id}` has a character the person cannot see (U+{:04X}): \
+                     a default is words they can read",
+                    u32::from(hidden)
+                ));
+            }
             if text.chars().count() > limit {
                 return Err(format!(
                     "the default of question `{id}` is over {limit} characters, the most a \"{}\" answer has",
@@ -993,7 +1004,7 @@ impl Tool for AskUser {
                         "the choices do not fit the screen's Choices component: {problem}"
                     )));
                 }
-                let id = format!("ask-{}", safe_id(ctx.call_id()));
+                let id = ask_surface_id(ctx.call_id());
                 let ui = surface(&id, catalog.catalog_id(), vec![instance]);
                 Err(ToolError::needs_input_with_ui(lead, ui))
             }
@@ -1243,6 +1254,19 @@ mod tests {
                 .unwrap_err()
                 .contains("over 500")
         );
+        // A default has no character the person cannot see: a page may drop it on the way back, and
+        // the words that come back would no longer be the default's. A line break is words.
+        for hidden in [
+            "\u{feff}merge",
+            "me\u{200b}rge",
+            "merge\u{202e}",
+            "a\u{0}b",
+            "a\u{ad}b",
+        ] {
+            let e = typed(json!({"default": hidden})).unwrap_err();
+            assert!(e.contains("cannot see"), "{hidden:?}: {e}");
+        }
+        assert!(typed(json!({"default": "one\ntwo\tthree"})).is_ok());
         assert!(
             asked(vec![
                 json!({"question": "q", "type": "longText", "default": "x".repeat(2000)})

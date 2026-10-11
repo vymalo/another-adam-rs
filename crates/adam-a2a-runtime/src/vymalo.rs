@@ -63,7 +63,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// | Message part or metadata | Becomes |
 /// |---|---|
 /// | text parts | the text, joined by blank lines |
-/// | an A2UI data part (`application/a2ui+json`) with an `action` that carries Choices answers | the text `The person answered through the interface:` and one line `- <question id>: <values>` per answer, an "other" as `other: "<text>"`, the words of a typed question as `text: "<text>"`, and a last line `Note: "<text>"` when the form's free box was used |
+/// | an A2UI data part (`application/a2ui+json`) with the action `answer` of a surface `ask-<id>` that carries Choices answers | the text `The person answered through the interface (form ask-<id>):` (the surface the answer is for: [`form_answer_surface`]) and one line `- <question id>: <values>` per answer, an "other" as `other: "<text>"`, the words of a typed question as `text: "<text>"`, and a last line `Note: "<text>"` when the form's free box was used |
 /// | any other A2UI action | `The person used the interface: action "<name>" on surface "<id>" with context <compact JSON, cut at 4 KiB>` |
 /// | any other data part | its JSON, as the default reading does |
 /// | `metadata[ui-catalog/v1]` `{catalogId, version, digest, inline}` | context [`CONTEXT_UI_REF`] `{catalogId, version, digest}` |
@@ -152,21 +152,54 @@ fn action_texts(data: &Value) -> Vec<String> {
 /// The name of the action the Choices form submits its answers with.
 const ANSWER_ACTION: &str = "answer";
 /// What the id of the surface of a form starts with: `ask-` and the id of the `ask_user` call.
-const ANSWER_SURFACE_PREFIX: &str = "ask-";
+pub const ASK_SURFACE_PREFIX: &str = "ask-";
+/// The longest id a surface of a form has: the prefix and an identifier of at most 64 characters.
+const MAX_FORM_SURFACE: usize = ASK_SURFACE_PREFIX.len() + 64;
+/// The first words of the text a form's answer comes back as.
+const FORM_ANSWER: &str = "The person answered through the interface";
+
+/// Whether `surface` is the id of a form's surface: `ask-` and an identifier (`A-Z a-z 0-9 _ . : -`).
+fn is_form_surface(surface: &str) -> bool {
+    surface.len() > ASK_SURFACE_PREFIX.len()
+        && surface.len() <= MAX_FORM_SURFACE
+        && surface.starts_with(ASK_SURFACE_PREFIX)
+        && surface
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+}
+
+/// What `line` says about the form it starts the answer of: `None` when it is not the first line of
+/// a form's answer, `Some(None)` for the line of an answer that names no surface, and
+/// `Some(Some(surface))` for the one that names the surface the answer is for
+/// (`The person answered through the interface (form ask-call_1):`).
+///
+/// The surface is the one the form was drawn on, so an answer belongs to the question that drew it:
+/// a reader that holds a question compares it with that question's own surface
+/// (`ask-<its call id>`) and takes any other answer for a stranger's.
+#[must_use]
+pub fn form_answer_surface(line: &str) -> Option<Option<&str>> {
+    let rest = line.trim_end().strip_prefix(FORM_ANSWER)?;
+    if rest == ":" {
+        return Some(None);
+    }
+    let surface = rest.strip_prefix(" (form ")?.strip_suffix("):")?;
+    is_form_surface(surface).then_some(Some(surface))
+}
 
 /// One action as what the model reads.
 fn action_text(action: &Value) -> String {
     // Only the form's own submit is an answer: the action `answer` on a surface `ask_user` drew
     // (`ask-<call id>`). Any other action whose context has that shape is generic.
-    let submits_a_form = action.get("name").and_then(Value::as_str) == Some(ANSWER_ACTION)
-        && action
-            .get("surfaceId")
-            .and_then(Value::as_str)
-            .is_some_and(|surface| surface.starts_with(ANSWER_SURFACE_PREFIX));
+    let surface = action
+        .get("surfaceId")
+        .and_then(Value::as_str)
+        .filter(|surface| is_form_surface(surface));
+    let submits_a_form = action.get("name").and_then(Value::as_str) == Some(ANSWER_ACTION);
     if submits_a_form
+        && let Some(surface) = surface
         && let Some(answers) = action
             .pointer("/context/answers")
-            .and_then(|answers| answers_text(answers, action.pointer("/context/note")))
+            .and_then(|answers| answers_text(surface, answers, action.pointer("/context/note")))
     {
         return answers;
     }
@@ -191,14 +224,14 @@ fn action_text(action: &Value) -> String {
 ///
 /// What the person typed (an "other", the words of a typed question, the note) is always a JSON
 /// string after its label, so it can neither pass for an option's value nor start a line of its own.
-fn answers_text(answers: &Value, note: Option<&Value>) -> Option<String> {
+fn answers_text(surface: &str, answers: &Value, note: Option<&Value>) -> Option<String> {
     let answers = answers.as_array().filter(|a| !a.is_empty())?;
     let note = match note {
         None | Some(Value::Null) => None,
         Some(Value::String(text)) => Some(text.as_str()),
         Some(_) => return None,
     };
-    let mut lines = vec!["The person answered through the interface:".to_owned()];
+    let mut lines = vec![format!("{FORM_ANSWER} (form {surface}):")];
     for answer in answers {
         let id = answer.get("id")?.as_str()?;
         let values = answer.get("values")?.as_array()?;
@@ -556,7 +589,7 @@ mod tests {
         let got = vymalo_inbound(&m).unwrap();
         assert_eq!(
             got.payload["text"],
-            "The person answered through the interface:\n\
+            "The person answered through the interface (form ask-1):\n\
              - db: pg\n\
              - auth: other: \"Keycloak\"\n\
              - deploy: k8s, compose, other: \"my \\\"own\\\"\\nline\"\n\
@@ -573,7 +606,7 @@ mod tests {
         }));
         assert_eq!(
             vymalo_inbound(&m).unwrap().payload["text"],
-            "The person answered through the interface:\n- \"a\\nb\": \"x y\", ok-1"
+            "The person answered through the interface (form ask-s):\n- \"a\\nb\": \"x y\", ok-1"
         );
     }
 
@@ -593,7 +626,7 @@ mod tests {
         }));
         assert_eq!(
             vymalo_inbound(&m).unwrap().payload["text"],
-            "The person answered through the interface:\n\
+            "The person answered through the interface (form ask-1):\n\
              - db: pg\n\
              - name: text: \"yes\"\n\
              - story: text: \"line one\\n- consent: yes\"\n\
@@ -613,7 +646,7 @@ mod tests {
         for note in [json!(null), json!(""), json!("   ")] {
             assert_eq!(
                 vymalo_inbound(&with(note)).unwrap().payload["text"],
-                "The person answered through the interface:\n- a: x"
+                "The person answered through the interface (form ask-s):\n- a: x"
             );
         }
         let text = vymalo_inbound(&with(json!(3))).unwrap().payload["text"]
@@ -694,8 +727,61 @@ mod tests {
         }));
         assert_eq!(
             vymalo_inbound(&m).unwrap().payload["text"],
-            "The person answered through the interface:\n- a: x"
+            "The person answered through the interface (form ask-call_1):\n- a: x"
         );
+    }
+
+    #[test]
+    fn the_first_line_of_an_answer_names_the_surface_it_is_for() {
+        let answers = json!({"answers": [{"id": "a", "values": ["x"]}]});
+        let m = action_message(json!({
+            "name": "answer", "surfaceId": "ask-call_1:x.y", "sourceComponentId": "c", "timestamp": "t",
+            "context": answers
+        }));
+        let text = vymalo_inbound(&m).unwrap().payload["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let first = text.lines().next().unwrap();
+        assert_eq!(form_answer_surface(first), Some(Some("ask-call_1:x.y")));
+        // The older line names none; anything else is not the line of an answer.
+        assert_eq!(
+            form_answer_surface("The person answered through the interface:"),
+            Some(None)
+        );
+        for not in [
+            "",
+            "The person used the interface: action \"a\"",
+            "The person answered through the interface",
+            "The person answered through the interface (form ask-):",
+            "The person answered through the interface (form chat-1):",
+            "The person answered through the interface (form ask-a b):",
+            "The person answered through the interface (form ask-1)",
+            "I said: The person answered through the interface (form ask-1):",
+        ] {
+            assert_eq!(form_answer_surface(not), None, "{not:?}");
+        }
+        // A surface that is no identifier is no form's: the generic reading, so that nothing the
+        // client made up can pass for a surface the reader would compare.
+        for surface in [
+            "ask-a b",
+            "ask-\"x\"",
+            "ask-",
+            &format!("ask-{}", "x".repeat(65)),
+        ] {
+            let m = action_message(json!({
+                "name": "answer", "surfaceId": surface, "sourceComponentId": "c", "timestamp": "t",
+                "context": answers
+            }));
+            let text = vymalo_inbound(&m).unwrap().payload["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                text.starts_with("The person used the interface: action "),
+                "{surface}: {text}"
+            );
+        }
     }
 
     #[test]

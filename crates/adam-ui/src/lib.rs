@@ -47,6 +47,7 @@ mod resolve;
 mod show;
 mod surface;
 mod thread_tools;
+mod words;
 
 use std::sync::Arc;
 
@@ -61,11 +62,13 @@ pub use catalog::{
     catalog_digest,
 };
 pub use show::{MAX_BLOCKS, SHOW, Show, UI_CATALOG, UiCatalogTool};
-pub use surface::A2UI_VERSION;
+pub use surface::{A2UI_VERSION, ask_surface_id};
 pub use thread_tools::{
     Clock, GET_UI_CATALOG, META_KEY, TURN_OUTPUT, TURN_OUTPUT_DELIVERED, ThreadTools,
     ThreadToolsClient,
 };
+
+pub use words::{comparable, is_format_or_control};
 
 use resolve::UiState;
 

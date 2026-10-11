@@ -251,7 +251,7 @@ async fn the_agent_asks_three_questions_as_one_form_the_person_answers_and_it_go
         requests[1].messages.last(),
         Some(&adam_model::Message::tool_result(
             "choices-call-1",
-            "The person answered through the interface:\n- db: pg\n- auth: keycloak\n- deploy: compose"
+            "The person answered through the interface (form ask-choices-call-1):\n- db: pg\n- auth: keycloak\n- deploy: compose"
         ))
     );
     // The catalog came inline, so the endpoint was listed twice (once a turn) and never asked for it.

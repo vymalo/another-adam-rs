@@ -1,5 +1,6 @@
 //! A2UI messages a tool emits: a surface with its components, under the screen's own catalog.
 
+use adam_a2a_runtime::ASK_SURFACE_PREFIX;
 use serde_json::{Value, json};
 
 /// The A2UI version these messages are written for.
@@ -23,6 +24,16 @@ pub(crate) fn safe_id(raw: &str) -> String {
         id.push('x');
     }
     id
+}
+
+/// The id of the surface `ask_user` draws its form on for the tool call `call_id`: the prefix the A2A
+/// layer recognises as a form's ([`ASK_SURFACE_PREFIX`]) and the call's id made into an identifier
+/// (`A-Z a-z 0-9 _ . : -`, anything else written as `-`, at most 64 characters). An answer comes
+/// back naming this surface, so a reader that holds the call can tell which question the answer is
+/// for.
+#[must_use]
+pub fn ask_surface_id(call_id: &str) -> String {
+    format!("{ASK_SURFACE_PREFIX}{}", safe_id(call_id))
 }
 
 /// The A2UI messages that create surface `surface_id` under `catalog_id` and give it

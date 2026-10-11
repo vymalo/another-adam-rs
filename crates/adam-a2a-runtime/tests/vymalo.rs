@@ -326,7 +326,7 @@ async fn a_question_with_an_interface_is_input_required_with_text_and_a_2ui_part
         requests[1].messages.last(),
         Some(&ModelMessage::tool_result(
             "c1",
-            "The person answered through the interface:\n- db: pg"
+            "The person answered through the interface (form ask-1):\n- db: pg"
         ))
     );
 }
