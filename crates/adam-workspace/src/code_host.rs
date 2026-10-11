@@ -104,6 +104,122 @@ pub trait CodeHost: Send + Sync + 'static {
         let _ = host_repo;
         Ok(None)
     }
+
+    /// Merge pull request `merge.number` of `merge.repo` with `merge.method`, only if the branch
+    /// still is what the caller looked at (the host refuses a merge of a head that moved).
+    ///
+    /// Idempotent: a pull request that is already merged is reported as it is
+    /// ([`MergedPullRequest::already_merged`]), so a repeat after a crash is the same answer. What
+    /// the host's own rules refuse (branch protection, required checks and reviews, conflicts, a
+    /// draft) is [`WorkspaceError::Conflict`] with the host's words; credentials that may not merge
+    /// are [`WorkspaceError::Auth`].
+    ///
+    /// The default is an error: a host that cannot merge need not say how.
+    async fn merge_pull_request(
+        &self,
+        merge: MergePullRequest,
+    ) -> Result<MergedPullRequest, WorkspaceError> {
+        let _ = merge;
+        Err(WorkspaceError::Invalid(
+            "this code host cannot merge pull requests".to_owned(),
+        ))
+    }
+
+    /// Rename the repository `repo` names to `new_name` (the same owner), and say what it is called
+    /// now. The host keeps redirecting the old address.
+    ///
+    /// Not idempotent: a name that is taken is [`WorkspaceError::Invalid`]. The default is an error,
+    /// as for [`create_repository`](Self::create_repository).
+    async fn rename_repository(
+        &self,
+        repo: &RepoRef,
+        new_name: &str,
+    ) -> Result<CreatedRepository, WorkspaceError> {
+        let _ = (repo, new_name);
+        Err(WorkspaceError::Invalid(
+            "this code host cannot rename repositories".to_owned(),
+        ))
+    }
+
+    /// Delete the repository `repo` names, for good. A repository that is not there is
+    /// [`WorkspaceError::NotFound`]; credentials that may not delete are [`WorkspaceError::Auth`].
+    ///
+    /// The default is an error, as for [`create_repository`](Self::create_repository).
+    async fn delete_repository(&self, repo: &RepoRef) -> Result<(), WorkspaceError> {
+        let _ = repo;
+        Err(WorkspaceError::Invalid(
+            "this code host cannot delete repositories".to_owned(),
+        ))
+    }
+}
+
+/// How a pull request is merged: the three ways a host offers. Closed on purpose: a new way is a
+/// decision for every caller.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MergeMethod {
+    /// One commit on the base branch with all the pull request's changes (the default).
+    #[default]
+    Squash,
+    /// A merge commit.
+    Merge,
+    /// The pull request's commits, replayed on the base branch.
+    Rebase,
+}
+
+impl MergeMethod {
+    /// The word the host and the callers use: `squash`, `merge` or `rebase`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Squash => "squash",
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
+impl std::str::FromStr for MergeMethod {
+    type Err = WorkspaceError;
+
+    fn from_str(word: &str) -> Result<Self, Self::Err> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "squash" => Ok(Self::Squash),
+            "merge" => Ok(Self::Merge),
+            "rebase" => Ok(Self::Rebase),
+            other => Err(WorkspaceError::Invalid(format!(
+                "{other:?} is not a merge method: use squash, merge or rebase"
+            ))),
+        }
+    }
+}
+
+/// Input for [`CodeHost::merge_pull_request`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergePullRequest {
+    /// The repository the pull request is in; `repo.base_branch` is not used.
+    pub repo: RepoRef,
+    /// The pull request's number.
+    pub number: u64,
+    /// How to merge it.
+    pub method: MergeMethod,
+    /// Delete the head branch afterwards, when it is a branch of this very repository (never a
+    /// fork's, never the base). A branch that cannot be deleted does not undo the merge: it is said
+    /// in [`MergedPullRequest::branch_note`].
+    pub delete_branch: bool,
+}
+
+/// A pull request that was merged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergedPullRequest {
+    /// The commit the merge made on the base branch (what the host says; empty if it said none).
+    pub sha: String,
+    /// The pull request's browser URL.
+    pub url: String,
+    /// It was merged before this call: nothing was done now.
+    pub already_merged: bool,
+    /// The head branch that was deleted, if one was.
+    pub deleted_branch: Option<String>,
+    /// Why the head branch was kept when the caller asked to delete it, if it was.
+    pub branch_note: Option<String>,
 }
 
 /// What owns repositories on a host.
@@ -186,7 +302,8 @@ mod memory {
     use async_trait::async_trait;
 
     use super::{
-        CodeHost, CreatedRepository, NewPullRequest, NewRepository, OwnerKind, PullRequest,
+        CodeHost, CreatedRepository, MergePullRequest, MergedPullRequest, NewPullRequest,
+        NewRepository, OwnerKind, PullRequest,
     };
     use crate::error::WorkspaceError;
     use crate::repo::RepoRef;
@@ -204,6 +321,10 @@ mod memory {
         created: Mutex<Vec<NewRepository>>,
         organizations: Mutex<Vec<String>>,
         login: Mutex<Option<String>>,
+        merged: Mutex<Vec<MergePullRequest>>,
+        renamed: Mutex<Vec<(String, String)>>,
+        deleted: Mutex<Vec<String>>,
+        refusal: Mutex<Option<String>>,
     }
 
     impl MemoryCodeHost {
@@ -242,6 +363,56 @@ mod memory {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(login.to_owned());
             self
+        }
+
+        /// Refuse [`merge_pull_request`](CodeHost::merge_pull_request),
+        /// [`rename_repository`](CodeHost::rename_repository) and
+        /// [`delete_repository`](CodeHost::delete_repository) with
+        /// [`WorkspaceError::Auth`]`(message)`: what a host says to credentials without the
+        /// permission.
+        #[must_use]
+        pub fn refusing_changes(self, message: &str) -> Self {
+            *self
+                .refusal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.to_owned());
+            self
+        }
+
+        /// The merges that were made, in order (a repeat of one is recorded once).
+        pub fn merges(&self) -> Vec<MergePullRequest> {
+            self.merged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        /// The renames that were made, as `(repository url, new name)`, in order.
+        pub fn renames(&self) -> Vec<(String, String)> {
+            self.renamed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        /// The addresses of the repositories that were deleted, in order.
+        pub fn deletions(&self) -> Vec<String> {
+            self.deleted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn refused(&self) -> Result<(), WorkspaceError> {
+            match self
+                .refusal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                Some(message) => Err(WorkspaceError::Auth(message)),
+                None => Ok(()),
+            }
         }
 
         /// The repositories that were created, in order.
@@ -415,6 +586,70 @@ mod memory {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone())
         }
+
+        async fn merge_pull_request(
+            &self,
+            merge: MergePullRequest,
+        ) -> Result<MergedPullRequest, WorkspaceError> {
+            self.refused()?;
+            let (url, head) = self
+                .lock()
+                .iter()
+                .find(|(req, pr)| req.repo.url == merge.repo.url && pr.number == merge.number)
+                .map(|(_, pr)| (pr.url.clone(), pr.head.clone()))
+                .ok_or_else(|| {
+                    WorkspaceError::NotFound(format!(
+                        "no pull request #{} in {}",
+                        merge.number, merge.repo.url
+                    ))
+                })?;
+            let mut merged = self
+                .merged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let already_merged = merged
+                .iter()
+                .any(|m| m.repo.url == merge.repo.url && m.number == merge.number);
+            if !already_merged {
+                merged.push(merge.clone());
+            }
+            Ok(MergedPullRequest {
+                sha: format!("{:040x}", merge.number),
+                url,
+                already_merged,
+                deleted_branch: (merge.delete_branch && !already_merged).then_some(head),
+                branch_note: None,
+            })
+        }
+
+        async fn rename_repository(
+            &self,
+            repo: &RepoRef,
+            new_name: &str,
+        ) -> Result<CreatedRepository, WorkspaceError> {
+            self.refused()?;
+            let loc = repo.locate()?;
+            let full_name = format!("{}/{new_name}", loc.owner);
+            self.renamed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((repo.url.clone(), new_name.to_owned()));
+            Ok(CreatedRepository {
+                clone_url: format!("memory://{full_name}.git"),
+                html_url: format!("memory://{full_name}"),
+                default_branch: "main".to_owned(),
+                full_name,
+            })
+        }
+
+        async fn delete_repository(&self, repo: &RepoRef) -> Result<(), WorkspaceError> {
+            self.refused()?;
+            self.deleted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(repo.url.clone());
+            Ok(())
+        }
     }
 
     #[cfg(test)]
@@ -546,6 +781,64 @@ mod memory {
                 None,
                 "an installation has no login"
             );
+        }
+
+        #[tokio::test]
+        async fn merges_renames_and_deletions_are_recorded_and_a_merge_is_idempotent() {
+            use super::super::MergeMethod;
+            let host = MemoryCodeHost::new();
+            let repo = RepoRef::new("https://github.com/o/r.git", "main");
+            let a = host.open_pull_request(new_pr("agent/a")).await.unwrap();
+            let merge = MergePullRequest {
+                repo: repo.clone(),
+                number: a.number,
+                method: MergeMethod::Squash,
+                delete_branch: true,
+            };
+            let first = host.merge_pull_request(merge.clone()).await.unwrap();
+            assert!(!first.already_merged);
+            assert_eq!(first.deleted_branch.as_deref(), Some("agent/a"));
+            let again = host.merge_pull_request(merge.clone()).await.unwrap();
+            assert!(again.already_merged);
+            assert_eq!(
+                host.merges(),
+                std::slice::from_ref(&merge),
+                "a repeat is recorded once"
+            );
+            assert!(matches!(
+                host.merge_pull_request(MergePullRequest {
+                    number: 99,
+                    ..merge
+                })
+                .await,
+                Err(WorkspaceError::NotFound(_))
+            ));
+
+            let renamed = host.rename_repository(&repo, "q").await.unwrap();
+            assert_eq!(renamed.full_name, "o/q");
+            assert_eq!(host.renames(), [(repo.url.clone(), "q".to_owned())]);
+            host.delete_repository(&repo).await.unwrap();
+            assert_eq!(host.deletions(), std::slice::from_ref(&repo.url));
+        }
+
+        #[tokio::test]
+        async fn a_host_that_refuses_changes_says_what_a_host_says_without_the_permission() {
+            let host =
+                MemoryCodeHost::new().refusing_changes("Resource not accessible by integration");
+            let repo = RepoRef::new("https://github.com/o/r.git", "main");
+            for err in [
+                host.rename_repository(&repo, "q")
+                    .await
+                    .map(|_| ())
+                    .unwrap_err(),
+                host.delete_repository(&repo).await.unwrap_err(),
+            ] {
+                assert!(
+                    matches!(&err, WorkspaceError::Auth(m) if m == "Resource not accessible by integration"),
+                    "{err:?}"
+                );
+            }
+            assert!(host.renames().is_empty() && host.deletions().is_empty());
         }
 
         #[tokio::test]

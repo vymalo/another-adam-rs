@@ -62,7 +62,8 @@ pub enum WorkspaceError {
         retry_after: Option<Duration>,
     },
 
-    /// The run id is already bound to a different repository.
+    /// The run id is already bound to a different repository, or the code host refused a change its
+    /// own rules forbid (a merge into a protected branch, a head that moved).
     #[error("conflict: {0}")]
     Conflict(String),
 

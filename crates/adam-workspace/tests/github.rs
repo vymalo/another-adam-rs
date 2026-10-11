@@ -821,3 +821,425 @@ mod create {
         assert_eq!(Bare.authenticated_login(&at("a", "b")).await.unwrap(), None);
     }
 }
+
+// ------------------------------------------------- merging, renaming and deleting
+
+mod change {
+    use super::*;
+    use adam_workspace::{MergeMethod, MergePullRequest};
+
+    fn merge(method: MergeMethod, delete_branch: bool) -> MergePullRequest {
+        MergePullRequest {
+            repo: repo(),
+            number: 7,
+            method,
+            delete_branch,
+        }
+    }
+
+    /// `GET /repos/octo/widgets/pulls/7` as the host answers it for an open pull request whose head
+    /// is `agent/018f3a2b` in `head_repo`.
+    fn open_pull(head_repo: &str) -> serde_json::Value {
+        json!({
+            "number": 7,
+            "html_url": "https://github.com/octo/widgets/pull/7",
+            "state": "open",
+            "merged": false,
+            "merge_commit_sha": null,
+            "head": {"ref": "agent/018f3a2b", "sha": "abc123", "repo": {"full_name": head_repo}},
+            "base": {"ref": "main", "sha": "def456", "repo": {"full_name": "octo/widgets"}},
+        })
+    }
+
+    async fn serve_pull(server: &MockServer, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/widgets/pulls/7"))
+            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_merge_sends_the_method_and_the_head_it_read_and_deletes_the_branch() {
+        let server = MockServer::start().await;
+        serve_pull(&server, open_pull("octo/widgets")).await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/octo/widgets/pulls/7/merge"))
+            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+            .and(header("x-github-api-version", "2022-11-28"))
+            .and(body_json(json!({"merge_method": "rebase", "sha": "abc123"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"sha": "9f8e7d", "merged": true, "message": "Pull Request successfully merged"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The branch has a slash in it, and the path keeps it.
+        Mock::given(method("DELETE"))
+            .and(path("/repos/octo/widgets/git/refs/heads/agent/018f3a2b"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let merged = client(&server)
+            .merge_pull_request(merge(MergeMethod::Rebase, true))
+            .await
+            .unwrap();
+        assert_eq!(merged.sha, "9f8e7d");
+        assert_eq!(merged.url, "https://github.com/octo/widgets/pull/7");
+        assert!(!merged.already_merged);
+        assert_eq!(merged.deleted_branch.as_deref(), Some("agent/018f3a2b"));
+        assert_eq!(merged.branch_note, None);
+    }
+
+    #[tokio::test]
+    async fn the_default_method_is_squash_and_a_branch_is_kept_unless_asked() {
+        assert_eq!(MergeMethod::default(), MergeMethod::Squash);
+        let server = MockServer::start().await;
+        serve_pull(&server, open_pull("octo/widgets")).await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/octo/widgets/pulls/7/merge"))
+            .and(body_json(
+                json!({"merge_method": "squash", "sha": "abc123"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"sha": "1", "merged": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let merged = client(&server)
+            .merge_pull_request(merge(MergeMethod::default(), false))
+            .await
+            .unwrap();
+        assert_eq!(merged.deleted_branch, None);
+    }
+
+    #[tokio::test]
+    async fn what_the_hosts_own_rules_refuse_is_a_conflict_in_its_own_words() {
+        for (status, message) in [
+            (405, "Required status check \"ci\" is expected."),
+            (405, "Pull Request is not mergeable"),
+            (
+                409,
+                "Head branch was modified. Review and try the merge again.",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            serve_pull(&server, open_pull("octo/widgets")).await;
+            Mock::given(method("PUT"))
+                .and(path("/repos/octo/widgets/pulls/7/merge"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(json!({"message": message})),
+                )
+                .mount(&server)
+                .await;
+            let err = client(&server)
+                .merge_pull_request(merge(MergeMethod::Squash, true))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, WorkspaceError::Conflict(m) if m == message),
+                "{err:?}"
+            );
+            assert_eq!(err.class(), ErrorClass::Rejected);
+        }
+    }
+
+    #[tokio::test]
+    async fn credentials_that_may_not_merge_are_auth_with_the_hosts_words() {
+        let server = MockServer::start().await;
+        serve_pull(&server, open_pull("octo/widgets")).await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/octo/widgets/pulls/7/merge"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"message": "Resource not accessible by integration"})),
+            )
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .merge_pull_request(merge(MergeMethod::Squash, false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WorkspaceError::Auth(m) if m == "Resource not accessible by integration"),
+            "{err:?}"
+        );
+        assert_eq!(err.class(), ErrorClass::Unauthenticated);
+        assert!(!adam_error::report(&err).contains(TOKEN));
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_that_is_merged_already_is_reported_and_merged_no_more() {
+        let server = MockServer::start().await;
+        let mut done = open_pull("octo/widgets");
+        done["state"] = json!("closed");
+        done["merged"] = json!(true);
+        done["merge_commit_sha"] = json!("77aa");
+        serve_pull(&server, done).await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let merged = client(&server)
+            .merge_pull_request(merge(MergeMethod::Squash, true))
+            .await
+            .unwrap();
+        assert!(merged.already_merged);
+        assert_eq!(merged.sha, "77aa");
+        assert_eq!(merged.deleted_branch, None);
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_that_was_closed_is_not_merged() {
+        let server = MockServer::start().await;
+        let mut closed = open_pull("octo/widgets");
+        closed["state"] = json!("closed");
+        serve_pull(&server, closed).await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .merge_pull_request(merge(MergeMethod::Squash, false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WorkspaceError::Invalid(m) if m.contains("closed")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_branch_of_a_fork_is_never_deleted_and_a_branch_that_will_not_go_is_a_note() {
+        // A fork's branch.
+        let server = MockServer::start().await;
+        serve_pull(&server, open_pull("someone/widgets")).await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/octo/widgets/pulls/7/merge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sha": "1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let merged = client(&server)
+            .merge_pull_request(merge(MergeMethod::Squash, true))
+            .await
+            .unwrap();
+        assert_eq!(merged.deleted_branch, None);
+        let note = merged.branch_note.expect("it says why");
+        assert!(note.contains("not in octo/widgets"), "{note}");
+
+        // A branch the host will not delete: the merge stands, and the note carries the host's words.
+        let server = MockServer::start().await;
+        serve_pull(&server, open_pull("octo/widgets")).await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/octo/widgets/pulls/7/merge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"sha": "1"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(
+                ResponseTemplate::new(422)
+                    .set_body_json(json!({"message": "Cannot delete a protected branch"})),
+            )
+            .mount(&server)
+            .await;
+        let merged = client(&server)
+            .merge_pull_request(merge(MergeMethod::Squash, true))
+            .await
+            .unwrap();
+        assert_eq!(merged.deleted_branch, None);
+        let note = merged.branch_note.expect("it says why");
+        assert!(note.contains("Cannot delete a protected branch"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn a_rename_patches_the_repository_and_says_what_it_is_called_now() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/octo/widgets"))
+            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+            .and(body_json(json!({"name": "gadgets"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "full_name": "octo/gadgets",
+                "clone_url": "https://github.com/octo/gadgets.git",
+                "html_url": "https://github.com/octo/gadgets",
+                "default_branch": "main",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let renamed = client(&server)
+            .rename_repository(&repo(), "gadgets")
+            .await
+            .unwrap();
+        assert_eq!(renamed.full_name, "octo/gadgets");
+        assert_eq!(renamed.clone_url, "https://github.com/octo/gadgets.git");
+    }
+
+    #[tokio::test]
+    async fn a_name_that_is_taken_is_invalid_and_a_name_that_is_no_name_sends_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/octo/widgets"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+                "message": "Repository creation failed.",
+                "errors": [{"message": "name already exists on this account"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let host = client(&server);
+        let err = host
+            .rename_repository(&repo(), "gadgets")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WorkspaceError::Invalid(m) if m.contains("already exists")),
+            "{err:?}"
+        );
+        for bad in ["", "a/b", "a b", "../x", &"x".repeat(101)] {
+            let err = host.rename_repository(&repo(), bad).await.unwrap_err();
+            assert!(matches!(err, WorkspaceError::Invalid(_)), "{bad:?}");
+        }
+        // Only the first call reached the host (`expect(1)`).
+    }
+
+    #[tokio::test]
+    async fn a_delete_is_a_delete_and_a_refusal_is_the_hosts_words() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/repos/octo/widgets"))
+            .and(header("authorization", format!("Bearer {TOKEN}").as_str()))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client(&server).delete_repository(&repo()).await.unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/repos/octo/widgets"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_json(json!({"message": "Must have admin rights to Repository."})),
+            )
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .delete_repository(&repo())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, WorkspaceError::Auth(m) if m == "Must have admin rights to Repository."),
+            "{err:?}"
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"message": "Not Found"})))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .delete_repository(&repo())
+            .await
+            .unwrap_err();
+        assert_eq!(err.class(), ErrorClass::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_local_repository_is_not_one_of_these() {
+        let server = MockServer::start().await;
+        let local = RepoRef::new("/srv/git/widgets.git", "main");
+        let host = client(&server);
+        assert!(host.delete_repository(&local).await.is_err());
+        assert!(host.rename_repository(&local, "x").await.is_err());
+        assert!(
+            host.merge_pull_request(MergePullRequest {
+                repo: local,
+                number: 1,
+                method: MergeMethod::Squash,
+                delete_branch: false,
+            })
+            .await
+            .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_methods_are_three_words() {
+        for (word, method) in [
+            ("squash", MergeMethod::Squash),
+            ("MERGE", MergeMethod::Merge),
+            (" rebase ", MergeMethod::Rebase),
+        ] {
+            assert_eq!(word.parse::<MergeMethod>().unwrap(), method);
+            assert_eq!(method.as_str().parse::<MergeMethod>().unwrap(), method);
+        }
+        assert!("fast-forward".parse::<MergeMethod>().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_says_so() {
+        struct Bare;
+        #[async_trait::async_trait]
+        impl CodeHost for Bare {
+            async fn open_pull_request(
+                &self,
+                _: NewPullRequest,
+            ) -> Result<PullRequest, WorkspaceError> {
+                unreachable!()
+            }
+            async fn find_pull_request(
+                &self,
+                _: &RepoRef,
+                _: &str,
+            ) -> Result<Option<PullRequest>, WorkspaceError> {
+                unreachable!()
+            }
+            async fn find_pull_request_on_head(
+                &self,
+                _: &RepoRef,
+                _: &str,
+            ) -> Result<Option<PullRequest>, WorkspaceError> {
+                unreachable!()
+            }
+            async fn comment_on_pull_request(
+                &self,
+                _: &RepoRef,
+                _: u64,
+                _: &str,
+            ) -> Result<(), WorkspaceError> {
+                unreachable!()
+            }
+        }
+        assert!(matches!(
+            Bare.merge_pull_request(merge(MergeMethod::Squash, false))
+                .await,
+            Err(WorkspaceError::Invalid(_))
+        ));
+        assert!(matches!(
+            Bare.rename_repository(&repo(), "x").await,
+            Err(WorkspaceError::Invalid(_))
+        ));
+        assert!(matches!(
+            Bare.delete_repository(&repo()).await,
+            Err(WorkspaceError::Invalid(_))
+        ));
+    }
+}

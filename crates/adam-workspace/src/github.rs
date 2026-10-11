@@ -11,7 +11,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::code_host::{
-    CodeHost, CreatedRepository, NewPullRequest, NewRepository, OwnerKind, PullRequest,
+    CodeHost, CreatedRepository, MergePullRequest, MergedPullRequest, NewPullRequest,
+    NewRepository, OwnerKind, PullRequest,
 };
 use crate::credentials::DynGitCredentials;
 use crate::error::{WorkspaceError, WorkspaceResult};
@@ -121,6 +122,71 @@ impl GitHub {
                             .is_some_and(|b| b.branch == repo.base_branch))
             })
             .map(|p| p.into_pull_request(branch)))
+    }
+
+    /// Delete the head branch of a merged pull request, if it is this repository's own and not
+    /// the base: `(the branch deleted, why a branch was kept)`. A failure here is a note, never an
+    /// error: the merge happened.
+    async fn delete_head(
+        &self,
+        token: &SecretString,
+        (owner, name): (&str, &str),
+        pull: &ApiPullDetail,
+    ) -> (Option<String>, Option<String>) {
+        let Some(head) = &pull.head else {
+            return (
+                None,
+                Some("the pull request names no head branch".to_owned()),
+            );
+        };
+        let own = format!("{owner}/{name}");
+        let in_this_repository = head
+            .repo
+            .as_ref()
+            .is_some_and(|r| r.full_name.eq_ignore_ascii_case(&own));
+        if !in_this_repository {
+            return (
+                None,
+                Some(format!(
+                    "the branch {} is not in {own} (a fork, or a repository that is gone), so it is kept",
+                    head.branch
+                )),
+            );
+        }
+        if pull.base.as_ref().is_some_and(|b| b.branch == head.branch) {
+            return (
+                None,
+                Some(format!(
+                    "the branch {} is the base, so it is kept",
+                    head.branch
+                )),
+            );
+        }
+        let path = format!(
+            "/repos/{owner}/{name}/git/refs/heads/{}",
+            encode_ref(&head.branch)
+        );
+        let sent = self.request(Method::DELETE, &path, token).send().await;
+        let outcome = match sent {
+            Ok(resp) => check(resp, token).await.map(|_| ()),
+            Err(e) => Err(transport(e, token)),
+        };
+        match outcome {
+            Ok(()) => (Some(head.branch.clone()), None),
+            // Deleted already (a repository that deletes merged branches by itself).
+            Err(WorkspaceError::Invalid(m)) if m.contains("does not exist") => (
+                None,
+                Some(format!("the branch {} was already gone", head.branch)),
+            ),
+            Err(WorkspaceError::NotFound(_)) => (
+                None,
+                Some(format!("the branch {} was already gone", head.branch)),
+            ),
+            Err(e) => (
+                None,
+                Some(format!("the branch {} was not deleted: {e}", head.branch)),
+            ),
+        }
     }
 }
 
@@ -326,6 +392,120 @@ impl CodeHost for GitHub {
             .map_err(|e| decode_error(e, &token))?;
         Ok(account.login)
     }
+
+    #[tracing::instrument(skip(self, merge), fields(repo = %merge.repo.url, number = merge.number))]
+    async fn merge_pull_request(
+        &self,
+        merge: MergePullRequest,
+    ) -> Result<MergedPullRequest, WorkspaceError> {
+        let token = self.creds.token_for(&merge.repo).await?;
+        let (owner, name) = slug(&merge.repo)?;
+        let path = format!("/repos/{owner}/{name}/pulls/{}", merge.number);
+        // Read it first: what is merged is the head the host shows now (`sha`), a pull request that
+        // was merged already is reported as it is, and the head branch is known for the delete.
+        let resp = self
+            .request(Method::GET, &path, &token)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        let pull: ApiPullDetail = check(resp, &token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, &token))?;
+        if pull.merged {
+            return Ok(MergedPullRequest {
+                sha: pull.merge_commit_sha.unwrap_or_default(),
+                url: pull.html_url,
+                already_merged: true,
+                deleted_branch: None,
+                branch_note: None,
+            });
+        }
+        if pull.state != "open" {
+            return Err(WorkspaceError::Invalid(format!(
+                "pull request #{} is {}, not open",
+                merge.number, pull.state
+            )));
+        }
+        let mut body = json!({"merge_method": merge.method.as_str()});
+        if let Some(sha) = pull.head.as_ref().and_then(|h| h.sha.as_deref()) {
+            body["sha"] = json!(sha);
+        }
+        let resp = self
+            .request(Method::PUT, &format!("{path}/merge"), &token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        let merged: ApiMerge = check_merge(resp, &token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, &token))?;
+        let (deleted_branch, branch_note) = if merge.delete_branch {
+            self.delete_head(&token, (&owner, &name), &pull).await
+        } else {
+            (None, None)
+        };
+        Ok(MergedPullRequest {
+            sha: merged.sha.unwrap_or_default(),
+            url: pull.html_url,
+            already_merged: false,
+            deleted_branch,
+            branch_note,
+        })
+    }
+
+    #[tracing::instrument(skip(self, repo), fields(repo = %repo.url, new_name))]
+    async fn rename_repository(
+        &self,
+        repo: &RepoRef,
+        new_name: &str,
+    ) -> Result<CreatedRepository, WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        let (owner, name) = slug(repo)?;
+        // The new name is sent in a body, but it is still only ever a repository's name.
+        if new_name.is_empty()
+            || new_name.len() > 100
+            || !new_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(WorkspaceError::Invalid(format!(
+                "{new_name:?} is not a repository name"
+            )));
+        }
+        let resp = self
+            .request(Method::PATCH, &format!("/repos/{owner}/{name}"), &token)
+            .json(&json!({ "name": new_name }))
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        let renamed: ApiRepository = check(resp, &token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, &token))?;
+        Ok(CreatedRepository {
+            full_name: renamed.full_name,
+            clone_url: renamed.clone_url,
+            html_url: renamed.html_url,
+            default_branch: renamed.default_branch.unwrap_or_else(|| "main".to_owned()),
+        })
+    }
+
+    #[tracing::instrument(skip(self, repo), fields(repo = %repo.url))]
+    async fn delete_repository(&self, repo: &RepoRef) -> Result<(), WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        let (owner, name) = slug(repo)?;
+        let resp = self
+            .request(Method::DELETE, &format!("/repos/{owner}/{name}"), &token)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        check(resp, &token).await.map(|_| ())
+    }
 }
 
 /// What a repository creation answers.
@@ -335,6 +515,40 @@ struct ApiRepository {
     clone_url: String,
     html_url: String,
     default_branch: Option<String>,
+}
+
+/// What `GET /repos/{owner}/{name}/pulls/{number}` says that a merge needs.
+#[derive(Deserialize)]
+struct ApiPullDetail {
+    html_url: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    merged: bool,
+    merge_commit_sha: Option<String>,
+    head: Option<ApiHeadDetail>,
+    base: Option<ApiHead>,
+}
+
+/// The head of a pull request: its branch, the commit the host shows, and the repository it is in.
+#[derive(Deserialize)]
+struct ApiHeadDetail {
+    #[serde(rename = "ref")]
+    branch: String,
+    sha: Option<String>,
+    repo: Option<ApiRepoName>,
+}
+
+/// A repository, by its `owner/name`.
+#[derive(Deserialize)]
+struct ApiRepoName {
+    full_name: String,
+}
+
+/// What a merge answers.
+#[derive(Deserialize)]
+struct ApiMerge {
+    sha: Option<String>,
 }
 
 /// A user or an organisation (`GET /users/{login}`, `GET /user`).
@@ -452,6 +666,31 @@ async fn check(resp: Response, token: &SecretString) -> WorkspaceResult<Response
             message,
         },
     })
+}
+
+/// [`check`] for a merge: GitHub answers `405` ("Pull Request is not mergeable": a protected branch,
+/// failing required checks, a conflict, a draft) and `409` ("Head branch was modified") when its own
+/// rules refuse, which is [`WorkspaceError::Conflict`] with its words, not an unexpected status.
+async fn check_merge(resp: Response, token: &SecretString) -> WorkspaceResult<Response> {
+    let status = resp.status();
+    if status == StatusCode::METHOD_NOT_ALLOWED || status == StatusCode::CONFLICT {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(WorkspaceError::Conflict(scrub(&api_message(&body), token)));
+    }
+    check(resp, token).await
+}
+
+/// `branch` as the path of a ref: every segment percent-encoded, the slashes kept.
+fn encode_ref(branch: &str) -> String {
+    let mut out = String::with_capacity(branch.len());
+    for byte in branch.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// The longest wait a rate-limited response can ask for; a larger value is a broken header.
