@@ -278,15 +278,23 @@ Each is testable alone. ADR 0038's removal comes first; it is independent.
 Workers (ADR 0037) do not depend on this ADR. This ADR's plugins depend on the shape ADR 0037 gives the tool steps, hence
 slice 3 after its slices 1-2.
 
-## Open questions for the owner
+## The owner's answers (2026-10-11)
 
-1. **Does `ask` ever reach a person?** The coder's presets use only allow and deny (autonomy, ADR 0036); `ask` exists for
-   folder agents that want a person in the loop. Is that right, or should the coder ask before some calls?
-2. **An undo for the person.** With snapshots, the web could offer "undo this turn's edits" (an A2A extension that calls
-   `revert_to`). Wanted now, later, or never?
-3. **Agents switched per message.** OpenCode lets a person pick the primary agent for a message (`build`, `plan`). adam has
-   the tier for that. Is a choice of agent per message also wanted?
-4. **Out-of-process plugins.** Needed now, and for which plugin? Without an answer they are not built.
+1. **`ask` reaches a person only for folder agents.** The coder's tier presets use allow and deny alone (autonomy, ADR
+   0036); a folder agent may use `ask`, shown as a consent form, with an "always" choice kept in the run's state.
+2. **No undo for the person.** Snapshots and `revert_to` stay internal to the coder; no extension and no web action.
+3. **A mode chosen per message, besides the tier.** An agent may declare primary modes, as OpenCode's `build` and `plan`:
+   a folder's `modes/<name>.md` (a prompt, `tools:` and `permission:` of its own, over the agent's), one of them the
+   default. A person picks one per message, and it holds until another is picked, as the tier does. To keep plain A2A whole
+   (the owner's rule for the tier, ADR 0036), the choice travels as an **optional extension of its own**,
+   `https://agents.vymalo.com/a2a/extensions/agent-mode/v1`: the card declares `params {modes: [{name, title, description}],
+   default}`, a message carries `metadata[URI] = {"mode": "<name>"}`, an unknown mode is `InvalidParams`, and an agent that
+   does not declare it ignores nothing and works as before. The tier still caps every mode: a mode's rules only narrow.
+   The orchestration layer's side (the contract page `docs/api/agent-mode-v1.md`, an ADR, the composer's switch, carrying
+   the mode on its own reworks like the tier) is a change there. A slice is added below the plugins: modes in the folder
+   format, the extension in `adam-a2a` and `adam-a2a-runtime`, and the coder's `build` (the default) and `plan` modes.
+4. **No out-of-process plugins now.** Plugins are Rust, composed at build time with the testkit; one over MCP or an exec
+   comes when a concrete plugin needs it.
 
 ## Verified and unverified (2026-10-11)
 
