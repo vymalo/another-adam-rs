@@ -45,10 +45,12 @@ applies at the next start, and a restart is a deploy.
 The built-in tools are the person's screen ([`adam-ui`](../../crates/adam-ui/README.md)), and the same ones
 `adam-coder` has, with descriptions that fit any agent:
 
-* `ask_user { question, choices? }`: the run parks, A2A reports `input-required` with the question, and the person's
-  answer resumes it. With `choices` (up to 8 questions of 2 to 8 options) and a screen that can draw a form, the
-  question carries one Choices surface and the answers come back as the result (`- db: pg`); otherwise the options
-  are listed in the question's text. `asks_user` is `true`, so a subagent never has it.
+* `ask_user { question, title?, description?, choices?, freeInput?, submitLabel? }`: the run parks, A2A reports
+  `input-required` with the question, and the person's answer resumes it. With `choices` (up to 8 questions: radio
+  buttons, checkboxes, a searchable list, a deck of pictures or a typed answer, options with a label and a
+  description) and a screen that can draw a form, the question carries one Choices surface with its title and its
+  description of why, and the answers come back as the result (`- db: pg`); otherwise the form is listed in the
+  question's text. `asks_user` is `true`, so a subagent never has it.
 * `show { blocks, title? }` and `ui_catalog {}`: draw blocks of the components the person's screen has (cards, a
   diagram), and list them. They answer "answer in text" when the screen sent no catalog. A folder that does not want
   them lists the tools it does want in `tools:`.

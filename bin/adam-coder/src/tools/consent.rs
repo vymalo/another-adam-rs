@@ -181,11 +181,14 @@ pub(crate) fn quoted_reason(reason: &str) -> String {
     out
 }
 
-/// The arguments of `ask_user` for a question with two answers: `text` is the question, `ask` the
-/// form's own, `yes` and `no` the labels of its two options.
-pub(crate) fn yes_no(text: &str, ask: &str, yes: &str, no: &str) -> Value {
+/// The arguments of `ask_user` for a question with two answers: `lead` is the sentence the person
+/// reads first, `title` and `why` the form's heading and its description (what the agent says to
+/// justify asking), `ask` the form's own question, `yes` and `no` the labels of its two options.
+pub(crate) fn yes_no(lead: &str, title: &str, why: &str, ask: &str, yes: &str, no: &str) -> Value {
     json!({
-        "question": text,
+        "question": lead,
+        "title": title,
+        "description": why,
         "choices": [{
             "id": QUESTION_ID,
             "question": ask,
@@ -267,15 +270,17 @@ pub async fn request_repository(
         )));
     }
 
-    let text = format!(
-        "May I add the repository {display} ({url}) to this workspace?\nThe agent says why: \"{}\"",
-        quoted_reason(reason)
-    );
+    // A screen that draws the form shows `why` as its description; on one that does not, `ask_user`
+    // puts it after the first line, so the person reads the same words either way.
+    let lead = format!("May I add the repository {display} ({url}) to this workspace?");
+    let why = format!("The agent says why: \"{}\"", quoted_reason(reason));
     ask(
         &env,
         ctx,
         yes_no(
-            &text,
+            &lead,
+            "Add a repository to this workspace",
+            &why,
             &format!("Add {display} to this workspace?"),
             &yes_label(&display),
             NO_LABEL,
@@ -401,8 +406,17 @@ mod tests {
 
     #[test]
     fn the_question_has_two_options_and_one_form_question() {
-        let args = yes_no("May I?", "Add it?", "Yes, add it", "No");
+        let args = yes_no(
+            "May I?",
+            "Add it",
+            "Because.",
+            "Add it?",
+            "Yes, add it",
+            "No",
+        );
         assert_eq!(args["question"], "May I?");
+        assert_eq!(args["title"], "Add it");
+        assert_eq!(args["description"], "Because.");
         let choices = args["choices"].as_array().unwrap();
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0]["id"], QUESTION_ID);

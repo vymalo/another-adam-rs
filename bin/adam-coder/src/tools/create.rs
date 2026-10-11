@@ -225,20 +225,21 @@ pub async fn create_repository(
         } else {
             "public (anyone can see it) and empty"
         };
-        let mut text = format!(
+        let lead = format!(
             "May I create the repository {owner}/{name} on {host}? It will be {visibility}."
         );
-        if let Some(description) = &description {
-            text.push_str(&format!(
-                "\nDescription: \"{}\"",
-                quoted_reason(description)
-            ));
-        }
+        // The "why" of the form: what the repository is for when the model said, else the promise.
+        let why = match &description {
+            Some(description) => format!("Description: \"{}\"", quoted_reason(description)),
+            None => "Nothing is created unless you say yes.".to_owned(),
+        };
         return ask(
             &env,
             ctx,
             yes_no(
-                &text,
+                &lead,
+                "Create a repository",
+                &why,
                 &format!("Create {owner}/{name} on {host}?"),
                 &yes_label(owner, name),
                 NO_CREATE_LABEL,
