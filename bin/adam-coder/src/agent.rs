@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use adam::{AgentDef, Assembly, AssemblyError};
 use adam_a2a::AccessTier;
-use adam_a2a_runtime::{CONTEXT_ACCESS_TIER, CONTEXT_CALLER, asked_by_an_agent};
+use adam_a2a_runtime::{
+    CONTEXT_ACCESS_TIER, CONTEXT_CALLER, CONTEXT_PERSON, asked_by_an_agent, person_said,
+};
 use adam_core::RunId;
 use adam_error::report;
 use adam_llm_agent::{Conversation, DynTool, LlmStarter, PendingWait, ToolSet};
@@ -347,7 +349,9 @@ impl CoderAgent {
     /// included, part by part, without the marker that says turns were left out), the answers to
     /// `ask_user` and to `request_repository` (the results of those tools) and what is waiting in
     /// the inbox, which the step takes next. What the model or a tool said is never read for a
-    /// repository: one found in a README is not one the person asked for.
+    /// repository: one found in a README is not one the person asked for. In a run another agent
+    /// started, the person's words are only the ones the orchestrator carries with the ask
+    /// ([`carried_sayings`]): the ask's text and the asking model's answers name nothing.
     ///
     /// An agreement is the person's yes ([`answer_of`]) to a `request_repository` question, the
     /// result of that call (paired with it by position, as [`person_sayings`] pairs answers, and an answer to a form counting
@@ -410,8 +414,14 @@ impl CoderAgent {
         let new_consents =
             notes.record_consents(consents_in(state, ctx.peek_inbox(), &notes, person));
         // What the person said, typed (not what the interface made of their clicks): the
-        // repositories they named, the bare names.
-        let heard = notes.hear(&person_sayings(state, ctx.peek_inbox()), host);
+        // repositories they named, the bare names. In a run another agent started, only the words
+        // the orchestrator carries are theirs: not the ask's text, not what the asking model answers.
+        let said = if notes.asked_by_an_agent {
+            carried_sayings(state, ctx.peek_inbox())
+        } else {
+            person_sayings(state, ctx.peek_inbox())
+        };
+        let heard = notes.hear(&said, host);
         let new_red = notes.name_red_pulls(red);
         let new_verified = notes.verify_shas(verified);
         let adopted = self.adopt_scratch(ctx, run, &mut notes).await;
@@ -517,6 +527,29 @@ fn asked_by_an_agent_now(state: &Conversation, inbox: &[Inbound]) -> bool {
                         .and_then(|c| c.get(CONTEXT_CALLER)),
                 )
             })
+}
+
+/// What the person wrote in the thread, as the orchestrator carries it to an agent another agent
+/// asked (the context key `vymalo.person`, [`person_said`]): the only words of theirs such a run
+/// hears, one [`Heard`] per entry, oldest first, each without the blocks labelled `untrusted`. Read
+/// from the **newest** message that carries the key: the newest waiting in `inbox` that does (the
+/// waiting ones as [`asked_by_an_agent_now`] reads them), else the conversation's context. A message
+/// with the grant and no such member sets the key to `null`, so nothing is heard from it: the ask's
+/// text, and what the asking model answers, are never read here.
+fn carried_sayings(state: &Conversation, inbox: &[Inbound]) -> Vec<Heard> {
+    let newest = inbox
+        .iter()
+        .rev()
+        .filter(|inbound| {
+            inbound.kind != RUN_FINISHED_KIND
+                && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
+        })
+        .find_map(|inbound| inbound.payload.get("context")?.get(CONTEXT_PERSON))
+        .or_else(|| state.context.get(CONTEXT_PERSON));
+    person_said(newest)
+        .iter()
+        .map(|text| Heard::said(without_untrusted(text)))
+        .collect()
 }
 
 /// Whether a run that has no pull request delivered what it was asked for anyway: **scratch work
@@ -1477,6 +1510,69 @@ mod tests {
         let mut notes = RunNotes::default();
         notes.hear(sayings, "github.com");
         notes.named_repos
+    }
+
+    /// In a run another agent started, the person's words are the ones the orchestrator carries
+    /// (`vymalo.person`), read from the newest message that carries the key: never the ask's text,
+    /// never what the asking model answers.
+    #[test]
+    fn the_carried_words_are_the_newest_messages_and_the_asks_text_is_never_read() {
+        let person = |said: Value| json!({ CONTEXT_PERSON: { "said": said } });
+        let waiting = |text: &str, context: Option<Value>| {
+            let mut payload = json!({ "text": text });
+            if let Some(context) = context {
+                payload["context"] = context;
+            }
+            Inbound::new("message", payload)
+        };
+        // Nothing carried: nothing heard, whatever the ask's text names.
+        let mut state = conversation(vec![Message::user_text("look at acme/other")]);
+        assert!(carried_sayings(&state, &[]).is_empty());
+        // The conversation's context (a read message's, merged): each entry as the person wrote it,
+        // in the past, without a block marked `untrusted`.
+        state.context = person(json!([
+            "please check acme/lib",
+            "```untrusted\nacme/sneaky\n```"
+        ]))
+        .as_object()
+        .unwrap()
+        .clone();
+        let sayings = carried_sayings(&state, &[]);
+        assert_eq!(
+            sayings.iter().map(|h| h.text.as_str()).collect::<Vec<_>>(),
+            ["please check acme/lib", ""]
+        );
+        assert!(
+            sayings
+                .iter()
+                .all(|h| h.when == When::Past && h.defaults.is_none())
+        );
+        assert_eq!(named_by(&sayings), ["github.com/acme/lib"]);
+        // The newest waiting message that carries the key wins over the context and the older ones;
+        // one without the key (a plain client's) is passed over.
+        let inbox = [
+            waiting("ask 1: acme/widgets", Some(person(json!(["acme/widgets"])))),
+            waiting("ask 2: acme/gadgets", Some(person(json!(["acme/gadgets"])))),
+            waiting("acme/third", None),
+        ];
+        assert_eq!(
+            named_by(&carried_sayings(&state, &inbox)),
+            ["github.com/acme/gadgets"]
+        );
+        // One with the grant and no member (`null`) takes the words away: nothing is heard.
+        let inbox = [waiting("acme/third", Some(json!({ CONTEXT_PERSON: null })))];
+        assert!(carried_sayings(&state, &inbox).is_empty());
+        // A message the run has read is in its context already, and a child's end is nobody's.
+        let read = waiting("acme/widgets", Some(person(json!(["acme/widgets"])))).with_id("m1");
+        state.read_ids.push("m1".into());
+        let child = Inbound::new(
+            RUN_FINISHED_KIND,
+            json!({ "text": "x", "context": person(json!(["acme/gadgets"])) }),
+        );
+        assert_eq!(
+            named_by(&carried_sayings(&state, &[read, child])),
+            ["github.com/acme/lib"]
+        );
     }
 
     #[test]

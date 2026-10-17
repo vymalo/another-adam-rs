@@ -905,6 +905,7 @@ without them) is a follow-up (ADR 0036, decision 6).
 **What counts as the person's words** (`RunNotes::hear`, `named::typed_by_the_person`): what they typed, in their messages and in
 the typed parts of a form's answer (`other:`, `text:`, `Note:`). They name **repositories** (`RunNotes::named_repos`, which
 `prepare_workspace`, `rename_repository` and `delete_repository` read) and the **bare names** below; they do not decide a merge.
+In a run another agent started, their words are only the ones the orchestrator carries with the ask (*When another agent asks*, below).
 The question ids and the option values of a form are what the model wrote when it drew it, so a click names no repository and is
 no bare name. More things are the model's and are not heard:
 
@@ -1092,7 +1093,8 @@ stateDiagram-v2
 
 An agent that another agent's model asked (the orchestration layer's `ask_agent`) has no person behind it, and the asking model
 reads the question it would be sent, yes label included. The A2A layer reads who each message was sent for from the claims of its
-thread-tools token (`caller`: `main`, or `ask:<n>`), into the run's context `vymalo.caller`
+thread-tools token (`caller`: `main`, or `ask:<n>`), into the run's context `vymalo.caller`, and what the person wrote in the
+thread from the `person` member beside the grant, into `vymalo.person`
 ([`adam-a2a-runtime`](../../crates/adam-a2a-runtime/README.md#a-screen-as-the-sender)). In a run where the context or any
 waiting message names an asked agent (`adam_a2a_runtime::asked_by_an_agent`), and for the rest of the run and the tasks that
 continue it once one did (`RunNotes::asked_by_an_agent`, so that a later message for the thread's agent does not make the asked
@@ -1105,13 +1107,19 @@ agent's words the person's):
   tools draw no form there).
 * What needs nobody's yes is unchanged: `ask_user` asks in words and the asking model answers (the ask goes on), Path A merges,
   and `bypass` asks nothing.
-* **Repositories named in the asking model's messages still count** as named (the ask's text, its answers to `ask_user`), so the
-  refusal of `request_repository` protects nothing yet: what is closed today is a consent in words to `create_repository`.
-  Decided as a follow-up (the owner, 2026-10-17): in such a run only the repositories the person named in their own message will count, passed by the
-  orchestrator as a structured field of the ask; until that lands in both repositories, the behaviour is the one described here.
+* **The person's words are the ones the orchestrator carries.** Beside the grant of an ask's message, the orchestrator says what
+  the person wrote in the thread (`person.said` of the thread-tools metadata: every message of theirs, every job, oldest first, as
+  written, a credential redacted, each cut at 4 KiB, the oldest left out beyond 64 KiB), read into the run's context
+  `vymalo.person`. In such a run the coder hears **only** those words (`carried_sayings`, from the newest message that carries
+  the key): the repositories they name are named (`RunNotes::named_repos`), and the ask's text and the asking model's answers to
+  `ask_user` name nothing. Without the member nothing is named, and `request_repository` refuses as above. What the person
+  named before the run was asked stays named (the notes only add). The person's form answers are not carried (the
+  orchestrator's gap), so a repository named only there is not named here; they can write it in a message.
 * **Fail closed:** a message that carries the grant and whose token's claims cannot be read is nobody's too. A message without a
-  grant (a plain A2A client) is read as before, and so is an ask the orchestrator sends with none (it does when it cannot mint
-  one: a gap of the orchestration layer). A child run inherits the key, and a large context does not drop it.
+  grant (a plain A2A client) is read as before, and so would be an ask with none; since 2026-10-17 the orchestrator never sends
+  an ask to a card that lists `thread-tools/v1` without its grant, it fails the ask instead (vymalo/another-agentic-system#270,
+  *verified 2026-10-17* at its commit 591fc28). A child run inherits `vymalo.caller`, which a large context does not drop, and
+  not `vymalo.person` (only the protected keys pass to a child), so a child of an asked run names nothing.
 
 The signature of the token is the orchestrator's to check (the agent has no key): what is trusted is the authenticated A2A
 caller, as for a form's answer and the access tier. Decision: [ADR 0036](../../docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md#amended-2026-10-17-an-asked-agent).
@@ -2253,13 +2261,17 @@ database of its own, so the role needs `CREATEDB`):
   form granting), and **an asked coder** (the message's thread-tools grant names `ask:1`): `request_repository` asks nobody, the
   run does not park, while with the thread's own agent the same call parks and the label is a yes; and **once an asked agent
   wrote, no words are a consent in the run**: its yes label answering the question a person was asked grants nothing, neither
-  then nor after the thread's own agent writes next. Unit tests: `src/tools/named.rs` (`typed_by_the_person`, with and without the defaults of the question),
+  then nor after the thread's own agent writes next; and **an asked coder hears the person only through the words the orchestrator
+  carries** (`person.said` beside the grant): the repositories they name are named and what only the ask's text names is not,
+  `request_repository` for the latter asking nobody; an ask without the member naming nothing; the asking model's answer to
+  `ask_user` naming nothing; and what the person named before the run was asked staying named. Unit tests: `src/tools/named.rs` (`typed_by_the_person`, with and without the defaults of the question),
   `src/tools/notes.rs` (the bare names), `src/tools/consent.rs` (the surface of an answer, the merge question, the merge
   answer) and `src/agent.rs` (`person_sayings`: an error is no answer, an answer is paired with its call's defaults only on its
   own surface, a message that waited behind an owed result is `Deferred`; `consents_in`: a stranger's form is no consent for the
   call that waits, a merge is agreed to by its own form alone, the typed yes label grants nothing in a run another agent
   started, also behind a message for the thread's own agent; `asked_by_an_agent_now`: the context or any waiting message that
-  says).
+  says; `carried_sayings`: the newest message that carries the person's words, `null` taking them away, a read message and a
+  child's end passed over, the ask's text never read).
 * `tests/tiers.rs` (the access tiers): the tools the model is **shown** on a turn per tier (a real `Runtime`, a scripted model), the
   tier noted from the message and said to the model, a task that continues another starting at the default, a model that calls a
   tool above the tier anyway (the host is never asked, the refusal names the tier it needs), every tool checking the root run's
@@ -2317,8 +2329,9 @@ database of its own, so the role needs `CREATEDB`):
   A2UI action as the answer, the model's next words and the run going on to the end; the catalog read again
   over a fake thread-tools endpoint when the message only names its digest, and the tools of that endpoint offered
   to the model and called; a screen the coder cannot read (no inline catalog, no grant) getting the options as
-  text, with no A2UI part. An asked coder (a grant whose token names `ask:1`, no catalog): `request_repository` asks
-  nobody, the task is never `input-required` and completes, and `vymalo.caller` is in the run's context.
+  text, with no A2UI part. An asked coder (a grant whose token names `ask:1`, the person's words beside it, no catalog):
+  `request_repository` asks nobody, the task is never `input-required` and completes, the repository the person's words name
+  is named and the one only the ask's text names is not, and `vymalo.caller` and `vymalo.person` are in the run's context.
 * `tests/binary.rs`: the `adam-coder` binary as a process. All problems of a
   bad configuration reported together with exit 78 (the `DEVCONTAINER_*` ones among them: a runtime that is neither `off` nor `podman`, `podman`
   with no `CONTAINER_HOST`, an OpenCode that is a script and cannot be mounted, a timeout that is not a number); with

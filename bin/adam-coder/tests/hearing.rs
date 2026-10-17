@@ -757,8 +757,119 @@ async fn once_an_asked_agent_wrote_no_words_are_a_consent_in_the_run() {
     let notes = s.then(common::message_for("main", "Yes")).await;
     assert!(notes.asked_by_an_agent, "it is kept");
     assert!(notes.consents.is_empty(), "{:?}", notes.consents);
-    // The label names the repository, and a repository an asked agent's words name still counts as
-    // named until the orchestrator passes the person's own (ADR 0036, an asked agent): no consent
-    // is what this proves.
+    // The label names the repository in the asked agent's words, which name nothing (the person's
+    // words come with the ask: `an_asked_coder_names_repositories_only_from_what_the_person_said`):
+    // no consent is what this proves.
+    s.finish().await;
+}
+
+/// An asked coder hears the person only through the words the orchestrator carries beside the grant
+/// (`person.said`): the repositories they name are named, what only the ask's text names is not, so
+/// `request_repository` for it asks nobody and grants nothing, as before.
+#[tokio::test]
+async fn an_asked_coder_names_repositories_only_from_what_the_person_said() {
+    let s = Session::start(
+        Fixture::new("hello\n").await,
+        |m| {
+            m.push_tool_calls(vec![call(
+                "c1",
+                "request_repository",
+                json!({"repo_url": "https://github.com/acme/other", "reason": "it is named"}),
+            )]);
+            m.push_text("Done.");
+        },
+        common::message_for_asked_told(
+            1,
+            &["Please fix the greeting in acme/lib"],
+            "Look at acme/other, please",
+        ),
+    )
+    .await;
+    s.settle(s.run).await;
+    let view = s.rt.view(s.run).await.unwrap().unwrap();
+    assert_eq!(view.status, RunStatus::Done, "it did not park: {view:#?}");
+    let said = s.result_of("c1");
+    assert!(
+        said.starts_with("No person is in this conversation")
+            && said.contains("nobody can agree to adding acme/other to this workspace"),
+        "{said}"
+    );
+    let notes = s.notes_of(s.run).await;
+    assert!(notes.asked_by_an_agent);
+    assert_eq!(notes.named_repos, [LIB_KEY]);
+    assert!(notes.consents.is_empty());
+    s.finish().await;
+}
+
+/// An ask that carries nothing of the person (no `person` member beside the grant) names nothing,
+/// whatever its text says.
+#[tokio::test]
+async fn an_asked_coder_told_nothing_of_the_person_names_nothing() {
+    let s = Session::start(
+        Fixture::new("hello\n").await,
+        |m| {
+            m.push_text("Done.");
+        },
+        common::message_for("ask:1", "Look at acme/other and acme/lib, please"),
+    )
+    .await;
+    s.settle(s.run).await;
+    let notes = s.notes_of(s.run).await;
+    assert!(notes.asked_by_an_agent);
+    assert!(notes.named_repos.is_empty(), "{:?}", notes.named_repos);
+    s.finish().await;
+}
+
+/// `ask_user` still asks in words in an asked run and the asking model answers: its answer reaches
+/// the model and names nothing, while the continuation carries the person's words again, whole.
+#[tokio::test]
+async fn the_asking_models_answer_names_nothing_in_an_asked_run() {
+    let said = ["Please fix the greeting in acme/lib"];
+    let s = Session::start(
+        Fixture::new("hello\n").await,
+        asks_then_ends,
+        common::message_for_asked_told(1, &said, "Look at acme/lib, please"),
+    )
+    .await;
+    s.settle(s.run).await;
+    assert!(
+        s.rt.view(s.run).await.unwrap().unwrap().waiting,
+        "the asking model is asked"
+    );
+    assert_eq!(s.notes_of(s.run).await.named_repos, [LIB_KEY]);
+    let notes = s
+        .then(common::message_for_asked_told(
+            1,
+            &said,
+            "Use acme/other too",
+        ))
+        .await;
+    assert!(notes.asked_by_an_agent);
+    assert_eq!(notes.named_repos, [LIB_KEY]);
+    assert!(notes.consents.is_empty());
+    s.finish().await;
+}
+
+/// What the person named before the run was asked stays named (the notes only add); from the first
+/// asked message on, only the words the orchestrator carries add, never the ask's text.
+#[tokio::test]
+async fn the_persons_words_before_the_run_was_asked_stay_named() {
+    let s = Session::start(
+        Fixture::new("hello\n").await,
+        asks_then_ends,
+        common::message_for("main", "Please fix acme/lib"),
+    )
+    .await;
+    s.settle(s.run).await;
+    assert_eq!(s.notes_of(s.run).await.named_repos, [LIB_KEY]);
+    let notes = s
+        .then(common::message_for_asked_told(
+            1,
+            &["please also use acme/widgets"],
+            "Also take acme/third",
+        ))
+        .await;
+    assert!(notes.asked_by_an_agent);
+    assert_eq!(notes.named_repos, [LIB_KEY, WIDGETS]);
     s.finish().await;
 }

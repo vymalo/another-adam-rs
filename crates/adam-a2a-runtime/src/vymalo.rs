@@ -10,6 +10,7 @@ use adam_runtime::Inbound;
 use serde_json::{Map, Number, Value, json};
 
 use crate::caller::{CONTEXT_CALLER, caller_of};
+use crate::person::{CONTEXT_PERSON, person_of};
 use crate::words::comparable;
 
 /// The context key under which a message that carries `ui-catalog/v1` says which catalog is
@@ -73,6 +74,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// | the renderer's capabilities (`a2uiClientCapabilities.v0.9.1`, else `.v0.9`, else `a2uiRendererCapabilities.v1.0`) holding an inline catalog with the ref's `catalogId` | context [`CONTEXT_UI_CATALOG`] `{catalogId, version, digest, catalog}` |
 /// | `metadata[thread-tools/v1]` `{url, token, expiresAt}` | context [`CONTEXT_THREAD_TOOLS`], the same three members |
 /// | the `caller` and `depth` claims of that `token` (any entry under the URI) | context [`CONTEXT_CALLER`](crate::CONTEXT_CALLER): `{caller: "main"}`, `{caller: "ask:<n>", depth}`, or `{caller: "unreadable"}` ([`asked_by_an_agent`](crate::asked_by_an_agent)) |
+/// | the `person` member of that entry, `{said: [<strings>], omitted?}`, what the person wrote in the thread (on the message of an agent another agent asked) | context [`CONTEXT_PERSON`](crate::CONTEXT_PERSON): the same, `omitted` as an integer and only above 0; `null` for any entry under the URI without a well-formed one ([`person_said`](crate::person_said)) |
 /// | `metadata[mentions/v1]` `{mentions: [{agentId, label, start, end, name?, cardUrl?}], coordinate?: {tool}}` | context [`CONTEXT_MENTIONS`], the mentions that are well formed (at most [`MAX_MENTIONS`]) and the `coordinate` tool; a message with other extension metadata and no mentions sets it to `null` |
 ///
 /// A message with none of the metadata has no `context` at all, so it changes nothing in the run.
@@ -345,8 +347,10 @@ fn context_of(metadata: &HashMap<String, Value>) -> Option<Map<String, Value>> {
             context.insert(CONTEXT_THREAD_TOOLS.to_owned(), grant);
         }
         // Said for every message that carries the extension, a partial grant included: one that
-        // carries it and cannot be read is not a person's.
+        // carries it and cannot be read is not a person's, and one that does not say what the
+        // person wrote takes an earlier message's words away.
         context.insert(CONTEXT_CALLER.to_owned(), caller_of(entry));
+        context.insert(CONTEXT_PERSON.to_owned(), person_of(entry));
     }
     // The mentions are the ones of this message: a message that speaks for the screen and names none
     // takes the earlier ones away (a run that continues another carries its context along).
@@ -496,7 +500,7 @@ fn thread_tools(value: &Value) -> Option<Value> {
 }
 
 /// `number` as an integer when it is a whole number a double holds exactly (`2` and `2.0`).
-fn whole_number(value: &Value) -> Option<i64> {
+pub(crate) fn whole_number(value: &Value) -> Option<i64> {
     let number = value.as_number()?;
     number.as_i64().or_else(|| {
         let f = number.as_f64()?;
@@ -1055,7 +1059,8 @@ mod tests {
         let m = with_metadata(text_message("hi"), json!({THREAD_TOOLS_EXTENSION: grant}));
         assert_eq!(
             vymalo_inbound(&m).unwrap().payload["context"],
-            json!({CONTEXT_THREAD_TOOLS: grant, CONTEXT_CALLER: {"caller": "main"}, CONTEXT_MENTIONS: null})
+            json!({CONTEXT_THREAD_TOOLS: grant, CONTEXT_CALLER: {"caller": "main"},
+                   CONTEXT_PERSON: null, CONTEXT_MENTIONS: null})
         );
         for missing in ["url", "token", "expiresAt"] {
             let mut partial = grant.clone();
@@ -1098,6 +1103,76 @@ mod tests {
                 .unwrap();
         assert!(mentions.get(CONTEXT_CALLER).is_none());
         assert_eq!(context(json!({"something": 1})), None);
+    }
+
+    /// The orchestrator tells an asked agent what the person wrote in the thread, beside the grant:
+    /// it reaches the context as it is, `omitted` (a double on the wire) as an integer; a grant
+    /// without it, or with one that cannot be read, sets the key to `null`, and a message without
+    /// the grant does not set it at all.
+    #[test]
+    fn what_the_person_said_reaches_the_context_of_a_message_with_the_grant() {
+        let context = |person: Option<Value>| {
+            let mut grant = json!({"url": "http://o/t", "token": token_for("ask:1", 1),
+                                   "expiresAt": "2999-01-01T00:00:00Z"});
+            if let Some(person) = person {
+                grant["person"] = person;
+            }
+            vymalo_inbound(&with_metadata(
+                text_message("hi"),
+                json!({THREAD_TOOLS_EXTENSION: grant}),
+            ))
+            .unwrap()
+            .payload["context"]
+                .clone()
+        };
+        let said = json!(["Set up acme/widgets for me, branch main", " yes, go ahead "]);
+        let told = context(Some(json!({"said": said, "omitted": 3.0})));
+        assert_eq!(told[CONTEXT_PERSON], json!({"said": said, "omitted": 3}));
+        assert_eq!(told[CONTEXT_CALLER], json!({"caller": "ask:1", "depth": 1}));
+        assert_eq!(
+            crate::person_said(told.get(CONTEXT_PERSON)),
+            ["Set up acme/widgets for me, branch main", " yes, go ahead "]
+        );
+        assert_eq!(
+            context(Some(json!({"said": ["hi"]})))[CONTEXT_PERSON],
+            json!({"said": ["hi"]})
+        );
+        // Nothing well formed: the key is set, to `null`, so an earlier value goes.
+        for person in [
+            None,
+            Some(json!("Set up acme/widgets")),
+            Some(json!({"said": "Set up acme/widgets"})),
+            Some(json!({"said": ["ok", 7]})),
+            Some(json!({"said": ["x".repeat(4 * 4096 + 1)]})),
+            Some(json!({"said": vec!["a"; 4097]})),
+        ] {
+            let got = context(person.clone());
+            assert!(got[CONTEXT_PERSON].is_null(), "{person:?}: {got}");
+            assert!(
+                got.as_object().unwrap().contains_key(CONTEXT_PERSON),
+                "{person:?}"
+            );
+            assert!(crate::person_said(got.get(CONTEXT_PERSON)).is_empty());
+        }
+        // No grant: nothing about the person, whatever else the message carries.
+        let m = with_metadata(
+            text_message("hi"),
+            json!({MENTIONS_EXTENSION: {"mentions": [{"agentId": "a", "label": "@a"}]}}),
+        );
+        let payload = vymalo_inbound(&m).unwrap().payload;
+        assert!(
+            !payload["context"]
+                .as_object()
+                .unwrap()
+                .contains_key(CONTEXT_PERSON)
+        );
+        assert!(
+            vymalo_inbound(&text_message("hi"))
+                .unwrap()
+                .payload
+                .get("context")
+                .is_none()
+        );
     }
 
     // ---- mentions ----
