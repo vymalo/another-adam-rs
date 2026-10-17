@@ -9,6 +9,13 @@ agreed) and [ADR 0009](0009-github-per-installation-read-through-mcp.md) (`creat
 `CREATE_REPO_OWNERS` names the owner, and asks every time). Builds on [ADR 0006](0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md)
 (the extensions) and [ADR 0017](0017-a-github-app-works-on-every-account-it-is-installed-on.md) (an App on several accounts).
 
+*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md), not built yet):* `delegate_to_opencode`
+leaves the `edits` row of decision 5; the coder no longer has it.
+
+*Amended 2026-10-11 ([ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md), not built yet):* decision 6's
+enforcement becomes rules. The tiers are presets of rules generated from `needs`, `withhold` is derived from those rules, and
+`Gated` still checks the root's notes at each call. What each tier allows does not change.
+
 ## Context
 
 The owner, 2026-10-11, about the coder: *"The goal is for the agent to be autonomous."* A person could not say how much the

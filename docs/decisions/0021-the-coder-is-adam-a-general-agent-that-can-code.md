@@ -4,6 +4,13 @@ Status: **Accepted** (2026-10-06), on the owner's decision; the owner may revisi
 Builds on [ADR 0007](0007-progress-as-steps-and-streamed-text.md) (steps and their closed icon vocabulary) and
 [ADR 0012](0012-files-as-a2a-artifacts.md) (files shared as artifacts).
 
+*Amended 2026-10-11 by [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md), not built yet: a third
+subagent, `worker`, edits, in a worktree and on a branch of its own that Adam merges; and the subagent calls of one
+turn run side by side. `explorer` and `reviewer` stay read-only.*
+
+*Amended 2026-10-11 by [ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md), not built yet:* decision 6 no longer
+applies: `delegate_to_opencode` is gone, so the coder sends no `opencode` icon. The word stays in the `steps/v1` vocabulary.
+
 ## Context
 
 The owner, 2026-10-06: "The system prompt of the actual coder looks too strict. It's as if the guy cannot do anything than

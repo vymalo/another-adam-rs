@@ -9,6 +9,10 @@ not part of this decision (see *Consequences*).
 `WORKER_ID` is the pod name for the pinning placements. `replicaCount` above 1 is allowed once a
 placement is set. The decision itself is unchanged.*
 
+*Amended 2026-10-11 by [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md), not built yet: a child run
+inherits its parent's owner when it is created, so a subagent under a pinning placement runs on the worker that holds
+its root's workspace. Until then a child is created with no owner and the first pinned claim takes it.*
+
 ## Context
 
 The owner's words, 2026-09-29: "A worker can do the work, it can own a folder, it can have an
