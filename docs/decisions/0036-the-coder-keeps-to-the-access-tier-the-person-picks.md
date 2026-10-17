@@ -373,6 +373,9 @@ answer. Decided on the owner's direction: **an agent asked by another agent neve
   form's answer still counts, because only the person's screen sends an A2UI action.
 * **Not changed:** `ask_user` still asks in words, and the asking model answers (the ask and continue flow of the orchestration
   layer); Path A merges with no question; `bypass` asks nothing, the tier being the consent (the orchestrator sends an ask under at
-  most the asked agent's default tier, capped by the person's roles). The words of an ask still name repositories, as a person's
-  words do, because the asking model relays the person's request.
-* **Open:** whether a repository that only the asking model named should count as named in an asked run.
+  most the asked agent's default tier, capped by the person's roles).
+* **Decided, a follow-up (the owner, 2026-10-17): in a run another agent started, only the repositories the person named in their
+  own message count as named.** The orchestrator will pass that list to the asked agent as a structured field of the ask, and the
+  coder will read it instead of the ask's words; this needs a change in both repositories and is not part of this amendment.
+  **Until it lands, an asked coder still counts the repositories named in the ask's text** (written by the asking model) as
+  named, which is the behaviour before this amendment.

@@ -1103,6 +1103,9 @@ names an asked agent (`adam_a2a_runtime::asked_by_an_agent`):
   ask carries no catalog to draw one.
 * What needs nobody's yes is unchanged: `ask_user` asks in words and the asking model answers (the ask goes on), Path A merges,
   and `bypass` asks nothing.
+* **Repositories named in the ask's text still count** as named, though the asking model wrote it. Decided as a follow-up (the
+  owner, 2026-10-17): in such a run only the repositories the person named in their own message will count, passed by the
+  orchestrator as a structured field of the ask; until that lands in both repositories, the behaviour is the one described here.
 * **Fail closed:** a message that carries the grant and whose token's claims cannot be read is nobody's too. A message without a
   grant (a plain A2A client) is read as before. A child run inherits the key, and a large context does not drop it.
 
