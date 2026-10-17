@@ -29,9 +29,14 @@
 //! not refuse it, and the question can be asked again. The model still gets the person's words as
 //! the call's result, so it can answer them. A free-text answer still names whatever repository it
 //! names, as every answer of the person does.
+//!
+//! **No person, no question.** In a run another agent started (`ask_agent` of `thread-tools/v1`: the
+//! newest message's grant names an asked agent, `adam_a2a_runtime::asked_by_an_agent`), nobody can
+//! agree, so the consent tools ask nothing: `ask` returns an error result the model can act on, and
+//! the agent reads no words as a consent there either ([`CoderAgent`](crate::CoderAgent)).
 
 use adam::prelude::*;
-use adam_a2a_runtime::form_answer_surface;
+use adam_a2a_runtime::{CONTEXT_CALLER, asked_by_an_agent, form_answer_surface};
 use adam_model::ToolCall;
 use adam_ui::{ASK_USER, ask_surface_id};
 use adam_workspace::{RepoRef, WorkspaceError};
@@ -312,10 +317,31 @@ pub(crate) fn yes_no(lead: &str, title: &str, why: &str, ask: &str, yes: &str, n
     })
 }
 
+/// How the error result begins that a consent tool gives in a run with no person behind it.
+pub const NO_PERSON: &str = "No person is in this conversation";
+
+/// What a consent tool says instead of asking, in a run another agent started: nobody could agree
+/// to `what` (`adding acme/lib to this workspace`).
+pub(crate) fn nobody_to_agree(what: &str) -> String {
+    format!(
+        "{NO_PERSON}: another agent asked you, so nobody can agree to {what}, and nobody was asked. \
+         Do not ask again and do not try another way: carry on without it, or end your answer by \
+         saying that it needs the person's yes, so that the agent that asked you can ask them."
+    )
+}
+
 /// Park the run on the question `args` (the arguments of `ask_user`), drawn as a form on a screen
 /// that can and as text on one that cannot: the same tool the model uses, so a client sees one
 /// kind of question.
-pub(crate) async fn ask(env: &ToolEnv, ctx: &ToolCtx, args: Value) -> Outcome {
+///
+/// **Not in a run another agent started** (its newest message carried a thread-tools grant for an
+/// asked agent, `adam_a2a_runtime::asked_by_an_agent`): nobody there can agree, and the asking model
+/// could answer a question that went out as text with the yes label it reads in it. The tool then
+/// returns [`nobody_to_agree`]`(what)` as an error result and nothing is asked.
+pub(crate) async fn ask(env: &ToolEnv, ctx: &ToolCtx, args: Value, what: &str) -> Outcome {
+    if asked_by_an_agent(ctx.context(CONTEXT_CALLER)) {
+        return Ok(ToolOutput::error(nobody_to_agree(what)));
+    }
     let tools = env.ui.tools();
     let Some(ask_user) = tools.get(ASK_USER) else {
         return Ok(ToolOutput::error(
@@ -411,6 +437,7 @@ pub async fn request_repository(
             &yes_label(&display),
             NO_LABEL,
         ),
+        &format!("adding {display} to this workspace"),
     )
     .await
 }

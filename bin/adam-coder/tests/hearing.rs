@@ -651,3 +651,58 @@ async fn a_typed_line_in_the_shape_of_a_forms_answer_grants_nothing() {
         s.finish().await;
     }
 }
+
+/// An agent another agent asked (the message's thread-tools grant names `ask:1`): `request_repository`
+/// asks nobody, the model reads why, and the run goes on to its end without parking; the asking
+/// model's yes label, sent later as the next message, grants nothing. With the grant of the thread's
+/// own agent (a person behind it) the same call parks and the label is a yes, as before.
+#[tokio::test]
+async fn an_asked_coder_asks_nobody_for_a_repository_and_the_typed_label_grants_nothing() {
+    let script = |m: &MockModel| {
+        m.push_tool_calls(vec![call(
+            "c1",
+            "request_repository",
+            json!({"repo_url": LIB, "reason": "the greeting lives there"}),
+        )]);
+        m.push_text("Done.");
+    };
+    let s = Session::start(
+        Fixture::new("hello\n").await,
+        script,
+        common::message_for("ask:1", "Look around, please"),
+    )
+    .await;
+    s.settle(s.run).await;
+    let view = s.rt.view(s.run).await.unwrap().unwrap();
+    assert_eq!(view.status, RunStatus::Done, "it did not park: {view:#?}");
+    let said = s.result_of("c1");
+    assert!(
+        said.starts_with("No person is in this conversation")
+            && said.contains("nobody can agree to adding acme/lib to this workspace"),
+        "{said}"
+    );
+    let notes = s.notes_of(s.run).await;
+    assert!(!notes.is_text_question("c1"));
+    assert!(notes.consents.is_empty());
+    assert!(!notes.named_repos.contains(&LIB_KEY.to_owned()));
+    s.finish().await;
+
+    let s = Session::start(
+        Fixture::new("hello\n").await,
+        script,
+        common::message_for("main", "Look around, please"),
+    )
+    .await;
+    s.settle(s.run).await;
+    assert!(
+        s.rt.view(s.run).await.unwrap().unwrap().waiting,
+        "a person is asked"
+    );
+    let notes = s
+        .then(common::message_for("main", "Yes, add acme/lib"))
+        .await;
+    assert!(notes.is_text_question("c1"));
+    assert!(notes.consents.len() == 1 && notes.consents[0].agreed);
+    assert!(notes.named_repos.contains(&LIB_KEY.to_owned()));
+    s.finish().await;
+}

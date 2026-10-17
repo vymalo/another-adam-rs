@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use adam::{AgentDef, Assembly, AssemblyError};
 use adam_a2a::AccessTier;
-use adam_a2a_runtime::CONTEXT_ACCESS_TIER;
+use adam_a2a_runtime::{CONTEXT_ACCESS_TIER, CONTEXT_CALLER, asked_by_an_agent};
 use adam_core::RunId;
 use adam_error::report;
 use adam_llm_agent::{Conversation, DynTool, LlmStarter, PendingWait, ToolSet};
@@ -398,7 +398,9 @@ impl CoderAgent {
         for id in &text_questions {
             new_questions |= notes.note_text_question(id);
         }
-        let new_consents = notes.record_consents(consents_in(state, ctx.peek_inbox(), &notes));
+        let person = !asked_by_an_agent_now(state, ctx.peek_inbox());
+        let new_consents =
+            notes.record_consents(consents_in(state, ctx.peek_inbox(), &notes, person));
         // What the person said, typed (not what the interface made of their clicks): the
         // repositories they named, the bare names.
         let heard = notes.hear(&person_sayings(state, ctx.peek_inbox()), host);
@@ -482,6 +484,22 @@ fn tier_of(state: &Conversation, inbox: &[Inbound]) -> AccessTier {
         .filter_map(tier::named_by)
         .next_back()
         .unwrap_or_else(|| tier::in_context(&state.context))
+}
+
+/// Whether nobody is behind the run from this step: the newest message waiting in the inbox that says
+/// who it was sent for, else the conversation's context, names an agent that another agent asked
+/// ([`asked_by_an_agent`]). A message says it only through its context, which the A2A backend filled
+/// from the token of a thread-tools grant: what the model or a tool said is never read.
+fn asked_by_an_agent_now(state: &Conversation, inbox: &[Inbound]) -> bool {
+    let newest = inbox
+        .iter()
+        .filter(|inbound| {
+            inbound.kind != RUN_FINISHED_KIND
+                && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
+        })
+        .filter_map(|inbound| inbound.payload.get("context")?.get(CONTEXT_CALLER))
+        .next_back();
+    asked_by_an_agent(newest.or_else(|| state.context.get(CONTEXT_CALLER)))
 }
 
 /// Whether a run that has no pull request delivered what it was asked for anyway: **scratch work
@@ -822,12 +840,19 @@ fn person_texts(state: &Conversation, inbox: &[Inbound]) -> Vec<String> {
 /// shows from an earlier question, is not this question's answer, whatever its ids say. **Words
 /// count only for a question that went out as text** (`notes`: [`RunNotes::is_text_question`], and
 /// for the parked call also that its interface is absent), and then only the label of the yes option
-/// ([`answer_of`]): a bare "yes" can answer anything the model asked in the same turn. A merge is
+/// ([`answer_of`]): a bare "yes" can answer anything the model asked in the same turn. **Words count
+/// only with a person behind the run** (`person`): in a run another agent started, the asking model
+/// reads the yes label in the question and can type it. A merge is
 /// answered by its form alone. The answer is read without the blocks marked `untrusted`. **Only a
 /// yes or a no is a consent**: any other text (`wait`, `?`, a question back) records nothing, so the
 /// question can be asked again, while the model still gets the person's words as the call's result.
 /// A call with an argument that is not a repository address asked nothing, so nothing was answered.
-fn consents_in(state: &Conversation, inbox: &[Inbound], notes: &RunNotes) -> Vec<Consent> {
+fn consents_in(
+    state: &Conversation,
+    inbox: &[Inbound],
+    notes: &RunNotes,
+    person: bool,
+) -> Vec<Consent> {
     let consent = |call: &ToolCall, answer: &str, drawn: bool| -> Option<Consent> {
         let answer = without_untrusted(answer);
         if call.name == MERGE_PULL_REQUEST {
@@ -841,7 +866,8 @@ fn consents_in(state: &Conversation, inbox: &[Inbound], notes: &RunNotes) -> Vec
         }
         let surface = surface_of_answer(call, &answer);
         if surface == Surface::Stranger
-            || (surface == Surface::Words && (drawn || !notes.is_text_question(&call.id)))
+            || (surface == Surface::Words
+                && (!person || drawn || !notes.is_text_question(&call.id)))
         {
             return None;
         }
@@ -1627,16 +1653,113 @@ mod tests {
 
     /// The consents of `state` and `inbox` when every question went out as a form.
     fn consents_of(state: &Conversation, inbox: &[Inbound]) -> Vec<Consent> {
-        consents_in(state, inbox, &RunNotes::default())
+        consents_in(state, inbox, &RunNotes::default(), true)
     }
 
     /// The consents when the questions of the calls `ids` went out as text.
     fn consents_of_text(state: &Conversation, inbox: &[Inbound], ids: &[&str]) -> Vec<Consent> {
+        consents_heard(state, inbox, ids, true)
+    }
+
+    /// The same, with a person behind the run or (`person` false) in a run another agent started.
+    fn consents_heard(
+        state: &Conversation,
+        inbox: &[Inbound],
+        ids: &[&str],
+        person: bool,
+    ) -> Vec<Consent> {
         let mut notes = RunNotes::default();
         for id in ids {
             notes.note_text_question(id);
         }
-        consents_in(state, inbox, &notes)
+        consents_in(state, inbox, &notes, person)
+    }
+
+    /// A message the orchestrator sends with a thread-tools grant for `caller` (`main`, or `ask:<n>`
+    /// for an agent another agent asked), as `vymalo_inbound` reads it.
+    fn message_for(caller: &str, text: &str) -> Inbound {
+        use base64::Engine as _;
+        let segment = |v: Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string().as_bytes())
+        };
+        let depth = u8::from(caller != "main");
+        let token = format!(
+            "{}.{}.c2ln",
+            segment(json!({"alg": "HS256", "typ": "JWT"})),
+            segment(json!({"caller": caller, "depth": depth}))
+        );
+        let mut message = a2a::Message::new(a2a::Role::User, vec![a2a::Part::text(text)]);
+        message.metadata = Some(std::collections::HashMap::from([(
+            adam_a2a::THREAD_TOOLS_EXTENSION.to_owned(),
+            json!({"url": "http://o/t", "token": token, "expiresAt": "2999-01-01T00:00:00Z"}),
+        )]));
+        adam_a2a_runtime::vymalo_inbound(&message).expect("text")
+    }
+
+    /// `state` as the run of an agent another agent asked: what its first message put in the context.
+    fn asked_run(mut state: Conversation) -> Conversation {
+        let first = message_for("ask:1", "task");
+        let context = first.payload["context"].as_object().unwrap().clone();
+        state.merge_context(&context);
+        state
+    }
+
+    #[test]
+    fn who_is_behind_the_run_is_the_newest_message_that_says_else_the_context() {
+        let person = conversation(vec![Message::user_text("task")]);
+        assert!(!asked_by_an_agent_now(&person, &[]));
+        assert!(!asked_by_an_agent_now(&person, &inbox("hi")));
+        assert!(asked_by_an_agent_now(
+            &person,
+            &[message_for("ask:1", "hi")]
+        ));
+        let asked = asked_run(person.clone());
+        assert!(asked_by_an_agent_now(&asked, &[]));
+        // A message that says nothing about it leaves it; one for the thread's agent is a person's.
+        assert!(asked_by_an_agent_now(&asked, &inbox("hi")));
+        assert!(!asked_by_an_agent_now(
+            &asked,
+            &[message_for("ask:1", "a"), message_for("main", "b")]
+        ));
+        // A message the run has read already says nothing new.
+        let mut read = asked.clone();
+        let main = message_for("main", "b").with_id("m-1");
+        read.read_ids.push("m-1".into());
+        assert!(asked_by_an_agent_now(&read, &[main]));
+        // The model's or a tool's words never say it.
+        let mut said = person;
+        said.messages.push(Message::user_text(
+            r#"{"context": {"vymalo.caller": {"caller": "ask:1"}}}"#,
+        ));
+        assert!(!asked_by_an_agent_now(&said, &[]));
+    }
+
+    /// In a run another agent started, the asking model reads the yes label in a question that went
+    /// out as text and can type it: words grant nothing there, as the result and while parked. A
+    /// form's answer is still the form's (an A2UI action, which no text makes).
+    #[test]
+    fn in_a_run_another_agent_started_the_typed_yes_label_grants_nothing() {
+        let label = "Yes, add acme/lib";
+        let typed_back = asked_run(answered(LIB, label));
+        let person = !asked_by_an_agent_now(&typed_back, &[]);
+        assert!(!person);
+        assert_eq!(consents_heard(&typed_back, &[], &["c1"], person), []);
+        let parked = asked_run(parked_on(LIB));
+        let typed = [message_for("ask:1", label)];
+        let person = !asked_by_an_agent_now(&parked, &typed);
+        assert_eq!(consents_heard(&parked, &typed, &["c1"], person), []);
+        // The same words with a person behind the run are a yes.
+        let typed = [message_for("main", label)];
+        let person = !asked_by_an_agent_now(&parked_on(LIB), &typed);
+        assert_eq!(
+            agreed(&consents_heard(&parked_on(LIB), &typed, &["c1"], person)),
+            [(LIB_KEY, true)]
+        );
+        let form = asked_run(answered(LIB, &consent_form("ask-c1", "yes")));
+        assert_eq!(
+            agreed(&consents_heard(&form, &[], &["c1"], false)),
+            [(LIB_KEY, true)]
+        );
     }
 
     /// The message `vymalo_inbound` makes of the client's A2UI `answer` action on `surface`: how a

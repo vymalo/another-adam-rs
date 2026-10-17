@@ -37,7 +37,9 @@
 //!    surface the call drew it on, is a yes (`CoderAgent` records it), and it is a yes to that and
 //!    nothing else: a head that moved, or checks that changed for the worse, are another question.
 //!    At `bypass` it asks nothing (that is what the tier means) and merges after the same checks of
-//!    the host, the repository and the commit.
+//!    the host, the repository and the commit. In a run another agent started there is nobody to
+//!    ask: below `bypass` the tool refuses with an error result and draws nothing
+//!    ([`consent::ask`](super::consent)).
 //!
 //! **Safe to repeat.** Merging a pull request that is merged already reports it as it is
 //! ([`CodeHost::merge_pull_request`](adam_workspace::CodeHost)). A rename and a deletion are noted
@@ -452,7 +454,8 @@ pub async fn merge_pull_request(
         );
         if !notes.agreed(MERGE_PULL_REQUEST, &id) {
             let form = merge_form(&target, &status, method, delete_branch, red, &id);
-            return ask(&env, ctx, form).await;
+            let merging = format!("merging pull request #{number} of {}", target.full_name);
+            return ask(&env, ctx, form, &merging).await;
         }
     }
     ctx.emit_progress(format!("merging #{number} of {}", target.full_name))
