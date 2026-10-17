@@ -379,14 +379,24 @@ impl CoderAgent {
                 .map_err(notes_error)?,
             None => None,
         };
-        let (pushed, red, verified) = match prior {
-            Some(prior) => (prior.pushed_branches, prior.red_pulls, prior.verified_shas),
+        let (pushed, red, verified, text_questions) = match prior {
+            Some(prior) => (
+                prior.pushed_branches,
+                prior.red_pulls,
+                prior.verified_shas,
+                prior.text_questions,
+            ),
             None if state.continued_from.is_some() => {
-                (pushed_branches(state), Vec::new(), Vec::new())
+                (pushed_branches(state), Vec::new(), Vec::new(), Vec::new())
             }
-            None => (Vec::new(), Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
+        // Before the consents are read: words answer a question of the earlier task that went out as
+        // text, as they would have in that task.
+        let new_questions = text_questions
+            .iter()
+            .fold(false, |new, id| notes.note_text_question(id) || new);
         let new_consents = notes.record_consents(consents_in(state, ctx.peek_inbox(), &notes));
         // What the person said, typed (not what the interface made of their clicks): the
         // repositories they named, the bare names.
@@ -398,6 +408,7 @@ impl CoderAgent {
         notes.tier = Some(tier);
         if notes.name_pushed_branches(pushed)
             || heard
+            || new_questions
             || new_red
             || new_verified
             || new_consents

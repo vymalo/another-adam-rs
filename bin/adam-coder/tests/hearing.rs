@@ -293,10 +293,10 @@ async fn bare_names_are_the_standalone_words_the_person_typed_last() {
     s.finish().await;
 }
 
-/// What the tools wrote about the conversation's work follows a task to the one that continues it.
+/// What the tools wrote about the conversation's work follows a task to the one that continues it, and so
+/// do the questions it asked as text.
 #[tokio::test]
-async fn a_task_that_continues_another_inherits_its_pushed_commits_red_pulls_and_verified_commits()
-{
+async fn a_continued_task_inherits_pushed_commits_red_pulls_verified_commits_text_questions() {
     let fx = Fixture::new("hello\n").await;
     let first = Session::start(
         fx,
@@ -318,6 +318,7 @@ async fn a_task_that_continues_another_inherits_its_pushed_commits_red_pulls_and
     }]);
     notes.name_red_pulls([pull(WIDGETS, 7)]);
     notes.verify_sha("decaf");
+    notes.note_text_question("call_1f2e");
     first.fx.env.notes.save(&run1, &notes).await.unwrap();
 
     // The next task of the conversation names nothing, and starts from the first.
@@ -333,6 +334,8 @@ async fn a_task_that_continues_another_inherits_its_pushed_commits_red_pulls_and
     assert!(!inherited.pushed_commit(WIDGETS, "agent/x", "badc0de"));
     assert!(inherited.red_accepted(WIDGETS, 7));
     assert!(inherited.is_verified("decaf") && !inherited.is_verified("c0ffee"));
+    // A question the first task asked as text can still be answered in words in this one.
+    assert!(inherited.is_text_question("call_1f2e") && !inherited.is_text_question("call_9a9a"));
     // And what the person said before is not said again: a new task has its own words.
     assert!(inherited.said("go") && !inherited.said("work"));
     first.finish().await;
