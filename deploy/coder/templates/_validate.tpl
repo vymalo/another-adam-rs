@@ -258,8 +258,8 @@ from service.yaml, which every render contains, so they always run.
 {{- if and $cacheClaim .Values.cache.create -}}
 {{- fail "cache.existingClaim and cache.create are both set: use a claim you manage, or let the chart create one for this release, not both" -}}
 {{- end -}}
-{{- if and $cacheClaim (or (gt (len $cacheClaim) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $cacheClaim))) -}}
-{{- fail (printf "cache.existingClaim must be the name of a PersistentVolumeClaim (lowercase letters, digits, - and .), got %q" $cacheClaim) -}}
+{{- if and $cacheClaim (or (gt (len $cacheClaim) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$" $cacheClaim))) -}}
+{{- fail (printf "cache.existingClaim must be the name of a PersistentVolumeClaim (dot-separated labels of lowercase letters, digits and -, each at most 63 characters), got %q" $cacheClaim) -}}
 {{- end -}}
 {{- if .Values.cache.create -}}
 {{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$" (toString .Values.cache.size)) -}}

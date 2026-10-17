@@ -1342,6 +1342,11 @@ helm_cache --set cache.create=true --set 'cache.accessModes={ReadWriteOnce}' > "
 check "cache.create ReadWriteOnce is allowed for one coder pod and no run pod" dhas PersistentVolumeClaim '^    - ReadWriteOnce$'
 
 check "refused: cache.existingClaim and cache.create together" fails helm_cache --set cache.existingClaim=x --set cache.create=true
+check "refused: cache.existingClaim with an empty label" fails helm_cache --set cache.existingClaim=a..b
+check "refused: cache.existingClaim with a label longer than 63 characters" fails helm_cache --set cache.existingClaim=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+check "refused: cache.existingClaim with an upper-case letter" fails helm_cache --set cache.existingClaim=Cache
+helm_cache --set cache.existingClaim=cache.team-a > "$out"
+check "cache.existingClaim: a dotted name is a claim name" dhas StatefulSet 'claimName: cache.team-a$'
 check "refused: cache.create that is not a boolean" fails helm_cache --set-string cache.create=maybe
 check "refused: a claim name that is not one" fails helm_cache --set cache.existingClaim=Not_A_Claim
 check "refused: a size that is not a quantity" fails helm_cache --set cache.create=true --set cache.size=big
