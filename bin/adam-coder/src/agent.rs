@@ -394,9 +394,10 @@ impl CoderAgent {
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
         // Before the consents are read: words answer a question of the earlier task that went out as
         // text, as they would have in that task.
-        let new_questions = text_questions
-            .iter()
-            .fold(false, |new, id| notes.note_text_question(id) || new);
+        let mut new_questions = false;
+        for id in &text_questions {
+            new_questions |= notes.note_text_question(id);
+        }
         let new_consents = notes.record_consents(consents_in(state, ctx.peek_inbox(), &notes));
         // What the person said, typed (not what the interface made of their clicks): the
         // repositories they named, the bare names.
