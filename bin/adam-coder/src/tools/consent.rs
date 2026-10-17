@@ -20,7 +20,7 @@
 //! What an answer says (`answer_of`): the person picked the option `yes` of the form, which is a
 //! **yes**, or the option `no`, which is a **no**. **Only the form's own answer counts** when the
 //! question went out as a form: it names the surface the call drew it on, and an answer made on any
-//! other surface is a stranger's ([`surface_of_answer`]). When the question went out as text (the
+//! other surface is a stranger's (`surface_of_answer`). When the question went out as text (the
 //! screen cannot draw a form: `ToolError::NeedsInput` with no `ui`, which the tool notes by its
 //! call's id), words count too, but only the label of the yes option ("Yes, add acme/lib"), because
 //! a bare `yes` answers whatever the person was last asked, and a model can ask something else in
