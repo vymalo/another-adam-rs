@@ -42,6 +42,7 @@ mod text_stream;
 mod tier;
 mod usage;
 mod vymalo;
+mod words;
 
 pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
 pub use convert::{
@@ -56,3 +57,4 @@ pub use vymalo::{
     ASK_SURFACE_PREFIX, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF,
     MAX_ACTION_CONTEXT_CHARS, MAX_MENTIONS, form_answer_surface, integral_numbers, vymalo_inbound,
 };
+pub use words::{comparable, is_format_or_control};

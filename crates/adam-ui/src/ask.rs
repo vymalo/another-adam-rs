@@ -27,7 +27,7 @@ use serde_json::{Map, Value, json};
 
 use crate::resolve::{Resolved, UiState};
 use crate::surface::{ask_surface_id, surface};
-use crate::words::is_format_or_control;
+use adam_a2a_runtime::is_format_or_control;
 
 /// The tool's name.
 pub const ASK_USER: &str = "ask_user";

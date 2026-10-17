@@ -47,7 +47,6 @@ mod resolve;
 mod show;
 mod surface;
 mod thread_tools;
-mod words;
 
 use std::sync::Arc;
 
@@ -68,7 +67,7 @@ pub use thread_tools::{
     ThreadToolsClient,
 };
 
-pub use words::{comparable, is_format_or_control};
+pub use adam_a2a_runtime::{comparable, is_format_or_control};
 
 use resolve::UiState;
 
