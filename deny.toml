@@ -7,7 +7,12 @@ all-features = true
 [advisories]
 # Known-vulnerable or unmaintained dependencies fail the build. To accept one
 # deliberately, add its RUSTSEC id below with a reason and a review date.
-ignore = []
+ignore = [
+    # Unmaintained, no known vulnerability: under `serde_yaml_ng` only, in the operator (`bin/adam-operator`
+    # writes the CRDs; its crates' tests read YAML fixtures). Moving to `serde-saphyr`, already a workspace
+    # dependency, changes the generated CRD file. Review by 2027-01-16.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained; only under serde_yaml_ng in the operator; replace with serde-saphyr, review by 2027-01-16" },
+]
 
 [licenses]
 # Permissive licenses only. Add to this list deliberately, in a reviewed change.
