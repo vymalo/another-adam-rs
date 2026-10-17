@@ -46,12 +46,13 @@ const REQUIRE_VAR: &str = "ADAM_OPERATOR_TEST_REQUIRE_CLUSTER";
 /// The namespace the suite's ids live in (`adam_operator_ports::testkit` uses it for every id).
 const NAMESPACE: &str = "adam-operator-test";
 
-/// `busybox:1.37.0` from the public ECR mirror of Docker Official Images, which has no pull limit for
-/// a CI runner (Docker Hub has one). The digest is the index of the tag (amd64, arm64 and others),
-/// the same on Docker Hub. *Verified 2026-10-05*: the `Docker-Content-Digest` of
-/// `registry-1.docker.io/v2/library/busybox/manifests/1.37.0` and of
-/// `public.ecr.aws/v2/docker/library/busybox/manifests/1.37.0`, an OCI image index.
-const IMAGE: &str = "public.ecr.aws/docker/library/busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e";
+/// `busybox:1.37.0` from `mirror.gcr.io`, Google's cache of Docker Hub, which takes no Docker Hub pull
+/// from a CI runner (`public.ecr.aws`, used before, answered GitHub runners `429 Data limit exceeded`
+/// on 2026-10-17). The digest is the index of the tag (amd64, arm64 and others), the same on Docker
+/// Hub. *Verified*: the `Docker-Content-Digest` of
+/// `registry-1.docker.io/v2/library/busybox/manifests/1.37.0` (2026-10-05) and of
+/// `mirror.gcr.io/v2/library/busybox/manifests/1.37.0` (2026-10-17), an OCI image index.
+const IMAGE: &str = "mirror.gcr.io/library/busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e";
 
 fn required() -> bool {
     matches!(std::env::var(REQUIRE_VAR).as_deref(), Ok("1" | "true"))

@@ -10,10 +10,11 @@
 # It reads no environment variable, so a missing Secret is still the kubelet's to notice.
 # busybox has no /usr/local/bin: the RUN makes it.
 #
-# busybox 1.37.0 from the public ECR mirror of Docker Official Images, pinned by digest (the index of the
-# tag, the same on Docker Hub; verified 2026-10-05, the Docker-Content-Digest of
-# registry-1.docker.io/v2/library/busybox/manifests/1.37.0 and public.ecr.aws/v2/docker/library/busybox/manifests/1.37.0).
-FROM public.ecr.aws/docker/library/busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+# busybox 1.37.0 from mirror.gcr.io, Google's cache of Docker Hub, pinned by digest (the index of the tag, the same
+# on Docker Hub; verified, the Docker-Content-Digest of registry-1.docker.io/v2/library/busybox/manifests/1.37.0 on
+# 2026-10-05 and of mirror.gcr.io/v2/library/busybox/manifests/1.37.0 on 2026-10-17). public.ecr.aws, used before,
+# answered GitHub runners 429 "Data limit exceeded" (2026-10-17).
+FROM mirror.gcr.io/library/busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
 
 RUN mkdir -p /www/.well-known /usr/local/bin \
  && echo ok > /www/healthz \

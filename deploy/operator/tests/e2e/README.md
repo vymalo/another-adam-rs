@@ -50,7 +50,7 @@ stateDiagram-v2
 |---|---|
 | [`coder-e2e.sh`](coder-e2e.sh) | the script: every step bounded, every assertion named, the cluster's state printed on a failure |
 | [`coder.yaml`](coder.yaml) | [`examples/coder.yaml`](../../examples/coder.yaml) adapted: the real image by tag and digest (`sha-4363924`, the newest `main` image of adam-rs on 2026-10-07, read anonymously from ghcr.io), the token variant with a dummy token, a Postgres by `secretRef`, no web search, a 1 GiB claim on kind's default storage class. Each difference is marked `# e2e:` |
-| [`postgres.yaml`](postgres.yaml) | a throwaway Postgres 17.9 (Alpine 3.23, pinned by digest, from the public ECR mirror of Docker Hub) with no volume |
+| [`postgres.yaml`](postgres.yaml) | a throwaway Postgres 17.9 (Alpine 3.23, pinned by digest, from `mirror.gcr.io`, Google's cache of Docker Hub) with no volume |
 | [`operator.values.yaml`](operator.values.yaml) | the operator chart's values: an existing Secret for the registry's token, and only the pods labelled `adam-operator-e2e/client` may read the registry |
 | `../../../../bin/adam-operator/tests/e2e_fixture.rs` | `cargo test`, no cluster: `coder.yaml` passes `adam_operator_domain::resolve`, runs the pinned image with its sidecar on the token variant, and names the Secrets the script makes |
 
