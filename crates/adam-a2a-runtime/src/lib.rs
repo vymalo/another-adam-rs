@@ -36,6 +36,7 @@ mod caller;
 mod convert;
 mod ids;
 mod list;
+mod person;
 mod push;
 mod steps;
 mod subscribe;
@@ -52,6 +53,7 @@ pub use convert::{
 };
 pub use ids::task_id_for;
 pub use list::MAX_SCAN;
+pub use person::{CONTEXT_PERSON, person_said};
 pub use push::StorePushStore;
 pub use tier::CONTEXT_ACCESS_TIER;
 pub use usage::MAX_TOKEN_COUNT;

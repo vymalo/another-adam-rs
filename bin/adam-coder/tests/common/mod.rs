@@ -71,6 +71,20 @@ pub fn message_for(caller: &str, text: &str) -> Inbound {
     vymalo_inbound(&message).expect("text reads as text")
 }
 
+/// A message the orchestrator sends to an agent another agent asked, the `n`-th asked in the job:
+/// the grant for `ask:<n>` and, beside it, what the person wrote in the thread (`person.said`,
+/// oldest first), as the A2A layer makes it. `text` is the asking model's words.
+pub fn message_for_asked_told(n: u32, said: &[&str], text: &str) -> Inbound {
+    let mut message = A2aMessage::new(Role::User, vec![Part::text(text)]);
+    message.metadata = Some(HashMap::from([(
+        adam_a2a::THREAD_TOOLS_EXTENSION.to_owned(),
+        json!({"url": "http://127.0.0.1:1/thread-tools/thread-1/mcp",
+               "token": thread_tools_token(&format!("ask:{n}")), "expiresAt": "2999-01-01T00:00:00Z",
+               "person": {"said": said}}),
+    )]));
+    vymalo_inbound(&message).expect("text reads as text")
+}
+
 /// The person answers the form drawn on `surface`: the answer as the A2A layer writes it.
 pub fn form_answer(surface: &str, answers: Value, note: Option<&str>) -> Inbound {
     let mut context = json!({ "answers": answers });

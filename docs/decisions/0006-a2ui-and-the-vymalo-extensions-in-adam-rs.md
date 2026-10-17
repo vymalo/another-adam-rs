@@ -14,6 +14,10 @@ catalog; an answer may carry `text` and a `note`.
 *Amended 2026-10-17 ([ADR 0036](0036-the-coder-keeps-to-the-access-tier-the-person-picks.md#amended-2026-10-17-an-asked-agent)):* decision 2's
 keys gain `vymalo.caller`, who a message was sent for, read from the `caller` and `depth` claims of the thread-tools token
 (`main`, `ask:<n>`, or `unreadable`); the token is still a secret that no log, result or model sees, and decision 3 is unchanged.
+*Amended 2026-10-17 ([ADR 0036](0036-the-coder-keeps-to-the-access-tier-the-person-picks.md#amended-2026-10-17-an-asked-agent), *Built 2026-10-17*):*
+decision 2's keys gain `vymalo.person`, what the person wrote in the thread, read from the `person` member `{said, omitted?}` that
+the orchestrator writes beside the grant of an asked agent's message (`null` for a message with the grant and no well-formed
+member, so an earlier message's words go); the coder hears only those words in a run another agent started. Decision 3 is unchanged.
 Builds on [ADR 0001](0001-library-first-host-roles.md) (libraries first, binaries compose),
 [ADR 0003](0003-a-new-task-continues-the-task-it-references.md) (a new task carries the conversation) and
 [ADR 0005](0005-one-binary-serves-any-agent-folder.md) (`adam-agent`). The other side of the contract is the

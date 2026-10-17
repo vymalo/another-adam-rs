@@ -4489,10 +4489,12 @@ async fn a_text_question_is_answered_with_the_label_of_its_yes_option(store: Dyn
 }
 
 /// Another agent's model asked the coder through the orchestrator (`ask_agent`): the message has a
-/// thread-tools grant whose token names `ask:1` and no UI catalog. Nobody can agree there, so
-/// `request_repository` asks nobody: the model reads why, the task is never `input-required` and
-/// completes, and the repository is neither granted nor fetched. Over HTTP, through the official
-/// client, so the metadata travels as an A2A server gets it.
+/// thread-tools grant whose token names `ask:1`, beside it what the person wrote in the thread
+/// (`person.said`), and no UI catalog. Nobody can agree there, so `request_repository` asks nobody:
+/// the model reads why, the task is never `input-required` and completes, and the repository is
+/// neither granted nor fetched. The repository the person's words name is named; the one only the
+/// ask's text names is not. Over HTTP, through the official client, so the metadata travels as an
+/// A2A server gets it.
 async fn an_asked_coder_asks_nobody_for_consent_and_the_task_goes_on(store: DynStore) {
     let fx = Fixture::new("hello\n").await;
     let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
@@ -4507,15 +4509,21 @@ async fn an_asked_coder_asks_nobody_for_consent_and_the_task_goes_on(store: DynS
     let server = Server::start(coder_with(&fx, &mock, store)).await;
     let worker = spawn_worker(&server.coder);
 
+    // The person's words, as the orchestrator carries them; the ask's text is the asking model's.
+    let words = format!(
+        "Please put our shared greeting into hello.txt of {}.",
+        fx.remote_url()
+    );
     let mut ask = user(&format!(
-        "In {}, put our shared greeting into hello.txt.",
+        "In {}, put our shared greeting into hello.txt, as acme/other has it.",
         fx.remote_url()
     ));
     ask.metadata = Some(std::collections::HashMap::from([(
         THREAD_TOOLS_EXTENSION.to_owned(),
         json!({"url": "http://127.0.0.1:1/thread-tools/thread-1/mcp",
                "token": common::thread_tools_token("ask:1"),
-               "expiresAt": "2999-01-01T00:00:00Z"}),
+               "expiresAt": "2999-01-01T00:00:00Z",
+               "person": {"said": [words], "omitted": 2}}),
     )]));
     let seen = until_it_waits(&server, ask).await;
     worker.stop().await;
@@ -4538,12 +4546,25 @@ async fn an_asked_coder_asks_nobody_for_consent_and_the_task_goes_on(store: DynS
     let run = run_id(&seen.task_id);
     let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
     assert!(notes.consents.is_empty() && !notes.is_text_question("r1"));
+    // Named by the person's words alone: the one `acme/other` of the ask's text is not.
     assert_eq!(notes.named_repos.len(), 1, "{:?}", notes.named_repos);
+    assert!(
+        !notes
+            .named_repos
+            .iter()
+            .any(|key| key.contains("acme/other")),
+        "{:?}",
+        notes.named_repos
+    );
     let view = server.coder.runtime.view(run).await.unwrap().unwrap();
     let state: Conversation = serde_json::from_value(view.state).unwrap();
     assert_eq!(
         state.context["vymalo.caller"],
         json!({"caller": "ask:1", "depth": 1})
+    );
+    assert_eq!(
+        state.context["vymalo.person"],
+        json!({"said": [words], "omitted": 2})
     );
 }
 
