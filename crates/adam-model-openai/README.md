@@ -36,6 +36,10 @@ let model: DynModel = Arc::new(OpenAiCompatible::new(OpenAiConfig::new(
 
 Behaviour (details in the crate docs, `src/lib.rs`):
 
+* A tool call the server gave **no id** (or an empty one) gets one made up: `call_` and 16 random hexadecimal digits, new for every
+  call of every response and the same in the stream and in the assembled message. It used to be `call_0`, `call_1`... in every
+  turn, and an id is what ties a person's answer to the call that asked. The agent journals the response with its ids, so a
+  resumed run reads the ones that were made (`adam-llm-agent`'s `call_ids_a_client_made_up_are_journaled_and_a_resumed_run_keeps_them`).
 * `Retry-After` (seconds or HTTP date) surfaces in `ModelError::RateLimited`.
 * `timeout` bounds a whole `complete` call; for `stream` it bounds the wait
   for headers and then the silence between chunks.
@@ -145,7 +149,7 @@ No Cargo features. TLS is `rustls` (workspace `reqwest` configuration).
   (`config_error_class_table`, `debug_shows_the_gateway_by_scheme_and_host_only`,
   `the_provider_is_openai_and_a_window_is_said_for_its_alias_only`) and `src/wire.rs` (the request shape, including several text parts
   sent as one string; the usage parts of a completion and of a stream's last chunk, absent ones, and reasoning beside a smaller
-  completion count).
+  completion count; made-up ids for calls with none: random, distinct, the same in the stream and the message).
 * `tests/wiremock_compose.rs`: the client against the `mock-openai` WireMock of `compose.yaml` (text and tool-call answers,
   streamed or not, the error scenarios), and **every scripted model** (`mock-coder`, `mock-assistant`, `mock-researcher`)
   played from its first request to its final answer both as a completion and as a stream, which must say the same, with the

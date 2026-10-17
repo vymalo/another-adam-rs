@@ -2062,6 +2062,119 @@ async fn crash_mid_step_replays_the_journal_instead_of_repeating_effects() {
     assert_eq!(view.output.expect("output")["text"], "both done");
 }
 
+/// A model client that makes up the ids of the tool calls it answers with, as a client does for a
+/// provider that sends none: a new set at every model call, `g<call>-<n>`, in the stream and in the
+/// assembled response alike.
+struct MadeUpIds {
+    inner: Arc<MockModel>,
+    generation: AtomicUsize,
+}
+
+impl MadeUpIds {
+    fn rewrite(response: &mut ModelResponse, generation: usize) {
+        if let Message::Assistant { tool_calls, .. } = &mut response.message {
+            for (n, call) in tool_calls.iter_mut().enumerate() {
+                call.id = format!("g{generation}-{n}");
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ModelClient for MadeUpIds {
+    async fn complete(&self, req: ModelRequest) -> Result<ModelResponse, ModelError> {
+        let generation = self.generation.fetch_add(1, SeqCst) + 1;
+        let mut response = self.inner.complete(req).await?;
+        Self::rewrite(&mut response, generation);
+        Ok(response)
+    }
+
+    async fn stream(
+        &self,
+        req: ModelRequest,
+    ) -> Result<BoxStream<'static, Result<ModelDelta, ModelError>>, ModelError> {
+        use futures::StreamExt as _;
+        let generation = self.generation.fetch_add(1, SeqCst) + 1;
+        let started = Arc::new(AtomicUsize::new(0));
+        let inner = self.inner.stream(req).await?;
+        Ok(inner
+            .map(move |delta| {
+                delta.map(|delta| match delta {
+                    ModelDelta::ToolCallStarted { name, .. } => ModelDelta::ToolCallStarted {
+                        id: format!("g{generation}-{}", started.fetch_add(1, SeqCst)),
+                        name,
+                    },
+                    ModelDelta::Finished(mut response) => {
+                        Self::rewrite(&mut response, generation);
+                        ModelDelta::Finished(response)
+                    }
+                    other => other,
+                })
+            })
+            .boxed())
+    }
+}
+
+/// The ids of calls a client made up are journaled with the model's answer: a worker that dies in
+/// the middle of the step and the survivor that replays it see the same ids, and the model is not
+/// asked again (it would make up others).
+#[tokio::test]
+async fn call_ids_a_client_made_up_are_journaled_and_a_resumed_run_keeps_them() {
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = Arc::new(MadeUpIds {
+        inner: mock.clone(),
+        generation: AtomicUsize::new(0),
+    });
+    let (a, a_calls) = CountingTool::new("a");
+    let reached = Arc::new(Notify::new());
+    let first = Arc::new(AtomicBool::new(true));
+    let agent = LlmAgent::builder("llm", model, "m")
+        .tool(a)
+        .tool(AsyncTool2 {
+            name: "b",
+            calls: Arc::new(AtomicUsize::new(0)),
+            first: first.clone(),
+            reached: reached.clone(),
+        })
+        .build();
+    mock.push_tool_calls(vec![call("x", "a", json!({})), call("y", "b", json!({}))])
+        .push_text("both done");
+
+    let h = Harness::new();
+    let (rt_a, rt_b) = (
+        h.runtime_with(&agent, "ids-a", short_lease),
+        h.runtime_with(&agent, "ids-b", short_lease),
+    );
+    let run = rt_a
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let doomed = spawn_worker(&rt_a);
+    notified(&reached, "tool b starting").await;
+    doomed.handle.abort();
+    assert!(doomed.handle.await.expect_err("aborted").is_cancelled());
+
+    let survivor = spawn_worker(&rt_b);
+    let view = wait_done(&rt_b, run).await;
+    survivor.stop().await;
+
+    let messages = conversation(&view).messages;
+    // The calls the model made are the ones the first model call made up, and so are their results.
+    let Message::Assistant { tool_calls, .. } = &messages[1] else {
+        panic!("{messages:?}")
+    };
+    assert_eq!(
+        tool_calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        ["g1-0", "g1-1"],
+        "the two calls have distinct ids"
+    );
+    assert_eq!(messages[2], Message::tool_result("g1-0", "a-out"));
+    assert_eq!(messages[3], Message::tool_result("g1-1", "b-out"));
+    // The model answered twice (the calls, the closing words): the survivor replayed the first.
+    assert_eq!(mock.requests().len(), 2);
+    assert_eq!(a_calls.load(SeqCst), 1);
+}
+
 /// Tool `b`: hangs the first time it is called.
 struct AsyncTool2 {
     name: &'static str,
