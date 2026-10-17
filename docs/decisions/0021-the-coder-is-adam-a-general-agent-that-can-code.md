@@ -8,7 +8,7 @@ Builds on [ADR 0007](0007-progress-as-steps-and-streamed-text.md) (steps and the
 subagent, `worker`, edits, in a worktree and on a branch of its own that Adam merges; and the subagent calls of one
 turn run side by side. `explorer` and `reviewer` stay read-only.*
 
-*Amended 2026-10-11 by [ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md):* decision 6 no longer
+*Amended 2026-10-11 by [ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md), not built yet:* decision 6 no longer
 applies: `delegate_to_opencode` is gone, so the coder sends no `opencode` icon. The word stays in the `steps/v1` vocabulary.
 
 ## Context

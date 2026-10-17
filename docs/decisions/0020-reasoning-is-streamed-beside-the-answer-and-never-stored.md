@@ -6,7 +6,7 @@ and `text-stream/v1`) and [ADR 0014](0014-a-turn-output-answer-is-the-runs-answe
 text). The contract it amends is the orchestration layer's, `docs/api/text-stream-v1.md` of `vymalo/another-agentic-system`,
 amended in the same change set (note of 2026-10-05).
 
-*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)):* the note on
+*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md), not built yet):* the note on
 `MODEL_EXTRA_BODY` and `OPENCODE_MODEL` is moot: the coder runs no OpenCode.
 
 ## Context

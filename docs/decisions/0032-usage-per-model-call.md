@@ -13,7 +13,7 @@ journaled model step), [ADR 0028](0028-the-card-says-which-build-answers.md) (an
 known, which the coder never sets); adam-acp drops both, and neither is a count per call. The per-call count is OpenCode's
 `step-finish` part, which a plugin can forward (*verified* in OpenCode v1.18.33's source).
 
-*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)):* the coder no longer
+*Amended 2026-10-11 ([ADR 0038](0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md), not built yet):* the coder no longer
 delegates to OpenCode, so its totals have no unreported calls; the notes on OpenCode below are history.
 
 ## Context
