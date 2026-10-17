@@ -1,5 +1,6 @@
-//! Who a message was sent for: the thread's addressed agent, behind which a person writes, or an
-//! agent that another agent asked (`ask_agent` of `thread-tools/v1`), behind which nobody is.
+//! Who a message was sent for: the thread's addressed agent, which a person drives (from their screen,
+//! or a program holding their token), or an agent that another agent asked (`ask_agent` of
+//! `thread-tools/v1`), behind which nobody is.
 //!
 //! The orchestration layer says it in the token of the thread-tools grant, a JWS whose claims hold
 //! `caller` (`"main"` or `"ask:<n>"`) and `depth` (`docs/api/thread-tools-v1.md` of

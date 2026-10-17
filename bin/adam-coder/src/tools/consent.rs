@@ -30,10 +30,11 @@
 //! the call's result, so it can answer them. A free-text answer still names whatever repository it
 //! names, as every answer of the person does.
 //!
-//! **No person, no question.** In a run another agent started (`ask_agent` of `thread-tools/v1`: the
-//! newest message's grant names an asked agent, `adam_a2a_runtime::asked_by_an_agent`), nobody can
-//! agree, so the consent tools ask nothing: `ask` returns an error result the model can act on, and
-//! the agent reads no words as a consent there either ([`CoderAgent`](crate::CoderAgent)).
+//! **No person, no question.** In a run another agent started (`ask_agent` of `thread-tools/v1`: a
+//! message's grant named an asked agent, `adam_a2a_runtime::asked_by_an_agent`; once one did, for the
+//! rest of the conversation), nobody can agree, so the consent tools ask nothing: `ask` returns an
+//! error result the model can act on, and the agent reads no words as a consent there either
+//! ([`CoderAgent`](crate::CoderAgent)).
 
 use adam::prelude::*;
 use adam_a2a_runtime::{CONTEXT_CALLER, asked_by_an_agent, form_answer_surface};
@@ -334,12 +335,21 @@ pub(crate) fn nobody_to_agree(what: &str) -> String {
 /// that can and as text on one that cannot: the same tool the model uses, so a client sees one
 /// kind of question.
 ///
-/// **Not in a run another agent started** (its newest message carried a thread-tools grant for an
-/// asked agent, `adam_a2a_runtime::asked_by_an_agent`): nobody there can agree, and the asking model
-/// could answer a question that went out as text with the yes label it reads in it. The tool then
-/// returns [`nobody_to_agree`]`(what)` as an error result and nothing is asked.
+/// **Not in a run another agent started** (the run's context names an asked agent,
+/// `adam_a2a_runtime::asked_by_an_agent`, or a message of the conversation ever did,
+/// `RunNotes::asked_by_an_agent`): nobody there can agree, and the asking model could answer a
+/// question that went out as text with the yes label it reads in it. The tool then returns
+/// [`nobody_to_agree`]`(what)` as an error result and nothing is asked.
 pub(crate) async fn ask(env: &ToolEnv, ctx: &ToolCtx, args: Value, what: &str) -> Outcome {
-    if asked_by_an_agent(ctx.context(CONTEXT_CALLER)) {
+    let run = ctx.root_run_id().to_string();
+    if asked_by_an_agent(ctx.context(CONTEXT_CALLER))
+        || env
+            .notes
+            .load(&run)
+            .await
+            .map_err(|e| notes_error(&e))?
+            .asked_by_an_agent
+    {
         return Ok(ToolOutput::error(nobody_to_agree(what)));
     }
     let tools = env.ui.tools();
@@ -352,7 +362,6 @@ pub(crate) async fn ask(env: &ToolEnv, ctx: &ToolCtx, args: Value, what: &str) -
     // A question that goes out as text (the screen cannot draw the form) may be answered in words,
     // and only such a question: the agent reads the call's id from the notes to tell the two apart.
     if let Err(ToolError::NeedsInput { ui: None, .. }) = &asked {
-        let run = ctx.root_run_id().to_string();
         let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
         if notes.note_text_question(ctx.call_id()) {
             env.notes

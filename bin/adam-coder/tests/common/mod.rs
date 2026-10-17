@@ -58,8 +58,8 @@ pub fn thread_tools_token(caller: &str) -> String {
     )
 }
 
-/// A message the orchestrator sends with a thread-tools grant for `caller` and no UI catalog (an
-/// ask carries none): the message as the A2A layer makes it. The endpoint refuses every connection,
+/// A message the orchestrator sends with a thread-tools grant for `caller` and no UI catalog: the
+/// message as the A2A layer makes it. The endpoint refuses every connection,
 /// so the run is offered none of its tools.
 pub fn message_for(caller: &str, text: &str) -> Inbound {
     let mut message = A2aMessage::new(Role::User, vec![Part::text(text)]);

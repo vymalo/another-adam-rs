@@ -310,8 +310,9 @@ and `bin/adam-coder` (`agent.rs`, `tools/{admin,consent,notes}.rs`).
   **The limit that stays:** an A2A client that builds an A2UI `answer` data part itself can still answer, on any surface and with
   any question id, because the client is the person's screen. So **the orchestrator must never let a model answer a sub-agent's
   form**: a question another agent's model re-asks has to be shown to the person, not answered by an agent. A run whose caller
-  is another agent's model is outside what the tiers promise. (*Amended 2026-10-17 (an asked agent), below:* such a run asks
-  for no consent at all.)
+  is another agent's model is outside what the tiers promise. (*Amended 2026-10-17 (an asked agent), below:* a run the
+  orchestration layer's grant says another agent asked asks for no consent; a model that drives the coder as a plain A2A client
+  still is outside.)
 * **After a form, only its answer counts; a text question needs words that name the subject.** A model could write "Shall I also
   fix the typo? Reply yes or no" and call `request_repository(acme/infra)` in the same turn, and the person's "yes" granted
   `acme/infra`. The consent tools now note, by the call's id (`RunNotes::text_questions`), the question that went out as text
@@ -343,18 +344,22 @@ and `bin/adam-coder` (`agent.rs`, `tools/{admin,consent,notes}.rs`).
 ## Amended 2026-10-17 (an asked agent)
 
 The fifth review left "a run whose caller is another agent's model is outside what the tiers promise". The orchestration layer's
-`ask_agent` makes such runs, and sends an ask no UI catalog, so the coder's consent question went out as text, where the yes label
-in words is a consent (the fifth review): the asking model reads the label in the question and can type it. A prompt-injected chat
+`ask_agent` makes such runs. Its asks carried no UI catalog (they carry the thread's since vymalo/another-agentic-system#267, which
+also ends an ask whose agent draws a form, but a thread whose screen sent none still sends none), so the coder's consent question
+went out as text, where the yes label in words is a consent (the fifth review): the asking model reads the label in the question
+and can type it. A prompt-injected chat
 model could so grant `request_repository` and `create_repository` to a coder it asked; a merge's Path B already needed the form's
 answer. Decided on the owner's direction: **an agent asked by another agent never parks on a person's consent.** In
 `crates/adam-a2a-runtime` (`caller.rs`, `vymalo.rs`), `crates/adam-llm-agent` (`PROTECTED_CONTEXT_KEYS`) and `bin/adam-coder`
 (`agent.rs`, `tools/{consent,create,admin}.rs`).
 
-* **The signal is the `caller` claim of the thread-tools token.** The orchestrator mints a token for every message it sends to an
+* **The signal is the `caller` claim of the thread-tools token.** The orchestrator mints a token for the messages it sends to an
   agent whose card lists `thread-tools/v1` (the coder's does), with `caller: "main"` and `depth: 0` for the thread's addressed agent
   and `caller: "ask:<n>"` for the n-th agent asked in the job (*verified 2026-10-17*: `docs/api/thread-tools-v1.md`, "The token" and
   "The child task", and `orchestrator/crates/app/src/dispatcher/ask.rs`, `Caller::Ask`, of `vymalo/another-agentic-system` at
-  `5cac58d`). `vymalo_inbound` reads the claims (the middle segment; the signature is not checked, the key being the orchestrator's)
+  `5cac58d`). It sends the message with no grant when the card it read for that send lacks the URI, the job has no grant, the
+  deployment has no issuer, or the token cannot be minted (`orchestrator/crates/agent-a2a/src/thread_tools.rs`, `mint`, which
+  never fails the message, at the same commit). `vymalo_inbound` reads the claims (the middle segment; the signature is not checked, the key being the orchestrator's)
   into the context key `vymalo.caller` of every message that carries the extension. No text reaches it: the A2A caller writes the
   metadata, and a model's words travel as text parts. What is trusted is the authenticated A2A caller, as for a form's answer and the
   tier. The other candidates were weaker: the orchestrator's bearer is one per agent, for asks and turns alike; an ask carries no
@@ -363,19 +368,28 @@ answer. Decided on the owner's direction: **an agent asked by another agent neve
   JSON object, a `caller` other than `main` and `ask:<n>`, a `main` whose `depth` is not 0) is `unreadable`, which is no person. A
   message without the grant (a plain A2A client, `dev/coder-e2e.sh`) leaves the key as it is, so such a client is read as before. The
   key is one of `PROTECTED_CONTEXT_KEYS` (a large context does not drop it, a child run inherits it) and has no `expiresAt`, so it
-  outlives the token. The newest message that says wins, as for the tier.
+  outlives the token. **Once asked, always asked:** the context or any message waiting in the inbox that names an asked agent
+  makes the run asked, and the coder keeps that for the rest of the run and the tasks that continue it
+  (`RunNotes::asked_by_an_agent`), so a message for the thread's agent that comes later does not turn the asked agent's words, in
+  the inbox or in the history, into the person's. **The gap:** an ask that arrives with no grant (above) reads as a plain
+  client's, and its run asks as a person's would. That the orchestrator never sends an ask it cannot mint a grant for is a
+  follow-up of the orchestration layer.
 * **The consent tools ask nobody there.** `request_repository`, `create_repository` and Path B of `merge_pull_request` ask through
   `consent::ask`, which then returns an error result ("No person is in this conversation: another agent asked you, so nobody can
   agree to <what>, and nobody was asked", then: carry on without it, or end the answer by saying that it needs the person's yes, so
   that the asking agent can ask them), draws no form and notes no question. A consent tool added later asks through the same
   function.
-* **No words are a consent in such a run** (`consents_in`): the defence for a run parked on a text question before this change. A
-  form's answer still counts, because only the person's screen sends an A2UI action.
+* **No words are a consent in such a run** (`consents_in`): the defence for a run parked on a text question before it was asked.
+  A form's answer still counts, because only a screen sends an A2UI action.
 * **Not changed:** `ask_user` still asks in words, and the asking model answers (the ask and continue flow of the orchestration
   layer); Path A merges with no question; `bypass` asks nothing, the tier being the consent (the orchestrator sends an ask under at
-  most the asked agent's default tier, capped by the person's roles).
+  most the asked agent's default tier, capped by the person's roles: *verified 2026-10-17* in
+  `orchestrator/crates/app/src/dispatcher/ask.rs` of vymalo/another-agentic-system, the cap by the roles being its #267).
 * **Decided, a follow-up (the owner, 2026-10-17): in a run another agent started, only the repositories the person named in their
   own message count as named.** The orchestrator will pass that list to the asked agent as a structured field of the ask, and the
   coder will read it instead of the ask's words; this needs a change in both repositories and is not part of this amendment.
-  **Until it lands, an asked coder still counts the repositories named in the ask's text** (written by the asking model) as
-  named, which is the behaviour before this amendment.
+  **Until it lands, an asked coder still counts the repositories named in its messages as named** (the ask's text, and the
+  asking model's answers to its `ask_user` questions in a later ask), which is the behaviour before this amendment. So, today,
+  the refusal of `request_repository` protects nothing in an asked run: the asking model can name the repository instead. What
+  this amendment closes now is a consent in words to `create_repository` below `bypass` (and to any consent tool added later);
+  Path B of a merge needed its form already.

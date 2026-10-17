@@ -676,7 +676,7 @@ stateDiagram-v2
   person typed.
 * **An agent another agent asked asks nobody for consent.** The A2A layer reads who a message was sent for from the claims of
   its thread-tools token (`vymalo.caller`: `main`, or `ask:<n>` for an agent another agent asked, an unreadable token counting
-  as the latter); in such a run `request_repository`, `create_repository` and the merge's form return an error result instead of
+  as the latter, and once a message said so for the rest of the run); in such a run `request_repository`, `create_repository` and the merge's form return an error result instead of
   a question, and no words are a consent ([ADR 0036](decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md#amended-2026-10-17-an-asked-agent)).
 
 ## The run lifecycle

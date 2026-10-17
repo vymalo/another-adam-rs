@@ -379,17 +379,22 @@ impl CoderAgent {
                 .map_err(notes_error)?,
             None => None,
         };
-        let (pushed, red, verified, text_questions) = match prior {
+        let (pushed, red, verified, text_questions, asked_before) = match prior {
             Some(prior) => (
                 prior.pushed_branches,
                 prior.red_pulls,
                 prior.verified_shas,
                 prior.text_questions,
+                prior.asked_by_an_agent,
             ),
-            None if state.continued_from.is_some() => {
-                (pushed_branches(state), Vec::new(), Vec::new(), Vec::new())
-            }
-            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            None if state.continued_from.is_some() => (
+                pushed_branches(state),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false),
         };
         let mut notes = self.env.notes.load(run).await.map_err(notes_error)?;
         // Before the consents are read: words answer a question of the earlier task that went out as
@@ -398,7 +403,10 @@ impl CoderAgent {
         for id in &text_questions {
             new_questions |= notes.note_text_question(id);
         }
-        let person = !asked_by_an_agent_now(state, ctx.peek_inbox());
+        let new_asked = !notes.asked_by_an_agent
+            && (asked_before || asked_by_an_agent_now(state, ctx.peek_inbox()));
+        notes.asked_by_an_agent |= new_asked;
+        let person = !notes.asked_by_an_agent;
         let new_consents =
             notes.record_consents(consents_in(state, ctx.peek_inbox(), &notes, person));
         // What the person said, typed (not what the interface made of their clicks): the
@@ -412,6 +420,7 @@ impl CoderAgent {
         if notes.name_pushed_branches(pushed)
             || heard
             || new_questions
+            || new_asked
             || new_red
             || new_verified
             || new_consents
@@ -486,20 +495,28 @@ fn tier_of(state: &Conversation, inbox: &[Inbound]) -> AccessTier {
         .unwrap_or_else(|| tier::in_context(&state.context))
 }
 
-/// Whether nobody is behind the run from this step: the newest message waiting in the inbox that says
-/// who it was sent for, else the conversation's context, names an agent that another agent asked
-/// ([`asked_by_an_agent`]). A message says it only through its context, which the A2A backend filled
-/// from the token of a thread-tools grant: what the model or a tool said is never read.
+/// Whether a message says that an agent another agent asked is behind the run
+/// ([`asked_by_an_agent`]): the conversation's context or **any** message waiting in the inbox, not
+/// only the newest, so that a person's message behind an asked one does not make the asked one's
+/// words a person's. The agent keeps the answer for good (`RunNotes::asked_by_an_agent`). A message
+/// says it only through its context, which the A2A backend filled from the token of a thread-tools
+/// grant: what the model or a tool said is never read.
 fn asked_by_an_agent_now(state: &Conversation, inbox: &[Inbound]) -> bool {
-    let newest = inbox
-        .iter()
-        .filter(|inbound| {
-            inbound.kind != RUN_FINISHED_KIND
-                && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
-        })
-        .filter_map(|inbound| inbound.payload.get("context")?.get(CONTEXT_CALLER))
-        .next_back();
-    asked_by_an_agent(newest.or_else(|| state.context.get(CONTEXT_CALLER)))
+    asked_by_an_agent(state.context.get(CONTEXT_CALLER))
+        || inbox
+            .iter()
+            .filter(|inbound| {
+                inbound.kind != RUN_FINISHED_KIND
+                    && (inbound.id.is_empty() || !state.read_ids.contains(&inbound.id))
+            })
+            .any(|inbound| {
+                asked_by_an_agent(
+                    inbound
+                        .payload
+                        .get("context")
+                        .and_then(|c| c.get(CONTEXT_CALLER)),
+                )
+            })
 }
 
 /// Whether a run that has no pull request delivered what it was asked for anyway: **scratch work
@@ -1705,27 +1722,32 @@ mod tests {
     }
 
     #[test]
-    fn who_is_behind_the_run_is_the_newest_message_that_says_else_the_context() {
+    fn an_asked_agent_is_behind_the_run_when_the_context_or_any_waiting_message_says_so() {
         let person = conversation(vec![Message::user_text("task")]);
         assert!(!asked_by_an_agent_now(&person, &[]));
         assert!(!asked_by_an_agent_now(&person, &inbox("hi")));
+        assert!(!asked_by_an_agent_now(
+            &person,
+            &[message_for("main", "hi")]
+        ));
         assert!(asked_by_an_agent_now(
             &person,
             &[message_for("ask:1", "hi")]
         ));
-        let asked = asked_run(person.clone());
-        assert!(asked_by_an_agent_now(&asked, &[]));
-        // A message that says nothing about it leaves it; one for the thread's agent is a person's.
-        assert!(asked_by_an_agent_now(&asked, &inbox("hi")));
-        assert!(!asked_by_an_agent_now(
-            &asked,
+        // Not only the newest: a message for the thread's agent behind an asked one leaves it asked.
+        assert!(asked_by_an_agent_now(
+            &person,
             &[message_for("ask:1", "a"), message_for("main", "b")]
         ));
+        let asked = asked_run(person.clone());
+        assert!(asked_by_an_agent_now(&asked, &[]));
+        assert!(asked_by_an_agent_now(&asked, &inbox("hi")));
+        assert!(asked_by_an_agent_now(&asked, &[message_for("main", "b")]));
         // A message the run has read already says nothing new.
-        let mut read = asked.clone();
-        let main = message_for("main", "b").with_id("m-1");
+        let mut read = person.clone();
+        let ask = message_for("ask:1", "b").with_id("m-1");
         read.read_ids.push("m-1".into());
-        assert!(asked_by_an_agent_now(&read, &[main]));
+        assert!(!asked_by_an_agent_now(&read, &[ask]));
         // The model's or a tool's words never say it.
         let mut said = person;
         said.messages.push(Message::user_text(
@@ -1748,6 +1770,11 @@ mod tests {
         let typed = [message_for("ask:1", label)];
         let person = !asked_by_an_agent_now(&parked, &typed);
         assert_eq!(consents_heard(&parked, &typed, &["c1"], person), []);
+        // Nor when the thread's own agent writes behind them.
+        let typed = [message_for("ask:1", label), message_for("main", "hi")];
+        let person = !asked_by_an_agent_now(&parked_on(LIB), &typed);
+        assert!(!person);
+        assert_eq!(consents_heard(&parked_on(LIB), &typed, &["c1"], person), []);
         // The same words with a person behind the run are a yes.
         let typed = [message_for("main", label)];
         let person = !asked_by_an_agent_now(&parked_on(LIB), &typed);

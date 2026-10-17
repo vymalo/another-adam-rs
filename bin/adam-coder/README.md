@@ -1093,21 +1093,25 @@ stateDiagram-v2
 An agent that another agent's model asked (the orchestration layer's `ask_agent`) has no person behind it, and the asking model
 reads the question it would be sent, yes label included. The A2A layer reads who each message was sent for from the claims of its
 thread-tools token (`caller`: `main`, or `ask:<n>`), into the run's context `vymalo.caller`
-([`adam-a2a-runtime`](../../crates/adam-a2a-runtime/README.md#a-screen-as-the-sender)). In a run whose newest message that says
-names an asked agent (`adam_a2a_runtime::asked_by_an_agent`):
+([`adam-a2a-runtime`](../../crates/adam-a2a-runtime/README.md#a-screen-as-the-sender)). In a run where the context or any
+waiting message names an asked agent (`adam_a2a_runtime::asked_by_an_agent`), and for the rest of the run and the tasks that
+continue it once one did (`RunNotes::asked_by_an_agent`, so that a later message for the thread's agent does not make the asked
+agent's words the person's):
 
 * `request_repository`, `create_repository` and Path B of `merge_pull_request` ask nobody and note no question
   (`consent::ask`): the result is an error that begins `No person is in this conversation` and tells the model to carry on without
   it, or to say in its answer that it needs the person's yes, so that the agent that asked can ask them.
-* No words are a consent (`consents_in`); a form's answer still is, because only the person's screen sends an A2UI action, and an
-  ask carries no catalog to draw one.
+* No words are a consent (`consents_in`); a form's answer still is, because only a screen sends an A2UI action (and the consent
+  tools draw no form there).
 * What needs nobody's yes is unchanged: `ask_user` asks in words and the asking model answers (the ask goes on), Path A merges,
   and `bypass` asks nothing.
-* **Repositories named in the ask's text still count** as named, though the asking model wrote it. Decided as a follow-up (the
-  owner, 2026-10-17): in such a run only the repositories the person named in their own message will count, passed by the
+* **Repositories named in the asking model's messages still count** as named (the ask's text, its answers to `ask_user`), so the
+  refusal of `request_repository` protects nothing yet: what is closed today is a consent in words to `create_repository`.
+  Decided as a follow-up (the owner, 2026-10-17): in such a run only the repositories the person named in their own message will count, passed by the
   orchestrator as a structured field of the ask; until that lands in both repositories, the behaviour is the one described here.
 * **Fail closed:** a message that carries the grant and whose token's claims cannot be read is nobody's too. A message without a
-  grant (a plain A2A client) is read as before. A child run inherits the key, and a large context does not drop it.
+  grant (a plain A2A client) is read as before, and so is an ask the orchestrator sends with none (it does when it cannot mint
+  one: a gap of the orchestration layer). A child run inherits the key, and a large context does not drop it.
 
 The signature of the token is the orchestrator's to check (the agent has no key): what is trusted is the authenticated A2A
 caller, as for a form's answer and the access tier. Decision: [ADR 0036](../../docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md#amended-2026-10-17-an-asked-agent).
@@ -2247,13 +2251,15 @@ database of its own, so the role needs `CREATEDB`):
   with an invisible character refused, **an answer to an earlier form that is not the answer to the one that waits**, and **a
   form the model drew with the question id `consent` granting nothing while `request_repository` waits** (and the tool's own
   form granting), and **an asked coder** (the message's thread-tools grant names `ask:1`): `request_repository` asks nobody, the
-  run does not park and the asking model's yes label grants nothing, while with the thread's own agent the same call parks and
-  the label is a yes. Unit tests: `src/tools/named.rs` (`typed_by_the_person`, with and without the defaults of the question),
+  run does not park, while with the thread's own agent the same call parks and the label is a yes; and **once an asked agent
+  wrote, no words are a consent in the run**: its yes label answering the question a person was asked grants nothing, neither
+  then nor after the thread's own agent writes next. Unit tests: `src/tools/named.rs` (`typed_by_the_person`, with and without the defaults of the question),
   `src/tools/notes.rs` (the bare names), `src/tools/consent.rs` (the surface of an answer, the merge question, the merge
   answer) and `src/agent.rs` (`person_sayings`: an error is no answer, an answer is paired with its call's defaults only on its
   own surface, a message that waited behind an owed result is `Deferred`; `consents_in`: a stranger's form is no consent for the
   call that waits, a merge is agreed to by its own form alone, the typed yes label grants nothing in a run another agent
-  started; `asked_by_an_agent_now`: the newest waiting message that says, else the context).
+  started, also behind a message for the thread's own agent; `asked_by_an_agent_now`: the context or any waiting message that
+  says).
 * `tests/tiers.rs` (the access tiers): the tools the model is **shown** on a turn per tier (a real `Runtime`, a scripted model), the
   tier noted from the message and said to the model, a task that continues another starting at the default, a model that calls a
   tool above the tier anyway (the host is never asked, the refusal names the tier it needs), every tool checking the root run's

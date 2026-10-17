@@ -653,9 +653,9 @@ async fn a_typed_line_in_the_shape_of_a_forms_answer_grants_nothing() {
 }
 
 /// An agent another agent asked (the message's thread-tools grant names `ask:1`): `request_repository`
-/// asks nobody, the model reads why, and the run goes on to its end without parking; the asking
-/// model's yes label, sent later as the next message, grants nothing. With the grant of the thread's
-/// own agent (a person behind it) the same call parks and the label is a yes, as before.
+/// asks nobody, the model reads why, and the run goes on to its end without parking. With the grant
+/// of the thread's own agent (a person behind it) the same call parks and the label is a yes, as
+/// before.
 #[tokio::test]
 async fn an_asked_coder_asks_nobody_for_a_repository_and_the_typed_label_grants_nothing() {
     let script = |m: &MockModel| {
@@ -704,5 +704,61 @@ async fn an_asked_coder_asks_nobody_for_a_repository_and_the_typed_label_grants_
     assert!(notes.is_text_question("c1"));
     assert!(notes.consents.len() == 1 && notes.consents[0].agreed);
     assert!(notes.named_repos.contains(&LIB_KEY.to_owned()));
+    s.finish().await;
+}
+
+/// Once a message of the run was sent for an asked agent, no words are a consent in it again: the
+/// asking model's yes label answering a question a person was asked grants nothing, and it still
+/// grants nothing when the thread's own agent writes next, after which a later step reads the
+/// conversation again.
+#[tokio::test]
+async fn once_an_asked_agent_wrote_no_words_are_a_consent_in_the_run() {
+    let s = Session::start(
+        Fixture::new("hello\n").await,
+        |m| {
+            m.push_tool_calls(vec![call(
+                "c1",
+                "request_repository",
+                json!({"repo_url": LIB, "reason": "the greeting lives there"}),
+            )]);
+            m.push_text("Anything else?");
+            m.push_text("Sure?");
+            m.push_text("Done.");
+        },
+        common::message_for("main", "Look around, please"),
+    )
+    .await;
+    s.settle(s.run).await;
+    assert!(
+        s.rt.view(s.run).await.unwrap().unwrap().waiting,
+        "a person is asked"
+    );
+    // Each message is read and answered with a question that waits, until the last.
+    let answer = |inbound: Inbound, left: usize| {
+        let s = &s;
+        async move {
+            s.rt.deliver(s.run, inbound).await.unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while s.mock.remaining() > left {
+                assert!(Instant::now() < deadline, "the question never came");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            s.settle(s.run).await;
+            s.notes_of(s.run).await
+        }
+    };
+    let notes = answer(common::message_for("ask:1", "Yes, add acme/lib"), 2).await;
+    assert!(notes.asked_by_an_agent);
+    assert!(notes.consents.is_empty(), "{:?}", notes.consents);
+    // The step that reads this message still has the asked agent's context; the one after it, which
+    // reads the conversation again, has the thread's agent's.
+    let notes = answer(common::message_for("main", "No, thanks"), 1).await;
+    assert!(notes.consents.is_empty(), "{:?}", notes.consents);
+    let notes = s.then(common::message_for("main", "Yes")).await;
+    assert!(notes.asked_by_an_agent, "it is kept");
+    assert!(notes.consents.is_empty(), "{:?}", notes.consents);
+    // The label names the repository, and a repository an asked agent's words name still counts as
+    // named until the orchestrator passes the person's own (ADR 0036, an asked agent): no consent
+    // is what this proves.
     s.finish().await;
 }
