@@ -20,12 +20,15 @@
 //! 1. *The checks passed* on the head commit ([`Checks::Passing`](adam_workspace::Checks)), and that
 //!    very commit is the one merged (`MergePullRequest::expected_sha`). One still running is waited
 //!    for, always. One that failed, or that nobody ran, stops the merge, **unless** the pull request
-//!    was opened by this conversation with `accept_red_checks` (`RunNotes::red_pulls`): that is an
-//!    override and goes by the third step.
+//!    was opened by this conversation with `accept_red_checks` (`RunNotes::red_pulls`) **and its head
+//!    is still the conversation's own commit** (step 2): that is an override and goes by the third
+//!    step. After somebody else's push the acceptance says nothing about what is there.
 //! 2. *Path A, a pull request of the conversation's own*: its head is in this very repository and is a
 //!    commit the conversation pushed for that branch (`RunNotes::pushed_commit`, an earlier task's
-//!    too), and where the host reports no check at all, the run's own checks passed on that commit
-//!    (`RunNotes::verified_shas`). It is merged at `auto` and above with no question.
+//!    too), it is against the base branch the conversation pushed the branch for
+//!    (`RunNotes::pushed_base`: a pull request somebody opened from the agent's branch into another
+//!    branch is another's), and where the host reports no check at all, the run's own checks passed on
+//!    that commit (`RunNotes::verified_shas`). It is merged at `auto` and above with no question.
 //! 3. *Path B, any other pull request, or a red-checks override*: at `auto` the tool asks the person
 //!    itself, in a form it draws ([`merge_question`]): the question is fixed ("Merge
 //!    owner/name#N into base?"), the options are fixed (`merge`, `not_now`), and the question's id
@@ -240,15 +243,18 @@ fn one_line(text: &str) -> String {
     out
 }
 
-/// Whether the head of the pull request is a commit this conversation pushed to that very
-/// repository: **Path A**. A branch of the same name that somebody else pushed to since, or one in a
-/// fork, is not that.
+/// Whether the pull request is the conversation's own: **Path A**. Its head is in this very
+/// repository and is a commit this conversation pushed for that branch (a branch of the same name that
+/// somebody else pushed to since, or one in a fork, is not that), **and** it is against the base branch
+/// the conversation pushed the branch for: somebody can open a pull request from the agent's branch
+/// into another branch (a release branch), and that one is not what the person asked for.
 fn is_the_conversations_own(notes: &RunNotes, target: &Target, status: &PullRequestStatus) -> bool {
     status
         .head_repo
         .as_deref()
         .is_some_and(|head| head.eq_ignore_ascii_case(&target.full_name))
         && notes.pushed_commit(&target.key, &status.head_branch, &status.head_sha)
+        && notes.pushed_base(&target.key, &status.head_branch) == Some(status.base_branch.as_str())
 }
 
 /// How the checks of pull request `number` of the repository with `key` stand: `Ok(false)` when they
@@ -268,7 +274,9 @@ fn judge_checks(
             "The checks of pull request #{number} have not finished: {which}. Do not merge it yet: \
              wait for them and look again, or tell the person they are still running."
         )),
-        Checks::Failing(_) | Checks::Unreported(_) if red_accepted => Ok(true),
+        // The override is for the conversation's own commit: after somebody else's push the
+        // acceptance that opened the pull request says nothing about what is there now.
+        Checks::Failing(_) | Checks::Unreported(_) if red_accepted && own => Ok(true),
         // Nobody can say yes to these for the person: the checks must pass.
         Checks::Failing(why) => Err(format!(
             "The checks of pull request #{number} did not pass: {why}. It is merged only when they \

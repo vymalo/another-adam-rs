@@ -31,6 +31,13 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 pub mod pg;
 
+/// What somebody types (or a client sends as a text part): the message as the A2A layer makes it.
+/// Whatever it says, it is not a form's answer.
+pub fn typed_message(text: &str) -> Inbound {
+    let message = A2aMessage::new(Role::User, vec![Part::text(text)]);
+    vymalo_inbound(&message).expect("text reads as text")
+}
+
 /// The person answers the form drawn on `surface`: the answer as the A2A layer writes it.
 pub fn form_answer(surface: &str, answers: Value, note: Option<&str>) -> Inbound {
     let mut context = json!({ "answers": answers });
@@ -403,6 +410,21 @@ pub async fn mount_pull_from(
     sha: &str,
     state: &str,
 ) {
+    mount_pull_to(github, slug, number, branch, head_repo, sha, state, "main").await;
+}
+
+/// [`mount_pull_from`] for a pull request against the branch `base`.
+#[allow(clippy::too_many_arguments)]
+pub async fn mount_pull_to(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    head_repo: &str,
+    sha: &str,
+    state: &str,
+    base: &str,
+) {
     Mock::given(method("GET"))
         .and(path(format!("/repos/{slug}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"full_name": slug})))
@@ -417,7 +439,7 @@ pub async fn mount_pull_from(
             "merged": false,
             "mergeable_state": state,
             "head": {"ref": branch, "sha": sha, "repo": {"full_name": head_repo}},
-            "base": {"ref": "main", "repo": {"full_name": slug}},
+            "base": {"ref": base, "repo": {"full_name": slug}},
         })))
         .mount(github)
         .await;

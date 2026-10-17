@@ -348,6 +348,9 @@ impl Heard {
     }
 }
 
+/// The most call ids [`RunNotes::text_questions`] keeps.
+pub const MAX_TEXT_QUESTIONS: usize = 64;
+
 /// The most words of the person's [`RunNotes::said_words`] keeps: past it the newest are not added.
 pub const MAX_SAID_WORDS: usize = 2000;
 
@@ -382,6 +385,12 @@ pub struct RunNotes {
     /// `create_repository`), in order. Filled by the agent before each step from the conversation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consents: Vec<Consent>,
+    /// The ids of the calls of a consent tool whose question went out as **text** (the screen could
+    /// not draw the form), in order. Written by the tool when it asks. Words answer only such a
+    /// question, and then only with the label of the yes option; a question that went out as a form,
+    /// or one this list does not hold, is answered by its form alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_questions: Vec<String>,
     /// The repositories this run created, in order. Written by `create_repository` itself, which
     /// also grants the repository's key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -692,6 +701,24 @@ impl RunNotes {
         let before = self.creating.len();
         self.creating.retain(|c| c.full_name != full_name);
         self.creating.len() != before
+    }
+
+    /// Note that the question of the call `call_id` went out as text; returns whether it was new.
+    /// At most [`MAX_TEXT_QUESTIONS`] are kept, the oldest dropped.
+    pub fn note_text_question(&mut self, call_id: &str) -> bool {
+        if self.text_questions.iter().any(|id| id == call_id) {
+            return false;
+        }
+        self.text_questions.push(call_id.to_owned());
+        if self.text_questions.len() > MAX_TEXT_QUESTIONS {
+            self.text_questions.remove(0);
+        }
+        true
+    }
+
+    /// Whether the question of the call `call_id` went out as text ([`text_questions`](Self::text_questions)).
+    pub fn is_text_question(&self, call_id: &str) -> bool {
+        self.text_questions.iter().any(|id| id == call_id)
     }
 
     /// Whether the person agreed to `subject` when `tool` asked: the latest answer decides.

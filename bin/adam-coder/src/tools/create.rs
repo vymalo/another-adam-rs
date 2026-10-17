@@ -88,7 +88,6 @@ pub(crate) fn consent_of(arguments: &Value) -> Option<Asked> {
     Some(Asked {
         subject: subject(owner, name, private),
         yes: yes_label(owner, name),
-        no: NO_CREATE_LABEL.to_owned(),
     })
 }
 
@@ -483,7 +482,6 @@ mod tests {
             Some(Asked {
                 subject: "scratch/fib:private".into(),
                 yes: "Create scratch/fib".into(),
-                no: "Don't create it".into(),
             })
         );
         assert_eq!(

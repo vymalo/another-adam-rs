@@ -211,7 +211,7 @@ sequenceDiagram
   C->>C: the catalog: inline, held by digest, or get_ui_catalog once (digest checked)
   C-->>S: input-required: the question and an application/a2ui+json surface (one Choices)
   S->>C: an A2UI action: answers db=pg, auth=keycloak, deploy=compose
-  C->>M: the tool result "The person answered through the interface: - db: pg ..."
+  C->>M: the tool result "The person answered through the interface (form ask-<call id>): - db: pg ..."
   M-->>C: "Going with Postgres, Keycloak and Compose."
 ```
 
@@ -425,7 +425,7 @@ make them hold:
   repository is granted in one of three ways. **The person named it** in their own messages of the run: the
   task, and every answer delivered to it (user messages and the results of
   `ask_user`, paired with the question by position in the history, because
-  providers that send no call ids get `call_0`, `call_1` again in every turn; what
+  a provider that sends no call ids once got `call_0`, `call_1` again in every turn (the OpenAI client now makes up a random id for such a call); what
   the model or a tool wrote never counts, and neither does text quoted in a
   fence labelled `untrusted`, which is how the orchestrator's message that sends
   a job back quotes findings of checks and reviewers: its `request` fence, the
@@ -827,16 +827,24 @@ recorded and from the answer to its own question.
   agent records the answer to a `merge_pull_request` call (`Consent`, tool `merge_pull_request`, subject the question id) when it
   names the surface the call drew its form on (`ask-<call id>`) and is exactly the one line `- merge-<digest>: merge` (or
   `not_now`, which is recorded as a no; the latest answer to a question decides). A message in words, a form the model drew (with
-  the same question id and option), a click on a form still on the screen from an earlier question: none is a yes. After the
+  the same question id and option), a click on a form still on the screen from an earlier question, a line of typed text that
+  reads like the form's answer (`vymalo_inbound` marks it `(typed) `, below): none is a yes. After the
   yes the model calls the tool again with the same arguments and it merges exactly that commit. After `not_now` it asks again if
   called again; the prompt tells the model not to unless the person asks. **At `bypass` nothing is asked** (that is what the tier
   means): Path B merges after the same checks of the host, the repository and the commit, red override included.
 * A repository on another host than the code host's (`ALLOWED_REPO_HOSTS`, the first) is refused, and the host is asked for the
   repository by its address first, with no redirect followed (a repository that was renamed or transferred is not acted on
   through its old address). The prompt says to merge only when the person asked, and that the tool asks for itself.
+* *Path A is the conversation's own base too.* A pull request from the agent's pushed branch into another branch (somebody
+  opened it) is another's: the base must be the one `commit_and_push` recorded for the branch (`RunNotes::pushed_base`).
+  The red-checks override needs the conversation's own head too: after somebody else's push the acceptance that opened the
+  pull request says nothing about what is there, and failing checks stop the merge.
 * *Limits.* A screen that cannot draw the form (the question comes as text) cannot answer it: below `bypass` a Path B merge
-  then waits for a screen that can. A provider that sends no call ids repeats them (`call_0`), and a form of an earlier turn has
-  the same surface id as the form of this one: it is the form the screen shows now.
+  then waits for a screen that can. An A2A client that builds an A2UI `answer` data part itself can answer, on any surface, with
+  any question id: the client is the person's screen. **The orchestrator must therefore never let a model answer a
+  sub-agent's form** (a question another agent's model re-asks must be shown to the person). A provider that sends no call ids
+  gets a random id for each call from the OpenAI client (`call_` and 16 hexadecimal digits, journaled with the response), so
+  two forms never share a surface id.
 
 A merge reads the pull request, the combined status and the check runs of its head: the App needs **Pull requests**, **Commit
 statuses** and **Checks** (read) beside **Contents** (write) (`deploy/coder/README.md`).
@@ -916,10 +924,19 @@ no bare name. More things are the model's and are not heard:
   waits on). **A form's answer made on another surface** (a form the model drew, or one the screen still shows from an earlier
   question) is a stranger's: for `ask_user` it has no default to match, so every `text:` part of it is dropped, and for
   `request_repository`, `create_repository` and `merge_pull_request` it is **no consent**, whatever question id and option it
-  holds. A form's answer that names no surface (the older line) is a stranger's too. The person's own words (not a form's answer)
-  to `request_repository` and `create_repository` still count as before (`yes`, `no`), because they are what they typed.
+  holds. A form's answer that names no surface (the older line) is a stranger's too.
+* **After a form, only its answer counts; a question that went out as text needs words that name the subject.** `request_repository`
+  and `create_repository` note, by the call's id (`RunNotes::text_questions`), when their question went out as text because the
+  screen could not draw the form (`NeedsInput` with no `ui`). Only for such a question do words count, and then only the label of
+  the yes option (`Yes, add acme/lib`, `Create acme/fib`, compared as `adam_ui::comparable` reads them): a bare `yes` answers
+  whatever the person was last asked, and a model can ask something else in the same turn ("Shall I also fix the typo? Reply yes
+  or no") and call the tool. Words are never a no. For a question that went out as a form, or one the notes do not know, the
+  form's own answer is the only consent.
 * **A form that is not the form's answer.** The A2A layer reads `context.answers` only from the action `answer` of a surface
   `ask-<identifier>` (`vymalo_inbound`); another action, or another surface, is `The person used the interface:` and no answer.
+  **Typed text is never a form's answer**: a text part that begins a line (after whitespace, invisible characters and case) with
+  `The person answered through the interface` has that line marked `(typed) ` first, so words that look like a form's answer
+  (pasted at the model's asking, or sent as text by another agent) cannot be one.
 
 The newest words are the last thing they said, an answer included. A message that arrived while a tool result was owed
 (`Conversation::deferred`) waits behind the results and is put into the history after them, so a click that answers a later
@@ -2310,9 +2327,10 @@ database of its own, so the role needs `CREATEDB`):
   through the stack.
 * **Another repository, only with the person's yes** ([above](#another-repository-only-with-the-persons-yes)).
   `src/agent.rs` (unit): a yes is a consent for the repository of *that call's* argument whatever the answer says
-  (the forms `yes`, `y`, the option's label and the form's `- consent: yes`); an explicit no (`no`, `n`, the form's
-  `no`) is a recorded refusal, and anything else (`wait`, `?`, `yes please`, `yes, add acme/other`, a form that picked
-  nothing) records nothing, also while the run is parked on the question (so it can be asked again); an `ask_user` the model wrote, a tool's result, an error result of the
+  (the form's `- consent: yes`, or, for a question that went out as text, the option's label); an explicit no on the form is a
+  recorded refusal, and anything else (`wait`, `?`, `yes please`, a bare `yes`, `yes, add acme/other`, a form that picked
+  nothing) records nothing, also while the run is parked on the question (so it can be asked again); a "yes" to what the
+  model asked beside the tool, and a typed line in the shape of a form's answer, grant nothing; an `ask_user` the model wrote, a tool's result, an error result of the
   tool and a call whose argument is no repository grant nothing and name nothing; the pairing holds when a provider
   sends `call_0` again; an answer in the inbox while the run is parked on the question is recorded (and a finished-child
   notice, or a run parked on another tool, records none); recording the same consents again changes nothing, an

@@ -17,14 +17,18 @@
 //! model wrote itself (`ask_user`) grants nothing, however it is worded, and neither does anything
 //! a tool printed.
 //!
-//! What an answer says (`answer_of`): the person picked the option `yes` of the form, or wrote
-//! exactly `yes`, `y` or the label of the option ("Yes, add acme/lib"), whatever the case, and that
-//! is a **yes**; the option `no`, or exactly `no`, `n` or the label of the no option, is a **no**.
-//! Anything else (`yes please`, `wait`, `?`, `no, use acme/other`) is **neither**: nothing is
-//! recorded, so a repository is not refused for good by a message that did not refuse it, and the
-//! question can be asked again. The model still gets the person's words as the call's result, so it
-//! can answer them. A free-text answer still names whatever repository it names, as every answer of
-//! the person does.
+//! What an answer says (`answer_of`): the person picked the option `yes` of the form, which is a
+//! **yes**, or the option `no`, which is a **no**. **Only the form's own answer counts** when the
+//! question went out as a form: it names the surface the call drew it on, and an answer made on any
+//! other surface is a stranger's ([`surface_of_answer`]). When the question went out as text (the
+//! screen cannot draw a form: `ToolError::NeedsInput` with no `ui`, which the tool notes by its
+//! call's id), words count too, but only the label of the yes option ("Yes, add acme/lib"), because
+//! a bare `yes` answers whatever the person was last asked, and a model can ask something else in
+//! the same turn. Words are never a no. Anything else (`yes`, `yes please`, `wait`, `?`, `no`) is
+//! **neither**: nothing is recorded, so a repository is not refused for good by a message that did
+//! not refuse it, and the question can be asked again. The model still gets the person's words as
+//! the call's result, so it can answer them. A free-text answer still names whatever repository it
+//! names, as every answer of the person does.
 
 use adam::prelude::*;
 use adam_a2a_runtime::form_answer_surface;
@@ -66,10 +70,9 @@ pub(crate) struct Asked {
     /// What the answer is recorded for: the repository's key for `request_repository`,
     /// `owner/name:private|public` for `create_repository`.
     pub subject: String,
-    /// The label of the question's "yes" option.
+    /// The label of the question's "yes" option: the words that name the subject, which a person
+    /// may type when the question went out as text.
     pub yes: String,
-    /// The label of its "no" option.
-    pub no: String,
 }
 
 /// What a call of a consent tool asked the person, from its arguments. `None` when the arguments
@@ -81,7 +84,6 @@ pub(crate) fn asked_by(tool: &str, arguments: &Value) -> Option<Asked> {
             Some(Asked {
                 subject: key_of_argument(url)?,
                 yes: yes_label(&display_name(url)?),
-                no: NO_LABEL.to_owned(),
             })
         }
         CREATE_REPOSITORY => consent_of(arguments),
@@ -134,14 +136,20 @@ pub(crate) enum Answer {
 }
 
 /// What `answer` (what the person said, without the blocks marked `untrusted`) says to the question
-/// whose options are labelled `yes_label` and `no_label`.
+/// whose "yes" option is labelled `yes_label`.
 ///
 /// Either the form's answer picked `yes` (or `no`) for the question [`QUESTION_ID`] and nothing
-/// else for it (a line `- consent: yes` of the text the answer comes back as), or the person
-/// wrote, in words, exactly `yes`, `y` or `yes_label` (`no`, `n` or `no_label`), trimmed and without
-/// regard to case. Nothing is an answer that is only close to one: `yes please`, `yes, but not the
-/// tests` and `no, use acme/other` say neither, and so does a form that picked nothing.
-pub(crate) fn answer_of(answer: &str, yes_label: &str, no_label: &str) -> Answer {
+/// else for it (a line `- consent: yes` of the text the answer comes back as), or the person wrote,
+/// in words, the label of the yes option: `Yes, add acme/lib`, as [`comparable`](adam_ui::comparable)
+/// reads it (case, spacing and what is not visible aside). **Words are a yes only when they name
+/// the subject**: a bare `yes` or `y` is an answer to whatever the person had just been asked, and
+/// a model can ask something else in the same turn. Words are never a no: a person who does not
+/// want it says anything else, and the question may be asked again. Nothing else is an answer: `yes
+/// please`, `yes, but not the tests` and a form that picked nothing say neither.
+///
+/// Whether words may answer at all is [`CoderAgent`](crate::CoderAgent)'s to say: only for a question
+/// that went out as text, never for one that went out as a form.
+pub(crate) fn answer_of(answer: &str, yes_label: &str) -> Answer {
     let answer = answer.trim();
     let (first, form) = answer.split_once('\n').unwrap_or((answer, ""));
     if form_answer_surface(first).is_some() {
@@ -155,11 +163,9 @@ pub(crate) fn answer_of(answer: &str, yes_label: &str, no_label: &str) -> Answer
             _ => Answer::Neither,
         };
     }
-    let said = answer.to_lowercase();
-    if said == "yes" || said == "y" || said == yes_label.trim().to_lowercase() {
+    let wanted = adam_ui::comparable(yes_label);
+    if !wanted.is_empty() && adam_ui::comparable(answer) == wanted {
         Answer::Yes
-    } else if said == "no" || said == "n" || said == no_label.trim().to_lowercase() {
-        Answer::No
     } else {
         Answer::Neither
     }
@@ -316,7 +322,20 @@ pub(crate) async fn ask(env: &ToolEnv, ctx: &ToolCtx, args: Value) -> Outcome {
             "there is no way to ask the person in this deployment",
         ));
     };
-    ask_user.call(ctx, args).await
+    let asked = ask_user.call(ctx, args).await;
+    // A question that goes out as text (the screen cannot draw the form) may be answered in words,
+    // and only such a question: the agent reads the call's id from the notes to tell the two apart.
+    if let Err(ToolError::NeedsInput { ui: None, .. }) = &asked {
+        let run = ctx.root_run_id().to_string();
+        let mut notes = env.notes.load(&run).await.map_err(|e| notes_error(&e))?;
+        if notes.note_text_question(ctx.call_id()) {
+            env.notes
+                .save(&run, &notes)
+                .await
+                .map_err(|e| notes_error(&e))?;
+        }
+    }
+    asked
 }
 
 /// Ask the person whether another repository may join this workspace. Use it when the task needs a
@@ -401,39 +420,43 @@ mod tests {
     use super::*;
 
     fn said(answer: &str) -> Answer {
-        answer_of(answer, &yes_label("acme/lib"), NO_LABEL)
+        answer_of(answer, &yes_label("acme/lib"))
     }
 
     #[test]
-    fn yes_in_the_words_the_plan_allows_is_a_yes() {
+    fn words_are_a_yes_only_with_the_label_of_the_yes_option() {
         for yes in [
+            "Yes, add acme/lib",
+            "yes, ADD acme/lib",
+            " Yes,add acme/lib\n",
+            "Yes, add\u{a0}acme/lib\u{200b}",
+        ] {
+            assert_eq!(said(yes), Answer::Yes, "{yes:?}");
+        }
+        // The label of another question's option is that question's.
+        assert_eq!(answer_of("Create acme/fib", "Create acme/fib"), Answer::Yes);
+        assert_eq!(
+            answer_of("Create acme/fib", "Create acme/other"),
+            Answer::Neither
+        );
+        // A label that reads as nothing is never matched by nothing.
+        assert_eq!(answer_of("", ""), Answer::Neither);
+        assert_eq!(answer_of(" \u{200b}", "\u{feff}"), Answer::Neither);
+    }
+
+    #[test]
+    fn words_are_never_a_no_and_a_bare_yes_is_neither() {
+        for neither in [
             "yes",
             "Yes",
             " YES\n",
             "y",
             "Y",
-            "Yes, add acme/lib",
-            "yes, ADD acme/lib",
-        ] {
-            assert_eq!(said(yes), Answer::Yes, "{yes:?}");
-        }
-    }
-
-    #[test]
-    fn only_an_explicit_no_is_a_no() {
-        for no in ["no", "No", " NO\n", "n", "N"] {
-            assert_eq!(said(no), Answer::No, "{no:?}");
-        }
-        // The label of the other question's no option is a no to that question.
-        assert_eq!(
-            answer_of("Don't create it", "Create acme/fib", "Don't create it"),
-            Answer::No
-        );
-    }
-
-    #[test]
-    fn anything_else_says_neither_so_that_nothing_is_recorded() {
-        for neither in [
+            "no",
+            "No",
+            " NO\n",
+            "n",
+            "N",
             "",
             "wait",
             "Wait",
@@ -451,6 +474,8 @@ mod tests {
             "nope",
             "Yes, add acme/other",
             "yess",
+            "Yes, add acme/lib please",
+            "Don't create it",
         ] {
             assert_eq!(said(neither), Answer::Neither, "{neither:?}");
         }
