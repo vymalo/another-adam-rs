@@ -52,7 +52,8 @@
 #     add that repository (`request_repository`): the task waits (TASK_STATE_INPUT_REQUIRED) with a
 #     question that names `local/library` and lists a yes and a no, no pull request exists, and git-server
 #     has not been asked for `local/library` since the script began (the repository is seeded, so its
-#     log is what tells: GIT_SERVER_LOGS). The answer (ANSWER, `yes` by default) is sent to the task.
+#     log is what tells: GIT_SERVER_LOGS). The answer (ANSWER, `yes` by default) is sent to the task: a yes
+#     in the words of the yes option (`Yes, add local/library`), a no as the form's answer (`ask-sr-call-2`).
 #       yes: the task completes, hello.txt on the branch holds the library's greeting, and git-server was
 #         asked for `local/library` after the answer, and every check above holds for the sandbox;
 #       no: the task waits again (TASK_STATE_INPUT_REQUIRED, the coder could not use the library),
@@ -61,7 +62,8 @@
 #     says it can create a repository for it (the task waits). The person says "Create scratch/fib-<id> and put
 #     it there": the coder calls `create_repository` and the task waits again, on a question the tool wrote
 #     (`May I create the repository scratch/fib-<id> on <host>? It will be private and empty.`), and mock-github
-#     has seen no `POST /orgs/scratch/repos`. The answer (ANSWER, `yes` by default) is the third message.
+#     has seen no `POST /orgs/scratch/repos`. The answer (ANSWER, `yes` by default) is the third message: a
+#     yes in the words of the yes option (`Create scratch/fib-<id>`), a no as the form's answer (`ask-cr-call-5`).
 #       yes: mock-github saw exactly one `POST /orgs/scratch/repos`, for that name, private, and the task
 #         completes as `scratch` does (the project is published to the new repository, which git-server made
 #         empty on first use, `main` is the one empty commit, the pull request is for it);
@@ -129,7 +131,7 @@
 #                    `scratch` (the [mock:scratch] script, above) or `second-repo` (the
 #                    [mock:second-repo] script, above) or `create-repo` (the [mock:create-repo] script), or
 #                    `devcontainer`, `default-env`, `broken-env` or `no-runtime` (above)
-#   ANSWER           yes     with SCENARIO=second-repo: the person's answer, `yes` or `no`
+#   ANSWER           yes     with SCENARIO=second-repo or create-repo: the person's answer, `yes` or `no`
 #   COMPOSE_CMD      docker compose -f compose.yaml -f dev/compose.devcontainer.yaml --profile app   how the devcontainer scenarios reach
 #                    the stack's `podman`, `coder` and `config` (run from the repository root)
 #   PRELOAD_FROM_DOCKER  unset  1 = load the default image into the Podman service from the host's Docker (no internet for containers)
@@ -352,9 +354,25 @@ run_id="e2e-$scenario-${NO_OPENCODE:-0}-$(date +%s)-$$"
 # TIMEOUT), into $tmp/stream-<number>.sse and, one JSON-RPC response per line, $tmp/events-<number>.jsonl.
 # A message with a task id goes to that task: it is the answer to the question the task waits on.
 send_message() {
-  rpc=$(jq -n --arg id "$run_id-$1" --arg text "$2" --arg task "${3:-}" '{
+  send_parts "$1" "$(jq -cn --arg text "$2" '[{text: $text}]')" "${3:-}"
+}
+
+# send_form_answer <n> <surface> <value> <task>: the person picks <value> for the question `consent`
+# of the form drawn on <surface> (`ask-<call id>`), as a screen sends it: one A2UI `answer` action. A
+# typed `no` is never a no (bin/adam-coder/src/tools/consent.rs), so a refusal goes through the form.
+send_form_answer() {
+  send_parts "$1" "$(jq -cn --arg surface "$2" --arg value "$3" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '[{
+    data: [{version: "v0.9.1", action: {
+      name: "answer", surfaceId: $surface, sourceComponentId: "root", timestamp: $ts,
+      context: {answers: [{id: "consent", values: [$value]}]}}}],
+    mediaType: "application/a2ui+json",
+    metadata: {mimeType: "application/a2ui+json"}}]')" "$4"
+}
+
+send_parts() {
+  rpc=$(jq -n --arg id "$run_id-$1" --argjson parts "$2" --arg task "${3:-}" '{
     jsonrpc: "2.0", id: "1", method: "SendStreamingMessage",
-    params: {message: ({messageId: $id, role: "ROLE_USER", parts: [{text: $text}]}
+    params: {message: ({messageId: $id, role: "ROLE_USER", parts: $parts}
       + (if $task == "" then {} else {taskId: $task} end))}}')
   curl_rc=0
   code=$(curl -sN --max-time "$timeout" -o "$tmp/stream-$1.sse" -w '%{http_code}' \
@@ -465,8 +483,13 @@ if [ "$scenario" = create-repo ]; then
     if [ "$made" = 0 ]; then ok "nothing was created while the person had not answered"; else bad "mock-github saw $made repository creation(s) before the person answered"; fi
     known=$(listed "$name.git")
     if [ "$known" = 0 ]; then ok "git-server has not heard of $repo_path yet"; else bad "git-server knows $repo_path before it was created ($known)"; fi
-    # 3. The answer.
-    send_message 3 "$answer" "$task_id"
+    # 3. The answer: a yes in the words of the yes option (the question went out as text, and a bare
+    # `yes` answers nothing), a no on the form the tool's call drew (cr-call-5).
+    if [ "$answer" = yes ]; then
+      send_message 3 "Create scratch/$name" "$task_id"
+    else
+      send_form_answer 3 ask-cr-call-5 no "$task_id"
+    fi
     events=$tmp/events-3.jsonl
     every_event=$tmp/events-all.jsonl
     cat "$tmp/events-1.jsonl" "$tmp/events-2.jsonl" "$tmp/events-3.jsonl" > "$every_event"
@@ -520,7 +543,12 @@ if [ "$scenario" = second-repo ]; then
   if [ -z "$task_id" ]; then
     bad "the stream does not say which task it is"
   else
-    send_message 2 "$answer" "$task_id"
+    # A yes in the words of the yes option, a no on the form request_repository's call drew (sr-call-2).
+    if [ "$answer" = yes ]; then
+      send_message 2 "Yes, add local/library" "$task_id"
+    else
+      send_form_answer 2 ask-sr-call-2 no "$task_id"
+    fi
     events=$tmp/events-2.jsonl
     every_event=$tmp/events-all.jsonl
     cat "$tmp/events-1.jsonl" "$tmp/events-2.jsonl" > "$every_event"
