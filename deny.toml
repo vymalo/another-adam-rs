@@ -12,6 +12,15 @@ ignore = [
     # writes the CRDs; its crates' tests read YAML fixtures). Moving to `serde-saphyr`, already a workspace
     # dependency, changes the generated CRD file. Review by 2027-01-16.
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained; only under serde_yaml_ng in the operator; replace with serde-saphyr, review by 2027-01-16" },
+    # zip 8.6 is only a build dependency of `utoipa-swagger-ui` 10.0.1 (adam-a2a's /docs), whose latest release
+    # still requires `^8.6`. Its build script reads the archive vendored in `utoipa-swagger-ui-vendored` (feature
+    # `vendored`, checksum-pinned by Cargo.lock) entry by entry with `by_index`; it never calls
+    # `ZipArchive::extract` or `ZipStreamReader::extract`, which the three advisories are about, and the archive is
+    # not attacker-controlled (verified 2026-10-17, utoipa-swagger-ui-10.0.1/build.rs). Drop these once
+    # utoipa-swagger-ui accepts zip >= 9. Review by 2027-01-17.
+    { id = "RUSTSEC-2026-0367", reason = "zip SUID bits on extract(); build-time only, vendored archive, extract() not called; review by 2027-01-17" },
+    { id = "RUSTSEC-2026-0368", reason = "zip symlink targets on extract(); build-time only, vendored archive, extract() not called; review by 2027-01-17" },
+    { id = "RUSTSEC-2026-0369", reason = "zip permissions through symlinks on extract(); build-time only, vendored archive, extract() not called; review by 2027-01-17" },
 ]
 
 [licenses]
