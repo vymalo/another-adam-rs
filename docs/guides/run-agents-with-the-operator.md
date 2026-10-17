@@ -31,6 +31,12 @@ kubectl get agentservices -n <namespace> -w          # State: Degraded, then Rea
 kubectl describe agentservice chat -n <namespace>    # the conditions and the Events
 ```
 
+To share one package cache among agents, name a ReadWriteMany claim you made in `AgentConfig`
+`spec.environment.cache.existingClaim`: the pods that run workers mount it at `/cache`, where npm, pnpm and cargo keep their
+caches ([ADR 0040](../decisions/0040-a-shared-package-cache-at-cache.md); the same claim as the coder chart's `cache.existingClaim`).
+The operator never creates it, and one trust domain shares it:
+[operator README, "The shared package cache"](../../deploy/operator/README.md#the-shared-package-cache).
+
 An object the schema refuses fails at `kubectl apply`; each rule has an invalid example in
 [`examples/invalid`](../../deploy/operator/examples/invalid). A pair the schema accepts but the operator cannot
 resolve (`a2a.enabled: false`, a name over 52 characters) is `Blocked`, reason `ConfigInvalid`.

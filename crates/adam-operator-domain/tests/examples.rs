@@ -711,6 +711,57 @@ fn a_shared_placement_sets_no_worker_id() {
 }
 
 #[test]
+fn the_cache_is_the_users_claim_at_cache_in_every_pod_that_runs_workers() {
+    // Unset: no volume, no mount, and the digest is the pinned one.
+    let plain = must_resolve("coder", |_, _| {});
+    for w in &plain.runtime.workloads {
+        assert!(w.volumes.iter().all(|v| v.name != "cache"));
+        assert!(w.container.mounts.iter().all(|m| m.path != "/cache"));
+    }
+    // Set, on a split coder: the workers mount it, the front (which runs no toolchain) does not.
+    let r = must_resolve("coder", |s, c| {
+        set(s, "/spec/scaling/topology", json!("split"));
+        set(s, "/spec/scaling/workers", json!(2));
+        set(s, "/spec/scaling/front", json!({"replicas": 2}));
+        set(
+            c,
+            "/spec/harness/adam/coder/workspacePlacement",
+            json!("isolated"),
+        );
+        set(
+            c,
+            "/spec/environment/cache",
+            json!({"existingClaim": "shared-cache"}),
+        );
+    });
+    let worker = workload(&r.runtime, "coder");
+    let cache = worker.volumes.iter().find(|v| v.name == "cache").unwrap();
+    assert_eq!(
+        cache.source,
+        VolumeSource::ExistingClaim {
+            name: "shared-cache".to_owned()
+        }
+    );
+    assert!(
+        worker
+            .container
+            .mounts
+            .iter()
+            .any(|m| m.volume == "cache" && m.path == "/cache" && !m.read_only)
+    );
+    // The cache is shared, not per replica: it does not make the workers need a stable identity, and the
+    // work volume is still the only claim of its own.
+    assert!(worker.volumes.iter().any(|v| v.name == "work"));
+    let front = workload(&r.runtime, "coder-front");
+    assert!(front.volumes.iter().all(|v| v.name != "cache"));
+    assert!(front.container.mounts.iter().all(|m| m.path != "/cache"));
+    // No sidecar mounts it either.
+    for sidecar in &worker.sidecars {
+        assert!(sidecar.mounts.iter().all(|m| m.path != "/cache"));
+    }
+}
+
+#[test]
 fn split_is_a_front_and_workers() {
     let r = must_resolve("coder", |s, c| {
         set(s, "/spec/scaling/topology", json!("split"));

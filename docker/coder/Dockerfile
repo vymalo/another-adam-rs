@@ -34,14 +34,16 @@
 # published by vymalo/another-agentic-images (merged in #7 as bc97d51). Deployments
 # pin an immutable tag, never `latest`. Bump it when that image changes (the tag
 # of its newest build on main), together with anything here that depends on it.
-# Anonymous pull verified 2026-10-09: the manifest request for this tag with an
+# Anonymous pull verified 2026-10-11: the manifest request for this tag with an
 # anonymous ghcr.io token returned 200, and the image's config has the
 # `devcontainer.metadata` label (it is a dev container base: the default environment of the
-# coder's devcontainers, ADR 0010) and /opt/obscura/bin on PATH (obscura 0.2.4, a headless
-# browser, vymalo/another-agentic-images#11). The same build is the default of DEVCONTAINER_DEFAULT_IMAGE,
-# by its digest alone (bin/adam-coder/src/config.rs: the devcontainer CLI cannot parse a tag together
-# with a digest); a test keeps this tag equal to the tag that digest was published as.
-ARG WORKSPACE_TAG=1.98.1-cfd2917
+# coder's devcontainers, ADR 0010), /opt/obscura/bin on PATH (obscura 0.2.4, a headless
+# browser, vymalo/another-agentic-images#11) and the package caches under /cache
+# (CARGO_HOME=/cache/cargo; npm and pnpm by their own config files; vymalo/another-agentic-images#12,
+# ADR 0040). The same build is the default of DEVCONTAINER_DEFAULT_IMAGE, by its digest alone
+# (bin/adam-coder/src/config.rs: the devcontainer CLI cannot parse a tag together with a digest);
+# a test keeps this tag equal to the tag that digest was published as.
+ARG WORKSPACE_TAG=1.98.1-e6a528f
 
 FROM rust:1.94-trixie@sha256:652612f07bfbbdfa3af34761c1e435094c00dde4a98036132fca28c7bb2b165c AS build
 WORKDIR /src

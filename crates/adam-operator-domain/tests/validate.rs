@@ -398,6 +398,58 @@ fn the_coder_rules() {
             "uses this volume name itself",
         ),
         (
+            "cache claim name",
+            |_, c| {
+                set(
+                    c,
+                    "/spec/environment/cache",
+                    json!({"existingClaim": "Shared_Cache"}),
+                )
+            },
+            "spec.environment.cache.existingClaim",
+            "PersistentVolumeClaim",
+        ),
+        (
+            "cache claim name, empty",
+            |_, c| set(c, "/spec/environment/cache", json!({"existingClaim": ""})),
+            "spec.environment.cache.existingClaim",
+            "PersistentVolumeClaim",
+        ),
+        (
+            "cache volume name",
+            |_, c| {
+                set(
+                    c,
+                    "/spec/environment/cache",
+                    json!({"existingClaim": "shared-cache"}),
+                );
+                set(
+                    c,
+                    "/spec/environment/volumes/1",
+                    json!({"name": "cache", "scope": "agent", "mountPath": "/x", "source": {"persistent": {"size": "1Gi"}}}),
+                )
+            },
+            "volumes[cache]",
+            "uses this volume name itself",
+        ),
+        (
+            "mount over the cache",
+            |_, c| {
+                set(
+                    c,
+                    "/spec/environment/cache",
+                    json!({"existingClaim": "shared-cache"}),
+                );
+                set(
+                    c,
+                    "/spec/environment/volumes/1",
+                    json!({"name": "more", "scope": "agent", "mountPath": "/cache/more", "source": {"persistent": {"size": "1Gi"}}}),
+                )
+            },
+            "volumes[more].mountPath",
+            "overlaps /cache",
+        ),
+        (
             "duplicate volume name",
             |_, c| {
                 set(

@@ -470,10 +470,28 @@ pub struct Environment {
     #[serde(default)]
     pub volumes: Vec<Volume>,
 
+    /// The shared package cache: a claim you manage, mounted at `/cache` in every pod that runs
+    /// toolchains (ADR 0040). Unset: `/cache` is a directory of the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<Cache>,
+
     /// The pod's `terminationGracePeriodSeconds`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0))]
     pub termination_grace_period_seconds: Option<i64>,
+}
+
+/// The package cache of the agent's pods: npm's, pnpm's and cargo's caches, which the image keeps under
+/// `/cache`. One trust domain: whatever a run writes there every run reads, so share the claim only with
+/// agents you trust.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Cache {
+    /// The name of a PersistentVolumeClaim in the service's namespace, `ReadWriteMany`, that you manage and
+    /// whose root is writable by uid and gid 10001. The operator creates and deletes nothing; a missing
+    /// claim keeps the pod `Pending`.
+    #[schemars(length(min = 1))]
+    pub existing_claim: String,
 }
 
 /// An image.

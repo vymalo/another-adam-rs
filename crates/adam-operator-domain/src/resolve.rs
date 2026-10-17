@@ -303,6 +303,20 @@ impl<'a> Cx<'a> {
                     read_only: false,
                 });
             }
+            // The shared package cache: where the image keeps the caches of npm, pnpm and cargo.
+            if let Some(cache) = &spec.environment.cache {
+                volumes.push(VolumeSpec {
+                    name: contract::CACHE_VOLUME.to_owned(),
+                    source: VolumeSource::ExistingClaim {
+                        name: cache.existing_claim.clone(),
+                    },
+                });
+                mounts.push(Mount {
+                    volume: contract::CACHE_VOLUME.to_owned(),
+                    path: contract::CACHE_DIR.to_owned(),
+                    read_only: false,
+                });
+            }
         }
         if let Some(f) = folder {
             volumes.push(f.clone());

@@ -555,6 +555,14 @@ impl Cx<'_> {
                     optional: None,
                 });
             }
+            VolumeSource::ExistingClaim { name } => {
+                // The user's claim, mounted as it is: no owner reference, so deleting the service
+                // never deletes it.
+                volume.persistent_volume_claim = Some(core::PersistentVolumeClaimVolumeSource {
+                    claim_name: name.clone(),
+                    read_only: None,
+                });
+            }
             VolumeSource::SecretFile { secret, file, mode } => {
                 // One key as one file: a private key is a file and never a variable.
                 volume.secret = Some(core::SecretVolumeSource {

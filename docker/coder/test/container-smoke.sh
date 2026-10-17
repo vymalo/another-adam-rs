@@ -83,6 +83,13 @@ if docker exec "$name" bash -lc 'git --version && opencode --version && github-m
 else
   bad "a tool is missing from PATH in a login shell"
 fi
+# The package caches (ADR 0040): npm, pnpm and cargo write under /cache, a directory the runtime user owns with
+# the sticky bit, where a deployment mounts the shared volume; installed binaries stay in the home.
+if docker exec "$name" bash -lc 'test -O /cache && test -w /cache && test -k /cache && test "$CARGO_HOME" = /cache/cargo && test "$CARGO_INSTALL_ROOT" = "$HOME/.cargo" && test "$(npm config get cache)" = /cache/npm && test "$(pnpm config get store-dir)" = /cache/pnpm-store' >/dev/null; then
+  ok "the package caches are under /cache and installed binaries stay in the home"
+else
+  bad "the package caches are not under /cache (ADR 0040)"
+fi
 # The devcontainer client side (ADR 0010): the CLI that makes a repository's devcontainer and
 # Podman's client it drives. Nothing in this image runs containers.
 if docker exec "$name" bash -lc 'test "$(devcontainer --version)" = 0.89.0 && podman-remote --version | grep -q "5\\.8\\.7"' >/dev/null; then

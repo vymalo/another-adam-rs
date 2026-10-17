@@ -598,6 +598,66 @@ fn collect(v: &Value, out: &mut Vec<String>) {
     }
 }
 
+#[test]
+fn the_cache_is_the_users_claim_mounted_by_the_workers_and_owned_by_nobody() {
+    let r = resolved("coder", |s, c| {
+        set(s, "/spec/scaling/topology", json!("split"));
+        set(s, "/spec/scaling/workers", json!(2));
+        set(s, "/spec/scaling/front", json!({"replicas": 2}));
+        set(
+            c,
+            "/spec/harness/adam/coder/workspacePlacement",
+            json!("isolated"),
+        );
+        set(
+            c,
+            "/spec/environment/cache",
+            json!({"existingClaim": "shared-cache"}),
+        );
+    });
+    let rendered = render(&r.id, &r.runtime).unwrap();
+    // The operator makes no claim for it, whatever the deletion policy says.
+    assert!(rendered.claims.is_empty(), "{:?}", rendered.claims);
+    let docs = rendered.documents();
+    assert!(
+        docs.iter().all(|d| d["kind"] != "PersistentVolumeClaim"),
+        "{:?}",
+        kinds(&docs)
+    );
+    // The worker's pod mounts the user's claim, by name, writable, at /cache.
+    let worker = &find(&docs, "StatefulSet", "coder")["spec"]["template"]["spec"];
+    let cache = worker["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "cache")
+        .unwrap();
+    assert_eq!(
+        cache["persistentVolumeClaim"],
+        json!({"claimName": "shared-cache"})
+    );
+    let mounts = worker["containers"][0]["volumeMounts"].as_array().unwrap();
+    assert!(
+        mounts
+            .iter()
+            .any(|m| m["name"] == "cache" && m["mountPath"] == "/cache" && m["readOnly"].is_null())
+    );
+    // The front runs no toolchain: nothing of the cache.
+    let front = &find(&docs, "Deployment", "coder-front")["spec"]["template"]["spec"];
+    assert!(front["volumes"].is_null(), "{:?}", front["volumes"]);
+    // The pod rolls with the claim's name (the digest annotation), and the rest is the coder's own.
+    assert_ne!(split().1.digest, r.runtime.digest);
+}
+
+#[test]
+fn without_the_cache_no_pod_mounts_one() {
+    let docs = rendered(&coder()).documents();
+    let sts = find(&docs, "StatefulSet", "coder");
+    let text = serde_json::to_string(sts).unwrap();
+    assert!(!text.contains("/cache"), "{text}");
+    assert!(!text.contains("\"cache\""), "{text}");
+}
+
 // ---------------------------------------------------------------- what is refused
 
 fn refused(change: impl FnOnce(&mut RuntimeSpec), says: &str) {

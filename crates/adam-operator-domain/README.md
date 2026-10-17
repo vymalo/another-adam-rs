@@ -65,6 +65,12 @@ replicas); a `split` one has the workers (`<svc>`, role `Worker`) and the front 
   `GITHUB_MCP_URL`; **`adam-agent`** runs `tini -- adam-agent`, has `ADAM_AGENT_DIR=/etc/adam/agent`, none
   of the coder's variables and no `MCP_ALLOW_STDIO` (the image does not set it, and `adam-agent` must refuse
   local processes unless its deployment opts in).
+* **The shared package cache.** `spec.environment.cache.existingClaim` becomes a volume `cache`
+  (`VolumeSource::ExistingClaim`) mounted read-write at `/cache` by every workload that runs workers (the combined
+  pod and the `split` workers; not the front, which runs no toolchain, and not the sidecar), where the image keeps the
+  caches of npm, pnpm and cargo ([ADR 0040](../../docs/decisions/0040-a-shared-package-cache-at-cache.md)). It is a
+  volume of the pods, so a different claim is a rollout; an agent with no `cache` is byte for byte what it was. The chart's
+  `cache.existingClaim` is the same, held by the parity case `coder-cache`.
 * **A secret is a reference.** `…secretRef` fields become `EnvValue::Secret`, the GitHub App key a
   `VolumeSource::SecretFile` mounted at `/var/run/secrets/github-app/private-key.pem` (mode `0440`): a key
   is a file and never a variable. An extra MCP server's header is `Authorization: Bearer ${SEARCH_MCP_TOKEN}`
@@ -116,7 +122,8 @@ checks what the reconciler needs and the schema cannot say:
   `model.contextWindow`); an MCP server's name is letters, digits, `_` and `-` (the model sees `<name>__<tool>`;
   *unverified* against every gateway).
 * Quantities (volumes, resources, a cluster) parse; mount paths are absolute, not nested in one another or in a
-  path the operator mounts; volume names are DNS labels, unique, not the operator's; `scope: agent` only.
+  path the operator mounts; volume names are DNS labels, unique, not the operator's; `scope: agent` only. With `environment.cache`, the claim
+  is a DNS subdomain, and the name `cache` and the path `/cache` (and anything inside it) are the operator's too.
 * Folder `files` paths are relative with no `..`, the folder is at most 1 MiB, and holds an
   `instructions.md` (`agent/instructions.md` and `agents/<name>/instructions.md` are also found by adam:
   *verified 2026-10-05*, adam-rs `docs/authoring.md` at `0391809`, "Discovery rules").

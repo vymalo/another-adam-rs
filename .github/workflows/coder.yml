@@ -164,6 +164,13 @@ jobs:
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set config.modelBaseUrlFromSecret=true --set topology=split --set front.replicas=2 \
             > "$RUNNER_TEMP/rendered-model-url-split.yaml"
+          # The package cache (ADR 0040): an existing claim, and a created one with run pods (the pod template and
+          # the admission policy carry the claim).
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set cache.existingClaim=shared-cache > "$RUNNER_TEMP/rendered-cache.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set cache.create=true --set cache.storageClass=rwx --set runPods.enabled=true \
+            --set topology=split --set front.replicas=2 > "$RUNNER_TEMP/rendered-cache-run-pods.yaml"
           for attempt in 1 2 3; do
             status=0
             "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
@@ -178,6 +185,7 @@ jobs:
                 "$RUNNER_TEMP/rendered-a2a.yaml" "$RUNNER_TEMP/rendered-a2a-split.yaml" \
                 "$RUNNER_TEMP/rendered-model-url.yaml" "$RUNNER_TEMP/rendered-model-url-split.yaml" \
                 "$RUNNER_TEMP/rendered-run-pods.yaml" "$RUNNER_TEMP/rendered-run-pods-shared.yaml" \
+                "$RUNNER_TEMP/rendered-cache.yaml" "$RUNNER_TEMP/rendered-cache-run-pods.yaml" \
                 > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
             cat "$RUNNER_TEMP/kubeconform.out"
             if [ "$status" -eq 0 ]; then exit 0; fi

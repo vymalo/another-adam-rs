@@ -104,7 +104,7 @@ instead of depending on that repository.
 | `Workload` | one set of identical pods: `role`, `replicas`, `stable_identity`, an agent `Container`, native `sidecars`, `volumes`, `security`, the grace period and a disruption budget |
 | `Container`, `EnvVar`, `Mount`, `Probe`, `Resources` | what runs |
 | `EnvValue::{Literal, Secret(SecretRef), PodName}` | where a variable comes from. Closed: a new source fails to compile in every provider |
-| `VolumeSpec`, `VolumeSource::{Persistent, Files, ExternalFiles, SecretFile}`, `Sharing::{PerReplica, Shared}` | volumes; persistent ones are data |
+| `VolumeSpec`, `VolumeSource::{Persistent, Files, ExternalFiles, ExistingClaim, SecretFile}`, `Sharing::{PerReplica, Shared}` | volumes; persistent ones are data. `ExistingClaim { name }` is a claim someone else owns (ADR 0040), mounted as it is and never created or deleted. **`ExistingClaim` is a new variant of a closed enum: a provider that matches `VolumeSource` stops compiling until it handles it** |
 | `FileSet` | files materialised by name (ConfigMaps); paths may contain `/` and a provider maps them |
 | `Network`, `Peer`, `Selector`, `IpBlock` | the Service port, which workload it selects, and the peers of the ingress rule (the neutral form of a `NetworkPolicyPeer`) |
 | `Role::{All, ControlPlane, Worker}` | adam's `ROLE`. Closed |

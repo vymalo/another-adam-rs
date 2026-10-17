@@ -53,8 +53,13 @@ this page: https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/run-a
    `agent.folder` (`files`, a map of path to content holding `instructions.md`, at most 1 MiB, or
    `configMapRef`) and no `coder` block. `adam-coder` takes `agent.embedded: {}` and the `coder` block
    (`github.app` or `github.token`, never both): `deploy/operator/examples/coder.yaml`. Optional: `tools`
-   (`mcpServers`, `allowInsecureHttp`, `githubMcp`), `environment` (`resources`, `volumes`), `security`,
+   (`mcpServers`, `allowInsecureHttp`, `githubMcp`), `environment` (`resources`, `volumes`, `cache`), `security`,
    `extraEnv`, `model.extraBody`, `model.contextWindow` (the model's window in tokens, `MODEL_CONTEXT_WINDOW`).
+   `environment.cache.existingClaim` (optional) names a ReadWriteMany PersistentVolumeClaim you made in the namespace,
+   writable by uid and gid 10001: it is mounted at `/cache` in the pods that run workers (not the front of `split`), where
+   the image keeps the caches of npm, pnpm and cargo (ADR 0040,
+   `docs/decisions/0040-a-shared-package-cache-at-cache.md`). The operator never creates or deletes the claim and the
+   Role is unchanged; a missing one keeps the pod `Pending`. One trust domain: share it only with agents you trust.
 4. **Write the `AgentService`.** Required: `configRef.name` (same namespace) and `store.postgres`;
    `interfaces.a2a` is required (so is `interfaces`), is on unless `enabled: false`, and needs its token: a CEL rule refuses it without `bearerTokensSecretRef`. A folder agent, trimmed from `deploy/operator/examples/chat.yaml`:
 

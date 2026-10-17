@@ -250,6 +250,36 @@ from service.yaml, which every render contains, so they always run.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- /* cache (ADR 0040): one volume at /cache for the package caches. */ -}}
+{{- if not (kindIs "bool" .Values.cache.create) -}}
+{{- fail (printf "cache.create must be true or false, got %q" (toString .Values.cache.create)) -}}
+{{- end -}}
+{{- $cacheClaim := default "" .Values.cache.existingClaim | toString | trim -}}
+{{- if and $cacheClaim .Values.cache.create -}}
+{{- fail "cache.existingClaim and cache.create are both set: use a claim you manage, or let the chart create one for this release, not both" -}}
+{{- end -}}
+{{- if and $cacheClaim (or (gt (len $cacheClaim) 253) (not (regexMatch "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$" $cacheClaim))) -}}
+{{- fail (printf "cache.existingClaim must be the name of a PersistentVolumeClaim (dot-separated labels of lowercase letters, digits and -, each at most 63 characters), got %q" $cacheClaim) -}}
+{{- end -}}
+{{- if .Values.cache.create -}}
+{{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|k|M|G|T)?$" (toString .Values.cache.size)) -}}
+{{- fail (printf "cache.size must be a quantity such as 20Gi, got %q" (toString .Values.cache.size)) -}}
+{{- end -}}
+{{- if or (not (kindIs "slice" .Values.cache.accessModes)) (not .Values.cache.accessModes) -}}
+{{- fail "cache.accessModes must be a list of access modes, ReadWriteMany by default" -}}
+{{- end -}}
+{{- range .Values.cache.accessModes -}}
+{{- if not (has (toString .) (list "ReadWriteMany" "ReadWriteOnce" "ReadWriteOncePod")) -}}
+{{- fail (printf "cache.accessModes entries are ReadWriteMany, ReadWriteOnce or ReadWriteOncePod (a cache is written to), got %q" (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (not (has "ReadWriteMany" .Values.cache.accessModes)) (or (gt (int .Values.replicaCount) 1) (eq (toString .Values.runPods.enabled) "true")) -}}
+{{- fail "cache.create without ReadWriteMany is for one coder pod and no run pods (replicaCount 1, runPods.enabled false): a claim mounted by several pods, perhaps on several nodes, is ReadWriteMany" -}}
+{{- end -}}
+{{- end -}}
+{{- if and (include "coder.cacheConfigured" .) (or (hasKey .Values.config.extraEnv "CARGO_HOME") (hasKey .Values.config.extraEnv "npm_config_cache") (hasKey .Values.config.extraEnv "NPM_CONFIG_CACHE")) -}}
+{{- fail "cache.* is on and config.extraEnv sets CARGO_HOME or the npm cache: the image already points both at /cache, and a variable here would send a tool's cache somewhere the volume does not reach. Remove it" -}}
+{{- end -}}
 {{- if and (gt (int .Values.replicaCount) 1) (include "coder.runsWorkers" .) (not $placement) -}}
 {{- fail "replicaCount > 1 needs workspace.placement (shared, affinity or isolated): runs move between workers at every step, and without a placement a run that lands on a worker without its worktree forks into a second pull request (see deploy/coder/README.md, Workspace placement)" -}}
 {{- end -}}

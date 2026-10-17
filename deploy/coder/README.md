@@ -15,6 +15,7 @@ cluster.
 | `NetworkPolicy` | (both workloads with `topology: split`) ingress only from the namespace `another-agentic-system`; egress open (git, the gateway, registries) |
 | `Cluster` (CNPG) | `database.enabled` (the default) only: the coder's database; `DATABASE_URL` is the `uri` key of the `<release>-db-app` Secret CNPG creates. With `database.enabled: false` no Cluster is rendered and `DATABASE_URL` is read from `database.existingSecret`, see [Database](#database) |
 | `ExternalSecret` | `ssegning-aws` / `prod/meta/test-app`; the property of each value is in `externalSecrets.properties` |
+| `PersistentVolumeClaim` | `cache.create` only: `<release>-coder-cache`, ReadWriteMany, deleted with the release, see [The package cache](#the-package-cache) |
 | `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `PriorityClass`, `ResourceQuota`, `ValidatingAdmissionPolicy` and its binding, a second `NetworkPolicy` | `runPods.enabled` only, on the roles that run workers: a pod of its own for each active run, see [Run pods](#run-pods) |
 | `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-mcp`, one file of extra MCP servers in the shape of `mcp.json`, mounted in the pods that run workers and named by `ADAM_EXTRA_MCP_FILE`, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 
@@ -644,7 +645,7 @@ What it renders, and why each is there:
 | `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, `MODEL_API_KEY` from the ExternalSecret's Secret, `/work` the coder's workspace claim at the same path, and an init container that copies `adam-exec` and OpenCode out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations; a changed template is a deploy (a checksum annotation) |
 | `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot. `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
 | `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is mounted in the coder pod alone; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
-| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim and the one Secret (so no `hostPath`), reads a Secret other than the ExternalSecret's, or any by `envFrom`, is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
+| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages`, has a volume other than an `emptyDir`, the work claim (and the [cache](#the-package-cache) claim, when it is on) and the one Secret (so no `hostPath`), reads a Secret other than the ExternalSecret's, or any by `envFrom`, is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
 | `NetworkPolicy` `<release>-coder-run-pods` | no ingress; egress to DNS and to the internet **except** `networkPolicy.blockedCIDRs` (RFC 1918, link-local, which holds the cloud metadata address, and the shared address space) and `networkPolicy.clusterCIDRs` (the pod and service CIDRs: yours to name), so builds reach registries and the model gateway and not the services of the cluster. A gateway inside the cluster needs `networkPolicy.extraEgress`. IPv4 only |
 
 The coder pod gets `RUN_ENVIRONMENT=kubernetes`, `RUN_POD_TEMPLATE_FILE`, `RUN_POD_NAMESPACE` (its own, by the downward API), `RUN_POD_INSTANCE` (the release),
@@ -670,6 +671,40 @@ in it, a kill, the idle sweep, the policy refusing thirteen changes to the pod a
 does not check the NetworkPolicy (kind's network plugin may not enforce one). **Unverified on the cluster:** its Kubernetes version (1.30 or later), Longhorn
 sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy, and the HTTP status of an admission refusal (the
 coder treats 403, 422 and 400 as the deployment's mistake).
+
+## The package cache
+
+`cache.*` mounts **one volume at `/cache`**, where the image keeps the caches of npm (`/cache/npm`), pnpm
+(`/cache/pnpm-store`) and cargo (`/cache/cargo`: registry and git sources), so that a pod, a run pod or a release does not
+download again what another fetched ([ADR 0040](../../docs/decisions/0040-a-shared-package-cache-at-cache.md)). **Off by
+default, and then invisible**: `/cache` is a directory of the container's file system, lost with the pod.
+
+| Value | |
+|---|---|
+| `cache.existingClaim` | the name of a ReadWriteMany claim in this namespace that you manage and may share with other releases and the operator's agents. The chart creates nothing |
+| `cache.create` | `true`: the chart makes the claim `<release>-coder-cache` for this release (`cache.storageClass`, `cache.size`, `cache.accessModes`, ReadWriteMany by default). It goes with the release: a cache is not state |
+
+Neither: off. Both: refused. The volume is mounted in the **pods that run toolchains**: the `combined` pod, the `split`
+worker and the run pods (their template, and the admission policy lets a run pod mount the work claim and this claim, no
+other). The `split` front and a control plane run none and get none.
+
+* **Prepare the volume.** Its root must be writable by uid and gid 10001. The pods set `fsGroup: 10001`
+  (`OnRootMismatch`), which does it where the storage driver supports it; otherwise `chown` it once.
+* **The storage class matters.** cargo takes **no lock at all on an NFS mount** (*verified* in its source, ADR 0040) and
+  pnpm's store is documented for one machine: Longhorn's ReadWriteMany is NFS (*unverified* here). Prefer a class with
+  real locks. If pnpm or cargo misbehave on the shared volume, turn the cache off and let the proxy of the ADR serve it.
+* **One trust domain.** Every run reads whatever any run wrote. Do not share the volume with a deployment you do not
+  trust, and give runs no registry credential: the chart gives them none, and npm may write a token into its cache when a
+  registry answers `Vary: Authorization`. The chart refuses `CARGO_HOME` and the npm cache variable in `config.extraEnv`
+  while the cache is on.
+* Installed binaries (`cargo install`) stay private in the home. Nothing prunes the volume: size it, and clean it
+  (`pnpm store prune`, `npm cache verify`) if it fills.
+* The image must have the caches under `/cache`: `image.tag` and `runPods.image` are on `1.98.1-e6a528f` or later of the
+  workspace image. An older image mounts a volume no tool uses.
+
+Checked by `tests/render-check.sh` (the claim and the mounts, the policy, the refusals; the render with run pods is
+`tests/golden/cache.yaml`) and kubeconform on the renders. **Unverified on the cluster:** the volume's file system,
+that the pods can write to it, and a hit across two pods.
 
 ## Known risks
 

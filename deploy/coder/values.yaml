@@ -317,6 +317,33 @@ persistence:
   accessModes:
     - ReadWriteOnce
 
+# The package cache (ADR 0040): ONE volume mounted at /cache, where the workspace image keeps the caches of npm
+# (/cache/npm), pnpm (/cache/pnpm-store) and cargo (/cache/cargo: registry and git sources), so that a pod, a run
+# pod or a release does not download again what another one fetched. Off by default, and then invisible: /cache
+# is a directory of the container's own file system, lost with the pod. On, the volume is mounted in the pods that
+# run toolchains (the combined pod, the split worker, and the run pods) and the admission policy of the run pods
+# lets them mount it. The front of `split` and a control plane run none and get none. Installed binaries
+# (`cargo install`) stay private in the home, and no credential is ever written there (ADR 0040: the chart gives
+# a pod no registry token). It is a cache, not state: deleting it only makes the next builds slow.
+#
+# Exactly one of:
+#   existingClaim  the name of a ReadWriteMany claim in this namespace that you manage: the deployment-level volume
+#                  that several releases (and the operator's agents) share. The chart creates nothing.
+#   create: true   the chart makes the claim <release>-cache for this release alone (storageClass, size, accessModes).
+#                  It is deleted with the release.
+# Neither: off. The volume's root must be writable by uid and gid 10001 (podSecurityContext.fsGroup does it where the
+# storage driver supports it; otherwise chown it once). Whether the volume honours flock(2) matters to cargo: it
+# takes no lock at all on an NFS mount (ADR 0040, *verified* in cargo's source). One trust domain: every run reads
+# whatever any run wrote there, so do not share it between deployments that do not trust each other.
+cache:
+  existingClaim: ""
+  create: false
+  # With create: a class that supports ReadWriteMany. Empty: the cluster's default class.
+  storageClass: ""
+  size: 20Gi
+  accessModes:
+    - ReadWriteMany
+
 # A pod of its own for each active run (ADR 0019). Off by default: with it off the render is exactly what it was.
 # On, the coder runs the processes of a run (the project's checks, the commands that look around, OpenCode and
 # everything it starts) in a pod made from the template below, and only the files, git and the credentials stay
@@ -331,13 +358,13 @@ persistence:
 runPods:
   enabled: false
   # The run container's image: the workspace image of another-agentic-images (the toolchains, user 10001, /work),
-  # by tag AND digest. *Verified 2026-10-09*: an anonymous ghcr.io token and a manifest request for the tag
+  # by tag AND digest. *Verified 2026-10-11*: an anonymous ghcr.io token and a manifest request for the tag
   # returned this digest (a single linux/amd64 manifest of 2.92 GB compressed, config `User: agent`,
-  # `Entrypoint: [tini, --]`). It is the image the coder is built on. A node pulls it once: `readyTimeoutSecs`.
+  # `Entrypoint: [tini, --]`, `CARGO_HOME=/cache/cargo`: the package caches are under /cache, ADR 0040). It is the image the coder is built on. A node pulls it once: `readyTimeoutSecs`.
   image:
     repository: ghcr.io/vymalo/another-agentic-images/workspace
-    tag: 1.98.1-cfd2917
-    digest: sha256:ee7e4c7539ad62942e43f9b8ea39d8433617888cac3b0d26a37de3993671786c
+    tag: 1.98.1-e6a528f
+    digest: sha256:d2aae762ecad2c13bb697332507d236a75d8233d061f38cc97dc9227192b0797
     pullPolicy: IfNotPresent
   # The init container copies adam-exec and the native OpenCode out of the coder's image (/opt/adam/bin) into the
   # pod: empty is `image.repository:image.tag` of the coder above.

@@ -113,6 +113,8 @@ fn project(spec: &RuntimeSpec, svc: &str) -> Value {
                 VolumeSource::ExternalFiles { name, mode } => {
                     volumes.push(json!({"name": v.name, "kind": "configMap", "configMap": name, "mode": mode}));
                 }
+                VolumeSource::ExistingClaim { name } => volumes
+                    .push(json!({"name": v.name, "kind": "persistentVolumeClaim", "claim": name})),
                 VolumeSource::SecretFile { secret, file, mode } => volumes.push(json!({
                     "name": v.name, "kind": "secret", "secret": secret.name, "mode": mode,
                     "items": [{"key": secret.key, "path": file}],
@@ -349,6 +351,15 @@ fn split(_service: &mut Value, _config: &mut Value) {
     );
 }
 
+/// …and `cases/coder-cache.yaml`: the shared package cache, a claim of the deployer's at `/cache`.
+fn cache(_service: &mut Value, config: &mut Value) {
+    set(
+        config,
+        "/spec/environment/cache",
+        json!({"existingClaim": "shared-cache"}),
+    );
+}
+
 /// …and `cases/coder-affinity-token.yaml`.
 fn affinity_token(service: &mut Value, config: &mut Value) {
     set(service, "/spec/scaling/workers", json!(2));
@@ -451,6 +462,13 @@ fn an_affinity_coder_on_a_token_renders_what_the_chart_renders() {
 }
 
 #[test]
+fn a_coder_with_the_shared_cache_renders_what_the_chart_renders() {
+    let r = must_resolve("coder", cache);
+    let mut applied = Applied::default();
+    parity("coder-cache", &project(&r.runtime, "coder"), &mut applied);
+}
+
+#[test]
 fn the_normalisations_are_the_documented_ones() {
     let mut applied = Applied::default();
     for (case, change) in [
@@ -459,6 +477,7 @@ fn the_normalisations_are_the_documented_ones() {
             (|_: &mut Value, _: &mut Value| {}) as fn(&mut Value, &mut Value),
         ),
         ("coder-split", split),
+        ("coder-cache", cache),
         ("coder-affinity-token", affinity_token),
     ] {
         let r = must_resolve("coder", change);
