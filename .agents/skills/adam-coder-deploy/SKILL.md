@@ -32,7 +32,8 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    (`docker buildx build -f docker/coder/Dockerfile .`): stage 1 compiles `adam-coder` and
    `adam-agent` on a pinned `rust:1.94-trixie` (tag and digest); stage 2 is the workspace image
    `ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}` (the `ARG WORKSPACE_TAG` is
-   an immutable `<rust toolchain>-<sha7>` tag) with the binaries, the pinned
+   an immutable `<rust toolchain>-<sha7>` tag; it moves together with the default devcontainer image's digest in
+   `bin/adam-coder/src/config.rs` and `runPods.image` of the chart) with the binaries, the pinned
    `github-mcp-server`, the devcontainer CLI and Podman's remote client added. Runtime user is
    uid 10001, `/work` is the workspace volume, `EXPOSE 8080`, entrypoint
    `tini -- adam-coder`. The build argument `ADAM_BUILD_REVISION` (CI passes the commit) is baked into both
@@ -93,6 +94,13 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      with a warning, not exit 69); a plain `http` URL needs `mcp.websearch.allowInsecure` (or
      `config.extraEnv.MCP_ALLOW_INSECURE`). Put the AWS properties in place before turning one on (chart
      README, "Extra MCP servers").
+   * `cache.existingClaim` or `cache.create` (off by default and then invisible): one volume at `/cache`, where the
+     image keeps the caches of npm, pnpm and cargo, mounted by the combined pod, the split worker and the run pods
+     (their pod template; the admission policy lets a run pod mount the work claim and this one, no other). The
+     deployer owns the ReadWriteMany claim, its root must be writable by uid and gid 10001, and cargo takes no lock
+     on NFS. One trust domain: runs get no registry credential and the claim is shared only with deployments you
+     trust (ADR 0040, `docs/decisions/0040-a-shared-package-cache-at-cache.md`; chart README, "The package cache").
+     The image must be on the workspace base `1.98.1-e6a528f` or later, which has the caches under `/cache`.
    * No Ingress: the service is cluster-internal and reached over A2A with a bearer token.
    * Devcontainers are off on Kubernetes (README "Devcontainers are off here"). Its own answer is
      `runPods.enabled` (off by default and then invisible): each active run's processes run in a pod of its own

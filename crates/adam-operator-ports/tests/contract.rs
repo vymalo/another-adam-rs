@@ -51,6 +51,14 @@ fn check_names_the_broken_invariant() {
             }),
         ),
         (
+            "names no claim",
+            Box::new(|s| {
+                s.workloads[0].volumes[1].source = VolumeSource::ExistingClaim {
+                    name: String::new(),
+                }
+            }),
+        ),
+        (
             "twice",
             Box::new(|s| {
                 let again = s.workloads[0].container.env[0].clone();

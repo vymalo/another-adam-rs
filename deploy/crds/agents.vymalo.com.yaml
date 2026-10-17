@@ -37,6 +37,22 @@ spec:
               environment:
                 description: The image, resources and volumes of the agent's pods.
                 properties:
+                  cache:
+                    description: |-
+                      The shared package cache: a claim you manage, mounted at `/cache` in every pod that runs
+                      toolchains (ADR 0040). Unset: `/cache` is a directory of the container.
+                    nullable: true
+                    properties:
+                      existingClaim:
+                        description: |-
+                          The name of a PersistentVolumeClaim in the service's namespace, `ReadWriteMany`, that you manage and
+                          whose root is writable by uid and gid 10001. The operator creates and deletes nothing; a missing
+                          claim keeps the pod `Pending`.
+                        minLength: 1
+                        type: string
+                    required:
+                    - existingClaim
+                    type: object
                   image:
                     description: The image. adam-rs ships one image for both binaries.
                     properties:

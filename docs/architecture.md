@@ -1048,6 +1048,11 @@ pinned run whose owner is gone is stranded: keep worker ids stable and do not sc
 Slots, the environments' sequences and states, and the mirror lock are in
 [Workspace and environments](reference/workspace-and-environments.md).
 
+The **package caches** (npm, pnpm, cargo) are not part of a workspace: they are one deployment-level volume at `/cache`, mounted
+by every pod that runs toolchains (the coder, its run pods, a devcontainer) and shared by all of them, off by default
+([ADR 0040](decisions/0040-a-shared-package-cache-at-cache.md); chart value `cache`, operator field `environment.cache`,
+`DEVCONTAINER_CACHE_DIR`). Installed trees (`node_modules`, `target/`) stay in the workspace.
+
 ## The two agents
 
 | | [`adam-coder`](../bin/adam-coder/README.md) | [`adam-agent`](../bin/adam-agent/README.md) |

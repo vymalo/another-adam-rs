@@ -29,6 +29,10 @@ let crds: Vec<CustomResourceDefinition> = adam_operator_api::crds(); // AgentCon
 | `GROUP`, `VERSION` | `agents.vymalo.com`, `v1alpha1` |
 | `MAX_CONTEXT_WINDOW` | 2^53 - 1, the largest `model.contextWindow` |
 
+`spec.environment.cache` (`Cache { existingClaim }`) names a ReadWriteMany PersistentVolumeClaim of the service's
+namespace that the operator mounts at `/cache` in the pods that run workers: the shared package cache of
+[ADR 0040](../../docs/decisions/0040-a-shared-package-cache-at-cache.md). Optional; the operator never creates it.
+
 `spec.model` also carries `extraBody` (a free-form object, `MODEL_EXTRA_BODY`), `echoReasoning`
 (`reasoning_content` or `reasoning`, `MODEL_ECHO_REASONING`) and `contextWindow` (the model's window in tokens,
 `MODEL_CONTEXT_WINDOW`): not secrets, all optional. `contextWindow` is a `u64`; in the schema an integer of

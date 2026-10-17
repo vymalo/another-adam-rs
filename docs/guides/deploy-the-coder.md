@@ -182,7 +182,9 @@ ReadWriteMany claim you manage, shared with other releases) or `cache.create` mo
 coder pods and the run pods, where npm, pnpm and cargo keep their caches
 ([ADR 0040](../decisions/0040-a-shared-package-cache-at-cache.md)). Off by default, and then invisible. It is one
 trust domain, cargo takes no lock on NFS, and the volume's root must be writable by uid 10001:
-[chart README, "The package cache"](../../deploy/coder/README.md#the-package-cache).
+[chart README, "The package cache"](../../deploy/coder/README.md#the-package-cache). The operator mounts the
+same claim from `AgentConfig` `environment.cache`
+([Run agents with the operator](run-agents-with-the-operator.md)).
 
 ## A folder agent instead of the coder
 

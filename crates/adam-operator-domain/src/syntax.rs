@@ -13,6 +13,12 @@ pub fn is_dns_label(s: &str) -> bool {
         && b.last().is_some_and(|c| *c != b'-')
 }
 
+/// A DNS-1123 subdomain: dot-separated DNS labels, at most 253 characters (the name of a
+/// PersistentVolumeClaim).
+pub fn is_dns_subdomain(s: &str) -> bool {
+    s.len() <= 253 && s.split('.').all(is_dns_label)
+}
+
 /// A shell-safe environment variable name: `[A-Za-z_][A-Za-z0-9_]*`. Kubernetes allows more; an
 /// adam `${VAR}` reference and a person reading a manifest are served by this.
 pub fn is_env_name(s: &str) -> bool {
@@ -193,6 +199,17 @@ mod tests {
         for bad in ["", "-a", "a-", "A", "a_b", "a.b", "x".repeat(64).as_str()] {
             assert!(!is_dns_label(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn dns_subdomains() {
+        for ok in ["cache", "shared-cache", "a.b-c.d", "x".repeat(63).as_str()] {
+            assert!(is_dns_subdomain(ok), "{ok}");
+        }
+        for bad in ["", ".a", "a.", "a..b", "A", "a_b", "x".repeat(64).as_str()] {
+            assert!(!is_dns_subdomain(bad), "{bad}");
+        }
+        assert!(!is_dns_subdomain(&["a"; 130].join(".")));
     }
 
     #[test]

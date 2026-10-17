@@ -38,6 +38,7 @@ else: the provider has no right on Secrets, never reads one, and copies no kubel
 | `NetworkPolicy` | `<svc>` | `Network::allow_from` is not empty: ingress on the container port from those peers, **no egress rule**. An empty list makes no policy (and deletes one an earlier spec made) |
 | `ConfigMap` | the `FileSet`'s name | one per file set. A path with `/` is a key by an injective encoding (`skills/review/SKILL.md` is `skills_sreview_sSKILL.md`) and is mounted at its path through `items` |
 | `PersistentVolumeClaim` | `<svc>-<volume>` | a `Shared` persistent volume: one ReadWriteMany claim for every replica |
+| (none: a pod volume `persistentVolumeClaim: {claimName}`) | the user's claim | `VolumeSource::ExistingClaim`, the shared package cache at `/cache` (ADR 0040): mounted by name, with no owner reference, no label, no annotation and no object of ours, so `Retain` and `Delete` never touch it |
 | (the StatefulSet's `volumeClaimTemplates`) | `<volume>`, claims `<volume>-<workload>-<n>` | a `PerReplica` volume: ReadWriteOnce, one per replica |
 
 **The pod template** is the adam-rs chart's `statefulset.yaml`: no service-account token, `runAsNonRoot` with the ids of

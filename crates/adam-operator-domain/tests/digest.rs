@@ -266,6 +266,26 @@ fn what_a_pod_runs_rolls_the_pods() {
             "the topology",
             Box::new(|s, _| set(s, "/spec/scaling/topology", json!("split"))),
         ),
+        (
+            "the shared cache",
+            Box::new(|_, c| {
+                set(
+                    c,
+                    "/spec/environment/cache",
+                    json!({"existingClaim": "shared-cache"}),
+                )
+            }),
+        ),
+        (
+            "another claim for the shared cache",
+            Box::new(|_, c| {
+                set(
+                    c,
+                    "/spec/environment/cache",
+                    json!({"existingClaim": "other-cache"}),
+                )
+            }),
+        ),
     ];
     let mut seen = std::collections::BTreeSet::from([base]);
     for (what, change) in different {

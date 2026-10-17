@@ -10,8 +10,8 @@ use adam_operator_api::{
 
 use crate::contract::{self, env};
 use crate::syntax::{
-    is_dns_label, is_env_name, is_http_token, is_mount_path, is_plain_http_remote,
-    is_relative_file_path, is_size, parse_http_url, paths_overlap,
+    is_dns_label, is_dns_subdomain, is_env_name, is_http_token, is_mount_path,
+    is_plain_http_remote, is_relative_file_path, is_size, parse_http_url, paths_overlap,
 };
 use crate::{convert, plan};
 
@@ -614,6 +614,15 @@ fn check_environment(v: &mut Issues, cfg: &AgentConfig) {
         v.add(format!("{me} {field}"), message);
     }
 
+    if let Some(cache) = &e.cache
+        && !is_dns_subdomain(&cache.existing_claim)
+    {
+        v.add(
+            format!("{me} spec.environment.cache.existingClaim"),
+            "the name of a PersistentVolumeClaim: lower-case letters, digits, `-` and `.`, at most 253 characters",
+        );
+    }
+    let cache_on = e.cache.is_some();
     let mut names = BTreeSet::new();
     let mut mounts: Vec<&str> = Vec::new();
     for vol in &e.volumes {
@@ -623,7 +632,9 @@ fn check_environment(v: &mut Issues, cfg: &AgentConfig) {
                 &at,
                 "a volume's name is a DNS label: a claim is named after it",
             );
-        } else if contract::RESERVED_VOLUMES.contains(&vol.name.as_str()) {
+        } else if contract::RESERVED_VOLUMES.contains(&vol.name.as_str())
+            || (cache_on && vol.name == contract::CACHE_VOLUME)
+        {
             v.add(&at, "the operator uses this volume name itself");
         }
         if !names.insert(vol.name.as_str()) {
@@ -641,7 +652,8 @@ fn check_environment(v: &mut Issues, cfg: &AgentConfig) {
                 "an absolute path with no empty, `.` or `..` segment",
             );
         } else {
-            for reserved in contract::RESERVED_MOUNTS {
+            let cache_dir = cache_on.then_some(contract::CACHE_DIR);
+            for reserved in contract::RESERVED_MOUNTS.iter().copied().chain(cache_dir) {
                 if paths_overlap(&vol.mount_path, reserved) {
                     v.add(
                         format!("{at}.mountPath"),

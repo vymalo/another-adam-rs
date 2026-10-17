@@ -176,6 +176,13 @@ pub const GITHUB_APP_VOLUME: &str = "github-app";
 /// The volume the coder's workspace is. `WORKSPACE_ROOT` is where it is mounted.
 pub const WORK_VOLUME: &str = "work";
 
+/// The volume of the shared package cache (`environment.cache`), and where it is mounted: the image keeps the
+/// caches of npm, pnpm and cargo under this path (ADR 0040).
+pub const CACHE_VOLUME: &str = "cache";
+
+/// Where the package cache is mounted.
+pub const CACHE_DIR: &str = "/cache";
+
 /// Volume names the operator uses itself.
 pub const RESERVED_VOLUMES: &[&str] = &[AGENT_FOLDER_VOLUME, EXTRA_MCP_VOLUME, GITHUB_APP_VOLUME];
 

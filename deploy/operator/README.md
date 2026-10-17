@@ -111,6 +111,18 @@ On netcup the token is the AWS property **`agent_registry_token`** of `prod/anot
 cannot differ. It is **not** the agents' bearer (`AGENT_REGISTRY_AGENT_TOKEN`, a member of each agent's `A2A_BEARER_TOKENS`: the
 agent token rule, see [`adam-operator-registry`](../../crates/adam-operator-registry/README.md)).
 
+## The shared package cache
+
+`AgentConfig` `spec.environment.cache.existingClaim` names a ReadWriteMany PersistentVolumeClaim of the agent's namespace
+that every pod running workers mounts at `/cache`, where the image keeps the caches of npm, pnpm and cargo
+([ADR 0040](../../docs/decisions/0040-a-shared-package-cache-at-cache.md)). It is the coder chart's `cache.existingClaim`, held
+equal by the parity case `coder-cache`. **The Role does not change**: the kubelet mounts the claim, the operator never reads,
+creates or deletes it (so `Retain` and `Delete` leave it alone), and a missing or unbound claim keeps the pod `Pending`. Make the
+claim yourself, writable by uid and gid 10001 (`spec.security.fsGroup` does it where the storage driver supports it), and share
+it only with agents you trust: whatever a run writes there every run reads. The operator makes no run pods yet, so there is no
+template to pass it to; the front of a `split` service runs no toolchain and mounts nothing. A commented line is in
+[`examples/coder.yaml`](examples/coder.yaml).
+
 ## The image
 
 `ghcr.io/vymalo/another-adam-rs/operator`, built from [`docker/operator/Dockerfile`](../../docker/operator/Dockerfile) by

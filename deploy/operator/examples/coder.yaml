@@ -130,6 +130,11 @@ spec:
             size: 20Gi
             storageClass: longhorn
             perReplica: true
+    # The shared package cache (ADR 0040), off by default: the name of a ReadWriteMany claim in this namespace that you
+    # make (writable by uid and gid 10001). It is mounted at /cache in every pod that runs workers, where the image keeps
+    # the caches of npm, pnpm and cargo. One trust domain: share it only with agents you trust.
+    # cache:
+    #   existingClaim: shared-cache
     terminationGracePeriodSeconds: 120
   security:
     runAsUser: 10001
