@@ -134,8 +134,8 @@ change of worker keeps it, and a run that continues another starts with the one 
 (`Conversation::continued`; the new message's keys then win). Two bounds: the whole context is at most
 `MAX_CONTEXT_BYTES` (256 KiB of JSON; a message that would take it over has its context dropped, with a warning,
 and is still read for its text, **but for the keys of `PROTECTED_CONTEXT_KEYS`**, today `ACCESS_TIER_CONTEXT_KEY`
-(`vymalo.accessTier`): a limit the person set is never lost to a large context, does not count toward the bound, and a
-value over `MAX_PROTECTED_VALUE_BYTES` is ignored), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
+(`vymalo.accessTier`) and `CALLER_CONTEXT_KEY` (`vymalo.caller`, who the message was sent for): a limit on the agent is never
+lost to a large context, does not count toward the bound, and a value over `MAX_PROTECTED_VALUE_BYTES` is ignored), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
 that time has passed**, at the start of the next step (`drop_expired_context`): a credential the sender put there
 does not stay in the store after it stops working. (A run parked for hours still holds it until it next steps.)
 
@@ -409,9 +409,9 @@ and the child keeps it in its stored state (`Conversation::root_run`), so `ToolC
 child is the top run, after a restart and on another worker, with no store read per call. A tool that keeps a
 workspace or a budget for the whole task keys it by the root. Only code in the process writes the key: the A2A front
 builds payloads of `text` and `context`, and a run that continues another does not inherit it. **A child starts with the
-`PROTECTED_CONTEXT_KEYS` of the run that starts it** (the access tier, and so on down a chain), nothing else of its context;
+`PROTECTED_CONTEXT_KEYS` of the run that starts it** (the access tier, who it was sent for, and so on down a chain), nothing else of its context;
 a source in a child run is told the root with `SourceCtx::root_run_id()` (`detached_under(root, context)` for tests).
-(`tests/root_run.rs` is the chain of three runs, and the limits it hands down; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too.)
+(`tests/root_run.rs` is the chain of three runs, and the limits it hands down, the tier and who the message was sent for; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too.)
 
 ## Remote tasks
 
@@ -512,7 +512,7 @@ of its model message are all answered first, and a refused one ends nothing), an
 
 `tests/withheld_tools.rs` covers `withhold`: a held-back tool (own or a source's) is not shown and a call to it is refused with the reason while the others run, a limit a later message lifts holds no more from the next turn, and a source that holds nothing changes nothing. `tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
 the context of the start message reaching a tool, replace/delete/keep across messages, a continued run carrying the
-context (and the new message winning), the expiry, the size bound, state stored before the context existed, a question
+context (and the new message winning), the expiry, the size bound (the protected keys kept past it), state stored before the context existed, a question
 that keeps its interface and the frozen shapes of old journals, a source read at every turn (a tool offered since the
 last turn is there), an own tool winning a clash, the limit of offered tools, an unknown name, a source's tool that asks the person, and, with a store that loses the
 acknowledgement of a write (`FaultyStore`), the replays: a model step that was recorded neither calls the model nor

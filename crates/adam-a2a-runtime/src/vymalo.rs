@@ -9,6 +9,7 @@ use adam_a2a::{A2UI_MEDIA_TYPE, MENTIONS_EXTENSION, THREAD_TOOLS_EXTENSION, UI_C
 use adam_runtime::Inbound;
 use serde_json::{Map, Number, Value, json};
 
+use crate::caller::{CONTEXT_CALLER, caller_of};
 use crate::words::comparable;
 
 /// The context key under which a message that carries `ui-catalog/v1` says which catalog is
@@ -71,6 +72,7 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 /// | `metadata[ui-catalog/v1]` `{catalogId, version, digest, inline}` | context [`CONTEXT_UI_REF`] `{catalogId, version, digest}` |
 /// | the renderer's capabilities (`a2uiClientCapabilities.v0.9.1`, else `.v0.9`, else `a2uiRendererCapabilities.v1.0`) holding an inline catalog with the ref's `catalogId` | context [`CONTEXT_UI_CATALOG`] `{catalogId, version, digest, catalog}` |
 /// | `metadata[thread-tools/v1]` `{url, token, expiresAt}` | context [`CONTEXT_THREAD_TOOLS`], the same three members |
+/// | the `caller` and `depth` claims of that `token` (any entry under the URI) | context [`CONTEXT_CALLER`](crate::CONTEXT_CALLER): `{caller: "main"}`, `{caller: "ask:<n>", depth}`, or `{caller: "unreadable"}` ([`asked_by_an_agent`](crate::asked_by_an_agent)) |
 /// | `metadata[mentions/v1]` `{mentions: [{agentId, label, start, end, name?, cardUrl?}], coordinate?: {tool}}` | context [`CONTEXT_MENTIONS`], the mentions that are well formed (at most [`MAX_MENTIONS`]) and the `coordinate` tool; a message with other extension metadata and no mentions sets it to `null` |
 ///
 /// A message with none of the metadata has no `context` at all, so it changes nothing in the run.
@@ -338,8 +340,13 @@ fn context_of(metadata: &HashMap<String, Value>) -> Option<Map<String, Value>> {
         }
         context.insert(CONTEXT_UI_REF.to_owned(), reference);
     }
-    if let Some(grant) = metadata.get(THREAD_TOOLS_EXTENSION).and_then(thread_tools) {
-        context.insert(CONTEXT_THREAD_TOOLS.to_owned(), grant);
+    if let Some(entry) = metadata.get(THREAD_TOOLS_EXTENSION) {
+        if let Some(grant) = thread_tools(entry) {
+            context.insert(CONTEXT_THREAD_TOOLS.to_owned(), grant);
+        }
+        // Said for every message that carries the extension, a partial grant included: one that
+        // carries it and cannot be read is not a person's.
+        context.insert(CONTEXT_CALLER.to_owned(), caller_of(entry));
     }
     // The mentions are the ones of this message: a message that speaks for the screen and names none
     // takes the earlier ones away (a run that continues another carries its context along).
@@ -1024,23 +1031,73 @@ mod tests {
         }
     }
 
+    /// A thread-tools token with the claims `caller` and `depth`, shaped as the orchestrator mints it.
+    fn token_for(caller: &str, depth: u8) -> String {
+        use base64::Engine as _;
+        let segment = |v: Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string().as_bytes())
+        };
+        format!(
+            "{}.{}.c2ln",
+            segment(json!({"alg": "HS256", "typ": "JWT", "kid": "0123456789abcdef"})),
+            segment(
+                json!({"iss": "orch", "aud": "thread-tools", "caller": caller, "depth": depth})
+            )
+        )
+    }
+
     #[test]
     fn the_thread_tools_grant_is_copied_exactly_and_a_partial_one_is_ignored() {
         let grant = json!({
             "url": "http://orchestrator:8080/thread-tools/1b4e28ba/mcp",
-            "token": "aaa.bbb.ccc",
+            "token": token_for("main", 0),
             "expiresAt": "2026-10-01T14:00:00Z"});
         let m = with_metadata(text_message("hi"), json!({THREAD_TOOLS_EXTENSION: grant}));
         assert_eq!(
             vymalo_inbound(&m).unwrap().payload["context"],
-            json!({CONTEXT_THREAD_TOOLS: grant, CONTEXT_MENTIONS: null})
+            json!({CONTEXT_THREAD_TOOLS: grant, CONTEXT_CALLER: {"caller": "main"}, CONTEXT_MENTIONS: null})
         );
         for missing in ["url", "token", "expiresAt"] {
             let mut partial = grant.clone();
             partial.as_object_mut().unwrap().remove(missing);
             let m = with_metadata(text_message("hi"), json!({THREAD_TOOLS_EXTENSION: partial}));
-            assert!(vymalo_inbound(&m).unwrap().payload.get("context").is_none());
+            let context = vymalo_inbound(&m).unwrap().payload["context"].clone();
+            assert!(context.get(CONTEXT_THREAD_TOOLS).is_none(), "{missing}");
+            // The message still says who it was sent for: the token's claims, or nobody's.
+            let caller = if missing == "token" {
+                json!({"caller": crate::UNREADABLE_CALLER})
+            } else {
+                json!({"caller": "main"})
+            };
+            assert_eq!(context[CONTEXT_CALLER], caller, "{missing}");
         }
+    }
+
+    #[test]
+    fn a_message_for_an_asked_agent_says_so_and_one_without_the_grant_says_nothing() {
+        let grant = |token: String| json!({"url": "http://o/t", "token": token, "expiresAt": "2999-01-01T00:00:00Z"});
+        let context = |metadata: Value| {
+            vymalo_inbound(&with_metadata(text_message("hi"), metadata))
+                .unwrap()
+                .payload
+                .get("context")
+                .cloned()
+        };
+        let asked = context(json!({THREAD_TOOLS_EXTENSION: grant(token_for("ask:3", 2))})).unwrap();
+        assert_eq!(
+            asked[CONTEXT_CALLER],
+            json!({"caller": "ask:3", "depth": 2})
+        );
+        assert!(crate::asked_by_an_agent(asked.get(CONTEXT_CALLER)));
+        let opaque =
+            context(json!({THREAD_TOOLS_EXTENSION: grant("thread-token".into())})).unwrap();
+        assert!(crate::asked_by_an_agent(opaque.get(CONTEXT_CALLER)));
+        // Mentions alone, or nothing at all, say nothing about the caller.
+        let mentions =
+            context(json!({MENTIONS_EXTENSION: {"mentions": [{"agentId": "a", "label": "@a"}]}}))
+                .unwrap();
+        assert!(mentions.get(CONTEXT_CALLER).is_none());
+        assert_eq!(context(json!({"something": 1})), None);
     }
 
     // ---- mentions ----

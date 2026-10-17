@@ -32,6 +32,7 @@
 #![warn(missing_docs)]
 
 mod backend;
+mod caller;
 mod convert;
 mod ids;
 mod list;
@@ -45,6 +46,7 @@ mod vymalo;
 mod words;
 
 pub use backend::{DEFAULT_POLL_INTERVAL, MAX_REFERENCES, RuntimeTaskBackend};
+pub use caller::{CONTEXT_CALLER, UNREADABLE_CALLER, asked_by_an_agent};
 pub use convert::{
     InboundFn, PromptFn, artifact_id, artifact_of, default_inbound, default_prompt, task_state,
 };

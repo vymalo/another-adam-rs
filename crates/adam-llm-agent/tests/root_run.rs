@@ -243,6 +243,7 @@ async fn a_child_starts_with_the_limits_of_its_parent_and_a_source_sees_the_root
     let mut first = user_message("go");
     first.payload["context"] = json!({
         adam_llm_agent::ACCESS_TIER_CONTEXT_KEY: {"tier": "plan"},
+        adam_llm_agent::CALLER_CONTEXT_KEY: {"caller": "ask:1", "depth": 1},
         "other": "not inherited",
     });
     let top = rt.start("top", first, None).await.unwrap();
@@ -259,6 +260,11 @@ async fn a_child_starts_with_the_limits_of_its_parent_and_a_source_sees_the_root
             .context
             .get(adam_llm_agent::ACCESS_TIER_CONTEXT_KEY),
         Some(&tier)
+    );
+    assert_eq!(
+        leaf_state.context.get(adam_llm_agent::CALLER_CONTEXT_KEY),
+        Some(&json!({"caller": "ask:1", "depth": 1})),
+        "a child of an asked agent's run has no person behind it either"
     );
     assert!(!leaf_state.context.contains_key("other"));
     let seen = seen.lock().unwrap().clone();

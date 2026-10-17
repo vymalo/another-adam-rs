@@ -14,8 +14,8 @@ use adam_a2a::{
     UI_CATALOG_EXTENSION,
 };
 use adam_a2a_runtime::{
-    CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF, RuntimeTaskBackend,
-    vymalo_inbound,
+    CONTEXT_CALLER, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS, CONTEXT_UI_CATALOG, CONTEXT_UI_REF,
+    RuntimeTaskBackend, UNREADABLE_CALLER, asked_by_an_agent, vymalo_inbound,
 };
 use adam_core::{DynStore, MemoryStore, RunId};
 use adam_llm_agent::{Conversation, LlmAgent, Tool, ToolCtx, ToolError, ToolOutput};
@@ -180,6 +180,56 @@ async fn a_messages_extensions_reach_the_run_as_its_context() {
     );
     assert!(context[CONTEXT_UI_CATALOG]["catalog"]["components"]["Text"]["maxLength"].is_i64());
     assert_eq!(context[CONTEXT_THREAD_TOOLS]["token"], "a.b.c");
+    // A token whose claims cannot be read says the message is nobody's.
+    assert_eq!(
+        context[CONTEXT_CALLER],
+        json!({"caller": UNREADABLE_CALLER})
+    );
+}
+
+/// The orchestrator's token for an asked agent (`caller: ask:<n>`) reaches the run as who the
+/// message was sent for, and a task that continues it in the same conversation keeps it until a
+/// message says otherwise.
+#[tokio::test]
+async fn who_a_message_was_sent_for_reaches_the_run_and_is_carried() {
+    use base64::Engine as _;
+    let rig = Rig::new();
+    rig.model.push_text("ok");
+    let (stop, handle) = rig.worker();
+    let segment = |v: Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+    let token = format!(
+        "{}.{}.c2ln",
+        segment(json!({"alg": "HS256", "typ": "JWT"})),
+        segment(json!({"iss": "orch", "aud": "thread-tools", "caller": "ask:2", "depth": 1}))
+    );
+    let grant = json!({"url": "http://127.0.0.1:1/thread-tools/t1/mcp", "token": token,
+                       "expiresAt": "2999-01-01T00:00:00Z"});
+    let first = with_metadata(
+        Message::new(Role::User, vec![Part::text("look at it")]),
+        json!({THREAD_TOOLS_EXTENSION: grant}),
+    );
+    let one = rig
+        .backend
+        .submit(alice(), first, None, Some("ctx-ask".into()))
+        .await
+        .unwrap();
+    let asked = json!({"caller": "ask:2", "depth": 1});
+    assert_eq!(rig.state(&one).await.context[CONTEXT_CALLER], asked);
+    assert!(asked_by_an_agent(Some(&asked)));
+    wait_task(&rig, &one.id, TaskState::Completed).await;
+
+    rig.model.push_text("ok again");
+    let mut second = Message::new(Role::User, vec![Part::text("and now?")]);
+    second.reference_task_ids = Some(vec![one.id.clone()]);
+    let two = rig
+        .backend
+        .submit(alice(), second, None, Some("ctx-ask".into()))
+        .await
+        .unwrap();
+    assert_eq!(rig.state(&two).await.context[CONTEXT_CALLER], asked);
+    wait_task(&rig, &two.id, TaskState::Completed).await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
 }
 
 /// The mentions of a message are the run's context, and the next job of the thread (a task that
