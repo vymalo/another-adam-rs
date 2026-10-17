@@ -267,9 +267,10 @@ pub struct PullRequestStatus {
     pub base_branch: String,
     /// Whether the checks of the head commit passed.
     pub checks: Checks,
-    /// The host reports at least one status or check run for the head commit. `false` with
+    /// The host reports at least one status or check run for the head commit **that succeeded** (a
+    /// run that was skipped or neutral does not count: it checked nothing). `false` with
     /// [`Checks::Passing`] is a pull request the host calls ready that **nothing ever checked**: a
-    /// repository with no CI.
+    /// repository with no CI, or one whose runs were all skipped or neutral.
     pub ci_reported: bool,
 }
 

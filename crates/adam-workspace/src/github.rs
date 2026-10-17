@@ -231,7 +231,12 @@ impl GitHub {
             }
             truncated = page == MAX_CHECK_RUN_PAGES;
         }
-        let reported = status.total_count > 0 || !runs.is_empty();
+        // "Reported" is reported **green**: a commit whose runs were all skipped or neutral, or whose
+        // statuses all failed to say, was checked by nothing.
+        let reported = (status.total_count > 0 && status.state == "success")
+            || runs.iter().any(|run| {
+                run.status == "completed" && run.conclusion.as_deref() == Some("success")
+            });
         Ok((
             classify_checks(mergeable_state, &status, &runs, truncated),
             reported,

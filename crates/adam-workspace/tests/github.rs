@@ -1364,6 +1364,40 @@ mod change {
         assert!(status.ci_reported);
     }
 
+    /// Runs that were all skipped or neutral pass a merge, but nothing checked the commit: they are
+    /// not "reported". One that succeeded is, and so is a status that did.
+    #[tokio::test]
+    async fn runs_that_were_all_skipped_or_neutral_checked_nothing() {
+        let run = |conclusion: &str| json!({"name": "job", "status": "completed", "conclusion": conclusion});
+        for (status, runs, reported) in [
+            (
+                json!({"state": "pending", "total_count": 0}),
+                json!({"total_count": 2, "check_runs": [run("skipped"), run("neutral")]}),
+                false,
+            ),
+            (
+                json!({"state": "pending", "total_count": 0}),
+                json!({"total_count": 2, "check_runs": [run("skipped"), run("success")]}),
+                true,
+            ),
+            (
+                json!({"state": "success", "total_count": 1}),
+                json!({"total_count": 1, "check_runs": [run("skipped")]}),
+                true,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            serve_pull(&server, pull_with_state("clean")).await;
+            serve_checks(&server, status, runs.clone()).await;
+            let got = client(&server)
+                .pull_request_status(&repo(), 7)
+                .await
+                .unwrap();
+            assert_eq!(got.checks, Checks::Passing, "{runs}");
+            assert_eq!(got.ci_reported, reported, "{runs}");
+        }
+    }
+
     #[tokio::test]
     async fn checks_are_read_from_the_statuses_and_the_check_runs_of_the_head() {
         let green = json!({"total_count": 2, "check_runs": [
