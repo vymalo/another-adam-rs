@@ -4488,6 +4488,65 @@ async fn a_text_question_is_answered_with_the_label_of_its_yes_option(store: Dyn
     assert!(notes.consents.len() == 1 && notes.consents[0].agreed);
 }
 
+/// Another agent's model asked the coder through the orchestrator (`ask_agent`): the message has a
+/// thread-tools grant whose token names `ask:1` and no UI catalog. Nobody can agree there, so
+/// `request_repository` asks nobody: the model reads why, the task is never `input-required` and
+/// completes, and the repository is neither granted nor fetched. Over HTTP, through the official
+/// client, so the metadata travels as an A2A server gets it.
+async fn an_asked_coder_asks_nobody_for_consent_and_the_task_goes_on(store: DynStore) {
+    let fx = Fixture::new("hello\n").await;
+    let library = fx.extra_remote("library", &[("greeting.txt", "hello from library\n")]);
+    let library_url = library.to_string_lossy().into_owned();
+    let mock = Arc::new(MockModel::new());
+    mock.push_tool_calls(vec![call(
+        "r1",
+        "request_repository",
+        json!({"repo_url": library_url, "reason": "the greeting"}),
+    )])
+    .push_text("I cannot add library without the person's yes.");
+    let server = Server::start(coder_with(&fx, &mock, store)).await;
+    let worker = spawn_worker(&server.coder);
+
+    let mut ask = user(&format!(
+        "In {}, put our shared greeting into hello.txt.",
+        fx.remote_url()
+    ));
+    ask.metadata = Some(std::collections::HashMap::from([(
+        THREAD_TOOLS_EXTENSION.to_owned(),
+        json!({"url": "http://127.0.0.1:1/thread-tools/thread-1/mcp",
+               "token": common::thread_tools_token("ask:1"),
+               "expiresAt": "2999-01-01T00:00:00Z"}),
+    )]));
+    let seen = until_it_waits(&server, ask).await;
+    worker.stop().await;
+    assert_eq!(
+        seen.last_state,
+        Some(TaskState::Completed),
+        "{:?}",
+        seen.labels
+    );
+    assert!(
+        !seen.labels.iter().any(|l| l.ends_with("InputRequired")),
+        "{:?}",
+        seen.labels
+    );
+    let (said, is_error) = result_of(&mock, "r1");
+    assert!(
+        is_error && said.starts_with("No person is in this conversation"),
+        "{said}"
+    );
+    let run = run_id(&seen.task_id);
+    let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
+    assert!(notes.consents.is_empty() && !notes.is_text_question("r1"));
+    assert_eq!(notes.named_repos.len(), 1, "{:?}", notes.named_repos);
+    let view = server.coder.runtime.view(run).await.unwrap().unwrap();
+    let state: Conversation = serde_json::from_value(view.state).unwrap();
+    assert_eq!(
+        state.context["vymalo.caller"],
+        json!({"caller": "ask:1", "depth": 1})
+    );
+}
+
 /// A bare "yes" or "no" to a question that went out as text is no answer: the model may have asked
 /// something else in the same turn. Nothing is recorded, the repository stays refused, and the tool
 /// asks again instead of saying the person declined.
@@ -5165,6 +5224,7 @@ macro_rules! coder_suite {
                 another_repository_joins_the_workspace_when_the_person_says_yes_on_the_form,
                 a_no_on_the_form_adds_nothing_and_is_not_asked_again,
                 a_text_question_is_answered_with_the_label_of_its_yes_option,
+                an_asked_coder_asks_nobody_for_consent_and_the_task_goes_on,
                 a_bare_yes_or_no_to_a_text_question_is_no_answer,
                 a_wait_is_no_answer_and_the_question_is_asked_again,
                 a_yes_to_a_question_the_model_wrote_grants_nothing,

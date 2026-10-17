@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use a2a::{Message as A2aMessage, Part, Role};
 use adam_a2a::{ACCESS_TIER_EXTENSION, AccessTier, BackendError, Caller, TaskBackend as _};
-use adam_a2a_runtime::CONTEXT_ACCESS_TIER;
-use adam_coder::tools::consent::merge_question;
+use adam_a2a_runtime::{CONTEXT_ACCESS_TIER, CONTEXT_CALLER, UNREADABLE_CALLER};
+use adam_coder::tools::consent::{NO_PERSON, merge_question};
 use adam_coder::{AGENT_NAME, Coder, CoderAgent, RuntimeOptions, coder_tools};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
@@ -474,6 +474,16 @@ impl Rig {
             ctx,
             said: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// The rig in a run whose newest message was sent for `caller` (`main`, or `ask:<n>` for an
+    /// agent another agent asked): what `vymalo_inbound` puts in the run's context from the token of
+    /// the message's thread-tools grant.
+    fn sent_for(mut self, caller: &str) -> Self {
+        let context =
+            serde_json::Map::from_iter([(CONTEXT_CALLER.to_owned(), json!({ "caller": caller }))]);
+        self.ctx = self.ctx.with_context(context);
+        self
     }
 
     async fn tier(&self, tier: AccessTier) {
@@ -1777,6 +1787,97 @@ async fn bypass_creates_with_no_question_and_auto_asks() {
         "{asked:?}"
     );
     assert!(host.created().is_empty());
+}
+
+// ------------------------------------------------------------- a run another agent started
+
+/// `out` is the refusal of a consent tool that asked nobody: an error result about `what`.
+fn refused_for_nobody(out: Result<ToolOutput, ToolError>, what: &str) {
+    match out {
+        Ok(out) => assert!(
+            out.is_error
+                && out.content.starts_with(NO_PERSON)
+                && out.content.contains(&format!("nobody can agree to {what}")),
+            "{}",
+            out.content
+        ),
+        other => panic!("the tool should have refused without asking: {other:?}"),
+    }
+}
+
+/// An agent another agent asked (`ask_agent`) has no person behind it, and the asking model would
+/// answer a question that went out as text: `request_repository`, `create_repository` and Path B of
+/// `merge_pull_request` ask nobody there, note no question and act on nothing; a grant whose claims
+/// cannot be read is nobody's too. The same calls in a person's run ask, as before.
+#[tokio::test]
+async fn in_a_run_another_agent_started_the_consent_tools_ask_nobody() {
+    for caller in ["ask:1", UNREADABLE_CALLER] {
+        let rig = Rig::new(Fixture::new("hello\n").await).sent_for(caller);
+        refused_for_nobody(ask(&rig).await, "adding acme/widgets to this workspace");
+        let notes = rig
+            .fx
+            .env
+            .notes
+            .load(&rig.ctx.run_id().to_string())
+            .await
+            .unwrap();
+        assert!(!notes.is_text_question(rig.ctx.call_id()), "{caller}");
+
+        let (rig, host) = app_rig(&["acme"]).await;
+        let rig = rig.sent_for(caller);
+        refused_for_nobody(
+            rig.call("create_repository", json!({"owner": "acme", "name": "fib"}))
+                .await,
+            "creating the repository acme/fib (private)",
+        );
+        assert!(host.created().is_empty());
+
+        let rig = rig_with_a_pull_request_of_somebody_else()
+            .await
+            .sent_for(caller);
+        refused_for_nobody(
+            rig.merge_raw().await,
+            "merging pull request #7 of octo/widgets",
+        );
+        assert!(rig.requests("PUT").await.is_empty());
+    }
+
+    // What needs nobody's yes is as it was: the conversation's own pull request is merged, and at
+    // bypass (the tier is the consent) nothing is asked.
+    let rig = Rig::new(Fixture::new("hello\n").await).sent_for("ask:1");
+    common::mount_mergeable(&rig.fx.github, "octo/widgets", 7, "agent/x", "9f8e7d").await;
+    rig.pushed("octo/widgets", "agent/x").await;
+    let out = rig.merge().await;
+    assert!(
+        !out.is_error && out.content.starts_with("Merged pull request #7"),
+        "{}",
+        out.content
+    );
+    let rig = Rig::new(Fixture::new("hello\n").await).sent_for("ask:1");
+    rig.tier(AccessTier::Bypass).await;
+    let out = ask(&rig).await.unwrap();
+    assert!(out.content.contains("already granted"), "{}", out.content);
+
+    // With a person behind the run, each asks.
+    let rig = Rig::new(Fixture::new("hello\n").await).sent_for("main");
+    assert!(matches!(ask(&rig).await, Err(ToolError::NeedsInput { .. })));
+    let (rig, _) = app_rig(&["acme"]).await;
+    let rig = rig.sent_for("main");
+    let asked = rig
+        .call("create_repository", json!({"owner": "acme", "name": "fib"}))
+        .await;
+    assert!(
+        matches!(asked, Err(ToolError::NeedsInput { .. })),
+        "{asked:?}"
+    );
+    let rig = rig_with_a_pull_request_of_somebody_else()
+        .await
+        .sent_for("main");
+    assert!(
+        rig.asked()
+            .await
+            .contains("Merge octo/widgets#7 into main?")
+    );
 }
 
 // ----------------------------------------------------------------------------------- A2A

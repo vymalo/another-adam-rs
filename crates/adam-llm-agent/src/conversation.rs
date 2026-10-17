@@ -72,12 +72,19 @@ pub const MAX_CONTEXT_BYTES: usize = 256 * 1024;
 /// (`access-tier/v1`): `{"tier": "plan" | "edits" | "auto" | "bypass"}`.
 pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
 
-/// The context keys that carry a **limit the person put on the agent**. A message always sets them,
-/// even when the rest of its context is over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large
-/// catalog next to a `plan` tier would lift the limit), and a child run starts with the ones its
-/// parent has ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
+/// The context key under which a message says **who it was sent for** (`thread-tools/v1`): the
+/// thread's addressed agent, `{"caller": "main"}`, or an agent another agent asked, `{"caller":
+/// "ask:<n>", ..}`, read from the claims of the grant's token. A run of an asked agent has no person
+/// behind it, which is a limit on what it may ask for.
+pub const CALLER_CONTEXT_KEY: &str = "vymalo.caller";
+
+/// The context keys that carry a **limit on the agent**: the access tier the person picked, and
+/// who the message was sent for. A message always sets them, even when the rest of its context is
+/// over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large catalog next to a `plan` tier would
+/// lift the limit), and a child run starts with the ones its parent has
+/// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)). Each value is at most
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
-pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[ACCESS_TIER_CONTEXT_KEY];
+pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY];
 
 /// The most serialized JSON, in bytes, that the value of a [`PROTECTED_CONTEXT_KEYS`] key may hold.
 pub const MAX_PROTECTED_VALUE_BYTES: usize = 1024;

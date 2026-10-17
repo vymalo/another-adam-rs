@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    ACCESS_TIER_CONTEXT_KEY, Conversation, LlmAgent, LlmAgentBuilder, MAX_CONTEXT_BYTES,
-    MAX_PROTECTED_VALUE_BYTES, MAX_SOURCE_TOOLS, PendingQuestion, PendingWait, SourceCtx, Tool,
-    ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
+    ACCESS_TIER_CONTEXT_KEY, CALLER_CONTEXT_KEY, Conversation, LlmAgent, LlmAgentBuilder,
+    MAX_CONTEXT_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_SOURCE_TOOLS, PendingQuestion, PendingWait,
+    SourceCtx, Tool, ToolCtx, ToolError, ToolOutput, ToolSource, user_message,
 };
 use adam_model::{DynModel, Message, MockModel, ToolCall, ToolSpec};
 use adam_runtime::{Inbound, ManualClock, RetryPolicy, RunView, Runtime};
@@ -451,6 +451,15 @@ fn a_limit_the_person_set_is_kept_when_the_rest_of_the_context_is_dropped() {
     assert!(c.merge_context(&obj(json!({ACCESS_TIER_CONTEXT_KEY: tier("plan")}))));
     assert!(c.merge_context(&obj(json!({ACCESS_TIER_CONTEXT_KEY: null}))));
     assert!(!c.context.contains_key(ACCESS_TIER_CONTEXT_KEY));
+    // Who the message was sent for is a limit too: an asked agent's run keeps saying so.
+    let asked = json!({"caller": "ask:1", "depth": 1});
+    let mut c = Conversation::new("t");
+    let update = obj(json!({"catalog": "x".repeat(MAX_CONTEXT_BYTES), CALLER_CONTEXT_KEY: asked}));
+    assert!(!c.merge_context(&update));
+    assert_eq!(
+        Value::Object(c.context.clone()),
+        json!({CALLER_CONTEXT_KEY: asked})
+    );
 }
 
 #[tokio::test]

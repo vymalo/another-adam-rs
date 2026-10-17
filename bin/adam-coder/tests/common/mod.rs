@@ -38,6 +38,39 @@ pub fn typed_message(text: &str) -> Inbound {
     vymalo_inbound(&message).expect("text reads as text")
 }
 
+/// The token of a thread-tools grant as the orchestrator mints it for `caller` (`main`, or `ask:<n>`
+/// for an agent another agent asked): a JWS whose claims say who the message was sent for. The
+/// signature is not read by the agent.
+pub fn thread_tools_token(caller: &str) -> String {
+    use base64::Engine as _;
+    let segment = |v: Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string().as_bytes())
+    };
+    let depth = u8::from(caller != "main");
+    format!(
+        "{}.{}.c2lnbmF0dXJl",
+        segment(json!({"alg": "HS256", "typ": "JWT", "kid": "0123456789abcdef"})),
+        segment(
+            json!({"iss": "orch", "aud": "thread-tools", "sub": "thread-1", "job": 1,
+                       "agt": "coder", "caller": caller, "depth": depth, "jti": "m-1",
+                       "iat": 1_790_856_000, "exp": 1_790_863_200})
+        ),
+    )
+}
+
+/// A message the orchestrator sends with a thread-tools grant for `caller` and no UI catalog: the
+/// message as the A2A layer makes it. The endpoint refuses every connection,
+/// so the run is offered none of its tools.
+pub fn message_for(caller: &str, text: &str) -> Inbound {
+    let mut message = A2aMessage::new(Role::User, vec![Part::text(text)]);
+    message.metadata = Some(HashMap::from([(
+        adam_a2a::THREAD_TOOLS_EXTENSION.to_owned(),
+        json!({"url": "http://127.0.0.1:1/thread-tools/thread-1/mcp",
+               "token": thread_tools_token(caller), "expiresAt": "2999-01-01T00:00:00Z"}),
+    )]));
+    vymalo_inbound(&message).expect("text reads as text")
+}
+
 /// The person answers the form drawn on `surface`: the answer as the A2A layer writes it.
 pub fn form_answer(surface: &str, answers: Value, note: Option<&str>) -> Inbound {
     let mut context = json!({ "answers": answers });

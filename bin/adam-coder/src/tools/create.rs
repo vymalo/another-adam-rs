@@ -261,6 +261,10 @@ pub async fn create_repository(
                 &yes_label(owner, name),
                 NO_CREATE_LABEL,
             ),
+            &format!(
+                "creating the repository {owner}/{name} ({})",
+                if private { "private" } else { "public" }
+            ),
         )
         .await;
     }

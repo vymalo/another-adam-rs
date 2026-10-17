@@ -391,6 +391,12 @@ pub struct RunNotes {
     /// or one this list does not hold, is answered by its form alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub text_questions: Vec<String>,
+    /// A message of this conversation was sent for an agent that another agent asked
+    /// (`adam_a2a_runtime::asked_by_an_agent`). Set by the agent before each step and never unset,
+    /// here or in a task that continues this one: from then on no words are a consent and the
+    /// consent tools ask nobody, whoever sends the next message (fail closed).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub asked_by_an_agent: bool,
     /// The repositories this run created, in order. Written by `create_repository` itself, which
     /// also grants the repository's key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
