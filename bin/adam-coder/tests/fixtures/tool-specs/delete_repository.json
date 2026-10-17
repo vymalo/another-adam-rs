@@ -1,0 +1,21 @@
+{
+  "name": "delete_repository",
+  "description": "Delete a repository the person named, for good. It needs the bypass access tier, and `confirm` must be the repository's `owner/name` exactly (a guard against a slip: nothing is deleted when it differs). GitHub's own rules and the permissions of your credentials decide whether it happens: if it refuses you get its words, and you tell the person.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "The repository the person named: `owner/name`, or its address"
+      },
+      "confirm": {
+        "type": "string",
+        "description": "The repository's `owner/name` again, exactly: the guard against deleting the wrong one"
+      }
+    },
+    "required": [
+      "repo",
+      "confirm"
+    ]
+  }
+}

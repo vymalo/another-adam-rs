@@ -7,7 +7,8 @@ use a2a::{
     Message, Part, Role, TaskArtifactUpdateEvent, TaskState, TaskStatus, TaskStatusUpdateEvent,
 };
 use adam_a2a::{
-    BackendError, Caller, STEPS_EXTENSION, TEXT_STREAM_EXTENSION, TaskEvent, USAGE_EXTENSION,
+    AccessTier, BackendError, Caller, STEPS_EXTENSION, TEXT_STREAM_EXTENSION, TaskEvent,
+    USAGE_EXTENSION,
 };
 use adam_runtime::{AGENT_TEXT_KIND, RunEvent, RunSubscription, RunView, StepEvent, StepState};
 use futures::StreamExt;
@@ -21,6 +22,7 @@ use crate::backend::{RuntimeTaskBackend, map_err};
 use crate::convert::{StatusKey, artifact_id, artifact_of, status_key, status_of, task_from_view};
 use crate::steps::step_message;
 use crate::text_stream;
+use crate::tier;
 use crate::usage;
 
 /// Consecutive failed reads of the durable run before a subscription gives up.
@@ -70,6 +72,9 @@ struct Tracker {
     /// The request activated `usage/v1`: each completed model call is reported as a status update with
     /// no message. Without it nothing is said of them (the totals are on the task either way).
     usage: bool,
+    /// The request activated `access-tier/v1`: the tier the subscriber was last told, which a status
+    /// update says again when the run's tier changes. `None` when it did not activate it.
+    tier: Option<AccessTier>,
 }
 
 impl Tracker {
@@ -84,13 +89,22 @@ impl Tracker {
         }
         let status = status_of(view, &backend.prompt);
         let key = status_key(&status);
-        if key != self.last {
+        // A tier that changed is said once, on the status update that carries it: the one of a
+        // change of state, or one of its own with the state as it is.
+        let tier = match (self.tier, backend.tier_of(view)) {
+            (Some(told), Some(now)) if told != now => {
+                self.tier = Some(now);
+                Some(tier::echo(now))
+            }
+            _ => None,
+        };
+        if key != self.last || tier.is_some() {
             self.last = key;
             events.push(TaskEvent::Status(TaskStatusUpdateEvent {
                 task_id: self.task_id.clone(),
                 context_id: self.context_id.clone(),
                 status,
-                metadata: None,
+                metadata: tier,
             }));
         }
         events
@@ -277,7 +291,12 @@ async fn pump(
         None => view,
     };
 
-    let task = task_from_view(&view, &context_id, &backend.prompt);
+    let told = backend.tier_said_to(caller, &view);
+    let task = backend.said(
+        caller,
+        &view,
+        task_from_view(&view, &context_id, &backend.prompt),
+    );
     let mut tracker = Tracker {
         task_id: task.id.clone(),
         context_id,
@@ -287,6 +306,7 @@ async fn pump(
         reported: HashMap::new(),
         text_stream: caller.has_extension(TEXT_STREAM_EXTENSION),
         usage: caller.has_extension(USAGE_EXTENSION),
+        tier: told,
     };
     let ends = task.status.state.is_terminal()
         || matches!(

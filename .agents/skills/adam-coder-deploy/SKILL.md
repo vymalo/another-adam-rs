@@ -63,7 +63,9 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      one of `.installationId`, a pin to one installation, or `.owners`, the accounts the App may
      act for, the installation of each found with the App's key: `GITHUB_APP_OWNERS`, ADR 0017;
      there is no default list, because a public App can be installed by anyone);
-     `createRepoOwners` turns the repository-creation tool on.
+     `createRepoOwners` turns the repository-creation tool on (an App that names its accounts does it by itself, not
+     with `owners: ["*"]`). `accessTiers.max` (`MAX_ACCESS_TIER`, empty is `auto`) caps the access tiers a person may pick;
+     `bypass` is opt-in. An App's key is readable by the commands of a run in the coder's own container: use run pods or Podman.
    * `githubMcp` (default on): the official GitHub MCP server as a **native sidecar** (an init
      container with `restartPolicy: Always`, Kubernetes 1.29+) of every pod that runs workers,
      `github-mcp-server http --read-only` on 127.0.0.1:8082 from the coder's own image. It holds no

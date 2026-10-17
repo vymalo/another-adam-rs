@@ -2351,6 +2351,7 @@ async fn next_task_with_base(
         branch: (*branch).to_owned(),
         // What `commit_and_push` of the first task recorded, and the next task inherits.
         base: base.map(str::to_owned),
+        shas: Vec::new(),
     }));
     fx.env.notes.save(&run, &notes).await.unwrap();
     ctx
@@ -4544,6 +4545,18 @@ async fn a_token_minted_while_the_process_runs_is_scrubbed_from_what_the_tools_r
     );
     let sink = CollectingSink::new();
     let ctx = ToolCtx::detached("tool", "call-1", Arc::new(sink)).with_state(env.clone());
+    // The agent writes the tier of the message into the run's notes before each step; the tools
+    // see no notes as a plan.
+    env.notes
+        .save(
+            &ctx.run_id().to_string(),
+            &adam_coder::tools::notes::RunNotes {
+                tier: Some(adam_coder::tier::DEFAULT),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     let tools: Vec<_> = coder_tools(&env).into_iter().collect();
     let tool = |name: &str| {
         tools

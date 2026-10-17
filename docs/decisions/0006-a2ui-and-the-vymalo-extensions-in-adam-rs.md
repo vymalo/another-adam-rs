@@ -52,7 +52,9 @@ What adam-rs had, *verified 2026-10-01 by reading the code at commit `bec4044`*:
    the ref's id, read under `v0.9`, `v0.9.1` and `v1.0` capability keys because A2UI's own files disagree on it),
    `vymalo.threadTools` (`{url, token, expiresAt}`). It also reads an A2UI **action** as the person's answer:
    Choices answers become `The person answered through the interface:` and a line per question (`- db: pg`), any
-   other action `The person used the interface: action "<name>" ...`. A2A servers hold metadata numbers as doubles
+   other action `The person used the interface: action "<name>" ...` (*Amended 2026-10-11, [ADR 0036](0036-the-coder-keeps-to-the-access-tier-the-person-picks.md):*
+   only the action `answer` of a surface `ask-<identifier>` is an answer, and its first line names the surface:
+   `The person answered through the interface (form ask-<call id>):`). A2A servers hold metadata numbers as doubles
    (`maxLength: 256.0`): whole numbers are written back as integers, which is what a catalog's digest is over.
 3. **The thread-tools token is kept in the run's state until it expires.** The token must survive the split between
    the A2A front and the worker that steps the run, and a restart, so it is stored in the context (the durable

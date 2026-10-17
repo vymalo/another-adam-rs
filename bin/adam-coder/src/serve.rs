@@ -27,6 +27,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use adam_a2a::AccessTier;
 use adam_devcontainer::{DevContainer, Network, Runtime};
 use adam_model::DynModel;
 use adam_service::{Agents, RuntimeOptions, claim_scope_for};
@@ -42,7 +43,7 @@ use crate::redact::Redactor;
 use crate::repos::workspaces_for;
 use crate::{
     AGENT_NAME, AgentFiles, CoderAgent, CoderSettings, Config, RunEnvironment, RunPodsConfig,
-    ToolEnv, WorkerConfig, agent_card_from, coder_tools,
+    ToolEnv, WorkerConfig, agent_card_for, coder_tools,
 };
 
 /// The complete coder agent for a role that runs workers: the model client, the GitHub client and
@@ -52,10 +53,20 @@ use crate::{
 /// either.
 async fn build_agent(
     worker: &WorkerConfig,
+    max_access_tier: AccessTier,
     redactor: Redactor,
     files: &AgentFiles,
 ) -> anyhow::Result<(CoderAgent, Janitor)> {
     let model: DynModel = worker.model.client().context("building the model client")?;
+    if worker.commands_can_read_the_app_key() {
+        tracing::warn!(
+            "GitHub App mode with the private key in a file (GITHUB_APP_PRIVATE_KEY_PATH), and the commands of a run \
+             (run_command, run, run_checks, OpenCode) run in this container as the user that can read it: a \
+             command can read the key and mint installation tokens, so NO access tier holds against a command, \
+             a `plan` included. Run the commands in run pods (RUN_ENVIRONMENT=kubernetes) or in Podman \
+             devcontainers (DEVCONTAINER_RUNTIME=podman), or use a token with the permissions you can live with"
+        );
+    }
 
     let root = worker.placed_root();
     tokio::fs::create_dir_all(&root)
@@ -90,6 +101,11 @@ async fn build_agent(
     settings
         .create_repo_owners
         .clone_from(&worker.create_repo_owners);
+    // With no `CREATE_REPO_OWNERS`, a GitHub App creates for the accounts it is installed on (the
+    // access tiers, ADR 0036); a token has no such list and keeps the tool off until owners are named.
+    // `GITHUB_APP_OWNERS=*` is not such a list: it needs `CREATE_REPO_OWNERS`.
+    settings.create_for_installed_owners = worker.github.names_its_accounts();
+    settings.max_access_tier = max_access_tier;
     settings.container_network_none = worker.devcontainer.network == Network::None;
     settings.check_timeout = worker.check_timeout;
     settings.check_output_tail = worker.check_output_tail;
@@ -354,8 +370,13 @@ pub async fn serve(
     // agent's name and `init` only (`CoderStarter`), so it takes no model or GitHub configuration.
     let agents = match &config.worker {
         Some(worker) => {
-            let (agent, janitor) =
-                build_agent(worker, Redactor::from_config(&config), &files).await?;
+            let (agent, janitor) = build_agent(
+                worker,
+                config.max_access_tier,
+                Redactor::from_config(&config),
+                &files,
+            )
+            .await?;
             Agents::new(AGENT_NAME, move |builder| agent.register(builder))
                 .options(options_of(worker))
                 // Beside the runtime's worker: the sweep of the workspaces of finished runs.
@@ -365,11 +386,14 @@ pub async fn serve(
     }
     // The person's screen is the sender: their answers through a form, and the catalog and the
     // tools of the conversation, reach the run (the extensions the card lists).
-    .inbound(adam_a2a_runtime::vymalo_inbound);
+    .inbound(adam_a2a_runtime::vymalo_inbound)
+    // The card lists `access-tier/v1` with all four tiers: the backend reads the tier a message
+    // names, refuses a bad one and says the tier a task works under.
+    .access_tiers(crate::tier::honoured_up_to(config.max_access_tier));
     // The card of the files this process runs, like the workers' agent.
     let card = match &config.service.public_url {
         Some(public_url) => Some(
-            agent_card_from(&files, public_url)
+            agent_card_for(&files, public_url, config.max_access_tier)
                 .map_err(|e| *e)
                 .context("building the agent card")?,
         ),

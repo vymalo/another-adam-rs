@@ -137,7 +137,8 @@ The values you will actually set:
 | `replicaCount`, `workspace.placement` | more than one worker **needs** a placement (`isolated`, `affinity` or `shared`, [why](../reference/workspace-and-environments.md#placement-which-worker-holds-a-runs-files)); the chart refuses `replicaCount > 1` without one. Switching between a per-pod and a shared volume needs `kubectl delete statefulset <release>-coder --cascade=orphan` first |
 | `github.auth`, `github.app.*` | `token`, or `app` with exactly one of `installationId` (pinned) or `owners` (the accounts it may act for; no default list) |
 | `config.allowedRepoHosts`, `config.githubApiUrl` | repository hosts the token may go to; GitHub Enterprise: add the host and `https://<host>/api/v3` |
-| `github.createRepoOwners` | owners the coder may create repositories for, after the person agrees; empty turns it off |
+| `github.createRepoOwners` | owners the coder may create repositories for (a list restricts); empty: the accounts a GitHub App names (not `owners: ["*"]`), and nothing for a token. The person agrees first, unless they picked the `bypass` access tier |
+| `accessTiers.max` | the highest access tier a person may pick: `plan`, `edits`, `auto` (empty, the default) or `bypass`, which is opt-in (rename and delete repositories). With an App and the commands in the coder's container, a command can read the key: [the access tiers](../../deploy/coder/README.md#the-access-tiers) |
 | `database.*` | CloudNativePG `Cluster` (default) or `existingSecret` |
 | `mcp.websearch.url`, `mcp.context7.enabled` | optional extra MCP servers, off by default |
 | `a2a.push.allowedUrls`, `a2a.cardSigning.secretName` | optional A2A push notifications (the webhooks they may reach) and a signed agent card (a Secret with the key), both off by default ([the chart](../../deploy/coder/README.md#push-notifications-and-the-cards-signature-a2a)) |

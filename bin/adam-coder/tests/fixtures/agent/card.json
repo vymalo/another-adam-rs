@@ -113,6 +113,19 @@
       "params": {}
     },
     {
+      "uri": "https://agents.vymalo.com/a2a/extensions/access-tier/v1",
+      "description": "Works under the access tier the person picks for each message.",
+      "required": false,
+      "params": {
+        "tiers": [
+          "plan",
+          "edits",
+          "auto"
+        ],
+        "default": "auto"
+      }
+    },
+    {
       "uri": "https://agents.vymalo.com/a2a/extensions/build/v1",
       "description": "Says which build answers and which agent files it runs",
       "required": false,

@@ -9,7 +9,7 @@ use serde_json::json;
 use super::checks::ChecksReport;
 use super::gitcli::{commits_ahead, head_sha, head_tree};
 use super::named::key_of_argument;
-use super::notes::{PullRequestNote, PushedBranch};
+use super::notes::{PullRef, PullRequestNote, PushedBranch};
 use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, scratch, workspace_error};
 
 /// The name of [`commit_and_push`], which the agent also needs to tell its results apart in the
@@ -139,6 +139,7 @@ pub async fn commit_and_push(
             repo,
             branch: wt.branch().to_owned(),
             base: Some(wt.repo().base_branch.clone()),
+            shas: vec![sha.clone()],
         }]);
     }
     env.notes
@@ -452,6 +453,19 @@ pub async fn open_pull_request(
         red_checks_accepted: red,
         commented_sha: already_noted.then(|| head.clone()),
     });
+    // The code that passed the run's own checks when the gate let it in: what stands in for a CI
+    // on a pull request nothing else ever checked (`merge_pull_request`).
+    if verified {
+        notes.verify_sha(&head);
+    }
+    // A pull request opened with red checks accepted is not one to merge on that acceptance
+    // (`merge_pull_request` asks the person again).
+    if red && let Some(repo) = key_of_argument(&wt.repo().url) {
+        notes.name_red_pulls([PullRef {
+            repo,
+            number: pr.number,
+        }]);
+    }
     env.notes
         .save(&run, &notes)
         .await

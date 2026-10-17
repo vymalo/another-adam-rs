@@ -314,6 +314,22 @@ fn owners_are_trimmed_and_joined_with_commas() {
 }
 
 #[test]
+fn the_cap_of_the_access_tiers_is_set_only_when_the_config_says_so() {
+    // The default (`auto`) is the coder's own: nothing is set.
+    let r = must_resolve("coder", |_, _| {});
+    unset(workload(&r.runtime, "coder"), env::MAX_ACCESS_TIER);
+    for tier in ["plan", "edits", "auto", "bypass"] {
+        let r = must_resolve("coder", |_, c| {
+            set(c, "/spec/harness/adam/coder/maxAccessTier", json!(tier));
+        });
+        assert_eq!(
+            lit(workload(&r.runtime, "coder"), env::MAX_ACCESS_TIER),
+            tier
+        );
+    }
+}
+
+#[test]
 fn a_github_token_is_a_secret_and_there_is_no_key_file() {
     let r = must_resolve("coder", |_, c| {
         let github = "/spec/harness/adam/coder/github";

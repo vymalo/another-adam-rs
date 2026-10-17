@@ -50,6 +50,11 @@ spec:
               value: "control-plane"
             - name: PUBLIC_URL
               value: {{ include "coder.publicUrl" . | quote }}
+            {{- with include "coder.maxAccessTier" . }}
+            {{- /* accessTiers.max: the front declares the tiers up to it on the card and refuses a higher one. */}}
+            - name: MAX_ACCESS_TIER
+              value: {{ . | quote }}
+            {{- end }}
             {{- range $name, $value := .Values.config.extraEnv }}
             - name: {{ $name }}
               value: {{ $value | quote }}

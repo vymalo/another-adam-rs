@@ -1,12 +1,15 @@
 //! `create_repository { owner, name, private?, description? }`: a new, empty repository, only for an
 //! owner the deployment names and only after the person agrees.
 //!
-//! Off unless `CREATE_REPO_OWNERS` lists the owner ([`CoderSettings::create_repo_owners`](super::CoderSettings)).
-//! Private by default, created empty (no commit: `publish_scratch` gives it its first one). Every
-//! creation is asked about, by a question this tool writes ([`consent`](super::consent)), and the
-//! person's yes is recorded by the agent for exactly `owner/name` and the visibility asked about, so
-//! a yes to a private repository does not cover a public one. The model calls the tool again after
-//! the yes, and the second call creates it.
+//! Needs the `auto` access tier ([`tier`](crate::tier)) and an owner the deployment allows: the
+//! owners `CREATE_REPO_OWNERS` lists (a list restricts to them), else, for a GitHub App, the accounts
+//! it is installed on ([`ToolEnv::creation_owners`](super::ToolEnv)); a token with no list creates
+//! nothing. Private by default, created empty (no commit: `publish_scratch` gives it its first one).
+//! Every creation is asked about, by a question this tool writes ([`consent`](super::consent)),
+//! **unless the person picked the `bypass` tier for the message**, which is no consent forms at all;
+//! the person's yes is recorded by the agent for exactly `owner/name` and the visibility asked
+//! about, so a yes to a private repository does not cover a public one. The model calls the tool
+//! again after the yes, and the second call creates it.
 //!
 //! **Safe to repeat.** The call writes its intent (`owner/name`, visibility) into the run's notes
 //! before it asks the host. A call that dies between the host's answer and the note of it is run
@@ -22,6 +25,8 @@
 use std::time::Duration;
 
 use adam::prelude::*;
+use adam_a2a::AccessTier;
+use adam_error::Classify as _;
 use adam_workspace::{NewRepository, OwnerKind, RepoRef, WorkspaceError};
 use serde_json::Value;
 
@@ -53,7 +58,7 @@ pub(crate) fn valid_name(name: &str) -> bool {
 }
 
 /// Whether `owner` can be an account name: as a repository name, and not starting with `.` or `-`.
-fn valid_owner(owner: &str) -> bool {
+pub(crate) fn valid_owner(owner: &str) -> bool {
     valid_name(owner) && !owner.starts_with(['.', '-'])
 }
 
@@ -83,7 +88,6 @@ pub(crate) fn consent_of(arguments: &Value) -> Option<Asked> {
     Some(Asked {
         subject: subject(owner, name, private),
         yes: yes_label(owner, name),
-        no: NO_CREATE_LABEL.to_owned(),
     })
 }
 
@@ -115,10 +119,11 @@ fn created_text(created: &CreatedRepo) -> String {
 /// Create a new, empty repository for a person or an organisation, after the person you are working
 /// with agrees. It works only for the owners this deployment allows, and the repository is private
 /// unless you say `private: false` (public only when the person asked for it). The person is asked
-/// a yes or no question that this tool writes; their answer comes back as the result of this call.
-/// If it was a yes, call create_repository again with the same arguments and it creates the
-/// repository; if it was a no, do not ask again and do not look for another way. The new repository
-/// is empty: put a scratch project in it with publish_scratch.
+/// a yes or no question that this tool writes (not under the bypass access tier, which asks nothing);
+/// their answer comes back as the result of this call. If it was a yes, call create_repository again
+/// with the same arguments and it creates the repository; if it was a no, do not ask again and do not
+/// look for another way. The new repository is empty: put a scratch project in it with
+/// publish_scratch. It needs the auto access tier or above.
 #[tool(asks_user, label = "Create a repository", icon = "git")]
 pub async fn create_repository(
     env: State<ToolEnv>,
@@ -132,7 +137,17 @@ pub async fn create_repository(
     /// What the repository is for, in one plain sentence (at most 350 characters)
     description: Option<String>,
 ) -> Outcome {
-    let owners = &env.settings.create_repo_owners;
+    let owners = match env.creation_owners().await {
+        Ok(owners) => owners,
+        Err(e) if e.is_retryable() => return Err(workspace_error(&e)),
+        Err(e) => {
+            return Ok(ToolOutput::error(format!(
+                "Cannot tell for which accounts a repository can be created: {}. Tell the person \
+                 that you cannot create one now, and ask them to create it and name it.",
+                adam_error::report(&e)
+            )));
+        }
+    };
     if owners.is_empty() {
         return Ok(ToolOutput::error(
             "Creating repositories is switched off in this deployment. Tell the person that you \
@@ -219,7 +234,9 @@ pub async fn create_repository(
         Err(outcome) => return outcome,
     };
 
-    if !notes.agreed(CREATE_REPOSITORY, &asked) {
+    // The person's tier is the consent at `bypass`: no form, whatever the visibility.
+    let standing = env.tier_of(&notes) == AccessTier::Bypass;
+    if !standing && !notes.agreed(CREATE_REPOSITORY, &asked) {
         let visibility = if private {
             "private and empty"
         } else {
@@ -465,7 +482,6 @@ mod tests {
             Some(Asked {
                 subject: "scratch/fib:private".into(),
                 yes: "Create scratch/fib".into(),
-                no: "Don't create it".into(),
             })
         );
         assert_eq!(

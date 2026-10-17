@@ -218,7 +218,9 @@ spec:
                             type: integer
                           createRepoOwners:
                             default: []
-                            description: '`CREATE_REPO_OWNERS`. Empty: the tool stays off.'
+                            description: |-
+                              `CREATE_REPO_OWNERS`. Empty: the accounts a GitHub App acts for (not with `github.app.owners`
+                              of `*`: list the owners here); a token creates nothing.
                             items:
                               type: string
                             type: array
@@ -309,6 +311,15 @@ spec:
                               rule: has(self.app) != has(self.token)
                           githubApiUrl:
                             description: '`GITHUB_API_URL`.'
+                            nullable: true
+                            type: string
+                          maxAccessTier:
+                            description: The highest access tier a deployment lets a person pick (`access-tier/v1`).
+                            enum:
+                            - plan
+                            - edits
+                            - auto
+                            - bypass
                             nullable: true
                             type: string
                           maxCheckCycles:

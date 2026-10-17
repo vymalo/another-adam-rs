@@ -21,6 +21,7 @@
 //! | Module | What |
 //! |---|---|
 //! | [`agent`] | [`CoderAgent`]: the `LlmAgent` assembled from `agent/` + the completion policy (red checks or rejected credentials and no PR = failed; a reply that asks, or repository work left undelivered = a question, `input-required`; any other reply = completed) and the record of the repositories the person named; [`CoderStarter`]: its start-only half |
+//! | [`tier`] | the access tier the person picks for each message (`access-tier/v1`, ADR 0036): which tool needs which tier ([`tier::needs`]), and [`TierSource`], which holds back the tools above the tier and refuses a call to one |
 //! | [`tools`] | the nine tools of the coder (`#[tool]` functions reading [`ToolEnv`] from the agent's state; the screen's three, `ask_user`, `show` and `ui_catalog`, are `adam-ui`'s) and [`CoderSettings`] |
 //! | `agent/instructions.md` | the system prompt, the loop's limits and the A2A card, as a file (embedded by `build.rs`, or read at startup from the folder `ADAM_AGENT_DIR` names) |
 //! | [`files`] | [`AgentFiles`]: where those files come from, the embedded copy or a folder read once at startup, and why a folder is refused ([`AgentFilesError`]) |
@@ -96,11 +97,13 @@ pub mod opencode;
 pub mod redact;
 mod repos;
 mod serve;
+pub mod tier;
 pub mod tools;
 
 pub use agent::{AGENT_NAME, CoderAgent, CoderStarter};
 pub use app::{
-    BUILD_REVISION, Coder, LiveSignals, RuntimeOptions, agent_card, agent_card_from, build_version,
+    BUILD_REVISION, Coder, LiveSignals, RuntimeOptions, agent_card, agent_card_for,
+    agent_card_from, build_version,
 };
 pub use config::{
     AppInstallations, Config, ConfigError, GitHubAppConfig, GitHubAuth, McpSettings,
@@ -113,4 +116,5 @@ pub use janitor::Janitor;
 pub use redact::{RedactingCredentials, Redactor};
 pub use repos::workspaces_for;
 pub use serve::{environment_for, serve};
+pub use tier::TierSource;
 pub use tools::{CoderSettings, ToolEnv, coder_tools};

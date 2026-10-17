@@ -169,3 +169,101 @@ fn a_detached_context_is_its_own_root() {
     let root = RunId::new();
     assert_eq!(ctx.with_root_run(root).root_run_id(), root);
 }
+
+/// A source that records the run, the root run and the tier of the context each model turn of its
+/// agent sees.
+struct Watch {
+    seen: Arc<Mutex<Vec<Seen>>>,
+}
+
+/// The run, its root and the tier in its context.
+type Seen = (RunId, RunId, Option<Value>);
+
+#[async_trait]
+impl adam_llm_agent::ToolSource for Watch {
+    async fn specs(&self, ctx: &adam_llm_agent::SourceCtx) -> Vec<ToolSpec> {
+        self.seen.lock().unwrap().push((
+            ctx.run_id(),
+            ctx.root_run_id(),
+            ctx.context(adam_llm_agent::ACCESS_TIER_CONTEXT_KEY)
+                .cloned(),
+        ));
+        Vec::new()
+    }
+    async fn call(&self, _: &ToolCtx, _: &str, _: Value) -> Option<Result<ToolOutput, ToolError>> {
+        None
+    }
+}
+
+/// The tier a person set for `top` is the one `mid` and `leaf` start with, and a source in a child
+/// run is told which run is the root.
+#[tokio::test]
+async fn a_child_starts_with_the_limits_of_its_parent_and_a_source_sees_the_root() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (top_model, mid_model, leaf_model) = (
+        Arc::new(MockModel::new()),
+        Arc::new(MockModel::new()),
+        Arc::new(MockModel::new()),
+    );
+    top_model
+        .push_tool_calls(vec![call("t1", "spawn")])
+        .push_text("top done");
+    mid_model
+        .push_tool_calls(vec![call("m1", "spawn")])
+        .push_text("mid done");
+    leaf_model.push_text("leaf done");
+    let agent = |name: &str, model: Arc<MockModel>, target: Option<&str>| {
+        let model: DynModel = model;
+        let mut builder =
+            LlmAgent::builder(name, model, "m").tool_source(Watch { seen: seen.clone() });
+        if let Some(target) = target {
+            builder = builder.tool(Spawn {
+                target: target.into(),
+            });
+        }
+        builder.build()
+    };
+    let rt = Runtime::builder(store)
+        .poll_interval(Duration::from_millis(20))
+        .agent(agent("top", top_model, Some("mid")))
+        .agent(agent("mid", mid_model, Some("leaf")))
+        .agent(agent("leaf", leaf_model, None))
+        .build();
+    let (stop, rx) = oneshot::channel::<()>();
+    let worker = {
+        let rt = rt.clone();
+        tokio::spawn(async move {
+            rt.run_worker(async {
+                let _ = rx.await;
+            })
+            .await
+        })
+    };
+    let mut first = user_message("go");
+    first.payload["context"] = json!({
+        adam_llm_agent::ACCESS_TIER_CONTEXT_KEY: {"tier": "plan"},
+        "other": "not inherited",
+    });
+    let top = rt.start("top", first, None).await.unwrap();
+    wait_done(&rt, top).await;
+    let mid = adam_runtime::child_run_id(top, "t1");
+    let leaf = adam_runtime::child_run_id(mid, "m1");
+    let leaf_state = conversation(&wait_done(&rt, leaf).await);
+    let _ = stop.send(());
+    worker.await.unwrap().unwrap();
+
+    let tier = json!({"tier": "plan"});
+    assert_eq!(
+        leaf_state
+            .context
+            .get(adam_llm_agent::ACCESS_TIER_CONTEXT_KEY),
+        Some(&tier)
+    );
+    assert!(!leaf_state.context.contains_key("other"));
+    let seen = seen.lock().unwrap().clone();
+    for (run, root, got) in seen {
+        assert_eq!(root, top, "{run} serves the top run");
+        assert_eq!(got, Some(tier.clone()), "{run} holds the tier");
+    }
+}

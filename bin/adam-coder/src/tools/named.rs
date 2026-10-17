@@ -29,6 +29,8 @@
 //! findings of tools and reviewers in fences labelled `untrusted`; [`without_untrusted`] removes
 //! those before [`named_in`] reads a word of it.
 
+use adam_a2a_runtime::form_answer_surface;
+use adam_ui::comparable;
 use adam_workspace::{RepoLocation, RepoRef};
 
 /// The host of a repository written as `owner/name` when nothing says otherwise.
@@ -51,6 +53,22 @@ fn key_of_location(loc: &RepoLocation) -> String {
     } else {
         key.to_ascii_lowercase()
     }
+}
+
+/// `(host, owner, name)` of a [`key`](key_of_argument): the three parts a key is made of.
+pub fn split_key(key: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = key.splitn(3, '/');
+    Some((parts.next()?, parts.next()?, parts.next()?))
+}
+
+/// The host part of the keys of repositories written as `owner/name` when nothing says otherwise:
+/// `default_host` as the keys spell it (`github.com`, `git.example.com_8443`).
+pub fn default_host_key(default_host: &str) -> String {
+    let key = named_in("o/n", default_host).into_iter().next();
+    key.as_deref().and_then(split_key).map_or_else(
+        || normal_host(default_host, None),
+        |(host, _, _)| host.to_owned(),
+    )
 }
 
 /// `text` without the fenced blocks labelled `untrusted`: what the person wrote themselves.
@@ -122,6 +140,124 @@ pub fn without_untrusted(text: &str) -> String {
     kept
 }
 
+/// What the interface wrote for any other action of the person.
+const ACTION_PREFIX: &str = "The person used the interface:";
+
+/// What the person **typed** in `text`, a message or the answer to a question: their words, and the
+/// typed parts of a form's answer (`other:`, `text:` and `Note:`, which the interface writes as JSON
+/// strings), and **not** what the interface made of their clicks.
+///
+/// `defaults` are the defaults of the text questions of the form the answer is for, when the
+/// answer could be paired with its `ask_user` call (`None`: it could not, or it is for a form that
+/// call did not draw). A `text:` part that is one of them is dropped (compared as
+/// [`comparable`] has it: a page may trim, or keep, what is not visible), and
+/// with `None` every `text:` part is: the model can pre-fill a typed question (`default`), the page
+/// sends the pre-filled words on an untouched submit, and they are the model's.
+///
+/// A form's answer reads `The person answered through the interface (form <surface>):`
+/// ([`form_answer_surface`]), a line `- <id>: <value>, ...`
+/// for each question, and a `Note:`. The question ids and the option values are what **the model**
+/// wrote when it drew the form (the person sees labels), so they are not the person's words: a model
+/// that offers an option whose value is `merge #7` or `acme/widgets` has said nothing for the person
+/// by their choosing it. Every other action's line (`The person used the interface: action ...`) is
+/// the model's names and context too. All of that is left out; the lines of `text` that are neither
+/// are kept as they are. A line of an answer that does not read as the interface writes it is left
+/// out as well.
+pub fn typed_by_the_person(text: &str, defaults: Option<&[String]>) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut answering = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if form_answer_surface(line).is_some() {
+            answering = true;
+            continue;
+        }
+        if line.starts_with(ACTION_PREFIX) {
+            answering = false;
+            continue;
+        }
+        if answering {
+            if let Some(rest) = line.strip_prefix("- ") {
+                kept.extend(typed_in_answer(rest, defaults));
+                continue;
+            }
+            if let Some(note) = line.strip_prefix("Note: ") {
+                if let Some((typed, _)) = json_string_prefix(note) {
+                    kept.push(typed);
+                }
+                continue;
+            }
+            answering = false;
+        }
+        kept.push(line.to_owned());
+    }
+    kept.join("\n")
+}
+
+/// The JSON string at the start of `text` and the length of it, or `None`.
+fn json_string_prefix(text: &str) -> Option<(String, usize)> {
+    if !text.starts_with('"') {
+        return None;
+    }
+    let mut values = serde_json::Deserializer::from_str(text).into_iter::<String>();
+    let value = values.next()?.ok()?;
+    Some((value, values.byte_offset()))
+}
+
+/// The typed parts of one line of an answer, after its `- `: `<id>: <value>, <value>, other: "..",
+/// text: ".."`, an id or a value being a plain token or a JSON string. `None` of them for a line
+/// that is not that.
+fn typed_in_answer(line: &str, defaults: Option<&[String]>) -> Vec<String> {
+    let mut typed = Vec::new();
+    let after_id = if line.starts_with('"') {
+        match json_string_prefix(line) {
+            Some((_, end)) => &line[end..],
+            None => return typed,
+        }
+    } else {
+        match line.find(": ") {
+            Some(end) => &line[end..],
+            None => return typed,
+        }
+    };
+    let Some(mut rest) = after_id.strip_prefix(": ") else {
+        return typed;
+    };
+    loop {
+        let label = ["other: ", "text: "]
+            .into_iter()
+            .find(|label| rest.starts_with(label) && rest[label.len()..].starts_with('"'));
+        let consumed = match label {
+            Some(label) => match json_string_prefix(&rest[label.len()..]) {
+                Some((value, end)) => {
+                    // A typed question's words are the person's only if they are not the model's default.
+                    let prefilled = label == "text: "
+                        && defaults.is_none_or(|d| {
+                            let value = comparable(&value);
+                            d.iter().any(|d| comparable(d) == value)
+                        });
+                    if !prefilled {
+                        typed.push(value);
+                    }
+                    label.len() + end
+                }
+                None => return typed,
+            },
+            None if rest.starts_with('"') => match json_string_prefix(rest) {
+                Some((_, end)) => end,
+                None => return typed,
+            },
+            // A plain token: no space, no comma.
+            None => rest.find(", ").unwrap_or(rest.len()),
+        };
+        rest = &rest[consumed..];
+        match rest.strip_prefix(", ") {
+            Some(next) => rest = next,
+            None => return typed,
+        }
+    }
+}
+
 /// The keys of every repository `text` names, in order of appearance, without repeats;
 /// `default_host` is the host of the `owner/name` shorthand.
 ///
@@ -136,7 +272,20 @@ pub fn without_untrusted(text: &str) -> String {
 pub fn named_in(text: &str, default_host: &str) -> Vec<String> {
     let default_host = normal_host(default_host, None);
     let mut keys = Vec::new();
-    for word in text.split(|c: char| {
+    for word in split_words(text) {
+        if let Some(key) = key_of_word(word, &default_host)
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// The words of `text`: what is between white space and the punctuation that surrounds an address
+/// in a sentence (quotes, brackets, commas).
+fn split_words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| {
         c.is_whitespace()
             || matches!(
                 c,
@@ -155,14 +304,7 @@ pub fn named_in(text: &str, default_host: &str) -> Vec<String> {
                     | '|'
                     | '*'
             )
-    }) {
-        if let Some(key) = key_of_word(word, &default_host)
-            && !keys.contains(&key)
-        {
-            keys.push(key);
-        }
-    }
-    keys
+    })
 }
 
 /// `host` as the workspace layout spells it, for a word the person wrote: lowercase, the port as
@@ -267,6 +409,113 @@ mod tests {
         let keys = named_in(text, DEFAULT_HOST);
         assert_eq!(keys.len(), 1, "{text:?} -> {keys:?}");
         keys.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn only_what_the_person_typed_survives_the_reading_of_a_forms_answer() {
+        // Their own words are kept as they are.
+        assert_eq!(
+            typed_by_the_person("merge #7\nplease", Some(&[])),
+            "merge #7\nplease"
+        );
+        // The ids and the values are the model's: plain or quoted, they go.
+        let answer = "The person answered through the interface:\n\
+            - merge_7: acme_widgets, \"https://github.com/acme/widgets/pull/7\"\n\
+            - \"pull/7\": other: \"merge #7 in acme/widgets\", \"x\", text: \"typed question\"\n\
+            - skipped: (nothing chosen)\n\
+            Note: \"a note, merge it\"";
+        assert_eq!(
+            typed_by_the_person(answer, Some(&[])),
+            "merge #7 in acme/widgets\ntyped question\na note, merge it"
+        );
+        // A value that merely looks like a typed part is still a value (it is a JSON string).
+        let looks = "The person answered through the interface:\n\
+            - q: \"x, other: \\\"acme/widgets#7\\\"\", ok-1";
+        assert_eq!(typed_by_the_person(looks, Some(&[])), "");
+        // The model cannot write the label itself: a plain token has no space.
+        assert_eq!(
+            typed_by_the_person(
+                "The person answered through the interface:\n- q: other:, v",
+                Some(&[])
+            ),
+            ""
+        );
+        // The person's own words around an answer are kept; the answer's lines end with it.
+        let around =
+            "see this\nThe person answered through the interface:\n- q: a\nand then merge #7";
+        assert_eq!(
+            typed_by_the_person(around, Some(&[])),
+            "see this\nand then merge #7"
+        );
+        // Any other action is the model's names and context.
+        assert_eq!(
+            typed_by_the_person(
+                "The person used the interface: action \"merge #7\" on surface \"acme/widgets\" with context {}",
+                Some(&[])
+            ),
+            ""
+        );
+        // A line the interface does not write that way is left out, not guessed at.
+        assert_eq!(
+            typed_by_the_person(
+                "The person answered through the interface:\n- no colon here",
+                Some(&[])
+            ),
+            ""
+        );
+        assert_eq!(
+            typed_by_the_person(
+                "The person answered through the interface:\n- q: other: \"unterminated",
+                Some(&[])
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_typed_question_the_model_prefilled_is_the_models_words() {
+        let untouched = "The person answered through the interface:\n\
+            - why: text: \"merge acme/widgets#7\"\n\
+            - more: other: \"my own\", text: \"edited words\"";
+        // Paired with its call: the default is dropped, an edit and an other are kept.
+        let defaults = ["merge acme/widgets#7".to_owned()];
+        assert_eq!(
+            typed_by_the_person(untouched, Some(&defaults)),
+            "my own\nedited words"
+        );
+        // The default with different spacing around it is the same default.
+        assert_eq!(
+            typed_by_the_person(
+                "The person answered through the interface:\n- why: text: \"  merge acme/widgets#7 \"",
+                Some(&defaults)
+            ),
+            ""
+        );
+        // A page may drop what is not visible (a JavaScript `trim()` takes U+FEFF), or keep it when
+        // the default had none: the same default either way.
+        let hidden = ["\u{feff}merge acme/widgets#7".to_owned()];
+        for (default, sent) in [
+            (&hidden, "merge acme/widgets#7"),
+            (&defaults, "\u{feff}merge acme/widgets#7"),
+            (&hidden, "merge\u{200b} acme/widgets#7\u{202e}"),
+            (&defaults, "MERGE acme/widgets#7"),
+        ] {
+            let answer = format!(
+                "The person answered through the interface (form ask-1):\n- why: text: {}",
+                serde_json::Value::String(sent.to_owned())
+            );
+            assert_eq!(typed_by_the_person(&answer, Some(default)), "", "{sent:?}");
+        }
+        // Words that differ are the person's.
+        assert_eq!(
+            typed_by_the_person(
+                "The person answered through the interface (form ask-1):\n- why: text: \"merge acme/widgets#8\"",
+                Some(&defaults)
+            ),
+            "merge acme/widgets#8"
+        );
+        // Not paired with a call: no typed question's words are trusted, an other is.
+        assert_eq!(typed_by_the_person(untouched, None), "my own");
     }
 
     #[test]

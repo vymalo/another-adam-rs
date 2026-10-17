@@ -14,6 +14,7 @@
 //! | `run_checks { command }` | [`checks`] |
 //! | `rebuild_environment { use_default? }` | [`environment`] |
 //! | `commit_and_push { message }` / `open_pull_request { title, body }` | [`publish`] |
+//! | `merge_pull_request { repo, number, method?, delete_branch? }` (tier `auto`), `rename_repository { repo, new_name }` and `delete_repository { repo, confirm }` (tier `bypass`) | [`admin`] |
 //! | `ask_user { question, choices? }`, `show { blocks, title? }`, `ui_catalog {}` | [`adam_ui`]: the person's screen as tools |
 //!
 //! # Retry safety
@@ -49,6 +50,9 @@
 //!   changes nothing.
 //! * `request_repository { repo_url, reason }`: it only asks. A repeat after the person's yes finds the
 //!   repository granted and says so; after a no it says so; with no answer yet it asks again.
+//! * `merge_pull_request`: the host reports a pull request merged already as it is.
+//! * `rename_repository`, `delete_repository`: noted in the run's notes once the host answered, and a
+//!   repeat after that is the same answer ([`admin`]).
 //! * `create_repository { owner, name, private?, description? }`: a repository made is recorded under
 //!   its `owner/name` and a repeat returns the record. The call writes its intent to the run's notes
 //!   before it asks the host, so a repeat after a crash between the host's answer and the record
@@ -83,6 +87,7 @@ use std::time::Duration;
 use adam::mcp::McpPolicy;
 use adam::prelude::*;
 use adam::{DynTool, StateKey, StepEvent, StepIcon, StepKind, StepState, StepStyle};
+use adam_a2a::AccessTier;
 use adam_error::{Classify, report};
 use adam_model::ToolSpec;
 use adam_ui::Ui;
@@ -98,6 +103,7 @@ use crate::redact::Redactor;
 /// What the description of `ask_user` opens with: the coder's own words about when to ask.
 const ASK_LEAD: &str = "Ask the person who gave you the task a question and wait for the answer. Use it only when you cannot proceed without it, or to get explicit consent (for example to open a pull request with failing checks). Be specific.";
 
+pub mod admin;
 pub mod checks;
 pub mod consent;
 pub mod create;
@@ -168,8 +174,20 @@ pub struct CoderSettings {
     /// of `ALLOWED_REPO_HOSTS` in the binary.
     pub default_repo_host: String,
     /// The owners `create_repository` may create repositories for, lowercased: `CREATE_REPO_OWNERS`.
-    /// Empty: the tool refuses every call.
+    /// A list restricts to exactly these owners. Empty: the owners the credentials act for when
+    /// [`create_for_installed_owners`](Self::create_for_installed_owners) (a GitHub App's
+    /// installations), else the tool is not offered and refuses every call.
     pub create_repo_owners: Vec<String>,
+    /// With no `CREATE_REPO_OWNERS`, `create_repository` is on for the accounts the credentials act
+    /// for ([`Workspaces::acts_for`]): a GitHub App's installations. Set by the process for an App,
+    /// left off for a token, which has no list of accounts and keeps the tool off until the
+    /// variable names owners.
+    pub create_for_installed_owners: bool,
+    /// The highest access tier a run may work under, whatever a message asks for
+    /// (`MAX_ACCESS_TIER`): the tools check it against the tier the notes hold. The default is
+    /// [`DEFAULT_MAX`](crate::tier::DEFAULT_MAX), `auto`: renaming and deleting a repository are
+    /// the deployment's opt-in.
+    pub max_access_tier: AccessTier,
     /// The devcontainers have no network (`DEVCONTAINER_NETWORK=none`): OpenCode, inside one,
     /// cannot reach its model, so `delegate_to_opencode` refuses there and says what to use instead.
     pub container_network_none: bool,
@@ -183,6 +201,12 @@ impl CoderSettings {
         } else {
             self.max_check_cycles
         }
+    }
+
+    /// Whether `create_repository` is offered at all: some owner is listed, or the credentials say
+    /// which accounts they act for.
+    pub fn can_create_repositories(&self) -> bool {
+        !self.create_repo_owners.is_empty() || self.create_for_installed_owners
     }
 
     /// Defaults: 3 check cycles in a repository and 5 in a scratch project, 15 minutes and 16 KiB per check run, the
@@ -199,6 +223,8 @@ impl CoderSettings {
             opencode,
             default_repo_host: named::DEFAULT_HOST.to_owned(),
             create_repo_owners: Vec::new(),
+            create_for_installed_owners: false,
+            max_access_tier: crate::tier::DEFAULT_MAX,
             container_network_none: false,
         }
     }
@@ -454,6 +480,89 @@ impl ToolEnv {
         ctx.report_step(event).await;
     }
 
+    /// The owners `create_repository` may create repositories for now: the list of
+    /// `CREATE_REPO_OWNERS` when there is one (it restricts), else the accounts the credentials act
+    /// for when the deployment says to use them (a GitHub App's installations), else none.
+    ///
+    /// # Errors
+    ///
+    /// The credentials' error when they could not be asked.
+    pub(crate) async fn creation_owners(&self) -> Result<Vec<String>, WorkspaceError> {
+        if !self.settings.create_repo_owners.is_empty() {
+            return Ok(self.settings.create_repo_owners.clone());
+        }
+        if !self.settings.create_for_installed_owners {
+            return Ok(Vec::new());
+        }
+        Ok(self.workspaces.acts_for().await?.unwrap_or_default())
+    }
+
+    /// The access tier the run with `notes` works under now: the one the agent noted for the newest
+    /// message, never above what the deployment allows ([`CoderSettings::max_access_tier`]).
+    pub(crate) fn tier_of(&self, notes: &RunNotes) -> AccessTier {
+        notes.tier().min(self.settings.max_access_tier)
+    }
+
+    /// The one owner a bare repository name belongs to, if there is exactly one: the owner of the
+    /// repositories already in the run's workspace (or created by the run), else the one account the
+    /// credentials act for (a GitHub App installed on one account). Two owners, or none, are
+    /// `None`: a bare name then needs the person's word, as ever.
+    async fn sole_owner(&self, ctx: &ToolCtx, notes: &RunNotes) -> Option<String> {
+        let mut owners = std::collections::BTreeSet::new();
+        if let Ok(workspace) = self.workspaces.run(&ctx.root_run_id().to_string())
+            && let Ok(slots) = workspace.slots().await
+        {
+            for slot in &slots {
+                if let Some(wt) = slot.worktree()
+                    && let Ok(loc) = wt.repo().locate()
+                    && !loc.is_local()
+                {
+                    owners.insert(loc.owner.to_ascii_lowercase());
+                }
+            }
+        }
+        for created in &notes.created_repos {
+            if let Some((owner, _)) = created.full_name.split_once('/') {
+                owners.insert(owner.to_ascii_lowercase());
+            }
+        }
+        match owners.len() {
+            1 => owners.into_iter().next(),
+            0 => match self.workspaces.acts_for().await {
+                Ok(Some(accounts)) if accounts.len() == 1 => {
+                    accounts.into_iter().next().map(|a| a.to_ascii_lowercase())
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether the repository with `key` is granted to the run under the tier it works under:
+    /// the person named it or agreed to add it (or the run created it); or, from `auto` up, the
+    /// person wrote its name alone and the owner is the one owner that applies ([`ToolEnv::sole_owner`]),
+    /// no form needed; or, at `bypass`, whatever the host allows.
+    pub(crate) async fn is_granted(&self, ctx: &ToolCtx, notes: &RunNotes, key: &str) -> bool {
+        if notes.named_repos.iter().any(|named| named == key) {
+            return true;
+        }
+        match self.tier_of(notes) {
+            AccessTier::Plan | AccessTier::Edits => false,
+            AccessTier::Bypass => true,
+            AccessTier::Auto => {
+                let Some((host, owner, name)) = named::split_key(key) else {
+                    return false;
+                };
+                host == named::default_host_key(&self.settings.default_repo_host)
+                    && notes.said(name)
+                    && self
+                        .sole_owner(ctx, notes)
+                        .await
+                        .is_some_and(|sole| sole == owner)
+            }
+        }
+    }
+
     /// What a call is called in the run notes (`record_missing_tool`): the model's call id, which is
     /// only unique within the run that made it, so a subagent's carries its own run.
     pub(crate) fn call_key(ctx: &ToolCtx) -> String {
@@ -550,15 +659,20 @@ pub(crate) fn resolve_slot(
     }
 }
 
-/// Every coder tool, in the order they are offered to the model: the seventeen of the coding workflow,
+/// Every coder tool, in the order they are offered to the model: the twenty of the coding workflow,
 /// then the screen's (`ask_user`, `show`, `ui_catalog`, from [`ToolEnv::ui`]).
 ///
-/// `create_repository` is offered only when some owner may create repositories
-/// ([`CoderSettings::create_repo_owners`], `CREATE_REPO_OWNERS`): with none, the tool is not in the
-/// set (sixteen of the workflow), so the model cannot offer a new repository to the person or call
-/// it with an owner of its own making. The agent says so in its prompt ([`CoderAgent`](crate::CoderAgent)
+/// `create_repository` is offered only when the deployment lets it create repositories for someone
+/// ([`CoderSettings::can_create_repositories`]: `CREATE_REPO_OWNERS` names owners, or the credentials
+/// are a GitHub App, whose installations are the owners): otherwise the tool is not in the set
+/// (nineteen of the workflow), so the model cannot offer a new repository to the person or call it
+/// with an owner of its own making. The agent says so in its prompt ([`CoderAgent`](crate::CoderAgent)
 /// fills the `repository_creation` var). A folder whose `tools:` names `create_repository` is
-/// refused as an unknown tool while no owner is allowed. The settings are read when this is called.
+/// refused as an unknown tool while nobody is allowed. The settings are read when this is called.
+///
+/// The set is the same at every access tier: which tools the model is **shown** on a turn, and which
+/// calls are **refused**, is [`tier`](crate::tier)'s ([`TierSource`](crate::TierSource)), and every
+/// tool here also checks the tier of the run's notes itself when it is called (`Gated`).
 ///
 /// Each tool is wrapped so that what it returns or fails with passes through
 /// [`ToolEnv::redactor`] first. The tools read `env` from the agent's state:
@@ -578,10 +692,10 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         scratch::PublishScratch,
         consent::RequestRepository,
     ];
-    let creating = if env.settings.create_repo_owners.is_empty() {
-        ToolSet::new()
-    } else {
+    let creating = if env.settings.can_create_repositories() {
         ToolSet::new().tool(create::CreateRepository)
+    } else {
+        ToolSet::new()
     };
     let after = tools![
         inspect::RunCommand,
@@ -596,12 +710,84 @@ pub fn coder_tools(env: &Arc<ToolEnv>) -> ToolSet {
         environment::RebuildEnvironment,
         publish::CommitAndPush,
         publish::OpenPullRequest,
+        admin::MergePullRequest,
+        admin::RenameRepository,
+        admin::DeleteRepository,
     ];
     before
         .extend(creating)
         .extend(after)
         .extend(env.ui.tools())
+        .wrap(Gated::layer(env.clone()))
         .wrap(Redacting::layer(env.redactor.clone()))
+}
+
+/// A tool that refuses a call its run's access tier does not allow.
+///
+/// The tier is the one the agent noted for the newest message (`RunNotes::tier`), read from the notes
+/// of the **root** run: so a subagent, whose own context holds no tier, keeps to the tier of the run
+/// it serves. This is the check at the moment of the call; the model is not shown the tools above the
+/// tier either ([`TierSource`](crate::TierSource)).
+struct Gated {
+    inner: DynTool,
+    name: String,
+    needs: AccessTier,
+    env: Arc<ToolEnv>,
+}
+
+impl Gated {
+    /// The wrapper for [`ToolSet::wrap`](adam::ToolSet::wrap).
+    fn layer(env: Arc<ToolEnv>) -> impl FnMut(DynTool) -> DynTool {
+        move |inner| {
+            let name = inner.spec().name;
+            Arc::new(Self {
+                needs: crate::tier::needs(&name),
+                name,
+                inner,
+                env: env.clone(),
+            })
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for Gated {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+
+    fn required_state(&self) -> Vec<StateKey> {
+        self.inner.required_state()
+    }
+
+    fn asks_user(&self) -> bool {
+        self.inner.asks_user()
+    }
+
+    fn step_style(&self) -> StepStyle {
+        self.inner.step_style()
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        // Every tier allows what needs the lowest one: no read of the notes for a look.
+        if self.needs > AccessTier::Plan {
+            let run = ctx.root_run_id().to_string();
+            // No notes of the root run: nothing recorded a tier, so nothing above a plan is allowed.
+            let tier = self
+                .env
+                .notes
+                .load_existing(&run)
+                .await
+                .map_err(|e| notes_error(&e))?
+                .map_or(AccessTier::Plan, |notes| self.env.tier_of(&notes));
+            if self.needs > tier {
+                return Ok(ToolOutput::error(crate::tier::refusal(
+                    &self.name, self.needs, tier,
+                )));
+            }
+        }
+        self.inner.call(ctx, args).await
+    }
 }
 
 /// A tool whose results and errors are scrubbed by a [`Redactor`].
@@ -781,4 +967,251 @@ impl EnvProgress for StepChannel {
 /// A failure to read or write the run's notes.
 pub(crate) fn notes_error(e: &std::io::Error) -> ToolError {
     ToolError::Transient(format!("cannot access the run notes: {e}"))
+}
+
+#[cfg(test)]
+mod grant_tests {
+    //! Which repository a run may work on under the tier it works under (`ToolEnv::is_granted`): the
+    //! person's words, or from `auto` a name written alone when exactly one owner applies, or at
+    //! `bypass` any repository the host allows.
+
+    use adam_runtime::CollectingSink;
+    use adam_workspace::{GitCredentials, MemoryCodeHost, RepoRef, ScopedToken, WorkspaceError};
+    use secrecy::SecretString;
+
+    use super::*;
+    use crate::opencode::OpenCodeLaunch;
+    use crate::tools::notes::CreatedRepo;
+
+    /// Credentials that act for `accounts`, or for no list (a token) when `None`.
+    struct Accounts(Option<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl GitCredentials for Accounts {
+        async fn token_for(&self, repo: &RepoRef) -> Result<SecretString, WorkspaceError> {
+            ScopedToken::new("github.com", "t").token_for(repo).await
+        }
+
+        async fn acts_for(&self) -> Result<Option<Vec<String>>, WorkspaceError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct Rig {
+        env: Arc<ToolEnv>,
+        ctx: ToolCtx,
+        _root: tempfile::TempDir,
+    }
+
+    fn rig(accounts: Option<&[&str]>) -> Rig {
+        let root = tempfile::tempdir().unwrap();
+        let creds = Arc::new(Accounts(
+            accounts.map(|a| a.iter().map(|s| (*s).to_owned()).collect()),
+        ));
+        let workspaces =
+            Workspaces::new(root.path().join("work"), creds).allow_hosts(["github.com"]);
+        let mut settings =
+            CoderSettings::new(OpenCodeLaunch::opencode("http://gateway.invalid/v1", "m"));
+        // These tests are about the tier in the notes: the deployment lets a person pick any.
+        settings.max_access_tier = AccessTier::Bypass;
+        let env = Arc::new(ToolEnv::new(
+            workspaces,
+            Arc::new(MemoryCodeHost::new()),
+            settings,
+        ));
+        let ctx = ToolCtx::detached("tool", "call-1", Arc::new(CollectingSink::new()))
+            .with_state(env.clone());
+        Rig {
+            env,
+            ctx,
+            _root: root,
+        }
+    }
+
+    fn notes(tier: AccessTier, said: &str) -> RunNotes {
+        let mut notes = RunNotes {
+            tier: Some(tier),
+            ..RunNotes::default()
+        };
+        notes.set_said_words(said);
+        notes
+    }
+
+    async fn granted(rig: &Rig, notes: &RunNotes, key: &str) -> bool {
+        rig.env.is_granted(&rig.ctx, notes, key).await
+    }
+
+    #[tokio::test]
+    async fn a_repository_the_person_named_is_granted_at_every_tier() {
+        let rig = rig(None);
+        for tier in AccessTier::ALL {
+            let mut notes = notes(tier, "");
+            notes.name_repos(["github.com/acme/widgets".to_owned()]);
+            assert!(
+                granted(&rig, &notes, "github.com/acme/widgets").await,
+                "{tier}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bare_name_counts_as_named_from_auto_when_one_owner_applies() {
+        // The App is installed on one account: that is the owner of a bare name.
+        let rig = rig(Some(&["acme"]));
+        let said = "fix the typo in widgets";
+        // Plan and edits keep the form: a bare name does not count as named there.
+        for tier in [AccessTier::Plan, AccessTier::Edits] {
+            assert!(
+                !granted(&rig, &notes(tier, said), "github.com/acme/widgets").await,
+                "{tier}"
+            );
+        }
+        for tier in [AccessTier::Auto, AccessTier::Bypass] {
+            let notes = notes(tier, said);
+            assert!(
+                granted(&rig, &notes, "github.com/acme/widgets").await,
+                "{tier}"
+            );
+        }
+        // Under auto only the name the person wrote, only on that owner, only on the default host.
+        let auto = notes(AccessTier::Auto, said);
+        assert!(
+            !granted(&rig, &auto, "github.com/acme/other").await,
+            "not written"
+        );
+        assert!(
+            !granted(&rig, &auto, "github.com/evil/widgets").await,
+            "another owner"
+        );
+        assert!(
+            !granted(&rig, &auto, "ghe.example.com/acme/widgets").await,
+            "another host"
+        );
+        assert!(
+            !granted(&rig, &auto, "local/abc/widgets").await,
+            "a local repository"
+        );
+        // A word is read without case, and is the name and not a part of it.
+        assert!(
+            granted(
+                &rig,
+                &notes(AccessTier::Auto, "WIDGETS"),
+                "github.com/acme/widgets"
+            )
+            .await
+        );
+        assert!(
+            !granted(
+                &rig,
+                &notes(AccessTier::Auto, "widget"),
+                "github.com/acme/widgets"
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn two_owners_or_none_leave_a_bare_name_to_the_form() {
+        let said = "fix widgets";
+        // The App is on two accounts: which one is not for the agent to choose.
+        let two = rig(Some(&["acme", "other"]));
+        assert!(
+            !granted(
+                &two,
+                &notes(AccessTier::Auto, said),
+                "github.com/acme/widgets"
+            )
+            .await
+        );
+        // A token has no list of accounts, and the workspace has no repository yet.
+        let token = rig(None);
+        assert!(
+            !granted(
+                &token,
+                &notes(AccessTier::Auto, said),
+                "github.com/acme/widgets"
+            )
+            .await
+        );
+        // The owner of a repository this run created is the owner then.
+        let mut with_created = notes(AccessTier::Auto, said);
+        with_created.created_repos.push(CreatedRepo {
+            full_name: "acme/fib".into(),
+            key: "github.com/acme/fib".into(),
+            clone_url: "https://github.com/acme/fib.git".into(),
+            html_url: "https://github.com/acme/fib".into(),
+            private: true,
+        });
+        assert!(granted(&token, &with_created, "github.com/acme/widgets").await);
+        assert!(!granted(&token, &with_created, "github.com/other/widgets").await);
+        // Two owners among what the run has: no owner applies.
+        with_created.created_repos.push(CreatedRepo {
+            full_name: "other/lib".into(),
+            key: "github.com/other/lib".into(),
+            clone_url: "https://github.com/other/lib.git".into(),
+            html_url: "https://github.com/other/lib".into(),
+            private: true,
+        });
+        assert!(!granted(&token, &with_created, "github.com/acme/widgets").await);
+    }
+
+    #[tokio::test]
+    async fn bypass_grants_any_repository_the_host_allows_and_the_other_tiers_none() {
+        let rig = rig(None);
+        let key = "github.com/anyone/anything";
+        assert!(granted(&rig, &notes(AccessTier::Bypass, ""), key).await);
+        for tier in [AccessTier::Plan, AccessTier::Edits, AccessTier::Auto] {
+            assert!(
+                !granted(&rig, &notes(tier, "anything"), key).await,
+                "{tier}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_words_that_stand_alone_in_the_newest_message_could_be_a_repository() {
+        let mut notes = RunNotes::default();
+        assert!(notes.set_said_words("Fix the typo in Widgets, not in api.v2!"));
+        assert!(notes.said("widgets") && notes.said("API.v2") && notes.said("typo"));
+        // A single letter is no repository's name, and punctuation is not part of a word.
+        assert!(!notes.said("a") && !notes.said("widgets,"));
+        // The same message again changes nothing.
+        assert!(!notes.set_said_words("Fix the typo in Widgets, not in api.v2!"));
+        // The next message replaces the words: what an older one said no longer stands.
+        assert!(notes.set_said_words("thanks, now gadgets"));
+        assert!(notes.said("gadgets") && !notes.said("widgets") && !notes.said("typo"));
+        // A piece of a URL, a path or a query is not a word of its own.
+        notes.set_said_words(
+            "see https://github.com/acme/widgets/issues/3, src/gadgets/main.rs, \
+             github.com/acme/sprockets?name=cogs and git@github.com:acme/bolts.git",
+        );
+        for fragment in [
+            "widgets",
+            "gadgets",
+            "sprockets",
+            "cogs",
+            "bolts",
+            "acme",
+            "github",
+            "main.rs",
+            "issues",
+        ] {
+            assert!(!notes.said(fragment), "{fragment}");
+        }
+        assert!(notes.said("see") && notes.said("and"));
+        // Quotes, backticks and a closing full stop around a word are not part of it.
+        notes.set_said_words("use `widgets`, (gadgets) or \"cogs\".");
+        assert!(notes.said("widgets") && notes.said("gadgets") && notes.said("cogs"));
+        // The list is bounded: the first words stay and the newest are not added.
+        let many: Vec<String> = (0..crate::tools::notes::MAX_SAID_WORDS + 50)
+            .map(|n| format!("word{n}"))
+            .collect();
+        let mut full = RunNotes::default();
+        full.set_said_words(&many.join(" "));
+        assert_eq!(full.said_words.len(), crate::tools::notes::MAX_SAID_WORDS);
+        assert!(
+            full.said("word0")
+                && !full.said(&format!("word{}", crate::tools::notes::MAX_SAID_WORDS + 10))
+        );
+    }
 }

@@ -408,10 +408,54 @@ refused before git runs. For GitHub Enterprise add its host and set
 exposed by the chart.
 
 `github.createRepoOwners` (default empty; env `CREATE_REPO_OWNERS`, workers only) lists the owners the coder may
-create repositories for. Empty turns the `create_repository` tool off. With owners listed it still asks the person
-before every creation, makes the repository private and empty unless asked otherwise, and refuses an owner that is
-not in the list. A GitHub App creates for organisations only and needs the **Administration** permission on the
-organisation; a token needs the `repo` scope.
+create repositories for, and **restricts** it to exactly those. Empty, a **GitHub App** that names its accounts creates for
+them (`github.app.owners` as listed, or the pinned installation's account), and a **token** creates nothing: the
+`create_repository` tool is off. **`github.app.owners: ["*"]` does not turn it on** (every account the App is installed on,
+which anyone may add): list the owners here. The coder asks the person before every creation (not under the `bypass` access
+tier below), makes the repository private and empty unless asked otherwise, and refuses an owner that is not allowed. A GitHub
+App creates for organisations only; a token needs the `repo` scope.
+
+### The access tiers
+
+The person picks an access tier for each message (`plan`, `edits`, `auto`, `bypass`; the default is `auto`;
+[ADR 0036](../../docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)). **`accessTiers.max`** (env
+`MAX_ACCESS_TIER`, every role; empty is `auto` and renders nothing) is the highest tier the deployment allows: the card lists the
+tiers up to it, a message that names a higher one is refused, and the tools check it again. **`bypass` (renaming and deleting
+repositories, no consent form for a repository) is opt-in**: set `accessTiers.max: bypass` only for a deployment whose GitHub
+credentials you are willing to see used that way. Do not also set `config.extraEnv.MAX_ACCESS_TIER`: the chart refuses the render
+(it would override the cap).
+
+**The tier is not a boundary against a command.** With `runPods.enabled: false` and no Podman devcontainers (the default),
+`run_command`, `run`, `run_checks` and OpenCode run **in the coder's own container**, as the user that holds the GitHub App's
+private key (a mounted file, `/var/run/secrets/github-app/private-key.pem`; the chart always uses the file form). A command can read it, mint an installation token
+and do whatever the App may, at any tier, a `plan` included. The coder logs a startup warning when it is an App and the commands
+run locally. If that is not acceptable: run the commands in run pods (`runPods.enabled: true`, [below](#run-pods)) or in Podman
+devcontainers (`DEVCONTAINER_RUNTIME=podman`), or grant the App only what you can live with. (A follow-up, not done: run local
+commands as a user that cannot read `/var/run/secrets`, or refuse App mode without run pods or Podman.)
+
+### What the GitHub App must be granted
+
+**GitHub's own rules decide at every tier**: an App without a permission is refused by GitHub, and the coder tells the person
+what GitHub said. Grant the App what the tiers you want need:
+
+| Repository permission | Level | The coder needs it to | Tier |
+|---|---|---|---|
+| Metadata | read | read a repository (always granted) | all |
+| Contents | write | push branches; merge a pull request; delete its head branch | `edits`, `auto` |
+| Pull requests | write | open pull requests, comment on them, read one before it merges it | `edits`, `auto` |
+| Checks | read | read the check runs of a pull request's head commit before it merges (`GET .../commits/{ref}/check-runs`) | `auto` |
+| Commit statuses | read | read the combined status of that commit (`GET .../commits/{ref}/status`) | `auto` |
+| Workflows | write | push a branch that changes `.github/workflows/*` | `edits` |
+| Administration | write | create (`POST /orgs/{org}/repos`, `POST /user/repos`), rename and delete a repository | `auto` (create), `bypass` (rename, delete) |
+
+*Verified 2026-10-11*, `docs.github.com/en/rest/authentication/permissions-required-for-github-apps` (read through a summariser):
+`PATCH` and `DELETE /repos/{owner}/{repo}` and the two repository-creation endpoints are under **Administration** (write); the
+merge endpoint and the deletion of a ref are under **Contents** (write); reading a pull request is **Pull requests** (read), the
+combined status is **Commit statuses** (read) and the check runs are **Checks** (read); **Workflows** and **Repository creation**
+are permissions of their own on that page. *Unverified:* that **Workflows** is what GitHub checks for a push under
+`.github/workflows` (the page names the permission and not the path), and whether creating a repository needs **Repository
+creation** in addition to **Administration**. A token needs the `repo` scope for all of this, and `delete_repo` to delete
+(*verified 2026-10-11*, `docs.github.com/en/rest/repos/repos`).
 
 ## Agent files
 

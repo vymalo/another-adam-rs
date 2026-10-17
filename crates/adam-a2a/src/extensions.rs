@@ -1,6 +1,6 @@
 //! The A2A extensions an agent that draws on a screen declares: the URIs, and the card entries.
 //!
-//! Nine extensions, each optional (a client that does not know one ignores it), detected by the
+//! Ten extensions, each optional (a client that does not know one ignores it), detected by the
 //! client from the card it reads, and removable without breaking plain A2A:
 //!
 //! | Extension | URI | What it is |
@@ -14,6 +14,7 @@
 //! | `steer/v1` | [`STEER_EXTENSION`] | a message that names a running task and activates the extension is added to that task's input, and the agent reads it at its next step |
 //! | `build/v1` | [`BUILD_EXTENSION`] | the card says which build of the agent answers (`revision`) and which agent files it runs (`folderDigest`); nothing to activate |
 //! | `usage/v1` | [`USAGE_EXTENSION`] | the agent reports the tokens of each model call, to a client whose request activated it, and writes a task's totals on the task when it ends or waits |
+//! | `access-tier/v1` | [`ACCESS_TIER_EXTENSION`] | the person picks how much the agent may do alone for each message (`plan`, `edits`, `auto`, `bypass`); the agent keeps to it and says which tier it worked under |
 //!
 //! The contracts are the orchestration layer's (`docs/api/ui-catalog-v1.md`,
 //! `docs/api/thread-tools-v1.md`, `docs/api/steps-v1.md`, `docs/api/text-stream-v1.md`,
@@ -23,6 +24,7 @@
 use serde_json::json;
 
 use crate::card::ExtensionConfig;
+use crate::tier::AccessTiers;
 
 /// The media type of a data part that carries A2UI messages, in `mediaType` (A2A 1.0) and in the
 /// part's `metadata.mimeType` (the A2UI extension's own spelling).
@@ -76,6 +78,14 @@ pub const BUILD_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/buil
 /// to a client whose request activated it, and writes a task's totals in the task's `metadata` under
 /// this URI when the task ends or waits, whoever asked (ADR 0032).
 pub const USAGE_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/usage/v1";
+
+/// The URI of the `access-tier/v1` extension: a message that activates it carries, in its metadata
+/// under this URI, `{"tier": "plan" | "edits" | "auto" | "bypass"}`, how much the agent may do alone
+/// for that message. The card's `params` are `{"tiers": [..], "default": ..}`; the agent echoes the
+/// tier it works under in the task's metadata under this URI. The contract is the orchestration
+/// layer's (`docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`); ADR 0036 is this
+/// repository's side.
+pub const ACCESS_TIER_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/access-tier/v1";
 
 /// What a build's revision, and the `+<revision>` of its card version, say when none was baked in.
 pub const UNKNOWN_REVISION: &str = "unknown";
@@ -206,6 +216,29 @@ impl ExtensionConfig {
         extension
     }
 
+    /// The `access-tier/v1` extension: the agent works under the tier a message names, never above
+    /// it. `params` are `{"tiers": [the tiers honoured, lowest first], "default": the tier it works
+    /// under when a message names none}`. Optional; the description is the contract's.
+    pub fn access_tier(tiers: &AccessTiers) -> Self {
+        let mut extension = Self::new(ACCESS_TIER_EXTENSION);
+        extension.description =
+            Some("Works under the access tier the person picks for each message.".into());
+        extension.params.insert(
+            "tiers".into(),
+            json!(
+                tiers
+                    .honoured()
+                    .iter()
+                    .map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        extension
+            .params
+            .insert("default".into(), json!(tiers.default_tier().as_str()));
+        extension
+    }
+
     /// The `mentions/v1` extension: the agent reads the agents a person mentioned in a message and
     /// asks them. Optional, no parameters; the description is the contract's.
     pub fn mentions() -> Self {
@@ -293,6 +326,35 @@ mod tests {
             "https://a2ui.org/a2a-extension/a2ui/v0.9.1"
         );
         assert_eq!(A2UI_MEDIA_TYPE, "application/a2ui+json");
+    }
+
+    #[test]
+    fn the_access_tier_entry_is_the_contracts_word_for_word() {
+        let e = ExtensionConfig::access_tier(&AccessTiers::all(crate::AccessTier::Auto));
+        assert_eq!(e.uri, ACCESS_TIER_EXTENSION);
+        assert_eq!(
+            ACCESS_TIER_EXTENSION,
+            "https://agents.vymalo.com/a2a/extensions/access-tier/v1"
+        );
+        assert!(
+            !e.required,
+            "a client that does not know it must still talk to the agent"
+        );
+        assert_eq!(
+            e.description.as_deref(),
+            Some("Works under the access tier the person picks for each message.")
+        );
+        assert_eq!(
+            serde_json::Value::Object(e.params),
+            json!({"tiers": ["plan", "edits", "auto", "bypass"], "default": "auto"})
+        );
+        // An agent that honours fewer says so, in the order of the tiers.
+        let read_only =
+            AccessTiers::new([crate::AccessTier::Plan], crate::AccessTier::Plan).unwrap();
+        assert_eq!(
+            serde_json::Value::Object(ExtensionConfig::access_tier(&read_only).params),
+            json!({"tiers": ["plan"], "default": "plan"})
+        );
     }
 
     #[test]

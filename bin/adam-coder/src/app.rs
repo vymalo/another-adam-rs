@@ -5,7 +5,7 @@
 use std::future::Future;
 
 use adam::AssemblyError;
-use adam_a2a::{AgentCardConfig, AuthConfig};
+use adam_a2a::{AccessTier, AgentCardConfig, AuthConfig};
 use adam_a2a_runtime::{InboundFn, RuntimeTaskBackend, vymalo_inbound};
 use adam_core::DynStore;
 use adam_runtime::{Runtime, RuntimeError};
@@ -59,9 +59,12 @@ impl Coder {
         options: &RuntimeOptions,
         live: LiveSignals,
     ) -> Self {
+        let tiers = crate::tier::honoured_up_to(agent.max_access_tier());
         let builder = agent.register(Runtime::builder(store));
         Self::from_service(
-            Service::new_with(builder, AGENT_NAME, options, live).with_inbound(screen_inbound()),
+            Service::new_with(builder, AGENT_NAME, options, live)
+                .with_inbound(screen_inbound())
+                .with_access_tiers(Some(tiers)),
         )
     }
 
@@ -80,9 +83,22 @@ impl Coder {
         options: &RuntimeOptions,
         live: LiveSignals,
     ) -> Self {
+        Self::control_plane_capped(store, options, live, crate::tier::DEFAULT_MAX)
+    }
+
+    /// [`Coder::control_plane_with`] for a deployment that caps the access tiers at `max`
+    /// (`MAX_ACCESS_TIER`): a message that names a higher tier is refused.
+    pub fn control_plane_capped(
+        store: DynStore,
+        options: &RuntimeOptions,
+        live: LiveSignals,
+        max: AccessTier,
+    ) -> Self {
         let builder = Runtime::builder(store).starter(CoderStarter);
         Self::from_service(
-            Service::new_with(builder, AGENT_NAME, options, live).with_inbound(screen_inbound()),
+            Service::new_with(builder, AGENT_NAME, options, live)
+                .with_inbound(screen_inbound())
+                .with_access_tiers(Some(crate::tier::honoured_up_to(max))),
         )
     }
 
@@ -147,7 +163,21 @@ pub fn agent_card_from(
     files: &AgentFiles,
     public_url: &Url,
 ) -> Result<AgentCardConfig, Box<AssemblyError>> {
-    card_for_build(files, public_url, BUILD_REVISION)
+    agent_card_for(files, public_url, crate::tier::DEFAULT_MAX)
+}
+
+/// [`agent_card_from`] for a deployment that caps the access tiers at `max` (`MAX_ACCESS_TIER`): the
+/// card lists the tiers up to it.
+///
+/// # Errors
+///
+/// As [`agent_card_from`].
+pub fn agent_card_for(
+    files: &AgentFiles,
+    public_url: &Url,
+    max: AccessTier,
+) -> Result<AgentCardConfig, Box<AssemblyError>> {
+    card_for_build(files, public_url, BUILD_REVISION, max)
 }
 
 /// The revision this binary was built from: the build argument `ADAM_BUILD_REVISION` of the image
@@ -166,12 +196,13 @@ fn card_for_build(
     files: &AgentFiles,
     public_url: &Url,
     revision: Option<&str>,
+    max: AccessTier,
 ) -> Result<AgentCardConfig, Box<AssemblyError>> {
     let version = adam_a2a::build_version(env!("CARGO_PKG_VERSION"), revision);
     files
         .def()?
         .card(public_url.clone(), version)
-        .map(with_extensions)
+        .map(|card| with_extensions(card, max))
         .map(|card| {
             card.with_extension(adam_a2a::ExtensionConfig::build(
                 revision,
@@ -185,13 +216,17 @@ fn card_for_build(
 /// `thread-tools/v1`, `mentions/v1`, `steer/v1`), `steps/v1` (every tool call, and OpenCode's, is reported as a step to a
 /// client that activates it) and `text-stream/v1` (its answers are sent as the model writes them to a
 /// client that activates it: the agent streams its model calls) and `usage/v1` (the tokens of every model
-/// call to a client that activates it, and a task's totals on the task). `build/v1`, which says the build
-/// and the files, is added by [`card_for_build`].
-fn with_extensions(card: AgentCardConfig) -> AgentCardConfig {
+/// call to a client that activates it, and a task's totals on the task) and `access-tier/v1` (the
+/// tier the person picks for a message, all four, `auto` by default: [`tier`](crate::tier)). `build/v1`,
+/// which says the build and the files, is added by [`card_for_build`].
+fn with_extensions(card: AgentCardConfig, max: AccessTier) -> AgentCardConfig {
     adam_ui::with_card_extensions(card)
         .with_extension(adam_a2a::ExtensionConfig::steps())
         .with_extension(adam_a2a::ExtensionConfig::text_stream())
         .with_extension(adam_a2a::ExtensionConfig::usage())
+        .with_extension(adam_a2a::ExtensionConfig::access_tier(
+            &crate::tier::honoured_up_to(max),
+        ))
 }
 
 #[cfg(test)]
@@ -248,7 +283,13 @@ mod tests {
     fn the_card_says_which_build_and_which_files_answer() {
         let url: Url = "https://agents.example.com/coder/".parse().expect("a URL");
         let sha = "6478fbc1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7";
-        let card = card_for_build(&AgentFiles::Embedded, &url, Some(sha)).expect("a card");
+        let card = card_for_build(
+            &AgentFiles::Embedded,
+            &url,
+            Some(sha),
+            crate::tier::DEFAULT_MAX,
+        )
+        .expect("a card");
         assert_eq!(
             card.version,
             format!("{}+6478fbc", env!("CARGO_PKG_VERSION"))
@@ -267,7 +308,8 @@ mod tests {
                 .is_some_and(|d| d.starts_with("sha256:"))
         );
 
-        let card = card_for_build(&AgentFiles::Embedded, &url, None).expect("a card");
+        let card = card_for_build(&AgentFiles::Embedded, &url, None, crate::tier::DEFAULT_MAX)
+            .expect("a card");
         assert_eq!(
             card.version,
             format!("{}+unknown", env!("CARGO_PKG_VERSION"))

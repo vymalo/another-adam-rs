@@ -3,20 +3,25 @@
 //! to script the model. Everything is offline.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use a2a::{Message as A2aMessage, Part, Role};
+use adam_a2a::A2UI_MEDIA_TYPE;
+use adam_a2a_runtime::vymalo_inbound;
 use adam_coder::opencode::OpenCodeLaunch;
 use adam_coder::{CoderSettings, Redactor, ToolEnv};
 use adam_model::ToolCall;
+use adam_runtime::Inbound;
 use adam_workspace::{
-    CodeHost, CreatedRepository, DynCodeHost, DynEnvironment, EnvDescription, EnvError, EnvKind,
-    EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec, GitHub, LocalSession,
-    NewPullRequest, NewRepository, OwnerKind, PreparedCommand, PullRequest, RepoRef, RunWorkspace,
-    ScopedToken, SecretRef, WorkspaceError, Workspaces,
+    CodeHost, CreatedRepository, DynCodeHost, DynEnvironment, DynGitCredentials, EnvDescription,
+    EnvError, EnvKind, EnvProgress, EnvSession, EnvStep, Environment, ExecId, ExecSpec,
+    GitCredentials, GitHub, LocalSession, MergePullRequest, MergedPullRequest, NewPullRequest,
+    NewRepository, OwnerKind, PreparedCommand, PullRequest, RepoRef, RunWorkspace, ScopedToken,
+    SecretRef, WorkspaceError, Workspaces,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -25,6 +30,33 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 pub mod pg;
+
+/// What somebody types (or a client sends as a text part): the message as the A2A layer makes it.
+/// Whatever it says, it is not a form's answer.
+pub fn typed_message(text: &str) -> Inbound {
+    let message = A2aMessage::new(Role::User, vec![Part::text(text)]);
+    vymalo_inbound(&message).expect("text reads as text")
+}
+
+/// The person answers the form drawn on `surface`: the answer as the A2A layer writes it.
+pub fn form_answer(surface: &str, answers: Value, note: Option<&str>) -> Inbound {
+    let mut context = json!({ "answers": answers });
+    if let Some(note) = note {
+        context["note"] = json!(note);
+    }
+    let action = json!({
+        "name": "answer", "surfaceId": surface, "sourceComponentId": "root",
+        "timestamp": "2026-10-11T10:00:00Z", "context": context,
+    });
+    let mut part = Part::data(json!([{ "version": "v0.9.1", "action": action }]))
+        .with_media_type(A2UI_MEDIA_TYPE);
+    part.metadata = Some(HashMap::from([(
+        "mimeType".to_owned(),
+        json!(A2UI_MEDIA_TYPE),
+    )]));
+    let message = A2aMessage::new(Role::User, vec![part]);
+    vymalo_inbound(&message).expect("an answer reads as text")
+}
 
 /// A check command that fails in a run's worktree and passes on the checkout of the base
 /// (`.adam-base`), so that its failure is the run's and costs a check cycle: `then` is what it
@@ -321,6 +353,208 @@ impl CodeHost for GithubBehindMock {
             .comment_on_pull_request(&self.slug, number, body)
             .await
     }
+
+    async fn merge_pull_request(
+        &self,
+        mut merge: MergePullRequest,
+    ) -> Result<MergedPullRequest, WorkspaceError> {
+        merge.repo = RepoRef::new(self.slug.url.clone(), merge.repo.base_branch.clone());
+        self.inner.merge_pull_request(merge).await
+    }
+
+    async fn pull_request_status(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<adam_workspace::PullRequestStatus, WorkspaceError> {
+        let repo = RepoRef::new(self.slug.url.clone(), repo.base_branch.clone());
+        self.inner.pull_request_status(&repo, number).await
+    }
+}
+
+/// Make the mock GitHub answer for pull request `number` of `slug`, open, from `branch` of that very
+/// repository, with every check passed (`mergeable_state` `clean`): the repository itself, the read of
+/// the pull request, the merge (`PUT .../merge`, answered with `merge_sha`) and the delete of its
+/// branch.
+pub async fn mount_mergeable(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    merge_sha: &str,
+) {
+    mount_pull(github, slug, number, branch, "abc123", "clean").await;
+    mount_merge(github, slug, number, branch, merge_sha).await;
+}
+
+/// The repository `slug` and its pull request `number`, open, from `branch` of that very repository,
+/// whose head is `sha` and whose `mergeable_state` is `state`.
+pub async fn mount_pull(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    sha: &str,
+    state: &str,
+) {
+    mount_pull_from(github, slug, number, branch, slug, sha, state).await;
+}
+
+/// [`mount_pull`] for a head that is in the repository `head_repo` (another one: a fork).
+pub async fn mount_pull_from(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    head_repo: &str,
+    sha: &str,
+    state: &str,
+) {
+    mount_pull_to(github, slug, number, branch, head_repo, sha, state, "main").await;
+}
+
+/// [`mount_pull_from`] for a pull request against the branch `base`.
+#[allow(clippy::too_many_arguments)]
+pub async fn mount_pull_to(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    head_repo: &str,
+    sha: &str,
+    state: &str,
+    base: &str,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{slug}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"full_name": slug})))
+        .mount(github)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{slug}/pulls/{number}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": number,
+            "html_url": pull_url(number),
+            "state": "open",
+            "merged": false,
+            "mergeable_state": state,
+            "head": {"ref": branch, "sha": sha, "repo": {"full_name": head_repo}},
+            "base": {"ref": base, "repo": {"full_name": slug}},
+        })))
+        .mount(github)
+        .await;
+    // A CI that passed, unless a test says otherwise (`mount_checks` wins over this one).
+    mount_checks_at(
+        github,
+        slug,
+        sha,
+        json!({"state": "success", "total_count": 1}),
+        json!({"total_count": 1, "check_runs": [
+            {"name": "build", "status": "completed", "conclusion": "success"}
+        ]}),
+        10,
+    )
+    .await;
+}
+
+/// Pull request `number` of `octo/widgets` as the fixture's remote has it **now**: open, from the
+/// first `agent/` branch there, whose head is that branch's tip, in the repository `head_repo`.
+struct PullOfTheRemote {
+    remote: PathBuf,
+    number: u64,
+    head_repo: String,
+}
+
+impl Respond for PullOfTheRemote {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let branches = git(
+            &self.remote,
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/agent",
+            ],
+        );
+        let branch = branches.lines().next().unwrap_or_default().to_owned();
+        let sha = git(&self.remote, &["rev-parse", &branch]);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "number": self.number,
+            "html_url": pull_url(self.number),
+            "state": "open",
+            "merged": false,
+            "mergeable_state": "clean",
+            "head": {"ref": branch, "sha": sha, "repo": {"full_name": self.head_repo}},
+            "base": {"ref": "main", "repo": {"full_name": "octo/widgets"}},
+        }))
+    }
+}
+
+/// The statuses and check runs the mock GitHub reports for commit `sha` of `slug`.
+pub async fn mount_checks(github: &MockServer, slug: &str, sha: &str, status: Value, runs: Value) {
+    mount_checks_at(github, slug, sha, status, runs, 5).await;
+}
+
+async fn mount_checks_at(
+    github: &MockServer,
+    slug: &str,
+    sha: &str,
+    status: Value,
+    runs: Value,
+    priority: u8,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{slug}/commits/{sha}/status")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status))
+        .with_priority(priority)
+        .mount(github)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{slug}/commits/{sha}/check-runs")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(runs))
+        .with_priority(priority)
+        .mount(github)
+        .await;
+}
+
+/// The merge of pull request `number` of `slug` (`PUT .../merge`, answered with `merge_sha`) and
+/// the delete of its branch `branch`.
+pub async fn mount_merge(
+    github: &MockServer,
+    slug: &str,
+    number: u64,
+    branch: &str,
+    merge_sha: &str,
+) {
+    Mock::given(method("PUT"))
+        .and(path(format!("/repos/{slug}/pulls/{number}/merge")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"sha": merge_sha, "merged": true})),
+        )
+        .mount(github)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/repos/{slug}/git/refs/heads/{branch}")))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(github)
+        .await;
+}
+
+/// Credentials that act for a list of accounts (what a GitHub App's are): the fixture's token, and
+/// `acts_for` says `accounts`.
+pub struct ActingFor {
+    pub inner: ScopedToken,
+    pub accounts: Vec<String>,
+}
+
+#[async_trait]
+impl GitCredentials for ActingFor {
+    async fn token_for(&self, repo: &RepoRef) -> Result<secrecy::SecretString, WorkspaceError> {
+        self.inner.token_for(repo).await
+    }
+
+    async fn acts_for(&self) -> Result<Option<Vec<String>>, WorkspaceError> {
+        Ok(Some(self.accounts.clone()))
+    }
 }
 
 /// A code host that can create repositories: every other call goes to the fixture's host, and a
@@ -558,6 +792,9 @@ impl Fixture {
             .env("FAKE_ACP_WRITE_PATH", "hello.txt")
             .env("FAKE_ACP_WRITE_CONTENT", content);
         let mut settings = CoderSettings::new(launch);
+        // A fixture is a deployment that lets a person pick any tier (`MAX_ACCESS_TIER=bypass`),
+        // so that a test of a tier is a test of the tier; the cap itself is `capped_at`.
+        settings.max_access_tier = adam_a2a::AccessTier::Bypass;
         tweak(&mut settings);
         let env = Arc::new(
             ToolEnv::new(workspaces, code_host, settings).with_redactor(Redactor::new(SECRETS)),
@@ -580,6 +817,64 @@ impl Fixture {
             .expect("the tools are not shared yet")
             .settings
             .create_repo_owners = vec!["acme".to_owned()];
+        self
+    }
+
+    /// The same fixture whose credentials act for `accounts`, as a GitHub App's do
+    /// ([`GitCredentials::acts_for`]): what `create_repository` reads when `CREATE_REPO_OWNERS` is
+    /// empty, and what a bare repository name is resolved against.
+    #[must_use]
+    pub fn acting_for(mut self, accounts: &[&str]) -> Self {
+        let creds: DynGitCredentials = Arc::new(ActingFor {
+            inner: ScopedToken::new("github.com", GITHUB_TOKEN),
+            accounts: accounts.iter().map(|a| (*a).to_owned()).collect(),
+        });
+        let workspaces = Workspaces::new(self.root.clone(), creds)
+            .allow_hosts(["github.com"])
+            .allow_local(true);
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .workspaces = workspaces;
+        self
+    }
+
+    /// The same fixture that also lets the workspaces use repositories on `hosts` (beside
+    /// `github.com`), as `ALLOWED_REPO_HOSTS` does.
+    #[must_use]
+    pub fn also_allowing(mut self, hosts: &[&str]) -> Self {
+        let creds: DynGitCredentials = Arc::new(ScopedToken::new("github.com", GITHUB_TOKEN));
+        let workspaces = Workspaces::new(self.root.clone(), creds)
+            .allow_hosts(std::iter::once("github.com").chain(hosts.iter().copied()))
+            .allow_local(true);
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .workspaces = workspaces;
+        self
+    }
+
+    /// The same fixture whose deployment caps the access tiers at `max` (`MAX_ACCESS_TIER`).
+    #[must_use]
+    pub fn capped_at(self, max: adam_a2a::AccessTier) -> Self {
+        self.tweaked(|settings| settings.max_access_tier = max)
+    }
+
+    /// The same fixture with its settings adjusted (before anything shares the tools).
+    #[must_use]
+    pub fn tweaked(mut self, tweak: impl FnOnce(&mut CoderSettings)) -> Self {
+        tweak(
+            &mut Arc::get_mut(&mut self.env)
+                .expect("the tools are not shared yet")
+                .settings,
+        );
+        self
+    }
+
+    /// The same fixture whose code host is `host` (a double that records what it is asked).
+    #[must_use]
+    pub fn hosted_by(mut self, host: DynCodeHost) -> Self {
+        Arc::get_mut(&mut self.env)
+            .expect("the tools are not shared yet")
+            .code_host = host;
         self
     }
 
@@ -739,6 +1034,69 @@ impl Fixture {
         .lines()
         .map(str::to_owned)
         .collect()
+    }
+
+    /// Make the mock GitHub answer for pull request `number` of `octo/widgets` (the one the mock
+    /// gives the first pull request) as the remote has it when asked: from the branch the run pushed,
+    /// with that very commit as its head and every check passed on whatever commit that is, and take
+    /// its merge. `head_repo` is the repository the head is said to be in.
+    pub async fn mount_pull_of_the_remote(&self, number: u64, head_repo: &str) {
+        Mock::given(method("GET"))
+            .and(path("/repos/octo/widgets"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"full_name": "octo/widgets"})),
+            )
+            .mount(&self.github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/octo/widgets/pulls/{number}")))
+            .respond_with(PullOfTheRemote {
+                remote: self.remote.clone(),
+                number,
+                head_repo: head_repo.to_owned(),
+            })
+            .mount(&self.github)
+            .await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/repos/octo/widgets/commits/[0-9a-f]+/status$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"state": "success", "total_count": 1})),
+            )
+            .mount(&self.github)
+            .await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/repos/octo/widgets/commits/[0-9a-f]+/check-runs$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total_count": 1,
+                "check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}],
+            })))
+            .mount(&self.github)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/repos/octo/widgets/pulls/{number}/merge")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"sha": "feedface", "merged": true})),
+            )
+            .mount(&self.github)
+            .await;
+    }
+
+    /// The JSON bodies of every merge the mock GitHub received (`PUT .../merge`).
+    pub async fn merge_requests(&self) -> Vec<Value> {
+        self.github
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.method.as_str() == "PUT" && r.url.path().ends_with("/merge"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap_or(Value::Null))
+            .collect()
     }
 
     /// `hello.txt` as committed on `branch` of the remote.

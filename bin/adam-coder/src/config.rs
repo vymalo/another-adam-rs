@@ -22,7 +22,8 @@
 //! | `GITHUB_APP_OWNERS` | the accounts (users and organisations, comma- or space-separated, compared without case) the App may act for, **without a pin**: the installation of each repository's owner is found with the App's JWT. `*` is every account the App is installed on (a startup warning: a public App can be installed by anyone). Refused with a pin and in token mode (exit 78) | App mode: this or `GITHUB_APP_INSTALLATION_ID`, exactly one |
 //! | `GITHUB_APP_PRIVATE_KEY_PATH`, `GITHUB_APP_PRIVATE_KEY` | the App's private key, a PEM (PKCS#1 or PKCS#8), as a file or inline (`\n` escapes accepted); exactly one; parsed at startup | one required in App mode |
 //! | `ALLOWED_REPO_HOSTS` | comma-separated hosts (`name` for any port, or `name:port`) repositories may live on; the token is scoped to them; the first is the host `owner/name` stands for | `github.com` |
-//! | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees; empty turns the tool off | empty (off) |
+//! | `CREATE_REPO_OWNERS` | comma- or space-separated owners (users or organisations) `create_repository` may create repositories for, after the person agrees (not under the `bypass` access tier). A list restricts to exactly these. Empty: a GitHub App creates for the accounts it acts for (**not** with `GITHUB_APP_OWNERS=*`: list the owners), a token creates nothing (the tool is off) | empty |
+//! | `MAX_ACCESS_TIER` | the highest access tier a person may pick for a message: `plan`, `edits`, `auto` or `bypass` ([`tier`](crate::tier)). The card lists the tiers up to it and the tools check it again. `bypass` (rename and delete repositories, no consent form) is the deployment's opt-in. Read by every role | `auto` |
 //! | `ALLOW_LOCAL_REPOS` | also accept local paths, `file://` and plain `http://` repositories (development and tests only) | `false` |
 //! | `GITHUB_API_URL` | GitHub REST API root (GitHub Enterprise: `https://<host>/api/v3`; tests: a mock) | `https://api.github.com` |
 //! | `GITHUB_MCP_URL` | where the GitHub MCP server (`github-mcp-server http`, a sidecar of the pod) listens, for the agent folder's `mcp.json`: only the origin counts, and the folder's `github` server must be at it. The coder gives that server the credentials of each call ([`GitHubReadBearer`](crate::GitHubReadBearer)); the server holds none | `http://127.0.0.1:8082` |
@@ -109,6 +110,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use adam::AGENT_DIR_ENV;
+use adam_a2a::AccessTier;
 use adam_devcontainer::{Network, Runtime, Settings};
 use adam_host::Placement;
 pub use adam_service::{ConfigError, McpSettings};
@@ -128,6 +130,10 @@ pub struct Config {
     /// `ADAM_AGENT_DIR`: the folder the agent's files are read from, an existing directory.
     /// `None`: the copy embedded in the binary. Every role reads it.
     pub agent_dir: Option<PathBuf>,
+    /// `MAX_ACCESS_TIER`: the highest access tier a message may name. Every role reads it: the
+    /// control plane declares the tiers up to it on the card and refuses a higher one, and the
+    /// workers' tools check it again.
+    pub max_access_tier: AccessTier,
     /// What stepping a run needs: the model, GitHub, the workspaces and the checks. `Some` exactly
     /// when [`Role::runs_workers`](adam_host::Role::runs_workers); a control plane holds none of it.
     pub worker: Option<WorkerConfig>,
@@ -138,6 +144,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("service", &self.service)
             .field("agent_dir", &self.agent_dir)
+            .field("max_access_tier", &self.max_access_tier)
             .field("worker", &self.worker)
             .finish()
     }
@@ -155,8 +162,8 @@ pub struct WorkerConfig {
     pub github: GitHubAuth,
     /// `ALLOWED_REPO_HOSTS`, lowercased.
     pub allowed_repo_hosts: Vec<String>,
-    /// `CREATE_REPO_OWNERS`, lowercased: the owners `create_repository` may create repositories for.
-    /// Empty (the default) turns the tool off.
+    /// `CREATE_REPO_OWNERS`, lowercased: the owners `create_repository` may create repositories for
+    /// (a list restricts to these; empty, a GitHub App's accounts, and nothing for a token).
     pub create_repo_owners: Vec<String>,
     /// `ALLOW_LOCAL_REPOS`.
     pub allow_local_repos: bool,
@@ -640,6 +647,10 @@ pub struct GitHubAppConfig {
     pub key: AppKey,
     /// The PEM the key was read from, kept so that the redactor can register it.
     pub pem: SecretString,
+    /// The key came from a file (`GITHUB_APP_PRIVATE_KEY_PATH`), which a command that runs as the
+    /// user that holds it can read. A key given inline (`GITHUB_APP_PRIVATE_KEY`) is hidden from
+    /// the commands of a run (`ExecSpec.hide`).
+    pub key_file: bool,
 }
 
 impl GitHubAuth {
@@ -659,6 +670,20 @@ impl GitHubAuth {
                 vec![pem.trim().to_owned(), body]
             }
         }
+    }
+
+    /// Whether the credentials name the accounts they act for: a GitHub App pinned to one
+    /// installation, or limited to listed owners. `GITHUB_APP_OWNERS=*` does not (every account the
+    /// App is installed on, which anyone may add), and a token has no such list.
+    pub fn names_its_accounts(&self) -> bool {
+        matches!(
+            self,
+            Self::App(GitHubAppConfig {
+                installations: AppInstallations::Pinned(_)
+                    | AppInstallations::Owners(AppOwners::Only(_)),
+                ..
+            })
+        )
     }
 
     /// Whether the installation is found by the owner of each repository (a GitHub App with
@@ -852,6 +877,7 @@ impl GitHubAuth {
             installations: installations?,
             key: key?,
             pem: SecretString::from(pem),
+            key_file: var == "GITHUB_APP_PRIVATE_KEY_PATH",
         }))
     }
 }
@@ -947,6 +973,18 @@ impl Config {
             }
         };
 
+        let max_access_tier = match get("MAX_ACCESS_TIER") {
+            None => crate::tier::DEFAULT_MAX,
+            Some(raw) => raw.trim().parse::<AccessTier>().unwrap_or_else(|_| {
+                problems.push(format!(
+                    "MAX_ACCESS_TIER {:?} is not an access tier (plan, edits, auto or bypass, in \
+                     lower case)",
+                    raw.trim()
+                ));
+                crate::tier::DEFAULT_MAX
+            }),
+        };
+
         // The workers' variables: a control plane neither needs nor validates them.
         let worker = match &service.worker {
             Some(settings) => WorkerConfig::parse(&lookup, &get, settings, &mut problems),
@@ -957,12 +995,24 @@ impl Config {
         Ok(Self {
             service,
             agent_dir,
+            max_access_tier,
             worker,
         })
     }
 }
 
 impl WorkerConfig {
+    /// Whether a command a run starts can read the GitHub App's private key: the credentials are an
+    /// App whose key is a **file** and the commands run in this container (no run pod, and
+    /// `DEVCONTAINER_RUNTIME=off`), as the user that holds the file. Then any access tier, a `plan`
+    /// too, can mint an installation token and do what the App may. A run pod or a Podman
+    /// devcontainer has no such file, and a key given inline is hidden from the commands.
+    pub fn commands_can_read_the_app_key(&self) -> bool {
+        matches!(&self.github, GitHubAuth::App(app) if app.key_file)
+            && matches!(self.run_environment, RunEnvironment::Local)
+            && self.devcontainer.runtime == Runtime::Off
+    }
+
     /// The folder this worker keeps mirrors and worktrees in: `WORKSPACE_ROOT` itself, or with
     /// [`Placement::Affinity`] the folder `WORKSPACE_ROOT/<WORKER_ID>` it owns.
     pub fn placed_root(&self) -> PathBuf {
@@ -2972,5 +3022,98 @@ mod tests {
         assert!(parse_dc(&vars).is_ok());
         vars.insert("ROLE", "worker".into());
         assert!(parse_dc(&vars).is_err(), "a worker does");
+    }
+
+    /// `MAX_ACCESS_TIER` caps the tiers a person may pick: `auto` unless the deployment says more
+    /// (`bypass` is its opt-in), and every role reads it, the control plane first.
+    #[test]
+    fn the_cap_of_the_access_tiers_is_auto_unless_the_deployment_says_otherwise() {
+        assert_eq!(parse(&full()).unwrap().max_access_tier, AccessTier::Auto);
+        for tier in AccessTier::ALL {
+            let mut vars = full();
+            vars.insert("MAX_ACCESS_TIER", tier.as_str());
+            assert_eq!(parse(&vars).unwrap().max_access_tier, tier);
+            // The control plane reads it too, with nothing of a worker's.
+            vars.insert("ROLE", "control-plane");
+            let c = parse(&vars).unwrap();
+            assert!(c.worker.is_none());
+            assert_eq!(c.max_access_tier, tier);
+        }
+        // Blank is unset; anything but one of the four words, exactly, is a problem that names it.
+        let mut vars = full();
+        vars.insert("MAX_ACCESS_TIER", "  ");
+        assert_eq!(parse(&vars).unwrap().max_access_tier, AccessTier::Auto);
+        for bad in ["root", "Bypass", "all", "3"] {
+            let mut vars = full();
+            vars.insert("MAX_ACCESS_TIER", bad);
+            let e = parse(&vars).unwrap_err();
+            assert!(
+                e.problems
+                    .iter()
+                    .any(|p| p.starts_with("MAX_ACCESS_TIER") && p.contains(&format!("{bad:?}"))),
+                "{bad}: {e}"
+            );
+        }
+    }
+
+    /// `GITHUB_APP_OWNERS=*` is every account the App is installed on, which anyone may add: it does
+    /// not make `create_repository` available for all of them by default. A pin or a list does.
+    #[test]
+    fn only_an_app_that_names_its_accounts_creates_for_them_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        for (owners, names) in [("acme", true), ("acme, other", true), ("*", false)] {
+            let c = parse_owned(&without_token(&owners_vars(owners, dir.path()))).unwrap();
+            assert_eq!(
+                c.worker.unwrap().github.names_its_accounts(),
+                names,
+                "{owners}"
+            );
+        }
+        let file = dir.path().join("app.pem");
+        std::fs::write(&file, &TestAppKey::generate().pkcs1_pem).unwrap();
+        let pinned = app_vars((
+            "GITHUB_APP_PRIVATE_KEY_PATH",
+            file.to_string_lossy().into_owned(),
+        ));
+        let c = parse_owned(&without_token(&pinned)).unwrap();
+        assert!(c.worker.unwrap().github.names_its_accounts());
+        // A token has no list of accounts.
+        assert!(
+            !parse(&full())
+                .unwrap()
+                .worker
+                .unwrap()
+                .github
+                .names_its_accounts()
+        );
+    }
+
+    /// Where the commands of a run run decides whether they can read the App's key: in this
+    /// container, as the user that holds it, they can; with a token there is no key.
+    #[test]
+    fn commands_in_this_container_can_read_the_key_of_a_github_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = parse_owned(&without_token(&owners_vars("acme", dir.path()))).unwrap();
+        let app = app.worker.unwrap();
+        assert!(matches!(app.run_environment, RunEnvironment::Local));
+        assert!(app.commands_can_read_the_app_key());
+        assert!(
+            !parse(&full())
+                .unwrap()
+                .worker
+                .unwrap()
+                .commands_can_read_the_app_key(),
+            "a token is in the environment, which the commands do not get"
+        );
+        // A key given inline is in the environment, which the commands do not get either.
+        let key = TestAppKey::generate();
+        let mut inline = without_token(&[
+            ("GITHUB_APP_ID", "12345".to_owned()),
+            ("GITHUB_APP_OWNERS", "acme".to_owned()),
+            ("GITHUB_APP_PRIVATE_KEY", key.pkcs8_pem.clone()),
+        ]);
+        inline.remove("GITHUB_TOKEN");
+        let inline = parse_owned(&inline).unwrap().worker.unwrap();
+        assert!(!inline.commands_can_read_the_app_key());
     }
 }

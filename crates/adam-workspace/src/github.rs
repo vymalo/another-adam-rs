@@ -3,6 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use adam_error::{Classify as _, ErrorClass};
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
@@ -11,7 +12,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::code_host::{
-    CodeHost, CreatedRepository, NewPullRequest, NewRepository, OwnerKind, PullRequest,
+    Checks, CodeHost, CreatedRepository, MergePullRequest, MergedPullRequest, NewPullRequest,
+    NewRepository, OwnerKind, PullRequest, PullRequestStatus,
 };
 use crate::credentials::DynGitCredentials;
 use crate::error::{WorkspaceError, WorkspaceResult};
@@ -19,6 +21,9 @@ use crate::repo::RepoRef;
 
 const DEFAULT_API_BASE: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
+/// Check runs read for one commit: a page and how many pages. More are reported as unfinished.
+const CHECK_RUNS_PER_PAGE: u32 = 100;
+const MAX_CHECK_RUN_PAGES: u32 = 3;
 const DEFAULT_USER_AGENT: &str = concat!("adam-workspace/", env!("CARGO_PKG_VERSION"));
 
 /// GitHub REST client implementing [`CodeHost`].
@@ -32,6 +37,10 @@ const DEFAULT_USER_AGENT: &str = concat!("adam-workspace/", env!("CARGO_PKG_VERS
 #[derive(Clone)]
 pub struct GitHub {
     http: reqwest::Client,
+    /// For what changes or reads a named repository, a pull request or its checks, before a merge
+    /// or a deletion: **it follows no redirect**, so a repository that was renamed or transferred
+    /// is never reached through its old address (see [`GitHub::verify_repository`]).
+    exact: reqwest::Client,
     api_base: String,
     creds: DynGitCredentials,
 }
@@ -52,14 +61,18 @@ impl GitHub {
     /// [`WorkspaceError::Invalid`] if the HTTP client cannot be constructed
     /// (for example when the TLS backend fails to initialise).
     pub fn new(creds: DynGitCredentials) -> WorkspaceResult<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(DEFAULT_USER_AGENT)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| WorkspaceError::Invalid(format!("cannot build HTTP client: {e}")))?;
+        let build = |redirects: reqwest::redirect::Policy| {
+            reqwest::Client::builder()
+                .user_agent(DEFAULT_USER_AGENT)
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .redirect(redirects)
+                .build()
+                .map_err(|e| WorkspaceError::Invalid(format!("cannot build HTTP client: {e}")))
+        };
         Ok(Self {
-            http,
+            http: build(reqwest::redirect::Policy::default())?,
+            exact: build(reqwest::redirect::Policy::none())?,
             api_base: DEFAULT_API_BASE.to_owned(),
             creds,
         })
@@ -73,12 +86,161 @@ impl GitHub {
     }
 
     fn request(&self, method: Method, path: &str, token: &SecretString) -> RequestBuilder {
-        self.http
-            .request(method, format!("{}{path}", self.api_base))
+        self.build(&self.http, method, path, token)
+    }
+
+    /// [`request`](Self::request) on the client that follows no redirect.
+    fn exact_request(&self, method: Method, path: &str, token: &SecretString) -> RequestBuilder {
+        self.build(&self.exact, method, path, token)
+    }
+
+    fn build(
+        &self,
+        http: &reqwest::Client,
+        method: Method,
+        path: &str,
+        token: &SecretString,
+    ) -> RequestBuilder {
+        http.request(method, format!("{}{path}", self.api_base))
             .header(AUTHORIZATION, format!("Bearer {}", token.expose_secret()))
             .header(ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
             .header(USER_AGENT, DEFAULT_USER_AGENT)
+    }
+
+    /// Check that `owner/name` is **that** repository on the host and not another one that GitHub
+    /// redirects its address to. A repository that was renamed or transferred keeps answering at its
+    /// old address with a redirect (and an address that is free again can be somebody else's), so what
+    /// a person named a while ago can be a different repository now. Everything that merges, renames
+    /// or deletes asks first, and none of it follows a redirect.
+    ///
+    /// [`WorkspaceError::Conflict`] when the host redirects or names the repository differently.
+    async fn verify_repository(
+        &self,
+        token: &SecretString,
+        owner: &str,
+        name: &str,
+    ) -> WorkspaceResult<()> {
+        let resp = self
+            .exact_request(Method::GET, &format!("/repos/{owner}/{name}"), token)
+            .send()
+            .await
+            .map_err(|e| transport(e, token))?;
+        if resp.status().is_redirection() {
+            return Err(WorkspaceError::Conflict(format!(
+                "{owner}/{name} has moved (the host answers {} for its address): it is not the \
+                 repository that was named any more, so nothing was done to it",
+                resp.status().as_u16()
+            )));
+        }
+        let found: ApiRepoName = check(resp, token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, token))?;
+        if found
+            .full_name
+            .eq_ignore_ascii_case(&format!("{owner}/{name}"))
+        {
+            Ok(())
+        } else {
+            Err(WorkspaceError::Conflict(format!(
+                "{owner}/{name} is called {} on the host: it is not the repository that was named,                  so nothing was done to it",
+                found.full_name
+            )))
+        }
+    }
+
+    /// `GET /repos/{owner}/{name}/pulls/{number}`.
+    async fn read_pull(
+        &self,
+        token: &SecretString,
+        (owner, name): (&str, &str),
+        number: u64,
+    ) -> WorkspaceResult<ApiPullDetail> {
+        let resp = self
+            .exact_request(
+                Method::GET,
+                &format!("/repos/{owner}/{name}/pulls/{number}"),
+                token,
+            )
+            .send()
+            .await
+            .map_err(|e| transport(e, token))?;
+        check(resp, token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, token))
+    }
+
+    /// What the host reports for the checks of commit `sha`: the combined status and every check run
+    /// as [`Checks`], and whether it reported any at all. `mergeable_state` `clean` is the host calling
+    /// the pull request ready, which stands in for success when nothing was reported.
+    async fn checks_of(
+        &self,
+        token: &SecretString,
+        (owner, name): (&str, &str),
+        sha: &str,
+        mergeable_state: Option<&str>,
+    ) -> WorkspaceResult<(Checks, bool)> {
+        if sha.is_empty() || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(WorkspaceError::Invalid(format!(
+                "{sha:?} is not a commit id"
+            )));
+        }
+        let resp = self
+            .exact_request(
+                Method::GET,
+                &format!("/repos/{owner}/{name}/commits/{sha}/status"),
+                token,
+            )
+            .send()
+            .await
+            .map_err(|e| transport(e, token))?;
+        let status: ApiCombinedStatus = check(resp, token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, token))?;
+        let mut runs = Vec::new();
+        let mut truncated = false;
+        for page in 1..=MAX_CHECK_RUN_PAGES {
+            let resp = self
+                .exact_request(
+                    Method::GET,
+                    &format!("/repos/{owner}/{name}/commits/{sha}/check-runs"),
+                    token,
+                )
+                .query(&[
+                    ("per_page", CHECK_RUNS_PER_PAGE.to_string()),
+                    ("page", page.to_string()),
+                ])
+                .send()
+                .await
+                .map_err(|e| transport(e, token))?;
+            let got: ApiCheckRuns = check(resp, token)
+                .await?
+                .json()
+                .await
+                .map_err(|e| decode_error(e, token))?;
+            let empty = got.check_runs.is_empty();
+            runs.extend(got.check_runs);
+            if runs.len() as u64 >= got.total_count || empty {
+                break;
+            }
+            truncated = page == MAX_CHECK_RUN_PAGES;
+        }
+        // "Reported" is reported **green**: a commit whose runs were all skipped or neutral, or whose
+        // statuses all failed to say, was checked by nothing.
+        let reported = (status.total_count > 0 && status.state == "success")
+            || runs.iter().any(|run| {
+                run.status == "completed" && run.conclusion.as_deref() == Some("success")
+            });
+        Ok((
+            classify_checks(mergeable_state, &status, &runs, truncated),
+            reported,
+        ))
     }
 
     /// The open pull request from `head`; against `repo.base_branch` when `on_base`, against any
@@ -121,6 +283,70 @@ impl GitHub {
                             .is_some_and(|b| b.branch == repo.base_branch))
             })
             .map(|p| p.into_pull_request(branch)))
+    }
+
+    /// Delete the head branch of a merged pull request, if it is this repository's own and not
+    /// the base: `(the branch deleted, why a branch was kept)`. A failure here is a note, never an
+    /// error: the merge happened.
+    async fn delete_head(
+        &self,
+        token: &SecretString,
+        (owner, name): (&str, &str),
+        pull: &ApiPullDetail,
+    ) -> (Option<String>, Option<String>) {
+        let Some(head) = &pull.head else {
+            return (
+                None,
+                Some("the pull request names no head branch".to_owned()),
+            );
+        };
+        let own = format!("{owner}/{name}");
+        let in_this_repository = head
+            .repo
+            .as_ref()
+            .is_some_and(|r| r.full_name.eq_ignore_ascii_case(&own));
+        if !in_this_repository {
+            return (
+                None,
+                Some(format!(
+                    "the branch {} is not in {own} (a fork, or a repository that is gone), so it is kept",
+                    head.branch
+                )),
+            );
+        }
+        if pull.base.as_ref().is_some_and(|b| b.branch == head.branch) {
+            return (
+                None,
+                Some(format!(
+                    "the branch {} is the base, so it is kept",
+                    head.branch
+                )),
+            );
+        }
+        let path = format!(
+            "/repos/{owner}/{name}/git/refs/heads/{}",
+            encode_ref(&head.branch)
+        );
+        let sent = self
+            .exact_request(Method::DELETE, &path, token)
+            .send()
+            .await;
+        let outcome = match sent {
+            Ok(resp) => check(resp, token).await.map(|_| ()),
+            Err(e) => Err(transport(e, token)),
+        };
+        match outcome {
+            Ok(()) => (Some(head.branch.clone()), None),
+            // Deleted already (a repository that deletes merged branches by itself).
+            Err(e) if e.class() == ErrorClass::NotFound => (
+                None,
+                Some(format!("the branch {} was already gone", head.branch)),
+            ),
+            Err(e) => (
+                None,
+                Some(format!("the branch {} was not deleted: {e}", head.branch)),
+            ),
+        }
     }
 }
 
@@ -326,6 +552,167 @@ impl CodeHost for GitHub {
             .map_err(|e| decode_error(e, &token))?;
         Ok(account.login)
     }
+
+    #[tracing::instrument(skip(self, repo), fields(repo = %repo.url, number))]
+    async fn pull_request_status(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequestStatus, WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        let (owner, name) = slug(repo)?;
+        self.verify_repository(&token, &owner, &name).await?;
+        let pull = self.read_pull(&token, (&owner, &name), number).await?;
+        let Some(head) = pull.head else {
+            return Err(WorkspaceError::Invalid(format!(
+                "pull request #{number} names no head branch"
+            )));
+        };
+        let head_sha = head.sha.unwrap_or_default();
+        let (checks, ci_reported) = self
+            .checks_of(
+                &token,
+                (&owner, &name),
+                &head_sha,
+                pull.mergeable_state.as_deref(),
+            )
+            .await?;
+        Ok(PullRequestStatus {
+            number,
+            url: pull.html_url,
+            open: pull.state == "open" && !pull.merged,
+            merged: pull.merged,
+            draft: pull.draft,
+            head_branch: head.branch,
+            head_repo: head.repo.map(|r| r.full_name),
+            head_sha,
+            base_branch: pull.base.map(|b| b.branch).unwrap_or_default(),
+            checks,
+            ci_reported,
+        })
+    }
+
+    #[tracing::instrument(skip(self, merge), fields(repo = %merge.repo.url, number = merge.number))]
+    async fn merge_pull_request(
+        &self,
+        merge: MergePullRequest,
+    ) -> Result<MergedPullRequest, WorkspaceError> {
+        let token = self.creds.token_for(&merge.repo).await?;
+        let (owner, name) = slug(&merge.repo)?;
+        self.verify_repository(&token, &owner, &name).await?;
+        let path = format!("/repos/{owner}/{name}/pulls/{}", merge.number);
+        // Read it first: what is merged is the head the caller decided on (`expected_sha`), else the
+        // head the host shows now; a pull request that was merged already is reported as it is, and
+        // the head branch is known for the delete.
+        let pull = self
+            .read_pull(&token, (&owner, &name), merge.number)
+            .await?;
+        if pull.merged {
+            return Ok(MergedPullRequest {
+                sha: pull.merge_commit_sha.unwrap_or_default(),
+                url: pull.html_url,
+                already_merged: true,
+                deleted_branch: None,
+                branch_note: None,
+            });
+        }
+        if pull.state != "open" {
+            return Err(WorkspaceError::Invalid(format!(
+                "pull request #{} is {}, not open",
+                merge.number, pull.state
+            )));
+        }
+        let head_sha = pull.head.as_ref().and_then(|h| h.sha.as_deref());
+        if let Some(expected) = &merge.expected_sha
+            && head_sha != Some(expected.as_str())
+        {
+            return Err(WorkspaceError::Conflict(format!(
+                "the head of pull request #{} is {} now, not {expected}, the commit that was \
+                 looked at: it was not merged",
+                merge.number,
+                head_sha.unwrap_or("unknown")
+            )));
+        }
+        let mut body = json!({"merge_method": merge.method.as_str()});
+        if let Some(sha) = merge.expected_sha.as_deref().or(head_sha) {
+            body["sha"] = json!(sha);
+        }
+        let resp = self
+            .exact_request(Method::PUT, &format!("{path}/merge"), &token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        let merged: ApiMerge = check_merge(resp, &token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, &token))?;
+        let (deleted_branch, branch_note) = if merge.delete_branch {
+            self.delete_head(&token, (&owner, &name), &pull).await
+        } else {
+            (None, None)
+        };
+        Ok(MergedPullRequest {
+            sha: merged.sha.unwrap_or_default(),
+            url: pull.html_url,
+            already_merged: false,
+            deleted_branch,
+            branch_note,
+        })
+    }
+
+    #[tracing::instrument(skip(self, repo), fields(repo = %repo.url, new_name))]
+    async fn rename_repository(
+        &self,
+        repo: &RepoRef,
+        new_name: &str,
+    ) -> Result<CreatedRepository, WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        let (owner, name) = slug(repo)?;
+        // The new name is sent in a body, but it is still only ever a repository's name.
+        if new_name.is_empty()
+            || new_name.len() > 100
+            || !new_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err(WorkspaceError::Invalid(format!(
+                "{new_name:?} is not a repository name"
+            )));
+        }
+        self.verify_repository(&token, &owner, &name).await?;
+        let resp = self
+            .exact_request(Method::PATCH, &format!("/repos/{owner}/{name}"), &token)
+            .json(&json!({ "name": new_name }))
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        let renamed: ApiRepository = check(resp, &token)
+            .await?
+            .json()
+            .await
+            .map_err(|e| decode_error(e, &token))?;
+        Ok(CreatedRepository {
+            full_name: renamed.full_name,
+            clone_url: renamed.clone_url,
+            html_url: renamed.html_url,
+            default_branch: renamed.default_branch.unwrap_or_else(|| "main".to_owned()),
+        })
+    }
+
+    #[tracing::instrument(skip(self, repo), fields(repo = %repo.url))]
+    async fn delete_repository(&self, repo: &RepoRef) -> Result<(), WorkspaceError> {
+        let token = self.creds.token_for(repo).await?;
+        let (owner, name) = slug(repo)?;
+        self.verify_repository(&token, &owner, &name).await?;
+        let resp = self
+            .exact_request(Method::DELETE, &format!("/repos/{owner}/{name}"), &token)
+            .send()
+            .await
+            .map_err(|e| transport(e, &token))?;
+        check(resp, &token).await.map(|_| ())
+    }
 }
 
 /// What a repository creation answers.
@@ -335,6 +722,121 @@ struct ApiRepository {
     clone_url: String,
     html_url: String,
     default_branch: Option<String>,
+}
+
+/// What `GET /repos/{owner}/{name}/pulls/{number}` says that a merge needs.
+#[derive(Deserialize)]
+struct ApiPullDetail {
+    html_url: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    merged: bool,
+    #[serde(default)]
+    draft: bool,
+    /// `clean`, `dirty`, `blocked`, `behind`, `unstable`...; `unknown` while GitHub computes it.
+    mergeable_state: Option<String>,
+    merge_commit_sha: Option<String>,
+    head: Option<ApiHeadDetail>,
+    base: Option<ApiHead>,
+}
+
+/// The head of a pull request: its branch, the commit the host shows, and the repository it is in.
+#[derive(Deserialize)]
+struct ApiHeadDetail {
+    #[serde(rename = "ref")]
+    branch: String,
+    sha: Option<String>,
+    repo: Option<ApiRepoName>,
+}
+
+/// A repository, by its `owner/name`.
+#[derive(Deserialize)]
+struct ApiRepoName {
+    full_name: String,
+}
+
+/// `GET /repos/{owner}/{name}/commits/{sha}/status`.
+#[derive(Deserialize)]
+struct ApiCombinedStatus {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    total_count: u64,
+}
+
+/// `GET /repos/{owner}/{name}/commits/{sha}/check-runs`.
+#[derive(Deserialize)]
+struct ApiCheckRuns {
+    #[serde(default)]
+    total_count: u64,
+    #[serde(default)]
+    check_runs: Vec<ApiCheckRun>,
+}
+
+#[derive(Deserialize)]
+struct ApiCheckRun {
+    name: String,
+    #[serde(default)]
+    status: String,
+    conclusion: Option<String>,
+}
+
+/// The checks of a commit as [`Checks`]: a status that failed or errored, or a check run that
+/// finished with anything but success, neutral or skipped, is failing; one that has not finished is
+/// pending; none reported, with the pull request not `clean`, is unreported; anything else passes.
+fn classify_checks(
+    mergeable_state: Option<&str>,
+    status: &ApiCombinedStatus,
+    runs: &[ApiCheckRun],
+    truncated: bool,
+) -> Checks {
+    let mut failing = Vec::new();
+    let mut pending = Vec::new();
+    match status.state.as_str() {
+        "failure" | "error" => failing.push(format!("commit status: {}", status.state)),
+        "pending" if status.total_count > 0 => pending.push("commit status: pending".to_owned()),
+        _ => {}
+    }
+    for run in runs {
+        if run.status != "completed" {
+            pending.push(format!("{} ({})", run.name, run.status));
+            continue;
+        }
+        match run.conclusion.as_deref() {
+            Some("success" | "neutral" | "skipped") => {}
+            other => failing.push(format!(
+                "{}: {}",
+                run.name,
+                other.unwrap_or("no conclusion")
+            )),
+        }
+    }
+    if truncated {
+        pending.push(format!(
+            "more than {} check runs, the rest are not read",
+            CHECK_RUNS_PER_PAGE * MAX_CHECK_RUN_PAGES
+        ));
+    }
+    if !failing.is_empty() {
+        Checks::Failing(failing.join("; "))
+    } else if !pending.is_empty() {
+        Checks::Pending(pending.join("; "))
+    } else if status.total_count == 0 && runs.is_empty() && mergeable_state != Some("clean") {
+        Checks::Unreported(format!(
+            "the host reports no status and no check run for this commit, and the pull request is \
+             {}",
+            mergeable_state.unwrap_or("not clean")
+        ))
+    } else {
+        Checks::Passing
+    }
+}
+
+/// What a merge answers.
+#[derive(Deserialize)]
+struct ApiMerge {
+    sha: Option<String>,
 }
 
 /// A user or an organisation (`GET /users/{login}`, `GET /user`).
@@ -454,6 +956,31 @@ async fn check(resp: Response, token: &SecretString) -> WorkspaceResult<Response
     })
 }
 
+/// [`check`] for a merge: GitHub answers `405` ("Pull Request is not mergeable": a protected branch,
+/// failing required checks, a conflict, a draft) and `409` ("Head branch was modified") when its own
+/// rules refuse, which is [`WorkspaceError::Conflict`] with its words, not an unexpected status.
+async fn check_merge(resp: Response, token: &SecretString) -> WorkspaceResult<Response> {
+    let status = resp.status();
+    if status == StatusCode::METHOD_NOT_ALLOWED || status == StatusCode::CONFLICT {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(WorkspaceError::Conflict(scrub(&api_message(&body), token)));
+    }
+    check(resp, token).await
+}
+
+/// `branch` as the path of a ref: every segment percent-encoded, the slashes kept.
+fn encode_ref(branch: &str) -> String {
+    let mut out = String::with_capacity(branch.len());
+    for byte in branch.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 /// The longest wait a rate-limited response can ask for; a larger value is a broken header.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 
@@ -537,6 +1064,110 @@ mod tests {
             h.insert(*k, HeaderValue::from_str(v).unwrap());
         }
         h
+    }
+
+    fn run(name: &str, status: &str, conclusion: Option<&str>) -> ApiCheckRun {
+        ApiCheckRun {
+            name: name.to_owned(),
+            status: status.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+        }
+    }
+
+    fn combined(state: &str, total_count: u64) -> ApiCombinedStatus {
+        ApiCombinedStatus {
+            state: state.to_owned(),
+            total_count,
+        }
+    }
+
+    #[test]
+    fn checks_are_passing_only_when_everything_reported_finished_well() {
+        let ok = [
+            run("build", "completed", Some("success")),
+            run("lint", "completed", Some("skipped")),
+            run("docs", "completed", Some("neutral")),
+        ];
+        assert_eq!(
+            classify_checks(Some("blocked"), &combined("success", 1), &ok, false),
+            Checks::Passing
+        );
+        // A run with no commit status at all (GitHub says `pending`, count 0) is fine.
+        assert_eq!(
+            classify_checks(None, &combined("pending", 0), &ok, false),
+            Checks::Passing
+        );
+        let red = [
+            run("build", "completed", Some("failure")),
+            ok[0].clone_run(),
+        ];
+        assert!(matches!(
+            classify_checks(None, &combined("success", 1), &red, false),
+            Checks::Failing(m) if m == "build: failure"
+        ));
+        for (conclusion, failing) in [
+            ("cancelled", true),
+            ("timed_out", true),
+            ("action_required", true),
+            ("stale", true),
+        ] {
+            let one = [run("x", "completed", Some(conclusion))];
+            assert_eq!(
+                matches!(
+                    classify_checks(None, &combined("success", 1), &one, false),
+                    Checks::Failing(_)
+                ),
+                failing,
+                "{conclusion}"
+            );
+        }
+        assert!(matches!(
+            classify_checks(None, &combined("failure", 2), &ok, false),
+            Checks::Failing(m) if m == "commit status: failure"
+        ));
+        let running = [run("build", "in_progress", None)];
+        assert!(matches!(
+            classify_checks(None, &combined("success", 1), &running, false),
+            Checks::Pending(m) if m == "build (in_progress)"
+        ));
+        assert!(matches!(
+            classify_checks(None, &combined("pending", 2), &ok, false),
+            Checks::Pending(_)
+        ));
+        // Failing wins over pending, and a cut-off list is never passing.
+        let mixed = [
+            run("a", "queued", None),
+            run("b", "completed", Some("failure")),
+        ];
+        assert!(matches!(
+            classify_checks(None, &combined("success", 1), &mixed, false),
+            Checks::Failing(_)
+        ));
+        assert!(matches!(
+            classify_checks(None, &combined("success", 1), &ok, true),
+            Checks::Pending(_)
+        ));
+        assert!(matches!(
+            classify_checks(Some("unstable"), &combined("pending", 0), &[], false),
+            Checks::Unreported(m) if m.contains("unstable")
+        ));
+        // A pull request the host calls clean with nothing reported passes (the caller is told that
+        // nothing was reported), and one with a failure does not, whatever the host calls it.
+        assert_eq!(
+            classify_checks(Some("clean"), &combined("pending", 0), &[], false),
+            Checks::Passing
+        );
+        let red = [run("build", "completed", Some("failure"))];
+        assert!(matches!(
+            classify_checks(Some("clean"), &combined("success", 1), &red, false),
+            Checks::Failing(_)
+        ));
+    }
+
+    impl ApiCheckRun {
+        fn clone_run(&self) -> Self {
+            run(&self.name, &self.status, self.conclusion.as_deref())
+        }
     }
 
     #[test]

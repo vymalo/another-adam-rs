@@ -116,13 +116,14 @@ pub mod push;
 mod rest;
 mod server;
 mod signing;
+mod tier;
 
 pub use auth::AuthConfig;
 pub use backend::{BackendError, Caller, DynTaskBackend, TaskBackend, TaskEvent};
 pub use card::{AgentCardConfig, ExtendedCardConfig, ExtensionConfig, SkillConfig};
 pub use extensions::{
-    A2UI_BASIC_CATALOG_V0_9_1, A2UI_EXTENSION_V0_9_1, A2UI_MEDIA_TYPE, BUILD_EXTENSION,
-    MENTIONS_EXTENSION, STEER_EXTENSION, STEPS_EXTENSION, TEXT_STREAM_EXTENSION,
+    A2UI_BASIC_CATALOG_V0_9_1, A2UI_EXTENSION_V0_9_1, A2UI_MEDIA_TYPE, ACCESS_TIER_EXTENSION,
+    BUILD_EXTENSION, MENTIONS_EXTENSION, STEER_EXTENSION, STEPS_EXTENSION, TEXT_STREAM_EXTENSION,
     TEXT_STREAM_KIND_REASONING, THREAD_TOOLS_EXTENSION, UI_CATALOG_EXTENSION, UNKNOWN_REVISION,
     USAGE_EXTENSION, build_version, revision_of,
 };
@@ -135,3 +136,4 @@ pub use signing::generate_signing_key_pem;
 pub use signing::{
     CardSigner, SigningError, VerifyError, VerifyingKey, canonical_payload, canonicalize,
 };
+pub use tier::{AccessTier, AccessTiers, AccessTiersError, NotATier};

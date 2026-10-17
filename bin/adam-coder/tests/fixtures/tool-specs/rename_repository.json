@@ -1,0 +1,21 @@
+{
+  "name": "rename_repository",
+  "description": "Rename a repository the person named, to `new_name` (the same owner). GitHub keeps redirecting the old address. It needs the bypass access tier, and GitHub's own rules and the permissions of your credentials decide whether it happens: if it refuses you get its words, and you tell the person.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo": {
+        "type": "string",
+        "description": "The repository the person named: `owner/name`, or its address"
+      },
+      "new_name": {
+        "type": "string",
+        "description": "The new name: letters, digits, `.`, `_` and `-`, at most 100 characters"
+      }
+    },
+    "required": [
+      "repo",
+      "new_name"
+    ]
+  }
+}

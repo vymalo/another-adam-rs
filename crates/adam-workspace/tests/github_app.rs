@@ -1280,3 +1280,123 @@ async fn the_caches_are_bounded() {
 fn the_default_bound_is_what_the_adr_says() {
     assert_eq!(MAX_CACHED_INSTALLATIONS, 64);
 }
+
+// ------------------------------------------------------------ the accounts an App acts for
+
+mod accounts {
+    use super::*;
+    use wiremock::matchers::query_param;
+
+    fn key() -> AppKey {
+        AppKey::from_pem(&TestAppKey::generate().pkcs1_pem).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_pinned_app_acts_for_the_account_of_its_installation() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/app/installations/67890"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"id": 67890, "account": {"login": "Acme"}, "suspended_at": null}),
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let app = GitHubApp::new(server.uri(), APP_ID, INSTALLATION, key()).unwrap();
+        assert_eq!(app.accounts().await.unwrap(), ["acme"]);
+        // The trait says it too, through the host check that wraps it.
+        let scoped = HostScoped::new(["github.com"], app);
+        assert_eq!(
+            scoped.acts_for().await.unwrap(),
+            Some(vec!["acme".to_owned()])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suspended_installation_acts_for_nobody() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/app/installations/67890"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 67890, "account": {"login": "acme"}, "suspended_at": "2026-10-01T00:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+        let app = GitHubApp::new(server.uri(), APP_ID, INSTALLATION, key()).unwrap();
+        assert!(app.accounts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_listed_owners_are_the_accounts_and_nothing_is_asked_of_github() {
+        let server = MockServer::start().await;
+        let app = GitHubApp::discovering(
+            server.uri(),
+            APP_ID,
+            key(),
+            AppOwners::only(["Acme", "octocat"]),
+        )
+        .unwrap();
+        assert_eq!(app.accounts().await.unwrap(), ["acme", "octocat"]);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn any_owner_means_every_account_the_app_is_installed_on_page_by_page() {
+        let server = MockServer::start().await;
+        let installation = |login: &str, suspended: bool| {
+            json!({
+                "id": 1, "account": {"login": login},
+                "suspended_at": suspended.then_some("2026-10-01T00:00:00Z"),
+            })
+        };
+        // A full page, then a short one: both are read, and the suspended one is left out.
+        let first: Vec<Value> = (0..100)
+            .map(|i| installation(&format!("Org{i:03}"), false))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/app/installations"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/app/installations"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                installation("late", false),
+                installation("gone", true),
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let app = GitHubApp::discovering(server.uri(), APP_ID, key(), AppOwners::Any).unwrap();
+        let accounts = app.accounts().await.unwrap();
+        assert_eq!(accounts.len(), 101);
+        assert!(accounts.contains(&"late".to_owned()) && !accounts.contains(&"gone".to_owned()));
+        assert!(accounts.contains(&"org000".to_owned()), "lowercased");
+    }
+
+    #[tokio::test]
+    async fn credentials_github_refuses_are_auth_and_a_token_acts_for_no_list() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(json!({"message": "Bad credentials"})),
+            )
+            .mount(&server)
+            .await;
+        let app = GitHubApp::discovering(server.uri(), APP_ID, key(), AppOwners::Any).unwrap();
+        let err = app.accounts().await.unwrap_err();
+        assert_eq!(err.class(), ErrorClass::Unauthenticated, "{err:?}");
+        // The default: a token is not confined to accounts.
+        assert_eq!(
+            adam_workspace::StaticToken::new("t")
+                .acts_for()
+                .await
+                .unwrap(),
+            None
+        );
+    }
+}

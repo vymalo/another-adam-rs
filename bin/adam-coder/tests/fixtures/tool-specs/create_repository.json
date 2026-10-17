@@ -1,6 +1,6 @@
 {
   "name": "create_repository",
-  "description": "Create a new, empty repository for a person or an organisation, after the person you are working with agrees. It works only for the owners this deployment allows, and the repository is private unless you say `private: false` (public only when the person asked for it). The person is asked a yes or no question that this tool writes; their answer comes back as the result of this call. If it was a yes, call create_repository again with the same arguments and it creates the repository; if it was a no, do not ask again and do not look for another way. The new repository is empty: put a scratch project in it with publish_scratch.",
+  "description": "Create a new, empty repository for a person or an organisation, after the person you are working with agrees. It works only for the owners this deployment allows, and the repository is private unless you say `private: false` (public only when the person asked for it). The person is asked a yes or no question that this tool writes (not under the bypass access tier, which asks nothing); their answer comes back as the result of this call. If it was a yes, call create_repository again with the same arguments and it creates the repository; if it was a no, do not ask again and do not look for another way. The new repository is empty: put a scratch project in it with publish_scratch. It needs the auto access tier or above.",
   "parameters": {
     "type": "object",
     "properties": {

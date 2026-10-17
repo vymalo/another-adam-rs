@@ -36,7 +36,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `spec_for::<A>(name, description)`, `ToolSpecExt::for_args` | feature `schema`: the `ToolSpec` of a tool whose arguments are `A: JsonSchema` |
 | `ToolError::from_classified(&e)` | a retryable `Classify` error becomes `Transient`, any other `Permanent`, with the whole source chain as the message |
 | `__private` | feature `schema`, `#[doc(hidden)]`: the paths `#[tool]` generates code against (`serde`, `schemars`, `async_trait`, `spec_for`, `parse_args`, ...). Not API: it changes with the macro |
-| `ToolSource`, `DynToolSource`, `SourceCtx`, `LlmAgentBuilder::tool_source`, `MAX_SOURCE_TOOLS` | tools the agent learns about while it runs: a source lists its tools at every model turn (`specs(&SourceCtx)`, or `listing` for the tools **and their notes**), may rewrite how the tools of that turn are described (`refine(&SourceCtx, &mut [ToolSpec])`, default: nothing), may add words to the agent's instructions for the turn (`instructions(&SourceCtx) -> Option<String>`, default: nothing) and answers the calls to them (`call(&ToolCtx, name, args) -> Option<..>`), see *Context and tool sources* |
+| `ToolSource`, `DynToolSource`, `SourceCtx`, `LlmAgentBuilder::tool_source`, `MAX_SOURCE_TOOLS` | tools the agent learns about while it runs: a source lists its tools at every model turn (`specs(&SourceCtx)`, or `listing` for the tools **and their notes**), may rewrite how the tools of that turn are described (`refine(&SourceCtx, &mut [ToolSpec])`, default: nothing), may add words to the agent's instructions for the turn (`instructions(&SourceCtx) -> Option<String>`, default: nothing), **holds tools back** (`withhold(&SourceCtx, tools: &[&str]) -> Vec<Withheld>`, default: none: the tools of `tools` it names, the agent's own and the MCP servers' included, are not shown to the model on that turn, and a call to one is refused with the `Withheld::reason` when it would run) and answers the calls to them (`call(&ToolCtx, name, args) -> Option<..>`), see *Context and tool sources* |
 | `Listing`, `ToolNote`, `Conversation::source_notes` | what a source says about a tool it lists: the system behind it **reports each call as a step itself** (`reports_step`, so the agent reports none), how long a call may run (`timeout_ms`) and what its step is called (`label`); kept in the run's state with the model's answer, so a later call, on another worker, reads it without listing again |
 | `Conversation::context`, `merge_context`, `drop_expired_context`, `MAX_CONTEXT_BYTES` | what the messages of the run say about their sender, merged key by key (`null` deletes), bounded, with expiring entries; see *Context and tool sources* |
 | `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `ArtifactRef` | what `Runtime::view(run).state` deserializes into; `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed), `Conversation::root_run` the top of a child run's parent chain (absent for a run that is nobody's child, and in state stored before it existed) |
@@ -133,7 +133,9 @@ message carries (`adam-a2a-runtime`'s `vymalo_inbound`). The context is part of 
 change of worker keeps it, and a run that continues another starts with the one before
 (`Conversation::continued`; the new message's keys then win). Two bounds: the whole context is at most
 `MAX_CONTEXT_BYTES` (256 KiB of JSON; a message that would take it over has its context dropped, with a warning,
-and is still read for its text), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
+and is still read for its text, **but for the keys of `PROTECTED_CONTEXT_KEYS`**, today `ACCESS_TIER_CONTEXT_KEY`
+(`vymalo.accessTier`): a limit the person set is never lost to a large context, does not count toward the bound, and a
+value over `MAX_PROTECTED_VALUE_BYTES` is ignored), and **an entry that is an object with an `expiresAt` (RFC 3339) is removed once
 that time has passed**, at the start of the next step (`drop_expired_context`): a credential the sender put there
 does not stay in the store after it stops working. (A run parked for hours still holds it until it next steps.)
 
@@ -170,6 +172,14 @@ has, among which a tool the agent already owns): the omission is then a debug li
 `MAX_SOURCE_TOOLS` (64) are offered, and an agent with no source behaves exactly as before. A source's tool may ask
 the person and wait for a child run, but not wait on a remote task (`AwaitRemote` is answered with an error result:
 the agent polls the tool that started the task, and a source's tool is not known then).
+
+A source can also **hold tools back** (`ToolSource::withhold(&SourceCtx, tools) -> Vec<Withheld>`, each `Withheld { tool, reason }`, `tools` the
+names the model is about to be shown or the one it is calling; the default holds nothing, so a source written before it keeps
+working): the named tools, **whoever offers them** (the agent's own,
+a source's, an MCP server's), are taken out of what the model is shown on that turn, and a call to one is **refused when it
+would run**, inside the journaled step of the call, with the `reason` as its error result. The two moments read the run's context
+as it is then, so a limit a message sets (the coder's access tier) holds from the next model turn and the next call, and a replay
+reads nothing. It is a limit on what the agent may do, not a description: `refine` only rewrites text.
 
 A source can also **refine** the description of the tools the model is about to be shown (`ToolSource::refine`): after
 every source has listed, each gets the turn's tools, the agent's own first, and may rewrite a `description` from what it
@@ -398,8 +408,10 @@ that is stepping the run (through `Ctx::child_starter()`, whose only possible pa
 and the child keeps it in its stored state (`Conversation::root_run`), so `ToolCtx::root_run_id()` in a child of a
 child is the top run, after a restart and on another worker, with no store read per call. A tool that keeps a
 workspace or a budget for the whole task keys it by the root. Only code in the process writes the key: the A2A front
-builds payloads of `text` and `context`, and a run that continues another does not inherit it. (`tests/root_run.rs` is
-the chain of three runs; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too.)
+builds payloads of `text` and `context`, and a run that continues another does not inherit it. **A child starts with the
+`PROTECTED_CONTEXT_KEYS` of the run that starts it** (the access tier, and so on down a chain), nothing else of its context;
+a source in a child run is told the root with `SourceCtx::root_run_id()` (`detached_under(root, context)` for tests).
+(`tests/root_run.rs` is the chain of three runs, and the limits it hands down; `tests/child_runs.rs` starts children with a `Runtime` it holds, which works too.)
 
 ## Remote tasks
 
@@ -498,7 +510,7 @@ the answer with their stream, a replay after a crash inside the next tool keeps 
 tool again, a message that reaches the run clears it, a final answer ends the turn with no model call after it (and the calls
 of its model message are all answered first, and a refused one ends nothing), and the serde shapes of older journals.
 
-`tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
+`tests/withheld_tools.rs` covers `withhold`: a held-back tool (own or a source's) is not shown and a call to it is refused with the reason while the others run, a limit a later message lifts holds no more from the next turn, and a source that holds nothing changes nothing. `tests/context_and_sources.rs` is the suite of *Context and tool sources* (real `Runtime`, scripted `MockModel`, `MemoryStore`):
 the context of the start message reaching a tool, replace/delete/keep across messages, a continued run carrying the
 context (and the new message winning), the expiry, the size bound, state stored before the context existed, a question
 that keeps its interface and the frozen shapes of old journals, a source read at every turn (a tool offered since the
@@ -541,7 +553,7 @@ through the starter).
 
 `tests/llm_agent.rs` is a behavioural suite over a scripted `MockModel` and
 `MemoryStore` (`a_starter_inits_exactly_like_the_agent`, tool loop, retries and rate limits, limits, replay after a
-crash, `NeedsInput` parking, cancellation (a tool, and the model call in flight: a model that takes 30 s, before the answer and in the middle of a stream, is dropped and the step ends in milliseconds; the owed calls of a turn do not start; a continuation answers the calls that were owed), history truncation, and **steps**: a tool is a step in its own style and the steps it reports run under it, a plain tool is labelled with its name and an unknown one fails, a question keeps the step `waiting` until the answer ends it, a detached context reports to its sink; the run's files bounded at 6 MiB, and each call told what is left, `files_left`). Property tests
+crash (**the ids of tool calls a model client made up are journaled with the answer: a worker that dies mid-step and the survivor that replays see the same ids**), `NeedsInput` parking, cancellation (a tool, and the model call in flight: a model that takes 30 s, before the answer and in the middle of a stream, is dropped and the step ends in milliseconds; the owed calls of a turn do not start; a continuation answers the calls that were owed), history truncation, and **steps**: a tool is a step in its own style and the steps it reports run under it, a plain tool is labelled with its name and an unknown one fails, a question keeps the step `waiting` until the answer ends it, a detached context reports to its sink; the run's files bounded at 6 MiB, and each call told what is left, `files_left`). Property tests
 of the truncation are in `src/history.rs`; the journal record of a model
 failure is tested in `src/agent.rs`
 (`a_journaled_failure_keeps_the_class_the_hint_and_the_whole_chain`,

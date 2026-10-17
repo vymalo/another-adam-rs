@@ -15,6 +15,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use adam_a2a::AccessTier;
 use serde::{Deserialize, Serialize};
 
 use super::checks::ChecksReport;
@@ -225,7 +226,15 @@ pub struct PushedBranch {
     /// not open a second against another base. Absent in notes written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// The commits this conversation pushed for the branch (newest last, at most
+    /// [`MAX_PUSHED_SHAS`]): what makes a pull request whose head is one of them the conversation's
+    /// own, and not just one that has a branch of the same name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shas: Vec<String>,
 }
+
+/// The most commits [`PushedBranch::shas`] keeps.
+pub const MAX_PUSHED_SHAS: usize = 64;
 
 /// What the person answered to a question a tool wrote for them (see [`consent`](super::consent)):
 /// the answer to `request_repository` ("may this repository join the workspace?").
@@ -278,6 +287,76 @@ pub struct CreationIntent {
     pub private: bool,
 }
 
+/// A repository this run renamed (`rename_repository`): what a repeat of the call is recognised by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenamedRepo {
+    /// The key of the repository before, a [`named`](super::named) key.
+    pub from: String,
+    /// The key it has now (the clone URL the host reported).
+    pub to: String,
+    /// `owner/name` it has now, as the host spells it.
+    pub full_name: String,
+    /// The browser URL it has now.
+    pub html_url: String,
+}
+
+/// A pull request: its repository, as a [`named`](super::named) key, and its number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRef {
+    /// The repository, as a key.
+    pub repo: String,
+    /// The pull request's number.
+    pub number: u64,
+}
+
+/// Where one of the person's sayings stands in the conversation, as far as that is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    /// In the history, in the order it happened.
+    Past,
+    /// A message that arrived while a tool result was owed and waited behind it
+    /// (`Conversation::deferred`): it may be older or newer than the answers beside it.
+    Deferred,
+    /// Delivered and not yet read by the run: newer than all the rest, in arrival order.
+    Waiting,
+}
+
+/// One thing the person said, as the conversation holds it: a message, or the answer to a question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heard {
+    /// The text as it reached the run: for an answer through the interface, the lines the interface
+    /// wrote (see `named::typed_by_the_person`).
+    pub text: String,
+    /// The defaults of the text questions of the `ask_user` call this answers, when it is the answer
+    /// to that call's own form (paired with the call by position, and naming the surface the call drew
+    /// its form on): a typed question's words that are one of them are the model's, not the
+    /// person's. `None`: not an answer to a call, or one that is not to that call's form; none of its
+    /// typed questions' words count.
+    pub defaults: Option<Vec<String>>,
+    /// Where it stands.
+    pub when: When,
+}
+
+impl Heard {
+    /// `text`, a message the person wrote, in the order it happened.
+    pub fn said(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            defaults: None,
+            when: When::Past,
+        }
+    }
+}
+
+/// The most call ids [`RunNotes::text_questions`] keeps.
+pub const MAX_TEXT_QUESTIONS: usize = 64;
+
+/// The most words of the person's [`RunNotes::said_words`] keeps: past it the newest are not added.
+pub const MAX_SAID_WORDS: usize = 2000;
+
+/// The most pull requests [`RunNotes::red_pulls`] keeps: past it the newest are not added.
+pub const MAX_PULLS: usize = 256;
+
 /// Everything remembered about one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunNotes {
@@ -306,6 +385,12 @@ pub struct RunNotes {
     /// `create_repository`), in order. Filled by the agent before each step from the conversation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consents: Vec<Consent>,
+    /// The ids of the calls of a consent tool whose question went out as **text** (the screen could
+    /// not draw the form), in order. Written by the tool when it asks. Words answer only such a
+    /// question, and then only with the label of the yes option; a question that went out as a form,
+    /// or one this list does not hold, is answered by its form alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_questions: Vec<String>,
     /// The repositories this run created, in order. Written by `create_repository` itself, which
     /// also grants the repository's key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -347,10 +432,90 @@ pub struct RunNotes {
     /// (`RunWorkspace::adopt_scratch`). Done once, in the run's first step, before the model acts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scratch_adopted: bool,
+    /// The access tier the newest message named (`access-tier/v1`), as the agent recorded it before
+    /// the step: the tools check it again here, which is what keeps a subagent to the tier of the
+    /// root run. `None`: no message named one, and the run works under [`crate::tier::DEFAULT`].
+    /// Written by the agent from the conversation, never by a tool and never from the model's words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<AccessTier>,
+    /// The words of the person's **newest message** that stand alone and could be the name of a
+    /// repository (letters, digits, `.`, `_`, `-`, between spaces and punctuation: never a piece of a
+    /// URL or a path; lowercase, once each, at most [`MAX_SAID_WORDS`]): what makes a bare repository
+    /// name count as named under the `auto` tier. Replaced each step by the agent from the person's
+    /// words only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub said_words: Vec<String>,
+    /// The pull requests this conversation opened with `accept_red_checks` that mattered (the checks
+    /// were red), by their repository's key. Written by `open_pull_request`; a run that continues
+    /// another inherits them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub red_pulls: Vec<PullRef>,
+    /// The commits this conversation pushed whose code passed the run's own checks when
+    /// `open_pull_request` let it in (the gate): what stands in for a CI on a pull request that no CI
+    /// ever checked. Written by `open_pull_request`; a run that continues another inherits them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_shas: Vec<String>,
+    /// The repositories this run renamed, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renamed_repos: Vec<RenamedRepo>,
+    /// The repositories this run deleted (`owner/name`, lowercase), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_repos: Vec<String>,
 }
 
 /// Most shared files [`RunNotes::shared`] lists.
 pub const MAX_SHARED: usize = 64;
+
+/// The words of `text` that stand alone and could be a repository's name: split at spaces, with
+/// the punctuation around a word taken off (`"widgets."`, `` `widgets`, ``), what is left being
+/// letters, digits, `.`, `_` and `-` only, lowercase, two to a hundred characters. A piece of a URL
+/// or a path (`github.com/acme/widgets`, `src/widgets`, `?name=widgets`) is **not** a word: the
+/// token it is part of has a `/`, `:`, `@`... in it.
+pub(crate) fn standalone_words(text: &str) -> Vec<String> {
+    const AROUND: &[char] = &[
+        '"', '\'', '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', ':', '!', '?', '*',
+    ];
+    text.split_whitespace()
+        .map(|token| {
+            token
+                .trim_start_matches(AROUND)
+                .trim_end_matches(|c: char| AROUND.contains(&c) || c == '.')
+        })
+        .filter(|word| {
+            (2..=100).contains(&word.len())
+                && word.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        })
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// The standalone words (`standalone_words`) that every one of `texts` has, joined by spaces.
+fn shared_words(texts: &[&str]) -> String {
+    let mut shared = standalone_words(texts.first().copied().unwrap_or_default());
+    for text in texts.iter().skip(1) {
+        let words = standalone_words(text);
+        shared.retain(|word| words.contains(word));
+    }
+    shared.join(" ")
+}
+
+/// Add each of `pulls` that `list` does not have, up to [`MAX_PULLS`]; returns whether any was added.
+fn add_pulls(list: &mut Vec<PullRef>, pulls: impl IntoIterator<Item = PullRef>) -> bool {
+    let mut added = false;
+    for pull in pulls {
+        if list.len() >= MAX_PULLS {
+            break;
+        }
+        if !list.contains(&pull) {
+            list.push(pull);
+            added = true;
+        }
+    }
+    added
+}
 
 impl RunNotes {
     /// The check that decides for the code with tree id `tree`: **the most recent run, in any
@@ -389,10 +554,108 @@ impl RunNotes {
         added
     }
 
+    /// The access tier the run works under: the one recorded for the newest message, else the default.
+    pub fn tier(&self) -> AccessTier {
+        self.tier.unwrap_or(crate::tier::DEFAULT)
+    }
+
+    /// Make the words of `text`, the person's newest message, the words that stand alone in it
+    /// (`standalone_words`) and nothing else; returns whether that changed anything.
+    pub fn set_said_words(&mut self, text: &str) -> bool {
+        let mut words: Vec<String> = Vec::new();
+        for word in standalone_words(text) {
+            if words.len() >= MAX_SAID_WORDS {
+                break;
+            }
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+        let changed = words != self.said_words;
+        self.said_words = words;
+        changed
+    }
+
+    /// Remember that pull request `pull` was opened with red checks accepted; returns whether it
+    /// was new.
+    pub fn name_red_pulls(&mut self, pulls: impl IntoIterator<Item = PullRef>) -> bool {
+        add_pulls(&mut self.red_pulls, pulls)
+    }
+
+    /// Whether pull request `number` of the repository with `key` was opened with red checks
+    /// accepted.
+    pub fn red_accepted(&self, key: &str, number: u64) -> bool {
+        self.red_pulls
+            .iter()
+            .any(|p| p.repo == key && p.number == number)
+    }
+
+    /// Take in what the person said, `said` in order (messages and the answers they gave, as the
+    /// conversation holds them, the oldest first), and return whether the notes changed. Only what
+    /// they **typed** counts ([`typed_by_the_person`](super::named::typed_by_the_person)): what the
+    /// interface made of a click is what the model wrote into the form.
+    ///
+    /// * The repositories they named ([`named_repos`](Self::named_repos)).
+    /// * The words that stand alone in the newest of their words that have any
+    ///   ([`said_words`](Self::said_words)). The newest is what waits for the run, else the last
+    ///   thing in the history together with the messages that arrived while a tool result was owed
+    ///   (their place among the answers is not known, [`When::Deferred`]): then only the words every
+    ///   one of them has stand.
+    ///
+    /// What the person says does not decide a merge: `merge_pull_request` asks them itself.
+    pub fn hear(&mut self, said: &[Heard], host: &str) -> bool {
+        use super::named::named_in;
+        let typed: Vec<(String, When)> = said
+            .iter()
+            .map(|heard| {
+                (
+                    super::named::typed_by_the_person(&heard.text, heard.defaults.as_deref()),
+                    heard.when,
+                )
+            })
+            .collect();
+        let mut changed = self.name_repos(typed.iter().flat_map(|(text, _)| named_in(text, host)));
+        let newest: Vec<&str> = match typed.iter().rev().find(|(_, when)| *when == When::Waiting) {
+            Some((text, _)) => vec![text.as_str()],
+            None => typed
+                .iter()
+                .rev()
+                .find(|(_, when)| *when == When::Past)
+                .into_iter()
+                .chain(typed.iter().filter(|(_, when)| *when == When::Deferred))
+                .map(|(text, _)| text.as_str())
+                .collect(),
+        };
+        let spoken: Vec<&str> = newest
+            .iter()
+            .copied()
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+        let words = if spoken.is_empty() {
+            typed
+                .iter()
+                .rev()
+                .find(|(text, _)| !text.trim().is_empty())
+                .map_or_else(String::new, |(text, _)| text.clone())
+        } else {
+            shared_words(&spoken)
+        };
+        changed |= self.set_said_words(&words);
+        changed
+    }
+
+    /// Whether the person wrote `name` as a word of their own messages (without case).
+    pub fn said(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        self.said_words.contains(&name)
+    }
+
     /// Remember the answers `consents` of the person, and grant the repository of every one that
     /// agreed to `request_repository`'s question; returns whether anything was new. A consent is
-    /// the same as one already held when its call, tool and subject are, so recording the answers
-    /// of the whole conversation again at every step changes nothing.
+    /// the same as one already held when its call, tool, subject and answer are, so recording the
+    /// answers of the whole conversation again at every step changes nothing, and an answer that
+    /// differs from an earlier one to the same question (a provider may send the same call id
+    /// again) is recorded after it: the latest decides ([`agreed`](Self::agreed)).
     pub fn record_consents(&mut self, consents: impl IntoIterator<Item = Consent>) -> bool {
         let mut added = false;
         for consent in consents {
@@ -403,6 +666,7 @@ impl RunNotes {
                 c.call_id == consent.call_id
                     && c.tool == consent.tool
                     && c.subject == consent.subject
+                    && c.agreed == consent.agreed
             });
             if !known {
                 self.consents.push(consent);
@@ -439,6 +703,24 @@ impl RunNotes {
         self.creating.len() != before
     }
 
+    /// Note that the question of the call `call_id` went out as text; returns whether it was new.
+    /// At most [`MAX_TEXT_QUESTIONS`] are kept, the oldest dropped.
+    pub fn note_text_question(&mut self, call_id: &str) -> bool {
+        if self.text_questions.iter().any(|id| id == call_id) {
+            return false;
+        }
+        self.text_questions.push(call_id.to_owned());
+        if self.text_questions.len() > MAX_TEXT_QUESTIONS {
+            self.text_questions.remove(0);
+        }
+        true
+    }
+
+    /// Whether the question of the call `call_id` went out as text ([`text_questions`](Self::text_questions)).
+    pub fn is_text_question(&self, call_id: &str) -> bool {
+        self.text_questions.iter().any(|id| id == call_id)
+    }
+
     /// Whether the person agreed to `subject` when `tool` asked: the latest answer decides.
     pub fn agreed(&self, tool: &str, subject: &str) -> bool {
         self.consents
@@ -458,7 +740,8 @@ impl RunNotes {
             .is_some_and(|c| !c.agreed)
     }
 
-    /// Remember the branches `pushed` names; returns whether anything was new.
+    /// Remember the branches `pushed` names, and the commits pushed for them; returns whether anything
+    /// was new.
     pub fn name_pushed_branches(&mut self, pushed: impl IntoIterator<Item = PushedBranch>) -> bool {
         let mut added = false;
         for one in pushed {
@@ -467,12 +750,23 @@ impl RunNotes {
                 .iter_mut()
                 .find(|p| p.repo == one.repo && p.branch == one.branch)
             {
-                // Known: only a base it did not have yet is new.
-                Some(known) if known.base.is_none() && one.base.is_some() => {
-                    known.base = one.base;
-                    added = true;
+                Some(known) => {
+                    // A base it did not have yet is new, and so is each commit it did not have.
+                    if known.base.is_none() && one.base.is_some() {
+                        known.base = one.base;
+                        added = true;
+                    }
+                    for sha in one.shas {
+                        if !known.shas.contains(&sha) {
+                            known.shas.push(sha);
+                            added = true;
+                        }
+                    }
+                    if known.shas.len() > MAX_PUSHED_SHAS {
+                        let excess = known.shas.len() - MAX_PUSHED_SHAS;
+                        known.shas.drain(..excess);
+                    }
                 }
-                Some(_) => {}
                 None => {
                     self.pushed_branches.push(one);
                     added = true;
@@ -480,6 +774,39 @@ impl RunNotes {
             }
         }
         added
+    }
+
+    /// Remember that the code of the commit `sha` passed the run's checks when it was let in.
+    pub fn verify_sha(&mut self, sha: &str) -> bool {
+        if self.verified_shas.iter().any(|known| known == sha) {
+            return false;
+        }
+        if self.verified_shas.len() >= MAX_PUSHED_SHAS {
+            self.verified_shas.remove(0);
+        }
+        self.verified_shas.push(sha.to_owned());
+        true
+    }
+
+    /// Remember the commits `shas`, verified by an earlier run of the conversation.
+    pub fn verify_shas(&mut self, shas: impl IntoIterator<Item = String>) -> bool {
+        let mut added = false;
+        for sha in shas {
+            added |= self.verify_sha(&sha);
+        }
+        added
+    }
+
+    /// Whether the code of `sha` passed the run's checks when it was let into a pull request.
+    pub fn is_verified(&self, sha: &str) -> bool {
+        self.verified_shas.iter().any(|known| known == sha)
+    }
+
+    /// Whether this conversation pushed the commit `sha` for `branch` of the repository `repo`.
+    pub fn pushed_commit(&self, repo: &str, branch: &str, sha: &str) -> bool {
+        self.pushed_branches
+            .iter()
+            .any(|p| p.repo == repo && p.branch == branch && p.shas.iter().any(|s| s == sha))
     }
 
     /// The base branch recorded for `branch` of `repo`, if one was.
@@ -692,6 +1019,79 @@ mod tests {
             preexisting: false,
             base_commit: None,
         }
+    }
+
+    fn heard(text: &str, when: When) -> Heard {
+        Heard {
+            text: text.to_owned(),
+            defaults: Some(Vec::new()),
+            when,
+        }
+    }
+
+    #[test]
+    fn what_the_person_typed_names_the_repositories_and_a_click_names_none() {
+        let hear = |said: &[Heard]| {
+            let mut notes = RunNotes::default();
+            notes.hear(said, "github.com");
+            notes.named_repos
+        };
+        assert_eq!(
+            hear(&[heard("see acme/widgets", When::Past)]),
+            ["github.com/acme/widgets"]
+        );
+        // The ids and the values of a form are the model's.
+        assert!(
+            hear(&[heard(
+                "The person answered through the interface (form ask-1):\n- acme/widgets: gadgets/cogs",
+                When::Past
+            )])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_bare_names_are_the_words_every_one_of_the_newest_says() {
+        let said = |said: &[Heard]| {
+            let mut notes = RunNotes::default();
+            notes.hear(said, "github.com");
+            notes.said_words
+        };
+        assert_eq!(
+            said(&[heard("fix widgets", When::Past)]),
+            ["fix", "widgets"]
+        );
+        // A click that says nothing leaves the words before it.
+        assert_eq!(
+            said(&[heard("fix widgets", When::Past), heard("", When::Past)]),
+            ["fix", "widgets"]
+        );
+        // A message that waited behind an owed result may be older than the answer after it: only
+        // what both say stands.
+        assert_eq!(
+            said(&[
+                heard("fix widgets", When::Past),
+                heard("use gadgets", When::Past),
+                heard("fix widgets please", When::Deferred)
+            ]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            said(&[
+                heard("fix widgets", When::Past),
+                heard("", When::Past),
+                heard("then fix gadgets", When::Deferred)
+            ]),
+            ["then", "fix", "gadgets"]
+        );
+        // What waits for the run is the newest alone.
+        assert_eq!(
+            said(&[
+                heard("fix widgets", When::Past),
+                heard("gadgets", When::Waiting)
+            ]),
+            ["gadgets"]
+        );
     }
 
     #[test]

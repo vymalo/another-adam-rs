@@ -17,12 +17,13 @@ agent; [`adam-coder`](../../bin/adam-coder/README.md) uses it.
 | `RuntimeTaskBackend::new(runtime, events, agent)` | `events` must be the `BroadcastSink` the runtime was built with; `agent` is the registered name, as an agent (`.agent`) or as a start-only starter (`.starter`) |
 | `.with_poll_interval(..)`, `DEFAULT_POLL_INTERVAL` | how often a subscription re-reads the durable run |
 | `.with_prompt(..)`, `.with_inbound(..)` | override how the `input-required` question is derived (`PromptFn`; the default reads `state.pending_wait.question`, and `state.pending_question.question` for runs parked by an older build) and how an A2A message becomes an `Inbound` (`InboundFn`) |
-| `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings. `artifact_of`: string data is a text part, anything else a data part; an object whose `url` is an absolute `http(s)` URL also gets a `url` part after the data part (A2A v1 `Part.url`), so a client can show a link; **a file artifact (`adam_runtime::Artifact::file`) is one `raw` part** (`Part.raw`: the bytes, base64 in JSON) with `mediaType` and `filename` and nothing else, so any A2A client reads a standard file artifact and no extension is involved ([ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)). `artifact_id` follows a file's name, media type, filename and the SHA-256 of its bytes, so the live event and the durable copy are one artifact |
-| `vymalo_inbound`, `CONTEXT_UI_REF`, `CONTEXT_UI_CATALOG`, `CONTEXT_THREAD_TOOLS`, `integral_numbers` | the inbound function of an agent that serves a screen (`.with_inbound(vymalo_inbound)`): an A2UI action reads as the person's answer, and the extensions a message carries become the run's inbound context; see *A screen as the sender* |
+| `default_prompt`, `default_inbound`, `task_state`, `artifact_of`, `artifact_id` | the default mappings. `default_inbound` marks a line of text that begins as a form's answer `(typed) `, as `vymalo_inbound` does ([below](#a-screen-as-the-sender)). `artifact_of`: string data is a text part, anything else a data part; an object whose `url` is an absolute `http(s)` URL also gets a `url` part after the data part (A2A v1 `Part.url`), so a client can show a link; **a file artifact (`adam_runtime::Artifact::file`) is one `raw` part** (`Part.raw`: the bytes, base64 in JSON) with `mediaType` and `filename` and nothing else, so any A2A client reads a standard file artifact and no extension is involved ([ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)). `artifact_id` follows a file's name, media type, filename and the SHA-256 of its bytes, so the live event and the durable copy are one artifact |
+| `vymalo_inbound`, `form_answer_surface`, `ASK_SURFACE_PREFIX`, `comparable`, `is_format_or_control`, `CONTEXT_UI_REF`, `CONTEXT_UI_CATALOG`, `CONTEXT_THREAD_TOOLS`, `integral_numbers` | the inbound function of an agent that serves a screen (`.with_inbound(vymalo_inbound)`): an A2UI action reads as the person's answer, and the extensions a message carries become the run's inbound context; see *A screen as the sender* |
 | `task_id_for(agent, subject, context_id, message_id)` | the task id a new task of `agent` started by that message gets (see *Stable ids*) |
 | `MAX_REFERENCES` | how many of a message's `referenceTaskIds` are looked at (8); see *Continuing a task* |
 | `RuntimeTaskBackend::list` (`TaskBackend::list`), `MAX_SCAN` | `ListTasks`: the caller's tasks, newest update first, by keyset cursor; see *Listing tasks* |
 | `MAX_TOKEN_COUNT` | the largest count a `usage/v1` report or total carries (2^53 - 1); see *Usage* |
+| `RuntimeTaskBackend::with_access_tiers(AccessTiers)`, `CONTEXT_ACCESS_TIER` | `access-tier/v1`: the backend reads the tier of a message that activated the extension, refuses a bad one, and says the tier a task works under; the tier is the run's context key `vymalo.accessTier` = `{"tier": ..}`; see *The access tier* |
 | `RuntimeTaskBackend::push_store()`, `StorePushStore::new(store, agent)` | the `adam_a2a::push::PushStore` over the run `Store`: configs and delivery progress next to the runs, so a restart or another replica loses nothing; see *Push notifications* |
 
 ```rust
@@ -172,9 +173,9 @@ sends it (contracts: `docs/api/ui-catalog-v1.md`, `docs/api/thread-tools-v1.md` 
 
 | In the message | In the run |
 |---|---|
-| text parts | the text |
-| an A2UI action part (`application/a2ui+json`, in `mediaType` or in `metadata.mimeType`) with Choices answers (`context.answers`: `[{id, values, other?, text?}]`, and `context.note`) | `The person answered through the interface:` then one line per question, `- db: pg`, `- auth: other: "Keycloak"`, `- name: text: "Quokka"`, and a last line `Note: "by Friday"` when the form's free box was used (what the person typed is always JSON-quoted after its label, so it can never pass for an option's value); a question with nothing chosen reads `(nothing chosen)`; it is the result of the `ask_user` call that parked the run |
-| any other A2UI action | `The person used the interface: action "<name>" on surface "<id>" with context <JSON, cut at 4096 characters>` |
+| text parts | the text; **a line that begins as a form's answer does** (after whitespace, invisible characters and case, `The person answered through the interface`) **is marked `(typed) `**, so typed words are never a form's answer (an A2UI `answer` action is) |
+| an A2UI action part (`application/a2ui+json`, in `mediaType` or in `metadata.mimeType`) named `answer` on a surface `ask-<identifier>` (`A-Z a-z 0-9 _ . : -`, at most 64 characters after the prefix: the one `ask_user` draws; any other id is not a form's), with Choices answers (`context.answers`: `[{id, values, other?, text?}]`, and `context.note`) | `The person answered through the interface (form ask-<id>):` (the surface the answer was made on; `form_answer_surface` reads the line) then one line per question, `- db: pg`, `- auth: other: "Keycloak"`, `- name: text: "Quokka"`, and a last line `Note: "by Friday"` when the form's free box was used (what the person typed is always JSON-quoted after its label, so it can never pass for an option's value); a question with nothing chosen reads `(nothing chosen)`; it is the result of the `ask_user` call that parked the run |
+| any other A2UI action (another name, another surface, even with the shape of answers: a card's button cannot pass for the form's answer) | `The person used the interface: action "<name>" on surface "<id>" with context <JSON, cut at 4096 characters>` |
 | `metadata[ui-catalog/v1]` | `Conversation::context["vymalo.ui.ref"]` = `{catalogId, version, digest}` |
 | an inline catalog with that `catalogId` in the renderer's capabilities (`a2uiClientCapabilities` under `v0.9.1`, else `v0.9`; `a2uiRendererCapabilities` under `v1.0`) | `context["vymalo.ui.catalog"]` = `{catalogId, version, digest, catalog}`; an inline catalog of another id is ignored |
 | `metadata[thread-tools/v1]` `{url, token, expiresAt}` | `context["vymalo.threadTools"]`, copied exactly; the entry expires at `expiresAt` (`Conversation::drop_expired_context`) |
@@ -194,7 +195,7 @@ sequenceDiagram
     R-->>B: input-required: question + an A2UI part (the interface)
     B-->>S: status message: [text, data(application/a2ui+json)]
     S->>B: message on the task: an A2UI action part
-    B->>R: Inbound {text: "The person answered through the interface: ..."}
+    B->>R: Inbound {text: "The person answered through the interface (form ask-<id>): ..."}
 ```
 
 ```mermaid
@@ -323,6 +324,22 @@ a working task, and a task whose agent keeps none, carries none. Nothing is stor
 stream's last status update carries no totals: a client reads them from the task. The SDK writes a number of metadata as a
 float on both bindings, a whole one (`41250.0`). Unit tests in `src/usage.rs`; `tests/usage.rs`.
 
+## The access tier
+
+`access-tier/v1` (the contract of `docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`, ADR 0036 of this repository). With
+`with_access_tiers(tiers)`, for an agent whose card lists the extension (`ExtensionConfig::access_tier`):
+
+| | |
+|---|---|
+| A message whose request **activated** the extension (`Caller::extensions`) | must carry `metadata[URI] = {"tier": "plan" \| "edits" \| "auto" \| "bypass"}`, a tier the agent honours. Anything else (no entry, an entry that is not an object, a `tier` that is missing, not a string, not exactly one of the four words, or not honoured) is **`InvalidParams`** (A2A `-32602`) with a sentence, **before anything is written**: no task, no run. A tier is never rounded |
+| the tier of an accepted message | the run's inbound context key `vymalo.accessTier` = `{"tier": ..}` (`CONTEXT_ACCESS_TIER`), merged like any key: the **newest message that names one wins** from the agent's next step, and a message that names none leaves it. This holds for a message to an open task too (an answer, a steer). The key is one of `adam_llm_agent::PROTECTED_CONTEXT_KEYS`: the run keeps it when the rest of the message's context is too large and dropped. A payload that cannot carry it (not text, or a `context` that is not an object) is `InvalidParams`, never a tier silently dropped |
+| a message that did **not** activate it | no tier is read, whatever its metadata says; the context is untouched |
+| **A task never inherits** | a new task that continues another starts with the earlier task's context, so **the agent drops the key at `init_continuing`** (the coder's `CoderStarter` does); the backend cannot know which keys an agent keeps |
+| the echo | to a caller that activated it, `metadata[URI] = {"tier": ..}` on the task of `SendMessage`, `GetTask` and a steered message's answer, and on the first frame of a stream; the tier said is the one in the run's state, else the agent's default. A stream says it again, in a status update (the current state, no message), **when the tier of the run changes** (the run committed the step that read the message), once per change |
+| a backend with no `with_access_tiers` | never reads or says a tier |
+
+Unit tests in `src/tier.rs` (the validation sentences, the context) and `tests/access_tier.rs` (a real `Runtime` and `LlmAgent`: the tier reaches the run and the task, the first frame and `GetTask` say it, a caller that did not activate it reads none, every kind of bad tier is `InvalidParams` and writes no run, a message that did not activate it carries no tier and an activated reader is told the default, a backend with no tiers reads none, and a tier changed by a message sent while the task works is said once on the stream).
+
 ## Stable ids
 
 Ids are derived, never drawn at random per read, so a consumer that keys on
@@ -406,7 +423,7 @@ the backend whose model is shown the earlier messages (memory and PostgreSQL). U
 (`runtime_errors_map_by_class`,
 `what_a_client_is_told_carries_no_cause_and_no_conversation_id`) and
 `src/convert.rs` (the interface part of a status, its id and key, the A2UI artifact), and the reading of a screen's
-messages in `src/vymalo.rs` (each shape of answer, quoting, the cut, the context under every capability key, a catalog
+messages in `src/vymalo.rs` (each shape of answer, only the `answer` action of an `ask-<identifier>` surface being one and the line naming it, **a text part never being one however it is spelled**, quoting, the cut, the context under every capability key, a catalog
 of another id, a malformed reference, the doubles) and `tests/vymalo.rs` (a real `Runtime` and `LlmAgent`: the
 extensions reaching the run's context, a question with an interface as `input-required` with two parts, and the person's
 answer as the tool result the model reads), and `tests/steer.rs` (a real `Runtime` and `LlmAgent` behind the backend, on memory and PostgreSQL: a steered message is delivered to the working task and the model's next request carries it, once even when sent twice; a `submitted` task takes one, **a task a worker has taken is `working` before its first commit (while the model is at its first call) and takes one, and a subscriber is told so by the live event, not the poll**; without the extension it is `InvalidParams` as before and nothing is delivered; a completed or canceled task is `-32004`, activated or not; an unknown, foreign or other-context task is not found; **a message sent while the model writes the final answer is answered**; and the whole path over HTTP through the real server and the official client, a streaming send whose first event is the working task, the activation by header alone, and the refusals), and `tests/text_stream.rs` (a real `Runtime` and an `LlmAgent` with a model that writes slowly: an activated client reads chunks that begin where the one before ended and add up to the answer, all before the status that ends the turn, and that status carries the stream's id; the words before a tool call are a `working` status with the stream's id as the message id and the answer is another stream; a question that is the streamed reply is stated under its stream; a model that fails in the middle ends the stream abandoned and fails the task as it does without streaming; a client that did not activate reads no chunk and the same reply; a blocking send's task has no chunk; and over HTTP through the SDK the header activates it, the response names it, and `offset` is a whole number on the wire), `src/text_stream.rs` (the chunk, the marker and the stream id as pure functions), `tests/usage.rs` (a real `Runtime` and `LlmAgent`s with scripted models: an activated client reads a report per model call

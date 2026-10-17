@@ -1279,4 +1279,23 @@ check "refused: a Secret name that is not one" fails helm_a2a --set a2a.cardSign
 check "refused: the allow-list in extraEnv beside the value" \
   fails helm_a2a --set 'a2a.push.allowedUrls={hooks.example.com}' --set-string config.extraEnv.A2A_PUSH_ALLOWED_URLS=x
 
+# accessTiers.max (MAX_ACCESS_TIER): nothing for the default, one variable for every role when set, and
+# only the four words (or empty) are accepted.
+helm template coder "$chart" --namespace coder-ns > "$out"
+check "the default access tier cap renders no MAX_ACCESS_TIER (the coder's own default is auto)" lacks 'name: MAX_ACCESS_TIER'
+helm template coder "$chart" --namespace coder-ns --set accessTiers.max=bypass > "$out"
+check "accessTiers.max reaches the coder as MAX_ACCESS_TIER" count 'name: MAX_ACCESS_TIER' 1
+check "... with its value" has 'value: "bypass"'
+helm template coder "$chart" --namespace coder-ns --set config.role=control-plane --set accessTiers.max=edits > "$out"
+check "a control plane declares the cap too" count 'name: MAX_ACCESS_TIER' 1
+helm template coder "$chart" --namespace coder-ns --set topology=split --set accessTiers.max=plan > "$out"
+check "with topology=split the front and the worker both get it" count 'name: MAX_ACCESS_TIER' 2
+helm template coder "$chart" --namespace coder-ns --set-string 'accessTiers.max= Auto ' > "$out"
+check "a padded, mixed-case cap is read as the word" has 'value: "auto"'
+message=$(helm template coder "$chart" --namespace coder-ns --set accessTiers.max=root 2>&1 || true)
+check "refused: a cap that is not a tier" fails helm template coder "$chart" --namespace coder-ns --set accessTiers.max=root
+check "... the error lists the tiers" says "$message" 'plan, edits, auto or bypass'
+check "refused: the cap in extraEnv beside the value" \
+  fails helm template coder "$chart" --namespace coder-ns --set accessTiers.max=edits --set-string config.extraEnv.MAX_ACCESS_TIER=bypass
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

@@ -130,6 +130,11 @@ spec:
             - name: PUBLIC_URL
               value: {{ include "coder.publicUrl" . | quote }}
             {{- end }}
+            {{- with include "coder.maxAccessTier" . }}
+            {{- /* accessTiers.max: the highest access tier a person may pick, read by every role. Nothing is rendered for the default (auto). */}}
+            - name: MAX_ACCESS_TIER
+              value: {{ . | quote }}
+            {{- end }}
             {{- if include "coder.runsWorkers" . }}
             - name: MODEL_BASE_URL
               {{- if include "coder.modelBaseUrlFromSecret" . }}

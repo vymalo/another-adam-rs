@@ -71,7 +71,8 @@ problem (exit 78). [ADR 0030](../decisions/0030-a2a-push-notifications-list-task
 | `ALLOWED_REPO_HOSTS` | hosts repositories may live on (`name` or `name:port`); the token is scoped to them; the first is what `owner/name` means | `github.com` |
 | `GITHUB_API_URL` | GitHub REST API root (Enterprise: `https://<host>/api/v3`) | `https://api.github.com` |
 | `GITHUB_MCP_URL` | origin of the GitHub MCP server (the sidecar); no credentials | `http://127.0.0.1:8082` |
-| `CREATE_REPO_OWNERS` | owners `create_repository` may create for, after the person agrees; empty turns the tool off | empty |
+| `CREATE_REPO_OWNERS` | owners `create_repository` may create for, after the person agrees (not under the `bypass` access tier). A list restricts to exactly these. Empty: a GitHub App that names its accounts (a pin, or `GITHUB_APP_OWNERS` as a list, **not** `*`) creates for them, a token creates nothing (the tool is off) | empty |
+| `MAX_ACCESS_TIER` | the highest access tier a person may pick for a message: `plan`, `edits`, `auto` or `bypass`. The card lists the tiers up to it, a higher one is refused, the tools check it again. `bypass` (rename and delete repositories, no consent form) is opt-in. Read by every role; a word that is not a tier is exit 78 | `auto` |
 | `ALLOW_LOCAL_REPOS` | accept local paths, `file://`, plain `http://`; development and tests only | `false` |
 | `WORKSPACE_ROOT` | mirrors, run workspaces, run notes | `/work` |
 | `WORKSPACE_PLACEMENT` | `shared`, `affinity` or `isolated` ([placement](workspace-and-environments.md#placement-which-worker-holds-a-runs-files)) | `shared` |

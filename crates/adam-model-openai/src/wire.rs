@@ -282,17 +282,12 @@ pub(crate) fn parse_completion(body: &[u8]) -> Result<ModelResponse, ModelError>
         .ok_or_else(|| ModelError::protocol("choice has no finish_reason"))?;
 
     let mut tool_calls = Vec::new();
-    for (i, call) in message
-        .tool_calls
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-    {
+    for call in message.tool_calls.unwrap_or_default() {
         let name = call.function.name.unwrap_or_default();
         let id = call
             .id
             .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| fallback_id(i));
+            .unwrap_or_else(fallback_id);
         let arguments = match call.function.arguments {
             None | Some(Value::Null) => json!({}),
             // Some servers send the arguments as an object instead of a string.
@@ -412,8 +407,20 @@ fn content_text(content: Option<Value>) -> String {
     }
 }
 
-fn fallback_id(index: usize) -> String {
-    format!("call_{index}")
+/// An id for a tool call the provider gave none: `call_` and 16 random hexadecimal digits, new for
+/// every call of every response. The ids `call_0`, `call_1`... that it used to be repeat in every
+/// turn, and an id is what ties an answer (a person's click on a question, a tool's result) to its
+/// call. The response is journaled with these ids by the agent, so a resumed run reads the ones that
+/// were made, not new ones.
+fn fallback_id() -> String {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    // `RandomState` is seeded from the system's randomness; the count keeps two ids of one process
+    // apart whatever the hash does.
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(MADE.fetch_add(1, Ordering::Relaxed));
+    format!("call_{:016x}", hasher.finish())
 }
 
 fn check_name(name: &str) -> Result<(), ModelError> {
@@ -599,7 +606,7 @@ impl Assembler {
         }
         if !call.started && !call.name.is_empty() {
             call.started = true;
-            let id = call.id.get_or_insert_with(|| fallback_id(index)).clone();
+            let id = call.id.get_or_insert_with(fallback_id).clone();
             return Some(ModelDelta::ToolCallStarted {
                 id,
                 name: call.name.clone(),
@@ -615,11 +622,11 @@ impl Assembler {
             .finish_reason
             .ok_or_else(|| ModelError::protocol("stream ended without a finish_reason"))?;
         let mut tool_calls = Vec::with_capacity(self.calls.len());
-        for (index, call) in self.calls {
+        for call in self.calls.into_values() {
             check_name(&call.name)?;
             let arguments = parse_arguments(&call.name, &call.arguments)?;
             tool_calls.push(ToolCall {
-                id: call.id.unwrap_or_else(|| fallback_id(index)),
+                id: call.id.unwrap_or_else(fallback_id),
                 name: call.name,
                 arguments,
             });
@@ -1143,26 +1150,66 @@ mod tests {
         );
     }
 
+    /// A call with no id gets one that is made up, is the same in the stream and in the response, and
+    /// is not the id of any other call: not `call_0` again in the next turn.
     #[test]
-    fn missing_call_id_gets_a_stable_fallback() {
-        let mut asm = Assembler::default();
-        let deltas = feed(
-            &mut asm,
-            &[
-                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"t","arguments":"{}"}}]}}]}"#,
-                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
-            ],
-        );
-        assert_eq!(
-            deltas,
-            vec![ModelDelta::ToolCallStarted {
-                id: "call_0".into(),
-                name: "t".into()
-            }]
-        );
-        let r = asm.finish().unwrap();
-        assert_eq!(r.message.tool_calls()[0].id, "call_0");
-        assert_eq!(r.finish, FinishReason::ToolCalls);
+    fn missing_call_ids_are_made_up_once_and_never_repeat() {
+        let one_stream = || {
+            let mut asm = Assembler::default();
+            let deltas = feed(
+                &mut asm,
+                &[
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"t","arguments":"{}"}}]}}]}"#,
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"u","arguments":"{}"}}]}}]}"#,
+                    r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                ],
+            );
+            (deltas, asm.finish().unwrap())
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let (deltas, response) = one_stream();
+            let calls = response.message.tool_calls();
+            assert_eq!(calls.len(), 2);
+            // The id the stream announced is the id of the call in the response.
+            let started: Vec<String> = deltas
+                .iter()
+                .filter_map(|d| match d {
+                    ModelDelta::ToolCallStarted { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(started, [calls[0].id.clone(), calls[1].id.clone()]);
+            for call in calls {
+                let digits = call.id.strip_prefix("call_").expect("call_ and digits");
+                assert!(
+                    digits.len() == 16 && digits.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{}",
+                    call.id
+                );
+                assert!(seen.insert(call.id.clone()), "{} came twice", call.id);
+            }
+            assert_eq!(response.finish, FinishReason::ToolCalls);
+        }
+        // Not streamed: the same, and an empty id is none.
+        for _ in 0..3 {
+            let body = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[
+                {"function":{"name":"t","arguments":"{}"}},
+                {"id":"","function":{"name":"u","arguments":"{}"}},
+                {"id":"given","function":{"name":"v","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+            let response = parse_completion(body.as_bytes()).unwrap();
+            let ids: Vec<&str> = response
+                .message
+                .tool_calls()
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect();
+            assert_eq!(ids[2], "given");
+            for id in &ids[..2] {
+                assert!(id.starts_with("call_") && id.len() == 21, "{id}");
+                assert!(seen.insert((*id).to_owned()), "{id} came twice");
+            }
+        }
     }
 
     #[test]

@@ -23,6 +23,12 @@ from service.yaml, which every render contains, so they always run.
 {{- if not (has $placement (list "" "shared" "affinity" "isolated")) -}}
 {{- fail (printf "workspace.placement must be one of shared, affinity or isolated (or empty for the single-worker default), got %q" $placement) -}}
 {{- end -}}
+{{- if not (has (include "coder.maxAccessTier" .) (list "" "plan" "edits" "auto" "bypass")) -}}
+{{- fail (printf "accessTiers.max must be plan, edits, auto or bypass (or empty for auto), got %q" (include "coder.maxAccessTier" .)) -}}
+{{- end -}}
+{{- if and (include "coder.maxAccessTier" .) (hasKey .Values.config.extraEnv "MAX_ACCESS_TIER") -}}
+{{- fail "accessTiers.max is set and config.extraEnv sets MAX_ACCESS_TIER: set one (extraEnv would override the cap the chart renders)" -}}
+{{- end -}}
 {{- if not (has (toString .Values.github.auth) (list "token" "app")) -}}
 {{- fail (printf "github.auth must be token or app, got %q" (toString .Values.github.auth)) -}}
 {{- end -}}

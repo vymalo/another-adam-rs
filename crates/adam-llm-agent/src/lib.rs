@@ -152,8 +152,9 @@ mod typed;
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{BuildError, DEFAULT_WAIT_POLL, Limits, LlmAgent, LlmAgentBuilder, LlmStarter};
 pub use conversation::{
-    ArtifactRef, Conversation, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES, MAX_READ_IDS, MESSAGE_KIND,
-    OMITTED_MARKER_PREFIX, PendingQuestion, PendingRemote, PendingRun, PendingWait,
+    ACCESS_TIER_CONTEXT_KEY, ArtifactRef, Conversation, MAX_CARRIED_BYTES, MAX_CONTEXT_BYTES,
+    MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS, MESSAGE_KIND, OMITTED_MARKER_PREFIX,
+    PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun, PendingWait,
     STOPPED_BY_THE_PERSON, user_message,
 };
 pub use fn_tool::FnTool;
@@ -162,7 +163,9 @@ pub use fn_tool::{FnToolBuilder, TypedFnToolBuilder};
 pub use history::TRUNCATION_MARKER_PREFIX;
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
-pub use source::{DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource};
+pub use source::{
+    DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource, Withheld,
+};
 pub use state::{Extensions, State, StateKey};
 pub use step_io::StepIo;
 pub use tool::{DynTool, RemotePoll, StepStyle, Tool, ToolCtx, ToolError, ToolOutput};

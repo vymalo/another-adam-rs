@@ -60,6 +60,14 @@ refuses to get here without one, see coder.validate). Indent it to the env list.
 {{- end -}}
 
 {{/*
+accessTiers.max (the highest access tier a person may pick), trimmed and folded to lower case. Empty
+means the coder's own default, auto, and nothing is rendered.
+*/}}
+{{- define "coder.maxAccessTier" -}}
+{{- default "" .Values.accessTiers.max | toString | trim | lower -}}
+{{- end -}}
+
+{{/*
 Whether this pod runs workers: every role but `control-plane` (an empty role is
 `all`). The role is trimmed and lower-cased first, as the binary parses it, so
 " Control-Plane " is a control plane here too. Renders "true" or nothing, so
