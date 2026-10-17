@@ -28,8 +28,10 @@ pub const CONTEXT_PERSON: &str = "vymalo.person";
 /// The most bytes of one entry of `said` that is read: four times the contract's cut (4 KiB).
 const MAX_SAID_ENTRY_BYTES: usize = 4 * 4096;
 
-/// The most bytes of all the entries together: four times the contract's bound (64 KiB).
-const MAX_SAID_BYTES: usize = 4 * 64 * 1024;
+/// The most bytes of all the entries together: twice the contract's bound (64 KiB), and under the
+/// context's own (`adam_llm_agent::MAX_CONTEXT_BYTES`, 256 KiB), so that a well-formed value never
+/// costs a message the rest of its context.
+const MAX_SAID_BYTES: usize = 2 * 64 * 1024;
 
 /// The most entries read.
 const MAX_SAID_ENTRIES: usize = 4096;
@@ -126,7 +128,8 @@ mod tests {
     #[test]
     fn a_member_that_is_not_a_list_of_strings_within_the_bounds_is_null_and_says_nothing() {
         let long = "x".repeat(MAX_SAID_ENTRY_BYTES + 1);
-        let many: Vec<String> = vec!["x".repeat(MAX_SAID_ENTRY_BYTES); 17];
+        let many: Vec<String> =
+            vec!["x".repeat(MAX_SAID_ENTRY_BYTES); MAX_SAID_BYTES / MAX_SAID_ENTRY_BYTES + 1];
         let too_many: Vec<&str> = vec!["a"; MAX_SAID_ENTRIES + 1];
         let cases = [
             grant(json!({"said": "acme/widgets"})),
@@ -151,10 +154,11 @@ mod tests {
         }
         assert!(person_said(None).is_empty());
         // The bounds, from inside: the largest list that is read.
-        let full: Vec<String> = vec!["x".repeat(MAX_SAID_ENTRY_BYTES); 16];
+        let full: Vec<String> =
+            vec!["x".repeat(MAX_SAID_ENTRY_BYTES); MAX_SAID_BYTES / MAX_SAID_ENTRY_BYTES];
         assert_eq!(
             person_said(Some(&person_of(&grant(json!({"said": full}))))).len(),
-            16
+            MAX_SAID_BYTES / MAX_SAID_ENTRY_BYTES
         );
     }
 

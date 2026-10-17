@@ -4546,15 +4546,10 @@ async fn an_asked_coder_asks_nobody_for_consent_and_the_task_goes_on(store: DynS
     let run = run_id(&seen.task_id);
     let notes = fx.env.notes.load(&run.to_string()).await.unwrap();
     assert!(notes.consents.is_empty() && !notes.is_text_question("r1"));
-    // Named by the person's words alone: the one `acme/other` of the ask's text is not.
-    assert_eq!(notes.named_repos.len(), 1, "{:?}", notes.named_repos);
-    assert!(
-        !notes
-            .named_repos
-            .iter()
-            .any(|key| key.contains("acme/other")),
-        "{:?}",
-        notes.named_repos
+    // Named by the person's words alone: the `acme/other` of the ask's text is not.
+    assert_eq!(
+        notes.named_repos,
+        [adam_coder::tools::named::key_of_argument(&fx.remote_url()).unwrap()]
     );
     let view = server.coder.runtime.view(run).await.unwrap().unwrap();
     let state: Conversation = serde_json::from_value(view.state).unwrap();

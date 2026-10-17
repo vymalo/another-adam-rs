@@ -781,7 +781,7 @@ async fn an_asked_coder_names_repositories_only_from_what_the_person_said() {
         common::message_for_asked_told(
             1,
             &["Please fix the greeting in acme/lib"],
-            "Look at acme/other and acme/lib, please",
+            "Look at acme/other, please",
         ),
     )
     .await;

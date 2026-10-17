@@ -373,7 +373,9 @@ answer. Decided on the owner's direction: **an agent asked by another agent neve
   (`RunNotes::asked_by_an_agent`), so a message for the thread's agent that comes later does not turn the asked agent's words, in
   the inbox or in the history, into the person's. **The gap:** an ask that arrives with no grant (above) reads as a plain
   client's, and its run asks as a person's would. That the orchestrator never sends an ask it cannot mint a grant for is a
-  follow-up of the orchestration layer.
+  follow-up of the orchestration layer. *Landed 2026-10-17:* vymalo/another-agentic-system#270 (an ask to a card that lists
+  `thread-tools/v1` is never sent without its grant; it fails instead: *verified 2026-10-17* at its commit 591fc28 and its
+  `docs/api/thread-tools-v1.md`, "An ask is never sent without the grant").
 * **The consent tools ask nobody there.** `request_repository`, `create_repository` and Path B of `merge_pull_request` ask through
   `consent::ask`, which then returns an error result ("No person is in this conversation: another agent asked you, so nobody can
   agree to <what>, and nobody was asked", then: carry on without it, or end the answer by saying that it needs the person's yes, so
@@ -400,7 +402,7 @@ answer. Decided on the owner's direction: **an agent asked by another agent neve
   whole beyond 64 KiB and counted in `omitted`; never on a `main` message, and a person's form answers are not in it
   (vymalo/another-agentic-system [#271](https://github.com/vymalo/another-agentic-system/pull/271):
   [`docs/api/thread-tools-v1.md`, "The `person` member"](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/thread-tools-v1.md#the-person-member)
-  and the fourth note of 2026-10-17 of its ADR 0026, *verified 2026-10-17* at its commit 568c85c). Words, because the rule of
+  and the fourth note of 2026-10-17 of its ADR 0026, *verified 2026-10-17* at its commit 55ac8ab, the head of that PR's contract). Words, because the rule of
   what names a repository (hosts, the default host, a bare name, a URL, a `git@` form) is this agent's
   (`bin/adam-coder/src/tools/named.rs`), and the orchestrator, protocol-agnostic, knows nothing of repositories. `vymalo_inbound`
   reads the member into the context key `vymalo.person` of every message that carries the grant, `null` when it is missing or
@@ -409,6 +411,8 @@ answer. Decided on the owner's direction: **an agent asked by another agent neve
   `named_in` to them, and never reads the ask's text or the asking model's answers to `ask_user`: without the member nothing is
   named, and `request_repository` refuses as above. What the person named before the run was asked stays named (the notes only
   add); `consents_in` is unchanged. The key is not one of `PROTECTED_CONTEXT_KEYS`: a protected value is capped at 1 KiB, far
-  under the words, and losing them is fail closed (nothing named). The gap that remains is the orchestrator's: a person's form
+  under the words, and losing them is fail closed (nothing named); so a child run inherits `vymalo.caller` and not
+  `vymalo.person` (only the protected keys pass to a child, `ToolCtx::start_child`), and a child of an asked run names
+  nothing, as intended. The gap that remains is the orchestrator's: a person's form
   answers (a typed field, a note) are not carried, so a repository named only there is not named in an asked run; the person can
   write it in a message.

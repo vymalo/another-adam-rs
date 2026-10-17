@@ -548,11 +548,7 @@ fn carried_sayings(state: &Conversation, inbox: &[Inbound]) -> Vec<Heard> {
         .or_else(|| state.context.get(CONTEXT_PERSON));
     person_said(newest)
         .iter()
-        .map(|text| Heard {
-            text: without_untrusted(text),
-            defaults: None,
-            when: When::Past,
-        })
+        .map(|text| Heard::said(without_untrusted(text)))
         .collect()
 }
 

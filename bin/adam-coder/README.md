@@ -1116,8 +1116,10 @@ agent's words the person's):
   named before the run was asked stays named (the notes only add). The person's form answers are not carried (the
   orchestrator's gap), so a repository named only there is not named here; they can write it in a message.
 * **Fail closed:** a message that carries the grant and whose token's claims cannot be read is nobody's too. A message without a
-  grant (a plain A2A client) is read as before, and so is an ask the orchestrator sends with none (it does when it cannot mint
-  one: a gap of the orchestration layer). A child run inherits the key, and a large context does not drop it.
+  grant (a plain A2A client) is read as before, and so would be an ask with none; since 2026-10-17 the orchestrator never sends
+  an ask to a card that lists `thread-tools/v1` without its grant, it fails the ask instead (vymalo/another-agentic-system#270,
+  *verified 2026-10-17* at its commit 591fc28). A child run inherits `vymalo.caller`, which a large context does not drop, and
+  not `vymalo.person` (only the protected keys pass to a child), so a child of an asked run names nothing.
 
 The signature of the token is the orchestrator's to check (the agent has no key): what is trusted is the authenticated A2A
 caller, as for a form's answer and the access tier. Decision: [ADR 0036](../../docs/decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md#amended-2026-10-17-an-asked-agent).
