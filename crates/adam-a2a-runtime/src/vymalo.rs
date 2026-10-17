@@ -125,7 +125,7 @@ pub fn vymalo_inbound(message: &Message) -> Result<Inbound, String> {
 /// run (the coder reads a yes to a merge from it), so the line is changed to say it was typed. A line
 /// is compared as [`comparable`] reads it (whitespace, control and format characters and case aside),
 /// and a line break is any of `\n`, `\r`, U+0085, U+2028 and U+2029.
-fn typed_text(text: &str) -> String {
+pub(crate) fn typed_text(text: &str) -> String {
     let marker = comparable(FORM_ANSWER);
     text.split_inclusive(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}'])
         .map(|line| {
