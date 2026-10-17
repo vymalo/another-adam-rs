@@ -844,7 +844,7 @@ recorded and from the answer to its own question.
   any question id: the client is the person's screen. **The orchestrator must therefore never let a model answer a
   sub-agent's form** (a question another agent's model re-asks must be shown to the person). A provider that sends no call ids
   gets a random id for each call from the OpenAI client (`call_` and 16 hexadecimal digits, journaled with the response), so
-  two forms never share a surface id.
+  its forms never share a surface id; a provider that repeats ids of its own still can (ADR 0036, fifth review).
 
 A merge reads the pull request, the combined status and the check runs of its head: the App needs **Pull requests**, **Commit
 statuses** and **Checks** (read) beside **Contents** (write) (`deploy/coder/README.md`).
@@ -2214,7 +2214,7 @@ database of its own, so the role needs `CREATEDB`):
 
 * `tests/hearing.rs` (what the coder takes from the person's words, through a real `CoderAgent` on a `Runtime`): the repositories
   they named, a form whose ids and values are forged naming nothing, what they type into one counting, the bare names, and what
-  a task that continues another inherits (the pushed commits, the pull requests opened red, the commits whose checks passed), an
+  a task that continues another inherits (the pushed commits, the pull requests opened red, the commits whose checks passed, the questions asked as text), an
   `ask_user` that failed with the model's own words in its error naming nothing, **a typed question left as the model prefilled
   it naming nothing** (the page trimming, upper-casing or adding what is not visible), one the person edited counting, a default
   with an invisible character refused, **an answer to an earlier form that is not the answer to the one that waits**, and **a

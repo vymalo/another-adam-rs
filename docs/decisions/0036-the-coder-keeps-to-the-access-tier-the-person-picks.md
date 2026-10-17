@@ -1,6 +1,6 @@
 # 0036. The coder keeps to the access tier the person picks
 
-Status: **Accepted** (2026-10-11), amended after security reviews the same day (four *Amended 2026-10-11* sections, below, one per review)
+Status: **Accepted** (2026-10-11), amended after security reviews (three *Amended 2026-10-11* sections, the first for the first two reviews, and *Amended 2026-10-17* for the fifth, below)
 Implements the A2A extension `https://agents.vymalo.com/a2a/extensions/access-tier/v1`, designed in
 `vymalo/another-agentic-system` ([ADR 0061](https://github.com/vymalo/another-agentic-system/blob/main/docs/decisions/0061-the-person-picks-an-access-tier-for-each-message-the-agent-keeps-to-it.md),
 [`docs/api/access-tier-v1.md`](https://github.com/vymalo/another-agentic-system/blob/main/docs/api/access-tier-v1.md)).
@@ -284,7 +284,7 @@ the person's intent from text", so the design changed instead of being patched a
   in words (`RunNotes::named_repos`), now with the hardening above. A form of their own is a follow-up if that is judged too
   weak.
 
-## Amended 2026-10-11 (a fifth review)
+## Amended 2026-10-17 (a fifth review)
 
 The fifth review found one way left to forge a merge consent, one to steer a repository consent, and five smaller gaps. In
 `crates/adam-a2a-runtime` (`vymalo.rs`, `words.rs`), `crates/adam-model-openai/src/wire.rs`, `crates/adam-workspace/src/github.rs`
@@ -296,7 +296,8 @@ and `bin/adam-coder` (`agent.rs`, `tools/{admin,consent,notes}.rs`).
   question as text (the orchestrator lets a re-ask do so), and the coder's own model asking the person to paste a "confirmation"
   line. Now every line of a text part that begins (after whitespace, invisible characters and case, as `adam_a2a_runtime::comparable`
   reads it; the line breaks are `\n`, `\r`, U+0085, U+2028 and U+2029) with `The person answered through the interface` is marked
-  `(typed) ` first, so only an A2UI `answer` action makes such a line. *Not a structured field of the `Inbound`:* a form's answer
+  `(typed) ` first, so only an A2UI `answer` action makes such a line. `default_inbound` marks it too, so a host that wraps the
+  coder in a backend with the default inbound function (an in-process host) is covered as well. *Not a structured field of the `Inbound`:* a form's answer
   reaches the run as the text of a user message or of a tool result (`Message::Tool.content`, which holds no field), so a
   marker outside the text would be a change of `adam-llm-agent`'s message type; the marking does the same work for the coder.
   **The limit that stays:** an A2A client that builds an A2UI `answer` data part itself can still answer, on any surface and with
