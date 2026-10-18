@@ -14,6 +14,10 @@
 //! never writable from it: its `config`, `hooks/` and refs are read by the coder's own `git` in every run's
 //! worktree, and a run that could write them would run code in the coder.
 //!
+//! The worktree's directory in the mirror is taken from **the coder's own metadata** (`Worktree::git_dir`),
+//! never from the slot's `.git` file: the run's commands can write that file, and a name read from it could
+//! be another run's directory, which would then be mounted read-write into this run's pod.
+//!
 //! The mounts of a pod are fixed when it is made, so the set it was made with is an annotation
 //! ([`MOUNTS_ANNOTATION`](crate::MOUNTS_ANNOTATION)) and [`ensure`](adam_workspace::Environment::ensure)
 //! compares it with the run's workspace each time: a worktree slot added since needs mounts the pod does
@@ -141,8 +145,9 @@ impl WorkspaceMounts {
     /// The run's directory is made first (by the coder, which owns the volume: a missing directory is made
     /// by the kubelet as root). Only a worktree slot inside the run's directory gets git directories: the
     /// legacy worktree of a run (`<root>/worktrees/<run>`) is outside it, where no command may run.
-    /// A worktree whose `.git` cannot be followed to a directory of its mirror gets none and is logged:
-    /// less access is safe, and the next `ensure` tries again.
+    /// A worktree whose directory in the mirror the coder's metadata cannot tell (a slot made before it was
+    /// recorded, with no or several candidates in the mirror) gets no git mounts and is logged: less access
+    /// is safe, and the next `ensure` tries again.
     ///
     /// # Errors
     ///
@@ -167,15 +172,14 @@ impl WorkspaceMounts {
             if !slot.path().starts_with(run_dir) {
                 continue;
             }
-            match admin_dir(slot.path(), worktree.mirror()).await {
-                Ok(admin) => dirs.push(WorktreeDirs {
+            match worktree.git_dir() {
+                Some(admin) => dirs.push(WorktreeDirs {
                     mirror: worktree.mirror().to_owned(),
-                    admin,
+                    admin: admin.to_owned(),
                 }),
-                Err(why) => tracing::warn!(
+                None => tracing::warn!(
                     slot = slot.dir(),
-                    %why,
-                    "git will not work in this slot of the run's pod: its worktree is not mounted"
+                    "git will not work in this slot of the run's pod: which directory of the mirror is its worktree's is not known"
                 ),
             }
         }
@@ -208,49 +212,6 @@ fn sub_path(base: &Path, path: &Path) -> Result<String, EnvError> {
         }
     }
     Ok(parts.join("/"))
-}
-
-/// The directory a worktree's `.git` file points at, which must be a directory of `mirror`'s
-/// `worktrees/`: what `git worktree add` wrote, with the name it picked (`r`, `r1` when `r` is taken).
-async fn admin_dir(slot: &Path, mirror: &Path) -> Result<PathBuf, String> {
-    let file = slot.join(".git");
-    let text = tokio::fs::read_to_string(&file)
-        .await
-        .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
-    let target = text
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("gitdir:"))
-        .map(str::trim)
-        .filter(|target| !target.is_empty())
-        .ok_or_else(|| format!("{} names no gitdir", file.display()))?;
-    // `join` keeps an absolute target; a relative one (`worktree.useRelativePaths`) is from the slot.
-    let target = lexical(&slot.join(target));
-    let worktrees = mirror.join("worktrees");
-    match target.strip_prefix(&worktrees) {
-        Ok(rest) if rest.components().count() == 1 => Ok(target),
-        _ => Err(format!(
-            "{} points at {}, which is not a directory of {}",
-            file.display(),
-            target.display(),
-            worktrees.display()
-        )),
-    }
-}
-
-/// `path` with its `.` and `..` resolved by name (no file is looked at).
-fn lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -379,41 +340,5 @@ mod tests {
             admin: PathBuf::from("/work/git/github.com/o/a.git/worktrees/a/b"),
         };
         assert!(refused(RUN, &[deep]).contains("not a worktree directory"));
-    }
-
-    #[tokio::test]
-    async fn the_admin_directory_is_what_the_git_file_names() {
-        let tmp = tempfile::tempdir().unwrap();
-        let slot = tmp.path().join("workspaces/r1/app");
-        let mirror = tmp.path().join("git/h/o/app.git");
-        std::fs::create_dir_all(&slot).unwrap();
-        let write = |text: String| std::fs::write(slot.join(".git"), text).unwrap();
-
-        // The name git picked, which is not always the slot's: `app1` when `app` was taken.
-        write(format!("gitdir: {}/worktrees/app1\n", mirror.display()));
-        assert_eq!(
-            admin_dir(&slot, &mirror).await.unwrap(),
-            mirror.join("worktrees/app1")
-        );
-        // A relative target (`worktree.useRelativePaths`) is from the slot.
-        write("gitdir: ../../../git/h/o/app.git/worktrees/app\n".to_owned());
-        assert_eq!(
-            admin_dir(&slot, &mirror).await.unwrap(),
-            mirror.join("worktrees/app")
-        );
-        // Anything else is not followed.
-        for bad in [
-            "gitdir: /somewhere/else\n".to_owned(),
-            format!("gitdir: {}\n", mirror.display()),
-            format!("gitdir: {}/worktrees/a/b\n", mirror.display()),
-            format!("gitdir: {}/worktrees/../config\n", mirror.display()),
-            "gitdir:\n".to_owned(),
-            "nothing\n".to_owned(),
-        ] {
-            write(bad.clone());
-            assert!(admin_dir(&slot, &mirror).await.is_err(), "{bad:?}");
-        }
-        std::fs::remove_file(slot.join(".git")).unwrap();
-        assert!(admin_dir(&slot, &mirror).await.is_err());
     }
 }

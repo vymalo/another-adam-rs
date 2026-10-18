@@ -88,16 +88,16 @@ workspace root, and have `MODEL_API_KEY` from the deployment's Secret when the g
 ## What a run pod mounts
 
 The coder's volume holds every run's files. A run pod gets only these, each **at the path the coder has it at**
-(`WorkspaceMounts`, from `PodTemplate::mounts_for`, which lists the run's slots and reads each worktree's `.git` file):
+(`WorkspaceMounts`, from `PodTemplate::mounts_for`, which lists the run's slots and takes each worktree's directory in its mirror from **the coder's metadata**, `Worktree::git_dir`, never from the slot's `.git` file, which the run's commands can write and which could name another run's directory):
 
 | Mount | Mode | Why |
 |---|---|---|
 | `<root>/workspaces/<run>` | read-write | the run's slots: its worktrees and scratch projects, also those added later |
 | `<root>/git/<host>/<owner>/<repo>.git`, for each worktree slot | **read-only** | the objects, refs and configuration a worktree's `.git` file points into; the coder's own `git` reads this directory in every run's worktree, so no run may write it |
-| `<mirror>/worktrees/<name>`, for each worktree slot | read-write, on top of the mirror | the worktree's own `HEAD`, `index` and logs (`<name>` is what the `.git` file says: git names a second worktree `r1`) |
+| `<mirror>/worktrees/<name>`, for each worktree slot | read-write, on top of the mirror | the worktree's own `HEAD`, `index` and logs (`<name>` is the coder's record: git names a second worktree `r1`) |
 
 Nothing of `meta/`, of another run or of another repository's mirror. The legacy worktree of a run (outside the run's directory)
-gets no mount, and a worktree whose `.git` does not lead to a directory of its own mirror gets no git mounts and a warning.
+gets no mount, and a worktree whose directory in the mirror the coder cannot tell (a slot made before it was recorded, with none or several candidates in the mirror) gets no git mounts and a warning.
 `ensure` makes the run's directory first (the coder owns the volume; the kubelet would make a missing `subPath` as root).
 
 Git in the pod reads and refreshes its index (`status`, `log`, `diff`, `describe`, `rev-parse`, `grep`, `checkout -- file`,
@@ -179,7 +179,7 @@ one line); none carries a secret, and the API server never echoes one in a refus
   steps, idempotency, concurrent calls, a create that races), the refusals above, `release`, `held_runs` (this release's pods
   only), the idle sweep (idle, busy, cannot be asked, another worker's, off), `prepare` and the quoting of the words, `kill`,
   and `tool_path` and `secret_ref`; the mounts (a run with no worktree, one, several and a scratch project, the legacy worktree,
-  a `.git` that leads nowhere, a workspace outside the volume, with real `git` worktrees), the pod made again for a worktree
+  a run that rewrites its `.git` to another run's directory, a slot whose directory in the mirror is ambiguous or absent, a workspace outside the volume, with real `git` worktrees), the pod made again for a worktree
   added later (no command running), waited for (a command running, or a pod that cannot be asked), left alone (nothing new, a
   spare mount) and replaced (no annotation); and the template's startup refusals (no mount at the workspace root, a `subPath`,
   read-only, no such volume, the volume mounted twice or by another container).

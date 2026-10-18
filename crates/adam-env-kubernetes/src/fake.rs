@@ -972,10 +972,9 @@ mod tests {
         mounts
     }
 
-    /// The directory of `slot` in its mirror's `worktrees/`, as its `.git` file names it.
+    /// The directory of `slot` in its mirror's `worktrees/`, as the coder's metadata has it.
     fn admin_of(slot: &adam_workspace::Slot) -> std::path::PathBuf {
-        let text = std::fs::read_to_string(slot.path().join(".git")).unwrap();
-        std::path::PathBuf::from(text.trim().strip_prefix("gitdir:").unwrap().trim())
+        slot.worktree().unwrap().git_dir().unwrap().to_owned()
     }
 
     #[tokio::test]
@@ -1092,17 +1091,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_worktree_that_does_not_lead_to_its_mirror_gets_no_git_mounts_and_the_run_goes_on() {
+    async fn a_run_that_rewrites_its_git_file_does_not_get_another_runs_directory_mounted() {
+        let fx = fixture(settings());
+        let (ws, other) = (fx.ws(RUN), fx.ws(OTHER));
+        let mine = ws.add_repository(&fx.remote("app")).await.unwrap();
+        let theirs = other.add_repository(&fx.remote("app")).await.unwrap();
+        let (my_dir, their_dir) = (admin_of(&mine), admin_of(&theirs));
+        assert_ne!(my_dir, their_dir);
+        // The commands of this run write its `.git` file: it names the other run's directory.
+        std::fs::write(
+            mine.path().join(".git"),
+            format!("gitdir: {}\n", their_dir.display()),
+        )
+        .unwrap();
+
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        let mirror = mine.worktree().unwrap().mirror().to_owned();
+        assert_eq!(
+            sorted(fx.work_mounts(&pod_name(RUN))),
+            expected(
+                &fx,
+                &[(ws.path(), false), (&mirror, true), (&my_dir, false)]
+            ),
+            "the mounts come from the coder's metadata"
+        );
+        assert!(
+            !fx.work_mounts(&pod_name(RUN))
+                .iter()
+                .any(|(path, _, _)| Path::new(path) == their_dir),
+            "the other run's directory is not mounted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slot_whose_directory_in_the_mirror_cannot_be_told_gets_no_git_mounts_and_the_run_goes_on()
+     {
         let fx = fixture(settings());
         let ws = fx.ws(RUN);
         let slot = ws.add_repository(&fx.remote("app")).await.unwrap();
-        // The `.git` file names a directory that is not one of the mirror's worktrees.
-        std::fs::write(slot.path().join(".git"), "gitdir: /somewhere/else\n").unwrap();
+        let mirror = slot.worktree().unwrap().mirror().to_owned();
+        let admin = admin_of(&slot);
+        let meta = fx
+            .workspaces
+            .root()
+            .join("meta")
+            .join(RUN)
+            .join(format!("{}.json", slot.dir()));
+        let forget = || {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&meta).unwrap()).unwrap();
+            json.as_object_mut().unwrap().remove("admin");
+            std::fs::write(&meta, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        };
+        let only_the_run = expected(&fx, &[(ws.path(), false)]);
+
+        // A slot from before the directory was recorded, with two directories that name it.
+        forget();
+        let forged = mirror.join("worktrees/forged");
+        std::fs::create_dir_all(&forged).unwrap();
+        std::fs::write(
+            forged.join("gitdir"),
+            format!("{}\n", slot.path().join(".git").display()),
+        )
+        .unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!(fx.work_mounts(&pod_name(RUN)), only_the_run, "ambiguous");
+
+        // With none naming it.
+        fx.env.release(RUN).await.unwrap();
+        std::fs::remove_dir_all(&forged).unwrap();
+        std::fs::remove_file(admin.join("gitdir")).unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!(fx.work_mounts(&pod_name(RUN)), only_the_run, "absent");
+
+        // With exactly one, the mirror's answer is taken (and recorded).
+        fx.env.release(RUN).await.unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", slot.path().join(".git").display()),
+        )
+        .unwrap();
         fx.env.ensure(&ws, &Steps::default()).await.unwrap();
         assert_eq!(
-            fx.work_mounts(&pod_name(RUN)),
-            expected(&fx, &[(ws.path(), false)]),
-            "less access is safe; a command in the slot finds git cannot work there"
+            sorted(fx.work_mounts(&pod_name(RUN))),
+            expected(&fx, &[(ws.path(), false), (&mirror, true), (&admin, false)]),
+            "unambiguous"
         );
     }
 
