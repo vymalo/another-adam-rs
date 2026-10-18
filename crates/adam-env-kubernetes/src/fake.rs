@@ -490,7 +490,7 @@ impl Fixture {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use adam_error::{Classify, ErrorClass};
@@ -967,6 +967,32 @@ mod tests {
         all
     }
 
+    /// The mounts of one worktree's git directory: the directory read-write, and on top of it what
+    /// the pod may not change, read-only.
+    fn admin_mounts(admin: &Path) -> Vec<(PathBuf, bool)> {
+        let mut mounts = vec![(admin.to_owned(), false)];
+        mounts.extend(["commondir", "gitdir", "logs"].map(|entry| (admin.join(entry), true)));
+        mounts
+    }
+
+    /// The mounts of a run pod with the given worktrees (`(mirror, admin)`).
+    fn expected_with(
+        fx: &Fixture,
+        run: &Path,
+        worktrees: &[(&Path, &Path)],
+    ) -> Vec<(String, String, bool)> {
+        let mut all: Vec<(PathBuf, bool)> = vec![(run.to_owned(), false)];
+        let mut mirrors = std::collections::BTreeSet::new();
+        for (mirror, admin) in worktrees {
+            if mirrors.insert(mirror.to_owned()) {
+                all.push(((*mirror).to_owned(), true));
+            }
+            all.extend(admin_mounts(admin));
+        }
+        let borrowed: Vec<(&Path, bool)> = all.iter().map(|(p, r)| (p.as_path(), *r)).collect();
+        expected(fx, &borrowed)
+    }
+
     fn sorted(mut mounts: Vec<(String, String, bool)>) -> Vec<(String, String, bool)> {
         mounts.sort();
         mounts
@@ -1022,8 +1048,17 @@ mod tests {
         fx.env.ensure(&ws, &Steps::default()).await.unwrap();
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected(&fx, &[(ws.path(), false), (&mirror, true), (&admin, false)])
+            expected_with(&fx, ws.path(), &[(&mirror, &admin)])
         );
+        // What git follows out of the worktree's directory is read-only in it.
+        let mounts = fx.work_mounts(&pod_name(RUN));
+        for entry in ["commondir", "gitdir", "logs"] {
+            let path = admin.join(entry).display().to_string();
+            assert!(
+                mounts.iter().any(|(p, _, ro)| *p == path && *ro),
+                "{entry} is read-only: {mounts:?}"
+            );
+        }
         // Nothing of `meta/` and no other run is mounted.
         assert!(
             fx.work_mounts(&pod_name(RUN))
@@ -1057,16 +1092,7 @@ mod tests {
         let (aa, ab) = (admin_of(&a), admin_of(&b));
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected(
-                &fx,
-                &[
-                    (ws.path(), false),
-                    (&ma, true),
-                    (&aa, false),
-                    (&mb, true),
-                    (&ab, false)
-                ]
-            ),
+            expected_with(&fx, ws.path(), &[(&ma, &aa), (&mb, &ab)]),
             "the scratch project is inside the run's directory and needs nothing of its own"
         );
         assert!(
@@ -1109,10 +1135,7 @@ mod tests {
         let mirror = mine.worktree().unwrap().mirror().to_owned();
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected(
-                &fx,
-                &[(ws.path(), false), (&mirror, true), (&my_dir, false)]
-            ),
+            expected_with(&fx, ws.path(), &[(&mirror, &my_dir)]),
             "the mounts come from the coder's metadata"
         );
         assert!(
@@ -1174,9 +1197,59 @@ mod tests {
         fx.env.ensure(&ws, &Steps::default()).await.unwrap();
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected(&fx, &[(ws.path(), false), (&mirror, true), (&admin, false)]),
+            expected_with(&fx, ws.path(), &[(&mirror, &admin)]),
             "unambiguous"
         );
+    }
+
+    #[tokio::test]
+    async fn a_worktree_directory_whose_entries_are_not_what_git_wrote_gets_no_git_mounts() {
+        let fx = fixture(settings());
+        let ws = fx.ws(RUN);
+        let slot = ws.add_repository(&fx.remote("app")).await.unwrap();
+        let mirror = slot.worktree().unwrap().mirror().to_owned();
+        let admin = admin_of(&slot);
+        let only_the_run = expected(&fx, &[(ws.path(), false)]);
+        let whole = expected_with(&fx, ws.path(), &[(&mirror, &admin)]);
+
+        // A link where a read-only file would be mounted: the mount would follow it to a place
+        // the coder did not name.
+        let elsewhere = fx.workspaces.root().join("elsewhere");
+        std::fs::write(&elsewhere, "x").unwrap();
+        for entry in ["commondir", "gitdir"] {
+            let file = admin.join(entry);
+            let kept = std::fs::read(&file).unwrap();
+            std::fs::remove_file(&file).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+            fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+            assert_eq!(
+                fx.work_mounts(&pod_name(RUN)),
+                only_the_run,
+                "{entry} is a link"
+            );
+            fx.env.release(RUN).await.unwrap();
+            std::fs::remove_file(&file).unwrap();
+            std::fs::write(&file, kept).unwrap();
+        }
+        // The same for the directory of the reflog.
+        let logs = admin.join("logs");
+        std::fs::rename(&logs, admin.join("logs.moved")).unwrap();
+        std::os::unix::fs::symlink(fx.workspaces.root(), &logs).unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert_eq!(
+            fx.work_mounts(&pod_name(RUN)),
+            only_the_run,
+            "logs is a link"
+        );
+        fx.env.release(RUN).await.unwrap();
+
+        // A missing `logs` is made by the coder (the kubelet would make it as root), and then the
+        // directory is mounted whole.
+        std::fs::remove_file(&logs).unwrap();
+        std::fs::remove_dir_all(admin.join("logs.moved")).unwrap();
+        fx.env.ensure(&ws, &Steps::default()).await.unwrap();
+        assert!(logs.is_dir());
+        assert_eq!(sorted(fx.work_mounts(&pod_name(RUN))), whole);
     }
 
     #[tokio::test]
@@ -1226,16 +1299,7 @@ mod tests {
         let (aa, ab) = (admin_of(&a), admin_of(&b));
         assert_eq!(
             sorted(fx.work_mounts(&pod_name(RUN))),
-            expected(
-                &fx,
-                &[
-                    (ws.path(), false),
-                    (&ma, true),
-                    (&aa, false),
-                    (&mb, true),
-                    (&ab, false)
-                ]
-            )
+            expected_with(&fx, ws.path(), &[(&ma, &aa), (&mb, &ab)])
         );
         // It asked the old pod whether a command ran before it was deleted, and said why.
         let commands = fx.exec.lock().unwrap().commands.clone();

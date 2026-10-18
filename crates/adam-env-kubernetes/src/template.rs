@@ -597,6 +597,24 @@ spec:
                     Some("git/github.com/o/r.git/worktrees/r"),
                     None
                 ),
+                (
+                    "work",
+                    "/work/git/github.com/o/r.git/worktrees/r/commondir",
+                    Some("git/github.com/o/r.git/worktrees/r/commondir"),
+                    Some(true)
+                ),
+                (
+                    "work",
+                    "/work/git/github.com/o/r.git/worktrees/r/gitdir",
+                    Some("git/github.com/o/r.git/worktrees/r/gitdir"),
+                    Some(true)
+                ),
+                (
+                    "work",
+                    "/work/git/github.com/o/r.git/worktrees/r/logs",
+                    Some("git/github.com/o/r.git/worktrees/r/logs"),
+                    Some(true)
+                ),
                 ("work", "/work/workspaces/r1", Some("workspaces/r1"), None),
                 ("cache", "/cache", None, None),
                 ("tools", "/opt/adam/bin", None, Some(true)),

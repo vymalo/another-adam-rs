@@ -8,11 +8,22 @@
 //! |---|---|---|
 //! | `workspaces/<run>` | read-write | the run's slots: its worktrees and scratch projects |
 //! | `git/<host>/<owner>/<repo>.git` for each worktree slot | **read-only** | a worktree's `.git` file points into its mirror: git reads objects, refs and configuration there |
-//! | `git/<host>/<owner>/<repo>.git/worktrees/<name>` for each worktree slot | read-write, on top | the worktree's own `HEAD`, `index` and logs, which `git status` refreshes |
+//! | `git/<host>/<owner>/<repo>.git/worktrees/<name>` for each worktree slot | read-write, on top | the worktree's own `HEAD` and `index`, which `git status` refreshes |
+//! | `.../worktrees/<name>/commondir`, `.../gitdir` and `.../logs` | **read-only**, on top of that | what the coder's `git` follows into the mirror (`commondir`), what ties the directory to its slot (`gitdir`), and the reflog it appends to (`logs/HEAD`) |
 //!
 //! Nothing of `meta/`, of another run, or of another repository's mirror is in the pod, and the mirror is
 //! never writable from it: its `config`, `hooks/` and refs are read by the coder's own `git` in every run's
 //! worktree, and a run that could write them would run code in the coder.
+//!
+//! The three read-only entries are the files of the worktree's directory that the **coder's** `git` follows
+//! outside it, and so the ones a run must not be able to replace: `commondir` is read by git's reference
+//! store even when `GIT_COMMON_DIR` is set (a run that rewrote it would move the refs the coder reads and
+//! writes), a link at `logs/HEAD` is appended to by `git` (*verified* with git 2.43.0), and a `gitdir` that a
+//! run could write is no proof of whose directory it is. A read-only bind mount of a file or of a directory
+//! cannot be written, renamed over, replaced or removed from the pod (`EROFS`, `EBUSY`). A pod's own `git`
+//! never needs to write them: it cannot move a ref (the mirror is read-only), and a bare mirror keeps no
+//! reflog but the one `git worktree add` made. A worktree whose entries are not what git wrote (a link, a
+//! missing file) gets no git mounts at all: the coder refuses git on it too.
 //!
 //! The worktree's directory in the mirror is taken from **the coder's own metadata** (`Worktree::git_dir`),
 //! never from the slot's `.git` file: the run's commands can write that file, and a name read from it could
@@ -26,7 +37,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use adam_workspace::{EnvError, RunWorkspace};
+use adam_workspace::{EnvError, RunWorkspace, safe_fs};
 
 /// One mount of the workspace volume in a run pod.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +72,9 @@ impl Mount {
         )
     }
 }
+
+/// The entries of a worktree's directory in the mirror that are mounted read-only on top of it.
+pub(crate) const SEALED: [&str; 3] = ["commondir", "gitdir", "logs"];
 
 /// The git directories a worktree slot needs in the pod.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +117,9 @@ impl WorkspaceMounts {
             }
             wanted.entry(dirs.mirror.clone()).or_insert(true);
             wanted.entry(dirs.admin.clone()).or_insert(false);
+            for entry in SEALED {
+                wanted.entry(dirs.admin.join(entry)).or_insert(true);
+            }
         }
         let mut mounts = Vec::with_capacity(wanted.len());
         for (path, read_only) in wanted {
@@ -173,10 +190,15 @@ impl WorkspaceMounts {
                 continue;
             }
             match worktree.git_dir() {
-                Some(admin) => dirs.push(WorktreeDirs {
+                Some(admin) if sealable(admin).await => dirs.push(WorktreeDirs {
                     mirror: worktree.mirror().to_owned(),
                     admin: admin.to_owned(),
                 }),
+                Some(admin) => tracing::warn!(
+                    slot = slot.dir(),
+                    admin = %admin.display(),
+                    "git will not work in this slot of the run's pod: commondir, gitdir or logs of its worktree directory is not what git wrote (a link, a pipe, a missing file), so they cannot be mounted read-only"
+                ),
                 None => tracing::warn!(
                     slot = slot.dir(),
                     "git will not work in this slot of the run's pod: which directory of the mirror is its worktree's is not known"
@@ -184,6 +206,29 @@ impl WorkspaceMounts {
             }
         }
         Self::plan(base, run_dir, &dirs)
+    }
+}
+
+/// Whether the entries of the worktree directory `admin` that the pod gets read-only are there and
+/// are what git wrote: `commondir` and `gitdir` regular files (looked at, not followed), `logs` a
+/// directory (made, if it is not there: the kubelet would make a missing one as root). A link is
+/// not mounted: the mount follows it to a place the coder did not name.
+async fn sealable(admin: &Path) -> bool {
+    if !safe_fs::is_real_directory(admin).await {
+        return false;
+    }
+    if !safe_fs::is_real_file(&admin.join("commondir")).await
+        || !safe_fs::is_real_file(&admin.join("gitdir")).await
+    {
+        return false;
+    }
+    let logs = admin.join("logs");
+    match tokio::fs::symlink_metadata(&logs).await {
+        Ok(meta) => meta.is_dir(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir(&logs).await.is_ok()
+        }
+        Err(_) => false,
     }
 }
 
@@ -248,12 +293,16 @@ mod tests {
     #[test]
     fn a_worktree_adds_its_mirror_read_only_and_its_own_directory_in_it_read_write() {
         let mounts = plan(&[dirs("/work/git/github.com/o/r.git", "r1")]);
-        // By path: a mirror, then the worktree directory inside it, then the run's directory.
+        // By path: a mirror, then the worktree directory inside it and what is read-only inside
+        // that, then the run's directory.
         assert_eq!(
             lines(&mounts),
             [
                 "ro /work/git/github.com/o/r.git",
                 "rw /work/git/github.com/o/r.git/worktrees/r1",
+                "ro /work/git/github.com/o/r.git/worktrees/r1/commondir",
+                "ro /work/git/github.com/o/r.git/worktrees/r1/gitdir",
+                "ro /work/git/github.com/o/r.git/worktrees/r1/logs",
                 "rw /work/workspaces/r1",
             ]
         );
@@ -263,6 +312,9 @@ mod tests {
             .collect();
         assert!(subs.contains(&("git/github.com/o/r.git", true)));
         assert!(subs.contains(&("git/github.com/o/r.git/worktrees/r1", false)));
+        assert!(subs.contains(&("git/github.com/o/r.git/worktrees/r1/commondir", true)));
+        assert!(subs.contains(&("git/github.com/o/r.git/worktrees/r1/gitdir", true)));
+        assert!(subs.contains(&("git/github.com/o/r.git/worktrees/r1/logs", true)));
         assert!(subs.contains(&("workspaces/r1", false)));
     }
 
@@ -277,7 +329,9 @@ mod tests {
         let all = lines(&mounts);
         let at = |line: &str| all.iter().position(|l| l == line).unwrap();
         assert_eq!(
-            all.iter().filter(|l| l.starts_with("ro ")).count(),
+            all.iter()
+                .filter(|l| l.starts_with("ro ") && l.ends_with(".git"))
+                .count(),
             2,
             "{all:?}"
         );
@@ -286,10 +340,16 @@ mod tests {
                 < at("rw /work/git/github.com/o/a.git/worktrees/a")
         );
         assert!(
+            at("rw /work/git/github.com/o/a.git/worktrees/a")
+                < at("ro /work/git/github.com/o/a.git/worktrees/a/commondir"),
+            "a directory comes before what is mounted in it"
+        );
+        assert!(
             at("ro /work/git/github.com/o/b.git")
                 < at("rw /work/git/github.com/o/b.git/worktrees/b")
         );
-        assert_eq!(all.len(), 1 + 2 + 3, "{all:?}");
+        // The run, two mirrors, three worktree directories with three read-only entries each.
+        assert_eq!(all.len(), 1 + 2 + 3 * (1 + 3), "{all:?}");
     }
 
     #[test]

@@ -889,6 +889,41 @@ async fn a_run_pod_sees_only_its_own_run(c: &Cluster) {
         assert_ne!(code, 0, "`{write}` wrote the mirror: {out}");
     }
 
+    // What the coder's git follows out of the worktree's directory is read-only inside it: a
+    // `commondir` that names another repository moves the refs the coder reads and writes, a link
+    // at `logs/HEAD` is appended to by git, and neither is the pod's to write, rename over, replace
+    // or remove, though the directory itself is writable and the files are its own uid's.
+    for write in [
+        format!("echo /elsewhere > {admin}/commondir"),
+        format!("echo x >> {admin}/commondir"),
+        format!("echo /elsewhere > {admin}/c2 && mv {admin}/c2 {admin}/commondir"),
+        format!("rm {admin}/commondir"),
+        format!("ln -sf /etc/passwd {admin}/commondir"),
+        format!("echo /work/workspaces/kind-iso-b/r/.git > {admin}/gitdir"),
+        format!("echo x > {admin}/g2 && mv {admin}/g2 {admin}/gitdir"),
+        format!("rm {admin}/gitdir"),
+        format!("mv {admin}/logs {admin}/logs.moved"),
+        format!("rm {admin}/logs/HEAD && ln -s /etc/passwd {admin}/logs/HEAD"),
+        format!("touch {admin}/logs/new"),
+    ] {
+        let (code, out) = sh(&write).await;
+        assert_ne!(
+            code, 0,
+            "`{write}` changed the worktree's directory in the mirror: {out}"
+        );
+    }
+    let (code, out) = sh(&format!("cat {admin}/commondir")).await;
+    assert_eq!(
+        (code, out.trim()),
+        (0, "../.."),
+        "commondir is what git wrote"
+    );
+    let (code, out) = sh(&format!(
+        "cd /work/workspaces/kind-iso-a/r && git status --short && git log --oneline | head -1 && touch {admin}/probe2"
+    ))
+    .await;
+    assert_eq!(code, 0, "git works with the entries read-only: {out}");
+
     pods.delete(&pod_name(RUN), &DeleteParams::default())
         .await
         .unwrap();

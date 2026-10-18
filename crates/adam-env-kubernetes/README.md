@@ -94,15 +94,16 @@ The coder's volume holds every run's files. A run pod gets only these, each **at
 |---|---|---|
 | `<root>/workspaces/<run>` | read-write | the run's slots: its worktrees and scratch projects, also those added later |
 | `<root>/git/<host>/<owner>/<repo>.git`, for each worktree slot | **read-only** | the objects, refs and configuration a worktree's `.git` file points into; the coder's own `git` reads this directory in every run's worktree, so no run may write it |
-| `<mirror>/worktrees/<name>`, for each worktree slot | read-write, on top of the mirror | the worktree's own `HEAD`, `index` and logs (`<name>` is the coder's record: git names a second worktree `r1`) |
+| `<mirror>/worktrees/<name>`, for each worktree slot | read-write, on top of the mirror | the worktree's own `HEAD` and `index`, which `git status` refreshes (`<name>` is the coder's record, `<run>+<slot>`: no other run's directory is called that) |
+| `<mirror>/worktrees/<name>/commondir`, `.../gitdir` and `.../logs` | **read-only**, on top of that | what the coder's `git` follows out of the directory (`commondir`: git's reference store reads it even when `GIT_COMMON_DIR` is set), what ties the directory to its slot (`gitdir`), and the reflog it appends to (`logs/HEAD`, through a link: *verified*, git 2.43.0). A read-only bind mount of a file or a directory cannot be written, renamed over, replaced by a link or removed from the pod |
 
 Nothing of `meta/`, of another run or of another repository's mirror. The legacy worktree of a run (outside the run's directory)
-gets no mount, and a worktree whose directory in the mirror the coder cannot tell (a slot made before it was recorded, with none or several candidates in the mirror) gets no git mounts and a warning.
+gets no mount, and a worktree whose directory in the mirror the coder cannot tell (a slot made before it was recorded, with none or several candidates in the mirror), or whose `commondir`, `gitdir` or `logs` is not what git wrote (a link, a pipe, a missing file; a missing `logs` is made by the coder) gets no git mounts and a warning.
 `ensure` makes the run's directory first (the coder owns the volume; the kubelet would make a missing `subPath` as root).
 
-Git in the pod reads and refreshes its index (`status`, `log`, `diff`, `describe`, `rev-parse`, `grep`, `checkout -- file`,
-moving `HEAD`); whatever writes an object, a ref or the mirror's configuration fails (`add`, `commit`, `stash`, `reset`, `tag`,
-`branch`, `config --local`): the coder commits. `deploy/coder/tests/git-in-run-pod.sh` proves it with real git and real mounts.
+Git in the pod reads and refreshes its index (`status`, `log`, `diff`, `describe`, `rev-parse`, `grep`, `checkout -- file`);
+whatever writes an object, a ref or the mirror's configuration fails (`add`, `commit`, `stash`, `reset`, `tag`,
+`branch`, `config --local`), and so does moving `HEAD` (`switch --detach`), which appends to the read-only reflog: the coder commits. `deploy/coder/tests/git-in-run-pod.sh` proves it with real git and real mounts.
 The mirror is shared by everyone who works on a repository, so the refs and `worktrees/` of the other runs of that repository
 stay readable through it (ADR 0041, "Known limits").
 
@@ -179,7 +180,7 @@ one line); none carries a secret, and the API server never echoes one in a refus
   steps, idempotency, concurrent calls, a create that races), the refusals above, `release`, `held_runs` (this release's pods
   only), the idle sweep (idle, busy, cannot be asked, another worker's, off), `prepare` and the quoting of the words, `kill`,
   and `tool_path` and `secret_ref`; the mounts (a run with no worktree, one, several and a scratch project, the legacy worktree,
-  a run that rewrites its `.git` to another run's directory, a slot whose directory in the mirror is ambiguous or absent, a workspace outside the volume, with real `git` worktrees), the pod made again for a worktree
+  a run that rewrites its `.git` to another run's directory, a slot whose directory in the mirror is ambiguous or absent, a directory whose `commondir`, `gitdir` or `logs` is a link (no git mounts) and a missing `logs` (made), a workspace outside the volume, with real `git` worktrees), the pod made again for a worktree
   added later (no command running), waited for (a command running, or a pod that cannot be asked), left alone (nothing new, a
   spare mount) and replaced (no annotation); and the template's startup refusals (no mount at the workspace root, a `subPath`,
   read-only, no such volume, the volume mounted twice or by another container).

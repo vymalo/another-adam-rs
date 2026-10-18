@@ -164,8 +164,8 @@ A build is bounded by the pod's memory (2Gi in the chart), and the coder shrinks
 ([ADR 0019](../decisions/0019-a-runs-processes-in-a-pod-of-their-own.md)). The pod is made from a template
 that holds the image, resources, priority class, security context and volumes; the code adds a name, labels and
 annotations, and narrows the template's one mount of the workspace volume to the run: its own directory, and for
-each worktree its mirror read-only and the worktree's own directory in it, each at the same path as in the coder, so
-a pod sees no other run ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md)). A repository added to a
+each worktree its mirror read-only and the worktree's own directory in it (with `commondir`, `gitdir` and `logs` read-only on
+top), each at the same path as in the coder, so a pod sees no other run ([ADR 0041](../decisions/0041-a-run-pod-sees-only-its-own-run.md)). A repository added to a
 run later makes the pod again, when no command runs in it. A command is
 `adam-kube-exec`, which runs `adam-exec` in the pod over `pods/exec`. No GitHub credential ever enters a
 pod. The chart's `runPods` block renders what surrounds it

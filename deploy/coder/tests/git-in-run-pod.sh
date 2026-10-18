@@ -3,15 +3,21 @@
 #
 # A run pod mounts its own run's directory read-write, a worktree's mirror READ-ONLY and the worktree's own
 # directory in the mirror (<mirror>/worktrees/<name>) read-write on top, each at the path the coder has it at, and
-# nothing else of the volume. This builds that view in a private mount namespace (bind mounts, as the container
-# runtime makes them from the pod's subPath mounts) and runs git as uid 10001 in it:
+# nothing else of the volume. On top of the worktree's directory, READ-ONLY, are three entries the coder's git
+# follows out of it: commondir and gitdir (single-file mounts) and logs (a directory). This builds that view in a
+# private mount namespace (bind mounts, as the container runtime makes them from the pod's subPath mounts) and runs
+# git as uid 10001 in it:
 #
 #   * what a repository's checks do with git works: status (also after the working tree changed: the index is
-#     refreshed in the worktree's own directory), log, diff, describe, rev-parse, grep, switching HEAD;
+#     refreshed in the worktree's own directory), log, diff, describe, rev-parse, grep;
 #   * what writes an object, a ref or the configuration of the shared mirror fails: add, commit, stash, reset, tag,
-#     branch, config, and a write to the mirror's config, hooks, refs, objects or worktrees/;
+#     branch, config, and a write to the mirror's config, hooks, refs, objects or worktrees/; so does moving HEAD
+#     (switch, checkout of another commit), which appends to the reflog in logs/;
 #   * nothing of another run, of meta/ or of another mirror is there, and a scratch project (its own repository
-#     inside the run's directory) commits.
+#     inside the run's directory) commits;
+#   * the three read-only entries cannot be written, appended to, renamed over, replaced by a link or removed (the
+#     coder's git would follow a rewritten commondir to another repository, and appends to a reflog that is a
+#     link), the files owned by the very uid that tries, and git still works with them.
 #
 #   sudo sh deploy/coder/tests/git-in-run-pod.sh        (from the repository root; needs root, unshare and setpriv)
 #
@@ -86,6 +92,11 @@ mount --bind "$volume/workspaces/a" /work/workspaces/a
 mount --bind "$volume/git/example.test/o/r.git" "$mirror"
 mount -o remount,bind,ro "$mirror"
 mount --bind "$volume/git/example.test/o/r.git/worktrees/${admin##*/}" "$admin"
+# The entries of the worktree's directory the coder's git follows: read-only on top of it.
+for entry in commondir gitdir logs; do
+  mount --bind "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/$entry" "$admin/$entry"
+  mount -o remount,bind,ro "$admin/$entry"
+done
 chmod 755 /work
 
 w=/work/workspaces/a/r
@@ -109,9 +120,34 @@ as_pod "cd $w && echo more >> README.md && touch new.txt"
 says "status sees a change and an untracked file" "cd $w && git status --short" 'M README.md'
 ok "the index is refreshed in the worktree's own directory" "cd $w && touch README.md && git status --short && test -f $admin/index"
 ok "a file is put back from the index" "cd $w && git checkout -- README.md && ! git status --short | grep -q README"
-ok "HEAD moves in the worktree's own directory" "cd $w && git switch --detach main && git switch agent/a"
+no "HEAD cannot be moved by git: its reflog (logs/HEAD) is read-only, and git appends to it" "cd $w && git switch --detach main"
+says "and git says why" "cd $w && git switch --detach main" 'Read-only file system'
 ok "writes to the worktree and the run's directory" "echo y > $w/y.txt && echo y > /work/workspaces/a/y.txt && touch $admin/probe"
 ok "a scratch project is a repository of its own and commits" "cd /work/workspaces/a/scratch && git add -A && git commit -qm s"
+
+echo "-- what the pod cannot change in the worktree's directory"
+no "commondir cannot be written" "echo /elsewhere > $admin/commondir"
+no "commondir cannot be appended to" "echo x >> $admin/commondir"
+no "commondir cannot be renamed over" "echo /elsewhere > $admin/c2 && mv $admin/c2 $admin/commondir"
+no "commondir cannot be removed" "rm $admin/commondir"
+no "commondir cannot be replaced by a link" "ln -sf /etc/passwd $admin/commondir"
+no "gitdir cannot be written" "echo /work/workspaces/b/r/.git > $admin/gitdir"
+no "gitdir cannot be renamed over" "echo x > $admin/g2 && mv $admin/g2 $admin/gitdir"
+no "gitdir cannot be removed" "rm $admin/gitdir"
+no "logs cannot be moved away" "mv $admin/logs $admin/logs.moved"
+no "logs cannot be removed" "rm -r $admin/logs"
+no "a link cannot be put at logs/HEAD" "rm $admin/logs/HEAD && ln -s /etc/passwd $admin/logs/HEAD"
+no "logs/HEAD cannot be replaced" "echo x > $admin/logs/new && mv $admin/logs/new $admin/logs/HEAD"
+no "nothing can be made in logs" "touch $admin/logs/new"
+equals "commondir says what git wrote" "cat $admin/commondir" '../.. '
+equals "and so does the volume" "cat /work/git/example.test/o/r.git/worktrees/${admin##*/}/commondir" '../.. '
+if [ "$(cat "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/commondir")" = "../.." ] && [ -f "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/logs/HEAD" ] && [ ! -L "$volume/git/example.test/o/r.git/worktrees/${admin##*/}/logs/HEAD" ]; then
+  echo "ok   the coder's side of the volume is as git wrote it"
+else
+  echo "FAIL the coder's side of the volume changed"; fail=1
+fi
+ok "git still works with them in place" "cd $w && git status --short && git log --oneline | grep -q seed && git diff --stat"
+ok "the other entries of the directory are writable" "touch $admin/probe2 && echo ref: refs/heads/agent/a > $admin/HEAD"
 
 echo "-- what is refused"
 no "add" "cd $w && echo z > z.txt && git add z.txt"
